@@ -49,8 +49,6 @@ const selfNode: RosterEntry['nodes'][number] = {
   live: true,
 }
 
-const AGENT_EXIT_DEDUP_WINDOW_MS = 5_000
-
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
   readonly #cwd?: string
@@ -65,7 +63,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #injectedEventIdSet = new Set<string>()
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
-  readonly #recentAgentExits = new Map<string, number>()
+  readonly #exitedAgentNames = new Set<string>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
@@ -92,6 +90,8 @@ export class InternalFleetClient implements FleetClient {
       continueFrom: input.sessionRef,
     })
 
+    this.#clearAgentExitLatch(handle.name)
+
     return { name: handle.name, sessionRef: sessionRefFrom(handle) }
   }
 
@@ -105,6 +105,8 @@ export class InternalFleetClient implements FleetClient {
       cwd: this.#cwd,
       continueFrom: input.sessionRef,
     })
+
+    this.#clearAgentExitLatch(handle.name)
 
     return { name: handle.name, sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
   }
@@ -291,33 +293,23 @@ export class InternalFleetClient implements FleetClient {
   }
 
   #rememberAgentExit(name: string): boolean {
-    const now = Date.now()
-    const prior = this.#recentAgentExits.get(name)
-    if (prior !== undefined && now - prior < AGENT_EXIT_DEDUP_WINDOW_MS) {
+    if (this.#exitedAgentNames.has(name)) {
       this.#suppressedDuplicateAgentExits += 1
       if (this.#suppressedDuplicateAgentExits <= 3 || this.#suppressedDuplicateAgentExits % 100 === 0) {
         this.#logger?.debug?.('[factory-sdk] suppressed duplicate agent exit', {
           count: this.#suppressedDuplicateAgentExits,
           name,
-          windowMs: AGENT_EXIT_DEDUP_WINDOW_MS,
         })
       }
       return true
     }
 
-    this.#recentAgentExits.set(name, now)
-    if (this.#recentAgentExits.size > 500) {
-      this.#pruneRecentAgentExits(now)
-    }
+    this.#exitedAgentNames.add(name)
     return false
   }
 
-  #pruneRecentAgentExits(now: number): void {
-    for (const [name, seenAt] of this.#recentAgentExits) {
-      if (now - seenAt >= AGENT_EXIT_DEDUP_WINDOW_MS) {
-        this.#recentAgentExits.delete(name)
-      }
-    }
+  #clearAgentExitLatch(name: string): void {
+    this.#exitedAgentNames.delete(name)
   }
 
   #rememberEvent(identity: EventIdentity): boolean {
