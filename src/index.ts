@@ -35,6 +35,13 @@ export type {
 } from './fleet/internal-fleet-client'
 export { RelayFleetClient } from './fleet/relay-fleet-client'
 export {
+  RelayfileCloudMountClient,
+} from './mount/relayfile-cloud-mount-client'
+export type {
+  RelayFileClientLike,
+  RelayfileCloudMountClientConfig,
+} from './mount/relayfile-cloud-mount-client'
+export {
   GhCliGithubMergeGate,
   GithubMergeGate,
   evaluateGithubMergeGate,
@@ -66,7 +73,9 @@ export {
 } from './writeback'
 export type {
   LinearCommentPayload,
+  LinearCreateIssuePayload,
   LinearStateIds,
+  MountLinearWritebackConfig,
   MountSlackWritebackConfig,
 } from './writeback'
 export {

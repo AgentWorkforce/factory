@@ -4,7 +4,9 @@ export {
 } from './linear'
 export type {
   LinearCommentPayload,
+  LinearCreateIssuePayload,
   LinearStateIds,
+  MountLinearWritebackConfig,
 } from './linear'
 export {
   MountSlackWriteback,

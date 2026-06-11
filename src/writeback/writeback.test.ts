@@ -12,11 +12,11 @@ const issuePath = '/linear/issues/AR-99__04ef067e-35b6-4ec4-81e7-66acc1f2e31f.js
 const issue: LinearIssue = {
   uuid: '04ef067e-35b6-4ec4-81e7-66acc1f2e31f',
   key: 'AR-99',
-  title: 'Reviewer merge on green',
+  title: '[factory-e2e] Reviewer merge on green',
   description: 'Dispatch reviewer after green checks',
   stateId: 'ready-state',
   state: { name: 'Ready for Agent' },
-  labels: ['factory'],
+  labels: [],
   path: issuePath,
   raw: {
     payload: {
@@ -25,10 +25,30 @@ const issue: LinearIssue = {
   },
 }
 
+const wrappedIssueRecord = (overrides: Record<string, unknown> = {}) => ({
+  provider: 'linear',
+  objectType: 'issue',
+  objectId: issue.uuid,
+  deleted: false,
+  connectionId: 'linear-connection',
+  payload: {
+    id: issue.uuid,
+    identifier: issue.key,
+    title: issue.title,
+    description: issue.description,
+    stateId: issue.stateId,
+    labels: undefined,
+    labelIds: ['label-id-not-used-by-guard'],
+    team: { key: 'AR', name: 'Agent Relay' },
+    url: 'https://linear.app/agent-relay/issue/AR-99/reviewer-merge-on-green',
+    ...overrides,
+  },
+})
+
 describe('MountLinearWriteback', () => {
   it('writes only stateId to the canonical AR-prefixed issue file and verifies read-back', async () => {
     const mount = new FakeMountClient({
-      [issuePath]: { stateId: 'ready-state' },
+      [issuePath]: wrappedIssueRecord(),
     })
     const linear = MountLinearWriteback(mount)
 
@@ -42,7 +62,7 @@ describe('MountLinearWriteback', () => {
 
   it('returns false on stale state read-back mismatches', async () => {
     const mount = new FakeMountClient({
-      [issuePath]: { stateId: 'ready-state' },
+      [issuePath]: wrappedIssueRecord(),
     })
     const linear = MountLinearWriteback(mount)
 
@@ -51,7 +71,7 @@ describe('MountLinearWriteback', () => {
 
   it('writes full comment payload under the canonical issue file parent', async () => {
     const mount = new FakeMountClient({
-      [issuePath]: { stateId: 'ready-state' },
+      [issuePath]: wrappedIssueRecord(),
     })
     const linear = MountLinearWriteback(mount)
     const body = 'Agent dispatched to factory-sdk/w4-writeback'
@@ -86,7 +106,7 @@ describe('MountLinearWriteback', () => {
 
   it('surfaces non-acked state writebacks even when local read-back matches', async () => {
     const mount = new FakeMountClient({
-      [issuePath]: { stateId: 'ready-state' },
+      [issuePath]: wrappedIssueRecord(),
     })
     mount.setConfirmWrite(issuePath, 'timeout')
     const linear = MountLinearWriteback(mount)
@@ -104,11 +124,142 @@ describe('MountLinearWriteback', () => {
     }
 
     const mount = new StaleMountClient({
-      [issuePath]: { stateId: 'ready-state' },
+      [issuePath]: wrappedIssueRecord(),
     })
     const linear = MountLinearWriteback(mount)
 
     await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/read-back verification failed/)
+  })
+
+  it('refuses setState and postComment on an issue without factory-e2e before writing', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ title: 'Real production work' }),
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    await expect(linear.postComment(issue, 'dispatch comment')).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    expect(mount.writes).toEqual([])
+  })
+
+  it('fails closed when issue title or guard record is unreadable', async () => {
+    const missingTitle = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ title: undefined }),
+    })
+    await expect(MountLinearWriteback(missingTitle).setState(issue, 'implementing-state'))
+      .rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+
+    const unreadable = new FakeMountClient()
+    await expect(MountLinearWriteback(unreadable).postComment(issue, 'dispatch comment'))
+      .rejects.toThrow(/unable to read guard fields/)
+    expect(missingTitle.writes).toEqual([])
+    expect(unreadable.writes).toEqual([])
+  })
+
+  it.each([
+    ['no-space suffix', '[factory-e2e]x Factory work', 'body'],
+    ['suffix word', '[factory-e2e]xyz Factory work', 'body'],
+    ['case mismatch', '[Factory-E2E] Factory work', 'body'],
+    ['not prefix', 'x[factory-e2e] Factory work', 'body'],
+    ['description marker only', 'Factory work', '[factory-e2e] marker in body'],
+  ])('refuses near-miss titles: %s', async (_name, title, description) => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ title, description }),
+    })
+
+    await expect(MountLinearWriteback(mount).setState(issue, 'implementing-state'))
+      .rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    expect(mount.writes).toEqual([])
+  })
+
+  it('allows writeback when the title is marked factory-e2e and team is absent', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ team: undefined }),
+    })
+
+    await expect(MountLinearWriteback(mount).setState(issue, 'implementing-state'))
+      .resolves.toBeUndefined()
+    expect(mount.writes).toEqual([
+      { path: issuePath, content: { stateId: 'implementing-state' } },
+    ])
+  })
+
+  it('refuses writeback when the issue is not scoped to the AR team', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ team: { key: 'OTHER', name: 'Other Team' } }),
+    })
+
+    await expect(MountLinearWriteback(mount).postComment(issue, 'dispatch comment'))
+      .rejects.toThrow(/team key must be AR/)
+    expect(mount.writes).toEqual([])
+  })
+
+  it('refuses createIssue when the create payload lacks factory-e2e', async () => {
+    const mount = new FakeMountClient()
+
+    await expect(MountLinearWriteback(mount).createIssue({
+      id: 'uuid-new',
+      identifier: 'AR-NEW',
+      title: 'marker missing from title',
+      team: { key: 'AR' },
+    })).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    expect(mount.writes).toEqual([])
+  })
+
+  it('refuses createIssue when the create payload is outside the AR team', async () => {
+    const mount = new FakeMountClient()
+
+    await expect(MountLinearWriteback(mount).createIssue({
+      id: 'uuid-new',
+      identifier: 'AR-NEW',
+      title: '[factory-e2e] synthetic issue',
+      team: { key: 'OTHER' },
+    })).rejects.toThrow(/team key must be AR/)
+    expect(mount.writes).toEqual([])
+  })
+
+  it('creates an issue only when the payload carries the factory-e2e title prefix and AR team', async () => {
+    const mount = new FakeMountClient()
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.createIssue({
+      id: 'uuid-new',
+      identifier: 'AR-NEW',
+      title: '[factory-e2e] synthetic issue',
+      team: { key: 'AR', name: 'Agent Relay' },
+    })).resolves.toEqual({
+      path: '/linear/issues/AR-NEW__uuid-new.json',
+    })
+
+    expect(mount.writes).toEqual([{
+      path: '/linear/issues/AR-NEW__uuid-new.json',
+      content: {
+        id: 'uuid-new',
+        identifier: 'AR-NEW',
+        title: '[factory-e2e] synthetic issue',
+        team: { key: 'AR', name: 'Agent Relay' },
+      },
+    }])
+  })
+
+  it('creates an issue when the title is marked factory-e2e and team is absent', async () => {
+    const mount = new FakeMountClient()
+
+    await expect(MountLinearWriteback(mount).createIssue({
+      id: 'uuid-no-team',
+      identifier: 'AR-NO-TEAM',
+      title: '[factory-e2e] synthetic issue with sparse sync',
+    })).resolves.toEqual({
+      path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
+    })
+    expect(mount.writes).toEqual([{
+      path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
+      content: {
+        id: 'uuid-no-team',
+        identifier: 'AR-NO-TEAM',
+        title: '[factory-e2e] synthetic issue with sparse sync',
+      },
+    }])
   })
 })
 

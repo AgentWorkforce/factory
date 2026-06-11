@@ -25,10 +25,12 @@ const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
 const issuePayload = (n: number, stateId = ready) => ({
   id: `uuid-${n}`,
   identifier: `AR-${n}`,
-  title: `Fix factory issue ${n}`,
+  title: `[factory-e2e] Fix factory issue ${n}`,
   description: 'Implement the requested fix in packages/factory-sdk/src/orchestrator/factory.ts and verify it with tests.',
   stateId,
-  labels: [{ name: 'pear' }],
+  labels: undefined,
+  labelIds: ['label-id-not-used-by-parser'],
+  team: { key: 'AR', name: 'Agent Relay' },
   project: { name: 'Factory' },
   state: { id: stateId, name: stateId === ready ? 'Ready for Agent' : 'Implementing' },
 })
@@ -83,10 +85,33 @@ describe('FactoryLoop', () => {
     expect(parseLinearIssue(issuePath(1), issueFile(1))).toMatchObject({
       uuid: 'uuid-1',
       key: 'AR-1',
-      title: 'Fix factory issue 1',
+      title: '[factory-e2e] Fix factory issue 1',
       stateId: ready,
-      labels: ['pear'],
+      labels: [],
       project: 'Factory',
+    })
+  })
+
+  it('parses sparse real Linear issue records without labels or stateId', () => {
+    expect(parseLinearIssue(issuePath(5), {
+      provider: 'linear',
+      objectType: 'issue',
+      objectId: 'uuid-5',
+      payload: {
+        id: 'uuid-5',
+        identifier: 'AR-5',
+        title: 'Real issue without factory marker',
+        description: 'Sparse sync shape',
+        state: { id: implementing },
+        state_name: 'Implementing',
+        labels: undefined,
+      },
+    })).toMatchObject({
+      uuid: 'uuid-5',
+      key: 'AR-5',
+      stateId: implementing,
+      state: { name: 'Implementing' },
+      labels: [],
     })
   })
 

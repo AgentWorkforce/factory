@@ -62,7 +62,10 @@ export class FactoryLoop implements Factory {
     this.#mount = ports.mount
     this.#fleet = ports.fleet
     this.#triage = ports.triage ?? new TieredTriage(new HeuristicTriage())
-    this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, config.stateIds)
+    this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
+      stateIds: config.stateIds,
+      safety: config.safety,
+    })
     this.#slack = ports.slack ?? (config.slack ? MountSlackWriteback(ports.mount, config.slack) : undefined)
     void (ports.github ?? MountGithubRead(ports.mount))
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
@@ -532,6 +535,7 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   const key = stringValue(payload.identifier) ?? keyFromPath(path)
   const uuid = stringValue(payload.id) ?? stringValue(wrapper.objectId) ?? uuidFromPath(path) ?? key
   const stateId = stringValue(payload.stateId) ?? stringValue(state?.id) ?? ''
+  const stateName = stringValue(state?.name) ?? stringValue(payload.state_name)
 
   return {
     uuid,
@@ -539,7 +543,7 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
     title: stringValue(payload.title) ?? '',
     description: stringValue(payload.description) ?? '',
     stateId,
-    state: state ? { name: stringValue(state.name) ?? '' } : undefined,
+    state: state || stateName ? { name: stateName ?? '' } : undefined,
     labels,
     project,
     team,

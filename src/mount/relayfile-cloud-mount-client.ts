@@ -1,0 +1,239 @@
+import { readFile as readLocalFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+import {
+  RelayfileSetup,
+  type ChangeEvent,
+  type EventFeedResponse,
+  type FileReadResponse,
+  type GetEventsOptions,
+  type ListTreeOptions,
+  type RelayfileCloudTokenSet,
+  type ResourceAtEventResult,
+  type OperationStatusResponse,
+  type SubscribeOptions,
+  type Subscription,
+  type TreeResponse,
+  type WriteFileInput,
+  type WriteQueuedResponse,
+} from '@relayfile/sdk'
+
+import type { EventPage, MountClient } from '../ports'
+import {
+  createWorkspaceScopedEventClient,
+  type RelayfileEventClient,
+  type TokenProvider,
+  type WorkspaceEventClientSource,
+} from '../subscriptions'
+
+const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
+const DEFAULT_CREDS_PATH = join(homedir(), '.relayfile', 'cloud-credentials.json')
+const DEFAULT_AGENT_NAME = 'pear-factory-sdk'
+const READ_WRITE_SCOPES = ['relayfile:fs:read:/**', 'relayfile:fs:write:/**']
+
+export interface RelayfileCloudMountClientConfig {
+  backend?: 'relayfile-cloud'
+  workspaceId?: string
+  credsPath?: string
+  agentName?: string
+  client?: RelayFileClientLike
+  tokenProvider?: TokenProvider
+  baseUrl?: string
+  eventClient?: RelayfileEventClient
+}
+
+export type RelayFileClientLike =
+  {
+    readFile(workspaceId: string, path: string): Promise<FileReadResponse>
+    writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
+    listTree(workspaceId: string, options?: ListTreeOptions): Promise<TreeResponse>
+    getEvents(workspaceId: string, options?: GetEventsOptions): Promise<EventFeedResponse>
+    getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
+    getOp?(workspaceId: string, opId: string): Promise<OperationStatusResponse>
+    getToken?(): Promise<string> | string
+    getBaseUrl?(): string
+  }
+
+export class RelayfileCloudMountClient implements MountClient {
+  readonly workspaceId: string
+
+  readonly #client: RelayFileClientLike
+  readonly #tokenProvider: TokenProvider
+  readonly #baseUrl?: string
+  readonly #eventClient?: RelayfileEventClient
+  readonly #lastOpByPath = new Map<string, string>()
+
+  constructor(config: RelayfileCloudMountClientConfig = {}) {
+    if (!config.client) {
+      throw new Error('RelayfileCloudMountClient requires a client; use fromConfig() to load cloud credentials')
+    }
+
+    this.workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
+    this.#client = config.client
+    this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
+    this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
+    this.#eventClient = config.eventClient
+  }
+
+  static async fromConfig(config: RelayfileCloudMountClientConfig = {}): Promise<RelayfileCloudMountClient> {
+    if (config.client) return new RelayfileCloudMountClient(config)
+
+    const workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
+    const credentials = parseCloudCredentials(
+      await readLocalFile(config.credsPath ?? DEFAULT_CREDS_PATH, 'utf8'),
+    )
+    const setup = RelayfileSetup.fromCloudTokens(credentials)
+    const handle = await setup.joinWorkspace(workspaceId, {
+      agentName: config.agentName ?? DEFAULT_AGENT_NAME,
+      scopes: READ_WRITE_SCOPES,
+    })
+
+    return new RelayfileCloudMountClient({
+      ...config,
+      workspaceId,
+      client: handle.client(),
+      tokenProvider: () => handle.getToken(),
+      baseUrl: handle.info.relayfileUrl,
+    })
+  }
+
+  async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    const response = await this.#client.readFile(this.workspaceId, path)
+    return {
+      content: parseRemoteContent(response),
+      revision: response.revision,
+    }
+  }
+
+  async writeFile(path: string, content: unknown): Promise<void> {
+    const serialized = serializeContent(content)
+
+    const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
+      let baseRevision = '0'
+      try {
+        baseRevision = (await this.#client.readFile(this.workspaceId, path)).revision
+      } catch (error) {
+        if (!isHttpStatus(error, 404)) throw error
+      }
+
+      return this.#client.writeFile({
+        workspaceId: this.workspaceId,
+        path,
+        baseRevision,
+        content: serialized.content,
+        contentType: serialized.contentType,
+      })
+    }
+
+    try {
+      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+    } catch (error) {
+      if (!isHttpStatus(error, 409)) throw error
+      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+    }
+  }
+
+  async listTree(prefix: string): Promise<string[]> {
+    const paths: string[] = []
+    let cursor: string | undefined
+    for (;;) {
+      const response = await this.#client.listTree(this.workspaceId, {
+        path: prefix,
+        cursor,
+      })
+      paths.push(...response.entries.map((entry) => entry.path))
+      if (!response.nextCursor) break
+      cursor = response.nextCursor
+    }
+    return paths.sort()
+  }
+
+  subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription {
+    const eventClient = this.#eventClient ?? createWorkspaceScopedEventClient(
+      this.#client as WorkspaceEventClientSource,
+      this.workspaceId,
+      this.#tokenProvider,
+      this.#baseUrl,
+    )
+    return eventClient.subscribe(globs, onChange as Parameters<RelayfileEventClient['subscribe']>[1], opts)
+  }
+
+  async getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage> {
+    const response = await this.#client.getEvents(this.workspaceId, opts)
+    return {
+      events: response.events as unknown as EventPage['events'],
+      nextCursor: response.nextCursor,
+    }
+  }
+
+  async confirmWrite(
+    path: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+    const opId = this.#lastOpByPath.get(path)
+    if (!opId || !this.#client.getOp) return 'acked'
+
+    const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
+    for (;;) {
+      const status = mapOperationStatus(await this.#client.getOp(this.workspaceId, opId))
+      if (status !== 'pending') return status
+      if (Date.now() >= deadline) return 'timeout'
+      await sleep(Math.min(500, Math.max(25, deadline - Date.now())))
+    }
+  }
+
+  async ensureSubRoot(prefix: string, _opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
+    try {
+      await this.#client.listTree(this.workspaceId, { path: prefix, depth: 1 })
+      return 'ready'
+    } catch (error) {
+      if (isHttpStatus(error, 404)) return 'absent'
+      throw error
+    }
+  }
+}
+
+const parseCloudCredentials = (raw: string): RelayfileCloudTokenSet => {
+  const parsed = JSON.parse(raw) as Partial<RelayfileCloudTokenSet>
+  if (!parsed.apiUrl || !parsed.accessToken || !parsed.refreshToken) {
+    throw new Error('Relayfile cloud credentials are missing apiUrl, accessToken, or refreshToken')
+  }
+  return parsed as RelayfileCloudTokenSet
+}
+
+const parseRemoteContent = (response: FileReadResponse): unknown => {
+  if (!response.contentType.includes('json')) return response.content
+  try {
+    return JSON.parse(response.content)
+  } catch {
+    return response.content
+  }
+}
+
+const serializeContent = (content: unknown): { content: string; contentType: string } => {
+  if (typeof content === 'string') {
+    return { content, contentType: 'text/plain' }
+  }
+  return {
+    content: JSON.stringify(content),
+    contentType: 'application/json',
+  }
+}
+
+const isHttpStatus = (error: unknown, status: number): boolean => {
+  const record = error !== null && typeof error === 'object' ? error as Record<string, unknown> : undefined
+  return record?.status === status || record?.statusCode === status
+}
+
+const mapOperationStatus = (
+  response: OperationStatusResponse,
+): 'acked' | 'pending' | 'failed' => {
+  if (response.status === 'succeeded') return 'acked'
+  if (response.status === 'failed' || response.status === 'dead_lettered' || response.status === 'canceled') {
+    return 'failed'
+  }
+  return 'pending'
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))

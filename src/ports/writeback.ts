@@ -3,6 +3,7 @@ import type { LinearIssue, PrSummary } from '../types'
 export interface LinearWriteback {
   setState(issue: LinearIssue, stateId: string): Promise<void>
   postComment(issue: LinearIssue, body: string): Promise<void>
+  createIssue(payload: Record<string, unknown>): Promise<{ path: string }>
   verify(issue: LinearIssue, expect: { stateId?: string; commentName?: string }): Promise<boolean>
 }
 

@@ -37,6 +37,10 @@ describe('FactoryConfigSchema', () => {
     })
     expect(parsed.mergePolicy).toBe('never')
     expect(parsed.stateIds).toEqual(LINEAR_STATE_IDS)
+    expect(parsed.safety).toEqual({
+      requireTitlePrefix: '[factory-e2e]',
+      requireTeamKey: 'AR',
+    })
     expect(parsed.dryRun).toBe(false)
   })
 
