@@ -19,6 +19,16 @@ export {
 } from './constants/slack'
 export { RelayFleetClient } from './fleet/relay-fleet-client'
 export { createFleet } from './ports'
+export {
+  HeuristicTriage,
+  LlmTriage,
+  TieredTriage,
+  TriageDecisionSchema,
+} from './triage'
+export type {
+  HeuristicTriageOptions,
+  LlmTriageOptions,
+} from './triage'
 export type {
   Capability,
   ChangeEvent,
