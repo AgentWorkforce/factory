@@ -1,0 +1,21 @@
+{
+  "provider": "github",
+  "objectType": "pull_request",
+  "objectId": "2086",
+  "deleted": false,
+  "payload": {
+    "id": "3848725326",
+    "number": 2086,
+    "title": "Add direct-proxy writeback fast path for Slack reply/comment actions",
+    "body": "Sanitized live PR fixture captured from .integrations/github/repos/AgentWorkforce__cloud/pulls/by-id/2086.json.",
+    "state": "open",
+    "url": "https://github.com/AgentWorkforce/cloud/pull/2086",
+    "head_ref": "feat/direct-proxy-writeback-fast-path",
+    "base_ref": "main",
+    "author": "kjgbot",
+    "created_at": "2026-06-11T16:12:52Z",
+    "updated_at": "2026-06-11T17:00:20Z",
+    "files_changed": 0
+  },
+  "connectionId": "sanitized-github-connection"
+}

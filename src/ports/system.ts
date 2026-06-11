@@ -5,6 +5,11 @@ export interface Logger {
   error?(message: string, ...args: unknown[]): void
 }
 
+export interface TelemetrySink {
+  increment?(name: string, value?: number, metadata?: Record<string, unknown>): void
+  gauge?(name: string, value: number, metadata?: Record<string, unknown>): void
+}
+
 export interface Clock {
   now(): number
   sleep(ms: number): Promise<void>

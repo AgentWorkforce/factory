@@ -24,4 +24,5 @@ export type {
 export type {
   Clock,
   Logger,
+  TelemetrySink,
 } from './system'

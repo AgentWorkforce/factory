@@ -74,6 +74,45 @@ export type {
   LinearStateIds,
   MountSlackWritebackConfig,
 } from './writeback'
+export {
+  canonicalMountPaths,
+  createWorkspaceScopedEventClient,
+  deliveryTargetsFor,
+  eventPathGlobsForIntegration,
+  filesystemEventToChangeEvent,
+  filterLinearPredicateSpecs,
+  globMatchesPath,
+  globSegmentMatches,
+  hasLinearPredicates,
+  integrationRelayFileSyncOptions,
+  isLinearIssueEventPath,
+  linearIssueMatchesPredicates,
+  linearRecordCandidates,
+  linearScopePredicates,
+  normalizeChangePath,
+  relayfileSdkPathFiltersFor,
+  slackListenDms,
+  subscriptionSpecsFor,
+} from './subscriptions'
+export type {
+  ConnectedIntegrationLike,
+  DeliveryTargets,
+  FilesystemEventLike,
+  IntegrationRelayFileSyncOptionsInput,
+  LinearPredicateSubscriptionSpec,
+  LinearScopePredicates,
+  LocalMountRoot,
+  RelayfileEventClient,
+  RelayFileSyncFactory,
+  RelayFileSyncLike,
+  SubscriptionSpec,
+  TokenProvider,
+  WatchRegistration,
+  WorkspaceEventClientSource,
+  WorkspaceScopedEventClientOptions,
+  WorkspaceScopedSubscribeOptions,
+  ChangeEvent as SubscriptionChangeEvent,
+} from './subscriptions'
 export type {
   Capability,
   ChangeEvent,
@@ -93,6 +132,7 @@ export type {
   LinearWriteback,
   Logger,
   SlackWriteback,
+  TelemetrySink,
 } from './ports'
 export type {
   DispatchResult,

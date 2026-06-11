@@ -1,0 +1,32 @@
+{
+  "provider": "slack",
+  "objectType": "message",
+  "objectId": "C0B902XR6PN:1781195129.654779",
+  "deleted": false,
+  "payload": {
+    "id": "C0B902XR6PN-1781195129.654779",
+    "channel": "C0B902XR6PN",
+    "channel_name": "epic-pear-cloud-relay-execution",
+    "channel_is_private": false,
+    "user": "SANITIZED_USER",
+    "user_name": "file_by_agent_relay",
+    "user_real_name": "Agent Relay",
+    "user_display_name": "",
+    "user_email": "",
+    "user_is_bot": true,
+    "text": "Sanitized live Slack channel message fixture captured from .integrations/slack/channels/C0B902XR6PN__epic-pear-cloud-relay-execution/messages/1781195129_654779/meta.json.",
+    "ts": "1781195129.654779",
+    "thread_ts": null,
+    "is_thread_parent": false,
+    "reply_count": 0,
+    "reply_users_count": 0,
+    "edited_ts": null,
+    "permalink": "https://example.invalid/slack/permalink",
+    "has_files": false,
+    "file_count": 0,
+    "reactions_json": "[]",
+    "mentions_json": "{\"users\":[],\"channels\":[]}",
+    "channelId": "C0B902XR6PN"
+  },
+  "connectionId": "sanitized-slack-connection"
+}
