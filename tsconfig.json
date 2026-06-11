@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.node.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "outDir": "../../out/packages/factory-sdk"
+  },
+  "include": [
+    "src/**/*"
+  ]
+}
