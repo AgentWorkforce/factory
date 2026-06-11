@@ -266,6 +266,7 @@ describe('MountLinearWriteback', () => {
 describe('MountSlackWriteback', () => {
   it('exposes only thread root and reply methods', () => {
     const slack = MountSlackWriteback(new FakeMountClient(), {
+      channel: 'C0AD7UU0J1G',
       channelDir: 'C0AD7UU0J1G__proj-cloud',
     })
 
@@ -275,6 +276,7 @@ describe('MountSlackWriteback', () => {
   it('writes root thread messages and threaded replies with exact mount payloads', async () => {
     const mount = new FakeMountClient()
     const slack = MountSlackWriteback(mount, {
+      channel: 'C0AD7UU0J1G',
       channelDir: 'C0AD7UU0J1G__proj-cloud',
       clientIdPrefix: 'factory-w4',
     })
@@ -321,6 +323,7 @@ describe('MountSlackWriteback', () => {
 
     const timeoutMount = new TimeoutAfterWriteMountClient()
     const timeoutSlack = MountSlackWriteback(timeoutMount, {
+      channel: 'C0AD7UU0J1G',
       channelDir: 'C0AD7UU0J1G__proj-cloud',
       clientIdPrefix: 'factory-w4',
     })
@@ -331,6 +334,76 @@ describe('MountSlackWriteback', () => {
     })).rejects.toThrow(/not acked/)
     expect(timeoutMount.writes).toHaveLength(1)
     await expect(timeoutMount.readFile(timeoutMount.writes[0]?.path ?? '')).resolves.toBeTruthy()
+  })
+
+  it('refuses thread roots and replies outside the configured factory-e2e channel before writing', async () => {
+    const postMount = new FakeMountClient()
+    const postSlack = MountSlackWriteback(postMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    await expect(postSlack.postThread({
+      channel: 'C0PROD__product-alerts',
+      text: 'Wrong channel',
+    })).rejects.toThrow(/target channel must match configured factory-e2e channel/)
+    expect(postMount.writes).toEqual([])
+
+    const channelDirBypassMount = new FakeMountClient()
+    const channelDirBypassSlack = MountSlackWriteback(channelDirBypassMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0PROD__product-alerts',
+    })
+
+    await expect(channelDirBypassSlack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Wrong effective channel',
+    })).rejects.toThrow(/target channel must match configured factory-e2e channel/)
+    expect(channelDirBypassMount.writes).toEqual([])
+
+    const replyMount = new FakeMountClient()
+    const replySlack = MountSlackWriteback(replyMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0PROD__product-alerts',
+    })
+
+    await expect(replySlack.reply('1780751612.176219', 'Wrong channel reply'))
+      .rejects.toThrow(/target channel must match configured factory-e2e channel/)
+    expect(replyMount.writes).toEqual([])
+  })
+
+  it('allows thread roots and replies to the configured factory-e2e channel by name', async () => {
+    const mount = new FakeMountClient()
+    const slack = MountSlackWriteback(mount, {
+      channel: 'factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+      clientIdPrefix: 'factory-e2e',
+    })
+
+    const root = await slack.postThread({
+      channel: '#factory-e2e',
+      text: 'Factory update',
+    })
+    await slack.reply(root.threadId, 'Factory reply')
+
+    expect(mount.writes).toHaveLength(2)
+    expect(mount.writes[0]?.path).toContain('/slack/channels/C0FACTORY__factory-e2e/messages/')
+    expect(mount.writes[1]?.path).toContain(`/slack/channels/C0FACTORY__factory-e2e/messages/${root.threadId}/replies/`)
+  })
+
+  it('fails closed when the configured factory-e2e channel is unset', async () => {
+    const mount = new FakeMountClient()
+    const slack = MountSlackWriteback(mount, {
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    await expect(slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })).rejects.toThrow(/configured factory-e2e channel is required/)
+    await expect(slack.reply('1780751612.176219', 'Factory reply'))
+      .rejects.toThrow(/configured factory-e2e channel is required/)
+    expect(mount.writes).toEqual([])
   })
 })
 

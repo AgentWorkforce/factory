@@ -16,6 +16,45 @@ interface ThreadRef {
 
 const channelIdFromDir = (channelDir: string): string => channelDir.split('__')[0] ?? channelDir
 
+const channelSegment = (value: string): string => {
+  const trimmed = value.trim().replace(/^#/u, '')
+  const match = trimmed.match(/(?:^|\/)slack\/channels\/([^/]+)/u)
+  return match?.[1] ?? trimmed.split('/')[0] ?? trimmed
+}
+
+const channelAliases = (value?: string): Set<string> => {
+  const segment = typeof value === 'string' ? channelSegment(value) : ''
+  if (!segment) return new Set()
+
+  const aliases = new Set<string>()
+  const add = (candidate: string) => {
+    const normalized = candidate.trim().replace(/^#/u, '').toLowerCase()
+    if (normalized) aliases.add(normalized)
+  }
+
+  add(segment)
+  const [id, name] = segment.split('__')
+  if (id) add(id)
+  if (name) add(name)
+
+  return aliases
+}
+
+const assertSlackChannelAllowed = (
+  configuredChannel: string | undefined,
+  targetChannel: string | undefined,
+  context: string,
+): void => {
+  const configured = channelAliases(configuredChannel)
+  const target = channelAliases(targetChannel)
+  if (configured.size === 0) {
+    throw new Error(`Refusing Slack writeback for ${context}: configured factory-e2e channel is required`)
+  }
+  if (target.size === 0 || ![...target].some((alias) => configured.has(alias))) {
+    throw new Error(`Refusing Slack writeback for ${context}: target channel must match configured factory-e2e channel`)
+  }
+}
+
 const pathTs = (threadTs: string): string => threadTs.replace(/\./g, '_')
 
 const payloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
@@ -45,9 +84,8 @@ export const MountSlackWriteback = (
   return {
     async postThread(root: { channel: string; text: string }): Promise<{ threadId: string }> {
       const channelDir = slackCfg.channelDir ?? root.channel ?? slackCfg.channel
-      if (!channelDir) {
-        throw new Error('Slack channel is required for postThread')
-      }
+      assertSlackChannelAllowed(slackCfg.channel, root.channel, 'postThread')
+      assertSlackChannelAllowed(slackCfg.channel, channelDir, 'postThread path')
 
       const text = trimToLines(root.text, 3)
       const channelId = channelIdFromDir(channelDir)
@@ -63,6 +101,7 @@ export const MountSlackWriteback = (
 
     async reply(threadId: string, text: string): Promise<void> {
       const fallbackChannelDir = slackCfg.channelDir ?? slackCfg.channel
+      assertSlackChannelAllowed(slackCfg.channel, fallbackChannelDir, 'reply')
       const ref = threads.get(threadId) ?? (
         fallbackChannelDir
           ? { channelDir: fallbackChannelDir, channelId: channelIdFromDir(fallbackChannelDir), threadTs: payloadTs(threadId) }
@@ -71,6 +110,7 @@ export const MountSlackWriteback = (
       if (!ref) {
         throw new Error(`Unknown Slack thread ${threadId}; provide channelDir in slack config`)
       }
+      assertSlackChannelAllowed(slackCfg.channel, ref.channelDir, 'reply path')
 
       const body = trimToLines(text, 3)
       const clientId = replyClientId(prefix, threadId, body)
