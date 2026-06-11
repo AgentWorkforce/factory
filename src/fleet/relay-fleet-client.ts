@@ -1,4 +1,4 @@
-import type { FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
+import type { Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
 
 const notImplemented = () => new Error('RelayFleetClient not implemented — see relay#1056')
 
@@ -8,7 +8,7 @@ export class RelayFleetClient implements FleetClient {
     throw notImplemented()
   }
 
-  async resume(_input: { name?: string; sessionRef: string; node?: 'self' | string }): Promise<SpawnResult> {
+  async resume(_input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     throw notImplemented()
   }
 

@@ -195,10 +195,10 @@ describe('MountGithubRead', () => {
           title: 'Add direct-proxy writeback fast path',
           state: 'open',
           url: 'https://github.com/AgentWorkforce/cloud/pull/2086',
-          checks: [
-            { name: 'test', status: 'completed', conclusion: 'success' },
-          ],
-          mergeable: 'unknown',
+          headRef: { name: 'factory-sdk/w4' },
+          baseRef: { name: 'main' },
+          author: { login: 'factory-bot' },
+          filesChanged: [{ path: 'packages/factory-sdk/src/writeback/github.ts' }],
         },
       },
     })
@@ -210,11 +210,10 @@ describe('MountGithubRead', () => {
       title: 'Add direct-proxy writeback fast path',
       url: 'https://github.com/AgentWorkforce/cloud/pull/2086',
       state: 'open',
-      status: 'open',
-      checks: [
-        { name: 'test', status: 'completed', conclusion: 'success' },
-      ],
-      mergeable: 'unknown',
+      headRef: 'factory-sdk/w4',
+      baseRef: 'main',
+      author: 'factory-bot',
+      filesChanged: ['packages/factory-sdk/src/writeback/github.ts'],
     })
   })
 })

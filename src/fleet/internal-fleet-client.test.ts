@@ -144,6 +144,25 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('resumes with the per-agent capability when provided', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+
+    await fleet.resume({
+      name: 'ar-1-review',
+      sessionRef: 'review-session',
+      node: 'self',
+      capability: 'spawn:claude',
+    })
+
+    expect(harness.spawned[0]).toMatchObject({
+      name: 'ar-1-review',
+      cli: 'claude',
+      cwd: '/worktree',
+      continueFrom: 'review-session',
+    })
+  })
+
   it('rejects non-self placement for the internal single-node backend', async () => {
     const fleet = new InternalFleetClient({ client: new FakeHarnessDriverClient() })
 

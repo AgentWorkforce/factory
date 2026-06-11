@@ -90,12 +90,13 @@ export class InternalFleetClient implements FleetClient {
     return { name: handle.name, sessionRef: sessionRefFrom(handle) }
   }
 
-  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string }): Promise<SpawnResult> {
+  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     assertSelfNode(input.node)
 
     const handle = await this.#client.spawnPty({
       name: input.name ?? input.sessionRef,
-      cli: capabilityCli[this.#resumeCapability],
+      // followups [fleet→W6]: W6 owns resume-vs-respawn and passes the per-agent capability.
+      cli: capabilityCli[input.capability ?? this.#resumeCapability],
       cwd: this.#cwd,
       continueFrom: input.sessionRef,
     })

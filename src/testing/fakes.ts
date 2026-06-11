@@ -9,6 +9,7 @@ import type {
   SpawnResult,
   SubscribeOptions,
   Subscription,
+  Capability,
 } from '../ports'
 
 type ExitListener = (name: string, reason?: string) => void
@@ -17,6 +18,7 @@ type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: stri
 export class FakeMountClient implements MountClient {
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
+  subscribeCount = 0
 
   #subscribers = new Set<(event: ChangeEvent) => void>()
   #events: ChangeEvent[] = []
@@ -50,6 +52,7 @@ export class FakeMountClient implements MountClient {
   }
 
   subscribe(_globs: string[], onChange: (event: ChangeEvent) => void, _opts?: SubscribeOptions): Subscription {
+    this.subscribeCount += 1
     this.#subscribers.add(onChange)
 
     return {
@@ -107,7 +110,7 @@ export class FakeMountClient implements MountClient {
 
 export class FakeFleetClient implements FleetClient {
   readonly spawns: SpawnInput[] = []
-  readonly resumes: Array<{ name?: string; sessionRef: string; node?: 'self' | string }> = []
+  readonly resumes: Array<{ name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }> = []
   readonly releases: Array<{ name: string; reason?: string }> = []
   readonly messages: SendInput[] = []
 
@@ -122,7 +125,7 @@ export class FakeFleetClient implements FleetClient {
     return { name: input.name, sessionRef: this.#sessionRefs.get(input.name) ?? input.sessionRef }
   }
 
-  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string }): Promise<SpawnResult> {
+  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     this.resumes.push(input)
     const name = input.name ?? input.sessionRef
     this.#agents.add(name)

@@ -18,52 +18,46 @@ const repoDir = (repo: string): string => {
 const prPath = (repo: string, number: number): string =>
   `/github/repos/${repoDir(repo)}/pulls/by-id/${number}.json`
 
-const checksFromPayload = (payload: Record<string, unknown>): Array<{ name: string; status: string; conclusion?: string }> | undefined => {
-  const checks = payload.checks ?? payload.check_runs ?? payload.status_checks
-  if (!Array.isArray(checks)) {
-    return undefined
-  }
-
-  return checks.map((check, index) => {
-    const record = asRecord(check) ?? {}
-    const name = typeof record.name === 'string'
-      ? record.name
-      : typeof record.context === 'string'
-        ? record.context
-        : `check-${index + 1}`
-    const status = typeof record.status === 'string'
-      ? record.status
-      : typeof record.state === 'string'
-        ? record.state
-        : 'unknown'
-    const conclusion = typeof record.conclusion === 'string'
-      ? record.conclusion
-      : undefined
-
-    return { name, status, conclusion }
-  })
-}
-
 export const MountGithubRead = (mount: MountClient) => ({
   async getPr(repo: string, number: number): Promise<PrSummary> {
     const { content } = await mount.readFile(prPath(repo, number))
     const payload = wrappedPayload(content)
-    const state = typeof payload.state === 'string' ? payload.state : undefined
-    const mergeable = typeof payload.mergeable === 'boolean'
-      ? payload.mergeable
-      : payload.mergeable === 'unknown'
-        ? 'unknown'
-        : undefined
 
     return {
       repo,
-      number,
+      number: numberValue(payload.number) ?? number,
       title: typeof payload.title === 'string' ? payload.title : undefined,
       url: typeof payload.url === 'string' ? payload.url : undefined,
-      state,
-      status: state,
-      checks: checksFromPayload(payload),
-      mergeable,
+      state: typeof payload.state === 'string' ? payload.state : undefined,
+      headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref),
+      baseRef: refName(payload.baseRef) ?? refName(payload.base) ?? stringValue(payload.base_ref),
+      author: refName(payload.author) ?? stringValue(payload.user),
+      filesChanged: filesChanged(payload.files_changed ?? payload.filesChanged ?? payload.files),
     }
   },
 })
+
+const stringValue = (value: unknown): string | undefined =>
+  typeof value === 'string' ? value : undefined
+
+const numberValue = (value: unknown): number | undefined =>
+  typeof value === 'number' ? value : undefined
+
+const refName = (value: unknown): string | undefined => {
+  if (typeof value === 'string') {
+    return value
+  }
+  const record = asRecord(value)
+  return stringValue(record?.name) ?? stringValue(record?.ref) ?? stringValue(record?.login)
+}
+
+const filesChanged = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  const files = value
+    .map((entry) => typeof entry === 'string' ? entry : stringValue(asRecord(entry)?.path) ?? stringValue(asRecord(entry)?.filename))
+    .filter((entry): entry is string => Boolean(entry))
+  return files.length > 0 ? files : undefined
+}

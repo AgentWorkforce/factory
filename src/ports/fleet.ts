@@ -28,7 +28,7 @@ export type SendInput = { to: string; text: string; from?: string; data?: Record
 
 export interface FleetClient {
   spawn(input: SpawnInput): Promise<SpawnResult>
-  resume(input: { name?: string; sessionRef: string; node?: 'self' | string }): Promise<SpawnResult>
+  resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
   sendMessage(input: SendInput): Promise<void>

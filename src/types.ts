@@ -1,6 +1,7 @@
 import type { FactoryConfig } from './config/schema'
 import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { Clock, Logger } from './ports/system'
+import type { GithubMergeGate } from './github/merge-gate'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -9,6 +10,7 @@ export interface FactoryPorts {
   linear?: LinearWriteback
   slack?: SlackWriteback
   github?: GithubRead
+  mergeGate?: GithubMergeGate
   logger?: Logger
   clock?: Clock
 }
@@ -107,8 +109,10 @@ export interface PrSummary {
   number: number
   title?: string
   url?: string
+  /** Advisory only: mount snapshots can lag live GitHub state. Never use this for merge readiness. */
   state?: string
-  status?: string
-  checks?: Array<{ name: string; status: string; conclusion?: string }>
-  mergeable?: boolean | 'unknown'
+  headRef?: string
+  baseRef?: string
+  author?: string
+  filesChanged?: string[]
 }
