@@ -15,7 +15,6 @@ export type {
   SpawnInput,
   SpawnResult,
 } from './fleet'
-export { createFleet } from './fleet'
 export type {
   GithubRead,
   LinearWriteback,

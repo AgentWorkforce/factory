@@ -51,8 +51,28 @@ export {
   slackMessagePath,
   slackReplyPath,
 } from './constants/slack'
+export {
+  agentSpecWithRenderedTask,
+  mergePolicyLine,
+  renderAgentTask,
+} from './dispatch/templates'
+export type {
+  RenderAgentTaskInput,
+  TemplateIssue,
+  TemplateRoute,
+} from './dispatch/templates'
+export { createFleet } from './fleet/create-fleet'
+export type {
+  CreateFleetDeps,
+  CreateFleetOptions,
+  FleetBackend,
+} from './fleet/create-fleet'
+export { InternalFleetClient } from './fleet/internal-fleet-client'
+export type {
+  HarnessDriverClientLike,
+  InternalFleetClientOptions,
+} from './fleet/internal-fleet-client'
 export { RelayFleetClient } from './fleet/relay-fleet-client'
-export { createFleet } from './ports'
 export {
   HeuristicTriage,
   LlmTriage,

@@ -51,7 +51,3 @@ export type AgentSpec = {
   invocationId?: string
   restartPolicy?: RestartPolicy
 }
-
-export function createFleet(_opts?: { backend?: 'internal' | 'relay' }): FleetClient {
-  throw new Error('not implemented')
-}
