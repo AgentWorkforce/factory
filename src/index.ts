@@ -1,8 +1,42 @@
 import type { Factory, FactoryPorts } from './types'
 import type { FactoryConfig } from './config/schema'
+import { MountGithubRead, MountLinearWriteback, MountSlackWriteback } from './writeback'
 
-export function createFactory(_config: FactoryConfig, _ports: FactoryPorts): Factory {
-  throw new Error('not implemented')
+const notImplemented = (method: string) => new Error(`Factory.${method} not implemented`)
+
+export function createFactory(config: FactoryConfig, ports: FactoryPorts): Factory {
+  const resolvedPorts: FactoryPorts = {
+    ...ports,
+    linear: ports.linear ?? MountLinearWriteback(ports.mount, config.stateIds),
+    slack: ports.slack ?? MountSlackWriteback(ports.mount, config.slack),
+    github: ports.github ?? MountGithubRead(ports.mount),
+  }
+
+  void resolvedPorts
+
+  return {
+    async start(): Promise<void> {
+      throw notImplemented('start')
+    },
+    async stop(): Promise<void> {
+      throw notImplemented('stop')
+    },
+    async runOnce(): Promise<never> {
+      throw notImplemented('runOnce')
+    },
+    async triageIssue(): Promise<never> {
+      throw notImplemented('triageIssue')
+    },
+    async dispatch(): Promise<never> {
+      throw notImplemented('dispatch')
+    },
+    status() {
+      return { inFlight: [], queued: [], counters: {} }
+    },
+    on() {
+      return () => {}
+    },
+  }
 }
 
 export type { FactoryConfig } from './config/schema'
@@ -29,6 +63,17 @@ export type {
   HeuristicTriageOptions,
   LlmTriageOptions,
 } from './triage'
+export {
+  linearCommentName,
+  MountGithubRead,
+  MountLinearWriteback,
+  MountSlackWriteback,
+} from './writeback'
+export type {
+  LinearCommentPayload,
+  LinearStateIds,
+  MountSlackWritebackConfig,
+} from './writeback'
 export type {
   Capability,
   ChangeEvent,

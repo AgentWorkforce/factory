@@ -10,6 +10,10 @@
     "./testing": {
       "types": "./src/testing/index.ts",
       "default": "./src/testing/index.ts"
+    },
+    "./writeback": {
+      "types": "./src/writeback/index.ts",
+      "default": "./src/writeback/index.ts"
     }
   }
 }

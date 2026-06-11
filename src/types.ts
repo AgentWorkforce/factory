@@ -107,6 +107,7 @@ export interface PrSummary {
   number: number
   title?: string
   url?: string
+  state?: string
   status?: string
   checks?: Array<{ name: string; status: string; conclusion?: string }>
   mergeable?: boolean | 'unknown'
