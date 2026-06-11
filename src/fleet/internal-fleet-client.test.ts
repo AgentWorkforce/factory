@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
@@ -301,20 +301,80 @@ describe('InternalFleetClient', () => {
     expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'crashed' }])
   })
 
-  it('does not suppress distinct legacy agent exit callbacks for the same agent name', () => {
-    const harness = new FakeHarnessDriverClient()
-    const fleet = new InternalFleetClient({ client: harness })
-    const exits: Array<{ name: string; reason?: string }> = []
+  it('deduplicates distinct broker exit events for one agent death by name', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-11T00:00:00.000Z'))
 
-    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+    try {
+      const harness = new FakeHarnessDriverClient()
+      const fleet = new InternalFleetClient({ client: harness })
+      const exits: Array<{ name: string; reason?: string }> = []
 
-    harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-1' })
-    harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-1' })
-    harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-2' })
+      fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
 
-    expect(exits).toEqual([
-      { name: 'ar-1-impl', reason: 'exited' },
-      { name: 'ar-1-impl', reason: 'exited' },
-    ])
+      harness.emit({
+        kind: 'agent_exited',
+        name: 'ar-1-impl',
+        code: 1,
+        reason: 'pty_closed',
+        event_id: 'exit-event-1',
+      } as BrokerEvent)
+      harness.emit({
+        kind: 'agent_exited',
+        name: 'ar-1-impl',
+        code: 1,
+        reason: 'pty_closed',
+        event_id: 'exit-event-2',
+      } as BrokerEvent)
+      harness.emit({
+        kind: 'agent_exited',
+        name: 'ar-1-review',
+        code: 1,
+        reason: 'pty_closed',
+        event_id: 'exit-event-3',
+      } as BrokerEvent)
+
+      vi.advanceTimersByTime(5_000)
+      harness.emit({
+        kind: 'agent_exited',
+        name: 'ar-1-impl',
+        code: 1,
+        reason: 'pty_closed',
+        event_id: 'exit-event-4',
+      } as BrokerEvent)
+
+      expect(exits).toEqual([
+        { name: 'ar-1-impl', reason: 'pty_closed' },
+        { name: 'ar-1-review', reason: 'pty_closed' },
+        { name: 'ar-1-impl', reason: 'pty_closed' },
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses legacy same-name exit callbacks inside the death window only', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-11T00:00:00.000Z'))
+
+    try {
+      const harness = new FakeHarnessDriverClient()
+      const fleet = new InternalFleetClient({ client: harness })
+      const exits: Array<{ name: string; reason?: string }> = []
+
+      fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+
+      harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-1' })
+      harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-2' })
+      vi.advanceTimersByTime(5_000)
+      harness.emitAgentExited({ name: 'ar-1-impl', sessionId: 'session-3' })
+
+      expect(exits).toEqual([
+        { name: 'ar-1-impl', reason: 'exited' },
+        { name: 'ar-1-impl', reason: 'exited' },
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

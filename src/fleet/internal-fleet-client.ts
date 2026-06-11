@@ -49,6 +49,8 @@ const selfNode: RosterEntry['nodes'][number] = {
   live: true,
 }
 
+const AGENT_EXIT_DEDUP_WINDOW_MS = 5_000
+
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
   readonly #cwd?: string
@@ -63,7 +65,9 @@ export class InternalFleetClient implements FleetClient {
   readonly #injectedEventIdSet = new Set<string>()
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
+  readonly #recentAgentExits = new Map<string, number>()
   #suppressedDuplicateEvents = 0
+  #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
   #subscribed = false
 
@@ -277,8 +281,42 @@ export class InternalFleetClient implements FleetClient {
       return
     }
 
+    if (this.#rememberAgentExit(name)) {
+      return
+    }
+
     for (const listener of this.#agentExitListeners) {
       listener(name, reason)
+    }
+  }
+
+  #rememberAgentExit(name: string): boolean {
+    const now = Date.now()
+    const prior = this.#recentAgentExits.get(name)
+    if (prior !== undefined && now - prior < AGENT_EXIT_DEDUP_WINDOW_MS) {
+      this.#suppressedDuplicateAgentExits += 1
+      if (this.#suppressedDuplicateAgentExits <= 3 || this.#suppressedDuplicateAgentExits % 100 === 0) {
+        this.#logger?.debug?.('[factory-sdk] suppressed duplicate agent exit', {
+          count: this.#suppressedDuplicateAgentExits,
+          name,
+          windowMs: AGENT_EXIT_DEDUP_WINDOW_MS,
+        })
+      }
+      return true
+    }
+
+    this.#recentAgentExits.set(name, now)
+    if (this.#recentAgentExits.size > 500) {
+      this.#pruneRecentAgentExits(now)
+    }
+    return false
+  }
+
+  #pruneRecentAgentExits(now: number): void {
+    for (const [name, seenAt] of this.#recentAgentExits) {
+      if (now - seenAt >= AGENT_EXIT_DEDUP_WINDOW_MS) {
+        this.#recentAgentExits.delete(name)
+      }
     }
   }
 
