@@ -15,6 +15,7 @@ export interface HarnessDriverClientLike {
   release(name: string, reason?: string): Promise<{ name: string }>
   listAgents(): Promise<Array<Pick<ListAgent, 'name'>>>
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }>
+  connectEvents?(sinceSeq?: number): void
   onEvent?(listener: HarnessEventListener): () => void
   addListener?(event: 'agentExited', listener: (agent: DriverAgentLike) => void): () => void
   addListener?(event: 'deliveryUpdate', listener: (event: DriverDeliveryEventLike) => void): () => void
@@ -180,6 +181,7 @@ export class InternalFleetClient implements FleetClient {
         hasStableId: false,
       }),
     )
+    this.#client.connectEvents?.()
   }
 
   #handleBrokerEvent(event: BrokerEvent): void {

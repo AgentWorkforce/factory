@@ -11,6 +11,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   readonly eventListeners = new Set<(event: BrokerEvent) => void>()
   readonly deliveryListeners = new Set<(event: BrokerEvent) => void>()
   readonly exitListeners = new Set<(agent: { name: string; sessionId?: string }) => void>()
+  connectEventsCalls = 0
 
   agents: Array<{ name: string }> = []
   nextSessionRef = 'session-1'
@@ -33,6 +34,10 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
     this.sent.push(input)
     return { event_id: `event-${this.sent.length}`, targets: [input.to] }
+  }
+
+  connectEvents(): void {
+    this.connectEventsCalls += 1
   }
 
   onEvent(listener: (event: BrokerEvent) => void): () => void {
@@ -209,6 +214,31 @@ describe('InternalFleetClient', () => {
       { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } },
       { to: 'broker', text: 'done', from: undefined, data: undefined },
     ])
+  })
+
+  it('starts the harness broker event stream on the connect-backed subscription path', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'broker', text: 'done' }, { timeoutMs: 1000 })
+    await Promise.resolve()
+
+    expect(harness.connectEventsCalls).toBe(1)
+    fleet.onDeliveryFailed(() => {})
+    fleet.onAgentExit(() => {})
+    expect(harness.connectEventsCalls).toBe(1)
+
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'broker',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+    })
+
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-1',
+      targets: ['broker'],
+    })
   })
 
   it('rejects waitForInjected on correlated delivery failure', async () => {
