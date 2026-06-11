@@ -44,9 +44,12 @@ export type {
 export {
   GhCliGithubMergeGate,
   GithubMergeGate,
+  closeProbePr,
   evaluateGithubMergeGate,
 } from './github'
 export type {
+  CloseProbePrInput,
+  CloseProbePrResult,
   GhRunner,
   GhRunResult,
   GithubMergeGateInput,
@@ -78,6 +81,15 @@ export type {
   MountLinearWritebackConfig,
   MountSlackWritebackConfig,
 } from './writeback'
+export {
+  assertInFactoryScope,
+  factoryScopeSafety,
+  isInFactoryScope,
+} from './safety/factory-scope'
+export type {
+  FactoryScopeSafety,
+  NormalizedFactoryScopeSafety,
+} from './safety/factory-scope'
 export {
   canonicalMountPaths,
   createWorkspaceScopedEventClient,
@@ -147,6 +159,9 @@ export type {
   IssueRef,
   IterationReport,
   LinearIssue,
+  ProbeCloser,
+  ProbePrRef,
+  ProbePrResolver,
   PrSummary,
   RepoMapEntry,
   TriageContext,

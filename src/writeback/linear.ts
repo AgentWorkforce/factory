@@ -1,5 +1,6 @@
 import { linearCommentPath, linearIssuePath } from '../constants/linear'
 import type { MountClient } from '../ports'
+import { assertInFactoryScope, isInFactoryScope } from '../safety/factory-scope'
 import type { LinearIssue } from '../types'
 import { asRecord, safePathSegment, stableHash, wrappedPayload } from './shared'
 
@@ -66,59 +67,26 @@ const linearCommentPayload = (issue: LinearIssue, body: string): LinearCommentPa
   issueId: issue.uuid,
 })
 
-const safetyFromConfig = (
-  configOrStateIds?: LinearStateIds | MountLinearWritebackConfig,
-): { titlePrefix: string; teamKey: string } => {
+const safetyFromConfig = (configOrStateIds?: LinearStateIds | MountLinearWritebackConfig) => {
   const safety = asRecord(asRecord(configOrStateIds)?.safety)
   if (safety) {
     return {
-      titlePrefix: typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
+      requireTitlePrefix: typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
         ? safety.requireTitlePrefix
         : '[factory-e2e]',
-      teamKey: typeof safety.requireTeamKey === 'string' && safety.requireTeamKey
+      requireTeamKey: typeof safety.requireTeamKey === 'string' && safety.requireTeamKey
         ? safety.requireTeamKey
         : 'AR',
     }
   }
-  return { titlePrefix: '[factory-e2e]', teamKey: 'AR' }
-}
-
-const payloadTitle = (payload: Record<string, unknown>): string | null =>
-  typeof payload.title === 'string' && payload.title ? payload.title : null
-
-const titleHasFactoryMarker = (title: string, marker: string): boolean =>
-  title === marker || title.startsWith(`${marker} `)
-
-const payloadTeamKey = (payload: Record<string, unknown>): string | null => {
-  const team = asRecord(payload.team)
-  return typeof team?.key === 'string' && team.key ? team.key : null
-}
-
-const assertPayloadInFactoryScope = (
-  payload: Record<string, unknown>,
-  safety: { titlePrefix: string; teamKey: string },
-  context: string,
-): void => {
-  const title = payloadTitle(payload)
-  if (!title || !titleHasFactoryMarker(title, safety.titlePrefix)) {
-    throw new Error(`Refusing Linear writeback for ${context}: title must start with ${safety.titlePrefix} boundary`)
-  }
-
-  const team = asRecord(payload.team)
-  const teamKey = payloadTeamKey(payload)
-  if (team && teamKey !== safety.teamKey) {
-    throw new Error(`Refusing Linear writeback for ${context}: team key must be ${safety.teamKey}`)
-  }
+  return { requireTitlePrefix: '[factory-e2e]', requireTeamKey: 'AR' }
 }
 
 const payloadInFactoryScope = (
   payload: Record<string, unknown>,
-  safety: { titlePrefix: string; teamKey: string },
+  safety: ReturnType<typeof safetyFromConfig>,
 ): boolean => {
-  const title = payloadTitle(payload)
-  if (!title || !titleHasFactoryMarker(title, safety.titlePrefix)) return false
-  const team = asRecord(payload.team)
-  return !team || payloadTeamKey(payload) === safety.teamKey
+  return isInFactoryScope(scopeIssueFromPayload(payload, 'createIssue payload'), safety)
 }
 
 const readIssuePayloadForGuard = async (
@@ -164,14 +132,14 @@ export const MountLinearWriteback = (
   const safety = safetyFromConfig(configOrStateIds)
   const adapter = {
     async setState(issue: LinearIssue, stateId: string): Promise<void> {
-      assertPayloadInFactoryScope(await readIssuePayloadForGuard(mount, issue), safety, issue.key)
+      assertInFactoryScope(scopeIssueFromPayload(await readIssuePayloadForGuard(mount, issue), issue.key), safety)
       const path = issuePath(issue)
       await mount.writeFile(path, { stateId })
       await confirmWriteback(mount, path, () => adapter.verify(issue, { stateId }))
     },
 
     async postComment(issue: LinearIssue, body: string): Promise<void> {
-      assertPayloadInFactoryScope(await readIssuePayloadForGuard(mount, issue), safety, issue.key)
+      assertInFactoryScope(scopeIssueFromPayload(await readIssuePayloadForGuard(mount, issue), issue.key), safety)
       const name = linearCommentName(issue, body)
       const path = linearCommentPath(issuePath(issue), name)
       await mount.writeFile(path, linearCommentPayload(issue, body))
@@ -179,7 +147,7 @@ export const MountLinearWriteback = (
     },
 
     async createIssue(payload: LinearCreateIssuePayload): Promise<{ path: string }> {
-      assertPayloadInFactoryScope(payload, safety, 'createIssue payload')
+      assertInFactoryScope(scopeIssueFromPayload(payload, 'createIssue payload'), safety, 'createIssue payload')
       const path = createIssuePath(payload)
       await mount.writeFile(path, payload)
       await confirmWriteback(mount, path, async () => {
@@ -221,3 +189,10 @@ export const MountLinearWriteback = (
 
   return adapter
 }
+
+const scopeIssueFromPayload = (payload: Record<string, unknown>, key: string) => ({
+  key,
+  title: typeof payload.title === 'string' ? payload.title : '',
+  team: typeof asRecord(payload.team)?.key === 'string' ? asRecord(payload.team)?.key as string : undefined,
+  raw: { payload },
+})

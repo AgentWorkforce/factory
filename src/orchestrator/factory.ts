@@ -1,8 +1,9 @@
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath } from '../constants/linear'
-import { GithubMergeGate, type GithubMergeGate as GithubMergeGatePort } from '../github/merge-gate'
+import { GithubMergeGate, closeProbePr, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type { AgentSpec, FleetClient, LinearWriteback, MountClient, SlackWriteback, Subscription } from '../ports'
 import type { Clock, Logger } from '../ports/system'
+import { isInFactoryScope } from '../safety/factory-scope'
 import { HeuristicTriage, TieredTriage } from '../triage'
 import type {
   DispatchResult,
@@ -13,6 +14,8 @@ import type {
   IssueRef,
   IterationReport,
   LinearIssue,
+  ProbeCloser,
+  ProbePrResolver,
   TriageDecision,
   TriageEngine,
 } from '../types'
@@ -43,6 +46,8 @@ export class FactoryLoop implements Factory {
   readonly #linear: LinearWriteback
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
+  readonly #probeCloser: ProbeCloser
+  readonly #probePrResolver: ProbePrResolver
   readonly #logger: Logger
   readonly #clock: Clock
   readonly #batch: BatchTracker
@@ -69,6 +74,8 @@ export class FactoryLoop implements Factory {
     this.#slack = ports.slack ?? (config.slack ? MountSlackWriteback(ports.mount, config.slack) : undefined)
     void (ports.github ?? MountGithubRead(ports.mount))
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
+    this.#probeCloser = ports.probeCloser ?? closeProbePr
+    this.#probePrResolver = ports.probePrResolver ?? ((issue) => resolveProbePrFromMount(this.#mount, this.#config, issue))
     this.#logger = ports.logger ?? console
     this.#clock = ports.clock ?? realClock
     this.#batch = new BatchTracker(config.batchSize)
@@ -143,6 +150,11 @@ export class FactoryLoop implements Factory {
         continue
       }
 
+      if (!isInFactoryScope(issue, this.#config.safety)) {
+        skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+        continue
+      }
+
       const decision = await this.triageIssue(issue)
       triaged.push(decision)
       const result = await this.dispatch(decision, { dryRun })
@@ -165,6 +177,13 @@ export class FactoryLoop implements Factory {
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
+    const liveIssue = await this.#readIssue(decision.issue.path)
+    if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
+      const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
+      this.#error(error, decision.issue)
+      throw error
+    }
+
     if (decision.confidence === 'low') {
       const error = new Error(`Low-confidence triage for ${decision.issue.key}; escalation required`)
       this.#error(error, decision.issue)
@@ -268,6 +287,10 @@ export class FactoryLoop implements Factory {
     try {
       const issue = await this.#readIssue(path)
       if (issue?.stateId !== this.#config.stateIds.readyForAgent) {
+        return
+      }
+
+      if (!isInFactoryScope(issue, this.#config.safety)) {
         return
       }
 
@@ -489,6 +512,10 @@ export class FactoryLoop implements Factory {
       }
       void this.#mergeGate
 
+      if (issue) {
+        await this.#closeProbeIfRequired(issue)
+      }
+
       for (const agent of record.agents.keys()) {
         await this.#fleet.release(agent, 'issue-done')
       }
@@ -518,6 +545,27 @@ export class FactoryLoop implements Factory {
 
   #increment(name: string): void {
     this.#counters[name] = (this.#counters[name] ?? 0) + 1
+  }
+
+  async #closeProbeIfRequired(issue: LinearIssue): Promise<void> {
+    if (this.#config.mergePolicy !== 'never' || !this.#isSyntheticProbeIssue(issue)) {
+      return
+    }
+
+    const probe = await this.#probePrResolver(issue)
+    if (!probe) {
+      return
+    }
+
+    await this.#probeCloser({
+      repo: probe.repo,
+      prNumber: probe.prNumber,
+      expectedIssueKey: issue.key,
+    })
+  }
+
+  #isSyntheticProbeIssue(issue: LinearIssue): boolean {
+    return isInFactoryScope(issue, this.#config.safety)
   }
 }
 
@@ -576,6 +624,74 @@ const repoMapFromConfig = (config: FactoryConfig) => {
   }))
 }
 
+const resolveProbePrFromMount = async (
+  mount: MountClient,
+  config: FactoryConfig,
+  issue: LinearIssue,
+): Promise<{ repo: string; prNumber: number } | undefined> => {
+  const candidates: Array<{ repo: string; prNumber: number }> = []
+  for (const repo of reposFromConfig(config)) {
+    for (const path of await mount.listTree(githubPullRoot(repo))) {
+      if (!path.endsWith('.json')) continue
+      const pr = await readProbePrCandidate(mount, path)
+      if (!pr || !probePrMatchesIssue(pr, issue, config.safety.requireTitlePrefix)) continue
+      candidates.push({ repo, prNumber: pr.number })
+    }
+  }
+
+  return candidates.sort((a, b) => b.prNumber - a.prNumber)[0]
+}
+
+const reposFromConfig = (config: FactoryConfig): string[] => {
+  const repos = new Set([
+    ...Object.values(config.repos.byLabel),
+    ...Object.values(config.repos.byProject),
+    ...config.repos.keywordRules.map((rule) => rule.repo),
+    config.repos.default,
+  ].filter((repo): repo is string => Boolean(repo)))
+  return [...repos]
+}
+
+const githubPullRoot = (repo: string): string => {
+  const [owner, name] = repo.split('/')
+  return owner && name ? `/github/repos/${owner}__${name}/pulls/by-id/` : `/github/repos/${repo}/pulls/by-id/`
+}
+
+const readProbePrCandidate = async (
+  mount: MountClient,
+  path: string,
+): Promise<{ number: number; title: string; body: string; headRef: string } | undefined> => {
+  try {
+    const payload = wrappedPayload((await mount.readFile(path)).content)
+    const number = typeof payload.number === 'number'
+      ? payload.number
+      : Number(path.split('/').at(-1)?.replace(/\.json$/, ''))
+    if (!Number.isInteger(number) || number <= 0) return undefined
+    return {
+      number,
+      title: stringValue(payload.title) ?? '',
+      body: stringValue(payload.body) ?? '',
+      headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? '',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+const probePrMatchesIssue = (
+  pr: { title: string; body: string; headRef: string },
+  issue: LinearIssue,
+  marker: string,
+): boolean => {
+  const haystack = `${pr.title}\n${pr.body}\n${pr.headRef}`
+  return containsIssueKey(haystack, issue.key) && (pr.title === marker || pr.title.startsWith(`${marker} `))
+}
+
+const containsIssueKey = (value: string, issueKey: string): boolean => {
+  const escaped = issueKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|[^A-Za-z0-9-])${escaped}([^A-Za-z0-9-]|$)`, 'i').test(value)
+}
+
 const isIssueFilePath = (path: string): boolean =>
   path.startsWith(`${ISSUE_ROOT}/`) &&
   path.endsWith('.json') &&
@@ -594,6 +710,14 @@ const recordName = (value: unknown): string | undefined => {
   }
   const record = asRecord(value)
   return stringValue(record?.name) ?? stringValue(record?.key) ?? stringValue(record?.id)
+}
+
+const refName = (value: unknown): string | undefined => {
+  if (typeof value === 'string') {
+    return value
+  }
+  const record = asRecord(value)
+  return stringValue(record?.name) ?? stringValue(record?.ref)
 }
 
 const labelName = (value: unknown): string | undefined => {

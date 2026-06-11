@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import { FactoryConfigSchema, createFactory, parseLinearIssue, type FactoryConfig, type TriageDecision, type TriageEngine } from '../index'
-import type { ChangeEvent } from '../ports'
+import type { ChangeEvent, LinearWriteback, SlackWriteback } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { LinearIssue } from '../types'
+import type { CloseProbePrInput, LinearIssue } from '../index'
 import { BatchTracker } from './batch-tracker'
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
@@ -80,6 +80,15 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+class CountingTriage extends StaticTriage {
+  count = 0
+
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    this.count += 1
+    return super.triage(issue)
+  }
+}
+
 describe('FactoryLoop', () => {
   it('parses wrapped Linear issue records', () => {
     expect(parseLinearIssue(issuePath(1), issueFile(1))).toMatchObject({
@@ -149,6 +158,54 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-2', 'AR-3'])
     expect(factory.status().queued).toEqual([])
+  })
+
+  it('skips ready issues outside factory-e2e scope before triage or dispatch', async () => {
+    const unscopedPath = issuePath(21)
+    const mount = new FakeMountClient({
+      [unscopedPath]: {
+        ...issueFile(21),
+        payload: {
+          ...issuePayload(21),
+          title: 'Real ready AR issue without synthetic marker',
+          team: { key: 'AR', name: 'Agent Relay' },
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const triage = new CountingTriage()
+    const factory = createFactory(config(), { mount, fleet, triage })
+
+    const report = await factory.runOnce()
+
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: 'uuid-21', key: 'AR-21', path: unscopedPath },
+      reason: 'not factory-e2e scope',
+    })
+    expect(report.triaged).toEqual([])
+    expect(report.dispatched).toEqual([])
+    expect(triage.count).toBe(0)
+    expect(fleet.spawns).toEqual([])
+    expect(mount.writes).toEqual([])
+  })
+
+  it('refuses explicit dispatch for issues outside factory-e2e scope before spawning', async () => {
+    const unscopedIssue = {
+      ...issueFile(22),
+      payload: {
+        ...issuePayload(22),
+        title: 'Real targeted AR issue without synthetic marker',
+        team: { key: 'AR', name: 'Agent Relay' },
+      },
+    }
+    const mount = new FakeMountClient({ [issuePath(22)]: unscopedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(22), unscopedIssue))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(/not factory-e2e scope/)
+    expect(fleet.spawns).toEqual([])
+    expect(mount.writes).toEqual([])
   })
 
   it('start backfills ready issues and dispatches when capacity is available', async () => {
@@ -361,6 +418,139 @@ describe('FactoryLoop', () => {
     await expect(factory.dispatch(decision)).rejects.toThrow('Writeback not acked')
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-9' } })
+  })
+
+  it('closes a synthetic probe PR after done writebacks and before release when mergePolicy is never', async () => {
+    const order: string[] = []
+    const mount = new FakeMountClient({
+      [issuePath(18)]: issueFile(18),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/18.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '18',
+        payload: {
+          number: 18,
+          title: '[factory-e2e] AR-18 probe',
+          body: 'Synthetic probe for AR-18',
+          head_ref: 'factory-e2e/ar-18-probe',
+        },
+      },
+    })
+    class OrderedFleetClient extends FakeFleetClient {
+      override async release(name: string, reason?: string): Promise<void> {
+        order.push(`release:${name}`)
+        await super.release(name, reason)
+      }
+    }
+    const fleet = new OrderedFleetClient()
+    const linear: LinearWriteback = {
+      async setState() {
+        order.push('linear-done')
+      },
+      async postComment() {
+        order.push('linear-comment')
+      },
+      async createIssue() {
+        throw new Error('not used')
+      },
+      async verify() {
+        return true
+      },
+    }
+    const slack: SlackWriteback = {
+      async postThread() {
+        order.push('slack-root')
+        return { threadId: 'thread-1' }
+      },
+      async reply() {
+        order.push('slack-reply')
+      },
+    }
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey'>> = []
+    const factory = createFactory(config({ slack: { channel: 'C0FACTORY', style: 'threaded-summarized' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear,
+      slack,
+      probeCloser: async (input) => {
+        order.push('probe-close')
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(18), issueFile(18)))
+
+    await factory.dispatch(decision)
+    order.length = 0
+    fleet.emitAgentExit('ar-18-impl', 'issue-done')
+    await flush()
+
+    expect(closeInputs).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 18, expectedIssueKey: 'AR-18' }])
+    expect(order).toEqual([
+      'linear-done',
+      'slack-root',
+      'slack-reply',
+      'probe-close',
+      'release:ar-18-impl',
+      'release:ar-18-review',
+    ])
+  })
+
+  it('does not close probes for non-never merge policies', async () => {
+    const markedMount = new FakeMountClient({ [issuePath(19)]: issueFile(19) })
+    const markedFleet = new FakeFleetClient()
+    const markedCalls: unknown[] = []
+    const markedFactory = createFactory(config({ mergePolicy: 'on-green-with-review' }), {
+      mount: markedMount,
+      fleet: markedFleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 19 }),
+      probeCloser: async (input) => {
+        markedCalls.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+    await markedFactory.dispatch(await markedFactory.triageIssue(parseLinearIssue(issuePath(19), issueFile(19))))
+    markedFleet.emitAgentExit('ar-19-impl', 'issue-done')
+    await flush()
+    expect(markedCalls).toEqual([])
+  })
+
+  it('does not resolve a probe PR when the factory-e2e marker is only in body or branch', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(23)]: issueFile(23),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/23.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '23',
+        payload: {
+          number: 23,
+          title: 'AR-23 probe without title marker',
+          body: '[factory-e2e] Synthetic probe for AR-23',
+          head_ref: 'factory-e2e/ar-23-probe',
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: unknown[] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(23), issueFile(23)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-23-impl', 'issue-done')
+    await flush()
+
+    expect(closeInputs).toEqual([])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-23-impl', 'ar-23-review'])
   })
 })
 

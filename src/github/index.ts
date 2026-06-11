@@ -3,6 +3,9 @@ export {
   GithubMergeGate,
   evaluateGithubMergeGate,
 } from './merge-gate'
+export {
+  closeProbePr,
+} from './probe-closer'
 export type {
   GhRunner,
   GhRunResult,
@@ -10,3 +13,7 @@ export type {
   GithubMergeGateVerdict,
   GithubMergeGate as GithubMergeGatePort,
 } from './merge-gate'
+export type {
+  CloseProbePrInput,
+  CloseProbePrResult,
+} from './probe-closer'

@@ -2,6 +2,12 @@
   "name": "@pear/factory-sdk",
   "private": true,
   "type": "commonjs",
+  "bin": {
+    "fleet": "bin/fleet.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",
