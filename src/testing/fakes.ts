@@ -85,6 +85,13 @@ export class FakeMountClient implements MountClient {
     }
   }
 
+  async getEventHighWatermark(opts: { provider?: string } = {}): Promise<string | undefined> {
+    const events = opts.provider
+      ? this.#events.filter((event) => event.resource.provider === opts.provider)
+      : this.#events
+    return events.at(-1)?.id
+  }
+
   async confirmWrite(path: string, _opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     return this.#confirmations.get(path) ?? 'acked'
   }

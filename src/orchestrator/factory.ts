@@ -1,7 +1,7 @@
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { LINEAR_STATE_IDS, linearByStatePath } from '../constants/linear'
 import { GithubMergeGate, closeProbePr, type GithubMergeGate as GithubMergeGatePort } from '../github'
-import type { AgentSpec, FleetClient, LinearWriteback, MountClient, SlackWriteback, Subscription } from '../ports'
+import type { AgentSpec, ChangeEvent, FleetClient, LinearWriteback, MountClient, SlackWriteback, Subscription } from '../ports'
 import type { Clock, Logger } from '../ports/system'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { HeuristicTriage, TieredTriage } from '../triage'
@@ -11,6 +11,8 @@ import type {
   FactoryEventPayload,
   FactoryPorts,
   FactoryStatus,
+  FactoryStartOptions,
+  FactoryLiveSubscriptionOptions,
   IssueRef,
   IterationReport,
   LinearIssue,
@@ -28,6 +30,8 @@ type Listener = (payload: FactoryEventPayload) => void
 
 const ISSUE_ROOT = '/linear/issues'
 const READY_EVENTS_LIMIT = 100
+const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
+const LIVE_DEDUPE_LIMIT = 5_000
 const STATE_NAME_TO_ID: Record<string, string> = {
   'Ready for Agent': LINEAR_STATE_IDS.readyForAgent,
   'Agent Implementing': LINEAR_STATE_IDS.agentImplementing,
@@ -64,6 +68,13 @@ export class FactoryLoop implements Factory {
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #resumedExitKeys = new Set<string>()
   #subscription?: Subscription
+  #livePollTimer?: ReturnType<typeof setTimeout>
+  #livePollInFlight = false
+  #liveEventCursor?: string
+  #liveEventHighWatermark?: string
+  #liveConnectStartedAtMs = 0
+  #liveReplaySkewMarginMs = 0
+  readonly #seenLiveEvents = new Set<string>()
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
   #starting?: Promise<void>
@@ -90,7 +101,7 @@ export class FactoryLoop implements Factory {
     this.#wireFleetEvents()
   }
 
-  async start(): Promise<void> {
+  async start(opts: FactoryStartOptions = {}): Promise<void> {
     if (this.#started) {
       return
     }
@@ -99,7 +110,7 @@ export class FactoryLoop implements Factory {
       return this.#starting
     }
 
-    this.#starting = this.#start()
+    this.#starting = this.#start(opts)
     try {
       await this.#starting
     } finally {
@@ -107,7 +118,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #start(): Promise<void> {
+  async #start(opts: FactoryStartOptions): Promise<void> {
     const ready = await this.#mount.ensureSubRoot(ISSUE_ROOT, { timeoutMs: 90_000 })
     if (ready !== 'ready') {
       this.#error(new Error(`${ISSUE_ROOT} sub-root is not mounted`))
@@ -115,6 +126,17 @@ export class FactoryLoop implements Factory {
     }
 
     this.#wireFleetEvents()
+
+    if (opts.mode === 'live') {
+      this.#started = true
+      try {
+        await this.#startLiveSubscription(opts.liveSubscription)
+        return
+      } catch (error) {
+        this.#started = false
+        throw error
+      }
+    }
 
     await this.#backfillReadyIssues()
     this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`], (event) => {
@@ -125,12 +147,149 @@ export class FactoryLoop implements Factory {
 
   async stop(): Promise<void> {
     this.#started = false
+    if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
+    this.#livePollTimer = undefined
+    this.#livePollInFlight = false
     await this.#subscription?.unsubscribe()
     this.#subscription = undefined
     this.#offAgentExit?.()
     this.#offDeliveryFailed?.()
     this.#offAgentExit = undefined
     this.#offDeliveryFailed = undefined
+  }
+
+  async #startLiveSubscription(overrides: Partial<FactoryLiveSubscriptionOptions> = {}): Promise<void> {
+    const options = this.#liveOptions(overrides)
+    this.#liveConnectStartedAtMs = this.#clock.now()
+    this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
+    this.#liveEventHighWatermark = await this.#currentEventHighWatermark()
+    this.#seenLiveEvents.clear()
+    this.#logger.info?.('[factory] live subscription starting', {
+      transport: options.transport,
+      highWatermark: this.#liveEventHighWatermark,
+      replaySkewMarginMs: this.#liveReplaySkewMarginMs,
+    })
+
+    if (options.transport !== 'poll') {
+      this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB], (event) => {
+        void this.#handleLiveChange(event)
+      }, { from: 'now', coalesce: 'none' })
+    }
+
+    if (options.transport === 'poll') {
+      this.#liveEventCursor = await this.#currentEventCursor(options.eventLimit)
+      this.#scheduleLivePoll(0, options)
+    }
+  }
+
+  #liveOptions(overrides: Partial<FactoryLiveSubscriptionOptions>): FactoryLiveSubscriptionOptions {
+    return {
+      transport: overrides.transport ?? this.#config.liveSubscription.transport,
+      pollIntervalMs: overrides.pollIntervalMs ?? this.#config.liveSubscription.pollIntervalMs,
+      eventLimit: overrides.eventLimit ?? this.#config.liveSubscription.eventLimit,
+      replaySkewMarginMs: overrides.replaySkewMarginMs ?? this.#config.liveSubscription.replaySkewMarginMs,
+    }
+  }
+
+  async #currentEventCursor(limit: number): Promise<string | undefined> {
+    let cursor: string | undefined
+    for (;;) {
+      const page = await this.#mount.getEvents({ cursor, limit })
+      cursor = eventCursorAfterPage(cursor, page.events, page.nextCursor)
+      if (!page.nextCursor) return cursor
+    }
+  }
+
+  async #currentEventHighWatermark(): Promise<string | undefined> {
+    try {
+      return await this.#mount.getEventHighWatermark?.()
+    } catch (error) {
+      this.#increment('liveHighWatermarkUnavailable')
+      this.#logger.warn?.('[factory] live subscription high-watermark unavailable', error)
+      return undefined
+    }
+  }
+
+  #scheduleLivePoll(delayMs: number, options: FactoryLiveSubscriptionOptions): void {
+    if (this.#livePollTimer || !this.#started) return
+    this.#livePollTimer = setTimeout(() => {
+      this.#livePollTimer = undefined
+      void this.#pollLiveEvents(options).finally(() => {
+        if (this.#started) this.#scheduleLivePoll(options.pollIntervalMs, options)
+      })
+    }, delayMs)
+  }
+
+  async #pollLiveEvents(options: FactoryLiveSubscriptionOptions): Promise<void> {
+    if (this.#livePollInFlight) return
+    this.#livePollInFlight = true
+    try {
+      let cursor = this.#liveEventCursor
+      for (;;) {
+        const page = await this.#mount.getEvents({ cursor, limit: options.eventLimit })
+        for (const event of page.events) {
+          await this.#handleLiveChange(event)
+        }
+        const nextCursor = eventCursorAfterPage(cursor, page.events, page.nextCursor)
+        this.#liveEventCursor = nextCursor
+        if (!page.nextCursor || page.nextCursor === cursor) break
+        cursor = page.nextCursor
+      }
+    } catch (error) {
+      this.#logger.warn?.('[factory] live subscription poll failed', error)
+    } finally {
+      this.#livePollInFlight = false
+    }
+  }
+
+  async #handleLiveChange(event: ChangeEvent): Promise<void> {
+    const path = event.resource.path
+    if (!isIssueFilePath(path)) {
+      return
+    }
+
+    if (isBeforeLiveCutoff(event.occurredAt, this.#liveConnectStartedAtMs, this.#liveReplaySkewMarginMs)) {
+      this.#increment('liveReplayEventsSuppressed')
+      this.#increment('liveReplayEventsSuppressedByTime')
+      this.#logger.debug?.('[factory] suppressed stale live issue event', {
+        id: event.id,
+        path,
+        occurredAt: event.occurredAt,
+        connectStartedAt: new Date(this.#liveConnectStartedAtMs).toISOString(),
+        replaySkewMarginMs: this.#liveReplaySkewMarginMs,
+      })
+      return
+    }
+
+    if (isAtOrBeforeHighWatermark(event.id, this.#liveEventHighWatermark)) {
+      this.#increment('liveReplayEventsSuppressed')
+      this.#increment('liveReplayEventsSuppressedByWatermark')
+      this.#logger.debug?.('[factory] suppressed replayed live issue event', {
+        id: event.id,
+        highWatermark: this.#liveEventHighWatermark,
+        path,
+      })
+      return
+    }
+
+    const dedupeKey = liveEventDedupeKey(event)
+    if (dedupeKey) {
+      if (this.#seenLiveEvents.has(dedupeKey)) {
+        this.#increment('liveDuplicateEventsSuppressed')
+        this.#logger.debug?.('[factory] suppressed duplicate live issue event', {
+          id: event.id,
+          path,
+        })
+        return
+      }
+      rememberLiveEvent(this.#seenLiveEvents, dedupeKey)
+    } else {
+      this.#increment('liveEventsMissingIdentity')
+      this.#logger.warn?.('[factory] live issue event missing stable identity', { path })
+    }
+
+    this.#recordArrivalLatency(event)
+    await this.#handleChange(path, { requireRealIssue: true })
   }
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
@@ -307,7 +466,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #handleChange(path: string): Promise<void> {
+  async #handleChange(path: string, opts: { requireRealIssue?: boolean } = {}): Promise<void> {
     if (!isIssueFilePath(path)) {
       return
     }
@@ -315,6 +474,10 @@ export class FactoryLoop implements Factory {
     try {
       const issue = await this.#readIssue(path)
       if (issue?.stateId !== this.#config.stateIds.readyForAgent) {
+        return
+      }
+
+      if (opts.requireRealIssue && !isRealLinearIssue(issue)) {
         return
       }
 
@@ -507,6 +670,20 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  #recordArrivalLatency(event: ChangeEvent): void {
+    const occurredAt = Date.parse(event.occurredAt)
+    if (!Number.isFinite(occurredAt)) return
+    const latencyMs = Math.max(0, this.#clock.now() - occurredAt)
+    this.#counters.liveEvents = (this.#counters.liveEvents ?? 0) + 1
+    this.#counters.liveArrivalLatencyMsLast = latencyMs
+    this.#counters.liveArrivalLatencyMsMax = Math.max(this.#counters.liveArrivalLatencyMsMax ?? 0, latencyMs)
+    this.#logger.debug?.('[factory] live issue event latency recorded', {
+      eventId: event.id,
+      path: event.resource.path,
+      latencyMs,
+    })
+  }
+
   async #sendCriticalReviewerMessage(record: InFlightIssue): Promise<void> {
     if (!this.#fleet.waitForInjected) {
       return
@@ -633,9 +810,7 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   }
 }
 
-const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
-
-const isRealLinearIssue = (issue: LinearIssue): boolean => {
+export function isRealLinearIssue(issue: LinearIssue): boolean {
   const payload = wrappedPayload(issue.raw)
   const identifier = stringValue(payload.identifier) ?? issue.key
   return identifier === issue.key &&
@@ -643,6 +818,8 @@ const isRealLinearIssue = (issue: LinearIssue): boolean => {
     typeof payload.url === 'string' &&
     payload.url.length > 0
 }
+
+const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
 
 const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
@@ -801,6 +978,69 @@ const scopeIssueFromDraftContent = (content: unknown) => ({
     : undefined,
   raw: asRecord(content) ?? {},
 })
+
+const eventCursorAfterPage = (
+  cursor: string | undefined,
+  events: ChangeEvent[],
+  nextCursor?: string | null,
+): string | undefined => {
+  if (nextCursor) return nextCursor
+  if (events.length === 0) return cursor
+  const numericCursor = cursor === undefined ? 0 : Number(cursor)
+  if (Number.isInteger(numericCursor) && numericCursor >= 0) {
+    return String(numericCursor + events.length)
+  }
+  return events.at(-1)?.id ?? cursor
+}
+
+const liveEventDedupeKey = (event: ChangeEvent): string | undefined => {
+  if (!event.id) return undefined
+  const resource = asRecord(event.resource) ?? {}
+  return [
+    event.id,
+    event.type,
+    event.resource.path,
+    stringValue(resource.revision) ?? '',
+    event.digest ?? '',
+  ].join('\u001f')
+}
+
+const isBeforeLiveCutoff = (
+  occurredAt: string,
+  connectStartedAtMs: number,
+  skewMarginMs: number,
+): boolean => {
+  const occurredAtMs = Date.parse(occurredAt)
+  if (!Number.isFinite(occurredAtMs)) return false
+  return occurredAtMs < connectStartedAtMs - skewMarginMs
+}
+
+const isAtOrBeforeHighWatermark = (eventId: string | undefined, highWatermark: string | undefined): boolean => {
+  if (!eventId || !highWatermark) return false
+  if (eventId === highWatermark) return true
+  const eventSequence = eventSequenceNumber(eventId)
+  const watermarkSequence = eventSequenceNumber(highWatermark)
+  if (eventSequence !== undefined && watermarkSequence !== undefined) {
+    return eventSequence <= watermarkSequence
+  }
+  return false
+}
+
+const eventSequenceNumber = (eventId: string): number | undefined => {
+  const whole = Number(eventId)
+  if (Number.isFinite(whole)) return whole
+  const trailing = eventId.match(/(\d+)$/u)?.[1]
+  if (!trailing) return undefined
+  const parsed = Number(trailing)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const rememberLiveEvent = (seen: Set<string>, key: string): void => {
+  seen.add(key)
+  if (seen.size <= LIVE_DEDUPE_LIMIT) return
+  const oldest = seen.values().next().value
+  if (oldest) seen.delete(oldest)
+}
 
 const recordName = (value: unknown): string | undefined => {
   if (typeof value === 'string') {

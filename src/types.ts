@@ -19,7 +19,7 @@ export interface FactoryPorts {
 }
 
 export interface Factory {
-  start(): Promise<void>
+  start(opts?: FactoryStartOptions): Promise<void>
   stop(): Promise<void>
   runOnce(opts?: { dryRun?: boolean }): Promise<IterationReport>
   triageIssue(issue: LinearIssue): Promise<TriageDecision>
@@ -29,6 +29,18 @@ export interface Factory {
     event: 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error',
     listener: (payload: FactoryEventPayload) => void,
   ): () => void
+}
+
+export interface FactoryStartOptions {
+  mode?: 'backfill-and-subscribe' | 'live'
+  liveSubscription?: Partial<FactoryLiveSubscriptionOptions>
+}
+
+export interface FactoryLiveSubscriptionOptions {
+  transport: 'subscribe-and-poll' | 'subscribe' | 'poll'
+  pollIntervalMs: number
+  eventLimit: number
+  replaySkewMarginMs: number
 }
 
 export interface LinearIssue {

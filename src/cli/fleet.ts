@@ -193,7 +193,7 @@ async function runFactoryCommand(
       return 0
     }
 
-    await factory.start()
+    await factory.start({ mode: 'live' })
     writeJson(out, factory.status())
     await waitForShutdown(factory)
     return 0

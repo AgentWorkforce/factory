@@ -13,14 +13,13 @@ import {
   type RelayfileCloudTokenSet,
   type ResourceAtEventResult,
   type OperationStatusResponse,
-  type SubscribeOptions,
   type Subscription,
   type TreeResponse,
   type WriteFileInput,
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
 
-import type { EventPage, MountClient } from '../ports'
+import type { EventPage, MountClient, SubscribeOptions } from '../ports'
 import {
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
@@ -53,6 +52,7 @@ export type RelayFileClientLike =
     deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
     listTree(workspaceId: string, options?: ListTreeOptions): Promise<TreeResponse>
     getEvents(workspaceId: string, options?: GetEventsOptions): Promise<EventFeedResponse>
+    listLastNChanges?(limit: number, context?: { workspaceId: string; token?: string }): Promise<{ events: ChangeEvent[] }>
     getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
     getOp?(workspaceId: string, opId: string): Promise<OperationStatusResponse>
     getToken?(): Promise<string> | string
@@ -230,6 +230,15 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
+  async getEventHighWatermark(opts: { provider?: string } = {}): Promise<string | undefined> {
+    if (!this.#client.listLastNChanges) return undefined
+    const response = await this.#client.listLastNChanges(10, { workspaceId: this.workspaceId })
+    const events = opts.provider
+      ? response.events.filter((event) => event.resource.provider === opts.provider)
+      : response.events
+    return maxEventId(events.map((event) => event.id))
+  }
+
   async confirmWrite(
     path: string,
     opts: { timeoutMs?: number } = {},
@@ -347,3 +356,31 @@ const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const maxEventId = (ids: string[]): string | undefined => {
+  let max: string | undefined
+  for (const id of ids) {
+    if (!max || compareEventIds(id, max) > 0) {
+      max = id
+    }
+  }
+  return max
+}
+
+const compareEventIds = (left: string, right: string): number => {
+  const leftSequence = eventSequenceNumber(left)
+  const rightSequence = eventSequenceNumber(right)
+  if (leftSequence !== undefined && rightSequence !== undefined) {
+    return leftSequence - rightSequence
+  }
+  return left.localeCompare(right)
+}
+
+const eventSequenceNumber = (eventId: string): number | undefined => {
+  const whole = Number(eventId)
+  if (Number.isFinite(whole)) return whole
+  const trailing = eventId.match(/(\d+)$/u)?.[1]
+  if (!trailing) return undefined
+  const parsed = Number(trailing)
+  return Number.isFinite(parsed) ? parsed : undefined
+}

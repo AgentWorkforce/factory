@@ -10,6 +10,12 @@ export const FactoryConfigSchema = z.object({
     labels: z.array(z.string()).default([]),
     assignees: z.array(z.string()).default([]),
   }).default({}),
+  liveSubscription: z.object({
+    transport: z.enum(['subscribe-and-poll', 'subscribe', 'poll']).default('subscribe-and-poll'),
+    pollIntervalMs: z.number().int().min(50).default(5_000),
+    eventLimit: z.number().int().min(1).max(1_000).default(1_000),
+    replaySkewMarginMs: z.number().int().min(0).default(60_000),
+  }).default({}),
   repos: z.object({
     byLabel: z.record(z.string(), z.string()),
     byProject: z.record(z.string(), z.string()).default({}),

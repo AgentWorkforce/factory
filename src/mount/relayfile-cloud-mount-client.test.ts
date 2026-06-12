@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { OperationStatusResponse } from '@relayfile/sdk'
+import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
 
 import { RelayfileCloudMountClient, type RelayFileClientLike } from './relayfile-cloud-mount-client'
 
@@ -91,6 +91,25 @@ class FakeRelayFileClient implements RelayFileClientLike {
     return { events: this.events, nextCursor: null }
   }
 
+  async listLastNChanges(_limit: number, _context?: { workspaceId: string }): Promise<{ events: ChangeEvent[] }> {
+    return {
+      events: this.events.map((event) => ({
+        id: event.eventId,
+        workspace: 'rw_test',
+        type: 'relayfile.changed' as const,
+        occurredAt: event.timestamp,
+        resource: {
+          path: event.path,
+          kind: 'file',
+          id: event.path,
+          provider: 'linear',
+        },
+        summary: {},
+        expand: async () => ({ level: 'summary' as const, path: event.path, summary: {} }),
+      }) as unknown as ChangeEvent),
+    }
+  }
+
   async getResourceAtEvent(eventId: string, context?: { workspaceId: string }) {
     return { path: `/events/${eventId}.json`, data: context, digest: eventId }
   }
@@ -143,6 +162,21 @@ describe('RelayfileCloudMountClient', () => {
       options: { path: '/linear/issues', cursor: undefined },
     })
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
+  })
+
+  it('selects the numeric event high-watermark instead of lexicographic max', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.events = ['7', '8', '9', '10', '11'].map((eventId) => ({
+      eventId,
+      type: 'file.updated' as const,
+      path: `/linear/issues/AR-${eventId}.json`,
+      revision: eventId,
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }))
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.getEventHighWatermark()).resolves.toBe('11')
+    expect(fake.getEventsCalls).toEqual([])
   })
 
   it('writes through the RelayFileClient with workspace id and live baseRevision', async () => {

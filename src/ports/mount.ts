@@ -1,12 +1,18 @@
 import type {
   ChangeEvent as RelayFileChangeEvent,
-  SubscribeOptions as RelayFileSubscribeOptions,
   Subscription as RelayFileSubscription,
 } from '@relayfile/sdk'
 
 export type ChangeEvent = RelayFileChangeEvent
-export type SubscribeOptions = RelayFileSubscribeOptions
 export type Subscription = RelayFileSubscription
+export type SubscribeOptions = {
+  coalesce?: 'none' | 'fire-once'
+  coalesceMs?: number
+  pathScope?: string[]
+  from?: 'now' | 'legacy'
+  onCoalesced?: () => void
+  onQueueDepth?: (depth: number) => void
+}
 
 export interface EventPage {
   events: ChangeEvent[]
@@ -23,6 +29,7 @@ export interface MountClient {
   listTree(prefix: string): Promise<string[]>
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription
   getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage>
+  getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
   ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'>
 }
