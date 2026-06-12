@@ -1,5 +1,6 @@
 import { linearCommentPath, linearIssuePath } from '../constants/linear'
 import type { MountClient } from '../ports'
+import type { Logger } from '../ports/system'
 import { assertInFactoryScope, isInFactoryScope } from '../safety/factory-scope'
 import type { LinearIssue } from '../types'
 import { asRecord, safePathSegment, stableHash, wrappedPayload } from './shared'
@@ -19,6 +20,7 @@ export interface MountLinearWritebackConfig {
     requireTitlePrefix?: string
     requireTeamKey?: string
   }
+  logger?: Pick<Logger, 'warn'>
 }
 
 export interface LinearCreateIssuePayload extends Record<string, unknown> {
@@ -96,10 +98,15 @@ const confirmWriteback = async (
   mount: MountClient,
   path: string,
   verify: () => Promise<boolean>,
+  logger: Pick<Logger, 'warn'>,
 ): Promise<void> => {
   await assertWritebackAcked(mount, path)
-  if (!await verify()) {
-    throw new Error(`Writeback read-back verification failed for ${path}`)
+  try {
+    if (!await verify()) {
+      logger.warn?.(`[factory-sdk] Linear writeback read-back verification failed for ${path}; treating getOp ack as success`)
+    }
+  } catch (error) {
+    logger.warn?.(`[factory-sdk] Linear writeback read-back verification errored for ${path}; treating getOp ack as success`, error)
   }
 }
 
@@ -118,6 +125,7 @@ export const MountLinearWriteback = (
   configOrStateIds?: LinearStateIds | MountLinearWritebackConfig,
 ) => {
   const safety = safetyFromConfig(configOrStateIds)
+  const logger = (asRecord(configOrStateIds)?.logger as Pick<Logger, 'warn'> | undefined) ?? console
   const canonicalByPath = new Map<string, CachedIssuePayload>()
 
   const seedCanonical = (
@@ -193,7 +201,7 @@ export const MountLinearWriteback = (
         stateId,
       }, { guarded: true })
       updateCanonicalState(path, issue, canonical, stateId)
-      await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId))
+      await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger)
     },
 
     async postComment(issue: LinearIssue, body: string): Promise<void> {
@@ -202,7 +210,7 @@ export const MountLinearWriteback = (
       const name = linearCommentName(issue, body)
       const path = linearCommentPath(issuePath(issue), name)
       await mount.writeFile(path, linearCommentPayload(issue, body), { guarded: true })
-      await confirmWriteback(mount, path, () => verifyCommentReadback(mount, issue, name))
+      await confirmWriteback(mount, path, () => verifyCommentReadback(mount, issue, name), logger)
     },
 
     async createIssue(payload: LinearCreateIssuePayload): Promise<{ path: string }> {
@@ -217,7 +225,7 @@ export const MountLinearWriteback = (
         } catch {
           return false
         }
-      })
+      }, logger)
       return { path }
     },
 
