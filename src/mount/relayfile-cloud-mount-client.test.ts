@@ -12,6 +12,11 @@ class FakeRelayFileClient implements RelayFileClientLike {
     content: string
     contentType?: string
   }> = []
+  readonly deleteFileCalls: Array<{
+    workspaceId: string
+    path: string
+    baseRevision: string
+  }> = []
   readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
@@ -55,6 +60,20 @@ class FakeRelayFileClient implements RelayFileClientLike {
       opId: `op-${this.writeFileCalls.length}`,
       status: 'queued' as const,
       targetRevision: 'next',
+    }
+  }
+
+  async deleteFile(input: {
+    workspaceId: string
+    path: string
+    baseRevision: string
+  }) {
+    this.deleteFileCalls.push(input)
+    this.files.delete(input.path)
+    return {
+      opId: `delete-op-${this.deleteFileCalls.length}`,
+      status: 'queued' as const,
+      targetRevision: 'deleted',
     }
   }
 
@@ -166,6 +185,7 @@ describe('RelayfileCloudMountClient', () => {
     const clientWithoutGetOp: RelayFileClientLike = {
       readFile: fake.readFile.bind(fake),
       writeFile: fake.writeFile.bind(fake),
+      deleteFile: fake.deleteFile.bind(fake),
       listTree: fake.listTree.bind(fake),
       getEvents: fake.getEvents.bind(fake),
       getResourceAtEvent: fake.getResourceAtEvent.bind(fake),
@@ -226,6 +246,260 @@ describe('RelayfileCloudMountClient', () => {
       guarded: true,
     }])
     expect(fake.writeFileCalls).toHaveLength(1)
+  })
+
+  it('deletes non-provider paths without requiring a delete predicate', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/tmp/draft.json', {
+      revision: '3',
+      content: '{"draft":true}',
+      contentType: 'application/json',
+    })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await mount.deleteFile('/tmp/draft.json')
+
+    expect(fake.deleteFileCalls).toEqual([{
+      workspaceId: 'rw_test',
+      path: '/tmp/draft.json',
+      baseRevision: '3',
+    }])
+    await expect(mount.confirmWrite('/tmp/draft.json', { timeoutMs: 5 })).resolves.toBe('acked')
+  })
+
+  it('refuses untracked provider deletes before calling client.deleteFile', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-E2ECANARY.json', {
+      revision: '7',
+      content: JSON.stringify({
+        provider: 'linear',
+        objectType: 'issue',
+        payload: {
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] untracked orphan-shaped draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.deleteFile('/linear/issues/AR-E2ECANARY.json'))
+      .rejects.toThrow(/create operation is unknown/)
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('refuses url-bearing provider deletes even when the tracked op failed', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-133__uuid-133.json', {
+      revision: '8',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-133',
+          url: 'https://linear.app/agent-relay/issue/AR-133/real',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-133__uuid-133.json', {
+      payload: {
+        identifier: 'AR-133',
+        url: 'https://linear.app/agent-relay/issue/AR-133/real',
+      },
+    })
+
+    await expect(mount.deleteFile('/linear/issues/AR-133__uuid-133.json'))
+      .rejects.toThrow(/reconciled or linked/)
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('refuses real-key provider deletes even when the tracked op failed', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-133__uuid-133.json', {
+      revision: '8',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-133',
+          title: '[factory-e2e] real-key draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-133__uuid-133.json', {
+      payload: {
+        identifier: 'AR-133',
+        title: '[factory-e2e] real-key draft',
+      },
+    })
+
+    await expect(mount.deleteFile('/linear/issues/AR-133__uuid-133.json'))
+      .rejects.toThrow(/reconciled or linked/)
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('refuses deletes for tracked provider writes that succeeded with an externalId', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-E2ECANARY.json', {
+      revision: '2',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] linked source draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: {
+        status: 200,
+        externalId: 'dac27fce-linked-real-issue',
+      },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-E2ECANARY.json', {
+      payload: {
+        identifier: 'AR-E2ECANARY',
+        title: '[factory-e2e] linked source draft',
+      },
+    })
+
+    await expect(mount.deleteFile('/linear/issues/AR-E2ECANARY.json'))
+      .rejects.toThrow(/linked provider object/)
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('refuses deletes while the tracked provider write is still pending', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-E2ECANARY.json', {
+      revision: '2',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] pending draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'pending',
+      attemptCount: 1,
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-E2ECANARY.json', {
+      payload: {
+        identifier: 'AR-E2ECANARY',
+        title: '[factory-e2e] pending draft',
+      },
+    })
+
+    await expect(mount.deleteFile('/linear/issues/AR-E2ECANARY.json'))
+      .rejects.toThrow(/status is pending/)
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('allows provider deletes only for this client’s failed unlinked orphan drafts', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-E2ECANARY.json', {
+      revision: '2',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] orphan draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'Field "id" is read-only and cannot be written',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+      isAllowedDelete: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-E2ECANARY.json', {
+      payload: {
+        identifier: 'AR-E2ECANARY',
+        title: '[factory-e2e] orphan draft',
+      },
+    })
+
+    await mount.deleteFile('/linear/issues/AR-E2ECANARY.json')
+
+    expect(fake.deleteFileCalls).toEqual([{
+      workspaceId: 'rw_test',
+      path: '/linear/issues/AR-E2ECANARY.json',
+      baseRevision: '3',
+    }])
+  })
+
+  it('refuses failed unlinked orphan deletes when the injected delete predicate is unset', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.files.set('/linear/issues/AR-E2ECANARY.json', {
+      revision: '2',
+      content: JSON.stringify({
+        payload: {
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] orphan draft',
+        },
+      }),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    await mount.writeFile('/linear/issues/AR-E2ECANARY.json', {
+      payload: {
+        identifier: 'AR-E2ECANARY',
+        title: '[factory-e2e] orphan draft',
+      },
+    })
+
+    await expect(mount.deleteFile('/linear/issues/AR-E2ECANARY.json'))
+      .rejects.toThrow(/delete predicate rejected or is unset/)
+    expect(fake.deleteFileCalls).toEqual([])
   })
 
   it('does not confirm a succeeded draft op without providerResult 200 and externalId', async () => {

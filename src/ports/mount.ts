@@ -16,6 +16,7 @@ export interface EventPage {
 export interface MountClient {
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
+  deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
   ): void

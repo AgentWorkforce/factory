@@ -18,6 +18,7 @@ type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: stri
 export class FakeMountClient implements MountClient {
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
+  readonly deletes: string[] = []
   subscribeCount = 0
 
   #subscribers = new Set<(event: ChangeEvent) => void>()
@@ -47,6 +48,14 @@ export class FakeMountClient implements MountClient {
     const storedContent = mergedLinearIssueContent(existing, content) ?? content
     this.files.set(path, { content: storedContent, revision })
     this.writes.push({ path, content })
+  }
+
+  async deleteFile(path: string): Promise<void> {
+    if (!this.files.has(path)) {
+      throw new Error(`File not found: ${path}`)
+    }
+    this.files.delete(path)
+    this.deletes.push(path)
   }
 
   async listTree(prefix: string): Promise<string[]> {

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   RelayfileSetup,
   type ChangeEvent,
+  type DeleteFileInput,
   type EventFeedResponse,
   type FileReadResponse,
   type GetEventsOptions,
@@ -42,12 +43,14 @@ export interface RelayfileCloudMountClientConfig {
   baseUrl?: string
   eventClient?: RelayfileEventClient
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
+  isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
 
 export type RelayFileClientLike =
   {
     readFile(workspaceId: string, path: string): Promise<FileReadResponse>
     writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
+    deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
     listTree(workspaceId: string, options?: ListTreeOptions): Promise<TreeResponse>
     getEvents(workspaceId: string, options?: GetEventsOptions): Promise<EventFeedResponse>
     getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
@@ -64,6 +67,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #baseUrl?: string
   readonly #eventClient?: RelayfileEventClient
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
+  readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
 
   constructor(config: RelayfileCloudMountClientConfig = {}) {
@@ -77,6 +81,7 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
     this.#isAllowedDraft = config.isAllowedDraft
+    this.#isAllowedDelete = config.isAllowedDelete
   }
 
   setDefaultAllowedDraftPredicate(
@@ -144,6 +149,51 @@ export class RelayfileCloudMountClient implements MountClient {
     } catch (error) {
       if (!isHttpStatus(error, 409)) throw error
       this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+    }
+  }
+
+  async deleteFile(path: string): Promise<void> {
+    const current = await this.#client.readFile(this.workspaceId, path)
+    const currentContent = parseRemoteContent(current)
+    if (isProviderPath(path)) {
+      await this.#assertProviderDeleteAllowed(path, currentContent)
+    }
+
+    this.#lastOpByPath.set(path, (await this.#client.deleteFile({
+      workspaceId: this.workspaceId,
+      path,
+      baseRevision: current.revision,
+    })).opId)
+  }
+
+  async #assertProviderDeleteAllowed(path: string, currentContent: unknown): Promise<void> {
+    if (providerContentLooksLinked(currentContent)) {
+      throw new Error(`Refusing provider delete for ${path}: current record is reconciled or linked`)
+    }
+
+    const opId = this.#lastOpByPath.get(path)
+    if (!opId || !this.#client.getOp) {
+      throw new Error(`Refusing provider delete for ${path}: create operation is unknown`)
+    }
+
+    let op: OperationStatusResponse
+    try {
+      op = await this.#client.getOp(this.workspaceId, opId)
+    } catch (error) {
+      throw new Error(`Refusing provider delete for ${path}: unable to verify create operation: ${errorMessage(error)}`)
+    }
+
+    const providerResult = op.providerResult
+    if (typeof providerResult?.externalId === 'string' && providerResult.externalId.length > 0) {
+      throw new Error(`Refusing provider delete for ${path}: create operation linked provider object ${providerResult.externalId}`)
+    }
+
+    if (op.status !== 'failed' && op.status !== 'dead_lettered' && op.status !== 'canceled') {
+      throw new Error(`Refusing provider delete for ${path}: create operation status is ${op.status}`)
+    }
+
+    if (await this.#isAllowedDelete?.(path, currentContent) !== true) {
+      throw new Error(`Refusing provider delete for ${path}: delete predicate rejected or is unset`)
     }
   }
 
@@ -276,5 +326,24 @@ const isProviderWritebackPath = (path: string): boolean =>
   path.startsWith('/linear/issues/') ||
   path.startsWith('/linear/comments/') ||
   /^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)
+
+const isProviderPath = (path: string): boolean =>
+  path.startsWith('/linear/') || path.startsWith('/slack/')
+
+const providerContentLooksLinked = (content: unknown): boolean => {
+  const record = content !== null && typeof content === 'object' && !Array.isArray(content)
+    ? content as Record<string, unknown>
+    : {}
+  const payload = record.payload !== null && typeof record.payload === 'object' && !Array.isArray(record.payload)
+    ? record.payload as Record<string, unknown>
+    : record
+  const url = payload.url
+  if (typeof url === 'string' && url.trim().length > 0) return true
+  const identifier = payload.identifier
+  return typeof identifier === 'string' && /^[A-Z][A-Z0-9]*-\d+$/u.test(identifier)
+}
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error)
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
