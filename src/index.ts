@@ -56,7 +56,17 @@ export type {
   GithubMergeGatePort,
   GithubMergeGateVerdict,
 } from './github'
-export { BatchTracker, createFactory, FactoryLoop, issueKey, isRealLinearIssue, parseLinearIssue } from './orchestrator'
+export {
+  BatchTracker,
+  DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
+  checkFactoryLoopLiveness,
+  createFactory,
+  FactoryLoop,
+  issueKey,
+  isRealLinearIssue,
+  parseLinearIssue,
+  readFactoryLoopHeartbeat,
+} from './orchestrator'
 export type { InFlightIssue, QueuedIssue, TrackedAgent } from './orchestrator'
 export {
   HeuristicTriage,
@@ -154,6 +164,9 @@ export type {
   DispatchResult,
   Factory,
   FactoryEventPayload,
+  FactoryLoopHeartbeat,
+  FactoryLoopLiveness,
+  FactoryLoopRunOptions,
   FactoryLiveSubscriptionOptions,
   FactoryPorts,
   FactoryStartOptions,

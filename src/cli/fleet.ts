@@ -5,11 +5,13 @@ import { dirname, join, resolve } from 'node:path'
 import {
   FactoryConfigSchema,
   RelayfileCloudMountClient,
+  checkFactoryLoopLiveness,
   closeProbePr,
   createFactory,
   createFleet,
   isInFactoryScope,
   parseLinearIssue,
+  readFactoryLoopHeartbeat,
   type Capability,
   type Factory,
   type FactoryConfig,
@@ -44,7 +46,7 @@ type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
-  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' }
+  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' }
   | { kind: 'factory-triage'; issue: string }
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
@@ -106,7 +108,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         if (!loaded) throw new Error('factory command requires config')
         const mount = await buildMount(loaded, deps)
         const factory = createFactory(loaded.config, { mount, fleet })
-        return await runFactoryCommand(command, factory, mount, globals, out)
+        return await runFactoryCommand(command, factory, mount, loaded.config, globals, out)
       }
     }
   } catch (error) {
@@ -182,6 +184,7 @@ async function runFactoryCommand(
   command: Extract<ParsedCommand, { kind: 'factory' | 'factory-triage' | 'factory-dispatch' }>,
   factory: Factory,
   mount: MountClient,
+  config: FactoryConfig,
   globals: GlobalOptions,
   out: Pick<NodeJS.WriteStream, 'write'>,
 ): Promise<number> {
@@ -194,10 +197,29 @@ async function runFactoryCommand(
       writeJson(out, factory.status())
       return 0
     }
+    if (command.action === 'loop-status') {
+      const heartbeat = await readFactoryLoopHeartbeat(config.loop.heartbeatPath)
+      writeJson(out, checkFactoryLoopLiveness(heartbeat, { staleMs: config.loop.heartbeatStaleMs }))
+      return 0
+    }
+    if (command.action === 'kill-loop') {
+      const heartbeat = await readFactoryLoopHeartbeat(config.loop.heartbeatPath)
+      if (!heartbeat?.pid) {
+        throw new Error(`No factory loop heartbeat at ${config.loop.heartbeatPath}`)
+      }
+      process.kill(heartbeat.pid, 'SIGTERM')
+      writeJson(out, { killed: heartbeat.pid, signal: 'SIGTERM' })
+      return 0
+    }
 
-    await factory.start({ mode: 'live' })
-    writeJson(out, factory.status())
-    await waitForShutdown(factory)
+    const removeSignalHandlers = installFactoryStopSignalHandlers(factory)
+    try {
+      const reports = await factory.runLoop({ dryRun: globals.dryRun })
+      writeJson(out, { reports, status: factory.status() })
+    } finally {
+      removeSignalHandlers()
+      await factory.stop()
+    }
     return 0
   }
 
@@ -214,7 +236,7 @@ async function runFactoryCommand(
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
-  if (action === 'run-once' || action === 'loop' || action === 'status') {
+  if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop') {
     return { kind: 'factory', action }
   }
   if (action === 'triage') {
@@ -376,17 +398,37 @@ function defaultAgentName(capability: Capability, now: number): string {
   return `fleet-${capability.replace('spawn:', '')}-${now}`
 }
 
-function waitForShutdown(factory: Factory): Promise<void> {
-  return new Promise((resolve) => {
-    const stop = async () => {
-      process.off('SIGINT', stop)
-      process.off('SIGTERM', stop)
-      await factory.stop()
-      resolve()
+export function installFactoryStopSignalHandlers(
+  factory: Factory,
+  opts: {
+    exit?: (code: number) => void
+    processLike?: Pick<NodeJS.Process, 'once' | 'off'>
+  } = {},
+): () => void {
+  const exit = opts.exit ?? ((code: number) => process.exit(code))
+  const processLike = opts.processLike ?? process
+  let stopping: Promise<void> | undefined
+  let installed = true
+  const remove = () => {
+    if (!installed) return
+    installed = false
+    processLike.off('SIGINT', onSigint)
+    processLike.off('SIGTERM', onSigterm)
+  }
+  const stopAndExit = (code: number) => {
+    if (!stopping) {
+      stopping = factory.stop()
     }
-    process.once('SIGINT', stop)
-    process.once('SIGTERM', stop)
-  })
+    void stopping.finally(() => {
+      remove()
+      exit(code)
+    })
+  }
+  const onSigint = () => stopAndExit(130)
+  const onSigterm = () => stopAndExit(143)
+  processLike.once('SIGINT', onSigint)
+  processLike.once('SIGTERM', onSigterm)
+  return remove
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

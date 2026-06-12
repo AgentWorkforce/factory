@@ -130,6 +130,18 @@ export class BatchTracker {
     return next
   }
 
+  abandon(issue: IssueRef): void {
+    const key = issueKey(issue)
+    const record = this.#inFlight.get(key)
+    if (record) {
+      for (const invocationId of record.invocationIds) {
+        this.#invocationIds.delete(invocationId)
+      }
+    }
+    this.#inFlight.delete(key)
+    this.#queued.delete(key)
+  }
+
   invocationIdFor(issue: IssueRef, spec: AgentSpec): string {
     return spec.invocationId ?? `factory:${issue.key}:${stableHash(`${issue.uuid}:${spec.role}:${spec.name}:${spec.repo}`)}`
   }

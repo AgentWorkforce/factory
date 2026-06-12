@@ -1,3 +1,6 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
+
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { LINEAR_STATE_IDS, linearByStatePath } from '../constants/linear'
 import { GithubMergeGate, closeProbePr, type GithubMergeGate as GithubMergeGatePort } from '../github'
@@ -13,6 +16,9 @@ import type {
   FactoryStatus,
   FactoryStartOptions,
   FactoryLiveSubscriptionOptions,
+  FactoryLoopRunOptions,
+  FactoryLoopHeartbeat,
+  FactoryLoopLiveness,
   IssueRef,
   IterationReport,
   LinearIssue,
@@ -28,6 +34,12 @@ import { BatchTracker, type InFlightIssue, issueKey } from './batch-tracker'
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
 type SlackThreadWatcher = { stop(): Promise<void> }
+type DispatchAttemptState = {
+  attempts: number
+  inFlight: boolean
+  terminal: boolean
+  backoffUntilMs: number
+}
 type SlackReply = {
   channelDir: string
   threadTs: string
@@ -50,6 +62,7 @@ const STATE_NAME_TO_ID: Record<string, string> = {
 }
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -81,6 +94,7 @@ export class FactoryLoop implements Factory {
   readonly #slackThreadIds = new Map<string, string>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
+  readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
@@ -174,6 +188,10 @@ export class FactoryLoop implements Factory {
     this.#offDeliveryFailed?.()
     this.#offAgentExit = undefined
     this.#offDeliveryFailed = undefined
+  }
+
+  async dispose(): Promise<void> {
+    await this.stop()
   }
 
   async #startLiveSubscription(overrides: Partial<FactoryLiveSubscriptionOptions> = {}): Promise<void> {
@@ -325,6 +343,12 @@ export class FactoryLoop implements Factory {
       }
 
       pulled.push(issueRef(issue))
+      const dispatchBlock = this.#dispatchBlockReason(issue)
+      if (dispatchBlock) {
+        skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+        continue
+      }
+
       if (this.#batch.isInFlight(issue) || this.#batch.isQueued(issue)) {
         skipped.push({ issue: issueRef(issue), reason: 'already tracked' })
         continue
@@ -358,6 +382,29 @@ export class FactoryLoop implements Factory {
     return { pulled, triaged, dispatched, skipped, dryRun }
   }
 
+  async runLoop(opts: FactoryLoopRunOptions = {}): Promise<IterationReport[]> {
+    const maxIterations = Math.min(5, Math.max(1, Math.trunc(opts.maxIterations ?? this.#config.loop.maxIterations)))
+    const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
+    const reports: IterationReport[] = []
+    let completed = false
+    try {
+      for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+        await this.#writeLoopHeartbeat(heartbeatPath, 'running', iteration, maxIterations)
+        reports.push(await this.runOnce({ dryRun: opts.dryRun }))
+        await this.#writeLoopHeartbeat(heartbeatPath, 'running', iteration + 1, maxIterations)
+      }
+      this.#increment('loopIdle')
+      await this.#writeLoopHeartbeat(heartbeatPath, 'idle', reports.length, maxIterations)
+      completed = true
+      return reports
+    } finally {
+      if (!completed) {
+        await this.#writeLoopHeartbeat(heartbeatPath, 'stopping', reports.length, maxIterations)
+      }
+      await this.stop()
+    }
+  }
+
   async triageIssue(issue: LinearIssue): Promise<TriageDecision> {
     return this.#triage.triage(issue, {
       config: this.#config,
@@ -370,6 +417,13 @@ export class FactoryLoop implements Factory {
     const existingRecord = this.#batch.getIssue(decision.issue)
     if (existingRecord?.result) {
       return existingRecord.result
+    }
+
+    const blockReason = this.#dispatchBlockReason(decision.issue)
+    if (blockReason) {
+      const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason}`)
+      this.#error(error, decision.issue)
+      throw error
     }
 
     const liveIssue = await this.#readIssue(decision.issue.path)
@@ -391,8 +445,10 @@ export class FactoryLoop implements Factory {
       return { issue: decision.issue, agents: [], dryRun }
     }
 
+    this.#recordDispatchAttempt(decision.issue)
     const record = this.#batch.start(decision, dryRun)
     if (!record) {
+      this.#clearDispatchInFlight(decision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: decision.issue })
       return { issue: decision.issue, agents: [], dryRun }
@@ -438,6 +494,8 @@ export class FactoryLoop implements Factory {
       await this.#sendCriticalReviewerMessage(record)
       return result
     } catch (error) {
+      this.#recordDispatchFailure(decision.issue)
+      this.#batch.abandon(decision.issue)
       this.#error(error, decision.issue)
       throw error
     }
@@ -512,6 +570,10 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      if (this.#dispatchBlockReason(issue)) {
+        return
+      }
+
       const decision = await this.triageIssue(issue)
       if (decision.confidence === 'low') {
         this.#error(new Error(`Low-confidence triage for ${decision.issue.key}; escalation required`), decision.issue)
@@ -526,8 +588,90 @@ export class FactoryLoop implements Factory {
         }
       }
     } catch (error) {
-      this.#error(error)
+      this.#logger.error?.('[factory] failed to handle issue change', error)
     }
+  }
+
+  #dispatchBlockReason(issue: IssueRef): string | undefined {
+    const key = issue.key
+    const state = this.#dispatchAttempts.get(key)
+    if (!state) return undefined
+    if (state.terminal) return 'dispatch already terminal'
+    if (state.inFlight) return 'dispatch already in-flight'
+    const now = this.#clock.now()
+    if (state.backoffUntilMs > now) {
+      return 'dispatch backoff active'
+    }
+    if (state.attempts >= this.#config.dispatch.maxAttempts) {
+      state.terminal = true
+      return 'dispatch retry limit reached'
+    }
+    return undefined
+  }
+
+  #recordDispatchAttempt(issue: IssueRef): void {
+    const key = issue.key
+    const state = this.#dispatchAttempts.get(key) ?? {
+      attempts: 0,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    }
+    state.attempts += 1
+    state.inFlight = true
+    state.backoffUntilMs = 0
+    this.#dispatchAttempts.set(key, state)
+  }
+
+  #clearDispatchInFlight(issue: IssueRef): void {
+    const state = this.#dispatchAttempts.get(issue.key)
+    if (state) state.inFlight = false
+  }
+
+  #recordDispatchFailure(issue: IssueRef): void {
+    const state = this.#dispatchAttempts.get(issue.key)
+    if (!state) return
+    state.inFlight = false
+    if (state.attempts >= this.#config.dispatch.maxAttempts) {
+      state.terminal = true
+      state.backoffUntilMs = 0
+      this.#increment('dispatchTerminalFailures')
+      return
+    }
+    state.backoffUntilMs = this.#clock.now() + this.#config.dispatch.errorCooldownMs
+    this.#increment('dispatchBackoffs')
+  }
+
+  #recordDispatchTerminal(issue: IssueRef): void {
+    const state = this.#dispatchAttempts.get(issue.key) ?? {
+      attempts: 0,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    }
+    state.inFlight = false
+    state.terminal = true
+    state.backoffUntilMs = 0
+    this.#dispatchAttempts.set(issue.key, state)
+  }
+
+  async #writeLoopHeartbeat(
+    path: string,
+    status: FactoryLoopHeartbeat['status'],
+    iteration: number,
+    maxIterations: number,
+  ): Promise<void> {
+    const updatedAtMs = this.#clock.now()
+    const heartbeat: FactoryLoopHeartbeat = {
+      pid: process.pid,
+      status,
+      iteration,
+      maxIterations,
+      updatedAt: new Date(updatedAtMs).toISOString(),
+      updatedAtMs,
+    }
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
   }
 
   async #readyIssuePaths(): Promise<string[]> {
@@ -764,6 +908,7 @@ export class FactoryLoop implements Factory {
       this.#increment('done')
       this.#emit('issue-done', { issue: record.issue })
       await this.#stopSlackWatcher(record.issue)
+      this.#recordDispatchTerminal(record.issue)
       const next = this.#batch.complete(record.issue)
       if (next) {
         await this.dispatch(next.decision, { dryRun: next.dryRun })
@@ -846,9 +991,11 @@ export class FactoryLoop implements Factory {
     const messagesPrefix = slackChannelMessagesPrefix(channelDir)
     const preExistingPaths = new Set<string>()
     const seenReplies = new Set<string>()
+    const seenReplyMessages = new Set<string>()
     let missingIdentityLogged = false
     let cursor: string | undefined
     let stopped = false
+    let pollTimer: ReturnType<typeof setTimeout> | undefined
 
     const markPreExisting = async (): Promise<void> => {
       try {
@@ -887,6 +1034,12 @@ export class FactoryLoop implements Factory {
           return
         }
 
+        const replyMessageKey = `${reply.threadTs}:${reply.messageTs}`
+        if (seenReplyMessages.has(replyMessageKey)) {
+          this.#logger.debug?.('[factory] suppressed duplicate Slack reply message', { issue: record.issue.key, path: event.resource.path })
+          return
+        }
+
         const replyKey = `${eventKey ?? event.resource.path}:${stableHash(JSON.stringify(reply.raw))}`
         if (seenReplies.has(replyKey)) {
           this.#logger.debug?.('[factory] suppressed duplicate Slack reply payload', { issue: record.issue.key, path: event.resource.path })
@@ -897,6 +1050,7 @@ export class FactoryLoop implements Factory {
         if (reply.isBot) {
           return
         }
+        seenReplyMessages.add(replyMessageKey)
 
         await this.#respondToSlackStatus(record, threadId)
       } catch (error) {
@@ -916,17 +1070,23 @@ export class FactoryLoop implements Factory {
     }
 
     const poll = async (): Promise<void> => {
-      while (!stopped) {
-        try {
-          const page = await this.#mount.getEvents({ cursor, limit: SLACK_REPLY_EVENTS_LIMIT })
-          cursor = page.nextCursor ?? cursor
-          for (const event of page.events) {
-            await handle(event)
-          }
-        } catch (error) {
-          this.#logger.warn?.('[factory] Slack reply polling failed', error)
+      if (stopped) {
+        return
+      }
+      try {
+        const page = await this.#mount.getEvents({ cursor, limit: SLACK_REPLY_EVENTS_LIMIT })
+        cursor = page.nextCursor ?? cursor
+        for (const event of page.events) {
+          await handle(event)
         }
-        await unrefDelay(SLACK_REPLY_POLL_INTERVAL_MS)
+      } catch (error) {
+        this.#logger.warn?.('[factory] Slack reply polling failed', error)
+      }
+      if (!stopped) {
+        pollTimer = setTimeout(() => {
+          void poll()
+        }, SLACK_REPLY_POLL_INTERVAL_MS)
+        pollTimer.unref?.()
       }
     }
     void poll()
@@ -934,6 +1094,10 @@ export class FactoryLoop implements Factory {
     this.#slackWatchers.set(key, {
       stop: async () => {
         stopped = true
+        if (pollTimer) {
+          clearTimeout(pollTimer)
+          pollTimer = undefined
+        }
         await subscription?.unsubscribe()
       },
     })
@@ -1036,6 +1200,37 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
     path,
     raw: asRecord(parsed) ?? payload,
   }
+}
+
+export async function readFactoryLoopHeartbeat(
+  path = DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
+): Promise<FactoryLoopHeartbeat | undefined> {
+  try {
+    return parseJsonContent(await readFile(path, 'utf8')) as FactoryLoopHeartbeat
+  } catch {
+    return undefined
+  }
+}
+
+export function checkFactoryLoopLiveness(
+  heartbeat: FactoryLoopHeartbeat | undefined,
+  opts: { nowMs?: number; staleMs?: number } = {},
+): FactoryLoopLiveness {
+  if (!heartbeat) {
+    return { ok: false, stale: true, reason: 'heartbeat missing' }
+  }
+
+  const nowMs = opts.nowMs ?? Date.now()
+  const staleMs = opts.staleMs ?? 60_000
+  const ageMs = Math.max(0, nowMs - heartbeat.updatedAtMs)
+  const stale = ageMs > staleMs
+  if (stale) {
+    return { ok: false, stale: true, ageMs, heartbeat, reason: 'heartbeat stale' }
+  }
+  if (heartbeat.status === 'stopping') {
+    return { ok: false, stale: false, ageMs, heartbeat, reason: 'loop stopping' }
+  }
+  return { ok: true, stale: false, ageMs, heartbeat }
 }
 
 export function isRealLinearIssue(issue: LinearIssue): boolean {

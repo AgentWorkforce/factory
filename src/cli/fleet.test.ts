@@ -1,12 +1,12 @@
-import { describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { describe, expect, it, vi } from 'vitest'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { LINEAR_STATE_IDS } from '../constants/linear'
-import type { CloseProbePrInput } from '../index'
+import type { CloseProbePrInput, Factory } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import { parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -213,6 +213,132 @@ describe('fleet CLI runtime', () => {
     expect(calls).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 42, expectedIssueKey: 'AR-77' }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
   })
+
+  it('runs factory loop through the bounded runner and emits a heartbeat-backed status', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-loop-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { maxIterations: 2, heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const fleet = new FakeFleetClient()
+      const mount = new FakeMountClient({ [issuePath]: issueFile })
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'factory',
+        'loop',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      const result = JSON.parse(output.text())
+      expect(result.reports).toHaveLength(2)
+      expect(result.status.counters.loopIdle).toBe(1)
+      const heartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8'))
+      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 2, maxIterations: 2 })
+
+      const statusOut = buffer()
+      const statusCode = await runFleetCli([
+        'factory',
+        'loop-status',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: statusOut,
+        stderr: buffer(),
+      })
+      expect(statusCode).toBe(0)
+      expect(JSON.parse(statusOut.text())).toMatchObject({ ok: true, stale: false })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('factory kill-loop sends SIGTERM to the heartbeat pid', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-kill-'))
+    const originalKill = process.kill
+    const killed: Array<{ pid: number; signal?: NodeJS.Signals | number }> = []
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { maxIterations: 2, heartbeatPath, heartbeatStaleMs: 10_000 } })
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: 4242,
+        status: 'running',
+        iteration: 1,
+        maxIterations: 2,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+      }))
+      process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+        killed.push({ pid, signal })
+        return true
+      }) as typeof process.kill
+
+      const output = buffer()
+      const code = await runFleetCli([
+        'factory',
+        'kill-loop',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(killed).toEqual([{ pid: 4242, signal: 'SIGTERM' }])
+      expect(JSON.parse(output.text())).toEqual({ killed: 4242, signal: 'SIGTERM' })
+    } finally {
+      process.kill = originalKill
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('signal handlers stop the factory before exiting and unregister themselves', async () => {
+    const calls: string[] = []
+    const listeners = new Map<string, () => void>()
+    const processLike = {
+      once(signal: string, listener: () => void) {
+        listeners.set(signal, listener)
+        return processLike
+      },
+      off(signal: string, listener: () => void) {
+        if (listeners.get(signal) === listener) listeners.delete(signal)
+        return processLike
+      },
+    }
+    const factory = {
+      stop: vi.fn(async () => {
+        calls.push('stop')
+      }),
+    } as unknown as Factory
+    const exits: number[] = []
+
+    installFactoryStopSignalHandlers(factory, {
+      processLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+      exit: (code) => {
+        calls.push('exit')
+        exits.push(code)
+      },
+    })
+    listeners.get('SIGTERM')?.()
+    await flush()
+
+    expect(factory.stop).toHaveBeenCalledTimes(1)
+    expect(calls).toEqual(['stop', 'exit'])
+    expect(exits).toEqual([143])
+    expect(listeners.size).toBe(0)
+  })
 })
 
 const buffer = () => {
@@ -226,4 +352,17 @@ const buffer = () => {
       return value
     },
   }
+}
+
+const writeConfig = async (root: string, overrides: Record<string, unknown> = {}): Promise<string> => {
+  const path = join(root, 'factory.config.json')
+  await writeFile(path, JSON.stringify({
+    ...config,
+    ...overrides,
+  }))
+  return path
+}
+
+const flush = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0))
 }

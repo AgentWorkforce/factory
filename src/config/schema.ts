@@ -16,6 +16,15 @@ export const FactoryConfigSchema = z.object({
     eventLimit: z.number().int().min(1).max(1_000).default(1_000),
     replaySkewMarginMs: z.number().int().min(0).default(60_000),
   }).default({}),
+  dispatch: z.object({
+    errorCooldownMs: z.number().int().min(0).default(60_000),
+    maxAttempts: z.number().int().min(1).max(5).default(2),
+  }).default({}),
+  loop: z.object({
+    maxIterations: z.number().int().min(1).max(5).default(3),
+    heartbeatPath: z.string().min(1).default('/tmp/factory-run/factory-loop-heartbeat.json'),
+    heartbeatStaleMs: z.number().int().min(1_000).default(60_000),
+  }).default({}),
   repos: z.object({
     byLabel: z.record(z.string(), z.string()),
     byProject: z.record(z.string(), z.string()).default({}),

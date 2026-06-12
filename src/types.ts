@@ -21,7 +21,9 @@ export interface FactoryPorts {
 export interface Factory {
   start(opts?: FactoryStartOptions): Promise<void>
   stop(): Promise<void>
+  dispose(): Promise<void>
   runOnce(opts?: { dryRun?: boolean }): Promise<IterationReport>
+  runLoop(opts?: FactoryLoopRunOptions): Promise<IterationReport[]>
   triageIssue(issue: LinearIssue): Promise<TriageDecision>
   dispatch(decision: TriageDecision, opts?: { dryRun?: boolean }): Promise<DispatchResult>
   status(): FactoryStatus
@@ -41,6 +43,31 @@ export interface FactoryLiveSubscriptionOptions {
   pollIntervalMs: number
   eventLimit: number
   replaySkewMarginMs: number
+}
+
+export interface FactoryLoopRunOptions {
+  dryRun?: boolean
+  maxIterations?: number
+  heartbeatPath?: string
+}
+
+export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
+
+export interface FactoryLoopHeartbeat {
+  pid: number
+  status: FactoryLoopHeartbeatStatus
+  iteration: number
+  maxIterations: number
+  updatedAt: string
+  updatedAtMs: number
+}
+
+export interface FactoryLoopLiveness {
+  ok: boolean
+  stale: boolean
+  ageMs?: number
+  heartbeat?: FactoryLoopHeartbeat
+  reason?: string
 }
 
 export interface LinearIssue {

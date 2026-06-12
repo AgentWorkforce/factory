@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { FactoryConfigSchema, createFactory, parseLinearIssue, type FactoryConfig, type TriageDecision, type TriageEngine } from '../index'
+import {
+  FactoryConfigSchema,
+  checkFactoryLoopLiveness,
+  createFactory,
+  parseLinearIssue,
+  readFactoryLoopHeartbeat,
+  type FactoryConfig,
+  type TriageDecision,
+  type TriageEngine,
+} from '../index'
 import type { ChangeEvent, EventPage, LinearWriteback, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, LinearIssue } from '../index'
@@ -112,12 +124,59 @@ class SpawnFailingFleetClient extends FakeFleetClient {
   }
 }
 
+class ManualClock {
+  value = 0
+
+  now(): number {
+    return this.value
+  }
+
+  advance(ms: number): void {
+    this.value += ms
+  }
+
+  async sleep(_ms: number): Promise<void> {
+    return
+  }
+}
+
+class TimestampFailingFleetClient extends FakeFleetClient {
+  readonly attemptTimes: number[] = []
+
+  constructor(readonly clock: ManualClock) {
+    super()
+  }
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    this.spawns.push(input)
+    this.attemptTimes.push(this.clock.now())
+    throw new Error('spawnPty failed: cwd does not exist')
+  }
+}
+
 class CountingEventsMount extends FakeMountClient {
   getEventsCalls = 0
 
   override async getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage> {
     this.getEventsCalls += 1
     return super.getEvents(opts)
+  }
+}
+
+class TrackingEventsMount extends CountingEventsMount {
+  activeSubscriptions = 0
+  unsubscribeCount = 0
+
+  override subscribe(...args: Parameters<FakeMountClient['subscribe']>): ReturnType<FakeMountClient['subscribe']> {
+    this.activeSubscriptions += 1
+    const subscription = super.subscribe(...args)
+    return {
+      unsubscribe: async () => {
+        this.unsubscribeCount += 1
+        this.activeSubscriptions -= 1
+        await subscription.unsubscribe()
+      },
+    }
   }
 }
 
@@ -304,6 +363,56 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-2', 'AR-3'])
     expect(factory.status().queued).toEqual([])
+  })
+
+  it('runLoop stops at the configured iteration cap, preserves the batch cap, and advances heartbeat liveness', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-loop-heartbeat-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    try {
+      const mount = new FakeMountClient(Object.fromEntries(
+        [51, 52, 53, 54, 55, 56].map((n) => [issuePath(n), issueFile(n)]),
+      ))
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({
+        batchSize: 5,
+        loop: { maxIterations: 3, heartbeatPath, heartbeatStaleMs: 10_000 },
+      }), { mount, fleet, triage: new StaticTriage() })
+
+      const reports = await factory.runLoop({ dryRun: true })
+
+      expect(reports).toHaveLength(3)
+      expect(factory.status().counters.loopIdle).toBe(1)
+      expect(factory.status().inFlight).toHaveLength(5)
+      expect(factory.status().queued).toHaveLength(1)
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 3, maxIterations: 3, pid: process.pid })
+      expect(checkFactoryLoopLiveness(heartbeat, { nowMs: heartbeat!.updatedAtMs + 500, staleMs: 10_000 })).toMatchObject({
+        ok: true,
+        stale: false,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports missing or stale loop heartbeat as not live', () => {
+    expect(checkFactoryLoopLiveness(undefined, { nowMs: 2_000, staleMs: 1_000 })).toMatchObject({
+      ok: false,
+      stale: true,
+      reason: 'heartbeat missing',
+    })
+    expect(checkFactoryLoopLiveness({
+      pid: 123,
+      status: 'running',
+      iteration: 1,
+      maxIterations: 3,
+      updatedAt: new Date(1_000).toISOString(),
+      updatedAtMs: 1_000,
+    }, { nowMs: 3_001, staleMs: 2_000 })).toMatchObject({
+      ok: false,
+      stale: true,
+      reason: 'heartbeat stale',
+    })
   })
 
   it('skips ready issues outside factory-e2e scope before triage or dispatch', async () => {
@@ -700,6 +809,50 @@ describe('FactoryLoop', () => {
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-5-impl', 'ar-5-review'])
     expect(new Set(fleet.spawns.map((spawn) => spawn.invocationId)).size).toBe(2)
+  })
+
+  it('dedupes dispatch attempts by issue key even when duplicate detections use different paths', async () => {
+    const duplicatePath = '/linear/issues/AR-40__uuid-40-duplicate.json'
+    const duplicateIssue = realIssueFile(40, ready, { id: 'uuid-40-duplicate' })
+    const mount = new FakeMountClient({
+      [issuePath(40)]: issueFile(40),
+      [duplicatePath]: duplicateIssue,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const first = await factory.triageIssue(parseLinearIssue(issuePath(40), issueFile(40)))
+    const duplicate = await factory.triageIssue(parseLinearIssue(duplicatePath, duplicateIssue))
+
+    await factory.dispatch(first)
+    await expect(factory.dispatch(duplicate)).rejects.toThrow(/dispatch already in-flight/)
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl', 'ar-40-review'])
+  })
+
+  it('backs off dispatch errors and enforces a retry gap before the bounded terminal attempt', async () => {
+    const clock = new ManualClock()
+    const mount = new FakeMountClient({ [issuePath(41)]: issueFile(41) })
+    const fleet = new TimestampFailingFleetClient(clock)
+    const factory = createFactory(config({
+      dispatch: { errorCooldownMs: 1_000, maxAttempts: 2 },
+    }), { mount, fleet, triage: new StaticTriage(), clock })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(41), issueFile(41)))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(/spawnPty failed/)
+    expect(fleet.attemptTimes).toEqual([0])
+
+    clock.advance(999)
+    await expect(factory.dispatch(decision)).rejects.toThrow(/dispatch backoff active/)
+    expect(fleet.attemptTimes).toEqual([0])
+
+    clock.advance(1)
+    await expect(factory.dispatch(decision)).rejects.toThrow(/spawnPty failed/)
+    expect(fleet.attemptTimes).toEqual([0, 1_000])
+    expect(fleet.attemptTimes[1]! - fleet.attemptTimes[0]!).toBeGreaterThanOrEqual(1_000)
+
+    clock.advance(1_000)
+    await expect(factory.dispatch(decision)).rejects.toThrow(/dispatch already terminal/)
+    expect(fleet.attemptTimes).toEqual([0, 1_000])
   })
 
   it('dedupes dispatch spawns that retry the same invocation id under different agent names', async () => {
@@ -1275,6 +1428,72 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackReplyWrites(mount)).toHaveLength(1)
+  })
+
+  it('dedupes Slack status responses by human message ts across poll re-reads with fresh event ids', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(42)]: issueFile(42) })
+    const fleet = new FakeFleetClient()
+    const slack = new RecordingSlack()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+    })
+    const messageTs = '1780751642.000001'
+    const path = slackTopLevelMessageFixturePath('C0FACTORY__factory-e2e', messageTs)
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(42), issueFile(42))))
+    mount.files.set(path, {
+      content: {
+        provider: 'slack',
+        objectType: 'message',
+        objectId: 'slack-human-reread',
+        payload: {
+          channel: 'C0FACTORY',
+          thread_ts: slack.threadId,
+          ts: messageTs,
+          text: 'status?',
+          user: 'U123',
+          user_is_bot: false,
+        },
+      },
+    })
+    mount.emit(changeEvent(path, 'slack-human-reread-1'))
+    mount.emit(changeEvent(path, 'slack-human-reread-2'))
+    await flush()
+    await flush()
+
+    expect(slackReplyWrites(mount)).toHaveLength(1)
+  })
+
+  it('dispose unsubscribes Slack watchers and clears their polling timers', async () => {
+    vi.useFakeTimers()
+    try {
+      const mount = new TrackingEventsMount({ [issuePath(43)]: issueFile(43) })
+      const fleet = new FakeFleetClient()
+      const slack = new RecordingSlack()
+      const factory = createFactory(config({ slack: slackConfig() }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        slack,
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(43), issueFile(43))))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mount.activeSubscriptions).toBe(1)
+      const callsBeforeDispose = mount.getEventsCalls
+
+      await factory.dispose()
+      expect(mount.activeSubscriptions).toBe(0)
+      expect(mount.unsubscribeCount).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(mount.getEventsCalls).toBe(callsBeforeDispose)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('treats Slack dispatch thread startup as best-effort after agents are dispatched', async () => {
