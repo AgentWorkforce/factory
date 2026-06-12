@@ -18,9 +18,11 @@ import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, Slack
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, LinearIssue } from '../index'
 import { BatchTracker } from './batch-tracker'
+import { keyFromPath } from './factory'
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
+const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 
 const config = (overrides: Partial<FactoryConfig> = {}): FactoryConfig => FactoryConfigSchema.parse({
   workspaceId: 'factory-test',
@@ -34,6 +36,7 @@ const config = (overrides: Partial<FactoryConfig> = {}): FactoryConfig => Factor
 })
 
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
+const readyAliasPath = (n: number) => `/linear/issues/by-state/ready-for-agent/AR-${n}.json`
 
 const issuePayload = (n: number, stateId = ready) => ({
   id: `uuid-${n}`,
@@ -397,6 +400,11 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('extracts issue keys from canonical and live ready-alias paths', () => {
+    expect(keyFromPath('/linear/issues/AR-173__40c7e780-59ad-47ee-8809-3a9b8434d8fb.json')).toBe('AR-173')
+    expect(keyFromPath('/linear/issues/by-state/ready-for-agent/AR-173.json')).toBe('AR-173')
+  })
+
   it('runOnce caps active issues, skips stale state, and pulls queued work after completion', async () => {
     const mount = new FakeMountClient({
       [issuePath(1)]: issueFile(1),
@@ -431,6 +439,92 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-2', 'AR-3'])
     expect(factory.status().queued).toEqual([])
+  })
+
+  it('uses canonical issue state when a ready alias is stale', async () => {
+    const canonicalPath = '/linear/issues/AR-67__uuid-67-canonical.json'
+    const aliasPath = readyAliasPath(67)
+    const mount = new FakeMountClient({
+      [canonicalPath]: realIssueFile(67, done, { id: 'uuid-67-canonical' }),
+      [aliasPath]: realIssueFile(67, ready, { id: 'uuid-67-alias' }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }])
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([
+      { issue: { uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }, reason: 'live state is not ready-for-agent' },
+    ])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it('uses canonical issue state during startup backfill when a ready alias is stale', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(69)]: realIssueFile(69, done),
+      [readyAliasPath(69)]: realIssueFile(69, ready),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start()
+
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().inFlight).toEqual([])
+    await factory.stop()
+  })
+
+  it('dedupes canonical and ready alias occurrences while dispatching genuinely ready issues', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(68)]: realIssueFile(68, ready),
+      [readyAliasPath(68)]: realIssueFile(68, ready),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'uuid-68', key: 'AR-68', path: issuePath(68) }])
+    expect(report.dispatched.map((result) => result.issue)).toEqual([
+      { uuid: 'uuid-68', key: 'AR-68', path: issuePath(68) },
+    ])
+    expect(report.skipped).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-68-impl', 'ar-68-review'])
+  })
+
+  it('resolves live-shaped ready alias discovery to the canonical issue record', async () => {
+    const canonicalPath = '/linear/issues/AR-70__uuid-70-canonical.json'
+    const mount = new FakeMountClient({
+      [canonicalPath]: realIssueFile(70, ready, { id: 'uuid-70-canonical' }),
+      [readyAliasPath(70)]: realIssueFile(70, ready, { id: 'uuid-70-alias' }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'uuid-70-canonical', key: 'AR-70', path: canonicalPath }])
+    expect(report.dispatched.map((result) => result.issue)).toEqual([
+      { uuid: 'uuid-70-canonical', key: 'AR-70', path: canonicalPath },
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-70-impl', 'ar-70-review'])
+  })
+
+  it('fails closed when a ready alias has no canonical issue record', async () => {
+    const mount = new FakeMountClient({
+      [readyAliasPath(71)]: realIssueFile(71, ready),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([])
+    expect(report.dispatched).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().counters.readyAliasesWithoutCanonical).toBe(1)
   })
 
   it('runLoop stops at the configured iteration cap, preserves the batch cap, and advances heartbeat liveness', async () => {

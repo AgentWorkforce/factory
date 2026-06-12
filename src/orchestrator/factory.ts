@@ -697,18 +697,27 @@ export class FactoryLoop implements Factory {
   }
 
   async #readyIssuePaths(): Promise<string[]> {
-    const paths = new Set<string>()
+    const pathsByKey = new Map<string, string>()
+    const canonicalPathsByKey = new Map<string, string>()
     for (const path of await this.#mount.listTree(ISSUE_ROOT)) {
       if (isIssueFilePath(path)) {
-        paths.add(path)
+        const key = keyFromPath(path)
+        canonicalPathsByKey.set(key, path)
+        pathsByKey.set(key, path)
       }
     }
     for (const path of await this.#mount.listTree(linearByStatePath('ready-for-agent'))) {
-      if (isIssueFilePath(path)) {
-        paths.add(path)
+      if (isIssueAliasFilePath(path)) {
+        const canonicalPath = canonicalPathsByKey.get(keyFromPath(path))
+        if (canonicalPath) {
+          pathsByKey.set(keyFromPath(path), canonicalPath)
+        } else {
+          this.#increment('readyAliasesWithoutCanonical')
+          this.#logger.debug?.('[factory] skipped ready alias without canonical issue', { path })
+        }
       }
     }
-    return [...paths].sort()
+    return [...pathsByKey.values()].sort()
   }
 
   async #readIssue(path: string): Promise<LinearIssue | undefined> {
@@ -1658,7 +1667,13 @@ const isIssueFilePath = (path: string): boolean =>
   !path.includes('/comments/') &&
   !path.includes('/by-state/')
 
-const keyFromPath = (path: string): string => path.split('/').at(-1)?.split('__')[0] ?? path
+const isIssueAliasFilePath = (path: string): boolean =>
+  path.startsWith(linearByStatePath('ready-for-agent')) &&
+  path.endsWith('.json') &&
+  !path.includes('/comments/')
+
+export const keyFromPath = (path: string): string =>
+  path.split('/').at(-1)?.replace(/\.json$/, '').split('__')[0] ?? path
 
 const uuidFromPath = (path: string): string | undefined => path.split('__')[1]?.replace(/\.json$/, '')
 
