@@ -14,7 +14,7 @@ export interface HarnessDriverClientLike {
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
   listAgents(): Promise<Array<Pick<ListAgent, 'name'>>>
-  sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }>
+  sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }>
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
   onEvent?(listener: HarnessEventListener): () => void
@@ -132,9 +132,10 @@ export class InternalFleetClient implements FleetClient {
     this.#ensureEventSubscription()
     const result = await this.#client.sendMessage(messageInputFrom(input))
     const eventId = result.event_id
+    const targets = result.targets ?? []
 
     if (this.#injectedEventIdSet.has(eventId)) {
-      return { eventId, targets: result.targets }
+      return { eventId, targets }
     }
 
     const priorFailure = this.#failedDeliveries.get(eventId)
@@ -150,7 +151,7 @@ export class InternalFleetClient implements FleetClient {
       }, timeoutMs)
 
       this.#pendingInjected.set(eventId, {
-        targets: result.targets,
+        targets,
         timeout,
         resolve,
         reject,

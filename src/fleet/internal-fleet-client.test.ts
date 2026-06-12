@@ -32,7 +32,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
     return this.agents
   }
 
-  async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+  async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
     this.sent.push(input)
     return { event_id: `event-${this.sent.length}`, targets: [input.to] }
   }
@@ -219,6 +219,31 @@ describe('InternalFleetClient', () => {
       { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } },
       { to: 'broker', text: 'done', from: undefined, data: undefined },
     ])
+  })
+
+  it('normalizes missing injected targets from the live broker ack', async () => {
+    class NoTargetsHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string }> {
+        this.sent.push(input)
+        return { event_id: `event-${this.sent.length}` }
+      }
+    }
+    const harness = new NoTargetsHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await Promise.resolve()
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+    })
+
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-1',
+      targets: [],
+    })
   })
 
   it('passes raw PTY input through to the harness client', async () => {

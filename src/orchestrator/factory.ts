@@ -1023,13 +1023,13 @@ export class FactoryLoop implements Factory {
 
   async #submitInjectedTask(
     input: Parameters<FleetClient['sendMessage']>[0],
-    ack: { targets: string[] },
+    ack: { targets?: string[] },
   ): Promise<void> {
     if (!this.#fleet.sendInput) {
       return
     }
 
-    const targets = ack.targets.length > 0 ? ack.targets : [input.to]
+    const targets = ack.targets && ack.targets.length > 0 ? ack.targets : [input.to]
     for (const target of new Set(targets)) {
       await this.#fleet.sendInput(target, '\r')
     }

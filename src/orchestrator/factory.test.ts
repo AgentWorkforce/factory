@@ -1159,6 +1159,38 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('falls back to the message recipient when the live injected ack omits targets', async () => {
+    class UndefinedTargetsFleetClient extends FakeFleetClient {
+      override async waitForInjected(
+        input: Parameters<FakeFleetClient['waitForInjected']>[0],
+        _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+      ): ReturnType<FakeFleetClient['waitForInjected']> {
+        this.messages.push(input)
+        const eventId = `fake-${this.messages.length}`
+        this.deliveryEvents.push({ kind: 'injected', to: input.to, eventId })
+        return { eventId, targets: undefined as unknown as string[] }
+      }
+    }
+    const mount = new FakeMountClient({ [issuePath(65)]: issueFile(65) })
+    const fleet = new UndefinedTargetsFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(65), issueFile(65))))).resolves.toMatchObject({
+      issue: { key: 'AR-65' },
+    })
+
+    expect(fleet.inputs).toEqual([
+      { name: 'ar-65-impl', data: '\r' },
+      { name: 'ar-65-review', data: '\r' },
+    ])
+    expect(fleet.deliveryEvents).toEqual([
+      { kind: 'injected', to: 'ar-65-impl', eventId: 'fake-1' },
+      { kind: 'input', name: 'ar-65-impl', data: '\r' },
+      { kind: 'injected', to: 'ar-65-review', eventId: 'fake-2' },
+      { kind: 'input', name: 'ar-65-review', data: '\r' },
+    ])
+  })
+
   it('reinjects the confirmed implementer task after delivery_failed', async () => {
     const mount = new FakeMountClient({ [issuePath(63)]: issueFile(63) })
     const fleet = new FakeFleetClient()
