@@ -4,6 +4,7 @@ import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
 import { createFactory, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import type { MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
@@ -446,6 +447,83 @@ describe('MountSlackWriteback', () => {
       thread_ts: '1780751612.176219',
       text: 'Full PR links:\nhttps://github.example/pr/1',
     })
+  })
+
+  it('returns the real Slack parent ts from the acked thread root when available', async () => {
+    class AckedSlackMountClient extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        this.files.set(path, {
+          content: {
+            provider: 'slack',
+            objectType: 'message',
+            payload: {
+              channel: 'C0FACTORY',
+              ts: '1780751612.176219',
+              text: 'Factory update',
+            },
+          },
+        })
+      }
+    }
+    const mount = new AckedSlackMountClient()
+    const slack = MountSlackWriteback(mount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+      clientIdPrefix: 'factory-e2e',
+    })
+
+    const root = await slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })
+    await slack.reply(root.threadId, 'Factory reply')
+
+    expect(root.threadId).toBe('1780751612.176219')
+    expect(mount.writes[1]?.path).toContain('/slack/channels/C0FACTORY__factory-e2e/messages/1780751612_176219/replies/')
+    expect(mount.writes[1]?.content).toMatchObject({
+      channelId: 'C0FACTORY',
+      thread_ts: '1780751612.176219',
+      text: 'Factory reply',
+    })
+  })
+
+  it('refuses Slack writes over a local mirror mount even if file writes appear acked', async () => {
+    const writes: Array<{ path: string; content: unknown }> = []
+    const localMirrorMount: MountClient = {
+      async readFile() {
+        return { content: {} }
+      },
+      async writeFile(path, content) {
+        writes.push({ path, content })
+      },
+      async deleteFile() {
+        throw new Error('local mirror delete is not used')
+      },
+      async listTree() {
+        return []
+      },
+      subscribe() {
+        return { unsubscribe: async () => undefined }
+      },
+      async getEvents() {
+        return { events: [] }
+      },
+      async confirmWrite() {
+        return 'acked'
+      },
+      async ensureSubRoot() {
+        return 'ready'
+      },
+    }
+    const slack = MountSlackWriteback(localMirrorMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    await expect(slack.reply('1780751612.176219', 'Factory reply'))
+      .rejects.toThrow(/requires RelayfileCloudMountClient cloud writeback transport/)
+    expect(writes).toEqual([])
   })
 
   it('surfaces non-acked thread writes even when local read-back succeeds', async () => {

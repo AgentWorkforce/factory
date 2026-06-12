@@ -61,6 +61,7 @@ export type RelayFileClientLike =
 
 export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
+  readonly writebackTransport = 'relayfile-cloud'
 
   readonly #client: RelayFileClientLike
   readonly #tokenProvider: TokenProvider

@@ -22,11 +22,20 @@ import type {
   TriageEngine,
 } from '../types'
 import { MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../writeback'
-import { asRecord, parseJsonContent, wrappedPayload } from '../writeback/shared'
+import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import { BatchTracker, type InFlightIssue, issueKey } from './batch-tracker'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
+type SlackThreadWatcher = { stop(): Promise<void> }
+type SlackReply = {
+  channelDir: string
+  threadTs: string
+  messageTs: string
+  isThreadReply: boolean
+  isBot: boolean
+  raw: Record<string, unknown>
+}
 
 const ISSUE_ROOT = '/linear/issues'
 const READY_EVENTS_LIMIT = 100
@@ -39,6 +48,8 @@ const STATE_NAME_TO_ID: Record<string, string> = {
   Done: LINEAR_STATE_IDS.done,
   'In Planning': LINEAR_STATE_IDS.inPlanning,
 }
+const SLACK_REPLY_EVENTS_LIMIT = 100
+const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -67,6 +78,9 @@ export class FactoryLoop implements Factory {
   readonly #criticalMessages = new Map<string, { issue: IssueRef; input: Parameters<FleetClient['sendMessage']>[0] }>()
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #resumedExitKeys = new Set<string>()
+  readonly #slackThreadIds = new Map<string, string>()
+  readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
+  readonly #slackWatcherStarts = new Map<string, Promise<void>>()
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
@@ -90,7 +104,7 @@ export class FactoryLoop implements Factory {
       stateIds: config.stateIds,
       safety: config.safety,
     })
-    this.#slack = ports.slack ?? (config.slack ? MountSlackWriteback(ports.mount, config.slack) : undefined)
+    this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     void (ports.github ?? MountGithubRead(ports.mount))
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
@@ -152,6 +166,10 @@ export class FactoryLoop implements Factory {
     this.#livePollInFlight = false
     await this.#subscription?.unsubscribe()
     this.#subscription = undefined
+    await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
+    this.#slackWatchers.clear()
+    this.#slackThreadIds.clear()
+    this.#slackWatcherStarts.clear()
     this.#offAgentExit?.()
     this.#offDeliveryFailed?.()
     this.#offAgentExit = undefined
@@ -416,6 +434,7 @@ export class FactoryLoop implements Factory {
       record.result = result
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: decision.issue, result })
+      await this.#ensureSlackDispatchThread(record, result)
       await this.#sendCriticalReviewerMessage(record)
       return result
     } catch (error) {
@@ -731,6 +750,7 @@ export class FactoryLoop implements Factory {
 
       this.#increment('done')
       this.#emit('issue-done', { issue: record.issue })
+      await this.#stopSlackWatcher(record.issue)
       const next = this.#batch.complete(record.issue)
       if (next) {
         await this.dispatch(next.decision, { dryRun: next.dryRun })
@@ -754,6 +774,201 @@ export class FactoryLoop implements Factory {
 
   #increment(name: string): void {
     this.#counters[name] = (this.#counters[name] ?? 0) + 1
+  }
+
+  async #ensureSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
+    if (!this.#slack || !this.#config.slack || result.dryRun) {
+      return
+    }
+
+    const key = issueKey(record.issue)
+    if (this.#slackThreadIds.has(key) || this.#slackWatcherStarts.has(key)) {
+      try {
+        await this.#slackWatcherStarts.get(key)
+      } catch {
+        // The initiator logs Slack watcher startup failures.
+      }
+      return
+    }
+
+    const start = this.#postAndWatchSlackDispatchThread(record, result)
+    this.#slackWatcherStarts.set(key, start)
+    try {
+      await start
+    } catch (error) {
+      this.#logger.warn?.(`[factory] failed to establish Slack dispatch thread for ${record.issue.key}`, error)
+    } finally {
+      this.#slackWatcherStarts.delete(key)
+    }
+  }
+
+  async #postAndWatchSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
+    if (!this.#slack || !this.#config.slack) {
+      return
+    }
+
+    const root = await this.#slack.postThread({
+      channel: this.#config.slack.channel,
+      text: [
+        `${record.issue.key}: factory agents dispatched.`,
+        `State: ${result.stateId ?? 'dispatching'}`,
+        `Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+      ].join('\n'),
+    })
+    this.#slackThreadIds.set(issueKey(record.issue), root.threadId)
+    await this.#watchSlackThread(record, root.threadId)
+  }
+
+  async #watchSlackThread(record: InFlightIssue, threadId: string): Promise<void> {
+    if (!this.#config.slack) {
+      return
+    }
+
+    const key = issueKey(record.issue)
+    if (this.#slackWatchers.has(key)) {
+      return
+    }
+
+    const channelDir = this.#config.slack.channel
+    const messagesPrefix = slackChannelMessagesPrefix(channelDir)
+    const preExistingPaths = new Set<string>()
+    const seenReplies = new Set<string>()
+    let missingIdentityLogged = false
+    let cursor: string | undefined
+    let stopped = false
+
+    const markPreExisting = async (): Promise<void> => {
+      try {
+        const page = await this.#mount.getEvents({ limit: SLACK_REPLY_EVENTS_LIMIT })
+        cursor = page.nextCursor ?? undefined
+        for (const event of page.events) {
+          if (event.resource.path.startsWith(messagesPrefix)) {
+            preExistingPaths.add(event.resource.path)
+          }
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] unable to seed Slack reply watcher event cursor', error)
+      }
+    }
+
+    const handle = async (event: ChangeEvent): Promise<void> => {
+      try {
+        if (stopped || !event.resource.path.startsWith(messagesPrefix)) {
+          return
+        }
+
+        const eventKey = eventIdentity(event)
+        if (!eventKey) {
+          if (!missingIdentityLogged) {
+            missingIdentityLogged = true
+            this.#logger.warn?.('[factory] Slack reply event missing stable identity; falling back to path/content dedupe')
+          }
+        }
+
+        if (preExistingPaths.has(event.resource.path)) {
+          return
+        }
+
+        const reply = await this.#readSlackReply(event.resource.path)
+        if (!reply || !reply.isThreadReply || reply.threadTs !== threadId || reply.channelDir !== channelDir) {
+          return
+        }
+
+        const replyKey = `${eventKey ?? event.resource.path}:${stableHash(JSON.stringify(reply.raw))}`
+        if (seenReplies.has(replyKey)) {
+          this.#logger.debug?.('[factory] suppressed duplicate Slack reply payload', { issue: record.issue.key, path: event.resource.path })
+          return
+        }
+        seenReplies.add(replyKey)
+
+        if (reply.isBot) {
+          return
+        }
+
+        await this.#respondToSlackStatus(record, threadId)
+      } catch (error) {
+        this.#logger.error?.('[factory] failed to handle Slack reply event', error)
+      }
+    }
+
+    await markPreExisting()
+
+    let subscription: Subscription | undefined
+    try {
+      subscription = this.#mount.subscribe([`${messagesPrefix}**`], (event) => {
+        void handle(event)
+      })
+    } catch (error) {
+      this.#logger.warn?.('[factory] Slack reply subscribe failed; relying on event polling', error)
+    }
+
+    const poll = async (): Promise<void> => {
+      while (!stopped) {
+        try {
+          const page = await this.#mount.getEvents({ cursor, limit: SLACK_REPLY_EVENTS_LIMIT })
+          cursor = page.nextCursor ?? cursor
+          for (const event of page.events) {
+            await handle(event)
+          }
+        } catch (error) {
+          this.#logger.warn?.('[factory] Slack reply polling failed', error)
+        }
+        await unrefDelay(SLACK_REPLY_POLL_INTERVAL_MS)
+      }
+    }
+    void poll()
+
+    this.#slackWatchers.set(key, {
+      stop: async () => {
+        stopped = true
+        await subscription?.unsubscribe()
+      },
+    })
+  }
+
+  async #stopSlackWatcher(issue: IssueRef): Promise<void> {
+    const key = issueKey(issue)
+    const watcher = this.#slackWatchers.get(key)
+    this.#slackWatchers.delete(key)
+    this.#slackThreadIds.delete(key)
+    await watcher?.stop()
+  }
+
+  async #readSlackReply(path: string): Promise<SlackReply | undefined> {
+    try {
+      const { content } = await this.#mount.readFile(path)
+      return parseSlackReply(path, content, this.#config.slack?.botUserId ?? 'U0B2596R7EZ')
+    } catch (error) {
+      this.#logger.warn?.(`Unable to read Slack reply ${path}`, error)
+      return undefined
+    }
+  }
+
+  async #respondToSlackStatus(record: InFlightIssue, threadId: string): Promise<void> {
+    if (!this.#slack || !this.#config.slack) {
+      return
+    }
+
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue || !isInFactoryScope(issue, this.#config.safety)) {
+      return
+    }
+
+    const [roster, probe] = await Promise.all([
+      this.#fleet.roster(),
+      this.#probePrResolver(issue),
+    ])
+    const activeAgents = new Set(record.agents.keys())
+    const liveAgents = roster.agents
+      .map((agent) => agent.name)
+      .filter((name) => activeAgents.has(name))
+      .sort()
+
+    await this.#slack.reply(threadId, [
+      `${issue.key}: ${issueStateLabel(issue)}`,
+      `Agents: ${liveAgents.join(', ') || [...activeAgents].sort().join(', ') || 'none'}`,
+      `PR: ${probe ? githubPrUrl(probe.repo, probe.prNumber) : 'not found yet'}`,
+    ].join('\n'))
   }
 
   async #closeProbeIfRequired(issue: LinearIssue): Promise<void> {
@@ -1071,3 +1286,56 @@ const isCompletionReason = (reason?: string): boolean =>
 
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
   spec.role === 'implementer' ? { maxRestarts: 3, strategy: 'resume' } as AgentSpec['restartPolicy'] : spec.restartPolicy
+
+const slackPayloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
+
+const slackChannelMessagesPrefix = (channelDir: string): string => `/slack/channels/${channelDir}/messages/`
+
+const eventIdentity = (event: ChangeEvent): string | undefined => {
+  const record = event as unknown as Record<string, unknown>
+  const rawId = record.id ?? record.event_id ?? record.seq
+  const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId) : undefined
+  return id ? `event:${id}` : undefined
+}
+
+const parseSlackReply = (path: string, content: unknown, botUserId: string): SlackReply | undefined => {
+  const raw = asRecord(parseJsonContent(content)) ?? {}
+  const payload = wrappedPayload(raw)
+  const channelDir = path.match(/^\/slack\/channels\/([^/]+)\//u)?.[1] ?? ''
+  const pathMatch = path.match(/^\/slack\/channels\/[^/]+\/messages\/([^/]+)(?:\/replies\/([^/]+))?/u)
+  const parentFromPath = pathMatch?.[2] ? slackPayloadTs(pathMatch[1]) : undefined
+  const messageFromPath = slackPayloadTs(pathMatch?.[2] ?? pathMatch?.[1] ?? '')
+  const messageTs = stringValue(payload.ts) ?? messageFromPath
+  const threadTs = stringValue(payload.thread_ts) ?? parentFromPath
+  if (!channelDir || !threadTs || !messageTs) {
+    return undefined
+  }
+
+  return {
+    channelDir,
+    threadTs,
+    messageTs,
+    isThreadReply: Boolean(parentFromPath) || threadTs !== messageTs,
+    isBot: isOwnSlackBotReply(payload, botUserId),
+    raw,
+  }
+}
+
+const isOwnSlackBotReply = (payload: Record<string, unknown>, botUserId: string): boolean =>
+  payload.user_is_bot === true ||
+  stringValue(payload.user) === botUserId
+
+const issueStateLabel = (issue: LinearIssue): string => {
+  const name = issue.state?.name?.trim()
+  if (name && issue.stateId) {
+    return `${name} (${issue.stateId})`
+  }
+  return name || issue.stateId || 'unknown state'
+}
+
+const githubPrUrl = (repo: string, prNumber: number): string => `https://github.com/${repo}/pull/${prNumber}`
+
+const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
+  const timer = setTimeout(resolve, ms)
+  timer.unref?.()
+})

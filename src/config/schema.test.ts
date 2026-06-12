@@ -34,6 +34,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',
+      botUserId: 'U0B2596R7EZ',
     })
     expect(parsed.mergePolicy).toBe('never')
     expect(parsed.stateIds).toEqual(LINEAR_STATE_IDS)

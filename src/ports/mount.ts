@@ -20,6 +20,7 @@ export interface EventPage {
 }
 
 export interface MountClient {
+  readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>

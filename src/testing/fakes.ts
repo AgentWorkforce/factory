@@ -16,6 +16,7 @@ type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 
 export class FakeMountClient implements MountClient {
+  readonly writebackTransport = 'test'
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []

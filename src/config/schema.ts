@@ -32,6 +32,7 @@ export const FactoryConfigSchema = z.object({
   slack: z.object({
     channel: z.string(),
     style: z.literal('threaded-summarized').default('threaded-summarized'),
+    botUserId: z.string().default('U0B2596R7EZ'),
   }).optional(),
   mergePolicy: z.enum(['never', 'on-green-with-review']).default('never'),
   stateIds: z.object({
