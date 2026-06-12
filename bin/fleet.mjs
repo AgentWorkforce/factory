@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
@@ -11,10 +10,13 @@ const here = dirname(fileURLToPath(import.meta.url))
 const packageRoot = join(here, '..')
 const repoRoot = join(packageRoot, '..', '..')
 const entry = join(packageRoot, 'src', 'cli', 'fleet.ts')
-const cacheDir = join(tmpdir(), 'pear-factory-sdk')
+const launcher = fileURLToPath(import.meta.url)
+const cacheDir = join(repoRoot, 'node_modules', '.cache', 'pear-factory-sdk')
 const hash = createHash('sha256')
   .update(entry)
   .update(String(statSync(entry).mtimeMs))
+  .update(launcher)
+  .update(String(statSync(launcher).mtimeMs))
   .digest('hex')
   .slice(0, 16)
 const outfile = join(cacheDir, `fleet-${hash}.mjs`)
@@ -29,6 +31,7 @@ if (!existsSync(outfile)) {
     entryPoints: [entry],
     outfile,
     bundle: true,
+    packages: 'external',
     platform: 'node',
     format: 'esm',
     banner: { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
