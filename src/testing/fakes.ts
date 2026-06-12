@@ -41,7 +41,7 @@ export class FakeMountClient implements MountClient {
     return { ...entry }
   }
 
-  async writeFile(path: string, content: unknown): Promise<void> {
+  async writeFile(path: string, content: unknown, _opts?: { guarded?: boolean }): Promise<void> {
     const revision = String((Number(this.files.get(path)?.revision ?? 0) || 0) + 1)
     const existing = this.files.get(path)?.content
     const storedContent = mergedLinearIssueContent(existing, content) ?? content

@@ -28,6 +28,7 @@ const issuePayload = (n: number, stateId = ready) => ({
   title: `[factory-e2e] Fix factory issue ${n}`,
   description: 'Implement the requested fix in packages/factory-sdk/src/orchestrator/factory.ts and verify it with tests.',
   stateId,
+  url: `https://linear.app/agent-relay/issue/AR-${n}/factory-issue-${n}`,
   labels: undefined,
   labelIds: ['label-id-not-used-by-parser'],
   team: { key: 'AR', name: 'Agent Relay' },
@@ -124,6 +125,29 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('maps state_name-only Ready for Agent records to the configured ready state id', () => {
+    expect(parseLinearIssue(issuePath(26), {
+      provider: 'linear',
+      objectType: 'issue',
+      objectId: 'uuid-26',
+      payload: {
+        id: 'uuid-26',
+        identifier: 'AR-26',
+        title: '[factory-e2e] State name only',
+        description: 'Factory-created issue synced without stateId',
+        url: 'https://linear.app/agent-relay/issue/AR-26/state-name-only',
+        state_name: 'Ready for Agent',
+        labels: undefined,
+        team: { key: 'AR', name: 'Agent Relay' },
+      },
+    })).toMatchObject({
+      uuid: 'uuid-26',
+      key: 'AR-26',
+      stateId: ready,
+      state: { name: 'Ready for Agent' },
+    })
+  })
+
   it('runOnce caps active issues, skips stale state, and pulls queued work after completion', async () => {
     const mount = new FakeMountClient({
       [issuePath(1)]: issueFile(1),
@@ -187,6 +211,79 @@ describe('FactoryLoop', () => {
     expect(triage.count).toBe(0)
     expect(fleet.spawns).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('skips factory-marked draft issues that are not reconciled provider records', async () => {
+    const draftPath = '/linear/issues/AR-E2ECANARY.json'
+    const mount = new FakeMountClient({
+      [draftPath]: {
+        provider: 'linear',
+        objectType: 'issue',
+        payload: {
+          id: 'draft-id',
+          identifier: 'AR-E2ECANARY',
+          title: '[factory-e2e] Draft should not dispatch',
+          description: 'Synthetic draft',
+          stateId: ready,
+          team: { key: 'AR', name: 'Agent Relay' },
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const triage = new CountingTriage()
+    const factory = createFactory(config(), { mount, fleet, triage })
+
+    const report = await factory.runOnce()
+
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: 'draft-id', key: 'AR-E2ECANARY', path: draftPath },
+      reason: 'not reconciled real Linear issue',
+    })
+    expect(triage.count).toBe(0)
+    expect(fleet.spawns).toEqual([])
+    expect(mount.writes).toEqual([])
+  })
+
+  it('refuses explicit dispatch for factory-marked issues without a provider URL', async () => {
+    const draft = {
+      ...issueFile(24),
+      payload: {
+        ...issuePayload(24),
+        url: undefined,
+      },
+    }
+    const mount = new FakeMountClient({ [issuePath(24)]: draft })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(24), draft))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(/not reconciled real Linear issue/)
+    expect(fleet.spawns).toEqual([])
+    expect(mount.writes).toEqual([])
+  })
+
+  it('dispatches factory-scoped real issues that only carry state_name for readiness', async () => {
+    const path = issuePath(27)
+    const stateNameOnly = {
+      provider: 'linear',
+      objectType: 'issue',
+      objectId: 'uuid-27',
+      payload: {
+        ...issuePayload(27),
+        stateId: undefined,
+        state: undefined,
+        state_name: 'Ready for Agent',
+      },
+    }
+    const mount = new FakeMountClient({ [path]: stateNameOnly })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-27'])
+    expect(report.skipped).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-27-impl', 'ar-27-review'])
   })
 
   it('refuses explicit dispatch for issues outside factory-e2e scope before spawning', async () => {
@@ -418,6 +515,47 @@ describe('FactoryLoop', () => {
     await expect(factory.dispatch(decision)).rejects.toThrow('Writeback not acked')
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-9' } })
+  })
+
+  it('logs and continues when best-effort dispatch comment writeback fails', async () => {
+    const mount = new FakeMountClient({ [issuePath(25)]: issueFile(25) })
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[] = []
+    const linear: LinearWriteback = {
+      async postComment() {
+        throw new Error('unsupported Linear writeback path')
+      },
+      async setState(issue, stateId) {
+        await mount.writeFile(issue.path, { stateId })
+      },
+      async createIssue() {
+        throw new Error('not used')
+      },
+      async verify() {
+        return true
+      },
+    }
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear,
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => {},
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(25), issueFile(25)))
+
+    await expect(factory.dispatch(decision)).resolves.toMatchObject({
+      issue: { key: 'AR-25' },
+      stateId: implementing,
+    })
+    expect(warnings[0]).toEqual([
+      '[factory] comment writeback skipped',
+      expect.objectContaining({ message: 'unsupported Linear writeback path' }),
+    ])
+    expect(mount.writes).toContainEqual({ path: issuePath(25), content: { stateId: implementing } })
   })
 
   it('closes a synthetic probe PR after done writebacks and before release when mergePolicy is never', async () => {

@@ -9,5 +9,5 @@ export const linearIssuePath = (key: string, uuid: string) => `/linear/issues/${
 
 export const linearByStatePath = (slug: string) => `/linear/issues/by-state/${slug}/`
 
-export const linearCommentPath = (issuePath: string, name: string) =>
-  `${issuePath}/comments/${name}.json`
+export const linearCommentPath = (_issuePath: string, name: string) =>
+  `/linear/comments/${name}.json`

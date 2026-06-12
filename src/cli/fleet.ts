@@ -6,6 +6,7 @@ import {
   closeProbePr,
   createFactory,
   createFleet,
+  isInFactoryScope,
   parseLinearIssue,
   type Capability,
   type Factory,
@@ -251,8 +252,64 @@ async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefin
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
   if (deps.mount) return deps.mount
   if (loaded.fixtureFiles) return new FakeMountClient(loaded.fixtureFiles)
-  return RelayfileCloudMountClient.fromConfig({ workspaceId: loaded.config.workspaceId })
+  let mount: MountClient
+  mount = await RelayfileCloudMountClient.fromConfig({
+    workspaceId: loaded.config.workspaceId,
+    isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
+  })
+  return mount
 }
+
+async function isAllowedFactoryDraft(
+  path: string,
+  content: unknown,
+  opts: { guarded?: boolean } | undefined,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<boolean> {
+  if (!opts?.guarded) return false
+
+  if (path.startsWith('/linear/issues/')) {
+    if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
+    try {
+      const issue = parseLinearIssue(path, (await mount.readFile(path)).content)
+      return isInFactoryScope(issue, config.safety)
+    } catch {
+      return false
+    }
+  }
+
+  if (path.startsWith('/linear/comments/')) {
+    const issueKey = path.split('/').at(-1)?.split('__')[0]
+    if (!issueKey) return false
+    const candidates = await mount.listTree('/linear/issues/')
+    const issuePath = candidates.find((candidate) =>
+      candidate.startsWith(`/linear/issues/${issueKey}__`) ||
+      candidate === `/linear/issues/${issueKey}.json`
+    )
+    if (!issuePath) return false
+    try {
+      const issue = parseLinearIssue(issuePath, (await mount.readFile(issuePath)).content)
+      return isInFactoryScope(issue, config.safety)
+    } catch {
+      return false
+    }
+  }
+
+  if (/^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)) {
+    return true
+  }
+
+  return false
+}
+
+const scopeIssueFromDraftContent = (content: unknown) => ({
+  title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',
+  team: typeof asRecord(asRecord(content)?.team)?.key === 'string'
+    ? asRecord(asRecord(content)?.team)?.key as string
+    : undefined,
+  raw: asRecord(content),
+})
 
 async function readIssueArg(mount: MountClient, issueArg: string) {
   const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg)

@@ -26,6 +26,7 @@ const issueFile = {
     identifier: 'AR-77',
     title: '[factory-e2e] CLI dry run',
     description: 'Implement a small fix in packages/factory-sdk/src/cli/fleet.ts and verify with tests. Ensure the fleet CLI parses arguments, calls the SDK facades, prints an IterationReport, and keeps dry-run execution free of writes or spawns.',
+    url: 'https://linear.app/agent-relay/issue/AR-77/cli-dry-run',
     stateId: LINEAR_STATE_IDS.readyForAgent,
     labels: ['pear'],
     team: { key: 'AR', name: 'Agent Relay' },

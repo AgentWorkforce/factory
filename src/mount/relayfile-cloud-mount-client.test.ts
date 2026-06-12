@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { OperationStatusResponse } from '@relayfile/sdk'
 
 import { RelayfileCloudMountClient, type RelayFileClientLike } from './relayfile-cloud-mount-client'
 
@@ -16,6 +17,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
 
   files = new Map<string, { revision: string; content: string; contentType: string }>()
+  ops = new Map<string, OperationStatusResponse>()
   events = [{
     eventId: 'evt-1',
     type: 'file.updated' as const,
@@ -76,10 +78,14 @@ class FakeRelayFileClient implements RelayFileClientLike {
 
   async getOp(workspaceId: string, opId: string) {
     this.getOpCalls.push({ workspaceId, opId })
-    return {
+    return this.ops.get(opId) ?? {
       opId,
       status: 'succeeded' as const,
       attemptCount: 1,
+      providerResult: {
+        status: 200,
+        externalId: 'linear-id',
+      },
     }
   }
 
@@ -100,7 +106,7 @@ describe('RelayfileCloudMountClient', () => {
       content: '{"payload":{"identifier":"AR-1"}}',
       contentType: 'application/json',
     })
-    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake, isAllowedDraft: () => true })
 
     await expect(mount.readFile('/linear/issues/AR-1.json')).resolves.toEqual({
       content: { payload: { identifier: 'AR-1' } },
@@ -127,7 +133,7 @@ describe('RelayfileCloudMountClient', () => {
       content: '{"stateId":"old"}',
       contentType: 'application/json',
     })
-    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake, isAllowedDraft: () => true })
 
     await mount.writeFile('/linear/issues/AR-1.json', { stateId: 'new' })
 
@@ -142,13 +148,142 @@ describe('RelayfileCloudMountClient', () => {
 
   it('uses baseRevision 0 for creates and confirms the queued operation', async () => {
     const fake = new FakeRelayFileClient()
-    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
 
     await mount.writeFile('/linear/issues/new.json', { title: 'new' })
 
     expect(fake.writeFileCalls[0]?.baseRevision).toBe('0')
     await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('acked')
     expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
+  })
+
+  it('fails closed on unpollable write confirmations for legacy clients and restarted instances', async () => {
+    const fake = new FakeRelayFileClient()
+    const clientWithoutGetOp: RelayFileClientLike = {
+      readFile: fake.readFile.bind(fake),
+      writeFile: fake.writeFile.bind(fake),
+      listTree: fake.listTree.bind(fake),
+      getEvents: fake.getEvents.bind(fake),
+      getResourceAtEvent: fake.getResourceAtEvent.bind(fake),
+      getToken: fake.getToken.bind(fake),
+      getBaseUrl: fake.getBaseUrl.bind(fake),
+    }
+    const legacyMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: clientWithoutGetOp,
+      isAllowedDraft: () => true,
+    })
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await legacyMount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(legacyMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
+    await expect(restartedMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
+    expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('refuses provider writeback paths when the draft predicate is unset or rejects', async () => {
+    const fake = new FakeRelayFileClient()
+    const unset = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+    const rejecting = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => false,
+    })
+
+    await expect(unset.writeFile('/linear/issues/new.json', { title: 'Real work' }))
+      .rejects.toThrow(/draft predicate rejected or is unset/)
+    await expect(rejecting.writeFile('/slack/channels/C123/messages/root.json', { text: 'Wrong channel' }))
+      .rejects.toThrow(/draft predicate rejected or is unset/)
+    expect(fake.writeFileCalls).toEqual([])
+  })
+
+  it('allows markerless provider writes only when the injected predicate approves the guarded draft', async () => {
+    const fake = new FakeRelayFileClient()
+    const calls: Array<{ path: string; content: unknown; guarded?: boolean }> = []
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: async (path, content, opts) => {
+        calls.push({ path, content, guarded: opts?.guarded })
+        return opts?.guarded === true && path === '/linear/issues/AR-1__uuid-1.json'
+      },
+    })
+
+    await mount.writeFile('/linear/issues/AR-1__uuid-1.json', { stateId: 'implementing' }, { guarded: true })
+
+    expect(calls).toEqual([{
+      path: '/linear/issues/AR-1__uuid-1.json',
+      content: { stateId: 'implementing' },
+      guarded: true,
+    }])
+    expect(fake.writeFileCalls).toHaveLength(1)
+  })
+
+  it('does not confirm a succeeded draft op without providerResult 200 and externalId', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: { status: 200 },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 }))
+      .rejects.toThrow(/provider result incomplete/)
+  })
+
+  it('keeps polling queued and running ops instead of treating them as acked', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'running',
+      attemptCount: 1,
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
+  })
+
+  it('surfaces provider writeback lastError on failed ops', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'Field "id" is read-only and cannot be written',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 }))
+      .rejects.toThrow(/Field "id" is read-only/)
   })
 
   it('delegates subscribe through the workspace-scoped event client', () => {

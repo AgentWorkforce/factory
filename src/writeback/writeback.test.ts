@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
@@ -8,18 +8,29 @@ import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
 const issuePath = '/linear/issues/AR-99__04ef067e-35b6-4ec4-81e7-66acc1f2e31f.json'
+const issueUuid = '04ef067e-35b6-4ec4-81e7-66acc1f2e31f'
+const issueKey = 'AR-99'
+const issueTitle = '[factory-e2e] Reviewer merge on green'
+const issueDescription = 'Dispatch reviewer after green checks'
 
 const issue: LinearIssue = {
-  uuid: '04ef067e-35b6-4ec4-81e7-66acc1f2e31f',
-  key: 'AR-99',
-  title: '[factory-e2e] Reviewer merge on green',
-  description: 'Dispatch reviewer after green checks',
+  uuid: issueUuid,
+  key: issueKey,
+  title: issueTitle,
+  description: issueDescription,
   stateId: 'ready-state',
   state: { name: 'Ready for Agent' },
   labels: [],
   path: issuePath,
   raw: {
     payload: {
+      id: issueUuid,
+      identifier: issueKey,
+      title: issueTitle,
+      description: issueDescription,
+      stateId: 'ready-state',
+      labelIds: ['label-id-not-used-by-guard'],
+      team: { key: 'AR', name: 'Agent Relay' },
       url: 'https://linear.app/agent-relay/issue/AR-99/reviewer-merge-on-green',
     },
   },
@@ -32,10 +43,10 @@ const wrappedIssueRecord = (overrides: Record<string, unknown> = {}) => ({
   deleted: false,
   connectionId: 'linear-connection',
   payload: {
-    id: issue.uuid,
-    identifier: issue.key,
-    title: issue.title,
-    description: issue.description,
+    id: issueUuid,
+    identifier: issueKey,
+    title: issueTitle,
+    description: issueDescription,
     stateId: issue.stateId,
     labels: undefined,
     labelIds: ['label-id-not-used-by-guard'],
@@ -46,7 +57,13 @@ const wrappedIssueRecord = (overrides: Record<string, unknown> = {}) => ({
 })
 
 describe('MountLinearWriteback', () => {
-  it('writes only stateId to the canonical AR-prefixed issue file and verifies read-back', async () => {
+  beforeEach(() => {
+    issue.stateId = 'ready-state'
+    const payload = issue.raw.payload as Record<string, unknown>
+    payload.stateId = 'ready-state'
+  })
+
+  it('writes a full writable issue record with only stateId changed and verifies read-back', async () => {
     const mount = new FakeMountClient({
       [issuePath]: wrappedIssueRecord(),
     })
@@ -55,9 +72,129 @@ describe('MountLinearWriteback', () => {
     await linear.setState(issue, 'implementing-state')
 
     expect(mount.writes).toEqual([
-      { path: issuePath, content: { stateId: 'implementing-state' } },
+      {
+        path: issuePath,
+        content: {
+          title: issueTitle,
+          stateId: 'implementing-state',
+          description: issueDescription,
+          labelIds: ['label-id-not-used-by-guard'],
+        },
+      },
     ])
     expect(await linear.verify(issue, { stateId: 'implementing-state' })).toBe(true)
+  })
+
+  it('builds setState from in-memory writable fields instead of the live mount read', async () => {
+    const richIssue: LinearIssue = {
+      ...issue,
+      raw: {
+        payload: {
+          ...(issue.raw.payload as Record<string, unknown>),
+          team: { key: 'AR', id: 'team-ar', name: 'Agent Relay' },
+          priority: 2,
+          assigneeId: 'assignee-1',
+          parentId: 'parent-1',
+          projectId: 'project-1',
+          estimate: 5,
+        },
+      },
+    }
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({
+        description: 'stale live description must not be used for RMW',
+        labelIds: ['stale-label'],
+      }),
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await linear.setState(richIssue, 'implementing-state')
+
+    expect(mount.writes).toEqual([
+      {
+        path: issuePath,
+        content: {
+          title: issueTitle,
+          teamId: 'team-ar',
+          stateId: 'implementing-state',
+          description: issueDescription,
+          priority: 2,
+          assigneeId: 'assignee-1',
+          labelIds: ['label-id-not-used-by-guard'],
+          parentId: 'parent-1',
+          projectId: 'project-1',
+          estimate: 5,
+        },
+      },
+    ])
+  })
+
+  it('keeps back-to-back setState writes title-bearing through a partial draft window', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord(),
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await linear.setState(issue, 'implementing-state')
+    mount.files.set(issuePath, { content: { stateId: 'implementing-state' } })
+    await linear.setState(issue, 'done-state')
+
+    expect(mount.writes).toEqual([
+      {
+        path: issuePath,
+        content: {
+          title: issueTitle,
+          stateId: 'implementing-state',
+          description: issueDescription,
+          labelIds: ['label-id-not-used-by-guard'],
+        },
+      },
+      {
+        path: issuePath,
+        content: {
+          title: issueTitle,
+          stateId: 'done-state',
+          description: issueDescription,
+          labelIds: ['label-id-not-used-by-guard'],
+        },
+      },
+    ])
+    expect(issue.stateId).toBe('done-state')
+    expect((issue.raw.payload as Record<string, unknown>).stateId).toBe('done-state')
+  })
+
+  it('allows a comment immediately after setState when the live issue is a partial draft', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord(),
+    })
+    const linear = MountLinearWriteback(mount)
+    const body = 'Agent dispatched after state update'
+
+    await linear.setState(issue, 'implementing-state')
+    mount.files.set(issuePath, { content: { stateId: 'implementing-state' } })
+    await linear.postComment(issue, body)
+
+    expect(mount.writes.at(-1)).toEqual({
+      path: linearCommentPath(issuePath, linearCommentName(issue, body)),
+      content: {
+        body,
+        issueId: issue.uuid,
+      },
+    })
+  })
+
+  it('fails closed instead of writing when the in-memory issue is not title-bearing', async () => {
+    const partialIssue: LinearIssue = {
+      ...issue,
+      raw: { payload: { stateId: 'ready-state' } },
+    }
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord(),
+    })
+
+    await expect(MountLinearWriteback(mount).setState(partialIssue, 'implementing-state'))
+      .rejects.toThrow(/missing title-bearing canonical issue payload/)
+    expect(mount.writes).toEqual([])
   })
 
   it('returns false on stale state read-back mismatches', async () => {
@@ -85,20 +222,11 @@ describe('MountLinearWriteback', () => {
         path: commentPath,
         content: {
           body,
-          botActor: '',
-          isArtificialAgentSessionRoot: false,
-          issue: {
-            id: issue.uuid,
-            identifier: issue.key,
-            title: issue.title,
-            url: 'https://linear.app/agent-relay/issue/AR-99/reviewer-merge-on-green',
-          },
-          issue_id: issue.uuid,
           issueId: issue.uuid,
         },
       },
     ])
-    expect(commentPath).toContain('/linear/issues/AR-99__04ef067e-35b6-4ec4-81e7-66acc1f2e31f.json/comments/')
+    expect(commentPath).toContain('/linear/comments/AR-99__factory-')
     expect(commentPath).toMatch(/\/comments\/[^/]+\.json$/)
     expect(commentPath.endsWith('.json.json')).toBe(false)
     expect(await linear.verify(issue, { commentName })).toBe(true)
@@ -112,7 +240,7 @@ describe('MountLinearWriteback', () => {
     const linear = MountLinearWriteback(mount)
 
     await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/not acked/)
-    expect(await linear.verify(issue, { stateId: 'implementing-state' })).toBe(true)
+    await expect(linear.verify(issue, { stateId: 'implementing-state' })).rejects.toThrow(/not acked/)
   })
 
   it('surfaces stale writebacks instead of swallowing read-back failures', async () => {
@@ -180,7 +308,15 @@ describe('MountLinearWriteback', () => {
     await expect(MountLinearWriteback(mount).setState(issue, 'implementing-state'))
       .resolves.toBeUndefined()
     expect(mount.writes).toEqual([
-      { path: issuePath, content: { stateId: 'implementing-state' } },
+      {
+        path: issuePath,
+        content: {
+          title: issueTitle,
+          stateId: 'implementing-state',
+          description: issueDescription,
+          labelIds: ['label-id-not-used-by-guard'],
+        },
+      },
     ])
   })
 
@@ -226,7 +362,11 @@ describe('MountLinearWriteback', () => {
       id: 'uuid-new',
       identifier: 'AR-NEW',
       title: '[factory-e2e] synthetic issue',
+      teamId: 'team-ar',
       team: { key: 'AR', name: 'Agent Relay' },
+      stateId: 'ready-state',
+      description: 'Create only with writable fields',
+      url: 'https://linear.invalid/read-only',
     })).resolves.toEqual({
       path: '/linear/issues/AR-NEW__uuid-new.json',
     })
@@ -234,10 +374,10 @@ describe('MountLinearWriteback', () => {
     expect(mount.writes).toEqual([{
       path: '/linear/issues/AR-NEW__uuid-new.json',
       content: {
-        id: 'uuid-new',
-        identifier: 'AR-NEW',
         title: '[factory-e2e] synthetic issue',
-        team: { key: 'AR', name: 'Agent Relay' },
+        teamId: 'team-ar',
+        stateId: 'ready-state',
+        description: 'Create only with writable fields',
       },
     }])
   })
@@ -249,14 +389,13 @@ describe('MountLinearWriteback', () => {
       id: 'uuid-no-team',
       identifier: 'AR-NO-TEAM',
       title: '[factory-e2e] synthetic issue with sparse sync',
+      state: { id: 'read-only-state' },
     })).resolves.toEqual({
       path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
     })
     expect(mount.writes).toEqual([{
       path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
       content: {
-        id: 'uuid-no-team',
-        identifier: 'AR-NO-TEAM',
         title: '[factory-e2e] synthetic issue with sparse sync',
       },
     }])
@@ -454,5 +593,47 @@ describe('createFactory writeback defaults', () => {
       mount: new FakeMountClient(),
       fleet: new FakeFleetClient(),
     })).not.toThrow()
+  })
+
+  it('installs a default draft predicate that rereads markerless Linear targets', async () => {
+    class GuardedMountClient extends FakeMountClient {
+      predicate?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
+
+      setDefaultAllowedDraftPredicate(
+        predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
+      ): void {
+        this.predicate = predicate
+      }
+
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        if (path.startsWith('/linear/') && await this.predicate?.(path, content, opts) !== true) {
+          throw new Error(`draft rejected for ${path}`)
+        }
+        await super.writeFile(path, content, opts)
+      }
+    }
+
+    const config = FactoryConfigSchema.parse({
+      workspaceId: 'rw_test',
+      repos: { byLabel: { factory: 'AgentWorkforce/pear' } },
+      slack: { channel: 'C0AD7UU0J1G__proj-cloud' },
+    })
+    const mount = new GuardedMountClient({
+      [issuePath]: wrappedIssueRecord(),
+    })
+    createFactory(config, {
+      mount,
+      fleet: new FakeFleetClient(),
+    })
+
+    await expect(mount.writeFile(issuePath, { stateId: 'implementing-state' }, { guarded: true }))
+      .resolves.toBeUndefined()
+
+    const body = 'best effort markerless comment'
+    await expect(mount.writeFile(
+      linearCommentPath(issuePath, linearCommentName(issue, body)),
+      { body, issueId: issue.uuid },
+      { guarded: true },
+    )).resolves.toBeUndefined()
   })
 })

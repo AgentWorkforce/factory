@@ -92,7 +92,7 @@ export const MountSlackWriteback = (
       const clientId = rootClientId(prefix, channelDir, text)
       const path = slackMessagePath(channelDir, clientId)
 
-      await mount.writeFile(path, { channelId, text })
+      await mount.writeFile(path, { channelId, text }, { guarded: true })
       await confirmPath(mount, path)
 
       threads.set(clientId, { channelDir, channelId, threadTs: clientId })
@@ -120,7 +120,7 @@ export const MountSlackWriteback = (
         channelId: ref.channelId,
         thread_ts: ref.threadTs,
         text: body,
-      })
+      }, { guarded: true })
       await confirmPath(mount, path)
     },
   }

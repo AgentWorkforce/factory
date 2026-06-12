@@ -41,6 +41,7 @@ export interface RelayfileCloudMountClientConfig {
   tokenProvider?: TokenProvider
   baseUrl?: string
   eventClient?: RelayfileEventClient
+  isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
 }
 
 export type RelayFileClientLike =
@@ -62,6 +63,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #tokenProvider: TokenProvider
   readonly #baseUrl?: string
   readonly #eventClient?: RelayfileEventClient
+  #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
 
   constructor(config: RelayfileCloudMountClientConfig = {}) {
@@ -74,6 +76,13 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
+    this.#isAllowedDraft = config.isAllowedDraft
+  }
+
+  setDefaultAllowedDraftPredicate(
+    predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
+  ): void {
+    this.#isAllowedDraft ??= predicate
   }
 
   static async fromConfig(config: RelayfileCloudMountClientConfig = {}): Promise<RelayfileCloudMountClient> {
@@ -106,7 +115,11 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
-  async writeFile(path: string, content: unknown): Promise<void> {
+  async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+    if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
+      throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
+    }
+
     const serialized = serializeContent(content)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
@@ -172,7 +185,7 @@ export class RelayfileCloudMountClient implements MountClient {
     opts: { timeoutMs?: number } = {},
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     const opId = this.#lastOpByPath.get(path)
-    if (!opId || !this.#client.getOp) return 'acked'
+    if (!opId || !this.#client.getOp) return 'timeout'
 
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
     for (;;) {
@@ -229,11 +242,39 @@ const isHttpStatus = (error: unknown, status: number): boolean => {
 const mapOperationStatus = (
   response: OperationStatusResponse,
 ): 'acked' | 'pending' | 'failed' => {
-  if (response.status === 'succeeded') return 'acked'
+  if (response.status === 'succeeded') {
+    const providerResult = response.providerResult
+    if (
+      providerResult &&
+      providerResult.status === 200 &&
+      typeof providerResult.externalId === 'string' &&
+      providerResult.externalId.length > 0
+    ) {
+      return 'acked'
+    }
+    throw new Error(`Writeback provider result incomplete for ${response.path ?? response.opId}: ${providerResultError(response)}`)
+  }
   if (response.status === 'failed' || response.status === 'dead_lettered' || response.status === 'canceled') {
-    return 'failed'
+    throw new Error(`Writeback operation failed for ${response.path ?? response.opId}: ${providerResultError(response)}`)
   }
   return 'pending'
 }
+
+const providerResultError = (response: OperationStatusResponse): string => {
+  const providerResult = response.providerResult
+  const resultError = typeof providerResult?.lastError === 'string'
+    ? providerResult.lastError
+    : typeof providerResult?.error === 'string'
+      ? providerResult.error
+      : typeof providerResult?.message === 'string'
+        ? providerResult.message
+        : undefined
+  return resultError ?? response.lastError ?? 'unknown provider error'
+}
+
+const isProviderWritebackPath = (path: string): boolean =>
+  path.startsWith('/linear/issues/') ||
+  path.startsWith('/linear/comments/') ||
+  /^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))

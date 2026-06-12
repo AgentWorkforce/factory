@@ -1,5 +1,5 @@
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
-import { linearByStatePath } from '../constants/linear'
+import { LINEAR_STATE_IDS, linearByStatePath } from '../constants/linear'
 import { GithubMergeGate, closeProbePr, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type { AgentSpec, FleetClient, LinearWriteback, MountClient, SlackWriteback, Subscription } from '../ports'
 import type { Clock, Logger } from '../ports/system'
@@ -28,6 +28,13 @@ type Listener = (payload: FactoryEventPayload) => void
 
 const ISSUE_ROOT = '/linear/issues'
 const READY_EVENTS_LIMIT = 100
+const STATE_NAME_TO_ID: Record<string, string> = {
+  'Ready for Agent': LINEAR_STATE_IDS.readyForAgent,
+  'Agent Implementing': LINEAR_STATE_IDS.agentImplementing,
+  Implementing: LINEAR_STATE_IDS.agentImplementing,
+  Done: LINEAR_STATE_IDS.done,
+  'In Planning': LINEAR_STATE_IDS.inPlanning,
+}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -65,6 +72,7 @@ export class FactoryLoop implements Factory {
   constructor(config: FactoryConfig, ports: FactoryPorts) {
     this.#config = config
     this.#mount = ports.mount
+    installFactoryDraftPredicate(this.#mount, config)
     this.#fleet = ports.fleet
     this.#triage = ports.triage ?? new TieredTriage(new HeuristicTriage())
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
@@ -155,6 +163,11 @@ export class FactoryLoop implements Factory {
         continue
       }
 
+      if (!isRealLinearIssue(issue)) {
+        skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+        continue
+      }
+
       const decision = await this.triageIssue(issue)
       triaged.push(decision)
       const result = await this.dispatch(decision, { dryRun })
@@ -177,9 +190,20 @@ export class FactoryLoop implements Factory {
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
+    const existingRecord = this.#batch.getIssue(decision.issue)
+    if (existingRecord?.result) {
+      return existingRecord.result
+    }
+
     const liveIssue = await this.#readIssue(decision.issue.path)
     if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
+      this.#error(error, decision.issue)
+      throw error
+    }
+
+    if (!isRealLinearIssue(liveIssue)) {
+      const error = new Error(`Refusing to dispatch ${decision.issue.key}: not reconciled real Linear issue`)
       this.#error(error, decision.issue)
       throw error
     }
@@ -214,7 +238,11 @@ export class FactoryLoop implements Factory {
         if (!issue || issue.stateId !== this.#config.stateIds.readyForAgent) {
           throw new Error(`Live state changed before writeback for ${decision.issue.key}`)
         }
-        await this.#linear.postComment(issue, comment)
+        try {
+          await this.#linear.postComment(issue, comment)
+        } catch (error) {
+          this.#logger.warn?.('[factory] comment writeback skipped', error)
+        }
         await this.#linear.setState(issue, this.#config.stateIds.agentImplementing)
         this.#emit('writeback-verified', { issue: decision.issue, path: issue.path })
       }
@@ -291,6 +319,10 @@ export class FactoryLoop implements Factory {
       }
 
       if (!isInFactoryScope(issue, this.#config.safety)) {
+        return
+      }
+
+      if (!isRealLinearIssue(issue)) {
         return
       }
 
@@ -582,8 +614,8 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   const assignee = recordName(payload.assignee)
   const key = stringValue(payload.identifier) ?? keyFromPath(path)
   const uuid = stringValue(payload.id) ?? stringValue(wrapper.objectId) ?? uuidFromPath(path) ?? key
-  const stateId = stringValue(payload.stateId) ?? stringValue(state?.id) ?? ''
   const stateName = stringValue(state?.name) ?? stringValue(payload.state_name)
+  const stateId = stringValue(payload.stateId) ?? stringValue(state?.id) ?? stateNameToId(stateName) ?? ''
 
   return {
     uuid,
@@ -602,6 +634,15 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
 }
 
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
+
+const isRealLinearIssue = (issue: LinearIssue): boolean => {
+  const payload = wrappedPayload(issue.raw)
+  const identifier = stringValue(payload.identifier) ?? issue.key
+  return identifier === issue.key &&
+    /^[A-Z]+-\d+$/u.test(identifier) &&
+    typeof payload.url === 'string' &&
+    payload.url.length > 0
+}
 
 const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
@@ -703,6 +744,63 @@ const keyFromPath = (path: string): string => path.split('/').at(-1)?.split('__'
 const uuidFromPath = (path: string): string | undefined => path.split('__')[1]?.replace(/\.json$/, '')
 
 const stringValue = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined
+
+const stateNameToId = (name: string | undefined): string | undefined =>
+  name ? STATE_NAME_TO_ID[name] : undefined
+
+const installFactoryDraftPredicate = (mount: MountClient, config: FactoryConfig): void => {
+  mount.setDefaultAllowedDraftPredicate?.((path, content, opts) =>
+    isAllowedFactoryDraft(path, content, opts, mount, config))
+}
+
+const isAllowedFactoryDraft = async (
+  path: string,
+  content: unknown,
+  opts: { guarded?: boolean } | undefined,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<boolean> => {
+  if (!opts?.guarded) return false
+
+  if (path.startsWith('/linear/issues/')) {
+    if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
+    return isIssuePathInFactoryScope(mount, path, config)
+  }
+
+  if (path.startsWith('/linear/comments/')) {
+    const issueKey = path.split('/').at(-1)?.split('__')[0]
+    if (!issueKey) return false
+    const candidates = await mount.listTree('/linear/issues/')
+    const issuePath = candidates.find((candidate) => candidate.startsWith(`/linear/issues/${issueKey}__`))
+    return issuePath ? isIssuePathInFactoryScope(mount, issuePath, config) : false
+  }
+
+  if (/^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)) {
+    return true
+  }
+
+  return false
+}
+
+const isIssuePathInFactoryScope = async (
+  mount: MountClient,
+  path: string,
+  config: FactoryConfig,
+): Promise<boolean> => {
+  try {
+    return isInFactoryScope(parseLinearIssue(path, (await mount.readFile(path)).content), config.safety)
+  } catch {
+    return false
+  }
+}
+
+const scopeIssueFromDraftContent = (content: unknown) => ({
+  title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',
+  team: typeof asRecord(asRecord(content)?.team)?.key === 'string'
+    ? asRecord(asRecord(content)?.team)?.key as string
+    : undefined,
+  raw: asRecord(content) ?? {},
+})
 
 const recordName = (value: unknown): string | undefined => {
   if (typeof value === 'string') {
