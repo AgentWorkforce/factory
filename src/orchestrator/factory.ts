@@ -571,24 +571,37 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
-    const roster = await this.#fleet.roster()
+    let roster
+    try {
+      roster = await this.#fleet.roster()
+    } catch (error) {
+      throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
+    }
     if (roster.agents.some((agent) => agent.name === spec.name)) {
       this.#batch.recordSpawn(record, spec, invocationId, { name: spec.name, sessionRef: spec.sessionRef })
       return { name: spec.name }
     }
 
-    const result = await this.#fleet.spawn({
-      name: spec.name,
-      capability: spec.capability,
-      node: spec.node ?? 'self',
-      task: spec.task,
-      model: spec.model,
-      cwd: spec.clonePath,
-      sessionRef: spec.sessionRef,
-      invocationId,
-      restartPolicy: spec.restartPolicy ?? defaultRestartPolicy(spec),
-      channel: spec.channel,
-    })
+    let result
+    try {
+      result = await this.#fleet.spawn({
+        name: spec.name,
+        capability: spec.capability,
+        node: spec.node ?? 'self',
+        task: spec.task,
+        model: spec.model,
+        cwd: spec.clonePath,
+        sessionRef: spec.sessionRef,
+        invocationId,
+        restartPolicy: spec.restartPolicy ?? defaultRestartPolicy(spec),
+        channel: spec.channel,
+      })
+    } catch (error) {
+      throw contextualError(
+        `Dispatch spawn failed for ${record.issue.key}/${spec.name} (${spec.capability}) cwd=${spec.clonePath ?? 'default'}`,
+        error,
+      )
+    }
     this.#batch.recordSpawn(record, spec, invocationId, result)
     return { name: result.name }
   }
@@ -769,7 +782,7 @@ export class FactoryLoop implements Factory {
   #error(error: unknown, issue?: IssueRef): void {
     this.#increment('errors')
     this.#logger.error?.('[factory] error', error)
-    this.#emit('error', { error, issue })
+    this.#emit('error', { error, ...describeError(error), issue })
   }
 
   #increment(name: string): void {
@@ -1296,6 +1309,38 @@ const eventIdentity = (event: ChangeEvent): string | undefined => {
   const rawId = record.id ?? record.event_id ?? record.seq
   const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId) : undefined
   return id ? `event:${id}` : undefined
+}
+
+const describeError = (error: unknown): { errorMessage: string; errorStack?: string } => {
+  if (error instanceof Error) {
+    return {
+      errorMessage: error.message || error.name || 'Error',
+      errorStack: error.stack,
+    }
+  }
+  if (typeof error === 'string') {
+    return { errorMessage: error }
+  }
+  try {
+    const serialized = JSON.stringify(error)
+    if (serialized && serialized !== '{}') {
+      return { errorMessage: serialized }
+    }
+  } catch {
+    // Fall through to String(error).
+  }
+  return { errorMessage: String(error) }
+}
+
+const contextualError = (context: string, error: unknown): Error => {
+  const details = describeError(error)
+  const wrapped = new Error(`${context}: ${details.errorMessage}`)
+  if (details.errorStack) {
+    wrapped.stack = `${wrapped.stack ?? wrapped.message}\nCaused by: ${details.errorStack}`
+  }
+  const withCause = wrapped as Error & { cause?: unknown }
+  withCause.cause = error
+  return wrapped
 }
 
 const parseSlackReply = (path: string, content: unknown, botUserId: string): SlackReply | undefined => {

@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 import { LINEAR_STATE_IDS } from '../constants/linear'
 import type { CloseProbePrInput } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import { parseFleetCommand, parseGlobalOptions, runFleetCli } from './fleet'
+import { parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -93,6 +96,21 @@ describe('fleet CLI parsing', () => {
       repo: 'AgentWorkforce/pear',
       issue: 'AR-77',
     })
+  })
+
+  it('resolves a broker connection path by walking up from the command cwd', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-'))
+    try {
+      const connectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      const nested = join(root, 'packages', 'factory-sdk')
+      await mkdir(dirname(connectionPath), { recursive: true })
+      await mkdir(nested, { recursive: true })
+      await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(resolveBrokerConnectionPath(nested)).toBe(connectionPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
 

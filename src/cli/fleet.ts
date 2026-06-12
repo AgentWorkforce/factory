@@ -1,4 +1,6 @@
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 
 import {
   FactoryConfigSchema,
@@ -246,7 +248,26 @@ async function loadConfig(path?: string): Promise<LoadedConfig> {
 async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefined, deps: FleetCliDeps): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
   if (globals.backend === 'internal' && loaded?.fixtureFiles) return new FakeFleetClient()
-  return createFleet({ backend: globals.backend, cwd: process.cwd() })
+  return createFleet({
+    backend: globals.backend,
+    cwd: process.cwd(),
+    connectionPath: resolveBrokerConnectionPath(process.cwd()),
+  })
+}
+
+export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {
+  let current = resolve(startCwd)
+  for (;;) {
+    const candidate = join(current, '.agentworkforce', 'relay', 'connection.json')
+    if (existsSync(candidate)) {
+      return candidate
+    }
+    const parent = dirname(current)
+    if (parent === current) {
+      return undefined
+    }
+    current = parent
+  }
 }
 
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {

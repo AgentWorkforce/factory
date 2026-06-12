@@ -90,7 +90,7 @@ export type FactoryEventPayload =
   | { issue: IssueRef }
   | { issue: IssueRef; result: DispatchResult }
   | { issue: IssueRef; path: string }
-  | { error: unknown; issue?: IssueRef }
+  | { error: unknown; errorMessage: string; errorStack?: string; issue?: IssueRef }
 
 export interface TriageEngine {
   triage(issue: LinearIssue, ctx: TriageContext): Promise<TriageDecision>

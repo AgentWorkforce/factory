@@ -80,13 +80,17 @@ interface CachedIssuePayload {
 }
 
 const createIssuePath = (payload: LinearCreateIssuePayload): string => {
-  const identifier = typeof payload.identifier === 'string' && payload.identifier ? payload.identifier : undefined
   const id = typeof payload.id === 'string' && payload.id ? payload.id : undefined
-  if (identifier && id) return linearIssuePath(identifier, id)
-  if (identifier) return `/linear/issues/${safePathSegment(identifier)}.json`
-  if (id) return `/linear/issues/${safePathSegment(id)}.json`
-  throw new Error('Linear createIssue payload must include id or identifier')
+  if (id) return `/linear/issues/factory-create-${safePathSegment(id)}.json`
+  const identifier = typeof payload.identifier === 'string' && payload.identifier ? payload.identifier : undefined
+  if (identifier && !looksLikeProviderIssueIdentifier(identifier)) {
+    return `/linear/issues/${safePathSegment(identifier)}.json`
+  }
+  throw new Error('Linear createIssue payload must include a non-provider id/clientId')
 }
+
+const looksLikeProviderIssueIdentifier = (value: string): boolean =>
+  /^[A-Z][A-Z0-9]*-/u.test(value)
 
 const confirmWriteback = async (
   mount: MountClient,

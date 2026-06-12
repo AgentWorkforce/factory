@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { FactoryConfigSchema, createFactory, parseLinearIssue, type FactoryConfig, type TriageDecision, type TriageEngine } from '../index'
-import type { ChangeEvent, EventPage, LinearWriteback, SlackWriteback } from '../ports'
+import type { ChangeEvent, EventPage, LinearWriteback, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, LinearIssue } from '../index'
 import { BatchTracker } from './batch-tracker'
@@ -102,6 +102,13 @@ class CountingTriage extends StaticTriage {
   override async triage(issue: LinearIssue): Promise<TriageDecision> {
     this.count += 1
     return super.triage(issue)
+  }
+}
+
+class SpawnFailingFleetClient extends FakeFleetClient {
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    this.spawns.push(input)
+    throw new Error('spawnPty failed: cwd does not exist')
   }
 }
 
@@ -803,6 +810,32 @@ describe('FactoryLoop', () => {
     await expect(factory.dispatch(decision)).rejects.toThrow('Writeback not acked')
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-9' } })
+    expect(errors[0]).toMatchObject({ errorMessage: expect.stringContaining('Writeback not acked') })
+    expect(errors[0]).toHaveProperty('errorStack')
+    expect(JSON.parse(JSON.stringify(errors[0]))).toMatchObject({
+      issue: { key: 'AR-9' },
+      errorMessage: expect.stringContaining('Writeback not acked'),
+      errorStack: expect.stringContaining('Error: Writeback not acked'),
+    })
+  })
+
+  it('classifies fleet spawn failures with issue, agent, capability, and cwd context', async () => {
+    const mount = new FakeMountClient({ [issuePath(36)]: issueFile(36) })
+    const fleet = new SpawnFailingFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const errors: unknown[] = []
+    factory.on('error', (payload) => errors.push(payload))
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(36), issueFile(36)))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(
+      'Dispatch spawn failed for AR-36/ar-36-impl (spawn:codex) cwd=/work/pear: spawnPty failed',
+    )
+    expect(errors).toHaveLength(1)
+    expect(JSON.parse(JSON.stringify(errors[0]))).toMatchObject({
+      issue: { key: 'AR-36' },
+      errorMessage: expect.stringContaining('Dispatch spawn failed for AR-36/ar-36-impl (spawn:codex) cwd=/work/pear'),
+      errorStack: expect.stringContaining('Caused by: Error: spawnPty failed: cwd does not exist'),
+    })
   })
 
   it('logs and continues when best-effort dispatch comment writeback fails', async () => {

@@ -369,11 +369,11 @@ describe('MountLinearWriteback', () => {
       description: 'Create only with writable fields',
       url: 'https://linear.invalid/read-only',
     })).resolves.toEqual({
-      path: '/linear/issues/AR-NEW__uuid-new.json',
+      path: '/linear/issues/factory-create-uuid-new.json',
     })
 
     expect(mount.writes).toEqual([{
-      path: '/linear/issues/AR-NEW__uuid-new.json',
+      path: '/linear/issues/factory-create-uuid-new.json',
       content: {
         title: '[factory-e2e] synthetic issue',
         teamId: 'team-ar',
@@ -392,14 +392,50 @@ describe('MountLinearWriteback', () => {
       title: '[factory-e2e] synthetic issue with sparse sync',
       state: { id: 'read-only-state' },
     })).resolves.toEqual({
-      path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
+      path: '/linear/issues/factory-create-uuid-no-team.json',
     })
     expect(mount.writes).toEqual([{
-      path: '/linear/issues/AR-NO-TEAM__uuid-no-team.json',
+      path: '/linear/issues/factory-create-uuid-no-team.json',
       content: {
         title: '[factory-e2e] synthetic issue with sparse sync',
       },
     }])
+  })
+
+  it('keys createIssue drafts by a non-provider synthetic id and never by an AR identifier', async () => {
+    const mount = new FakeMountClient()
+
+    await MountLinearWriteback(mount).createIssue({
+      id: '8fc81e88-9b2e-4b23-8bb1-e1ebe03b963b',
+      identifier: 'AR-CLAMPV2',
+      title: '[factory-e2e] add clamp(n, min, max) util to factory-sdk',
+      teamId: 'team-ar',
+      team: { key: 'AR', name: 'Agent Relay' },
+      stateId: 'ready-state',
+      description: 'Create should let Linear assign the real issue key',
+    })
+
+    expect(mount.writes).toHaveLength(1)
+    expect(mount.writes[0]?.path).toBe('/linear/issues/factory-create-8fc81e88-9b2e-4b23-8bb1-e1ebe03b963b.json')
+    expect(mount.writes[0]?.path).not.toContain('AR-CLAMPV2')
+    expect(mount.writes[0]?.path).not.toContain('__')
+    expect(mount.writes[0]?.content).toEqual({
+      title: '[factory-e2e] add clamp(n, min, max) util to factory-sdk',
+      teamId: 'team-ar',
+      stateId: 'ready-state',
+      description: 'Create should let Linear assign the real issue key',
+    })
+  })
+
+  it('refuses identifier-only createIssue drafts that look like provider issue keys', async () => {
+    const mount = new FakeMountClient()
+
+    await expect(MountLinearWriteback(mount).createIssue({
+      identifier: 'AR-CLAMPV2',
+      title: '[factory-e2e] add clamp(n, min, max) util to factory-sdk',
+      team: { key: 'AR', name: 'Agent Relay' },
+    })).rejects.toThrow(/non-provider id\/clientId/)
+    expect(mount.writes).toEqual([])
   })
 })
 
