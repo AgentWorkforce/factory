@@ -7,6 +7,7 @@ import { GithubMergeGate, closeProbePr, type GithubMergeGate as GithubMergeGateP
 import type { AgentSpec, ChangeEvent, FleetClient, LinearWriteback, MountClient, ProviderSyncStatus, SlackWriteback, Subscription } from '../ports'
 import type { Clock, Logger } from '../ports/system'
 import { isInFactoryScope } from '../safety/factory-scope'
+import { renderAgentTask } from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage } from '../triage'
 import type {
   DispatchResult,
@@ -506,6 +507,7 @@ export class FactoryLoop implements Factory {
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: decision.issue, result })
       await this.#ensureSlackDispatchThread(record, result)
+      await this.#sendImplementerTask(record)
       await this.#sendCriticalReviewerMessage(record)
       return result
     } catch (error) {
@@ -972,6 +974,39 @@ export class FactoryLoop implements Factory {
     }
     const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
     this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+  }
+
+  async #sendImplementerTask(record: InFlightIssue): Promise<void> {
+    if (!this.#fleet.waitForInjected) {
+      return
+    }
+
+    const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
+    if (implementers.length === 0) {
+      return
+    }
+
+    const issue = await this.#readIssue(record.issue.path)
+    const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
+    const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name ?? 'reviewer'
+    const implementerNames = implementers.map((agent) => agent.result?.name ?? agent.spec.name)
+    for (const implementer of implementers) {
+      const input = {
+        to: implementer.result?.name ?? implementer.spec.name,
+        text: renderAgentTask({
+          issue: templateIssueFromRecord(record, issue),
+          route: routeForImplementer(record, implementer.spec),
+          role: 'implementer',
+          config: { mergePolicy: this.#config.mergePolicy },
+          reviewerName,
+          implementerNames,
+        }),
+        from: 'factory',
+        data: { issue: record.issue },
+      }
+      const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
+      this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+    }
   }
 
   async #completeIssue(record: InFlightIssue): Promise<void> {
@@ -1489,6 +1524,24 @@ const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agent
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
   `Reviewer: ${agents.find((agent) => agent.role === 'reviewer')?.name ?? 'none'}`,
 ].join('\n')
+
+const templateIssueFromRecord = (record: InFlightIssue, issue: LinearIssue | undefined) => ({
+  key: issue?.key ?? record.issue.key,
+  title: issue?.title ?? record.issue.key,
+  description: issue?.description ?? '',
+})
+
+const routeForImplementer = (record: InFlightIssue, spec: AgentSpec) => {
+  const route = record.decision.routes.find((candidate) =>
+    candidate.repo === spec.repo && candidate.clonePath === spec.clonePath,
+  ) ?? record.decision.routes.find((candidate) => candidate.repo === spec.repo)
+
+  return {
+    repo: spec.repo,
+    clonePath: spec.clonePath,
+    rationale: route?.rationale,
+  }
+}
 
 const repoMapFromConfig = (config: FactoryConfig) => {
   const repos = new Set([
