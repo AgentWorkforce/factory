@@ -19,7 +19,7 @@ import {
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
 
-import type { EventPage, MountClient, SubscribeOptions } from '../ports'
+import type { EventPage, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
 import {
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
@@ -55,6 +55,7 @@ export type RelayFileClientLike =
     listLastNChanges?(limit: number, context?: { workspaceId: string; token?: string }): Promise<{ events: ChangeEvent[] }>
     getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
     getOp?(workspaceId: string, opId: string): Promise<OperationStatusResponse>
+    getSyncStatus?(workspaceId: string, options?: { provider?: string }): Promise<unknown>
     getToken?(): Promise<string> | string
     getBaseUrl?(): string
   }
@@ -240,6 +241,11 @@ export class RelayfileCloudMountClient implements MountClient {
     return maxEventId(events.map((event) => event.id))
   }
 
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    if (!this.#client.getSyncStatus) return undefined
+    return normalizeProviderSyncStatus(await this.#client.getSyncStatus(this.workspaceId, { provider }), provider)
+  }
+
   async confirmWrite(
     path: string,
     opts: { timeoutMs?: number } = {},
@@ -331,6 +337,32 @@ const providerResultError = (response: OperationStatusResponse): string => {
         : undefined
   return resultError ?? response.lastError ?? 'unknown provider error'
 }
+
+const normalizeProviderSyncStatus = (value: unknown, provider: string): ProviderSyncStatus | undefined => {
+  const record = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+  if (!record) return undefined
+  const lastEventAt = stringField(record, 'lastEventAt') ??
+    stringField(record, 'last_event_at') ??
+    stringField(record, 'watermarkAt') ??
+    stringField(record, 'watermark_at')
+  const lastEventAtMs = numberField(record, 'lastEventAtMs') ??
+    numberField(record, 'last_event_at_ms') ??
+    (lastEventAt ? Date.parse(lastEventAt) : undefined)
+  return {
+    provider: stringField(record, 'provider') ?? provider,
+    status: stringField(record, 'status'),
+    lastEventAt,
+    lastEventAtMs: Number.isFinite(lastEventAtMs) ? lastEventAtMs : undefined,
+  }
+}
+
+const stringField = (record: Record<string, unknown>, key: string): string | undefined =>
+  typeof record[key] === 'string' ? record[key] : undefined
+
+const numberField = (record: Record<string, unknown>, key: string): number | undefined =>
+  typeof record[key] === 'number' ? record[key] : undefined
 
 const isProviderWritebackPath = (path: string): boolean =>
   path.startsWith('/linear/issues/') ||

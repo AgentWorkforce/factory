@@ -19,6 +19,13 @@ export interface EventPage {
   nextCursor?: string | null
 }
 
+export interface ProviderSyncStatus {
+  provider?: string
+  status?: string
+  lastEventAt?: string
+  lastEventAtMs?: number
+}
+
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
@@ -31,6 +38,7 @@ export interface MountClient {
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription
   getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage>
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
+  getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
   confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
   ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'>
 }

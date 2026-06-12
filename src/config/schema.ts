@@ -42,6 +42,7 @@ export const FactoryConfigSchema = z.object({
     channel: z.string(),
     style: z.literal('threaded-summarized').default('threaded-summarized'),
     botUserId: z.string().default('U0B2596R7EZ'),
+    staleAfterMs: z.number().int().min(1_000).default(10 * 60_000),
   }).optional(),
   mergePolicy: z.enum(['never', 'on-green-with-review']).default('never'),
   stateIds: z.object({

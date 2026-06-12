@@ -2,6 +2,7 @@ export type {
   ChangeEvent,
   EventPage,
   MountClient,
+  ProviderSyncStatus,
   SubscribeOptions,
   Subscription,
 } from './mount'

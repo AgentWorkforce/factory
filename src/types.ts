@@ -97,6 +97,7 @@ export interface IterationReport {
   dispatched: DispatchResult[]
   skipped: Array<{ issue: IssueRef; reason: string }>
   dryRun: boolean
+  slackDegraded?: boolean
 }
 
 export interface DispatchResult {
@@ -111,6 +112,8 @@ export interface FactoryStatus {
   inFlight: IssueRef[]
   queued: IssueRef[]
   counters: Record<string, number>
+  slackDegraded?: boolean
+  slackDegradedReason?: string
 }
 
 export type FactoryEventPayload =

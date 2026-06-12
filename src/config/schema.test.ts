@@ -35,6 +35,7 @@ describe('FactoryConfigSchema', () => {
       channel: 'C123',
       style: 'threaded-summarized',
       botUserId: 'U0B2596R7EZ',
+      staleAfterMs: 10 * 60_000,
     })
     expect(parsed.mergePolicy).toBe('never')
     expect(parsed.stateIds).toEqual(LINEAR_STATE_IDS)

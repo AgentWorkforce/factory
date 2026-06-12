@@ -145,6 +145,7 @@ export type {
   Clock,
   EventPage,
   MountClient,
+  ProviderSyncStatus,
   SubscribeOptions,
   Subscription,
   AgentSpec,

@@ -13,7 +13,7 @@ import {
   type TriageDecision,
   type TriageEngine,
 } from '../index'
-import type { ChangeEvent, EventPage, LinearWriteback, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, LinearIssue } from '../index'
 import { BatchTracker } from './batch-tracker'
@@ -68,6 +68,7 @@ const slackConfig = (channel = 'C0FACTORY__factory-e2e') => ({
   channel,
   style: 'threaded-summarized' as const,
   botUserId: 'U0B2596R7EZ',
+  staleAfterMs: 10 * 60_000,
 })
 
 const flush = async () => {
@@ -177,6 +178,14 @@ class TrackingEventsMount extends CountingEventsMount {
         await subscription.unsubscribe()
       },
     }
+  }
+}
+
+class SlackSyncStatusMount extends FakeMountClient {
+  slackStatus: ProviderSyncStatus | undefined
+
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    return provider === 'slack' ? this.slackStatus : undefined
   }
 }
 
@@ -1163,6 +1172,104 @@ describe('FactoryLoop', () => {
 
     expect(closeInputs).toEqual([])
     expect(fleet.releases.map((release) => release.name)).toEqual(['ar-23-impl', 'ar-23-review'])
+  })
+
+  it('skips Slack writeback while sync is stale, logs once, and keeps Linear dispatch core running', async () => {
+    const mount = new SlackSyncStatusMount({
+      [issuePath(44)]: issueFile(44),
+      [issuePath(45)]: issueFile(45),
+      [issuePath(46)]: issueFile(46),
+    })
+    mount.slackStatus = { provider: 'slack', status: 'lagging' }
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ batchSize: 5, slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-44', 'AR-45', 'AR-46'])
+    expect(report.slackDegraded).toBe(true)
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toEqual([])
+    expect(mount.writes.filter((write) =>
+      write.path.startsWith('/linear/issues/') &&
+      (write.content as { stateId?: string }).stateId === implementing,
+    )).toHaveLength(3)
+    expect(factory.status()).toMatchObject({
+      slackDegraded: true,
+      slackDegradedReason: 'slack sync status is lagging',
+      counters: {
+        dispatched: 3,
+        slackDegradedEpisodes: 1,
+        slackWritebacksSkipped: 3,
+      },
+    })
+    expect(warnings.filter((warning) => warning[0] === '[factory] Slack sync degraded; skipping Slack writeback')).toHaveLength(1)
+  })
+
+  it('does not skip Slack writeback when sync is healthy', async () => {
+    const mount = new SlackSyncStatusMount({ [issuePath(47)]: issueFile(47) })
+    mount.slackStatus = { provider: 'slack', status: 'healthy', lastEventAtMs: Date.now() }
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-47'])
+    expect(report.slackDegraded).toBe(false)
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-47: factory agents dispatched.')
+    expect(factory.status().slackDegraded).toBe(false)
+  })
+
+  it('logs Slack recovery once and resumes writeback after a degraded episode', async () => {
+    const mount = new SlackSyncStatusMount({
+      [issuePath(48)]: issueFile(48),
+      [issuePath(49)]: issueFile(49),
+    })
+    mount.slackStatus = { provider: 'slack', status: 'lagging' }
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const infos: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        info: (...args: unknown[]) => infos.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(48), issueFile(48))))
+    mount.slackStatus = { provider: 'slack', status: 'healthy', lastEventAtMs: Date.now() }
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(49), issueFile(49))))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-49: factory agents dispatched.')
+    expect(factory.status()).toMatchObject({
+      slackDegraded: false,
+      counters: {
+        slackDegradedEpisodes: 1,
+        slackRecoveredEpisodes: 1,
+      },
+    })
+    expect(warnings.filter((warning) => warning[0] === '[factory] Slack sync degraded; skipping Slack writeback')).toHaveLength(1)
+    expect(infos.filter((info) => info[0] === '[factory] Slack sync recovered; resuming Slack writeback')).toHaveLength(1)
   })
 
   it('watches the in-flight factory Slack thread and replies to a human status request with live state, roster, and PR', async () => {
