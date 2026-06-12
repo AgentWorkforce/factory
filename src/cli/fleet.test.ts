@@ -98,6 +98,13 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses the factory orphan reaper command', () => {
+    expect(parseFleetCommand(['factory', 'reap-orphans'])).toEqual({
+      kind: 'factory',
+      action: 'reap-orphans',
+    })
+  })
+
   it('resolves a broker connection path by walking up from the command cwd', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-'))
     try {
@@ -300,6 +307,43 @@ describe('fleet CLI runtime', () => {
       expect(JSON.parse(output.text())).toEqual({ killed: 4242, signal: 'SIGTERM' })
     } finally {
       process.kill = originalKill
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('factory reap-orphans reports fresh heartbeat without killing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reaper-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
+      const configPath = await writeConfig(root, { loop: { maxIterations: 2, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 } })
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: 4242,
+        status: 'running',
+        iteration: 1,
+        maxIterations: 2,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        registryPath,
+      }))
+      await writeFile(registryPath, JSON.stringify({ pid: 4242, updatedAt: new Date().toISOString(), updatedAtMs: Date.now(), agents: [] }))
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'factory',
+        'reap-orphans',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ stale: false, reaped: [], skipped: [] })
+    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })

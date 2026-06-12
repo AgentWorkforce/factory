@@ -11,6 +11,7 @@ import {
   createFleet,
   isInFactoryScope,
   parseLinearIssue,
+  reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
   type Capability,
   type Factory,
@@ -46,7 +47,7 @@ type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
-  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' }
+  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
   | { kind: 'factory-triage'; issue: string }
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
@@ -211,6 +212,14 @@ async function runFactoryCommand(
       writeJson(out, { killed: heartbeat.pid, signal: 'SIGTERM' })
       return 0
     }
+    if (command.action === 'reap-orphans') {
+      writeJson(out, await reapFactoryOrphansOnce({
+        heartbeatPath: config.loop.heartbeatPath,
+        registryPath: config.loop.registryPath,
+        staleMs: config.loop.heartbeatStaleMs,
+      }))
+      return 0
+    }
 
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory)
     try {
@@ -236,7 +245,7 @@ async function runFactoryCommand(
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
-  if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop') {
+  if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop' || action === 'reap-orphans') {
     return { kind: 'factory', action }
   }
   if (action === 'triage') {

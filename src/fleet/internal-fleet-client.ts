@@ -5,7 +5,7 @@ import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@a
 import type { Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 
-type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: string; sessionRef?: string }
+type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: string; sessionRef?: string; pid?: number }
 type HarnessEventListener = (event: BrokerEvent) => void
 type DriverAgentLike = { name: string; sessionId?: string }
 type DriverDeliveryEventLike = BrokerEvent
@@ -92,7 +92,7 @@ export class InternalFleetClient implements FleetClient {
 
     this.#clearAgentExitLatch(handle.name)
 
-    return { name: handle.name, sessionRef: sessionRefFrom(handle) }
+    return spawnResultFrom(handle)
   }
 
   async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
@@ -108,7 +108,7 @@ export class InternalFleetClient implements FleetClient {
 
     this.#clearAgentExitLatch(handle.name)
 
-    return { name: handle.name, sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
+    return { ...spawnResultFrom(handle), sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
   }
 
   async release(name: string, reason?: string): Promise<void> {
@@ -353,6 +353,14 @@ function assertSelfNode(node: SpawnInput['node']): void {
 
 function sessionRefFrom(handle: SpawnedHandleLike): string | undefined {
   return handle.session_ref ?? handle.sessionRef ?? handle.sessionId
+}
+
+function spawnResultFrom(handle: SpawnedHandleLike): SpawnResult {
+  const result: SpawnResult = { name: handle.name }
+  const sessionRef = sessionRefFrom(handle)
+  if (sessionRef) result.sessionRef = sessionRef
+  if (typeof handle.pid === 'number') result.pid = handle.pid
+  return result
 }
 
 function messageInputFrom(input: SendInput): SendMessageInput {

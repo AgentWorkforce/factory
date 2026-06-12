@@ -3,6 +3,7 @@ import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, 
 import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GithubMergeGate } from './github/merge-gate'
+import type { ProcessIdentity } from './orchestrator/process-identity'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -16,6 +17,7 @@ export interface FactoryPorts {
   probePrResolver?: ProbePrResolver
   logger?: Logger
   clock?: Clock
+  processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
 }
 
 export interface Factory {
@@ -49,6 +51,7 @@ export interface FactoryLoopRunOptions {
   dryRun?: boolean
   maxIterations?: number
   heartbeatPath?: string
+  registryPath?: string
 }
 
 export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
@@ -60,6 +63,31 @@ export interface FactoryLoopHeartbeat {
   maxIterations: number
   updatedAt: string
   updatedAtMs: number
+  registryPath?: string
+}
+
+export interface FactoryInFlightRegistryAgent {
+  name: string
+  role?: AgentSpec['role']
+  issue?: IssueRef
+  sessionRef?: string
+  pids: number[]
+  processes?: FactoryInFlightRegistryProcess[]
+}
+
+export interface FactoryInFlightRegistryProcess {
+  pid: number
+  agentName: string
+  cmdline: string
+  startTime: string
+}
+
+export interface FactoryInFlightRegistry {
+  pid: number
+  heartbeatPath?: string
+  updatedAt: string
+  updatedAtMs: number
+  agents: FactoryInFlightRegistryAgent[]
 }
 
 export interface FactoryLoopLiveness {

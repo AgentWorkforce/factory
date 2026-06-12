@@ -8,6 +8,7 @@ import {
   checkFactoryLoopLiveness,
   createFactory,
   parseLinearIssue,
+  readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
   type FactoryConfig,
   type TriageDecision,
@@ -168,6 +169,16 @@ class ReleaseFailingFleetClient extends FakeFleetClient {
       throw new Error(`release failed for ${name}`)
     }
     await super.release(name, reason)
+  }
+}
+
+class PidFleetClient extends FakeFleetClient {
+  nextPid = 9_000
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    this.spawns.push(input)
+    const pid = this.nextPid++
+    return { name: input.name, sessionRef: `session-${pid}`, pid }
   }
 }
 
@@ -425,6 +436,7 @@ describe('FactoryLoop', () => {
   it('runLoop stops at the configured iteration cap, preserves the batch cap, and advances heartbeat liveness', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-loop-heartbeat-'))
     const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
     try {
       const mount = new FakeMountClient(Object.fromEntries(
         [51, 52, 53, 54, 55, 56].map((n) => [issuePath(n), issueFile(n)]),
@@ -432,7 +444,7 @@ describe('FactoryLoop', () => {
       const fleet = new FakeFleetClient()
       const factory = createFactory(config({
         batchSize: 5,
-        loop: { maxIterations: 3, heartbeatPath, heartbeatStaleMs: 10_000 },
+        loop: { maxIterations: 3, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
       }), { mount, fleet, triage: new StaticTriage() })
 
       const reports = await factory.runLoop({ dryRun: true })
@@ -447,6 +459,52 @@ describe('FactoryLoop', () => {
         ok: true,
         stale: false,
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('writes a durable in-flight registry with agent PID identity signatures', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-loop-registry-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({ [issuePath(62)]: issueFile(62) })
+      const fleet = new PidFleetClient()
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        processIdentityReader: async (pid) => ({
+          pid,
+          startTime: `start-${pid}`,
+          cmdline: pid === 9_000 ? 'node ar-62-impl worker' : 'node ar-62-review worker',
+        }),
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(62), issueFile(62))))
+
+      const registry = await readFactoryInFlightRegistry(registryPath)
+      expect(registry).toMatchObject({
+        pid: process.pid,
+        heartbeatPath,
+        agents: [
+          {
+            name: 'ar-62-impl',
+            pids: [9_000],
+            processes: [{ pid: 9_000, agentName: 'ar-62-impl', startTime: 'start-9000', cmdline: 'node ar-62-impl worker' }],
+          },
+          {
+            name: 'ar-62-review',
+            pids: [9_001],
+            processes: [{ pid: 9_001, agentName: 'ar-62-review', startTime: 'start-9001', cmdline: 'node ar-62-review worker' }],
+          },
+        ],
+      })
+      await factory.stop()
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

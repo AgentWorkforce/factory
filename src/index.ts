@@ -59,13 +59,17 @@ export type {
 export {
   BatchTracker,
   DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
+  DEFAULT_FACTORY_LOOP_REGISTRY_PATH,
+  FactoryReaper,
   checkFactoryLoopLiveness,
   createFactory,
   FactoryLoop,
   issueKey,
   isRealLinearIssue,
   parseLinearIssue,
+  readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
+  reapFactoryOrphansOnce,
 } from './orchestrator'
 export type { InFlightIssue, QueuedIssue, TrackedAgent } from './orchestrator'
 export {
@@ -165,6 +169,9 @@ export type {
   DispatchResult,
   Factory,
   FactoryEventPayload,
+  FactoryInFlightRegistry,
+  FactoryInFlightRegistryAgent,
+  FactoryInFlightRegistryProcess,
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
   FactoryLoopRunOptions,

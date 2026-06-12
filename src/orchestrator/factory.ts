@@ -19,6 +19,8 @@ import type {
   FactoryLoopRunOptions,
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
+  FactoryInFlightRegistry,
+  FactoryInFlightRegistryAgent,
   IssueRef,
   IterationReport,
   LinearIssue,
@@ -30,6 +32,7 @@ import type {
 import { MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import { BatchTracker, type InFlightIssue, issueKey } from './batch-tracker'
+import { readProcessIdentity } from './process-identity'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -63,6 +66,7 @@ const STATE_NAME_TO_ID: Record<string, string> = {
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
+export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -85,6 +89,7 @@ export class FactoryLoop implements Factory {
   readonly #probePrResolver: ProbePrResolver
   readonly #logger: Logger
   readonly #clock: Clock
+  readonly #processIdentityReader: typeof readProcessIdentity
   readonly #batch: BatchTracker
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
   readonly #counters: Record<string, number> = {}
@@ -130,6 +135,7 @@ export class FactoryLoop implements Factory {
     this.#probePrResolver = ports.probePrResolver ?? ((issue) => resolveProbePrFromMount(this.#mount, this.#config, issue))
     this.#logger = ports.logger ?? console
     this.#clock = ports.clock ?? realClock
+    this.#processIdentityReader = ports.processIdentityReader ?? readProcessIdentity
     this.#batch = new BatchTracker(config.batchSize)
     this.#wireFleetEvents()
   }
@@ -393,21 +399,22 @@ export class FactoryLoop implements Factory {
   async runLoop(opts: FactoryLoopRunOptions = {}): Promise<IterationReport[]> {
     const maxIterations = Math.min(5, Math.max(1, Math.trunc(opts.maxIterations ?? this.#config.loop.maxIterations)))
     const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
+    const registryPath = opts.registryPath ?? this.#config.loop.registryPath
     const reports: IterationReport[] = []
     let completed = false
     try {
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-        await this.#writeLoopHeartbeat(heartbeatPath, 'running', iteration, maxIterations)
+        await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration, maxIterations)
         reports.push(await this.runOnce({ dryRun: opts.dryRun }))
-        await this.#writeLoopHeartbeat(heartbeatPath, 'running', iteration + 1, maxIterations)
+        await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration + 1, maxIterations)
       }
       this.#increment('loopIdle')
-      await this.#writeLoopHeartbeat(heartbeatPath, 'idle', reports.length, maxIterations)
+      await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'idle', reports.length, maxIterations)
       completed = true
       return reports
     } finally {
       if (!completed) {
-        await this.#writeLoopHeartbeat(heartbeatPath, 'stopping', reports.length, maxIterations)
+        await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'stopping', reports.length, maxIterations)
       }
       await this.stop()
     }
@@ -667,6 +674,7 @@ export class FactoryLoop implements Factory {
 
   async #writeLoopHeartbeat(
     path: string,
+    registryPath: string,
     status: FactoryLoopHeartbeat['status'],
     iteration: number,
     maxIterations: number,
@@ -679,9 +687,11 @@ export class FactoryLoop implements Factory {
       maxIterations,
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
+      registryPath,
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
+    await this.#writeInFlightRegistry(registryPath, path)
   }
 
   async #readyIssuePaths(): Promise<string[]> {
@@ -727,6 +737,53 @@ export class FactoryLoop implements Factory {
         this.#logger.warn?.(`[factory] failed to release ${agentName} during stop`, error)
       }
     }))
+    await this.#writeInFlightRegistry(undefined, undefined, true)
+  }
+
+  async #writeInFlightRegistry(
+    path = this.#config.loop.registryPath,
+    heartbeatPath = this.#config.loop.heartbeatPath,
+    empty = false,
+  ): Promise<void> {
+    const updatedAtMs = this.#clock.now()
+    const agents: FactoryInFlightRegistryAgent[] = []
+    if (!empty) {
+      for (const record of this.#batch.inFlight) {
+        if (record.dryRun) continue
+        for (const [agentName, tracked] of record.agents) {
+          const pids = pidsFromSpawnResult(tracked.result)
+          const processes = []
+          for (const pid of pids) {
+            const identity = await this.#processIdentityReader(pid)
+            if (identity && identity.cmdline.includes(agentName)) {
+              processes.push({ ...identity, agentName })
+            }
+          }
+          agents.push({
+            name: agentName,
+            role: tracked.spec.role,
+            issue: record.issue,
+            sessionRef: tracked.sessionRef,
+            pids,
+            processes,
+          })
+        }
+      }
+    }
+
+    const registry: FactoryInFlightRegistry = {
+      pid: process.pid,
+      heartbeatPath,
+      updatedAt: new Date(updatedAtMs).toISOString(),
+      updatedAtMs,
+      agents,
+    }
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+  }
+
+  #hasInFlightPids(): boolean {
+    return this.#batch.inFlight.some(recordHasPids)
   }
 
   async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean): Promise<{ name: string }> {
@@ -777,6 +834,9 @@ export class FactoryLoop implements Factory {
       )
     }
     this.#batch.recordSpawn(record, spec, invocationId, result)
+    if (pidsFromSpawnResult(result).length > 0) {
+      await this.#writeInFlightRegistry()
+    }
     return { name: result.name }
   }
 
@@ -948,7 +1008,11 @@ export class FactoryLoop implements Factory {
       this.#emit('issue-done', { issue: record.issue })
       await this.#stopSlackWatcher(record.issue)
       this.#recordDispatchTerminal(record.issue)
+      const completedHadPids = recordHasPids(record)
       const next = this.#batch.complete(record.issue)
+      if (completedHadPids || this.#hasInFlightPids()) {
+        await this.#writeInFlightRegistry()
+      }
       if (next) {
         await this.dispatch(next.decision, { dryRun: next.dryRun })
       }
@@ -1405,6 +1469,20 @@ export function isRealLinearIssue(issue: LinearIssue): boolean {
 }
 
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
+
+const recordHasPids = (record: InFlightIssue): boolean =>
+  [...record.agents.values()].some((agent) => pidsFromSpawnResult(agent.result).length > 0)
+
+const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefined): number[] => {
+  const pids = new Set<number>()
+  for (const pid of result?.pids ?? []) {
+    if (Number.isInteger(pid) && pid > 0) pids.add(pid)
+  }
+  if (Number.isInteger(result?.pid) && result!.pid! > 0) {
+    pids.add(result!.pid!)
+  }
+  return [...pids].sort((a, b) => a - b)
+}
 
 const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,

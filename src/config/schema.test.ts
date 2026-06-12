@@ -31,6 +31,7 @@ describe('FactoryConfigSchema', () => {
       implementer: 'codex',
       reviewer: 'claude',
     })
+    expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',

@@ -17,6 +17,8 @@ export interface SpawnInput {
 export interface SpawnResult {
   name: string
   sessionRef?: string
+  pid?: number
+  pids?: number[]
 }
 
 export interface RosterEntry {
