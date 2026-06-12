@@ -934,7 +934,7 @@ export class FactoryLoop implements Factory {
 
     if (critical && this.#fleet.waitForInjected) {
       try {
-        const ack = await this.#fleet.waitForInjected(critical.input, { timeoutMs: 90_000 })
+        const ack = await this.#waitForInjectedAndSubmit(critical.input)
         this.#criticalMessages.set(ack.eventId, critical)
       } catch (retryError) {
         this.#error(retryError, critical.issue)
@@ -972,7 +972,7 @@ export class FactoryLoop implements Factory {
       from: 'factory',
       data: { issue: record.issue },
     }
-    const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
+    const ack = await this.#waitForInjectedAndSubmit(input)
     this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
   }
 
@@ -1004,8 +1004,34 @@ export class FactoryLoop implements Factory {
         from: 'factory',
         data: { issue: record.issue },
       }
-      const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
+      const ack = await this.#waitForInjectedAndSubmit(input)
       this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+    }
+  }
+
+  async #waitForInjectedAndSubmit(
+    input: Parameters<FleetClient['sendMessage']>[0],
+  ): Promise<{ eventId: string; targets: string[] }> {
+    if (!this.#fleet.waitForInjected) {
+      throw new Error('Fleet client does not support confirmed task injection')
+    }
+
+    const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
+    await this.#submitInjectedTask(input, ack)
+    return ack
+  }
+
+  async #submitInjectedTask(
+    input: Parameters<FleetClient['sendMessage']>[0],
+    ack: { targets: string[] },
+  ): Promise<void> {
+    if (!this.#fleet.sendInput) {
+      return
+    }
+
+    const targets = ack.targets.length > 0 ? ack.targets : [input.to]
+    for (const target of new Set(targets)) {
+      await this.#fleet.sendInput(target, '\r')
     }
   }
 

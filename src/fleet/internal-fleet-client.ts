@@ -15,6 +15,7 @@ export interface HarnessDriverClientLike {
   release(name: string, reason?: string): Promise<{ name: string }>
   listAgents(): Promise<Array<Pick<ListAgent, 'name'>>>
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }>
+  sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
   onEvent?(listener: HarnessEventListener): () => void
   addListener?(event: 'agentExited', listener: (agent: DriverAgentLike) => void): () => void
@@ -155,6 +156,10 @@ export class InternalFleetClient implements FleetClient {
         reject,
       })
     })
+  }
+
+  async sendInput(name: string, data: string): Promise<void> {
+    await this.#client.sendInput(name, data)
   }
 
   onDeliveryFailed(listener: DeliveryFailedListener): () => void {

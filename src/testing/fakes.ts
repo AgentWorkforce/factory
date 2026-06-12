@@ -152,6 +152,11 @@ export class FakeFleetClient implements FleetClient {
   readonly resumes: Array<{ name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }> = []
   readonly releases: Array<{ name: string; reason?: string }> = []
   readonly messages: SendInput[] = []
+  readonly inputs: Array<{ name: string; data: string }> = []
+  readonly deliveryEvents: Array<
+    | { kind: 'injected'; to: string; eventId: string }
+    | { kind: 'input'; name: string; data: string }
+  > = []
 
   #agents = new Set<string>()
   #exitListeners = new Set<ExitListener>()
@@ -196,7 +201,14 @@ export class FakeFleetClient implements FleetClient {
     _opts?: { timeoutMs?: number },
   ): Promise<{ eventId: string; targets: string[] }> {
     this.messages.push(input)
-    return { eventId: `fake-${this.messages.length}`, targets: [input.to] }
+    const eventId = `fake-${this.messages.length}`
+    this.deliveryEvents.push({ kind: 'injected', to: input.to, eventId })
+    return { eventId, targets: [input.to] }
+  }
+
+  async sendInput(name: string, data: string): Promise<void> {
+    this.inputs.push({ name, data })
+    this.deliveryEvents.push({ kind: 'input', name, data })
   }
 
   onAgentExit(listener: ExitListener): () => void {

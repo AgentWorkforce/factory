@@ -18,6 +18,7 @@ const fakeHarness: HarnessDriverClientLike = {
   async sendMessage(input) {
     return { event_id: 'event', targets: [input.to] }
   },
+  async sendInput() {},
 }
 
 describe('createFleet', () => {

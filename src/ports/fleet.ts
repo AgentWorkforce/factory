@@ -35,6 +35,7 @@ export interface FleetClient {
   roster(): Promise<RosterEntry>
   sendMessage(input: SendInput): Promise<void>
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
+  sendInput?(name: string, data: string): Promise<void>
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
 }

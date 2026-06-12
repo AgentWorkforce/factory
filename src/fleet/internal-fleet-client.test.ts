@@ -8,6 +8,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   readonly spawned: SpawnPtyInput[] = []
   readonly released: Array<{ name: string; reason?: string }> = []
   readonly sent: SendMessageInput[] = []
+  readonly inputs: Array<{ name: string; data: string }> = []
   readonly eventListeners = new Set<(event: BrokerEvent) => void>()
   readonly deliveryListeners = new Set<(event: BrokerEvent) => void>()
   readonly exitListeners = new Set<(agent: { name: string; sessionId?: string }) => void>()
@@ -34,6 +35,10 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
     this.sent.push(input)
     return { event_id: `event-${this.sent.length}`, targets: [input.to] }
+  }
+
+  async sendInput(name: string, data: string): Promise<void> {
+    this.inputs.push({ name, data })
   }
 
   connectEvents(): void {
@@ -214,6 +219,15 @@ describe('InternalFleetClient', () => {
       { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } },
       { to: 'broker', text: 'done', from: undefined, data: undefined },
     ])
+  })
+
+  it('passes raw PTY input through to the harness client', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    await fleet.sendInput('ar-1-impl', '\r')
+
+    expect(harness.inputs).toEqual([{ name: 'ar-1-impl', data: '\r' }])
   })
 
   it('starts the harness broker event stream on the connect-backed subscription path', async () => {

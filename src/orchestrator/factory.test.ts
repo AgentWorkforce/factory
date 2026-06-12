@@ -1147,6 +1147,16 @@ describe('FactoryLoop', () => {
       from: 'factory',
       text: 'Review is queued for AR-62. Watch implementer PR handoff and report readiness.',
     })
+    expect(fleet.inputs).toEqual([
+      { name: 'ar-62-impl', data: '\r' },
+      { name: 'ar-62-review', data: '\r' },
+    ])
+    expect(fleet.deliveryEvents).toEqual([
+      { kind: 'injected', to: 'ar-62-impl', eventId: 'fake-1' },
+      { kind: 'input', name: 'ar-62-impl', data: '\r' },
+      { kind: 'injected', to: 'ar-62-review', eventId: 'fake-2' },
+      { kind: 'input', name: 'ar-62-review', data: '\r' },
+    ])
   })
 
   it('reinjects the confirmed implementer task after delivery_failed', async () => {
@@ -1170,6 +1180,13 @@ describe('FactoryLoop', () => {
     expect(fleet.messages[2]!.text).toContain('Open a PR targeting `main` when done.')
     expect(fleet.messages[2]!.text).toContain('Use `gh pr create --base main` and report the PR URL.')
     expect(fleet.messages[2]!.text).toContain('DM the reviewer `ar-63-review` when the PR is ready.')
+    expect(fleet.inputs).toEqual([
+      { name: 'ar-63-impl', data: '\r' },
+      { name: 'ar-63-review', data: '\r' },
+      { name: 'ar-63-impl', data: '\r' },
+    ])
+    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-63-impl', eventId: 'fake-3' })
+    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-63-impl', data: '\r' })
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-63' } })
   })
@@ -1189,6 +1206,13 @@ describe('FactoryLoop', () => {
       from: 'factory',
       text: 'Review is queued for AR-64. Watch implementer PR handoff and report readiness.',
     })
+    expect(fleet.inputs).toEqual([
+      { name: 'ar-64-impl', data: '\r' },
+      { name: 'ar-64-review', data: '\r' },
+      { name: 'ar-64-review', data: '\r' },
+    ])
+    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-64-review', eventId: 'fake-3' })
+    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-64-review', data: '\r' })
   })
 
   it('emits error and rejects when writeback verification fails', async () => {
