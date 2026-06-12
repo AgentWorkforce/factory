@@ -1,19 +1,22 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
-import type { Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 
 type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: string; sessionRef?: string; pid?: number }
 type HarnessEventListener = (event: BrokerEvent) => void
-type DriverAgentLike = { name: string; sessionId?: string }
+type DriverAgentLike = { name: string; sessionId?: string; pid?: number }
 type DriverDeliveryEventLike = BrokerEvent
 
 export interface HarnessDriverClientLike {
+  readonly brokerPid?: number
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
-  listAgents(): Promise<Array<Pick<ListAgent, 'name'>>>
+  listAgents(): Promise<Array<Pick<ListAgent, 'name'> & { pid?: number }>>
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }>
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
@@ -49,10 +52,13 @@ const selfNode: RosterEntry['nodes'][number] = {
   capabilities: ['spawn:claude', 'spawn:codex'],
   live: true,
 }
+const PID_RESOLVE_ATTEMPTS = 3
+const PID_RESOLVE_BACKOFF_MS = 75
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
   readonly #cwd?: string
+  readonly #connectionPath?: string
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
   readonly #agentExitListeners = new Set<AgentExitListener>()
@@ -72,6 +78,7 @@ export class InternalFleetClient implements FleetClient {
 
   constructor(options: InternalFleetClientOptions = {}) {
     this.#cwd = options.cwd
+    this.#connectionPath = options.connectionPath
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
@@ -121,6 +128,52 @@ export class InternalFleetClient implements FleetClient {
     return {
       agents: agents.map((agent) => ({ name: agent.name })),
       nodes: [selfNode],
+    }
+  }
+
+  async protectedPids(): Promise<number[]> {
+    const pids = new Set<number>()
+    if (Number.isInteger(this.#client.brokerPid) && this.#client.brokerPid! > 0) {
+      pids.add(this.#client.brokerPid!)
+    }
+    const connectionPid = await this.#connectionFilePid()
+    if (connectionPid) {
+      pids.add(connectionPid)
+    }
+    return [...pids].sort((a, b) => a - b)
+  }
+
+  async resolveAgentPid(name: string): Promise<AgentPidResolution> {
+    try {
+      let sawAgent = false
+      for (let attempt = 1; attempt <= PID_RESOLVE_ATTEMPTS; attempt += 1) {
+        const agent = (await this.#client.listAgents()).find((candidate) => candidate.name === name)
+        if (agent) {
+          sawAgent = true
+        }
+        if (typeof agent?.pid === 'number') {
+          return { status: 'found', pid: agent.pid }
+        }
+        if (attempt < PID_RESOLVE_ATTEMPTS) {
+          await sleep(PID_RESOLVE_BACKOFF_MS)
+        }
+      }
+      return sawAgent ? { status: 'unresolved' } : { status: 'missing' }
+    } catch (error) {
+      this.#logger?.warn?.('[factory-sdk] unable to resolve spawned agent pid from roster', error)
+      return { status: 'unresolved' }
+    }
+  }
+
+  async #connectionFilePid(): Promise<number | undefined> {
+    const path = this.#connectionPath ?? connectionPathForCwd(this.#cwd)
+    if (!path) return undefined
+    try {
+      const parsed = JSON.parse(await readFile(path, 'utf8')) as { pid?: unknown }
+      const pid = parsed.pid
+      return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : undefined
+    } catch {
+      return undefined
     }
   }
 
@@ -351,6 +404,14 @@ export class InternalFleetClient implements FleetClient {
   }
 }
 
+function connectionPathForCwd(cwd: string | undefined): string | undefined {
+  const stateDir = process.env.AGENT_RELAY_STATE_DIR
+  if (stateDir) return join(stateDir, 'connection.json')
+  return cwd ? join(cwd, '.agentworkforce', 'relay', 'connection.json') : undefined
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 function assertSelfNode(node: SpawnInput['node']): void {
   if (node && node !== 'self') {
     throw new Error(`InternalFleetClient only supports node 'self' tonight; received ${node}`)
@@ -361,11 +422,11 @@ function sessionRefFrom(handle: SpawnedHandleLike): string | undefined {
   return handle.session_ref ?? handle.sessionRef ?? handle.sessionId
 }
 
-function spawnResultFrom(handle: SpawnedHandleLike): SpawnResult {
+function spawnResultFrom(handle: SpawnedHandleLike, resolvedPid = handle.pid): SpawnResult {
   const result: SpawnResult = { name: handle.name }
   const sessionRef = sessionRefFrom(handle)
   if (sessionRef) result.sessionRef = sessionRef
-  if (typeof handle.pid === 'number') result.pid = handle.pid
+  if (typeof resolvedPid === 'number') result.pid = resolvedPid
   return result
 }
 

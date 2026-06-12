@@ -3,7 +3,7 @@ import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, 
 import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GithubMergeGate } from './github/merge-gate'
-import type { ProcessIdentity } from './orchestrator/process-identity'
+import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -18,6 +18,10 @@ export interface FactoryPorts {
   logger?: Logger
   clock?: Clock
   processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
+  processFinder?: AgentProcessFinder
+  kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean
+  readChildPids?: (pid: number) => Promise<number[]>
+  terminationGraceMs?: number
 }
 
 export interface Factory {

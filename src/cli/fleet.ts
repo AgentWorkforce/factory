@@ -109,7 +109,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         if (!loaded) throw new Error('factory command requires config')
         const mount = await buildMount(loaded, deps)
         const factory = createFactory(loaded.config, { mount, fleet })
-        return await runFactoryCommand(command, factory, mount, loaded.config, globals, out)
+        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out)
       }
     }
   } catch (error) {
@@ -185,6 +185,7 @@ async function runFactoryCommand(
   command: Extract<ParsedCommand, { kind: 'factory' | 'factory-triage' | 'factory-dispatch' }>,
   factory: Factory,
   mount: MountClient,
+  fleet: FleetClient,
   config: FactoryConfig,
   globals: GlobalOptions,
   out: Pick<NodeJS.WriteStream, 'write'>,
@@ -217,6 +218,7 @@ async function runFactoryCommand(
         heartbeatPath: config.loop.heartbeatPath,
         registryPath: config.loop.registryPath,
         staleMs: config.loop.heartbeatStaleMs,
+        fleet,
       }))
       return 0
     }
