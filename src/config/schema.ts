@@ -35,8 +35,8 @@ export const FactoryConfigSchema = z.object({
   }),
   batchSize: z.number().int().min(1).max(5).default(5),
   models: z.object({
-    implementer: z.string().default('codex'),
-    reviewer: z.string().default('claude'),
+    implementer: z.string().optional(),
+    reviewer: z.string().optional(),
     triage: z.string().optional(),
   }).default({}),
   slack: z.object({

@@ -994,6 +994,35 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl', 'ar-40-review'])
   })
 
+  it('omits implementer and reviewer models from default heuristic dispatch spawns', async () => {
+    const routedIssue = realIssueFile(66, ready, {
+      labels: [{ name: 'pear' }],
+      labelIds: [],
+      description: 'Implement the requested fix in packages/factory-sdk/src/orchestrator/factory.ts, add regression tests, verify the dispatch path, and ensure the spawned implementer and reviewer omit default model flags while preserving all factory safety checks.',
+    })
+    const mount = new FakeMountClient({ [issuePath(66)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(66), routedIssue))
+
+    expect(decision.implementers[0]?.model).toBeUndefined()
+    expect(decision.reviewer.model).toBeUndefined()
+
+    await factory.dispatch(decision)
+
+    expect(fleet.spawns).toHaveLength(2)
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-66-impl',
+      capability: 'spawn:codex',
+    })
+    expect(fleet.spawns[0]!.model).toBeUndefined()
+    expect(fleet.spawns[1]).toMatchObject({
+      name: 'ar-66-review',
+      capability: 'spawn:claude',
+    })
+    expect(fleet.spawns[1]!.model).toBeUndefined()
+  })
+
   it('backs off dispatch errors and enforces a retry gap before the bounded terminal attempt', async () => {
     const clock = new ManualClock()
     const mount = new FakeMountClient({ [issuePath(41)]: issueFile(41) })

@@ -27,10 +27,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.keywordRules).toEqual([])
     expect(parsed.repos.clonePaths).toEqual({})
     expect(parsed.batchSize).toBe(5)
-    expect(parsed.models).toEqual({
-      implementer: 'codex',
-      reviewer: 'claude',
-    })
+    expect(parsed.models).toEqual({})
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
     expect(parsed.slack).toEqual({
       channel: 'C123',
@@ -45,6 +42,26 @@ describe('FactoryConfigSchema', () => {
       requireTeamKey: 'AR',
     })
     expect(parsed.dryRun).toBe(false)
+  })
+
+  it('preserves explicit model overrides', () => {
+    const parsed = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+        },
+      },
+      models: {
+        implementer: 'gpt-5-codex',
+        reviewer: 'claude-opus-4-1',
+      },
+    })
+
+    expect(parsed.models).toMatchObject({
+      implementer: 'gpt-5-codex',
+      reviewer: 'claude-opus-4-1',
+    })
   })
 
   it('rejects batch sizes over five', () => {
