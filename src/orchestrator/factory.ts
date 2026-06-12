@@ -50,6 +50,11 @@ type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-ve
 type Listener = (payload: FactoryEventPayload) => void
 type SlackThreadWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
+type RegistryHandoffAgent = {
+  issue: IssueRef
+  name: string
+  tracked: TrackedAgent
+}
 type DispatchAttemptState = {
   attempts: number
   inFlight: boolean
@@ -117,6 +122,7 @@ export class FactoryLoop implements Factory {
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
   readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
+  readonly #dispatchFailureReaperHandoffs = new Map<string, RegistryHandoffAgent>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
   #slackWritebackFailureDegraded = false
@@ -497,10 +503,19 @@ export class FactoryLoop implements Factory {
       return record.result
     }
 
+    const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
       const agents: DispatchResult['agents'] = []
       for (const spec of [...decision.implementers, decision.reviewer]) {
         const spawned = await this.#spawnAgent(record, spec, dryRun)
+        const tracked = record.agents.get(spawned.name)
+        if (tracked) {
+          spawnedForReaperHandoff.push({
+            issue: record.issue,
+            name: spawned.name,
+            tracked: cloneTrackedAgent(tracked),
+          })
+        }
         agents.push({ name: spawned.name, role: spec.role })
       }
       await this.#writeInFlightRegistry()
@@ -535,6 +550,7 @@ export class FactoryLoop implements Factory {
       await this.#sendCriticalReviewerMessage(record)
       return result
     } catch (error) {
+      await this.#persistDispatchFailureReaperHandoff(record, spawnedForReaperHandoff)
       this.#recordDispatchFailure(decision.issue)
       this.#batch.abandon(decision.issue)
       this.#error(error, decision.issue)
@@ -860,6 +876,34 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #persistDispatchFailureReaperHandoff(record: InFlightIssue, handoffAgents: RegistryHandoffAgent[]): Promise<void> {
+    if (record.dryRun || handoffAgents.length === 0) {
+      return
+    }
+
+    try {
+      for (const agent of handoffAgents) {
+        this.#dispatchFailureReaperHandoffs.set(registryHandoffKey(agent.issue, agent.name), agent)
+      }
+      await this.#writeInFlightRegistry()
+      this.#increment('dispatchFailureReaperHandoffs')
+      this.#logger.warn?.('[factory] persisted dispatch-failed agents for orphan reaper', {
+        issue: record.issue,
+        agents: handoffAgents.map((agent) => agent.name).sort(),
+      })
+    } catch (error) {
+      this.#increment('dispatchFailureReaperHandoffFailures')
+      for (const agent of handoffAgents) {
+        this.#dispatchFailureReaperHandoffs.delete(registryHandoffKey(agent.issue, agent.name))
+      }
+      this.#logger.error?.('[factory] failed to persist dispatch-failed agents for orphan reaper', {
+        issue: record.issue,
+        error,
+      })
+      this.#error(error, record.issue)
+    }
+  }
+
   async #writeInFlightRegistry(
     path = this.#config.loop.registryPath,
     heartbeatPath = this.#config.loop.heartbeatPath,
@@ -867,28 +911,41 @@ export class FactoryLoop implements Factory {
   ): Promise<void> {
     const updatedAtMs = this.#clock.now()
     const agents: FactoryInFlightRegistryAgent[] = []
+    const seenAgents = new Set<string>()
+    const appendAgent = async (issue: IssueRef, agentName: string, tracked: TrackedAgent): Promise<void> => {
+      const key = registryHandoffKey(issue, agentName)
+      if (seenAgents.has(key)) {
+        return
+      }
+      seenAgents.add(key)
+      const { pids } = await this.#terminationRoots(agentName, tracked)
+      const processes = []
+      for (const pid of pids) {
+        const identity = await this.#processIdentityReader(pid)
+        if (identity && identity.cmdline.includes(agentName)) {
+          processes.push({ ...identity, agentName })
+        }
+      }
+      agents.push({
+        name: agentName,
+        role: tracked.spec.role,
+        issue,
+        sessionRef: tracked.sessionRef,
+        pids,
+        processes,
+      })
+    }
+
     if (!empty) {
       for (const record of this.#batch.inFlight) {
         if (record.dryRun) continue
         for (const [agentName, tracked] of record.agents) {
-          const { pids } = await this.#terminationRoots(agentName, tracked)
-          const processes = []
-          for (const pid of pids) {
-            const identity = await this.#processIdentityReader(pid)
-            if (identity && identity.cmdline.includes(agentName)) {
-              processes.push({ ...identity, agentName })
-            }
-          }
-          agents.push({
-            name: agentName,
-            role: tracked.spec.role,
-            issue: record.issue,
-            sessionRef: tracked.sessionRef,
-            pids,
-            processes,
-          })
+          await appendAgent(record.issue, agentName, tracked)
         }
       }
+    }
+    for (const agent of this.#dispatchFailureReaperHandoffs.values()) {
+      await appendAgent(agent.issue, agent.name, agent.tracked)
     }
 
     const registry: FactoryInFlightRegistry = {
@@ -2000,6 +2057,15 @@ const contextualError = (context: string, error: unknown): Error => {
   withCause.cause = error
   return wrapped
 }
+
+const registryHandoffKey = (issue: IssueRef, agentName: string): string =>
+  `${issueKey(issue)}:${agentName}`
+
+const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
+  spec: { ...tracked.spec },
+  result: tracked.result ? { ...tracked.result } : undefined,
+  sessionRef: tracked.sessionRef,
+})
 
 const parseSlackReply = (path: string, content: unknown, botUserId: string): SlackReply | undefined => {
   const raw = asRecord(parseJsonContent(content)) ?? {}
