@@ -155,6 +155,22 @@ class TimestampFailingFleetClient extends FakeFleetClient {
   }
 }
 
+class ReleaseFailingFleetClient extends FakeFleetClient {
+  readonly releaseAttempts: Array<{ name: string; reason?: string }> = []
+
+  constructor(readonly failNames = new Set<string>()) {
+    super()
+  }
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.releaseAttempts.push({ name, reason })
+    if (this.failNames.has(name)) {
+      throw new Error(`release failed for ${name}`)
+    }
+    await super.release(name, reason)
+  }
+}
+
 class CountingEventsMount extends FakeMountClient {
   getEventsCalls = 0
 
@@ -588,6 +604,56 @@ describe('FactoryLoop', () => {
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-11'])
     expect(factory.status().queued).toEqual([])
     await factory.stop()
+  })
+
+  it('stop releases each in-flight factory-dispatched agent', async () => {
+    const mount = new FakeMountClient({ [issuePath(60)]: issueFile(60) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    await fleet.spawn({ name: 'external-worker', capability: 'spawn:codex', task: 'external', model: 'codex' })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(60), issueFile(60))))
+    await factory.stop()
+
+    expect(fleet.releases).toEqual([
+      { name: 'ar-60-impl', reason: 'factory-stopped' },
+      { name: 'ar-60-review', reason: 'factory-stopped' },
+    ])
+  })
+
+  it('stop swallows one release failure and still releases others plus tears down listeners', async () => {
+    const mount = new TrackingEventsMount({ [issuePath(61)]: issueFile(61) })
+    const fleet = new ReleaseFailingFleetClient(new Set(['ar-61-impl']))
+    const warnings: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.start()
+    expect(mount.activeSubscriptions).toBe(1)
+    await expect(factory.stop()).resolves.toBeUndefined()
+
+    expect(fleet.releaseAttempts).toEqual([
+      { name: 'ar-61-impl', reason: 'factory-stopped' },
+      { name: 'ar-61-review', reason: 'factory-stopped' },
+    ])
+    expect(fleet.releases).toEqual([
+      { name: 'ar-61-review', reason: 'factory-stopped' },
+    ])
+    expect(mount.activeSubscriptions).toBe(0)
+    expect(mount.unsubscribeCount).toBe(1)
+    expect(warnings).toEqual([
+      [
+        '[factory] failed to release ar-61-impl during stop',
+        expect.objectContaining({ message: 'release failed for ar-61-impl' }),
+      ],
+    ])
   })
 
   it('start queues and emits issue-queued when backfill exceeds batch capacity', async () => {
@@ -1838,6 +1904,10 @@ describe('FactoryLoop', () => {
       await factory.dispose()
       expect(mount.activeSubscriptions).toBe(0)
       expect(mount.unsubscribeCount).toBe(1)
+      expect(fleet.releases).toEqual([
+        { name: 'ar-43-impl', reason: 'factory-stopped' },
+        { name: 'ar-43-review', reason: 'factory-stopped' },
+      ])
 
       await vi.advanceTimersByTimeAsync(10_000)
       expect(mount.getEventsCalls).toBe(callsBeforeDispose)

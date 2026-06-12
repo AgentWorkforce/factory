@@ -111,6 +111,7 @@ export class FactoryLoop implements Factory {
   #offDeliveryFailed?: () => void
   #starting?: Promise<void>
   #started = false
+  #stopping = false
 
   constructor(config: FactoryConfig, ports: FactoryPorts) {
     this.#config = config
@@ -151,6 +152,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #start(opts: FactoryStartOptions): Promise<void> {
+    this.#stopping = false
     const ready = await this.#mount.ensureSubRoot(ISSUE_ROOT, { timeoutMs: 90_000 })
     if (ready !== 'ready') {
       this.#error(new Error(`${ISSUE_ROOT} sub-root is not mounted`))
@@ -179,6 +181,8 @@ export class FactoryLoop implements Factory {
 
   async stop(): Promise<void> {
     this.#started = false
+    this.#stopping = true
+    await this.#releaseInFlightAgents('factory-stopped')
     if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
     this.#livePollTimer = undefined
     this.#livePollInFlight = false
@@ -705,6 +709,26 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #releaseInFlightAgents(reason: string): Promise<void> {
+    const agentNames = new Set<string>()
+    for (const record of this.#batch.inFlight) {
+      if (record.dryRun) {
+        continue
+      }
+      for (const agentName of record.agents.keys()) {
+        agentNames.add(agentName)
+      }
+    }
+
+    await Promise.all([...agentNames].map(async (agentName) => {
+      try {
+        await this.#fleet.release(agentName, reason)
+      } catch (error) {
+        this.#logger.warn?.(`[factory] failed to release ${agentName} during stop`, error)
+      }
+    }))
+  }
+
   async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean): Promise<{ name: string }> {
     const invocationId = this.#batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
@@ -757,6 +781,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #handleAgentExit(name: string, reason?: string): Promise<void> {
+    if (this.#stopping) {
+      return
+    }
+
     const record = this.#batch.getIssueByAgent(name)
     if (!record) {
       return
