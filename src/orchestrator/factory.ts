@@ -97,6 +97,8 @@ export class FactoryLoop implements Factory {
   readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
+  #slackWritebackFailureDegraded = false
+  #slackWritebackFailureBackoffUntilMs = 0
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
@@ -893,11 +895,16 @@ export class FactoryLoop implements Factory {
       }
 
       if (this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('completion-thread')) {
-        const root = await this.#slack.postThread({
-          channel: this.#config.slack.channel,
-          text: `${record.issue.key}: factory agents completed.\nStatus: done\nMerge policy: ${this.#config.mergePolicy}`,
-        })
-        await this.#slack.reply(root.threadId, `${record.issue.key}: Linear state set to done.`)
+        try {
+          const root = await this.#slack.postThread({
+            channel: this.#config.slack.channel,
+            text: `${record.issue.key}: factory agents completed.\nStatus: done\nMerge policy: ${this.#config.mergePolicy}`,
+          })
+          await this.#slack.reply(root.threadId, `${record.issue.key}: Linear state set to done.`)
+          this.#recordSlackWritebackSuccess('completion-thread')
+        } catch (error) {
+          this.#markSlackWritebackFailure('completion-thread', error)
+        }
       }
       void this.#mergeGate
 
@@ -942,13 +949,30 @@ export class FactoryLoop implements Factory {
     if (!this.#config.slack) return false
 
     const freshness = await this.#slackFreshness()
-    if (!freshness.degraded) {
+    if (this.#slackWritebackFailureDegraded) {
+      if (this.#slackWritebackFailureBackoffUntilMs > this.#clock.now()) {
+        this.#increment('slackWritebacksSkipped')
+        return true
+      }
+      return false
+    }
+
+    if (!freshness.degraded && freshness.known) {
       if (this.#slackDegraded) {
         this.#logger.info?.('[factory] Slack sync recovered; resuming Slack writeback', { context })
         this.#increment('slackRecoveredEpisodes')
       }
       this.#slackDegraded = false
       this.#slackDegradedReason = undefined
+      return false
+    }
+
+    if (!freshness.degraded && this.#slackDegraded) {
+      this.#increment('slackWritebacksSkipped')
+      return true
+    }
+
+    if (!freshness.degraded) {
       return false
     }
 
@@ -966,17 +990,45 @@ export class FactoryLoop implements Factory {
     return true
   }
 
-  async #slackFreshness(): Promise<{ degraded: boolean; reason?: string; status?: ProviderSyncStatus }> {
+  #markSlackWritebackFailure(context: string, error: unknown): void {
+    this.#slackWritebackFailureDegraded = true
+    this.#slackWritebackFailureBackoffUntilMs = this.#clock.now() + (this.#config.slack?.staleAfterMs ?? 10 * 60_000)
+    this.#slackDegradedReason = `slack writeback failed: ${describeError(error).errorMessage}`
+    if (!this.#slackDegraded) {
+      this.#slackDegraded = true
+      this.#increment('slackDegradedEpisodes')
+      this.#logger.warn?.('[factory] Slack writeback failed; marking Slack degraded', {
+        context,
+        reason: this.#slackDegradedReason,
+      })
+    }
+  }
+
+  #recordSlackWritebackSuccess(context: string): void {
+    if (this.#slackWritebackFailureDegraded) {
+      this.#logger.info?.('[factory] Slack writeback recovered; clearing write-failure degradation', { context })
+      this.#increment('slackRecoveredEpisodes')
+    }
+    this.#slackWritebackFailureDegraded = false
+    this.#slackWritebackFailureBackoffUntilMs = 0
+    if (this.#slackDegraded) {
+      this.#slackDegraded = false
+      this.#slackDegradedReason = undefined
+    }
+  }
+
+  async #slackFreshness(): Promise<{ known: boolean; degraded: boolean; reason?: string; status?: ProviderSyncStatus }> {
     const staleAfterMs = this.#config.slack?.staleAfterMs ?? 10 * 60_000
+    let sawSlackStatus = false
     try {
       const status = await this.#mount.getSyncStatus?.('slack')
+      sawSlackStatus = status?.provider === 'slack'
       const statusResult = slackSyncStatusResult(status, this.#clock.now(), staleAfterMs)
       if (statusResult.known) {
-        return { degraded: statusResult.degraded, reason: statusResult.reason, status }
+        return { known: true, degraded: statusResult.degraded, reason: statusResult.reason, status }
       }
     } catch (error) {
       this.#logger.warn?.('[factory] Slack sync freshness check failed; proceeding without degradation', error)
-      return { degraded: false }
     }
 
     try {
@@ -987,15 +1039,17 @@ export class FactoryLoop implements Factory {
         .filter((time) => Number.isFinite(time))
         .sort((a, b) => b - a)[0]
       if (lastSlackEvent === undefined) {
-        return { degraded: false }
+        return sawSlackStatus
+          ? { known: true, degraded: true, reason: 'slack sync has no recent event watermark' }
+          : { known: false, degraded: false }
       }
       const ageMs = this.#clock.now() - lastSlackEvent
       return ageMs > staleAfterMs
-        ? { degraded: true, reason: `slack event watermark stale by ${ageMs}ms` }
-        : { degraded: false }
+        ? { known: true, degraded: true, reason: `slack event watermark stale by ${ageMs}ms` }
+        : { known: true, degraded: false }
     } catch (error) {
       this.#logger.warn?.('[factory] Slack event freshness fallback failed; proceeding without degradation', error)
-      return { degraded: false }
+      return { known: false, degraded: false }
     }
   }
 
@@ -1023,6 +1077,7 @@ export class FactoryLoop implements Factory {
     try {
       await start
     } catch (error) {
+      this.#markSlackWritebackFailure('dispatch-thread', error)
       this.#logger.warn?.(`[factory] failed to establish Slack dispatch thread for ${record.issue.key}`, error)
     } finally {
       this.#slackWatcherStarts.delete(key)
@@ -1044,6 +1099,7 @@ export class FactoryLoop implements Factory {
     })
     this.#slackThreadIds.set(issueKey(record.issue), root.threadId)
     await this.#watchSlackThread(record, root.threadId)
+    this.#recordSlackWritebackSuccess('dispatch-thread')
   }
 
   async #watchSlackThread(record: InFlightIssue, threadId: string): Promise<void> {
@@ -1214,11 +1270,16 @@ export class FactoryLoop implements Factory {
       .filter((name) => activeAgents.has(name))
       .sort()
 
-    await this.#slack.reply(threadId, [
-      `${issue.key}: ${issueStateLabel(issue)}`,
-      `Agents: ${liveAgents.join(', ') || [...activeAgents].sort().join(', ') || 'none'}`,
-      `PR: ${probe ? githubPrUrl(probe.repo, probe.prNumber) : 'not found yet'}`,
-    ].join('\n'))
+    try {
+      await this.#slack.reply(threadId, [
+        `${issue.key}: ${issueStateLabel(issue)}`,
+        `Agents: ${liveAgents.join(', ') || [...activeAgents].sort().join(', ') || 'none'}`,
+        `PR: ${probe ? githubPrUrl(probe.repo, probe.prNumber) : 'not found yet'}`,
+      ].join('\n'))
+      this.#recordSlackWritebackSuccess('status-responder')
+    } catch (error) {
+      this.#markSlackWritebackFailure('status-responder', error)
+    }
   }
 
   async #closeProbeIfRequired(issue: LinearIssue): Promise<void> {
@@ -1533,11 +1594,20 @@ const slackSyncStatusResult = (
     return { known: true, degraded: true, reason: `slack sync status is ${status.status}` }
   }
 
-  const lastEventAtMs = status.lastEventAtMs ?? (status.lastEventAt ? Date.parse(status.lastEventAt) : undefined)
+  const lastEventAtMs = status.lastEventAtMs ??
+    (status.lastEventAt ? Date.parse(status.lastEventAt) : undefined) ??
+    (status.watermarkTs ? Date.parse(status.watermarkTs) : undefined)
   if (lastEventAtMs !== undefined && Number.isFinite(lastEventAtMs)) {
     const ageMs = nowMs - lastEventAtMs
     return ageMs > staleAfterMs
       ? { known: true, degraded: true, reason: `slack sync watermark stale by ${ageMs}ms` }
+      : { known: true, degraded: false }
+  }
+
+  if (status.lagSeconds !== undefined && Number.isFinite(status.lagSeconds)) {
+    const lagMs = status.lagSeconds * 1000
+    return lagMs > staleAfterMs
+      ? { known: true, degraded: true, reason: `slack sync lag is ${lagMs}ms` }
       : { known: true, degraded: false }
   }
 

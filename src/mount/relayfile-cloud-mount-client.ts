@@ -343,26 +343,65 @@ const normalizeProviderSyncStatus = (value: unknown, provider: string): Provider
     ? value as Record<string, unknown>
     : undefined
   if (!record) return undefined
-  const lastEventAt = stringField(record, 'lastEventAt') ??
-    stringField(record, 'last_event_at') ??
-    stringField(record, 'watermarkAt') ??
-    stringField(record, 'watermark_at')
-  const lastEventAtMs = numberField(record, 'lastEventAtMs') ??
-    numberField(record, 'last_event_at_ms') ??
+  const candidates = [
+    record,
+    asRecord(record[provider]),
+    asRecord(record.integration),
+    asRecord(record.connection),
+    ...arrayRecords(record.providers),
+    ...arrayRecords(record.integrations),
+    ...arrayRecords(record.connections),
+    ...arrayRecords(record.items),
+  ].filter((candidate): candidate is Record<string, unknown> =>
+    candidate !== undefined &&
+    (stringField(candidate, 'provider') === undefined || stringField(candidate, 'provider') === provider))
+  const source = candidates.find(hasProviderSyncFreshness) ??
+    candidates.find((candidate) =>
+      stringField(candidate, 'status')) ?? record
+  const lastEventAt = stringField(source, 'lastEventAt') ??
+    stringField(source, 'last_event_at') ??
+    stringField(source, 'watermarkAt') ??
+    stringField(source, 'watermark_at') ??
+    stringField(source, 'watermarkTs') ??
+    stringField(source, 'watermark_ts')
+  const lastEventAtMs = numberField(source, 'lastEventAtMs') ??
+    numberField(source, 'last_event_at_ms') ??
     (lastEventAt ? Date.parse(lastEventAt) : undefined)
+  const watermarkTs = stringField(source, 'watermarkTs') ?? stringField(source, 'watermark_ts') ?? lastEventAt
   return {
-    provider: stringField(record, 'provider') ?? provider,
-    status: stringField(record, 'status'),
+    provider: stringField(source, 'provider') ?? provider,
+    status: stringField(source, 'status'),
     lastEventAt,
     lastEventAtMs: Number.isFinite(lastEventAtMs) ? lastEventAtMs : undefined,
+    watermarkTs,
+    lagSeconds: numberField(source, 'lagSeconds') ?? numberField(source, 'lag_seconds'),
   }
 }
+
+const hasProviderSyncFreshness = (candidate: Record<string, unknown>): boolean => Boolean(
+    stringField(candidate, 'lastEventAt') ||
+    stringField(candidate, 'last_event_at') ||
+    stringField(candidate, 'watermarkAt') ||
+    stringField(candidate, 'watermark_at') ||
+    stringField(candidate, 'watermarkTs') ||
+    stringField(candidate, 'watermark_ts') ||
+    numberField(candidate, 'lastEventAtMs') !== undefined ||
+    numberField(candidate, 'last_event_at_ms') !== undefined ||
+    numberField(candidate, 'lagSeconds') !== undefined ||
+    numberField(candidate, 'lag_seconds') !== undefined
+)
 
 const stringField = (record: Record<string, unknown>, key: string): string | undefined =>
   typeof record[key] === 'string' ? record[key] : undefined
 
 const numberField = (record: Record<string, unknown>, key: string): number | undefined =>
   typeof record[key] === 'number' ? record[key] : undefined
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+
+const arrayRecords = (value: unknown): Array<Record<string, unknown>> =>
+  Array.isArray(value) ? value.map(asRecord).filter((entry): entry is Record<string, unknown> => entry !== undefined) : []
 
 const isProviderWritebackPath = (path: string): boolean =>
   path.startsWith('/linear/issues/') ||

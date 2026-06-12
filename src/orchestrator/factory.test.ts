@@ -189,6 +189,15 @@ class SlackSyncStatusMount extends FakeMountClient {
   }
 }
 
+class ThrowingSlackSyncStatusMount extends FakeMountClient {
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    if (provider === 'slack') {
+      throw new Error('sync status unavailable')
+    }
+    return undefined
+  }
+}
+
 class NoWatermarkMount extends FakeMountClient {
   override async getEventHighWatermark(): Promise<string | undefined> {
     return undefined
@@ -272,8 +281,31 @@ class FailFirstSlackReplyMountClient extends CloudWritebackFakeMountClient {
 }
 
 class FailSlackRootMountClient extends CloudWritebackFakeMountClient {
+  slackStatus: ProviderSyncStatus | undefined
+
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    return provider === 'slack' ? this.slackStatus : undefined
+  }
+
   override async confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     if (isSlackRootWritePath(path)) {
+      return 'failed'
+    }
+    return super.confirmWrite(path, opts)
+  }
+}
+
+class RecoveringSlackRootMountClient extends CloudWritebackFakeMountClient {
+  slackStatus: ProviderSyncStatus | undefined
+  failedRootsRemaining = 1
+
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    return provider === 'slack' ? this.slackStatus : undefined
+  }
+
+  override async confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+    if (isSlackRootWritePath(path) && this.failedRootsRemaining > 0) {
+      this.failedRootsRemaining -= 1
       return 'failed'
     }
     return super.confirmWrite(path, opts)
@@ -1214,9 +1246,47 @@ describe('FactoryLoop', () => {
     expect(warnings.filter((warning) => warning[0] === '[factory] Slack sync degraded; skipping Slack writeback')).toHaveLength(1)
   })
 
+  it('treats live-shaped bare Slack sync status with zero Slack events as degraded', async () => {
+    const mount = new SlackSyncStatusMount({
+      [issuePath(50)]: issueFile(50),
+      [issuePath(51)]: issueFile(51),
+    })
+    mount.slackStatus = { provider: 'slack' }
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-50', 'AR-51'])
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toEqual([])
+    expect(mount.writes.filter((write) =>
+      write.path.startsWith('/linear/issues/') &&
+      (write.content as { stateId?: string }).stateId === implementing,
+    )).toHaveLength(2)
+    expect(factory.status()).toMatchObject({
+      slackDegraded: true,
+      slackDegradedReason: 'slack sync has no recent event watermark',
+      counters: {
+        dispatched: 2,
+        slackDegradedEpisodes: 1,
+        slackWritebacksSkipped: 2,
+      },
+    })
+    expect(warnings.filter((warning) => warning[0] === '[factory] Slack sync degraded; skipping Slack writeback')).toHaveLength(1)
+  })
+
   it('does not skip Slack writeback when sync is healthy', async () => {
     const mount = new SlackSyncStatusMount({ [issuePath(47)]: issueFile(47) })
-    mount.slackStatus = { provider: 'slack', status: 'healthy', lastEventAtMs: Date.now() }
+    mount.slackStatus = { provider: 'slack', lastEventAt: new Date().toISOString() }
     const fleet = new FakeFleetClient()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -1232,6 +1302,38 @@ describe('FactoryLoop', () => {
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-47: factory agents dispatched.')
     expect(factory.status().slackDegraded).toBe(false)
+  })
+
+  it('falls back to Slack event freshness when sync status lookup fails', async () => {
+    const mount = new ThrowingSlackSyncStatusMount({ [issuePath(54)]: issueFile(54) })
+    const slackEvent = changeEvent('/slack/channels/C0FACTORY__factory-e2e/messages/1781267200_000000/meta.json', 'slack-54')
+    mount.emit({
+      ...slackEvent,
+      resource: {
+        ...slackEvent.resource,
+        provider: 'slack',
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-54'])
+    expect(report.slackDegraded).toBe(false)
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    expect(warnings.filter((warning) =>
+      warning[0] === '[factory] Slack sync freshness check failed; proceeding without degradation',
+    )).toHaveLength(1)
   })
 
   it('logs Slack recovery once and resumes writeback after a degraded episode', async () => {
@@ -1270,6 +1372,147 @@ describe('FactoryLoop', () => {
     })
     expect(warnings.filter((warning) => warning[0] === '[factory] Slack sync degraded; skipping Slack writeback')).toHaveLength(1)
     expect(infos.filter((info) => info[0] === '[factory] Slack sync recovered; resuming Slack writeback')).toHaveLength(1)
+  })
+
+  it('marks Slack degraded after one writeback failure and skips the next cycle without retrying', async () => {
+    const mount = new FailSlackRootMountClient({
+      [issuePath(52)]: issueFile(52),
+      [issuePath(53)]: issueFile(53),
+    })
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(53), issueFile(53))))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-52: factory agents dispatched.')
+    expect(mount.writes.filter((write) =>
+      write.path.startsWith('/linear/issues/') &&
+      (write.content as { stateId?: string }).stateId === implementing,
+    )).toHaveLength(2)
+    expect(factory.status()).toMatchObject({
+      slackDegraded: true,
+      counters: {
+        dispatched: 2,
+        slackDegradedEpisodes: 1,
+        slackWritebacksSkipped: 1,
+      },
+    })
+    expect(factory.status().slackDegradedReason).toMatch(/slack writeback failed/)
+    expect(warnings.filter((warning) =>
+      warning[0] === '[factory] Slack writeback failed; marking Slack degraded',
+    )).toHaveLength(1)
+  })
+
+  it('does not clear a writeback-failure latch from a healthy read watermark', async () => {
+    const mount = new FailSlackRootMountClient({
+      [issuePath(54)]: issueFile(54),
+      [issuePath(55)]: issueFile(55),
+      [issuePath(56)]: issueFile(56),
+    })
+    mount.slackStatus = { provider: 'slack', lastEventAt: new Date().toISOString() }
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const infos: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig(), batchSize: 5 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        info: (...args: unknown[]) => infos.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(54), issueFile(54))))
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(55), issueFile(55))))
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(56), issueFile(56))))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-54: factory agents dispatched.')
+    expect(mount.writes.filter((write) =>
+      write.path.startsWith('/linear/issues/') &&
+      (write.content as { stateId?: string }).stateId === implementing,
+    )).toHaveLength(3)
+    expect(factory.status()).toMatchObject({
+      slackDegraded: true,
+      counters: {
+        dispatched: 3,
+        slackDegradedEpisodes: 1,
+        slackWritebacksSkipped: 2,
+      },
+    })
+    expect(factory.status().slackDegradedReason).toMatch(/slack writeback failed/)
+    expect(warnings.filter((warning) =>
+      warning[0] === '[factory] Slack writeback failed; marking Slack degraded',
+    )).toHaveLength(1)
+    expect(infos.filter((info) =>
+      info[0] === '[factory] Slack sync recovered; resuming Slack writeback',
+    )).toEqual([])
+  })
+
+  it('probes after writeback-failure cooldown and clears the latch on success', async () => {
+    const clock = new ManualClock()
+    const mount = new RecoveringSlackRootMountClient({
+      [issuePath(57)]: issueFile(57),
+      [issuePath(58)]: issueFile(58),
+      [issuePath(59)]: issueFile(59),
+    })
+    const fleet = new FakeFleetClient()
+    const infos: unknown[][] = []
+    const factory = createFactory(config({
+      slack: slackConfig(),
+      batchSize: 5,
+      dispatch: { errorCooldownMs: 1_000, maxAttempts: 3 },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      logger: {
+        info: (...args: unknown[]) => infos.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(57), issueFile(57))))
+    mount.slackStatus = { provider: 'slack' }
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(58), issueFile(58))))
+    clock.advance(10 * 60_000)
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(59), issueFile(59))))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(2)
+    expect(slackRoots.map((write) => (write.content as { text?: string }).text)).toEqual([
+      expect.stringContaining('AR-57: factory agents dispatched.'),
+      expect.stringContaining('AR-59: factory agents dispatched.'),
+    ])
+    expect(factory.status()).toMatchObject({
+      slackDegraded: false,
+      slackDegradedReason: undefined,
+      counters: {
+        dispatched: 3,
+        slackDegradedEpisodes: 1,
+        slackRecoveredEpisodes: 1,
+        slackWritebacksSkipped: 1,
+      },
+    })
+    expect(infos.filter((info) =>
+      info[0] === '[factory] Slack writeback recovered; clearing write-failure degradation',
+    )).toHaveLength(1)
   })
 
   it('watches the in-flight factory Slack thread and replies to a human status request with live state, roster, and PR', async () => {

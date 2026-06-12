@@ -24,6 +24,8 @@ export interface ProviderSyncStatus {
   status?: string
   lastEventAt?: string
   lastEventAtMs?: number
+  watermarkTs?: string | null
+  lagSeconds?: number
 }
 
 export interface MountClient {
