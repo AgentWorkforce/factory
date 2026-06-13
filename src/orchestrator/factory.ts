@@ -54,6 +54,7 @@ type RegistryHandoffAgent = {
   issue: IssueRef
   name: string
   tracked: TrackedAgent
+  persistedAtMs: number
 }
 type DispatchAttemptState = {
   attempts: number
@@ -91,6 +92,7 @@ const INJECTION_MAX_ATTEMPTS = 6
 const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
+const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -575,6 +577,7 @@ export class FactoryLoop implements Factory {
             issue: record.issue,
             name: spawned.name,
             tracked: cloneTrackedAgent(tracked),
+            persistedAtMs: this.#clock.now(),
           })
         }
         agents.push({ name: spawned.name, role: spec.role })
@@ -810,12 +813,33 @@ export class FactoryLoop implements Factory {
       for (const [key, handoff] of [...this.#dispatchFailureReaperHandoffs]) {
         const roots = await this.#terminationRoots(handoff.name, handoff.tracked, protectedPids)
         if (roots.pids.length === 0 && roots.status === 'unresolved') {
+          const unresolvedAgeMs = this.#clock.now() - handoff.persistedAtMs
           this.#increment('agentTerminateMissingPid')
           this.#logger.error?.('[factory] no pid available to reap dispatch-failed handoff during loop catch', {
             agentName: handoff.name,
             issue: handoff.issue,
             sessionRef: handoff.tracked.sessionRef,
+            unresolvedAgeMs,
           })
+          if (unresolvedAgeMs >= DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS) {
+            this.#dispatchFailureReaperHandoffs.delete(key)
+            registryChanged = true
+            this.#increment('dispatchFailureReaperHandoffsDroppedStaleUnresolved')
+            this.#logger.warn?.('[factory] dropped stale unresolved dispatch-failed handoff', {
+              agentName: handoff.name,
+              issue: handoff.issue,
+              unresolvedAgeMs,
+              ttlMs: DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS,
+            })
+            try {
+              await this.#fleet.release(handoff.name, 'dispatch failed')
+            } catch (error) {
+              this.#logger.warn?.('[factory] failed to release unresolved dispatch-failure handoff after pruning', {
+                agentName: handoff.name,
+                error,
+              })
+            }
+          }
           continue
         }
 

@@ -1203,6 +1203,194 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('drops dispatch-failure handoffs only after they remain unresolved past the TTL', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-stale-unresolved-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({ [issuePath(78)]: issueFile(78) })
+      const clock = new ManualClock()
+      const fleet = new FakeFleetClient()
+      fleet.setSessionRef('ar-78-impl', 'session-ar-78-impl')
+      fleet.setSessionRef('ar-78-review', 'session-ar-78-review')
+      const linear: LinearWriteback = {
+        async postComment() {},
+        async setState() {
+          clock.advance(5 * 60_000)
+          throw new Error('setState 404')
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      }
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, maxConsecutiveFailures: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        linear,
+        clock,
+        processFinder: async () => ({ status: 'ambiguous' }),
+        processIdentityReader: async () => undefined,
+      })
+
+      await factory.runLoop()
+
+      expect(factory.status().counters.agentTerminateMissingPid).toBe(2)
+      expect(factory.status().counters.dispatchFailureReaperHandoffsDroppedStaleUnresolved).toBe(2)
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retains dispatch-failure handoffs that still resolve to protected live pids', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-protected-retained-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({ [issuePath(79)]: issueFile(79) })
+      const fleet = new FakeFleetClient()
+      fleet.setSessionRef('ar-79-impl', 'session-ar-79-impl')
+      fleet.setSessionRef('ar-79-review', 'session-ar-79-review')
+      const resolvingFleet = fleet as FakeFleetClient & {
+        resolveAgentPid: (name: string) => Promise<{ status: 'found'; pid: number } | { status: 'unresolved' }>
+        protectedPids: () => Promise<number[]>
+      }
+      resolvingFleet.resolveAgentPid = async (name: string) => {
+        if (name === 'ar-79-impl') return { status: 'found', pid: 7_901 }
+        if (name === 'ar-79-review') return { status: 'found', pid: 7_903 }
+        return { status: 'unresolved' }
+      }
+      resolvingFleet.protectedPids = async () => [7_901, 7_903]
+      const linear: LinearWriteback = {
+        async postComment() {},
+        async setState() {
+          throw new Error('setState 404')
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      }
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, maxConsecutiveFailures: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        linear,
+        processFinder: async () => ({ status: 'missing' }),
+        processIdentityReader: async () => undefined,
+      })
+
+      await factory.runLoop()
+
+      expect(factory.status().counters.dispatchFailureReaperHandoffsDroppedStaleUnresolved).toBeUndefined()
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
+        'ar-79-impl',
+        'ar-79-review',
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retains slow-to-register dispatch-failure handoffs within the TTL and reaps them once registered', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-slow-register-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({
+        [issuePath(80)]: issueFile(80),
+        [issuePath(81)]: issueFile(81),
+      })
+      const clock = new ManualClock()
+      const fleet = new FakeFleetClient()
+      for (const name of ['ar-80-impl', 'ar-80-review', 'ar-81-impl', 'ar-81-review']) {
+        fleet.setSessionRef(name, `session-${name}`)
+      }
+      const resolveAttempts = new Map<string, number>()
+      const resolvingFleet = fleet as FakeFleetClient & {
+        resolveAgentPid: (name: string) => Promise<{ status: 'found'; pid: number }>
+      }
+      resolvingFleet.resolveAgentPid = async (name: string) => {
+        const attempts = (resolveAttempts.get(name) ?? 0) + 1
+        resolveAttempts.set(name, attempts)
+        if (name === 'ar-80-impl') {
+          if (attempts === 1) throw new Error('broker registration pending')
+          return { status: 'found', pid: 8_001 }
+        }
+        if (name === 'ar-80-review') {
+          if (attempts === 1) throw new Error('broker registration pending')
+          return { status: 'found', pid: 8_003 }
+        }
+        throw new Error('broker registration pending')
+      }
+      const alive = new Set([8_001, 8_002, 8_003, 8_004])
+      const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
+      const linear: LinearWriteback = {
+        async postComment() {},
+        async setState() {
+          throw new Error('setState 404')
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      }
+      const factory = createFactory(config({
+        batchSize: 4,
+        loop: { maxIterations: 2, maxConsecutiveFailures: 2, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        linear,
+        clock,
+        processFinder: async () => ({ status: 'missing' }),
+        processIdentityReader: async (pid) => {
+          if (pid === 8_001) return { pid, startTime: 'start-8001', cmdline: 'node --agent-name ar-80-impl launcher' }
+          if (pid === 8_003) return { pid, startTime: 'start-8003', cmdline: 'node --agent-name ar-80-review launcher' }
+          return undefined
+        },
+        readChildPids: async (pid) => {
+          if (pid === 8_001) return [8_002]
+          if (pid === 8_003) return [8_004]
+          return []
+        },
+        kill: (pid, signal) => {
+          killed.push({ pid, signal })
+          if (!alive.has(pid)) throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+          if (signal === 'SIGKILL') alive.delete(pid)
+          return true
+        },
+        terminationGraceMs: 0,
+      })
+
+      await factory.runLoop()
+
+      expect(factory.status().counters.dispatchFailureReaperHandoffsDroppedStaleUnresolved).toBeUndefined()
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
+      expect(killed.map((entry) => entry.pid)).toEqual(expect.arrayContaining([8_002, 8_001, 8_004, 8_003]))
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
+        'ar-81-impl',
+        'ar-81-review',
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('reaper consumes dispatch-failure handoff by resolving name-only agents without touching protected pids', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-reap-'))
     const heartbeatPath = join(root, 'heartbeat.json')
