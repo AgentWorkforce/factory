@@ -885,6 +885,90 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('start live writes and refreshes a running loop heartbeat, then marks stopping on stop', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const clock = new ManualClock()
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 1_000 },
+      }), {
+        mount: new FakeMountClient(),
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        clock,
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      const initial = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(initial).toMatchObject({
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAtMs: 0,
+        registryPath,
+      })
+      expect(checkFactoryLoopLiveness(initial, { nowMs: 900, staleMs: 1_000 })).toMatchObject({
+        ok: true,
+        stale: false,
+      })
+
+      clock.advance(500)
+      await new Promise((resolve) => setTimeout(resolve, 650))
+
+      const refreshed = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(refreshed).toMatchObject({
+        status: 'running',
+        updatedAtMs: 500,
+      })
+
+      await factory.stop()
+
+      const stopped = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(stopped).toMatchObject({
+        status: 'stopping',
+        updatedAtMs: 500,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('start live marks the heartbeat stopping before releasing in-flight agents', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-stop-order-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({ [issuePath(62)]: issueFile(62) })
+      const heartbeatStatusesAtRelease: string[] = []
+      class HeartbeatObservingFleetClient extends FakeFleetClient {
+        override async release(name: string, reason?: string): Promise<void> {
+          heartbeatStatusesAtRelease.push((await readFactoryLoopHeartbeat(heartbeatPath))?.status ?? 'missing')
+          await super.release(name, reason)
+        }
+      }
+      const fleet = new HeartbeatObservingFleetClient()
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(62), issueFile(62))))
+      await factory.stop()
+
+      expect(heartbeatStatusesAtRelease).toEqual(['stopping', 'stopping'])
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('writes a durable in-flight registry with agent PID identity signatures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-loop-registry-'))
     const heartbeatPath = join(root, 'heartbeat.json')

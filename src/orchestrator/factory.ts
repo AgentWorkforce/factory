@@ -93,6 +93,7 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
+const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -145,6 +146,10 @@ export class FactoryLoop implements Factory {
   #liveEventHighWatermark?: string
   #liveConnectStartedAtMs = 0
   #liveReplaySkewMarginMs = 0
+  #liveHeartbeatTimer?: ReturnType<typeof setTimeout>
+  #liveHeartbeatActive = false
+  #liveHeartbeatInFlight = false
+  #liveHeartbeatRefresh?: Promise<void>
   readonly #seenLiveEvents = new Set<string>()
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
@@ -216,6 +221,7 @@ export class FactoryLoop implements Factory {
         return
       } catch (error) {
         this.#started = false
+        await this.#stopLiveHeartbeat('stopping')
         throw error
       }
     }
@@ -230,6 +236,7 @@ export class FactoryLoop implements Factory {
   async stop(): Promise<void> {
     this.#started = false
     this.#stopping = true
+    await this.#stopLiveHeartbeat('stopping')
     await this.#releaseInFlightAgents('factory-stopped')
     if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
     this.#livePollTimer = undefined
@@ -280,6 +287,7 @@ export class FactoryLoop implements Factory {
 
   async #startLiveSubscription(overrides: Partial<FactoryLiveSubscriptionOptions> = {}): Promise<void> {
     const options = this.#liveOptions(overrides)
+    await this.#startLiveHeartbeat()
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     this.#liveEventHighWatermark = await this.#currentEventHighWatermark()
@@ -300,6 +308,67 @@ export class FactoryLoop implements Factory {
       this.#liveEventCursor = await this.#currentEventCursor(options.eventLimit)
       this.#scheduleLivePoll(0, options)
     }
+  }
+
+  async #startLiveHeartbeat(): Promise<void> {
+    this.#liveHeartbeatActive = true
+    await this.#writeLiveHeartbeat('running')
+    this.#scheduleLiveHeartbeatRefresh()
+  }
+
+  async #stopLiveHeartbeat(status: FactoryLoopHeartbeat['status']): Promise<void> {
+    if (!this.#liveHeartbeatActive && !this.#liveHeartbeatTimer) {
+      return
+    }
+    this.#liveHeartbeatActive = false
+    if (this.#liveHeartbeatTimer) {
+      clearTimeout(this.#liveHeartbeatTimer)
+      this.#liveHeartbeatTimer = undefined
+    }
+    await this.#liveHeartbeatRefresh
+    await this.#writeLiveHeartbeat(status)
+  }
+
+  #scheduleLiveHeartbeatRefresh(): void {
+    if (!this.#liveHeartbeatActive || this.#liveHeartbeatTimer) {
+      return
+    }
+    // This heartbeat proves daemon process liveness for the external crash reaper.
+    // MountClient subscriptions do not expose connected/keepalive state here, so
+    // subscription-wedge detection remains a separate watchdog concern.
+    this.#liveHeartbeatTimer = setTimeout(() => {
+      this.#liveHeartbeatTimer = undefined
+      this.#liveHeartbeatRefresh = this.#refreshLiveHeartbeat()
+        .finally(() => {
+          this.#liveHeartbeatRefresh = undefined
+        })
+    }, liveHeartbeatIntervalMs(this.#config.loop.heartbeatStaleMs))
+    this.#liveHeartbeatTimer.unref?.()
+  }
+
+  async #refreshLiveHeartbeat(): Promise<void> {
+    if (!this.#liveHeartbeatActive || this.#liveHeartbeatInFlight) {
+      return
+    }
+    this.#liveHeartbeatInFlight = true
+    try {
+      await this.#writeLiveHeartbeat('running')
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to refresh live daemon heartbeat', error)
+    } finally {
+      this.#liveHeartbeatInFlight = false
+      this.#scheduleLiveHeartbeatRefresh()
+    }
+  }
+
+  async #writeLiveHeartbeat(status: FactoryLoopHeartbeat['status']): Promise<void> {
+    await this.#writeLoopHeartbeat(
+      this.#config.loop.heartbeatPath,
+      this.#config.loop.registryPath,
+      status,
+      0,
+      0,
+    )
   }
 
   #liveOptions(overrides: Partial<FactoryLiveSubscriptionOptions>): FactoryLiveSubscriptionOptions {
@@ -2138,6 +2207,9 @@ const stringValue = (value: unknown): string | undefined => typeof value === 'st
 
 const stateNameToId = (name: string | undefined): string | undefined =>
   name ? STATE_NAME_TO_ID[name] : undefined
+
+const liveHeartbeatIntervalMs = (staleMs: number): number =>
+  Math.min(DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS, Math.max(500, Math.floor(staleMs / 4)))
 
 const installFactoryDraftPredicate = (mount: MountClient, config: FactoryConfig): void => {
   mount.setDefaultAllowedDraftPredicate?.((path, content, opts) =>
