@@ -141,6 +141,7 @@ export class FactoryLoop implements Factory {
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
   readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
+  readonly #canonicalIssueStates = new Map<string, string>()
   readonly #dispatchFailureReaperHandoffs = new Map<string, RegistryHandoffAgent>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
@@ -718,6 +719,9 @@ export class FactoryLoop implements Factory {
 
     for (const path of paths) {
       const issue = await this.#readIssue(path)
+      if (issue) {
+        this.#recordCanonicalIssueState(issue)
+      }
       if (!issue) {
         continue
       }
@@ -972,6 +976,9 @@ export class FactoryLoop implements Factory {
 
     try {
       const issue = await this.#readIssue(path)
+      if (issue) {
+        this.#recordCanonicalIssueState(issue)
+      }
       if (issue?.stateId !== this.#config.stateIds.readyForAgent) {
         return
       }
@@ -1075,6 +1082,21 @@ export class FactoryLoop implements Factory {
     state.terminal = true
     state.backoffUntilMs = 0
     this.#dispatchAttempts.set(issue.key, state)
+  }
+
+  #recordCanonicalIssueState(issue: Pick<LinearIssue, 'key' | 'stateId'>): void {
+    const previousStateId = this.#canonicalIssueStates.get(issue.key)
+    if (previousStateId === this.#config.stateIds.done && issue.stateId === this.#config.stateIds.readyForAgent) {
+      const dispatchState = this.#dispatchAttempts.get(issue.key)
+      if (dispatchState?.terminal) {
+        dispatchState.attempts = 0
+        dispatchState.inFlight = false
+        dispatchState.terminal = false
+        dispatchState.backoffUntilMs = 0
+        this.#increment('dispatchTerminalReopened')
+      }
+    }
+    this.#canonicalIssueStates.set(issue.key, issue.stateId)
   }
 
   async #writeLoopHeartbeat(
@@ -1713,6 +1735,7 @@ export class FactoryLoop implements Factory {
       const issue = await this.#readIssue(record.issue.path)
       if (issue) {
         await this.#linear.setState(issue, this.#config.stateIds.done)
+        this.#recordCanonicalIssueState({ key: issue.key, stateId: this.#config.stateIds.done })
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
       }
 

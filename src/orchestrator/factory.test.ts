@@ -781,6 +781,52 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('re-dispatches a terminal issue after a canonical Done to Ready re-open', async () => {
+    const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+
+    fleet.emitAgentExit('ar-364-impl', 'issue-done')
+    await flush()
+    expect(factory.status().counters.done).toBe(1)
+
+    await mount.writeFile(issuePath(364), issuePayload(364, ready))
+    const reopened = await factory.runOnce()
+
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+    expect(reopened.skipped).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-364-impl',
+      'ar-364-review',
+      'ar-364-impl',
+      'ar-364-review',
+    ])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+  })
+
+  it('does not re-dispatch a terminal issue from a stale ready alias when canonical state is still done', async () => {
+    const mount = new FakeMountClient({ [issuePath(365)]: issueFile(365) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-365-impl', 'issue-done')
+    await flush()
+
+    await mount.writeFile(readyAliasPath(365), realIssueFile(365, ready))
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([
+      { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal' },
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-365-impl', 'ar-365-review'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
+  })
+
   it('uses canonical issue state during startup backfill when a ready alias is stale', async () => {
     const mount = new FakeMountClient({
       [issuePath(69)]: realIssueFile(69, done),
