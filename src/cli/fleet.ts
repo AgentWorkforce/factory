@@ -36,6 +36,8 @@ interface FleetCliDeps {
   probeCloser?: ProbeCloser
   now?: () => number
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
+  daemonExit?: (code: number) => void
+  flushDaemonOutput?: () => Promise<void>
 }
 
 interface GlobalOptions {
@@ -215,10 +217,19 @@ async function runFactoryCommand(
     if (command.action === 'start') {
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
+      const flushAndExit = async (code: number): Promise<void> => {
+        try {
+          await (deps.flushDaemonOutput ?? flushProcessOutput)()
+        } finally {
+          const daemonExit = deps.daemonExit ?? ((exitCode: number) => process.exit(exitCode))
+          daemonExit(code)
+          waiter.resolve(code)
+        }
+      }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
-          waiter.resolve(code)
+          void flushAndExit(code)
         },
         processLike: deps.stopSignalProcessLike,
       })
@@ -465,6 +476,23 @@ function requireValue(args: string[], index: number, flag: string): string {
 
 function writeJson(out: Pick<NodeJS.WriteStream, 'write'>, value: unknown): void {
   out.write(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+async function flushProcessOutput(): Promise<void> {
+  await Promise.all([
+    flushWritable(process.stdout),
+    flushWritable(process.stderr),
+  ])
+}
+
+function flushWritable(stream: NodeJS.WriteStream): Promise<void> {
+  if (stream.destroyed || stream.writableEnded || stream.writable === false) {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve) => {
+    stream.write('', () => resolve())
+  })
 }
 
 function isCapability(value: string | undefined): value is Capability {

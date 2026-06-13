@@ -444,6 +444,7 @@ describe('fleet CLI runtime', () => {
     try {
       const configPath = await writeConfig(root)
       const listeners = new Map<string, () => void>()
+      const calls: string[] = []
       const processLike = {
         once(signal: string, listener: () => void) {
           listeners.set(signal, listener)
@@ -456,7 +457,9 @@ describe('fleet CLI runtime', () => {
       }
       const factory = {
         start: vi.fn(async () => {}),
-        stop: vi.fn(async () => {}),
+        stop: vi.fn(async () => {
+          calls.push('stop')
+        }),
         runLoop: vi.fn(async () => []),
         runOnce: vi.fn(),
         status: vi.fn(),
@@ -466,6 +469,7 @@ describe('fleet CLI runtime', () => {
         dispose: vi.fn(),
       } as unknown as Factory
       const createFactory = vi.fn(() => factory)
+      const daemonExits: number[] = []
 
       const run = runFleetCli([
         'factory',
@@ -479,6 +483,13 @@ describe('fleet CLI runtime', () => {
         mount: new FakeMountClient(),
         createFactory,
         stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+        flushDaemonOutput: async () => {
+          calls.push('flush')
+        },
+        daemonExit: (code) => {
+          calls.push('exit')
+          daemonExits.push(code)
+        },
         stdout: buffer(),
         stderr: buffer(),
       })
@@ -489,7 +500,74 @@ describe('fleet CLI runtime', () => {
 
       await expect(run).resolves.toBe(0)
       expect(factory.stop).toHaveBeenCalledTimes(1)
+      expect(calls).toEqual(['stop', 'flush', 'exit'])
+      expect(daemonExits).toEqual([0])
       expect(listeners.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not force process exit for one-shot factory commands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-one-shot-no-force-exit-'))
+    try {
+      const configPath = await writeConfig(root)
+      const daemonExits: number[] = []
+      const daemonFlushes: string[] = []
+      const runOnceFactory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const runOnceCode = await runFleetCli([
+        '--dry-run',
+        'factory',
+        'run-once',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => runOnceFactory,
+        daemonExit: (code) => {
+          daemonExits.push(code)
+        },
+        flushDaemonOutput: async () => {
+          daemonFlushes.push('flush')
+        },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      const reapCode = await runFleetCli([
+        'factory',
+        'reap-orphans',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        daemonExit: (code) => {
+          daemonExits.push(code)
+        },
+        flushDaemonOutput: async () => {
+          daemonFlushes.push('flush')
+        },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(runOnceCode).toBe(0)
+      expect(reapCode).toBe(0)
+      expect(daemonExits).toEqual([])
+      expect(daemonFlushes).toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
