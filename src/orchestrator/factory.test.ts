@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -483,6 +484,33 @@ class ThrowingWatermarkMount extends FakeMountClient {
   }
 }
 
+class BlockingIssueReadMount extends FakeMountClient {
+  readCount = 0
+  observedStaleWhileReading = false
+
+  constructor(
+    initialFiles: Record<string, unknown>,
+    readonly clock: ManualClock,
+    readonly opts: { heartbeatPath: string; staleMs: number; blockMs: number; advanceMs: number },
+  ) {
+    super(initialFiles)
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown }> {
+    if (path.startsWith('/linear/issues/')) {
+      this.readCount += 1
+      const until = Date.now() + this.opts.blockMs
+      while (Date.now() < until) {
+        // Simulate CPU-heavy real handler work before the first await can yield.
+      }
+      this.clock.advance(this.opts.advanceMs)
+      const heartbeat = JSON.parse(readFileSync(this.opts.heartbeatPath, 'utf8')) as { updatedAtMs?: number }
+      this.observedStaleWhileReading ||= this.clock.now() - (heartbeat.updatedAtMs ?? 0) > this.opts.staleMs
+    }
+    return super.readFile(path)
+  }
+}
+
 class ListingReadTrackingMount extends FakeMountClient {
   readonly readPaths: string[] = []
 
@@ -931,6 +959,61 @@ describe('FactoryLoop', () => {
         status: 'stopping',
         updatedAtMs: 500,
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the live heartbeat fresh while draining a blocking live event burst', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-burst-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    const staleMs = 1_000
+    const issueCount = 60
+    try {
+      const clock = new ManualClock()
+      const files = Object.fromEntries(
+        Array.from({ length: issueCount }, (_, index) => {
+          const n = 400 + index
+          return [issuePath(n), realIssueFile(n)]
+        }),
+      )
+      const mount = new BlockingIssueReadMount(files, clock, {
+        heartbeatPath,
+        staleMs,
+        blockMs: 20,
+        advanceMs: 20,
+      })
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({
+        batchSize: 5,
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: staleMs },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        clock,
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      for (let index = 0; index < issueCount; index += 1) {
+        const n = 400 + index
+        mount.emit(changeEvent(issuePath(n), `event-live-burst-${n}`))
+      }
+
+      await vi.waitFor(() => expect(mount.readCount).toBeGreaterThanOrEqual(issueCount), { timeout: 8_000 })
+      await flush()
+
+      expect(mount.observedStaleWhileReading).toBe(false)
+      await vi.waitFor(async () => {
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        const ageMs = clock.now() - (heartbeat?.updatedAtMs ?? 0)
+        expect(ageMs).toBeLessThan(staleMs / 2)
+      }, { timeout: 2_000 })
+      expect(factory.status().counters.liveEventDrainYields).toBeGreaterThan(0)
+      expect(fleet.spawns.length).toBeGreaterThan(0)
+
+      await factory.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2345,14 +2428,12 @@ describe('FactoryLoop', () => {
     await flush()
 
     mount.emit(changeEvent(freshPath, '203', new Date(Date.now()).toISOString()))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
       'ar-39-impl',
       'ar-39-review',
       'ar-38-impl',
       'ar-38-review',
-    ])
+    ]))
     await factory.stop()
   })
 

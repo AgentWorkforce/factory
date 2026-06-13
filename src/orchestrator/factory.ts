@@ -76,6 +76,7 @@ const ISSUE_ROOT = '/linear/issues'
 const READY_EVENTS_LIMIT = 100
 const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
 const LIVE_DEDUPE_LIMIT = 5_000
+const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
 const STATE_NAME_TO_ID: Record<string, string> = {
   'Ready for Agent': LINEAR_STATE_IDS.readyForAgent,
   'Agent Implementing': LINEAR_STATE_IDS.agentImplementing,
@@ -151,6 +152,10 @@ export class FactoryLoop implements Factory {
   #liveHeartbeatActive = false
   #liveHeartbeatInFlight = false
   #liveHeartbeatRefresh?: Promise<void>
+  #liveHeartbeatLastWriteMs = 0
+  readonly #liveEventQueue: ChangeEvent[] = []
+  #liveEventDrainScheduled = false
+  #liveEventDrainActive = false
   readonly #seenLiveEvents = new Set<string>()
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
@@ -242,6 +247,7 @@ export class FactoryLoop implements Factory {
     if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
     this.#livePollTimer = undefined
     this.#livePollInFlight = false
+    this.#liveEventQueue.length = 0
     const subscription = this.#subscription
     this.#subscription = undefined
     await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
@@ -301,7 +307,7 @@ export class FactoryLoop implements Factory {
 
     if (options.transport !== 'poll') {
       this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB], (event) => {
-        void this.#handleLiveChange(event)
+        this.#enqueueLiveEvent(event)
       }, { from: 'now', coalesce: 'none' })
     }
 
@@ -370,6 +376,7 @@ export class FactoryLoop implements Factory {
       0,
       0,
     )
+    this.#liveHeartbeatLastWriteMs = this.#clock.now()
   }
 
   #liveOptions(overrides: Partial<FactoryLiveSubscriptionOptions>): FactoryLiveSubscriptionOptions {
@@ -417,9 +424,7 @@ export class FactoryLoop implements Factory {
       let cursor = this.#liveEventCursor
       for (;;) {
         const page = await this.#mount.getEvents({ cursor, limit: options.eventLimit })
-        for (const event of page.events) {
-          await this.#handleLiveChange(event)
-        }
+        await this.#handleLiveEventsWithYield(page.events)
         const nextCursor = eventCursorAfterPage(cursor, page.events, page.nextCursor)
         this.#liveEventCursor = nextCursor
         if (!page.nextCursor || page.nextCursor === cursor) break
@@ -430,6 +435,70 @@ export class FactoryLoop implements Factory {
     } finally {
       this.#livePollInFlight = false
     }
+  }
+
+  #enqueueLiveEvent(event: ChangeEvent): void {
+    if (!this.#started) return
+    this.#liveEventQueue.push(event)
+    this.#scheduleLiveEventDrain()
+  }
+
+  #scheduleLiveEventDrain(): void {
+    if (this.#liveEventDrainScheduled || this.#liveEventDrainActive || !this.#started) {
+      return
+    }
+    this.#liveEventDrainScheduled = true
+    void liveEventYield()
+      .then(() => {
+        this.#liveEventDrainScheduled = false
+        return this.#drainLiveEventQueue()
+      })
+      .catch((error: unknown) => {
+        this.#liveEventDrainScheduled = false
+        this.#logger.warn?.('[factory] live issue event drain failed', error)
+      })
+  }
+
+  async #drainLiveEventQueue(): Promise<void> {
+    if (this.#liveEventDrainActive) {
+      return
+    }
+    this.#liveEventDrainActive = true
+    try {
+      await this.#handleLiveEventsWithYield(this.#liveEventQueue)
+    } finally {
+      this.#liveEventDrainActive = false
+      if (this.#liveEventQueue.length > 0 && this.#started) {
+        this.#scheduleLiveEventDrain()
+      }
+    }
+  }
+
+  async #handleLiveEventsWithYield(events: ChangeEvent[]): Promise<void> {
+    let handled = 0
+    while (events.length > 0 && this.#started) {
+      const event = events.shift()
+      if (!event) continue
+      await this.#handleLiveChange(event)
+      handled += 1
+      if (handled % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+        await this.#refreshLiveHeartbeatIfDue()
+        if (events.length > 0) {
+          this.#increment('liveEventDrainYields')
+          await liveEventYield()
+        }
+      }
+    }
+    if (handled % LIVE_EVENT_DRAIN_BATCH_SIZE !== 0) {
+      await this.#refreshLiveHeartbeatIfDue()
+    }
+  }
+
+  async #refreshLiveHeartbeatIfDue(): Promise<void> {
+    if (!this.#liveHeartbeatActive) return
+    const intervalMs = liveHeartbeatIntervalMs(this.#config.loop.heartbeatStaleMs)
+    if (this.#clock.now() - this.#liveHeartbeatLastWriteMs < intervalMs) return
+    await this.#refreshLiveHeartbeat()
   }
 
   async #handleLiveChange(event: ChangeEvent): Promise<void> {
@@ -2501,4 +2570,12 @@ const githubPrUrl = (repo: string, prNumber: number): string => `https://github.
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)
   timer.unref?.()
+})
+
+const liveEventYield = (): Promise<void> => new Promise((resolve) => {
+  if (typeof setImmediate === 'function') {
+    setImmediate(resolve)
+    return
+  }
+  setTimeout(resolve, 0)
 })
