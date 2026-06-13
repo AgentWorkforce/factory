@@ -27,8 +27,10 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 interface FleetCliDeps {
   fleet?: FleetClient
   mount?: MountClient
+  createFactory?: typeof createFactory
   createFleet?: typeof createFleet
   cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
+  waitForStopSignal?: () => Promise<number | void>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
@@ -51,6 +53,7 @@ type ParsedCommand =
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
   | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
+  | { kind: 'factory'; action: 'start'; mode?: 'live' }
   | { kind: 'factory-triage'; issue: string }
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
@@ -121,8 +124,8 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           return 0
         }
         const mount = await buildMount(loaded, deps)
-        const factory = createFactory(loaded.config, { mount, fleet })
-        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out)
+        const factory = (deps.createFactory ?? createFactory)(loaded.config, { mount, fleet })
+        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps)
       }
     }
     return 1
@@ -205,8 +208,21 @@ async function runFactoryCommand(
   config: FactoryConfig,
   globals: GlobalOptions,
   out: Pick<NodeJS.WriteStream, 'write'>,
+  deps: FleetCliDeps = {},
 ): Promise<number> {
   if (command.kind === 'factory') {
+    if (command.action === 'start') {
+      const waiter = createStopSignalWaiter()
+      const removeSignalHandlers = installFactoryStopSignalHandlers(factory, { exit: waiter.resolve })
+      try {
+        await factory.start({ mode: command.mode })
+        const code = await (deps.waitForStopSignal?.() ?? waiter.promise)
+        return typeof code === 'number' ? code : 0
+      } finally {
+        removeSignalHandlers()
+        await factory.stop()
+      }
+    }
     if (command.action === 'run-once') {
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
@@ -263,6 +279,9 @@ async function runFactoryCommand(
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
+  if (action === 'start') {
+    return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
+  }
   if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop' || action === 'reap-orphans') {
     return { kind: 'factory', action }
   }
@@ -282,6 +301,22 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
     return { kind: 'factory-close-probe', prNumber, repo: parsed.repo, issue: parsed.issue }
   }
   throw new Error(`Unknown fleet factory action: ${action ?? ''}`)
+}
+
+function parseFactoryStartFlags(args: Array<string | undefined>): { mode?: 'live' } {
+  let mode: 'live' | undefined
+  const flags = args.filter((arg): arg is string => Boolean(arg))
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index]
+    if (flag === '--mode') {
+      const value = requireValue(flags, ++index, '--mode')
+      if (value !== 'live') throw new Error(`Invalid factory start mode: ${value}`)
+      mode = value
+      continue
+    }
+    throw new Error(`Unknown fleet factory start option: ${flag}`)
+  }
+  return { mode }
 }
 
 async function loadConfig(path?: string): Promise<LoadedConfig> {
@@ -459,6 +494,14 @@ export function installFactoryStopSignalHandlers(
   processLike.once('SIGINT', onSigint)
   processLike.once('SIGTERM', onSigterm)
   return remove
+}
+
+function createStopSignalWaiter(): { promise: Promise<number>; resolve: (code: number) => void } {
+  let resolve!: (code: number) => void
+  const promise = new Promise<number>((innerResolve) => {
+    resolve = innerResolve
+  })
+  return { promise, resolve }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

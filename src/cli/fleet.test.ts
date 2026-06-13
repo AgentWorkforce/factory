@@ -105,6 +105,14 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses the factory live start command', () => {
+    expect(parseFleetCommand(['factory', 'start', '--mode', 'live'])).toEqual({
+      kind: 'factory',
+      action: 'start',
+      mode: 'live',
+    })
+  })
+
   it('resolves a broker connection path by walking up from the command cwd', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-'))
     try {
@@ -377,6 +385,53 @@ describe('fleet CLI runtime', () => {
       })
       expect(statusCode).toBe(0)
       expect(JSON.parse(statusOut.text())).toMatchObject({ ok: true, stale: false })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('starts the factory live daemon and waits for an injected stop signal boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-'))
+    try {
+      const configPath = await writeConfig(root)
+      const fleet = new FakeFleetClient()
+      const mount = new FakeMountClient()
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const waitForStopSignal = vi.fn(async () => undefined)
+      const createFactory = vi.fn(() => factory)
+
+      const code = await runFleetCli([
+        'factory',
+        'start',
+        '--mode',
+        'live',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory,
+        waitForStopSignal,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(createFactory).toHaveBeenCalledTimes(1)
+      expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+      expect(factory.runLoop).not.toHaveBeenCalled()
+      expect(waitForStopSignal).toHaveBeenCalledTimes(1)
+      expect(factory.stop).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
