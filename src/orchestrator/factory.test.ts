@@ -40,6 +40,10 @@ const config = (overrides: Partial<FactoryConfig> = {}): FactoryConfig => Factor
 
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
 const readyAliasPath = (n: number) => `/linear/issues/by-state/ready-for-agent/AR-${n}.json`
+const capturedReadyCanaryPath = '/linear/issues/AR-133__dac27fce-e8de-4910-bbf6-98ad436df3dd.json'
+const capturedStaleDoneCanonicalPath = '/linear/issues/AR-173__40c7e780-59ad-47ee-8809-3a9b8434d8fb.json'
+const capturedStaleReadyAliasPath = '/linear/issues/by-state/ready-for-agent/AR-173.json'
+const capturedBareUuidPhantomPath = '/linear/issues/40c7e780-59ad-47ee-8809-3a9b8434d8fb.json'
 
 const issuePayload = (n: number, stateId = ready) => ({
   id: `uuid-${n}`,
@@ -324,6 +328,26 @@ class NoWatermarkMount extends FakeMountClient {
 class ThrowingWatermarkMount extends FakeMountClient {
   override async getEventHighWatermark(): Promise<string | undefined> {
     throw Object.assign(new Error('Route not found'), { status: 404 })
+  }
+}
+
+class ListingReadTrackingMount extends FakeMountClient {
+  readonly readPaths: string[] = []
+
+  constructor(initialFiles: Record<string, unknown> = {}, readonly extraTreePaths: string[] = []) {
+    super(initialFiles)
+  }
+
+  override async listTree(prefix: string): Promise<string[]> {
+    return [...new Set([
+      ...await super.listTree(prefix),
+      ...this.extraTreePaths.filter((path) => path.startsWith(prefix)),
+    ])].sort()
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    this.readPaths.push(path)
+    return super.readFile(path)
   }
 }
 
@@ -612,6 +636,70 @@ describe('FactoryLoop', () => {
     expect(report.dispatched).toEqual([])
     expect(fleet.spawns).toEqual([])
     expect(factory.status().counters.readyAliasesWithoutCanonical).toBe(1)
+  })
+
+  it('discovers only canonical key-shaped issue records from captured live listing shapes', async () => {
+    const byIdBareAliasPath = '/linear/issues/by-id/AR-214.json'
+    const byIdCanonicalShapedAliasPath = '/linear/issues/by-id/AR-214__uuid-214.json'
+    const mount = new ListingReadTrackingMount({
+      [capturedReadyCanaryPath]: realIssueFile(133, ready, { id: 'dac27fce-e8de-4910-bbf6-98ad436df3dd' }),
+      [readyAliasPath(133)]: realIssueFile(133, ready, { id: 'dac27fce-e8de-4910-bbf6-98ad436df3dd' }),
+      [capturedStaleDoneCanonicalPath]: realIssueFile(173, done, { id: '40c7e780-59ad-47ee-8809-3a9b8434d8fb' }),
+      [capturedStaleReadyAliasPath]: realIssueFile(173, ready, { id: '40c7e780-59ad-47ee-8809-3a9b8434d8fb' }),
+      [byIdBareAliasPath]: realIssueFile(214, ready),
+      [byIdCanonicalShapedAliasPath]: realIssueFile(214, ready),
+    }, [
+      capturedBareUuidPhantomPath,
+      '/linear/issues/dac27fce-e8de-4910-bbf6-98ad436df3dd.json',
+    ])
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled.map((issue) => issue.path)).toEqual([
+      capturedReadyCanaryPath,
+      capturedStaleDoneCanonicalPath,
+    ])
+    expect(report.dispatched.map((result) => result.issue.path)).toEqual([capturedReadyCanaryPath])
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: '40c7e780-59ad-47ee-8809-3a9b8434d8fb', key: 'AR-173', path: capturedStaleDoneCanonicalPath },
+      reason: 'live state is not ready-for-agent',
+    })
+    expect(mount.readPaths).not.toContain(byIdBareAliasPath)
+    expect(mount.readPaths).not.toContain(byIdCanonicalShapedAliasPath)
+    expect(mount.readPaths).not.toContain(capturedBareUuidPhantomPath)
+    expect(mount.readPaths).not.toContain('/linear/issues/dac27fce-e8de-4910-bbf6-98ad436df3dd.json')
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-133-impl', 'ar-133-review'])
+  })
+
+  it('skips missing canonical-shaped issue paths without aborting discovery', async () => {
+    const missingCanonicalPath = '/linear/issues/ZZ-404__00000000-0000-4000-8000-000000000404.json'
+    const debugLogs: unknown[][] = []
+    const mount = new ListingReadTrackingMount({
+      [capturedReadyCanaryPath]: realIssueFile(133, ready, { id: 'dac27fce-e8de-4910-bbf6-98ad436df3dd' }),
+    }, [missingCanonicalPath])
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        debug: (...args: unknown[]) => debugLogs.push(args),
+        warn: () => undefined,
+        error: () => undefined,
+      },
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled.map((issue) => issue.path)).toEqual([capturedReadyCanaryPath])
+    expect(mount.readPaths).toContain(missingCanonicalPath)
+    expect(factory.status().counters.phantomSkipped).toBe(1)
+    expect(debugLogs).toContainEqual([
+      '[factory] skipped missing issue file discovered from issue tree',
+      { path: missingCanonicalPath },
+    ])
   })
 
   it('runLoop stops at the configured iteration cap, preserves the batch cap, and advances heartbeat liveness', async () => {
@@ -1074,10 +1162,8 @@ describe('FactoryLoop', () => {
 
     const report = await factory.runOnce()
 
-    expect(report.skipped).toContainEqual({
-      issue: { uuid: 'draft-id', key: 'AR-E2ECANARY', path: draftPath },
-      reason: 'not reconciled real Linear issue',
-    })
+    expect(report.pulled).toEqual([])
+    expect(report.skipped).toEqual([])
     expect(triage.count).toBe(0)
     expect(fleet.spawns).toEqual([])
     expect(mount.writes).toEqual([])

@@ -765,6 +765,11 @@ export class FactoryLoop implements Factory {
       const { content } = await this.#mount.readFile(path)
       return parseLinearIssue(path, content)
     } catch (error) {
+      if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
+        this.#increment('phantomSkipped')
+        this.#logger.debug?.('[factory] skipped missing issue file discovered from issue tree', { path })
+        return undefined
+      }
       this.#logger.warn?.(`Unable to read issue ${path}`, error)
       return undefined
     }
@@ -1812,16 +1817,36 @@ const containsIssueKey = (value: string, issueKey: string): boolean => {
   return new RegExp(`(^|[^A-Za-z0-9-])${escaped}([^A-Za-z0-9-]|$)`, 'i').test(value)
 }
 
+const ISSUE_KEY_PATTERN = /^[A-Z]+-\d+$/u
+
+const isIssuePathUnderRoot = (path: string): boolean =>
+  path.startsWith(`${ISSUE_ROOT}/`) && path.endsWith('.json')
+
 const isIssueFilePath = (path: string): boolean =>
-  path.startsWith(`${ISSUE_ROOT}/`) &&
-  path.endsWith('.json') &&
+  isIssuePathUnderRoot(path) &&
   !path.includes('/comments/') &&
-  !path.includes('/by-state/')
+  !path.includes('/by-state/') &&
+  !path.includes('/by-id/') &&
+  isCanonicalIssueFileBasename(path.split('/').at(-1) ?? '')
 
 const isIssueAliasFilePath = (path: string): boolean =>
   path.startsWith(linearByStatePath('ready-for-agent')) &&
   path.endsWith('.json') &&
-  !path.includes('/comments/')
+  !path.includes('/comments/') &&
+  ISSUE_KEY_PATTERN.test(keyFromPath(path))
+
+const isCanonicalIssueFileBasename = (basename: string): boolean => {
+  const stem = basename.replace(/\.json$/u, '')
+  const parts = stem.split('__')
+  return parts.length === 2 && ISSUE_KEY_PATTERN.test(parts[0]) && parts[1].length > 0
+}
+
+const isMissingIssueFileError = (error: unknown): boolean => {
+  const record = asRecord(error)
+  const status = record?.status ?? record?.statusCode
+  if (status === 404) return true
+  return error instanceof Error && /(?:404|not found|file not found)/iu.test(error.message)
+}
 
 export const keyFromPath = (path: string): string =>
   path.split('/').at(-1)?.replace(/\.json$/, '').split('__')[0] ?? path
