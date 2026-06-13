@@ -2,7 +2,7 @@ import type { FactoryConfig } from './config/schema'
 import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
-import type { GithubMergeGate } from './github/merge-gate'
+import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 
 export interface FactoryPorts {
@@ -15,6 +15,7 @@ export interface FactoryPorts {
   mergeGate?: GithubMergeGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver
+  probePrGhRunner?: GhRunner
   logger?: Logger
   clock?: Clock
   processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
@@ -196,7 +197,7 @@ export interface PrSummary {
   filesChanged?: string[]
 }
 
-export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'>
+export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'> & { draft?: boolean }
 
 export type ProbePrResolver = (issue: LinearIssue) => Promise<ProbePrRef | undefined>
 

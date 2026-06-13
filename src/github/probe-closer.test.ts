@@ -118,6 +118,32 @@ describe('closeProbePr', () => {
     ])
   })
 
+  it('treats an already-closed probe PR as idempotent success', async () => {
+    const calls: string[][] = []
+    const runner: GhRunner = async (args) => {
+      calls.push(args)
+      return {
+        stdout: JSON.stringify({
+          state: 'CLOSED',
+          headRefName: 'ar-229-is-positive',
+          title: 'Add isPositive util',
+          body: '',
+        }),
+      }
+    }
+
+    await expect(closeProbePr({
+      repo: 'AgentWorkforce/pear',
+      prNumber: 279,
+      expectedIssueKey: 'AR-229',
+      requireTitleMarker: false,
+      runner,
+    })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 279, state: 'CLOSED' })
+    expect(calls.map((args) => args.slice(0, 3))).toEqual([
+      ['pr', 'view', '279'],
+    ])
+  })
+
   it('refuses a probe that is not tied to the expected issue key before closing', async () => {
     const calls: string[][] = []
     const runner: GhRunner = async (args) => {

@@ -9,6 +9,7 @@ import {
   closeProbePr,
   createFactory,
   createFleet,
+  defaultGhRunner,
   isInFactoryScope,
   parseLinearIssue,
   reapFactoryOrphansOnce,
@@ -18,6 +19,7 @@ import {
   type FactoryConfig,
   type FleetBackend,
   type FleetClient,
+  type GhRunner,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
@@ -34,6 +36,7 @@ interface FleetCliDeps {
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
+  probePrGhRunner?: GhRunner
   now?: () => number
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
   daemonExit?: (code: number) => void
@@ -128,7 +131,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           return 0
         }
         const mount = await buildMount(loaded, deps)
-        const factory = (deps.createFactory ?? createFactory)(loaded.config, { mount, fleet })
+        const factory = (deps.createFactory ?? createFactory)(loaded.config, {
+          mount,
+          fleet,
+          probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
+        })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps)
       }
     }

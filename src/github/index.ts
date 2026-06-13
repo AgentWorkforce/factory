@@ -1,6 +1,7 @@
 export {
   GhCliGithubMergeGate,
   GithubMergeGate,
+  defaultGhRunner,
   evaluateGithubMergeGate,
 } from './merge-gate'
 export {

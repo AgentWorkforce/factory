@@ -45,6 +45,7 @@ export {
   GhCliGithubMergeGate,
   GithubMergeGate,
   closeProbePr,
+  defaultGhRunner,
   evaluateGithubMergeGate,
 } from './github'
 export type {

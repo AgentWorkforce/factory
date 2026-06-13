@@ -172,7 +172,7 @@ export function evaluateGithubMergeGate(
   }
 }
 
-const defaultGhRunner: GhRunner = async (args) => {
+export const defaultGhRunner: GhRunner = async (args) => {
   const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
   return { stdout, stderr }
 }

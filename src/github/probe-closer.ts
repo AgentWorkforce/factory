@@ -24,7 +24,10 @@ export interface CloseProbePrResult {
 export async function closeProbePr(input: CloseProbePrInput): Promise<CloseProbePrResult> {
   const run = input.runner ?? defaultGhRunner
   const before = await viewPr(run, input)
-  assertOpenProbe(before, input)
+  const beforeState = assertClosableProbe(before, input)
+  if (beforeState === 'CLOSED') {
+    return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+  }
 
   await run(['pr', 'close', String(input.prNumber), '--repo', input.repo])
 
@@ -53,9 +56,10 @@ const viewPr = async (run: GhRunner, input: CloseProbePrInput): Promise<Record<s
   return parseGhJson(result.stdout)
 }
 
-const assertOpenProbe = (live: Record<string, unknown>, input: CloseProbePrInput): void => {
+const assertClosableProbe = (live: Record<string, unknown>, input: CloseProbePrInput): 'OPEN' | 'CLOSED' => {
   const state = stringValue(live.state)
-  if (normalizeState(state) !== 'OPEN') {
+  const normalized = normalizeState(state)
+  if (normalized !== 'OPEN' && normalized !== 'CLOSED') {
     throw new Error(`Refusing to close probe PR #${input.prNumber}: live state is ${state ?? 'unknown'}`)
   }
 
@@ -69,6 +73,7 @@ const assertOpenProbe = (live: Record<string, unknown>, input: CloseProbePrInput
   if ((input.requireTitleMarker ?? true) && !hasFactoryE2eMarker(title)) {
     throw new Error(`Refusing to close probe PR #${input.prNumber}: missing ${FACTORY_E2E_MARKER} probe marker`)
   }
+  return normalized
 }
 
 const hasFactoryE2eMarker = (title: string): boolean =>

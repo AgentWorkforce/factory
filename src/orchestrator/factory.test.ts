@@ -8,6 +8,7 @@ import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/
 import {
   FactoryConfigSchema,
   checkFactoryLoopLiveness,
+  closeProbePr,
   createFactory,
   parseLinearIssue,
   readFactoryInFlightRegistry,
@@ -82,6 +83,34 @@ const realIssueFile = (n: number, stateId = ready, overrides: Record<string, unk
 
 const realMergeIssueFile = (n: number, stateId = ready) => realIssueFile(n, stateId, {
   title: `Real product issue ${n}`,
+})
+
+const prFile = (
+  number: number,
+  payload: { title?: string; body?: string; head_ref?: string; isDraft?: boolean } = {},
+) => ({
+  provider: 'github',
+  objectType: 'pull_request',
+  objectId: String(number),
+  payload: {
+    number,
+    title: payload.title ?? `AR-${number}: test PR`,
+    body: payload.body ?? '',
+    head_ref: payload.head_ref ?? `ar-${number}-test`,
+    isDraft: payload.isDraft,
+  },
+})
+
+const ghPr = (
+  number: number,
+  payload: { title?: string; body?: string; headRefName?: string; isDraft?: boolean; state?: string } = {},
+) => ({
+  number,
+  title: payload.title ?? `AR-${number}: test PR`,
+  body: payload.body ?? '',
+  headRefName: payload.headRefName ?? `ar-${number}-test`,
+  isDraft: payload.isDraft ?? false,
+  state: payload.state ?? 'OPEN',
 })
 
 const slackConfig = (channel = 'C0FACTORY__factory-e2e') => ({
@@ -3074,6 +3103,580 @@ describe('FactoryLoop', () => {
       902338,
     ])
     expect(alive).toEqual(new Set())
+  })
+
+  it('PR-state sweep completes wedged synthetic issues, frees batch slots, and dispatches queued work', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(351)]: issueFile(351),
+      [issuePath(352)]: issueFile(352),
+      [issuePath(353)]: issueFile(353),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/351.json': prFile(351, {
+        title: 'Add isOdd factory SDK util',
+        body: 'Linear: AR-351',
+        head_ref: 'ar-351-is-odd-v11b',
+      }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/352.json': prFile(352, {
+        title: 'AR-352: add square utility',
+        body: '',
+        head_ref: 'square-util',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    for (const n of [351, 352, 353]) {
+      fleet.setSessionRef(`ar-${n}-impl`, `session-ar-${n}-impl`)
+      fleet.setSessionRef(`ar-${n}-review`, `session-ar-${n}-review`)
+    }
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
+    const factory = createFactory(config({ batchSize: 2 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.runOnce()
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-351', 'AR-352'])
+    expect(factory.status().queued.map((issue) => issue.key)).toEqual(['AR-353'])
+
+    for (const n of [351, 352]) {
+      for (const role of ['impl', 'review']) {
+        fleet.emitAgentExit(`ar-${n}-${role}`, 'worker_exited')
+        await flush()
+        fleet.emitAgentExit(`ar-${n}-${role}`, 'worker_exited')
+        await flush()
+      }
+    }
+
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-351', 'AR-352'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-353-impl')
+
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(closeInputs).toEqual([
+      { repo: 'AgentWorkforce/pear', prNumber: 351, expectedIssueKey: 'AR-351', requireTitleMarker: false },
+      { repo: 'AgentWorkforce/pear', prNumber: 352, expectedIssueKey: 'AR-352', requireTitleMarker: false },
+    ])
+    expect(fleet.releases.filter((release) => release.reason === 'issue-done').map((release) => release.name)).toEqual([
+      'ar-351-impl',
+      'ar-351-review',
+      'ar-352-impl',
+      'ar-352-review',
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-353-impl')
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-353'])
+    expect(factory.status().queued).toEqual([])
+    expect(factory.status().counters.completionSweepCompleted).toBe(2)
+
+    await factory.runLoop({ maxIterations: 1 })
+    expect(closeInputs).toHaveLength(2)
+    expect(factory.status().counters.done).toBe(2)
+  })
+
+  it('live mode runs the PR-state completion sweep timer', async () => {
+    vi.useFakeTimers()
+    try {
+      const mount = new FakeMountClient({
+        [issuePath(241)]: issueFile(241),
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/241.json': prFile(241, {
+          title: 'Add live completion sweep coverage',
+          body: '',
+          head_ref: 'ar-241-live-completion-sweep',
+        }),
+      })
+      const fleet = new FakeFleetClient()
+      const closeInputs: unknown[] = []
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        probeCloser: async (input) => {
+          closeInputs.push(input)
+          return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+        },
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(241), issueFile(241))))
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(closeInputs).toEqual([{
+        repo: 'AgentWorkforce/pear',
+        prNumber: 241,
+        expectedIssueKey: 'AR-241',
+        requireTitleMarker: false,
+      }])
+      expect(factory.status().inFlight).toEqual([])
+      await factory.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('backfill-and-subscribe mode runs the PR-state completion sweep timer', async () => {
+    vi.useFakeTimers()
+    try {
+      const mount = new FakeMountClient({
+        [issuePath(243)]: issueFile(243),
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/243.json': prFile(243, {
+          title: 'Add default start completion sweep coverage',
+          body: '',
+          head_ref: 'ar-243-default-completion-sweep',
+        }),
+      })
+      const fleet = new FakeFleetClient()
+      const closeInputs: unknown[] = []
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        probeCloser: async (input) => {
+          closeInputs.push(input)
+          return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+        },
+      })
+
+      await factory.start()
+      expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-243'])
+
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(closeInputs).toEqual([{
+        repo: 'AgentWorkforce/pear',
+        prNumber: 243,
+        expectedIssueKey: 'AR-243',
+        requireTitleMarker: false,
+      }])
+      expect(factory.status().inFlight).toEqual([])
+      await factory.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('coalesces concurrent PR sweep and agent-exit completion triggers', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(354)]: issueFile(354),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/354.json': prFile(354, {
+        title: 'Add idempotent completion coverage',
+        body: '',
+        head_ref: 'ar-354-idempotent-completion',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
+    let releaseProbeClose!: () => void
+    const probeCloseBlocked = new Promise<void>((release) => {
+      releaseProbeClose = release
+    })
+    let resolveProbeCloseStarted!: () => void
+    const probeCloseStarted = new Promise<void>((resolve) => {
+      resolveProbeCloseStarted = resolve
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        resolveProbeCloseStarted()
+        await probeCloseBlocked
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(354), issueFile(354))))
+    const sweep = factory.runLoop({ maxIterations: 1 })
+    await probeCloseStarted
+    fleet.emitAgentExit('ar-354-impl', 'issue-done')
+    await flush()
+    releaseProbeClose()
+    await sweep
+
+    expect(closeInputs).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      prNumber: 354,
+      expectedIssueKey: 'AR-354',
+      requireTitleMarker: false,
+    }])
+    expect(fleet.releases.filter((release) => release.reason === 'issue-done').map((release) => release.name)).toEqual([
+      'ar-354-impl',
+      'ar-354-review',
+    ])
+    expect(factory.status().counters.done).toBe(1)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('PR-state sweep releases a real issue under mergePolicy never without merging', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(240)]: realMergeIssueFile(240),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/240.json': prFile(240, {
+        title: 'Real product issue 240',
+        body: 'Linear: AR-240',
+        head_ref: 'ar-240-real-fix',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-sha')])
+    const factory = createFactory(config({
+      mergePolicy: 'never',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(240), realMergeIssueFile(240))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-240-impl', 'ar-240-review'])
+    expect(gate.checks).toEqual([])
+    expect(gate.merges).toEqual([])
+    expect(factory.status().inFlight).toEqual([])
+    expect(mount.writes).toContainEqual({ path: issuePath(240), content: { stateId: done } })
+  })
+
+  it('PR-state sweep merges a real issue only when policy, checks, review, and head are ready', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(242)]: realMergeIssueFile(242),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/242.json': prFile(242, {
+        title: 'Real product issue 242',
+        body: '',
+        head_ref: 'ar-242-real-fix',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-approved-sha')])
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(242), realMergeIssueFile(242))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(gate.merges).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      number: 242,
+      expectedHeadSha: 'green-approved-sha',
+    }])
+    expect(factory.status().counters.mergeGateMerged).toBe(1)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('PR-state sweep does not complete on a wrong PR or draft PR', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(250)]: issueFile(250),
+      [issuePath(251)]: issueFile(251),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/250.json': prFile(250, {
+        title: 'Unrelated cleanup',
+        body: 'This merely mentions ar-250, but is not the issue PR.',
+        head_ref: 'docs-cleanup',
+      }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/251.json': prFile(251, {
+        title: 'AR-251: draft work',
+        body: '',
+        head_ref: 'ar-251-draft-work',
+        isDraft: true,
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: unknown[] = []
+    const factory = createFactory(config({ batchSize: 2 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.runOnce()
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(closeInputs).toEqual([])
+    expect(fleet.releases.filter((release) => release.reason === 'issue-done')).toEqual([])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-250', 'AR-251'])
+    expect(factory.status().counters.completionSweepCompleted).toBeUndefined()
+    expect(factory.status().counters.completionSweepMissingPr).toBe(1)
+    expect(factory.status().counters.completionSweepDraftPr).toBe(1)
+  })
+
+  it('PR-state sweep resolves fresh PRs through gh when the mount is missing them', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(355)]: issueFile(355),
+      [issuePath(356)]: issueFile(356),
+      [issuePath(357)]: issueFile(357),
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
+    const ghCalls: string[][] = []
+    const factory = createFactory(config({ batchSize: 2 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: JSON.stringify([
+            ghPr(880, {
+              title: 'Fix PR-state completion sweep',
+              body: 'Regression fixture mentions AR-355 but is not its PR.',
+              headRefName: 'factory-sdk-pr-state-completion-sb-impl3',
+              state: 'OPEN',
+            }),
+            ghPr(855, {
+              title: 'Add old isOdd util',
+              body: '',
+              headRefName: 'ar-355-is-odd-v1',
+              state: 'CLOSED',
+            }),
+            ghPr(856, {
+              title: 'Add fresh isOdd util',
+              body: '',
+              headRefName: 'ar-355-is-odd-v2',
+              state: 'OPEN',
+            }),
+            ghPr(857, {
+              title: 'AR-356: add square utility',
+              body: '',
+              headRefName: 'ar-356-square',
+              state: 'OPEN',
+            }),
+          ]),
+        }
+      },
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.runOnce()
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(ghCalls).toHaveLength(2)
+    expect(ghCalls.every((args) => args.includes('--repo') && args.includes('AgentWorkforce/pear'))).toBe(true)
+    expect(closeInputs).toEqual([
+      { repo: 'AgentWorkforce/pear', prNumber: 856, expectedIssueKey: 'AR-355', requireTitleMarker: false },
+      { repo: 'AgentWorkforce/pear', prNumber: 857, expectedIssueKey: 'AR-356', requireTitleMarker: false },
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-357-impl')
+    expect(factory.status().counters.probePrGhResolveHits).toBe(2)
+  })
+
+  it('gh PR fallback rejects fuzzy over-matches and numeric-prefix collisions', async () => {
+    const mount = new FakeMountClient({ [issuePath(229)]: issueFile(229) })
+    const fleet = new FakeFleetClient()
+    const closeInputs: unknown[] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify([
+          ghPr(287, {
+            title: 'Add PR-state completion sweep',
+            body: 'This fix PR mentions AR-229 in tests but is not its issue PR.',
+            headRefName: 'factory-sdk-pr-state-completion-sb-impl3',
+            state: 'OPEN',
+          }),
+          ghPr(291, {
+            title: 'AR-22: wrong issue',
+            body: 'Linear: AR-22',
+            headRefName: 'ar-22-9-not-229',
+            state: 'OPEN',
+          }),
+          ghPr(292, {
+            title: 'AR-229-1: wrong child issue',
+            body: '',
+            headRefName: 'ar-229-1-is-positive',
+            state: 'OPEN',
+          }),
+          ghPr(293, {
+            title: 'AR-2290: wrong prefix',
+            body: '',
+            headRefName: 'ar-2290-is-positive',
+            state: 'OPEN',
+          }),
+        ]),
+      }),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(229), issueFile(229))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(closeInputs).toEqual([])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-229'])
+    expect(factory.status().counters.completionSweepMissingPr).toBe(1)
+  })
+
+  it('gh PR fallback fails closed when gh is unavailable', async () => {
+    const mount = new FakeMountClient({ [issuePath(358)]: issueFile(358) })
+    const fleet = new FakeFleetClient()
+    const closeInputs: unknown[] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrGhRunner: async () => {
+        throw new Error('gh auth missing')
+      },
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(358), issueFile(358))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(closeInputs).toEqual([])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-358'])
+    expect(factory.status().counters.completionSweepMissingPr).toBe(1)
+    expect(factory.status().counters.done).toBeUndefined()
+  })
+
+  it('gh PR fallback backs off repeated not-found lookups', async () => {
+    const clock = new ManualClock()
+    const mount = new FakeMountClient({ [issuePath(361)]: issueFile(361) })
+    const fleet = new FakeFleetClient()
+    const ghCalls: string[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: JSON.stringify([
+            ghPr(871, {
+              title: 'Unrelated factory fix',
+              body: 'Mentions AR-361 in a loose sentence only.',
+              headRefName: 'factory-sdk-pr-state-completion-sb-impl3',
+              state: 'OPEN',
+            }),
+          ]),
+        }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(361), issueFile(361))))
+    await factory.runLoop({ maxIterations: 1 })
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(ghCalls).toHaveLength(1)
+    expect(factory.status().counters.probePrGhBackoffSkips).toBe(1)
+    expect(factory.status().counters.completionSweepMissingPr).toBe(2)
+
+    clock.advance(60_000)
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(ghCalls).toHaveLength(2)
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-361'])
+    expect(factory.status().counters.done).toBeUndefined()
+  })
+
+  it('gh PR fallback skips draft PRs and backs off repeated unresolved lookups', async () => {
+    const clock = new ManualClock()
+    const mount = new FakeMountClient({ [issuePath(359)]: issueFile(359) })
+    const fleet = new FakeFleetClient()
+    const ghCalls: string[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: JSON.stringify([
+            ghPr(859, {
+              title: 'AR-359: draft work',
+              body: '',
+              headRefName: 'ar-359-draft-work',
+              isDraft: true,
+              state: 'OPEN',
+            }),
+          ]),
+        }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(359), issueFile(359))))
+    await factory.runLoop({ maxIterations: 1 })
+    await factory.runLoop({ maxIterations: 1 })
+    expect(ghCalls).toHaveLength(1)
+    expect(factory.status().counters.probePrGhBackoffSkips).toBe(1)
+    expect(factory.status().counters.completionSweepDraftPr).toBe(1)
+
+    clock.advance(60_000)
+    await factory.runLoop({ maxIterations: 1 })
+    expect(ghCalls).toHaveLength(2)
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-359'])
+  })
+
+  it('treats already-closed gh-resolved probe PRs as completed instead of re-wedging', async () => {
+    const mount = new FakeMountClient({ [issuePath(360)]: issueFile(360) })
+    const fleet = new FakeFleetClient()
+    const closeViewCalls: string[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify([
+          ghPr(860, {
+            title: 'Add already closed probe work',
+            body: '',
+            headRefName: 'ar-360-closed-work',
+            state: 'CLOSED',
+          }),
+        ]),
+      }),
+      probeCloser: (input) => closeProbePr({
+        ...input,
+        runner: async (args) => {
+          closeViewCalls.push(args)
+          return {
+            stdout: JSON.stringify({
+              state: 'CLOSED',
+              title: 'Add already closed probe work',
+              body: '',
+              headRefName: 'ar-360-closed-work',
+            }),
+          }
+        },
+      }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(360), issueFile(360))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(closeViewCalls).toHaveLength(1)
+    expect(closeViewCalls[0]).toContain('view')
+    expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-done', 'issue-done'])
+    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().counters.done).toBe(1)
+    expect(factory.status().counters.errors).toBeUndefined()
   })
 
   it('closes synthetic probe PRs even when real auto-merge is enabled', async () => {
