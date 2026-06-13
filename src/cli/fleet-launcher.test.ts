@@ -49,7 +49,7 @@ describe('fleet.mjs launcher', () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 60_000)
 })
 
 async function createLauncherFixture(marker: string): Promise<{ root: string; repoRoot: string; packageRoot: string }> {

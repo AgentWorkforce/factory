@@ -356,6 +356,39 @@ class TrackingEventsMount extends CountingEventsMount {
   }
 }
 
+class HangingUnsubscribeMount extends TrackingEventsMount {
+  unsubscribeStarted = 0
+  readonly unsubscribeStartedPromise: Promise<void>
+  #releaseUnsubscribe!: () => void
+  #resolveUnsubscribeStarted!: () => void
+  #unsubscribeReleased = new Promise<void>((resolve) => {
+    this.#releaseUnsubscribe = resolve
+  })
+
+  constructor(initialFiles: Record<string, unknown> = {}) {
+    super(initialFiles)
+    this.unsubscribeStartedPromise = new Promise<void>((resolve) => {
+      this.#resolveUnsubscribeStarted = resolve
+    })
+  }
+
+  override subscribe(...args: Parameters<FakeMountClient['subscribe']>): ReturnType<FakeMountClient['subscribe']> {
+    const subscription = super.subscribe(...args)
+    return {
+      unsubscribe: async () => {
+        this.unsubscribeStarted += 1
+        this.#resolveUnsubscribeStarted()
+        await this.#unsubscribeReleased
+        await subscription.unsubscribe()
+      },
+    }
+  }
+
+  releaseUnsubscribe(): void {
+    this.#releaseUnsubscribe()
+  }
+}
+
 class SlackSyncStatusMount extends FakeMountClient {
   slackStatus: ProviderSyncStatus | undefined
 
@@ -1788,6 +1821,51 @@ describe('FactoryLoop', () => {
         expect.objectContaining({ message: 'release failed for ar-61-impl' }),
       ],
     ])
+  })
+
+  it('stop bounds a hanging live subscription unsubscribe and continues shutdown', async () => {
+    vi.useFakeTimers()
+    const mount = new HangingUnsubscribeMount()
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+    let stopped = false
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      expect(mount.activeSubscriptions).toBe(1)
+
+      const stop = factory.stop().then(() => {
+        stopped = true
+      })
+      await mount.unsubscribeStartedPromise
+      await vi.advanceTimersByTimeAsync(2_499)
+      await Promise.resolve()
+      expect(stopped).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await stop
+
+      expect(stopped).toBe(true)
+      expect(mount.unsubscribeStarted).toBe(1)
+      expect(warnings).toEqual([
+        [
+          '[factory] factory subscription unsubscribe timed out after 2500ms; continuing shutdown and allowing the server-side subscription to expire',
+          { timeoutMs: 2_500 },
+        ],
+      ])
+    } finally {
+      mount.releaseUnsubscribe()
+      await Promise.resolve()
+      vi.useRealTimers()
+    }
   })
 
   it('start queues and emits issue-queued when backfill exceeds batch capacity', async () => {

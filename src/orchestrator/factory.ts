@@ -87,6 +87,7 @@ const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
 const INJECTION_RETRY_DELAY_MS = 1_000
 const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
+const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -226,8 +227,9 @@ export class FactoryLoop implements Factory {
     if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
     this.#livePollTimer = undefined
     this.#livePollInFlight = false
-    await this.#subscription?.unsubscribe()
+    const subscription = this.#subscription
     this.#subscription = undefined
+    await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
     await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
     this.#slackWatchers.clear()
     this.#slackThreadIds.clear()
@@ -237,6 +239,32 @@ export class FactoryLoop implements Factory {
     this.#offAgentExit = undefined
     this.#offDeliveryFailed = undefined
     await this.#fleet.dispose()
+  }
+
+  async #boundedStopTeardown(label: string, teardown: () => Promise<void> | void | undefined): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const action = Promise.resolve()
+      .then(teardown)
+      .then(
+        () => ({ status: 'done' as const }),
+        (error: unknown) => ({ status: 'error' as const, error }),
+      )
+    const timeout = new Promise<{ status: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ status: 'timeout' }), STOP_TEARDOWN_TIMEOUT_MS)
+      timer.unref?.()
+    })
+
+    const result = await Promise.race([action, timeout])
+    if (timer) {
+      clearTimeout(timer)
+    }
+    if (result.status === 'timeout') {
+      this.#logger.warn?.(`[factory] ${label} timed out after ${STOP_TEARDOWN_TIMEOUT_MS}ms; continuing shutdown and allowing the server-side subscription to expire`, {
+        timeoutMs: STOP_TEARDOWN_TIMEOUT_MS,
+      })
+    } else if (result.status === 'error') {
+      this.#logger.warn?.(`[factory] failed while stopping ${label}; continuing shutdown`, result.error)
+    }
   }
 
   async dispose(): Promise<void> {
@@ -1676,7 +1704,7 @@ export class FactoryLoop implements Factory {
           clearTimeout(pollTimer)
           pollTimer = undefined
         }
-        await subscription?.unsubscribe()
+        await this.#boundedStopTeardown('Slack reply subscription unsubscribe', () => subscription?.unsubscribe())
       },
     })
   }

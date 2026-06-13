@@ -439,6 +439,62 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('factory start exits cleanly on SIGTERM after the signal handler stops the factory once', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-sigterm-'))
+    try {
+      const configPath = await writeConfig(root)
+      const listeners = new Map<string, () => void>()
+      const processLike = {
+        once(signal: string, listener: () => void) {
+          listeners.set(signal, listener)
+          return processLike
+        },
+        off(signal: string, listener: () => void) {
+          if (listeners.get(signal) === listener) listeners.delete(signal)
+          return processLike
+        },
+      }
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const createFactory = vi.fn(() => factory)
+
+      const run = runFleetCli([
+        'factory',
+        'start',
+        '--mode',
+        'live',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory,
+        stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+      await vi.waitFor(() => {
+        expect(listeners.has('SIGTERM')).toBe(true)
+      })
+      listeners.get('SIGTERM')?.()
+
+      await expect(run).resolves.toBe(0)
+      expect(factory.stop).toHaveBeenCalledTimes(1)
+      expect(listeners.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('factory kill-loop sends SIGTERM to the heartbeat pid', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-kill-'))
     const originalKill = process.kill
@@ -528,7 +584,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('signal handlers stop the factory before exiting and unregister themselves', async () => {
+  it('signal handlers exit 0 after clean graceful stop and unregister themselves', async () => {
     const calls: string[] = []
     const listeners = new Map<string, () => void>()
     const processLike = {
@@ -560,7 +616,44 @@ describe('fleet CLI runtime', () => {
 
     expect(factory.stop).toHaveBeenCalledTimes(1)
     expect(calls).toEqual(['stop', 'exit'])
-    expect(exits).toEqual([143])
+    expect(exits).toEqual([0])
+    expect(listeners.size).toBe(0)
+  })
+
+  it('signal handlers exit 1 when local teardown rejects', async () => {
+    const calls: string[] = []
+    const listeners = new Map<string, () => void>()
+    const processLike = {
+      once(signal: string, listener: () => void) {
+        listeners.set(signal, listener)
+        return processLike
+      },
+      off(signal: string, listener: () => void) {
+        if (listeners.get(signal) === listener) listeners.delete(signal)
+        return processLike
+      },
+    }
+    const factory = {
+      stop: vi.fn(async () => {
+        calls.push('stop')
+        throw new Error('dispose failed')
+      }),
+    } as unknown as Factory
+    const exits: number[] = []
+
+    installFactoryStopSignalHandlers(factory, {
+      processLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+      exit: (code) => {
+        calls.push('exit')
+        exits.push(code)
+      },
+    })
+    listeners.get('SIGTERM')?.()
+    await flush()
+
+    expect(factory.stop).toHaveBeenCalledTimes(1)
+    expect(calls).toEqual(['stop', 'exit'])
+    expect(exits).toEqual([1])
     expect(listeners.size).toBe(0)
   })
 })

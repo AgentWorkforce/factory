@@ -35,6 +35,7 @@ interface FleetCliDeps {
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
   now?: () => number
+  stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
 }
 
 interface GlobalOptions {
@@ -213,14 +214,23 @@ async function runFactoryCommand(
   if (command.kind === 'factory') {
     if (command.action === 'start') {
       const waiter = createStopSignalWaiter()
-      const removeSignalHandlers = installFactoryStopSignalHandlers(factory, { exit: waiter.resolve })
+      let stoppedBySignal = false
+      const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
+        exit: (code) => {
+          stoppedBySignal = true
+          waiter.resolve(code)
+        },
+        processLike: deps.stopSignalProcessLike,
+      })
       try {
         await factory.start({ mode: command.mode })
         const code = await (deps.waitForStopSignal?.() ?? waiter.promise)
         return typeof code === 'number' ? code : 0
       } finally {
         removeSignalHandlers()
-        await factory.stop()
+        if (!stoppedBySignal) {
+          await factory.stop()
+        }
       }
     }
     if (command.action === 'run-once') {
@@ -255,7 +265,9 @@ async function runFactoryCommand(
       return 0
     }
 
-    const removeSignalHandlers = installFactoryStopSignalHandlers(factory)
+    const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
+      processLike: deps.stopSignalProcessLike,
+    })
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
       writeJson(out, { reports, status: factory.status() })
@@ -480,17 +492,20 @@ export function installFactoryStopSignalHandlers(
     processLike.off('SIGINT', onSigint)
     processLike.off('SIGTERM', onSigterm)
   }
-  const stopAndExit = (code: number) => {
+  const stopAndExit = () => {
     if (!stopping) {
       stopping = factory.stop()
     }
-    void stopping.finally(() => {
+    void stopping.then(() => {
       remove()
-      exit(code)
+      exit(0)
+    }, () => {
+      remove()
+      exit(1)
     })
   }
-  const onSigint = () => stopAndExit(130)
-  const onSigterm = () => stopAndExit(143)
+  const onSigint = () => stopAndExit()
+  const onSigterm = () => stopAndExit()
   processLike.once('SIGINT', onSigint)
   processLike.once('SIGTERM', onSigterm)
   return remove
