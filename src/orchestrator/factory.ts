@@ -158,6 +158,7 @@ export class FactoryLoop implements Factory {
   #liveHeartbeatInFlight = false
   #liveHeartbeatRefresh?: Promise<void>
   #liveHeartbeatLastWriteMs = 0
+  #stoppingHeartbeatRefreshActive = false
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -257,25 +258,29 @@ export class FactoryLoop implements Factory {
     this.#stopping = true
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
-    await this.#stopLiveHeartbeat('stopping')
-    await this.#releaseInFlightAgents('factory-stopped')
-    if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
-    this.#livePollTimer = undefined
-    this.#livePollInFlight = false
-    this.#liveEventQueue.length = 0
-    this.#completionInFlight.clear()
-    const subscription = this.#subscription
-    this.#subscription = undefined
-    await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
-    await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
-    this.#slackWatchers.clear()
-    this.#slackThreadIds.clear()
-    this.#slackWatcherStarts.clear()
-    this.#offAgentExit?.()
-    this.#offDeliveryFailed?.()
-    this.#offAgentExit = undefined
-    this.#offDeliveryFailed = undefined
-    await this.#fleet.dispose()
+    this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
+    try {
+      await this.#releaseInFlightAgents('factory-stopped')
+      if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
+      this.#livePollTimer = undefined
+      this.#livePollInFlight = false
+      this.#liveEventQueue.length = 0
+      this.#completionInFlight.clear()
+      const subscription = this.#subscription
+      this.#subscription = undefined
+      await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
+      await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
+      this.#slackWatchers.clear()
+      this.#slackThreadIds.clear()
+      this.#slackWatcherStarts.clear()
+      this.#offAgentExit?.()
+      this.#offDeliveryFailed?.()
+      this.#offAgentExit = undefined
+      this.#offDeliveryFailed = undefined
+      await this.#fleet.dispose()
+    } finally {
+      this.#stoppingHeartbeatRefreshActive = false
+    }
   }
 
   async #boundedStopTeardown(label: string, teardown: () => Promise<void> | void | undefined): Promise<void> {
@@ -339,9 +344,9 @@ export class FactoryLoop implements Factory {
     this.#scheduleLiveHeartbeatRefresh()
   }
 
-  async #stopLiveHeartbeat(status: FactoryLoopHeartbeat['status']): Promise<void> {
+  async #stopLiveHeartbeat(status: FactoryLoopHeartbeat['status']): Promise<boolean> {
     if (!this.#liveHeartbeatActive && !this.#liveHeartbeatTimer) {
-      return
+      return false
     }
     this.#liveHeartbeatActive = false
     if (this.#liveHeartbeatTimer) {
@@ -350,6 +355,18 @@ export class FactoryLoop implements Factory {
     }
     await this.#liveHeartbeatRefresh
     await this.#writeLiveHeartbeat(status)
+    return status === 'stopping'
+  }
+
+  async #refreshStoppingHeartbeat(): Promise<void> {
+    if (!this.#stoppingHeartbeatRefreshActive) {
+      return
+    }
+    try {
+      await this.#writeLiveHeartbeat('stopping')
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to refresh stopping heartbeat', error)
+    }
   }
 
   #scheduleLiveHeartbeatRefresh(): void {
@@ -1226,6 +1243,9 @@ export class FactoryLoop implements Factory {
   ): Promise<void> {
     const protectedPids = await this.#protectedPids()
     for (const [agentName, tracked] of agents) {
+      if (context === 'stop') {
+        await this.#refreshStoppingHeartbeat()
+      }
       const roots = await this.#terminationRoots(agentName, tracked, protectedPids)
       if (roots.pids.length === 0 && roots.status === 'unresolved') {
         this.#increment('agentTerminateMissingPid')
@@ -1250,11 +1270,17 @@ export class FactoryLoop implements Factory {
           }
         }
       }
+      if (context === 'stop') {
+        await this.#refreshStoppingHeartbeat()
+      }
 
       try {
         await this.#fleet.release(agentName, reason)
       } catch (error) {
         this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
+      }
+      if (context === 'stop') {
+        await this.#refreshStoppingHeartbeat()
       }
     }
   }

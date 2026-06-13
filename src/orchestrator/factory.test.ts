@@ -1081,6 +1081,87 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('keeps stopping heartbeat fresh between progressing multi-agent teardown steps', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-stop-progress-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    const staleMs = 1_000
+    const clock = new ManualClock()
+    const pids = new Map([
+      ['ar-363-impl', 36_301],
+      ['ar-363-review', 36_302],
+    ])
+    const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
+    try {
+      const mount = new FakeMountClient({ [issuePath(363)]: issueFile(363) })
+      const reaperReports: Awaited<ReturnType<typeof reapFactoryOrphansOnce>>[] = []
+      const kill = (pid: number, signal?: NodeJS.Signals | 0): boolean => {
+        killed.push({ pid, signal })
+        return true
+      }
+      const processIdentityReader = async (pid: number) => {
+        const agentName = [...pids.entries()].find(([, candidatePid]) => candidatePid === pid)?.[0]
+        return agentName
+          ? { pid, startTime: `start-${pid}`, cmdline: `node ${agentName} worker` }
+          : undefined
+      }
+      class ReaperObservingFleetClient extends CapturedPidFleetClient {
+        override async release(name: string, reason?: string): Promise<void> {
+          if (this.releases.length === 1) {
+            reaperReports.push(await reapFactoryOrphansOnce({
+              heartbeatPath,
+              registryPath,
+              staleMs,
+              nowMs: clock.now(),
+              termGraceMs: 0,
+              kill,
+              readChildPids: async () => [],
+              readProcessIdentity: processIdentityReader,
+            }))
+          }
+          await super.release(name, reason)
+          if (this.releases.length === 1) {
+            clock.advance(staleMs + 100)
+          }
+        }
+      }
+      const fleet = new ReaperObservingFleetClient([
+        { name: 'ar-363-impl', pid: pids.get('ar-363-impl') },
+        { name: 'ar-363-review', pid: pids.get('ar-363-review') },
+      ])
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: staleMs },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        clock,
+        terminationGraceMs: 0,
+        readChildPids: async () => [],
+        kill,
+        processFinder: async (agentName) => {
+          const pid = pids.get(agentName)
+          return pid
+            ? { status: 'found', identity: { pid, startTime: `start-${pid}`, cmdline: `node ${agentName} worker` } }
+            : { status: 'missing' }
+        },
+        processIdentityReader,
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(363), issueFile(363))))
+      await factory.stop()
+
+      expect(reaperReports).toEqual([{ stale: false, reason: 'loop stopping', reaped: [], skipped: [] }])
+      expect(fleet.releases.map((release) => release.name)).toEqual(['ar-363-impl', 'ar-363-review'])
+      expect((await readFactoryLoopHeartbeat(heartbeatPath))?.updatedAtMs).toBe(clock.now())
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
+      expect(killed.some((entry) => entry.signal === 'SIGTERM')).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('writes a durable in-flight registry with agent PID identity signatures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-loop-registry-'))
     const heartbeatPath = join(root, 'heartbeat.json')

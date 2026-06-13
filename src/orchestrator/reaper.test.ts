@@ -73,6 +73,39 @@ describe('factory reaper', () => {
     }
   })
 
+  it('reaps stale stopping heartbeats so wedged teardown is still detected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-reaper-stale-stopping-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
+      await writeJson(heartbeatPath, { ...heartbeat(1_000), status: 'stopping' })
+      await writeJson(registryPath, registry())
+      const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
+
+      const report = await reapFactoryOrphansOnce({
+        heartbeatPath,
+        registryPath,
+        staleMs: 1_000,
+        nowMs: 3_001,
+        termGraceMs: 0,
+        kill: (pid, signal) => {
+          killed.push({ pid, signal })
+          return true
+        },
+        readProcessIdentity: async (pid) => ({ pid, startTime: 'started-111', cmdline: 'node ar-1-impl worker' }),
+      })
+
+      expect(report).toMatchObject({
+        stale: true,
+        reason: 'heartbeat stale',
+        reaped: [{ pid: 111, signals: ['SIGTERM', 'SIGKILL'] }],
+      })
+      expect(killed.some((entry) => entry.signal === 'SIGTERM')).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('terminates a whole process tree before killing the parent root', async () => {
     const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
     const brokerParentPid = 68009
