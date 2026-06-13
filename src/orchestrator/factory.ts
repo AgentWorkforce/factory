@@ -83,11 +83,14 @@ const STATE_NAME_TO_ID: Record<string, string> = {
 }
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+const FACTORY_E2E_MARKER = '[factory-e2e]'
 const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
 const INJECTION_RETRY_DELAY_MS = 1_000
 const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const STOP_TEARDOWN_TIMEOUT_MS = 2_500
+const MERGE_GATE_MAX_ATTEMPTS = 12
+const MERGE_GATE_POLL_DELAY_MS = 10_000
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -110,6 +113,7 @@ export class FactoryLoop implements Factory {
   readonly #mergeGate: GithubMergeGatePort
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
+  readonly #customProbePrResolver: boolean
   readonly #logger: Logger
   readonly #clock: Clock
   readonly #processIdentityReader: typeof readProcessIdentity
@@ -160,7 +164,8 @@ export class FactoryLoop implements Factory {
     void (ports.github ?? MountGithubRead(ports.mount))
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
-    this.#probePrResolver = ports.probePrResolver ?? ((issue) => resolveProbePrFromMount(this.#mount, this.#config, issue))
+    this.#customProbePrResolver = Boolean(ports.probePrResolver)
+    this.#probePrResolver = ports.probePrResolver ?? ((issue) => resolveIssuePrFromMount(this.#mount, this.#config, issue))
     this.#logger = ports.logger ?? console
     this.#clock = ports.clock ?? realClock
     this.#processIdentityReader = ports.processIdentityReader ?? readProcessIdentity
@@ -1388,10 +1393,8 @@ export class FactoryLoop implements Factory {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
       }
-      void this.#mergeGate
-
       if (issue) {
-        await this.#closeProbeIfRequired(issue)
+        await this.#runCompletionMergeGate(issue)
       }
 
       await this.#releaseAndTerminateAgents([...record.agents], 'issue-done', 'completion')
@@ -1763,12 +1766,69 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #closeProbeIfRequired(issue: LinearIssue): Promise<void> {
-    if (this.#config.mergePolicy !== 'never' || !this.#isSyntheticProbeIssue(issue)) {
+  async #runCompletionMergeGate(issue: LinearIssue): Promise<void> {
+    if (this.#isSyntheticProbeIssue(issue)) {
+      await this.#closeSyntheticProbeIfPresent(issue)
       return
     }
 
-    const probe = await this.#probePrResolver(issue)
+    if (!isRealLinearIssue(issue)) {
+      this.#logger.warn?.('[factory] merge gate skipped non-real Linear issue', { issue: issue.key })
+      this.#increment('mergeGateSkippedNonReal')
+      return
+    }
+
+    if (this.#config.mergePolicy !== 'on-green-with-review') {
+      return
+    }
+
+    const pr = await this.#probePrResolver(issue)
+    if (!pr) {
+      this.#logger.warn?.('[factory] merge gate found no PR for real issue', { issue: issue.key })
+      this.#increment('mergeGateMissingPr')
+      return
+    }
+
+    const ready = await this.#waitForMergeReady(pr)
+    const headSha = ready?.live.headRefOid
+    if (!ready || !headSha) {
+      this.#increment('mergeGateNotMerged')
+      return
+    }
+
+    const result = await this.#mergeGate.merge({
+      repo: pr.repo,
+      number: pr.prNumber,
+      expectedHeadSha: headSha,
+    })
+    if (!result.merged) {
+      this.#logger.warn?.('[factory] merge gate aborted guarded merge', {
+        issue: issue.key,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+        headSha,
+        reason: result.reason,
+      })
+      this.#increment('mergeGateMergeAborted')
+      return
+    }
+
+    this.#logger.info?.('[factory] merge gate merged PR', {
+      issue: issue.key,
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      headSha,
+    })
+    this.#increment('mergeGateMerged')
+  }
+
+  async #closeSyntheticProbeIfPresent(issue: LinearIssue): Promise<void> {
+    const probe = this.#customProbePrResolver
+      ? await this.#probePrResolver(issue)
+      : await resolveIssuePrFromMount(this.#mount, this.#config, issue, {
+        requireTitleMarker: true,
+        titleMarker: FACTORY_E2E_MARKER,
+      })
     if (!probe) {
       return
     }
@@ -1778,10 +1838,34 @@ export class FactoryLoop implements Factory {
       prNumber: probe.prNumber,
       expectedIssueKey: issue.key,
     })
+    this.#increment('mergeGateSyntheticClosed')
+  }
+
+  async #waitForMergeReady(pr: { repo: string; prNumber: number }): Promise<Awaited<ReturnType<GithubMergeGatePort['check']>> | undefined> {
+    let lastReason = 'not checked'
+    for (let attempt = 1; attempt <= MERGE_GATE_MAX_ATTEMPTS; attempt += 1) {
+      const verdict = await this.#mergeGate.check({ repo: pr.repo, number: pr.prNumber })
+      lastReason = verdict.reason
+      if (verdict.ready && verdict.live.headRefOid) {
+        return verdict
+      }
+
+      if (attempt < MERGE_GATE_MAX_ATTEMPTS) {
+        await this.#clock.sleep(MERGE_GATE_POLL_DELAY_MS)
+      }
+    }
+
+    this.#logger.warn?.('[factory] merge gate left PR open; readiness timeout', {
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      attempts: MERGE_GATE_MAX_ATTEMPTS,
+      reason: lastReason,
+    })
+    return undefined
   }
 
   #isSyntheticProbeIssue(issue: LinearIssue): boolean {
-    return isInFactoryScope(issue, this.#config.safety)
+    return hasTitlePrefix(issue.title, FACTORY_E2E_MARKER)
   }
 }
 
@@ -1909,17 +1993,18 @@ const repoMapFromConfig = (config: FactoryConfig) => {
   }))
 }
 
-const resolveProbePrFromMount = async (
+const resolveIssuePrFromMount = async (
   mount: MountClient,
   config: FactoryConfig,
   issue: LinearIssue,
+  opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
 ): Promise<{ repo: string; prNumber: number } | undefined> => {
   const candidates: Array<{ repo: string; prNumber: number }> = []
   for (const repo of reposFromConfig(config)) {
     for (const path of await mount.listTree(githubPullRoot(repo))) {
       if (!path.endsWith('.json')) continue
       const pr = await readProbePrCandidate(mount, path)
-      if (!pr || !probePrMatchesIssue(pr, issue, config.safety.requireTitlePrefix)) continue
+      if (!pr || !issuePrMatchesIssue(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)) continue
       candidates.push({ repo, prNumber: pr.number })
     }
   }
@@ -1963,14 +2048,26 @@ const readProbePrCandidate = async (
   }
 }
 
-const probePrMatchesIssue = (
+const issuePrMatchesIssue = (
   pr: { title: string; body: string; headRef: string },
   issue: LinearIssue,
   marker: string,
+  opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
 ): boolean => {
   const haystack = `${pr.title}\n${pr.body}\n${pr.headRef}`
-  return containsIssueKey(haystack, issue.key) && (pr.title === marker || pr.title.startsWith(`${marker} `))
+  if (!containsIssueKey(haystack, issue.key)) {
+    return false
+  }
+
+  if (!opts.requireTitleMarker) {
+    return true
+  }
+
+  return pr.title === marker || pr.title.startsWith(`${marker} `)
 }
+
+const hasTitlePrefix = (title: string, marker: string): boolean =>
+  title === marker || title.startsWith(`${marker} `)
 
 const containsIssueKey = (value: string, issueKey: string): boolean => {
   const escaped = issueKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

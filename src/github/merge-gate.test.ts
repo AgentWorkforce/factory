@@ -12,6 +12,7 @@ const live = (overrides: Record<string, unknown> = {}) => ({
   mergeable: 'MERGEABLE',
   mergeStateStatus: 'CLEAN',
   headRefOid: 'abc123',
+  reviewDecision: 'APPROVED',
   statusCheckRollup: [
     { name: 'test', conclusion: 'SUCCESS' },
   ],
@@ -47,6 +48,17 @@ describe('GithubMergeGate', () => {
       verdict: 'REFUSE',
       ready: false,
       reason: expect.stringMatching(/head moved/),
+    })
+  })
+
+  it('captures the current ready head when no expected head sha is supplied', () => {
+    expect(evaluateGithubMergeGate({
+      repo: 'AgentWorkforce/pear',
+      number: 123,
+    }, live({ headRefOid: 'ready-sha' }))).toMatchObject({
+      verdict: 'READY',
+      ready: true,
+      live: { headRefOid: 'ready-sha' },
     })
   })
 
@@ -116,6 +128,49 @@ describe('GithubMergeGate', () => {
     expect(evaluateGithubMergeGate(input, live({ statusCheckRollup: [{ status: 'COMPLETED' }] }))).toMatchObject({
       verdict: 'REFUSE',
       ready: false,
+    })
+  })
+
+  it('refuses until the review decision is approved', () => {
+    expect(evaluateGithubMergeGate(input, live({ reviewDecision: 'REVIEW_REQUIRED' }))).toMatchObject({
+      verdict: 'REFUSE',
+      ready: false,
+      reason: expect.stringMatching(/review decision/),
+    })
+  })
+
+  it('merges through gh with squash, delete-branch, and match-head-commit', async () => {
+    const calls: string[][] = []
+    const gate = new GhCliGithubMergeGate(async (args) => {
+      calls.push(args)
+      return { stdout: 'merged' }
+    })
+
+    await expect(gate.merge(input)).resolves.toMatchObject({
+      merged: true,
+    })
+
+    expect(calls).toEqual([[
+      'pr',
+      'merge',
+      '123',
+      '--repo',
+      'AgentWorkforce/pear',
+      '--squash',
+      '--delete-branch',
+      '--match-head-commit',
+      'abc123',
+    ]])
+  })
+
+  it('reports guarded merge failure without claiming success', async () => {
+    const gate = new GhCliGithubMergeGate(async () => {
+      throw new Error('Head commit changed')
+    })
+
+    await expect(gate.merge(input)).resolves.toMatchObject({
+      merged: false,
+      reason: expect.stringMatching(/Head commit changed/),
     })
   })
 })

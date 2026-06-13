@@ -52,8 +52,10 @@ export type {
   CloseProbePrResult,
   GhRunner,
   GhRunResult,
+  GithubMergeInput,
   GithubMergeGateInput,
   GithubMergeGatePort,
+  GithubMergeResult,
   GithubMergeGateVerdict,
 } from './github'
 export {

@@ -9,7 +9,9 @@ export {
 export type {
   GhRunner,
   GhRunResult,
+  GithubMergeInput,
   GithubMergeGateInput,
+  GithubMergeResult,
   GithubMergeGateVerdict,
   GithubMergeGate as GithubMergeGatePort,
 } from './merge-gate'

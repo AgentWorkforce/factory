@@ -18,7 +18,7 @@ import {
 } from '../index'
 import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { CloseProbePrInput, LinearIssue } from '../index'
+import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker } from './batch-tracker'
 import { keyFromPath } from './factory'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
@@ -77,6 +77,10 @@ const realIssueFile = (n: number, stateId = ready, overrides: Record<string, unk
     url: `https://linear.app/agent-relay/issue/AR-${n}/factory-issue-${n}`,
     ...overrides,
   },
+})
+
+const realMergeIssueFile = (n: number, stateId = ready) => realIssueFile(n, stateId, {
+  title: `Real product issue ${n}`,
 })
 
 const slackConfig = (channel = 'C0FACTORY__factory-e2e') => ({
@@ -185,6 +189,67 @@ class ReleaseFailingFleetClient extends FakeFleetClient {
     await super.release(name, reason)
   }
 }
+
+class ScriptedGithubMergeGate implements GithubMergeGatePort {
+  readonly checks: Array<{ repo: string; number: number; expectedHeadSha?: string }> = []
+  readonly merges: GithubMergeInput[] = []
+  readonly #verdicts: GithubMergeGateVerdict[]
+  #mergeResult: { merged: boolean; reason: string }
+
+  constructor(verdicts: GithubMergeGateVerdict[], mergeResult: { merged: boolean; reason: string } = { merged: true, reason: 'merged' }) {
+    this.#verdicts = [...verdicts]
+    this.#mergeResult = mergeResult
+  }
+
+  async check(input: { repo: string; number: number; expectedHeadSha?: string }): Promise<GithubMergeGateVerdict> {
+    this.checks.push(input)
+    return this.#verdicts.shift() ?? this.#verdicts.at(-1) ?? refusedMergeVerdict('no scripted verdict')
+  }
+
+  async merge(input: GithubMergeInput): Promise<{ merged: boolean; reason: string }> {
+    this.merges.push(input)
+    return this.#mergeResult
+  }
+}
+
+const readyMergeVerdict = (headRefOid = 'green-sha'): GithubMergeGateVerdict => ({
+  verdict: 'READY',
+  ready: true,
+  reason: 'ready',
+  live: {
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'CLEAN',
+    headRefOid,
+    reviewDecision: 'APPROVED',
+    checkStates: ['SUCCESS'],
+  },
+})
+
+const refusedMergeVerdict = (reason: string): GithubMergeGateVerdict => ({
+  verdict: 'REFUSE',
+  ready: false,
+  reason,
+  live: {
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'UNSTABLE',
+    headRefOid: 'red-sha',
+    reviewDecision: 'APPROVED',
+    checkStates: ['FAILURE'],
+  },
+})
+
+const stateOnlyLinear = (mount: FakeMountClient): LinearWriteback => ({
+  async setState(issue, stateId) {
+    await mount.writeFile(issue.path, { stateId })
+  },
+  async postComment() {},
+  async createIssue() {
+    throw new Error('not used')
+  },
+  async verify() {
+    return true
+  },
+})
 
 class CapturedPidFleetClient extends FakeFleetClient {
   readonly plans: Map<string, SpawnResult>
@@ -2653,14 +2718,16 @@ describe('FactoryLoop', () => {
     expect(alive).toEqual(new Set())
   })
 
-  it('does not close probes for non-never merge policies', async () => {
+  it('closes synthetic probe PRs even when real auto-merge is enabled', async () => {
     const markedMount = new FakeMountClient({ [issuePath(19)]: issueFile(19) })
     const markedFleet = new FakeFleetClient()
     const markedCalls: unknown[] = []
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('synthetic-sha')])
     const markedFactory = createFactory(config({ mergePolicy: 'on-green-with-review' }), {
       mount: markedMount,
       fleet: markedFleet,
       triage: new StaticTriage(),
+      mergeGate: gate,
       probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 19 }),
       probeCloser: async (input) => {
         markedCalls.push(input)
@@ -2670,7 +2737,98 @@ describe('FactoryLoop', () => {
     await markedFactory.dispatch(await markedFactory.triageIssue(parseLinearIssue(issuePath(19), issueFile(19))))
     markedFleet.emitAgentExit('ar-19-impl', 'issue-done')
     await flush()
-    expect(markedCalls).toEqual([])
+    expect(markedCalls).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 19, expectedIssueKey: 'AR-19' }])
+    expect(gate.checks).toEqual([])
+    expect(gate.merges).toEqual([])
+  })
+
+  it('does not merge a real PR while a required check is red', async () => {
+    const mount = new FakeMountClient({ [issuePath(20)]: realMergeIssueFile(20) })
+    const fleet = new FakeFleetClient()
+    const clock = new ManualClock()
+    const gate = new ScriptedGithubMergeGate([
+      refusedMergeVerdict('checks not merge-ready: FAILURE'),
+    ])
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+      clock,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 20 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(20), realMergeIssueFile(20))))
+    fleet.emitAgentExit('ar-20-impl', 'issue-done')
+
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-20-impl', 'ar-20-review']))
+    expect(gate.checks).toHaveLength(12)
+    expect(gate.merges).toEqual([])
+  })
+
+  it('aborts a real PR merge when the guarded head commit has drifted', async () => {
+    const mount = new FakeMountClient({ [issuePath(21)]: realMergeIssueFile(21) })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([
+      readyMergeVerdict('green-approved-sha'),
+    ], { merged: false, reason: 'Head commit changed' })
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 21 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), realMergeIssueFile(21))))
+    fleet.emitAgentExit('ar-21-impl', 'issue-done')
+
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-21-impl', 'ar-21-review']))
+    expect(gate.merges).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      number: 21,
+      expectedHeadSha: 'green-approved-sha',
+    }])
+    expect(factory.status().counters.mergeGateMergeAborted).toBe(1)
+    expect(factory.status().counters.mergeGateMerged).toBeUndefined()
+  })
+
+  it('merges a real PR once checks are green, review is approved, and head still matches', async () => {
+    const mount = new FakeMountClient({ [issuePath(22)]: realMergeIssueFile(22) })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([
+      readyMergeVerdict('green-approved-sha'),
+    ])
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 22 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(22), realMergeIssueFile(22))))
+    fleet.emitAgentExit('ar-22-impl', 'issue-done')
+
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-22-impl', 'ar-22-review']))
+    expect(gate.merges).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      number: 22,
+      expectedHeadSha: 'green-approved-sha',
+    }])
+    expect(factory.status().counters.mergeGateMerged).toBe(1)
   })
 
   it('does not resolve a probe PR when the factory-e2e marker is only in body or branch', async () => {
