@@ -20,12 +20,15 @@ import {
   type FleetClient,
   type MountClient,
   type ProbeCloser,
+  type RelayfileCloudMountClientConfig,
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
 interface FleetCliDeps {
   fleet?: FleetClient
   mount?: MountClient
+  createFleet?: typeof createFleet
+  cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
@@ -274,14 +277,14 @@ async function loadConfig(path?: string): Promise<LoadedConfig> {
   const record = asRecord(raw)
   return {
     config: FactoryConfigSchema.parse(record.factoryConfig ?? record),
-    fixtureFiles: asRecord(record.fixtureFiles),
+    fixtureFiles: record.fixtureFiles ? asRecord(record.fixtureFiles) : undefined,
   }
 }
 
 async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefined, deps: FleetCliDeps): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
-  if (globals.backend === 'internal' && loaded?.fixtureFiles) return new FakeFleetClient()
-  return createFleet({
+  if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
+  return (deps.createFleet ?? createFleet)({
     backend: globals.backend,
     cwd: process.cwd(),
     connectionPath: resolveBrokerConnectionPath(process.cwd()),
@@ -305,14 +308,17 @@ export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | 
 
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
   if (deps.mount) return deps.mount
-  if (loaded.fixtureFiles) return new FakeMountClient(loaded.fixtureFiles)
+  if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
   let mount: MountClient
-  mount = await RelayfileCloudMountClient.fromConfig({
+  mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
   })
   return mount
 }
+
+const hasExplicitFixtureFiles = (loaded: LoadedConfig | undefined): loaded is LoadedConfig & { fixtureFiles: Record<string, unknown> } =>
+  loaded?.fixtureFiles !== undefined
 
 async function isAllowedFactoryDraft(
   path: string,

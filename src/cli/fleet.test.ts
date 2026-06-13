@@ -122,6 +122,86 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it('uses real fleet and cloud mount for fixture-less factory configs on the operator path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-real-default-'))
+    try {
+      const configPath = await writeConfig(root)
+      const realFleet = new FakeFleetClient()
+      const realMount = new FakeMountClient({ [issuePath]: issueFile })
+      const createFleetCalls: unknown[] = []
+      const cloudMountCalls: unknown[] = []
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'factory',
+        'run-once',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        createFleet: (opts) => {
+          createFleetCalls.push(opts)
+          return realFleet
+        },
+        cloudMountFromConfig: async (opts) => {
+          cloudMountCalls.push(opts)
+          return realMount
+        },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(createFleetCalls).toHaveLength(1)
+      expect(cloudMountCalls).toHaveLength(1)
+      const report = JSON.parse(output.text())
+      expect(report).toMatchObject({
+        dryRun: true,
+        pulled: [{ key: 'AR-77' }],
+        dispatched: [{ issue: { key: 'AR-77' } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps explicit fixtureFiles configs on Fake fleet and mount for harness runs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-fixture-opt-in-'))
+    try {
+      const configPath = await writeConfig(root, {
+        fixtureFiles: { [issuePath]: issueFile },
+      })
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'factory',
+        'run-once',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        createFleet: () => {
+          throw new Error('real fleet should not be selected for fixture config')
+        },
+        cloudMountFromConfig: async () => {
+          throw new Error('real mount should not be selected for fixture config')
+        },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      const report = JSON.parse(output.text())
+      expect(report).toMatchObject({
+        dryRun: true,
+        pulled: [{ key: 'AR-77' }],
+        dispatched: [{ issue: { key: 'AR-77' } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('runs factory run-once dry-run over FleetClient and MountClient fakes with zero writes and zero spawns', async () => {
     const fleet = new FakeFleetClient()
     const mount = new FakeMountClient({ [issuePath]: issueFile })
