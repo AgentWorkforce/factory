@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
+import { containsIssueKey } from '../issue-key-match'
 import type { GhRunner } from './merge-gate'
 
 const execFileAsync = promisify(execFile)
@@ -10,6 +11,7 @@ export interface CloseProbePrInput {
   repo: string
   prNumber: number
   expectedIssueKey: string
+  requireTitleMarker?: boolean
   runner?: GhRunner
 }
 
@@ -64,18 +66,13 @@ const assertOpenProbe = (live: Record<string, unknown>, input: CloseProbePrInput
   if (!containsIssueKey(haystack, input.expectedIssueKey)) {
     throw new Error(`Refusing to close probe PR #${input.prNumber}: missing issue key ${input.expectedIssueKey}`)
   }
-  if (!hasFactoryE2eMarker(title)) {
+  if ((input.requireTitleMarker ?? true) && !hasFactoryE2eMarker(title)) {
     throw new Error(`Refusing to close probe PR #${input.prNumber}: missing ${FACTORY_E2E_MARKER} probe marker`)
   }
 }
 
 const hasFactoryE2eMarker = (title: string): boolean =>
   title === FACTORY_E2E_MARKER || title.startsWith(`${FACTORY_E2E_MARKER} `)
-
-const containsIssueKey = (value: string, issueKey: string): boolean => {
-  const escaped = issueKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`(^|[^A-Za-z0-9-])${escaped}([^A-Za-z0-9-]|$)`, 'i').test(value)
-}
 
 const normalizeState = (state?: string): string | undefined => state?.toUpperCase()
 

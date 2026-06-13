@@ -16,6 +16,7 @@ import type {
   Subscription,
 } from '../ports'
 import type { Clock, Logger } from '../ports/system'
+import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { renderAgentTask } from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage } from '../triage'
@@ -1919,7 +1920,6 @@ export class FactoryLoop implements Factory {
     const probe = this.#customProbePrResolver
       ? await this.#probePrResolver(issue)
       : await resolveIssuePrFromMount(this.#mount, this.#config, issue, {
-        requireTitleMarker: true,
         titleMarker: FACTORY_E2E_MARKER,
       })
     if (!probe) {
@@ -1930,6 +1930,7 @@ export class FactoryLoop implements Factory {
       repo: probe.repo,
       prNumber: probe.prNumber,
       expectedIssueKey: issue.key,
+      requireTitleMarker: false,
     })
     this.#increment('mergeGateSyntheticClosed')
   }
@@ -2092,17 +2093,20 @@ const resolveIssuePrFromMount = async (
   issue: LinearIssue,
   opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
 ): Promise<{ repo: string; prNumber: number } | undefined> => {
-  const candidates: Array<{ repo: string; prNumber: number }> = []
+  const candidates: Array<{ repo: string; prNumber: number; score: number }> = []
   for (const repo of reposFromConfig(config)) {
     for (const path of await mount.listTree(githubPullRoot(repo))) {
       if (!path.endsWith('.json')) continue
       const pr = await readProbePrCandidate(mount, path)
-      if (!pr || !issuePrMatchesIssue(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)) continue
-      candidates.push({ repo, prNumber: pr.number })
+      const score = pr
+        ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
+        : 0
+      if (!pr || score <= 0) continue
+      candidates.push({ repo, prNumber: pr.number, score })
     }
   }
 
-  return candidates.sort((a, b) => b.prNumber - a.prNumber)[0]
+  return candidates.sort((a, b) => b.score - a.score || b.prNumber - a.prNumber)[0]
 }
 
 const reposFromConfig = (config: FactoryConfig): string[] => {
@@ -2141,31 +2145,22 @@ const readProbePrCandidate = async (
   }
 }
 
-const issuePrMatchesIssue = (
+const issuePrMatchScore = (
   pr: { title: string; body: string; headRef: string },
   issue: LinearIssue,
   marker: string,
   opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
-): boolean => {
-  const haystack = `${pr.title}\n${pr.body}\n${pr.headRef}`
-  if (!containsIssueKey(haystack, issue.key)) {
-    return false
-  }
+): number => {
+  if (opts.requireTitleMarker && !hasTitlePrefix(pr.title, marker)) return 0
 
-  if (!opts.requireTitleMarker) {
-    return true
-  }
-
-  return pr.title === marker || pr.title.startsWith(`${marker} `)
+  if (containsIssueKey(pr.headRef, issue.key)) return 30
+  if (containsIssueKey(pr.title, issue.key)) return 20
+  if (containsExplicitIssueReference(pr.body, issue.key)) return 10
+  return 0
 }
 
 const hasTitlePrefix = (title: string, marker: string): boolean =>
   title === marker || title.startsWith(`${marker} `)
-
-const containsIssueKey = (value: string, issueKey: string): boolean => {
-  const escaped = issueKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`(^|[^A-Za-z0-9-])${escaped}([^A-Za-z0-9-]|$)`, 'i').test(value)
-}
 
 const ISSUE_KEY_PATTERN = /^[A-Z]+-\d+$/u
 

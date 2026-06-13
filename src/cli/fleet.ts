@@ -71,6 +71,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     const command = parseFleetCommand(args)
 
     if (command.kind === 'factory-close-probe') {
+      // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
       const result = await (deps.probeCloser ?? closeProbePr)({
         repo: command.repo,
         prNumber: command.prNumber,

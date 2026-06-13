@@ -85,11 +85,51 @@ describe('closeProbePr', () => {
     expect(calls).toHaveLength(1)
   })
 
+  it('allows issue-gated callers to close markerless branch-convention PRs', async () => {
+    const calls: string[][] = []
+    const markerlessProbe = {
+      state: 'OPEN',
+      headRefName: 'ar-229-is-positive',
+      title: 'Add isPositive util',
+      body: '',
+    }
+    const runner: GhRunner = async (args) => {
+      calls.push(args)
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return { stdout: JSON.stringify(calls.length === 1 ? markerlessProbe : { ...markerlessProbe, state: 'CLOSED' }) }
+      }
+      if (args[0] === 'pr' && args[1] === 'close') {
+        return { stdout: '' }
+      }
+      throw new Error(`unexpected gh args ${args.join(' ')}`)
+    }
+
+    await expect(closeProbePr({
+      repo: 'AgentWorkforce/pear',
+      prNumber: 279,
+      expectedIssueKey: 'AR-229',
+      requireTitleMarker: false,
+      runner,
+    })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 279, state: 'CLOSED' })
+    expect(calls.map((args) => args.slice(0, 3))).toEqual([
+      ['pr', 'view', '279'],
+      ['pr', 'close', '279'],
+      ['pr', 'view', '279'],
+    ])
+  })
+
   it('refuses a probe that is not tied to the expected issue key before closing', async () => {
     const calls: string[][] = []
     const runner: GhRunner = async (args) => {
       calls.push(args)
-      return { stdout: JSON.stringify({ ...openProbe, body: 'Closes AR-99', title: '[factory-e2e] AR-99 probe' }) }
+      return {
+        stdout: JSON.stringify({
+          ...openProbe,
+          body: 'Closes AR-99',
+          headRefName: 'factory-e2e/ar-99-probe',
+          title: '[factory-e2e] AR-99 probe',
+        }),
+      }
     }
 
     await expect(closeProbePr({

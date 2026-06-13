@@ -2916,7 +2916,7 @@ describe('FactoryLoop', () => {
         return true
       },
     }
-    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey'>> = []
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
     const factory = createFactory(config({ slack: slackConfig('C0FACTORY') }), {
       mount,
       fleet,
@@ -2935,7 +2935,12 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-18-impl', 'issue-done')
     await flush()
 
-    expect(closeInputs).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 18, expectedIssueKey: 'AR-18' }])
+    expect(closeInputs).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      prNumber: 18,
+      expectedIssueKey: 'AR-18',
+      requireTitleMarker: false,
+    }])
     expect(order).toEqual([
       'linear-done',
       'slack-root',
@@ -3009,7 +3014,12 @@ describe('FactoryLoop', () => {
     await markedFactory.dispatch(await markedFactory.triageIssue(parseLinearIssue(issuePath(19), issueFile(19))))
     markedFleet.emitAgentExit('ar-19-impl', 'issue-done')
     await flush()
-    expect(markedCalls).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 19, expectedIssueKey: 'AR-19' }])
+    expect(markedCalls).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      prNumber: 19,
+      expectedIssueKey: 'AR-19',
+      requireTitleMarker: false,
+    }])
     expect(gate.checks).toEqual([])
     expect(gate.merges).toEqual([])
   })
@@ -3103,18 +3113,164 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.mergeGateMerged).toBe(1)
   })
 
-  it('does not resolve a probe PR when the factory-e2e marker is only in body or branch', async () => {
+  it('closes synthetic probe PRs with real-agent body, title, or branch issue references', async () => {
+    const cases = [
+      {
+        n: 235,
+        pr: {
+          number: 277,
+          title: 'Add isOdd factory SDK util',
+          body: 'Linear: AR-235',
+          head_ref: 'feature/is-odd',
+        },
+      },
+      {
+        n: 236,
+        pr: {
+          number: 278,
+          title: 'AR-236: add square utility',
+          body: '',
+          head_ref: 'square-util',
+        },
+      },
+      {
+        n: 229,
+        pr: {
+          number: 279,
+          title: 'Add isPositive util',
+          body: '',
+          head_ref: 'ar-229-is-positive',
+        },
+      },
+    ]
+
+    for (const entry of cases) {
+      const mount = new FakeMountClient({
+        [issuePath(entry.n)]: issueFile(entry.n),
+        [`/github/repos/AgentWorkforce__pear/pulls/by-id/${entry.pr.number}.json`]: {
+          provider: 'github',
+          objectType: 'pull_request',
+          objectId: String(entry.pr.number),
+          payload: entry.pr,
+        },
+      })
+      const fleet = new FakeFleetClient()
+      const closeInputs: unknown[] = []
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        probeCloser: async (input) => {
+          closeInputs.push(input)
+          return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+        },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(entry.n), issueFile(entry.n))))
+      fleet.emitAgentExit(`ar-${entry.n}-impl`, 'issue-done')
+      await flush()
+
+      expect(closeInputs).toEqual([{
+        repo: 'AgentWorkforce/pear',
+        prNumber: entry.pr.number,
+        expectedIssueKey: `AR-${entry.n}`,
+        requireTitleMarker: false,
+      }])
+    }
+  })
+
+  it('does not close PRs for non-synthetic issues', async () => {
     const mount = new FakeMountClient({
-      [issuePath(23)]: issueFile(23),
-      '/github/repos/AgentWorkforce__pear/pulls/by-id/23.json': {
+      [issuePath(230)]: realMergeIssueFile(230),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/230.json': {
         provider: 'github',
         objectType: 'pull_request',
-        objectId: '23',
+        objectId: '230',
         payload: {
-          number: 23,
-          title: 'AR-23 probe without title marker',
-          body: '[factory-e2e] Synthetic probe for AR-23',
-          head_ref: 'factory-e2e/ar-23-probe',
+          number: 230,
+          title: 'Real product fix',
+          body: 'Linear: AR-230',
+          head_ref: 'ar-230-real-fix',
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: unknown[] = []
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(230), realMergeIssueFile(230))))
+    fleet.emitAgentExit('ar-230-impl', 'issue-done')
+    await flush()
+
+    expect(closeInputs).toEqual([])
+  })
+
+  it('prefers the exact branch-convention PR over prefix collisions and loose body mentions', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(229)]: issueFile(229),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/991.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '991',
+        payload: {
+          number: 991,
+          title: 'Unrelated documentation change',
+          body: 'This merely mentions ar-229 in passing, but is not the issue PR.',
+          head_ref: 'feature/docs-cleanup',
+        },
+      },
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/993.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '993',
+        payload: {
+          number: 993,
+          title: 'AR-229: title match but not branch match',
+          body: '',
+          head_ref: 'feature/title-match',
+        },
+      },
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/994.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '994',
+        payload: {
+          number: 994,
+          title: 'Body-only match',
+          body: 'Linear: AR-229',
+          head_ref: 'feature/body-match',
+        },
+      },
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/992.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '992',
+        payload: {
+          number: 992,
+          title: 'AR-22: wrong issue',
+          body: 'Linear: AR-22',
+          head_ref: 'ar-22-9-not-229',
+        },
+      },
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/279.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '279',
+        payload: {
+          number: 279,
+          title: 'Add isPositive util',
+          body: '',
+          head_ref: 'ar-229-is-positive',
         },
       },
     })
@@ -3129,14 +3285,19 @@ describe('FactoryLoop', () => {
         return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
       },
     })
-    const decision = await factory.triageIssue(parseLinearIssue(issuePath(23), issueFile(23)))
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(229), issueFile(229)))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-23-impl', 'issue-done')
+    fleet.emitAgentExit('ar-229-impl', 'issue-done')
     await flush()
 
-    expect(closeInputs).toEqual([])
-    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-23-impl', 'ar-23-review'])
+    expect(closeInputs).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      prNumber: 279,
+      expectedIssueKey: 'AR-229',
+      requireTitleMarker: false,
+    }])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-229-impl', 'ar-229-review'])
   })
 
   it('skips Slack writeback while sync is stale, logs once, and keeps Linear dispatch core running', async () => {

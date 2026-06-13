@@ -201,5 +201,5 @@ export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'>
 export type ProbePrResolver = (issue: LinearIssue) => Promise<ProbePrRef | undefined>
 
 export type ProbeCloser = (
-  input: Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey'>,
+  input: Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>,
 ) => Promise<CloseProbePrResult>
