@@ -540,6 +540,31 @@ class BlockingIssueReadMount extends FakeMountClient {
   }
 }
 
+class DelayedIssueReadMount extends FakeMountClient {
+  activeIssueReads = 0
+  maxConcurrentIssueReads = 0
+  readCount = 0
+
+  constructor(initialFiles: Record<string, unknown>, readonly delayMs: number) {
+    super(initialFiles)
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    if (path.startsWith('/linear/issues/') && !path.includes('/by-state/')) {
+      this.readCount += 1
+      this.activeIssueReads += 1
+      this.maxConcurrentIssueReads = Math.max(this.maxConcurrentIssueReads, this.activeIssueReads)
+      try {
+        await new Promise((resolve) => setTimeout(resolve, this.delayMs))
+        return await super.readFile(path)
+      } finally {
+        this.activeIssueReads -= 1
+      }
+    }
+    return super.readFile(path)
+  }
+}
+
 class ListingReadTrackingMount extends FakeMountClient {
   readonly readPaths: string[] = []
 
@@ -1092,6 +1117,32 @@ describe('FactoryLoop', () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('drains live issue reads with bounded parallelism before yielding to the next batch', async () => {
+    const issueCount = 6
+    const files = Object.fromEntries(
+      Array.from({ length: issueCount }, (_, index) => {
+        const n = 470 + index
+        return [issuePath(n), realIssueFile(n)]
+      }),
+    )
+    const mount = new DelayedIssueReadMount(files, 25)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ batchSize: 5 }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    for (let index = 0; index < issueCount; index += 1) {
+      const n = 470 + index
+      mount.emit(changeEvent(issuePath(n), `event-live-parallel-${n}`))
+    }
+
+    await vi.waitFor(() => expect(mount.readCount).toBeGreaterThanOrEqual(issueCount), { timeout: 5_000 })
+    await vi.waitFor(() => expect(factory.status().counters.liveEventDrainYields).toBeGreaterThan(0), { timeout: 5_000 })
+
+    expect(mount.maxConcurrentIssueReads).toBeGreaterThan(1)
+    expect(mount.maxConcurrentIssueReads).toBeLessThanOrEqual(5)
+    await factory.stop()
   })
 
   it('start live marks the heartbeat stopping before releasing in-flight agents', async () => {
@@ -2491,6 +2542,40 @@ describe('FactoryLoop', () => {
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-17-impl', 'ar-17-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-17'])
+    await factory.stop()
+  })
+
+  it('suppresses duplicate live event identities within a parallel drain batch', async () => {
+    const path = issuePath(18)
+    const mount = new FakeMountClient({ [path]: realIssueFile(18) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const event = changeEvent(path, 'event-duplicate-same-id')
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.emit(event)
+    mount.emit(event)
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-18-impl', 'ar-18-review']))
+    expect(factory.status().counters.liveDuplicateEventsSuppressed).toBe(1)
+    await factory.stop()
+  })
+
+  it('does not double-dispatch the same issue from concurrent live events', async () => {
+    const path = issuePath(19)
+    const mount = new DelayedIssueReadMount({ [path]: realIssueFile(19) }, 25)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.emit(changeEvent(path, 'event-same-issue-a'))
+    mount.emit(changeEvent(path, 'event-same-issue-b'))
+
+    await vi.waitFor(() => expect(mount.readCount).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-19-impl', 'ar-19-review']))
+
+    expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-19'])
     await factory.stop()
   })
 

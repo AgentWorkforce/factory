@@ -510,20 +510,21 @@ export class FactoryLoop implements Factory {
 
   async #handleLiveEventsWithYield(events: ChangeEvent[]): Promise<void> {
     let handled = 0
+    const seenIssueKeys = new Set<string>()
     while (events.length > 0 && this.#started) {
-      const event = events.shift()
-      if (!event) continue
-      await this.#handleLiveChange(event)
-      handled += 1
-      if (handled % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
-        await this.#refreshLiveHeartbeatIfDue()
-        if (events.length > 0) {
-          this.#increment('liveEventDrainYields')
-          await liveEventYield()
-        }
+      const batch = events.splice(0, LIVE_EVENT_DRAIN_BATCH_SIZE)
+      const paths = batch
+        .map((event) => this.#prepareLiveEventForDrain(event, seenIssueKeys))
+        .filter((path): path is string => Boolean(path))
+      await Promise.all(paths.map((path) => this.#handlePreparedLiveChange(path)))
+      handled += batch.length
+      await this.#refreshLiveHeartbeatIfDue()
+      if (events.length > 0) {
+        this.#increment('liveEventDrainYields')
+        await liveEventYield()
       }
     }
-    if (handled % LIVE_EVENT_DRAIN_BATCH_SIZE !== 0) {
+    if (handled === 0) {
       await this.#refreshLiveHeartbeatIfDue()
     }
   }
@@ -535,10 +536,10 @@ export class FactoryLoop implements Factory {
     await this.#refreshLiveHeartbeat()
   }
 
-  async #handleLiveChange(event: ChangeEvent): Promise<void> {
+  #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): string | undefined {
     const path = event.resource.path
     if (!isIssueFilePath(path)) {
-      return
+      return undefined
     }
 
     if (isBeforeLiveCutoff(event.occurredAt, this.#liveConnectStartedAtMs, this.#liveReplaySkewMarginMs)) {
@@ -551,7 +552,7 @@ export class FactoryLoop implements Factory {
         connectStartedAt: new Date(this.#liveConnectStartedAtMs).toISOString(),
         replaySkewMarginMs: this.#liveReplaySkewMarginMs,
       })
-      return
+      return undefined
     }
 
     if (isAtOrBeforeHighWatermark(event.id, this.#liveEventHighWatermark)) {
@@ -562,7 +563,7 @@ export class FactoryLoop implements Factory {
         highWatermark: this.#liveEventHighWatermark,
         path,
       })
-      return
+      return undefined
     }
 
     const dedupeKey = liveEventDedupeKey(event)
@@ -573,7 +574,7 @@ export class FactoryLoop implements Factory {
           id: event.id,
           path,
         })
-        return
+        return undefined
       }
       rememberLiveEvent(this.#seenLiveEvents, dedupeKey)
     } else {
@@ -581,7 +582,34 @@ export class FactoryLoop implements Factory {
       this.#logger.warn?.('[factory] live issue event missing stable identity', { path })
     }
 
+    const issueKey = keyFromPath(path)
+    if (seenIssueKeys.has(issueKey)) {
+      this.#increment('liveDuplicateIssueEventsSuppressed')
+      this.#logger.debug?.('[factory] suppressed duplicate live issue event for issue in current drain', {
+        id: event.id,
+        path,
+        issue: issueKey,
+      })
+      return undefined
+    }
+
+    const issueRef = { key: issueKey, uuid: uuidFromPath(path) ?? issueKey, path }
+    if (this.#batch.isInFlight(issueRef) || this.#batch.isQueued(issueRef)) {
+      this.#increment('liveDuplicateIssueEventsSuppressed')
+      this.#logger.debug?.('[factory] suppressed duplicate live issue event for tracked issue', {
+        id: event.id,
+        path,
+        issue: issueKey,
+      })
+      return undefined
+    }
+
+    seenIssueKeys.add(issueKey)
     this.#recordArrivalLatency(event)
+    return path
+  }
+
+  async #handlePreparedLiveChange(path: string): Promise<void> {
     await this.#handleChange(path, { requireRealIssue: true })
   }
 
