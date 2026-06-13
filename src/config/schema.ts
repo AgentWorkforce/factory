@@ -22,6 +22,7 @@ export const FactoryConfigSchema = z.object({
   }).default({}),
   loop: z.object({
     maxIterations: z.number().int().min(1).max(5).default(3),
+    maxConsecutiveFailures: z.number().int().min(1).max(5).default(3),
     heartbeatPath: z.string().min(1).default('/tmp/factory-run/factory-loop-heartbeat.json'),
     registryPath: z.string().min(1).default('/tmp/factory-run/factory-loop-registry.json'),
     heartbeatStaleMs: z.number().int().min(1_000).default(60_000),

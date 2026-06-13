@@ -27,7 +27,11 @@ const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 
-const config = (overrides: Partial<FactoryConfig> = {}): FactoryConfig => FactoryConfigSchema.parse({
+type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop'> & {
+  loop?: Partial<FactoryConfig['loop']>
+}
+
+const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => FactoryConfigSchema.parse({
   workspaceId: 'factory-test',
   repos: {
     byLabel: { pear: 'AgentWorkforce/pear' },
@@ -147,8 +151,8 @@ class ManualClock {
     this.value += ms
   }
 
-  async sleep(_ms: number): Promise<void> {
-    return
+  async sleep(ms: number): Promise<void> {
+    this.advance(ms)
   }
 }
 
@@ -199,6 +203,56 @@ class CapturedPidFleetClient extends FakeFleetClient {
       pid: planned?.pid,
       pids: planned?.pids,
     }
+  }
+}
+
+class InjectFailingPidFleetClient extends CapturedPidFleetClient {
+  injectionAttempts = 0
+
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    this.messages.push(input)
+    this.injectionAttempts += 1
+    throw new Error(`recipient unavailable: ${input.to}`)
+  }
+}
+
+class SelectiveInjectFailingPidFleetClient extends CapturedPidFleetClient {
+  constructor(plans: SpawnResult[], readonly failPrefix: string) {
+    super(plans)
+  }
+
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    this.messages.push(input)
+    if (input.to.startsWith(this.failPrefix)) {
+      throw new Error(`recipient unavailable: ${input.to}`)
+    }
+    const eventId = `fake-${this.messages.length}`
+    this.deliveryEvents.push({ kind: 'injected', to: input.to, eventId })
+    return { eventId, targets: [input.to] }
+  }
+}
+
+class LagThenInjectedFleetClient extends FakeFleetClient {
+  injectionAttempts = 0
+
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    this.messages.push(input)
+    this.injectionAttempts += 1
+    if (this.injectionAttempts === 1) {
+      throw new Error(`recipient unavailable: ${input.to}`)
+    }
+    const eventId = `fake-${this.messages.length}`
+    this.deliveryEvents.push({ kind: 'injected', to: input.to, eventId })
+    return { eventId, targets: [input.to] }
   }
 }
 
@@ -897,7 +951,7 @@ describe('FactoryLoop', () => {
         },
       }
       const factory = createFactory(config({
-        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+        loop: { maxIterations: 1, maxConsecutiveFailures: 1, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
       }), {
         mount,
         fleet,
@@ -907,16 +961,145 @@ describe('FactoryLoop', () => {
         processIdentityReader: async () => undefined,
       })
 
-      await expect(factory.runLoop()).rejects.toThrow('setState 404')
+      await factory.runLoop()
 
       expect(factory.status().inFlight).toEqual([])
       const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
-      expect(heartbeat).toMatchObject({ status: 'stopping', registryPath })
+      expect(heartbeat).toMatchObject({ status: 'idle', registryPath })
       const registry = await readFactoryInFlightRegistry(registryPath)
       expect(registry?.agents).toMatchObject([
         { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pids: [], processes: [] },
         { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pids: [], processes: [] },
       ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runLoop catches spawned-then-inject failures, reaps the handoff, advances heartbeat, and continues', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-loop-registry-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
+      const clock = new ManualClock()
+      const alive = new Set([7_601, 7_602, 7_603, 7_604])
+      const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
+      const fleet = new InjectFailingPidFleetClient([
+        { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pid: 7_601 },
+        { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pid: 7_603 },
+      ])
+      const factory = createFactory(config({
+        loop: { maxIterations: 2, maxConsecutiveFailures: 2, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        processIdentityReader: async (pid) => {
+          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl launcher' }
+          if (pid === 7_603) return { pid, startTime: 'start-7603', cmdline: 'node --agent-name ar-76-review launcher' }
+          return undefined
+        },
+        readChildPids: async (pid) => {
+          if (pid === 7_601) return [7_602]
+          if (pid === 7_603) return [7_604]
+          return []
+        },
+        clock,
+        kill: (pid, signal) => {
+          killed.push({ pid, signal })
+          if (!alive.has(pid)) throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+          if (signal === 'SIGKILL') alive.delete(pid)
+          return true
+        },
+        terminationGraceMs: 0,
+      })
+
+      const reports = await factory.runLoop()
+
+      expect(reports).toHaveLength(2)
+      expect(reports[0]?.error?.message).toContain('recipient unavailable')
+      expect(reports[1]?.error).toBeUndefined()
+      expect(factory.status().inFlight).toEqual([])
+      expect(factory.status().counters.loopIterationFailures).toBe(1)
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
+      expect([...alive]).toEqual([])
+      expect(killed.map((entry) => entry.pid)).toEqual(expect.arrayContaining([7_602, 7_601, 7_604, 7_603]))
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 2, maxIterations: 2, registryPath })
+      const registry = await readFactoryInFlightRegistry(registryPath)
+      expect(registry?.agents).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runLoop catch reaps only failed handoffs and preserves healthy in-flight agents', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-no-overreap-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    try {
+      const mount = new FakeMountClient({
+        [issuePath(76)]: issueFile(76),
+        [issuePath(77)]: issueFile(77),
+      })
+      const clock = new ManualClock()
+      const healthyPids = new Set([7_601, 7_603])
+      const failedPids = new Set([7_701, 7_703])
+      const alive = new Set([7_601, 7_602, 7_603, 7_604, 7_701, 7_702, 7_703, 7_704])
+      const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
+      const healthyAliveDuringFailedReap: boolean[] = []
+      const fleet = new SelectiveInjectFailingPidFleetClient([
+        { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pid: 7_601 },
+        { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pid: 7_603 },
+        { name: 'ar-77-impl', sessionRef: 'session-ar-77-impl', pid: 7_701 },
+        { name: 'ar-77-review', sessionRef: 'session-ar-77-review', pid: 7_703 },
+      ], 'ar-77-')
+      const factory = createFactory(config({
+        batchSize: 4,
+        loop: { maxIterations: 2, maxConsecutiveFailures: 2, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        processIdentityReader: async (pid) => {
+          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl launcher' }
+          if (pid === 7_603) return { pid, startTime: 'start-7603', cmdline: 'node --agent-name ar-76-review launcher' }
+          if (pid === 7_701) return { pid, startTime: 'start-7701', cmdline: 'node --agent-name ar-77-impl launcher' }
+          if (pid === 7_703) return { pid, startTime: 'start-7703', cmdline: 'node --agent-name ar-77-review launcher' }
+          return undefined
+        },
+        readChildPids: async (pid) => {
+          if (pid === 7_601) return [7_602]
+          if (pid === 7_603) return [7_604]
+          if (pid === 7_701) return [7_702]
+          if (pid === 7_703) return [7_704]
+          return []
+        },
+        clock,
+        kill: (pid, signal) => {
+          killed.push({ pid, signal })
+          if (failedPids.has(pid) && signal !== 0) {
+            healthyAliveDuringFailedReap.push([...healthyPids].every((healthyPid) => alive.has(healthyPid)))
+          }
+          if (!alive.has(pid)) throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+          if (signal === 'SIGKILL') alive.delete(pid)
+          return true
+        },
+        terminationGraceMs: 0,
+      })
+
+      const reports = await factory.runLoop()
+
+      expect(reports).toHaveLength(2)
+      expect(reports[0]?.error?.message).toContain('recipient unavailable')
+      expect(healthyAliveDuringFailedReap.length).toBeGreaterThan(0)
+      expect(healthyAliveDuringFailedReap.every(Boolean)).toBe(true)
+      const firstHealthyKill = killed.findIndex((entry) => healthyPids.has(entry.pid) && entry.signal !== 0)
+      const firstFailedKill = killed.findIndex((entry) => failedPids.has(entry.pid) && entry.signal !== 0)
+      expect(firstFailedKill).toBeGreaterThanOrEqual(0)
+      expect(firstHealthyKill).toBeGreaterThan(firstFailedKill)
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2078,6 +2261,27 @@ describe('FactoryLoop', () => {
       { kind: 'input', name: 'ar-62-impl', data: '\r' },
       { kind: 'injected', to: 'ar-62-review', eventId: 'fake-2' },
       { kind: 'input', name: 'ar-62-review', data: '\r' },
+    ])
+  })
+
+  it('retries confirmed task injection when the spawned agent is not registered yet', async () => {
+    const clock = new ManualClock()
+    const mount = new FakeMountClient({ [issuePath(67)]: issueFile(67) })
+    const fleet = new LagThenInjectedFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(67), issueFile(67))))
+
+    expect(fleet.injectionAttempts).toBe(3)
+    expect(factory.status().counters.injectionRegistrationLagRetries).toBe(1)
+    expect(fleet.messages.map((message) => message.to)).toEqual([
+      'ar-67-impl',
+      'ar-67-impl',
+      'ar-67-review',
+    ])
+    expect(fleet.inputs).toEqual([
+      { name: 'ar-67-impl', data: '\r' },
+      { name: 'ar-67-review', data: '\r' },
     ])
   })
 

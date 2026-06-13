@@ -54,6 +54,7 @@ export interface FactoryLiveSubscriptionOptions {
 export interface FactoryLoopRunOptions {
   dryRun?: boolean
   maxIterations?: number
+  maxConsecutiveFailures?: number
   heartbeatPath?: string
   registryPath?: string
 }
@@ -130,6 +131,7 @@ export interface IterationReport {
   skipped: Array<{ issue: IssueRef; reason: string }>
   dryRun: boolean
   slackDegraded?: boolean
+  error?: { message: string; stack?: string }
 }
 
 export interface DispatchResult {

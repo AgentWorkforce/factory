@@ -269,6 +269,8 @@ describe('fleet CLI runtime', () => {
       dispatched: [{ issue: { key: 'AR-77' }, dryRun: true, agents: [{ name: 'ar-77-impl' }, { name: 'ar-77-review' }] }],
     })
     expect(fleet.spawns).toEqual([])
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
     expect(mount.writes).toEqual([])
   })
 

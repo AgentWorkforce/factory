@@ -83,6 +83,10 @@ const STATE_NAME_TO_ID: Record<string, string> = {
 }
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
+const INJECTION_RETRY_DELAY_MS = 1_000
+const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
+const INJECTION_MAX_ATTEMPTS = 6
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -429,14 +433,37 @@ export class FactoryLoop implements Factory {
 
   async runLoop(opts: FactoryLoopRunOptions = {}): Promise<IterationReport[]> {
     const maxIterations = Math.min(5, Math.max(1, Math.trunc(opts.maxIterations ?? this.#config.loop.maxIterations)))
+    const maxConsecutiveFailures = Math.min(5, Math.max(1, Math.trunc(
+      opts.maxConsecutiveFailures ?? this.#config.loop.maxConsecutiveFailures,
+    )))
     const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
     const registryPath = opts.registryPath ?? this.#config.loop.registryPath
     const reports: IterationReport[] = []
+    let consecutiveFailures = 0
     let completed = false
     try {
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
         await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration, maxIterations)
-        reports.push(await this.runOnce({ dryRun: opts.dryRun }))
+        try {
+          reports.push(await this.runOnce({ dryRun: opts.dryRun }))
+          consecutiveFailures = 0
+        } catch (error) {
+          consecutiveFailures += 1
+          this.#increment('loopIterationFailures')
+          this.#error(error)
+          reports.push(failedIterationReport(error, opts.dryRun ?? this.#config.dryRun))
+          await this.#reapDispatchFailureHandoffsNow(heartbeatPath, registryPath)
+          await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration + 1, maxIterations)
+          if (consecutiveFailures >= maxConsecutiveFailures) {
+            this.#increment('loopCircuitBreaks')
+            this.#logger.error?.('[factory] stopping loop after consecutive iteration failures', {
+              consecutiveFailures,
+              maxConsecutiveFailures,
+            })
+            break
+          }
+          continue
+        }
         await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration + 1, maxIterations)
       }
       this.#increment('loopIdle')
@@ -546,9 +573,11 @@ export class FactoryLoop implements Factory {
       record.result = result
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: decision.issue, result })
-      await this.#ensureSlackDispatchThread(record, result)
-      await this.#sendImplementerTask(record)
-      await this.#sendCriticalReviewerMessage(record)
+      if (!dryRun) {
+        await this.#ensureSlackDispatchThread(record, result)
+        await this.#sendImplementerTask(record)
+        await this.#sendCriticalReviewerMessage(record)
+      }
       return result
     } catch (error) {
       await this.#persistDispatchFailureReaperHandoff(record, spawnedForReaperHandoff)
@@ -735,6 +764,68 @@ export class FactoryLoop implements Factory {
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
     await this.#writeInFlightRegistry(registryPath, path)
+  }
+
+  async #reapDispatchFailureHandoffsNow(heartbeatPath: string, registryPath: string): Promise<void> {
+    if (this.#dispatchFailureReaperHandoffs.size === 0) {
+      return
+    }
+
+    try {
+      const protectedPids = await this.#protectedPids()
+      let registryChanged = false
+      for (const [key, handoff] of [...this.#dispatchFailureReaperHandoffs]) {
+        const roots = await this.#terminationRoots(handoff.name, handoff.tracked, protectedPids)
+        if (roots.pids.length === 0 && roots.status === 'unresolved') {
+          this.#increment('agentTerminateMissingPid')
+          this.#logger.error?.('[factory] no pid available to reap dispatch-failed handoff during loop catch', {
+            agentName: handoff.name,
+            issue: handoff.issue,
+            sessionRef: handoff.tracked.sessionRef,
+          })
+          continue
+        }
+
+        let blockingSkip = false
+        if (roots.pids.length > 0) {
+          const report = await terminatePids(roots.pids, {
+            kill: this.#kill,
+            readChildPids: this.#readChildPids,
+            sleep: this.#clock.sleep,
+            termGraceMs: this.#terminationGraceMs,
+            protectedPids,
+          })
+          if (report.terminated.length > 0) {
+            this.#increment('loopDispatchFailureHandoffsReaped')
+          }
+          for (const skipped of report.skipped) {
+            if (skipped.reason !== 'pid not running') {
+              blockingSkip = true
+              this.#logger.warn?.('[factory] dispatch-failure handoff reap skipped during loop catch', {
+                ...skipped,
+                agentName: handoff.name,
+              })
+            }
+          }
+        }
+
+        if (!blockingSkip) {
+          this.#dispatchFailureReaperHandoffs.delete(key)
+          registryChanged = true
+          try {
+            await this.#fleet.release(handoff.name, 'dispatch failed')
+          } catch (error) {
+            this.#logger.warn?.(`[factory] failed to release ${handoff.name} after dispatch-failure reap`, error)
+          }
+        }
+      }
+      if (registryChanged) {
+        await this.#writeInFlightRegistry(registryPath, heartbeatPath)
+      }
+    } catch (error) {
+      this.#increment('loopDispatchFailureHandoffReapFailures')
+      this.#error(error)
+    }
   }
 
   async #readyIssuePaths(): Promise<string[]> {
@@ -1190,9 +1281,49 @@ export class FactoryLoop implements Factory {
       throw new Error('Fleet client does not support confirmed task injection')
     }
 
-    const ack = await this.#fleet.waitForInjected(input, { timeoutMs: 90_000 })
+    const ack = await this.#waitForInjectedWithRetry(input)
     await this.#submitInjectedTask(input, ack)
     return ack
+  }
+
+  async #waitForInjectedWithRetry(
+    input: Parameters<FleetClient['sendMessage']>[0],
+  ): Promise<{ eventId: string; targets: string[] }> {
+    if (!this.#fleet.waitForInjected) {
+      throw new Error('Fleet client does not support confirmed task injection')
+    }
+
+    const startedAt = this.#clock.now()
+    let attempt = 0
+    let lastError: unknown
+    while (attempt < INJECTION_MAX_ATTEMPTS && this.#clock.now() - startedAt < INJECTION_CONFIRMATION_TIMEOUT_MS) {
+      attempt += 1
+      const elapsed = Math.max(0, this.#clock.now() - startedAt)
+      const remaining = Math.max(1, INJECTION_CONFIRMATION_TIMEOUT_MS - elapsed)
+      try {
+        return await this.#fleet.waitForInjected(input, {
+          timeoutMs: Math.min(INJECTION_RETRY_ATTEMPT_TIMEOUT_MS, remaining),
+        })
+      } catch (error) {
+        lastError = error
+        if (
+          !isRegistrationLagInjectionError(error) ||
+          remaining <= INJECTION_RETRY_DELAY_MS ||
+          attempt >= INJECTION_MAX_ATTEMPTS
+        ) {
+          throw error
+        }
+        this.#increment('injectionRegistrationLagRetries')
+        this.#logger.warn?.('[factory] task injection target not registered yet; retrying', {
+          to: input.to,
+          attempt,
+          error: describeError(error).errorMessage,
+        })
+        await this.#clock.sleep(Math.min(INJECTION_RETRY_DELAY_MS, remaining))
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(`Timed out waiting to inject task to ${input.to}`)
   }
 
   async #submitInjectedTask(
@@ -2071,6 +2202,27 @@ const describeError = (error: unknown): { errorMessage: string; errorStack?: str
     // Fall through to String(error).
   }
   return { errorMessage: String(error) }
+}
+
+const failedIterationReport = (error: unknown, dryRun: boolean): IterationReport => {
+  const details = describeError(error)
+  return {
+    pulled: [],
+    triaged: [],
+    dispatched: [],
+    skipped: [],
+    dryRun,
+    error: {
+      message: details.errorMessage,
+      ...(details.errorStack ? { stack: details.errorStack } : {}),
+    },
+  }
+}
+
+const isRegistrationLagInjectionError = (error: unknown): boolean => {
+  const { errorMessage } = describeError(error)
+  return /recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
+    .test(errorMessage)
 }
 
 const contextualError = (context: string, error: unknown): Error => {

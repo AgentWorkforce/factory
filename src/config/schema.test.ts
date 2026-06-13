@@ -29,6 +29,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.batchSize).toBe(5)
     expect(parsed.models).toEqual({})
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
+    expect(parsed.loop.maxConsecutiveFailures).toBe(3)
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',
