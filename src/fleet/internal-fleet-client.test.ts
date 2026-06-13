@@ -14,6 +14,9 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   readonly deliveryListeners = new Set<(event: BrokerEvent) => void>()
   readonly exitListeners = new Set<(agent: { name: string; sessionId?: string }) => void>()
   connectEventsCalls = 0
+  disconnectCalls = 0
+  throwOnConnect = false
+  partiallyConnected = false
 
   agents: Array<{ name: string; pid?: number }> = []
   nextSessionRef = 'session-1'
@@ -45,6 +48,15 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
 
   connectEvents(): void {
     this.connectEventsCalls += 1
+    if (this.throwOnConnect) {
+      this.partiallyConnected = true
+      throw new Error('connect failed after opening event stream')
+    }
+  }
+
+  disconnect(): void {
+    this.disconnectCalls += 1
+    this.partiallyConnected = false
   }
 
   onEvent(listener: (event: BrokerEvent) => void): () => void {
@@ -337,6 +349,54 @@ describe('InternalFleetClient', () => {
       eventId: 'event-1',
       targets: ['broker'],
     })
+  })
+
+  it('disposes broker subscriptions, pending delivery timers, and the harness connection idempotently', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'broker', text: 'done' }, { timeoutMs: 1000 })
+    const rejected = expect(injected).rejects.toThrow('InternalFleetClient disposed')
+    const offExit = fleet.onAgentExit(() => {})
+    const offDelivery = fleet.onDeliveryFailed(() => {})
+    await Promise.resolve()
+
+    expect(harness.connectEventsCalls).toBe(1)
+    expect(harness.eventListeners.size).toBe(1)
+    expect(harness.deliveryListeners.size).toBe(1)
+    expect(harness.exitListeners.size).toBe(1)
+
+    await fleet.dispose()
+
+    expect(harness.disconnectCalls).toBe(1)
+    expect(harness.eventListeners.size).toBe(0)
+    expect(harness.deliveryListeners.size).toBe(0)
+    expect(harness.exitListeners.size).toBe(0)
+    await rejected
+
+    offExit()
+    offDelivery()
+    await fleet.dispose()
+    expect(harness.disconnectCalls).toBe(1)
+  })
+
+  it('disposes safely after a broker event stream throws during partial connect', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.throwOnConnect = true
+    const fleet = new InternalFleetClient({ client: harness })
+
+    expect(() => fleet.onAgentExit(() => {})).toThrow('connect failed after opening event stream')
+    expect(harness.partiallyConnected).toBe(true)
+    expect(harness.eventListeners.size).toBe(1)
+    expect(harness.exitListeners.size).toBe(1)
+
+    await fleet.dispose()
+    await fleet.dispose()
+
+    expect(harness.disconnectCalls).toBe(1)
+    expect(harness.partiallyConnected).toBe(false)
+    expect(harness.eventListeners.size).toBe(0)
+    expect(harness.exitListeners.size).toBe(0)
   })
 
   it('rejects waitForInjected on correlated delivery failure', async () => {

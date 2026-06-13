@@ -58,6 +58,7 @@ type ParsedCommand =
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
   const err = deps.stderr ?? process.stderr
+  let fleet: FleetClient | undefined
 
   try {
     const { globals, args } = parseGlobalOptions(argv)
@@ -74,7 +75,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     }
 
     const loaded = command.kind.startsWith('factory') ? await loadConfig(globals.config) : undefined
-    const fleet = await buildFleet(globals, loaded, deps)
+    fleet = await buildFleet(globals, loaded, deps)
 
     switch (command.kind) {
       case 'spawn': {
@@ -110,14 +111,26 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       case 'factory-triage':
       case 'factory-dispatch': {
         if (!loaded) throw new Error('factory command requires config')
+        if (command.kind === 'factory' && command.action === 'reap-orphans') {
+          writeJson(out, await reapFactoryOrphansOnce({
+            heartbeatPath: loaded.config.loop.heartbeatPath,
+            registryPath: loaded.config.loop.registryPath,
+            staleMs: loaded.config.loop.heartbeatStaleMs,
+            fleet,
+          }))
+          return 0
+        }
         const mount = await buildMount(loaded, deps)
         const factory = createFactory(loaded.config, { mount, fleet })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out)
       }
     }
+    return 1
   } catch (error) {
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 1
+  } finally {
+    await fleet?.dispose()
   }
 }
 

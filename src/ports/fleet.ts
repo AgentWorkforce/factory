@@ -45,6 +45,7 @@ export interface FleetClient {
   sendInput?(name: string, data: string): Promise<void>
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
+  dispose(): Promise<void>
 }
 
 export type AgentSpec = {

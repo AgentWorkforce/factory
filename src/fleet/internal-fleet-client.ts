@@ -20,6 +20,7 @@ export interface HarnessDriverClientLike {
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }>
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
+  disconnect?(): void
   onEvent?(listener: HarnessEventListener): () => void
   addListener?(event: 'agentExited', listener: (agent: DriverAgentLike) => void): () => void
   addListener?(event: 'deliveryUpdate', listener: (event: DriverDeliveryEventLike) => void): () => void
@@ -63,6 +64,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #logger?: Logger
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
+  readonly #eventUnsubscribers: Array<() => void> = []
   readonly #seenEvents: string[] = []
   readonly #seenEventKeys = new Set<string>()
   readonly #pendingInjected = new Map<string, PendingInjectedWait>()
@@ -75,6 +77,7 @@ export class InternalFleetClient implements FleetClient {
   #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
   #subscribed = false
+  #disposed = false
 
   constructor(options: InternalFleetClientOptions = {}) {
     this.#cwd = options.cwd
@@ -232,20 +235,47 @@ export class InternalFleetClient implements FleetClient {
     }
   }
 
+  async dispose(): Promise<void> {
+    if (this.#disposed) {
+      return
+    }
+    this.#disposed = true
+
+    const pending = [...this.#pendingInjected.values()]
+    this.#pendingInjected.clear()
+    for (const entry of pending) {
+      clearTimeout(entry.timeout)
+      entry.reject(new Error('InternalFleetClient disposed before delivery was confirmed'))
+    }
+
+    for (const unsubscribe of this.#eventUnsubscribers.splice(0)) {
+      unsubscribe()
+    }
+    this.#agentExitListeners.clear()
+    this.#deliveryFailedListeners.clear()
+    this.#failedDeliveries.clear()
+    this.#failedDeliveryIds.length = 0
+    this.#client.disconnect?.()
+    this.#subscribed = false
+  }
+
   #ensureEventSubscription(): void {
     if (this.#subscribed) {
       return
     }
 
     this.#subscribed = true
-    this.#client.onEvent?.((event) => this.#handleBrokerEvent(event))
-    this.#client.addListener?.('deliveryUpdate', (event) => this.#handleBrokerEvent(event))
-    this.#client.addListener?.('agentExited', (agent) =>
+    const offEvent = this.#client.onEvent?.((event) => this.#handleBrokerEvent(event))
+    if (offEvent) this.#eventUnsubscribers.push(offEvent)
+    const offDeliveryUpdate = this.#client.addListener?.('deliveryUpdate', (event) => this.#handleBrokerEvent(event))
+    if (offDeliveryUpdate) this.#eventUnsubscribers.push(offDeliveryUpdate)
+    const offAgentExited = this.#client.addListener?.('agentExited', (agent) =>
       this.#emitAgentExit(agent.name, 'exited', {
         key: `agentExited:${JSON.stringify(agent)}`,
         hasStableId: false,
       }),
     )
+    if (offAgentExited) this.#eventUnsubscribers.push(offAgentExited)
     this.#client.connectEvents?.()
   }
 

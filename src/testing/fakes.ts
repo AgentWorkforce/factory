@@ -225,6 +225,8 @@ export class FakeFleetClient implements FleetClient {
     }
   }
 
+  async dispose(): Promise<void> {}
+
   setSessionRef(name: string, sessionRef?: string): void {
     this.#sessionRefs.set(name, sessionRef)
   }

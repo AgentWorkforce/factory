@@ -128,6 +128,7 @@ describe('fleet CLI runtime', () => {
       const configPath = await writeConfig(root)
       const realFleet = new FakeFleetClient()
       const realMount = new FakeMountClient({ [issuePath]: issueFile })
+      const dispose = vi.spyOn(realFleet, 'dispose')
       const createFleetCalls: unknown[] = []
       const cloudMountCalls: unknown[] = []
       const output = buffer()
@@ -154,6 +155,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(createFleetCalls).toHaveLength(1)
       expect(cloudMountCalls).toHaveLength(1)
+      expect(dispose).toHaveBeenCalledTimes(1)
       const report = JSON.parse(output.text())
       expect(report).toMatchObject({
         dryRun: true,
@@ -197,6 +199,37 @@ describe('fleet CLI runtime', () => {
         pulled: [{ key: 'AR-77' }],
         dispatched: [{ issue: { key: 'AR-77' } }],
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('disposes a one-shot fleet when event subscription setup throws during factory construction', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-connect-throw-'))
+    try {
+      const configPath = await writeConfig(root)
+      const fleet = new FakeFleetClient()
+      const dispose = vi.spyOn(fleet, 'dispose')
+      vi.spyOn(fleet, 'onAgentExit').mockImplementation(() => {
+        throw new Error('connect failed after opening event stream')
+      })
+      const stderr = buffer()
+
+      const code = await runFleetCli([
+        'factory',
+        'run-once',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount: new FakeMountClient(),
+        stdout: buffer(),
+        stderr,
+      })
+
+      expect(code).toBe(1)
+      expect(stderr.text()).toContain('connect failed after opening event stream')
+      expect(dispose).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -397,6 +430,10 @@ describe('fleet CLI runtime', () => {
       const heartbeatPath = join(root, 'heartbeat.json')
       const registryPath = join(root, 'registry.json')
       const configPath = await writeConfig(root, { loop: { maxIterations: 2, heartbeatPath, registryPath, heartbeatStaleMs: 10_000 } })
+      const fleet = new FakeFleetClient()
+      const dispose = vi.spyOn(fleet, 'dispose')
+      const createFleetCalls: unknown[] = []
+      const cloudMountFromConfig = vi.fn(async () => new FakeMountClient())
       await writeFile(heartbeatPath, JSON.stringify({
         pid: 4242,
         status: 'running',
@@ -415,13 +452,19 @@ describe('fleet CLI runtime', () => {
         '--config',
         configPath,
       ], {
-        fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        createFleet: (opts) => {
+          createFleetCalls.push(opts)
+          return fleet
+        },
+        cloudMountFromConfig,
         stdout: output,
         stderr: buffer(),
       })
 
       expect(code).toBe(0)
+      expect(createFleetCalls).toHaveLength(1)
+      expect(cloudMountFromConfig).not.toHaveBeenCalled()
+      expect(dispose).toHaveBeenCalledTimes(1)
       expect(JSON.parse(output.text())).toMatchObject({ stale: false, reaped: [], skipped: [] })
     } finally {
       await rm(root, { recursive: true, force: true })

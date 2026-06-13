@@ -38,4 +38,6 @@ export class RelayFleetClient implements FleetClient {
   onAgentExit(_listener: (name: string, reason?: string) => void): () => void {
     throw notImplemented()
   }
+
+  async dispose(): Promise<void> {}
 }
