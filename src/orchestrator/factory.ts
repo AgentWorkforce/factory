@@ -64,6 +64,7 @@ type DispatchAttemptState = {
   backoffUntilMs: number
 }
 type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
+type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type SlackReply = {
   channelDir: string
   threadTs: string
@@ -319,13 +320,22 @@ export class FactoryLoop implements Factory {
     await this.#startLiveHeartbeat()
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
-    this.#liveEventHighWatermark = await this.#currentEventHighWatermark()
+    const highWatermark = await this.#currentEventHighWatermark()
+    this.#liveEventHighWatermark = highWatermark.highWatermark
     this.#seenLiveEvents.clear()
     this.#logger.info?.('[factory] live subscription starting', {
       transport: options.transport,
       highWatermark: this.#liveEventHighWatermark,
       replaySkewMarginMs: this.#liveReplaySkewMarginMs,
+      highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
     })
+
+    if (highWatermark.routeUnavailable) {
+      this.#increment('liveHighWatermarkFullPullFallbacks')
+      this.#logger.info?.('[factory] live subscription high-watermark route unavailable; running startup full pull before event stream')
+      await this.runOnce()
+      await this.#refreshLiveHeartbeatIfDue()
+    }
 
     if (options.transport !== 'poll') {
       this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB], (event) => {
@@ -431,13 +441,18 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #currentEventHighWatermark(): Promise<string | undefined> {
+  async #currentEventHighWatermark(): Promise<EventHighWatermarkResult> {
     try {
-      return await this.#mount.getEventHighWatermark?.()
+      return {
+        highWatermark: await this.#mount.getEventHighWatermark?.(),
+        routeUnavailable: false,
+      }
     } catch (error) {
       this.#increment('liveHighWatermarkUnavailable')
       this.#logger.warn?.('[factory] live subscription high-watermark unavailable', error)
-      return undefined
+      return {
+        routeUnavailable: isHighWatermarkRouteUnavailable(error),
+      }
     }
   }
 
@@ -2688,6 +2703,22 @@ const isAtOrBeforeHighWatermark = (eventId: string | undefined, highWatermark: s
     return eventSequence <= watermarkSequence
   }
   return false
+}
+
+const isHighWatermarkRouteUnavailable = (error: unknown): boolean => {
+  const details = asRecord(error) ?? {}
+  const response = asRecord(details.response) ?? {}
+  const status = details.status ?? details.statusCode ?? response.status ?? response.statusCode
+  if (status === 404 || status === '404') {
+    return true
+  }
+
+  const code = stringValue(details.code)?.toLowerCase()
+  if (code === 'route_not_found') {
+    return true
+  }
+
+  return error instanceof Error && /route not found/i.test(error.message)
 }
 
 const slackSyncStatusResult = (

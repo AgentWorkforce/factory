@@ -509,6 +509,21 @@ class NoWatermarkMount extends FakeMountClient {
 
 class ThrowingWatermarkMount extends FakeMountClient {
   override async getEventHighWatermark(): Promise<string | undefined> {
+    throw new Error('watermark unavailable')
+  }
+}
+
+class CountingListTreeMount extends FakeMountClient {
+  readonly listTreePrefixes: string[] = []
+
+  override async listTree(prefix: string): Promise<string[]> {
+    this.listTreePrefixes.push(prefix)
+    return super.listTree(prefix)
+  }
+}
+
+class RouteNotFoundCountingListTreeMount extends CountingListTreeMount {
+  override async getEventHighWatermark(): Promise<string | undefined> {
     throw Object.assign(new Error('Route not found'), { status: 404 })
   }
 }
@@ -2611,6 +2626,53 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl', 'ar-33-review'])
+    await factory.stop()
+  })
+
+  it('live subscription runs a startup full pull when the high-watermark route is unavailable', async () => {
+    const path = issuePath(40)
+    const mount = new RouteNotFoundCountingListTreeMount({ [path]: realIssueFile(40) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+    expect(mount.listTreePrefixes).toEqual(['/linear/issues', '/linear/issues/by-state/ready-for-agent/'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl', 'ar-40-review'])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-40'])
+    expect(factory.status().counters.liveHighWatermarkUnavailable).toBe(1)
+    expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
+    await factory.stop()
+  })
+
+  it('live subscription skips the startup full pull when a high-watermark is present', async () => {
+    const path = issuePath(41)
+    const mount = new CountingListTreeMount({ [path]: realIssueFile(41) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    mount.emit(changeEvent(path, 'event-before-start-41'))
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+    expect(mount.listTreePrefixes).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBeUndefined()
+    await factory.stop()
+  })
+
+  it('does not re-dispatch a startup-pulled issue from a later live event', async () => {
+    const path = issuePath(42)
+    const mount = new RouteNotFoundCountingListTreeMount({ [path]: realIssueFile(42) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.emit(changeEvent(path, 'event-after-start-42'))
+    await flush()
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-42-impl', 'ar-42-review'])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-42'])
+    expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
     await factory.stop()
   })
 
