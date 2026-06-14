@@ -5,6 +5,7 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { LINEAR_STATE_IDS, linearByStatePath } from '../constants/linear'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type {
+  AgentMessage,
   AgentPidResolution,
   AgentSpec,
   ChangeEvent,
@@ -74,10 +75,41 @@ type SlackReply = {
   isBot: boolean
   raw: Record<string, unknown>
 }
+type AgentQuestion = {
+  agentName: string
+  issueKey?: string
+  question: string
+  eventId?: string
+}
+type GithubIssueSource = {
+  owner: string
+  repoName: string
+  repo: string
+  number: number
+  title: string
+  body: string
+  url: string
+  state: string
+  labels: string[]
+  path: string
+  raw: Record<string, unknown>
+}
+
+// Memoizes the existing Linear mirror candidates for one GitHub ingestion pass
+// so dedupe lookups reuse a single ISSUE_ROOT scan.
+type MirrorCandidateCache = {
+  load: () => Promise<LinearIssue[]>
+}
 
 const ISSUE_ROOT = '/linear/issues'
+const GITHUB_ISSUE_ROOT = '/github/repos'
 const READY_EVENTS_LIMIT = 100
 const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
+// Matches both /github/repos/<owner>/<repo>/issues/<n>.json (the shape live
+// relayfile mounts emit) and the nested .../issues/by-id/<n>.json variant.
+// isGithubIssueFilePath() re-validates the exact shape, so a broad subscription
+// glob is safe.
+const LIVE_GITHUB_ISSUE_GLOB = `${GITHUB_ISSUE_ROOT}/**/issues/**/*.json`
 const LIVE_DEDUPE_LIMIT = 5_000
 const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
 const COMPLETION_SWEEP_INTERVAL_MS = 15_000
@@ -93,6 +125,9 @@ const STATE_NAME_TO_ID: Record<string, string> = {
 }
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+const AGENT_QUESTION_DEDUPE_LIMIT = 500
+const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
+const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
 const INJECTION_RETRY_DELAY_MS = 1_000
@@ -103,6 +138,9 @@ const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
+const GITHUB_FACTORY_LABEL = 'factory'
+const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
+const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -142,6 +180,8 @@ export class FactoryLoop implements Factory {
   readonly #slackThreadIds = new Map<string, string>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
+  readonly #seenAgentQuestionKeys = new Set<string>()
+  readonly #seenAgentQuestionOrder: string[] = []
   readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
   readonly #canonicalIssueStates = new Map<string, string>()
   readonly #dispatchFailureReaperHandoffs = new Map<string, RegistryHandoffAgent>()
@@ -177,6 +217,10 @@ export class FactoryLoop implements Factory {
   readonly #seenLiveEvents = new Set<string>()
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
+  #offAgentMessage?: () => void
+  // undefined = readiness not yet probed; resolved lazily so the standalone
+  // runOnce() path (which skips #start) still ingests when the mount is present.
+  #githubIngestionEnabled?: boolean
   #starting?: Promise<void>
   #started = false
   #stopping = false
@@ -236,6 +280,7 @@ export class FactoryLoop implements Factory {
       this.#error(new Error(`${ISSUE_ROOT} sub-root is not mounted`))
       return
     }
+    await this.#ensureGithubIngestionReady()
 
     this.#wireFleetEvents()
 
@@ -253,7 +298,11 @@ export class FactoryLoop implements Factory {
     }
 
     await this.#backfillReadyIssues()
-    this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`], (event) => {
+    this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB], (event) => {
+      if (isGithubIssueFilePath(event.resource.path)) {
+        void this.#handleGithubIssueChange(event.resource.path, { dryRun: this.#config.dryRun })
+        return
+      }
       void this.#handleChange(event.resource.path)
     })
     this.#started = true
@@ -282,8 +331,10 @@ export class FactoryLoop implements Factory {
       this.#slackWatcherStarts.clear()
       this.#offAgentExit?.()
       this.#offDeliveryFailed?.()
+      this.#offAgentMessage?.()
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
+      this.#offAgentMessage = undefined
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
@@ -341,7 +392,7 @@ export class FactoryLoop implements Factory {
     // pull finishes; batch dedupe then suppresses any overlap with what the
     // pull already dispatched.
     if (options.transport !== 'poll') {
-      this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB], (event) => {
+      this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB, LIVE_GITHUB_ISSUE_GLOB], (event) => {
         this.#enqueueLiveEvent(event)
       }, { from: 'now', coalesce: 'none' })
     }
@@ -575,7 +626,7 @@ export class FactoryLoop implements Factory {
 
   #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): string | undefined {
     const path = event.resource.path
-    if (!isIssueFilePath(path)) {
+    if (!isIssueFilePath(path) && !isGithubIssueFilePath(path)) {
       return undefined
     }
 
@@ -619,6 +670,21 @@ export class FactoryLoop implements Factory {
       this.#logger.warn?.('[factory] live issue event missing stable identity', { path })
     }
 
+    if (isGithubIssueFilePath(path)) {
+      const sourceKey = `github:${path}`
+      if (seenIssueKeys.has(sourceKey)) {
+        this.#increment('liveDuplicateIssueEventsSuppressed')
+        this.#logger.debug?.('[factory] suppressed duplicate live GitHub issue event in current drain', {
+          id: event.id,
+          path,
+        })
+        return undefined
+      }
+      seenIssueKeys.add(sourceKey)
+      this.#recordArrivalLatency(event)
+      return path
+    }
+
     const issueKey = keyFromPath(path)
     if (seenIssueKeys.has(issueKey)) {
       this.#increment('liveDuplicateIssueEventsSuppressed')
@@ -647,6 +713,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #handlePreparedLiveChange(path: string): Promise<void> {
+    if (isGithubIssueFilePath(path)) {
+      await this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
+      return
+    }
     await this.#handleChange(path, { requireRealIssue: true })
   }
 
@@ -776,6 +846,7 @@ export class FactoryLoop implements Factory {
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
+    await this.#ingestGithubIssues({ dryRun })
     const paths = await this.#readyIssuePaths()
     const pulled: IssueRef[] = []
     const triaged: TriageDecision[] = []
@@ -1024,11 +1095,21 @@ export class FactoryLoop implements Factory {
         void this.#handleDeliveryFailed(info)
       })
     }
+    if (!this.#offAgentMessage) {
+      this.#offAgentMessage = this.#fleet.onAgentMessage?.((message) => {
+        void this.#handleAgentMessage(message)
+      })
+    }
   }
 
   async #backfillReadyIssues(): Promise<void> {
     const page = await this.#mount.getEvents({ limit: READY_EVENTS_LIMIT })
     const eventPaths = page.events.map((event) => event.resource.path).filter(isIssueFilePath)
+    const githubEventPaths = page.events.map((event) => event.resource.path).filter(isGithubIssueFilePath)
+    for (const path of new Set(githubEventPaths)) {
+      await this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
+    }
+    await this.#ingestGithubIssues({ dryRun: this.#config.dryRun })
     const treePaths = await this.#readyIssuePaths()
     for (const path of new Set([...eventPaths, ...treePaths])) {
       await this.#handleChange(path)
@@ -1087,6 +1168,177 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#logger.error?.('[factory] failed to handle issue change', error)
     }
+  }
+
+  // Probes the GitHub issue sub-root at most once and caches the verdict so
+  // repeated iterations skip listTree calls when the mount is absent.
+  async #ensureGithubIngestionReady(): Promise<boolean> {
+    if (this.#githubIngestionEnabled !== undefined) {
+      return this.#githubIngestionEnabled
+    }
+    const githubReady = await this.#mount.ensureSubRoot(GITHUB_ISSUE_ROOT, { timeoutMs: 90_000 })
+    this.#githubIngestionEnabled = githubReady === 'ready'
+    if (!this.#githubIngestionEnabled) {
+      this.#logger.warn?.(`[factory] ${GITHUB_ISSUE_ROOT} sub-root is not mounted; GitHub issue ingestion disabled`)
+    }
+    return this.#githubIngestionEnabled
+  }
+
+  async #ingestGithubIssues(opts: { dryRun?: boolean } = {}): Promise<void> {
+    if (!await this.#ensureGithubIngestionReady()) {
+      return
+    }
+    // Load the existing Linear mirror candidates once for the whole pass so
+    // dedupe stays O(N + M) reads instead of re-scanning ISSUE_ROOT for every
+    // GitHub issue (gemini perf finding on #findGithubIssueMirror).
+    const candidates = this.#newMirrorCandidateCache()
+    for (const path of await this.#githubIssuePaths()) {
+      await this.#handleGithubIssueChange(path, { ...opts, candidates })
+    }
+  }
+
+  // Lazily lists+reads ISSUE_ROOT mirror candidates at most once, then memoizes
+  // them for reuse across every GitHub issue handled in the same pass.
+  #newMirrorCandidateCache(): MirrorCandidateCache {
+    let loaded: Promise<LinearIssue[]> | undefined
+    return {
+      load: () => {
+        if (!loaded) {
+          loaded = this.#loadLinearMirrorCandidates()
+        }
+        return loaded
+      },
+    }
+  }
+
+  async #loadLinearMirrorCandidates(): Promise<LinearIssue[]> {
+    const candidates: LinearIssue[] = []
+    for (const path of await this.#mount.listTree(ISSUE_ROOT)) {
+      if (!isLinearIssueMirrorCandidatePath(path)) {
+        continue
+      }
+      const issue = await this.#readIssue(path)
+      if (issue) {
+        candidates.push(issue)
+      }
+    }
+    return candidates
+  }
+
+  async #githubIssuePaths(): Promise<string[]> {
+    try {
+      return (await this.#mount.listTree(GITHUB_ISSUE_ROOT))
+        .filter(isGithubIssueFilePath)
+        .sort()
+    } catch (error) {
+      this.#increment('githubIssueListFailures')
+      this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
+      return []
+    }
+  }
+
+  async #handleGithubIssueChange(
+    path: string,
+    opts: { dryRun?: boolean; candidates?: MirrorCandidateCache } = {},
+  ): Promise<void> {
+    if (this.#githubIngestionEnabled === false || !isGithubIssueFilePath(path)) {
+      return
+    }
+
+    try {
+      const ghIssue = await this.#readGithubIssue(path)
+      if (!ghIssue) {
+        return
+      }
+
+      if (githubIssueIsClosed(ghIssue)) {
+        const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
+        if (mirror && mirror.stateId !== this.#config.stateIds.done) {
+          if (!opts.dryRun) {
+            await this.#linear.setState(mirror, this.#config.stateIds.done)
+          }
+          this.#increment('githubIssueMirrorsClosed')
+        }
+        return
+      }
+
+      if (!githubIssueHasFactoryLabel(ghIssue)) {
+        return
+      }
+
+      const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
+      if (mirror) {
+        this.#increment('githubIssueMirrorsDeduped')
+        return
+      }
+
+      const repoLabel = this.#repoLabelForGithubIssue(ghIssue)
+      if (!repoLabel) {
+        this.#increment('githubIssueMirrorsSkippedUnroutable')
+        this.#logger.warn?.('[factory] skipped factory-labeled GitHub issue without repos.byLabel route', {
+          path,
+          repo: ghIssue.repo,
+          url: ghIssue.url,
+        })
+        return
+      }
+
+      if (!opts.dryRun) {
+        await this.#linear.createIssue(githubIssueMirrorPayload(ghIssue, repoLabel, this.#config))
+      }
+      this.#increment('githubIssueMirrorsCreated')
+    } catch (error) {
+      this.#logger.error?.('[factory] failed to ingest GitHub issue', error)
+    }
+  }
+
+  async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
+    try {
+      const { content } = await this.#mount.readFile(path)
+      return parseGithubIssue(path, content)
+    } catch (error) {
+      if (isMissingIssueFileError(error)) {
+        this.#increment('githubIssuePhantomSkipped')
+        this.#logger.debug?.('[factory] skipped missing GitHub issue file discovered from issue tree', { path })
+        return undefined
+      }
+      throw error
+    }
+  }
+
+  async #findGithubIssueMirror(
+    ghIssue: GithubIssueSource,
+    candidates?: MirrorCandidateCache,
+  ): Promise<LinearIssue | undefined> {
+    const draftPath = githubIssueMirrorDraftPath(ghIssue)
+    try {
+      return parseLinearIssue(draftPath, (await this.#mount.readFile(draftPath)).content)
+    } catch {
+      // The draft path only exists before the Linear provider reconciles the
+      // create writeback into a canonical AR-* issue. Fall through to persisted
+      // source metadata on existing Linear issues for restart/replay dedupe.
+    }
+
+    // During a full ingestion pass the candidate list is loaded once and shared
+    // across every GitHub issue; the live single-event path passes none and
+    // loads on demand.
+    const mirrorCandidates = candidates
+      ? await candidates.load()
+      : await this.#loadLinearMirrorCandidates()
+    return mirrorCandidates.find((issue) => linearIssueMirrorsGithubIssue(issue, ghIssue))
+  }
+
+  #repoLabelForGithubIssue(ghIssue: GithubIssueSource): string | undefined {
+    const fullName = ghIssue.repo.toLowerCase()
+    const bareName = ghIssue.repoName.toLowerCase()
+    const entry = Object.entries(this.#config.repos.byLabel)
+      .find(([, repo]) => {
+        const configured = repo.toLowerCase()
+        // ghIssue.repo is always owner/name, so byLabel entries configured with
+        // just the bare repo name still match via repoName.
+        return configured === fullName || configured === bareName
+      })
+    return entry?.[0]
   }
 
   #dispatchBlockReason(issue: IssueRef): string | undefined {
@@ -1705,6 +1957,104 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #handleAgentMessage(message: AgentMessage): Promise<void> {
+    const question = parseAgentQuestion(message)
+    if (!question || !isFactoryQuestionTarget(message.target)) {
+      return
+    }
+
+    const record = this.#batch.getIssueByAgent(question.agentName)
+    if (!record || record.dryRun) {
+      this.#increment('agentQuestionsIgnoredNoInFlight')
+      return
+    }
+
+    if (question.issueKey && question.issueKey !== record.issue.key) {
+      this.#increment('agentQuestionsIgnoredIssueMismatch')
+      this.#logger.warn?.('[factory] ignored agent question for mismatched issue', {
+        from: question.agentName,
+        requestedIssue: question.issueKey,
+        activeIssue: record.issue.key,
+      })
+      return
+    }
+
+    const dedupeKey = agentQuestionDedupeKey(record.issue, question)
+    if (this.#seenAgentQuestionKeys.has(dedupeKey)) {
+      this.#increment('agentQuestionDuplicatesSuppressed')
+      this.#logger.debug?.('[factory] suppressed duplicate agent question', {
+        from: question.agentName,
+        issue: record.issue.key,
+      })
+      return
+    }
+    this.#rememberAgentQuestion(dedupeKey)
+
+    if (!question.eventId) {
+      this.#increment('agentQuestionsMissingIdentity')
+      this.#logger.warn?.('[factory] agent question event missing stable identity; falling back to sender/content dedupe', {
+        from: question.agentName,
+        issue: record.issue.key,
+      })
+    }
+
+    await this.#postAgentQuestionToSlack(record, question)
+  }
+
+  async #postAgentQuestionToSlack(record: InFlightIssue, question: AgentQuestion): Promise<void> {
+    if (!this.#slack || !this.#config.slack) {
+      this.#increment('agentQuestionsSkippedNoSlack')
+      this.#logger.warn?.('[factory] agent question has no Slack channel configured', {
+        issue: record.issue,
+        from: question.agentName,
+      })
+      return
+    }
+
+    if (await this.#shouldSkipSlackWriteback('agent-question')) {
+      this.#increment('agentQuestionsSkippedSlackDegraded')
+      return
+    }
+
+    const key = issueKey(record.issue)
+    try {
+      await this.#slackWatcherStarts.get(key)
+    } catch {
+      // The initiator logs Slack watcher startup failures.
+    }
+
+    const threadId = this.#slackThreadIds.get(key)
+    if (!threadId) {
+      this.#increment('agentQuestionsSkippedMissingThread')
+      this.#logger.warn?.('[factory] agent question has no Slack dispatch thread', {
+        issue: record.issue,
+        from: question.agentName,
+      })
+      return
+    }
+
+    try {
+      await this.#slack.reply(threadId, agentQuestionSlackText(record.issue, question))
+      this.#increment('agentQuestionsPostedToSlack')
+      this.#recordSlackWritebackSuccess('agent-question')
+    } catch (error) {
+      this.#markSlackWritebackFailure('agent-question', error)
+      this.#logger.warn?.(`[factory] failed to post agent question for ${record.issue.key}`, error)
+    }
+  }
+
+  #rememberAgentQuestion(key: string): void {
+    if (this.#seenAgentQuestionKeys.has(key)) {
+      return
+    }
+    this.#seenAgentQuestionKeys.add(key)
+    this.#seenAgentQuestionOrder.push(key)
+    while (this.#seenAgentQuestionOrder.length > AGENT_QUESTION_DEDUPE_LIMIT) {
+      const oldest = this.#seenAgentQuestionOrder.shift()
+      if (oldest) this.#seenAgentQuestionKeys.delete(oldest)
+    }
+  }
+
   #recordArrivalLatency(event: ChangeEvent): void {
     const occurredAt = Date.parse(event.occurredAt)
     if (!Number.isFinite(occurredAt)) return
@@ -1763,6 +2113,7 @@ export class FactoryLoop implements Factory {
           config: { mergePolicy: this.#config.mergePolicy },
           reviewerName,
           implementerNames,
+          slackDispatchThread: this.#slackDispatchThreadFor(record),
         }),
         from: 'factory',
         data: { issue: record.issue },
@@ -2303,6 +2654,15 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  #slackDispatchThreadFor(record: InFlightIssue): { channel: string; threadId: string } | undefined {
+    if (!this.#config.slack) {
+      return undefined
+    }
+
+    const threadId = this.#slackThreadIds.get(issueKey(record.issue))
+    return threadId ? { channel: this.#config.slack.channel, threadId } : undefined
+  }
+
   async #runCompletionMergeGate(issue: LinearIssue): Promise<void> {
     if (this.#isSyntheticProbeIssue(issue)) {
       await this.#closeSyntheticProbeIfPresent(issue)
@@ -2438,6 +2798,36 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   }
 }
 
+export function parseGithubIssue(path: string, content: unknown): GithubIssueSource {
+  const parsed = parseJsonContent(content)
+  const payload = wrappedPayload(parsed)
+  const pathParts = githubIssuePathParts(path)
+  const repository = asRecord(payload.repository)
+  const owner = stringValue(asRecord(repository?.owner)?.login) ?? stringValue(asRecord(repository?.owner)?.name) ?? pathParts?.owner
+  const repoName = stringValue(repository?.name) ?? pathParts?.repo
+  const number = numberValue(payload.number) ?? pathParts?.number
+  const url = stringValue(payload.html_url) ?? stringValue(payload.url) ?? stringValue(payload.issue_url)
+  if (!owner || !repoName || typeof number !== 'number' || !url) {
+    throw new Error(`GitHub issue ${path} is missing owner, repo, number, or url`)
+  }
+
+  return {
+    owner,
+    repoName,
+    repo: `${owner}/${repoName}`,
+    number,
+    title: stringValue(payload.title) ?? '',
+    body: stringValue(payload.body) ?? '',
+    url,
+    state: (stringValue(payload.state) ?? '').toLowerCase(),
+    labels: Array.isArray(payload.labels)
+      ? payload.labels.map(labelName).filter((label): label is string => Boolean(label))
+      : [],
+    path,
+    raw: asRecord(parsed) ?? payload,
+  }
+}
+
 export async function readFactoryLoopHeartbeat(
   path = DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
 ): Promise<FactoryLoopHeartbeat | undefined> {
@@ -2528,6 +2918,81 @@ const repoMapFromConfig = (config: FactoryConfig) => {
     clonePath: config.repos.clonePaths[repo],
     source: 'default' as const,
   }))
+}
+
+const githubIssuePathParts = (path: string): { owner: string; repo: string; number: number } | undefined => {
+  // Live relayfile mounts expose GitHub issues as
+  // /github/repos/<owner>/<repo>/issues/<number>.json (see the renderer
+  // issues-store mount reader). Some mount shapes nest them under an extra
+  // by-id/ segment, so accept either to stay robust across mount versions.
+  const match = path.match(/^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/(?:by-id\/)?(\d+)\.json$/u)
+  if (!match) return undefined
+  return {
+    owner: match[1]!,
+    repo: match[2]!,
+    number: Number(match[3]),
+  }
+}
+
+const githubIssueHasFactoryLabel = (issue: GithubIssueSource): boolean =>
+  issue.labels.some((label) => label.toLowerCase() === GITHUB_FACTORY_LABEL)
+
+const githubIssueIsClosed = (issue: GithubIssueSource): boolean =>
+  issue.state === 'closed'
+
+const githubIssueMirrorPayload = (
+  issue: GithubIssueSource,
+  repoLabel: string,
+  config: FactoryConfig,
+): Record<string, unknown> => ({
+  id: githubIssueMirrorId(issue),
+  title: `${GITHUB_MIRROR_TITLE_PREFIX} ${issue.title}`.trim(),
+  description: githubIssueMirrorDescription(issue),
+  stateId: config.stateIds.readyForAgent,
+  labels: [{ name: repoLabel }],
+  team: { key: config.safety.requireTeamKey },
+  source: {
+    provider: 'github',
+    owner: issue.owner,
+    repo: issue.repoName,
+    number: issue.number,
+    url: issue.url,
+    path: issue.path,
+  },
+})
+
+const githubIssueMirrorDescription = (issue: GithubIssueSource): string => {
+  const body = issue.body.trim()
+  const source = `${GITHUB_MIRROR_SOURCE_PREFIX}${issue.url}`
+  return body ? `${body}\n\n${source}` : source
+}
+
+const githubIssueMirrorId = (issue: GithubIssueSource): string =>
+  `github-${stableHash(`${issue.repo.toLowerCase()}#${issue.number}:${issue.url}`)}`
+
+const githubIssueMirrorDraftPath = (issue: GithubIssueSource): string =>
+  `/linear/issues/factory-create-${githubIssueMirrorId(issue)}.json`
+
+const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueSource): boolean => {
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  if (
+    stringValue(source?.provider)?.toLowerCase() === 'github' &&
+    stringValue(source?.url) === ghIssue.url
+  ) {
+    return true
+  }
+  if (
+    stringValue(source?.provider)?.toLowerCase() === 'github' &&
+    stringValue(source?.owner)?.toLowerCase() === ghIssue.owner.toLowerCase() &&
+    stringValue(source?.repo)?.toLowerCase() === ghIssue.repoName.toLowerCase() &&
+    numberValue(source?.number) === ghIssue.number
+  ) {
+    return true
+  }
+  return issue.description
+    .split(/\r?\n/u)
+    .some((line) => line.trim() === `${GITHUB_MIRROR_SOURCE_PREFIX}${ghIssue.url}`)
 }
 
 const resolveIssuePrFromMount = async (
@@ -2701,6 +3166,12 @@ const isIssueFilePath = (path: string): boolean =>
   !path.includes('/by-state/') &&
   !path.includes('/by-id/') &&
   isCanonicalIssueFileBasename(path.split('/').at(-1) ?? '')
+
+const isLinearIssueMirrorCandidatePath = (path: string): boolean =>
+  isIssueFilePath(path) || /^\/linear\/issues\/factory-create-[^/]+\.json$/u.test(path)
+
+const isGithubIssueFilePath = (path: string): boolean =>
+  githubIssuePathParts(path) !== undefined
 
 const isIssueAliasFilePath = (path: string): boolean =>
   path.startsWith(linearByStatePath('ready-for-agent')) &&
@@ -3057,6 +3528,61 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
 
 const slackAnswerInput = (issue: IssueRef, text: string): string =>
   `Slack reply for ${issue.key}:\n${text}\r`
+
+const isFactoryQuestionTarget = (target: string): boolean => {
+  const normalized = target.trim().replace(/^@/u, '').toLowerCase()
+  return normalized === 'broker' || normalized === 'factory'
+}
+
+const parseAgentQuestion = (message: AgentMessage): AgentQuestion | undefined => {
+  const markerPattern = new RegExp(
+    `(^|\\n)\\s*(?:${escapeRegExp(AGENT_NEEDS_INPUT_MARKER)}|${escapeRegExp(LEGACY_AGENT_NEEDS_INPUT_MARKER)})\\s*(?::\\s*)?`,
+    'iu',
+  )
+  const match = markerPattern.exec(message.body)
+  if (!match || !message.from.trim()) {
+    return undefined
+  }
+
+  const markerEnd = match.index + match[0].length
+  const bodyAfterMarker = message.body.slice(markerEnd).trim()
+  const issueKey = message.body.match(/(?:^|\n)\s*Issue:\s*([A-Z]+-\d+)\s*(?:\n|$)/iu)?.[1]?.toUpperCase()
+  const question = extractQuestionText(bodyAfterMarker)
+  if (!question) {
+    return undefined
+  }
+
+  return {
+    agentName: message.from.trim(),
+    issueKey,
+    question,
+    eventId: message.eventId,
+  }
+}
+
+const extractQuestionText = (bodyAfterMarker: string): string => {
+  const questionMatch = bodyAfterMarker.match(/(?:^|\n)\s*Question:\s*([\s\S]+)$/iu)
+  const raw = questionMatch?.[1] ?? bodyAfterMarker
+  return raw
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*Issue:\s*[A-Z]+-\d+\s*$/iu.test(line))
+    .join('\n')
+    .trim()
+}
+
+const agentQuestionDedupeKey = (issue: IssueRef, question: AgentQuestion): string =>
+  `${question.eventId ?? 'missing'}:${stableHash(JSON.stringify({
+    issue: issue.key,
+    from: question.agentName,
+    question: question.question,
+  }))}`
+
+const agentQuestionSlackText = (issue: IssueRef, question: AgentQuestion): string => [
+  `${issue.key}: ${question.agentName} needs input.`,
+  `Question: ${question.question}`,
+].join('\n')
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 
 const isOwnSlackBotReply = (payload: Record<string, unknown>, botUserId: string): boolean =>
   payload.user_is_bot === true ||

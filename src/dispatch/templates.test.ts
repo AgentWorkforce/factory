@@ -34,6 +34,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Open a PR targeting `main` when done.')
     expect(task).toContain('Use `gh pr create --base main` and report the PR URL.')
     expect(task).toContain('DM the reviewer `ar-123-review` when the PR is ready.')
+    expect(task).toContain('DM `factory` with `[factory-needs-input] <your question>` so the factory can relay it to the issue Slack thread.')
     expect(task).toContain('DM `broker` when fully done.')
     expect(task).toContain('Do NOT auto-merge.')
     expect(task).toContain('Merge policy: never')
@@ -75,5 +76,24 @@ describe('renderAgentTask', () => {
     expect(task).toContain('GitHub repo: AgentWorkforce/cloud')
     expect(task).toContain('Clone/worktree: clone AgentWorkforce/cloud and work in your own isolated git worktree before editing.')
     expect(task).toContain('Merge policy: on-green-with-review')
+  })
+
+  it('uses the consistent factory needs-input format across both blocked-input clauses', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      slackDispatchThread: { channel: 'C123', threadId: '169.000' },
+    })
+
+    // The always-present clause and the Slack-thread fallback both point at
+    // `factory` with the [factory-needs-input] marker; no legacy
+    // FACTORY_NEEDS_INPUT / DM `broker` blocked-input wording remains.
+    expect(task).toContain('If blocked and you need human input, DM `factory` with `[factory-needs-input] <your question>`')
+    expect(task).toContain('Fallback: DM `factory` with `[factory-needs-input] <your question>`')
+    expect(task).not.toContain('FACTORY_NEEDS_INPUT')
+    expect(task).not.toContain('DM `broker` with')
   })
 })

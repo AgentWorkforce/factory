@@ -194,7 +194,9 @@ are illustrative — strip them; JSON has no comments):
   (see [`src/constants/linear.ts`](src/constants/linear.ts)). If you run against a
   different Linear team, override all four with that team's state UUIDs (read them
   from the Linear API / the issue JSON's `state.id`).
-- **`safety`** — the scope gate (below). Defaults `[factory-e2e]` + team `AR`.
+- **`safety`** — the scope gate (below). Defaults `[factory-e2e]` + team `AR`;
+  GitHub issue mirrors created by the factory use `[factory]` and are accepted
+  by the same gate.
 
 ### The safety gate (what actually gets dispatched)
 
@@ -202,7 +204,9 @@ are illustrative — strip them; JSON has no comments):
 dispatches an issue only when **both** are true:
 
 1. The issue **title starts with `safety.requireTitlePrefix`** — exactly
-   `[factory-e2e]`, or `[factory-e2e] <rest>`. Anything else is out of scope.
+   `[factory-e2e]`, or `[factory-e2e] <rest>` by default. Factory-created
+   GitHub mirrors titled `[factory] <GitHub title>` are also accepted. Anything
+   else is out of scope.
 2. The issue's **team key equals `safety.requireTeamKey`** (`AR`).
 
 This is why `factory run-once` may pull issues but dispatch none — they're real

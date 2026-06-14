@@ -2,6 +2,7 @@ import type {
   ChangeEvent,
   EventPage,
   FleetClient,
+  AgentMessage,
   MountClient,
   RosterEntry,
   SendInput,
@@ -14,6 +15,7 @@ import type {
 
 type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
+type AgentMessageListener = (message: AgentMessage) => void
 
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
@@ -161,6 +163,7 @@ export class FakeFleetClient implements FleetClient {
   #agents = new Set<string>()
   #exitListeners = new Set<ExitListener>()
   #deliveryFailedListeners = new Set<DeliveryFailedListener>()
+  #agentMessageListeners = new Set<AgentMessageListener>()
   #sessionRefs = new Map<string, string | undefined>()
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -225,6 +228,13 @@ export class FakeFleetClient implements FleetClient {
     }
   }
 
+  onAgentMessage(listener: AgentMessageListener): () => void {
+    this.#agentMessageListeners.add(listener)
+    return () => {
+      this.#agentMessageListeners.delete(listener)
+    }
+  }
+
   async dispose(): Promise<void> {}
 
   setSessionRef(name: string, sessionRef?: string): void {
@@ -241,6 +251,12 @@ export class FakeFleetClient implements FleetClient {
   emitDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): void {
     for (const listener of this.#deliveryFailedListeners) {
       listener(info)
+    }
+  }
+
+  emitAgentMessage(message: AgentMessage): void {
+    for (const listener of this.#agentMessageListeners) {
+      listener(message)
     }
   }
 }

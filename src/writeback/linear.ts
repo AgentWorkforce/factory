@@ -29,6 +29,8 @@ export interface LinearCreateIssuePayload extends Record<string, unknown> {
   title?: string
   teamId?: string
   team?: unknown
+  labels?: unknown
+  source?: unknown
 }
 
 const issuePath = (issue: LinearIssue): string =>
@@ -217,7 +219,7 @@ export const MountLinearWriteback = (
       assertInFactoryScope(scopeIssueFromPayload(payload, 'createIssue payload'), safety, 'createIssue payload')
       const path = createIssuePath(payload)
       seedCanonical(path, payload)
-      await mount.writeFile(path, createIssueWritePayload(payload), { guarded: true })
+      await mount.writeFile(path, createIssueDraftPayload(payload), { guarded: true })
       await confirmWriteback(mount, path, async () => {
         try {
           const written = wrappedPayload((await mount.readFile(path)).content)
@@ -295,6 +297,8 @@ const createIssueWritePayload = (payload: LinearCreateIssuePayload): Record<stri
     'priority',
     'assigneeId',
     'labelIds',
+    'labels',
+    'source',
     'parentId',
     'projectId',
     'estimate',
@@ -310,6 +314,18 @@ const createIssueWritePayload = (payload: LinearCreateIssuePayload): Record<stri
       : undefined
   if (teamId) writable.teamId = teamId
 
+  return writable
+}
+
+// createIssue drafts (e.g. GitHub mirrors) only carry a team key, no teamId. The
+// shared writable strips that, leaving the draft teamless. Re-attach the team
+// object for creates only — existing issues already have their team assigned, so
+// setState/postComment must not re-send it.
+const createIssueDraftPayload = (payload: LinearCreateIssuePayload): Record<string, unknown> => {
+  const writable = createIssueWritePayload(payload)
+  if (writable.teamId === undefined && asRecord(payload.team)) {
+    writable.team = payload.team
+  }
   return writable
 }
 

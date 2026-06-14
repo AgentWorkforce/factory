@@ -20,6 +20,10 @@ export interface RenderAgentTaskInput {
   config: Pick<FactoryConfig, 'mergePolicy'>
   reviewerName: string
   implementerNames?: string[]
+  slackDispatchThread?: {
+    channel: string
+    threadId: string
+  }
 }
 
 export function renderAgentTask(input: RenderAgentTaskInput): string {
@@ -42,14 +46,26 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'Open a PR targeting `main` when done.',
     'Use `gh pr create --base main` and report the PR URL.',
     `DM the reviewer \`${input.reviewerName}\` when the PR is ready.`,
+    'If blocked and you need human input, DM `factory` with `[factory-needs-input] <your question>` so the factory can relay it to the issue Slack thread.',
     'DM `broker` when fully done.',
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
   ]
+  const questionInstructions = input.slackDispatchThread
+    ? [
+        '',
+        'If you are blocked or need a human answer mid-task, ask in this issue\'s Slack dispatch thread.',
+        `Slack dispatch channel: ${input.slackDispatchThread.channel}`,
+        `Slack dispatch thread: ${input.slackDispatchThread.threadId}`,
+        'Prefer the injected Agent Relay MCP thread reply tool when it is available.',
+        'Fallback: DM `factory` with `[factory-needs-input] <your question>` and continue with safe reversible work while waiting.',
+      ]
+    : []
 
   if (input.role === 'reviewer') {
     return [
       ...common,
+      ...questionInstructions,
       '',
       `Wait for a DM from the implementer(s): ${implementers}.`,
       'Read the PR diff via `.integrations/github/repos`.',
@@ -59,7 +75,10 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ].join('\n')
   }
 
-  return common.join('\n')
+  return [
+    ...common,
+    ...questionInstructions,
+  ].join('\n')
 }
 
 export function agentSpecWithRenderedTask(

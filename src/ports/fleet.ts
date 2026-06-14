@@ -32,6 +32,7 @@ export type AgentPidResolution =
   | { status: 'unresolved' }
 
 export type SendInput = { to: string; text: string; from?: string; data?: Record<string, unknown> }
+export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
 
 export interface FleetClient {
   spawn(input: SpawnInput): Promise<SpawnResult>
@@ -44,6 +45,7 @@ export interface FleetClient {
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
   sendInput?(name: string, data: string): Promise<void>
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
+  onAgentMessage?(listener: (message: AgentMessage) => void): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
   dispose(): Promise<void>
 }

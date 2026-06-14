@@ -1,4 +1,4 @@
-import type { Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
+import type { AgentMessage, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
 
 const notImplemented = () => new Error('RelayFleetClient not implemented — see relay#1056')
 
@@ -32,6 +32,10 @@ export class RelayFleetClient implements FleetClient {
   }
 
   onDeliveryFailed(_listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void {
+    throw notImplemented()
+  }
+
+  onAgentMessage(_listener: (message: AgentMessage) => void): () => void {
     throw notImplemented()
   }
 

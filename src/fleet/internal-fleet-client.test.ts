@@ -583,6 +583,34 @@ describe('InternalFleetClient', () => {
     expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'crashed' }])
   })
 
+  it('surfaces inbound relay messages once for duplicate events', () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+    const messages: Array<{ from: string; target: string; body: string; threadId?: string; eventId?: string }> = []
+
+    fleet.onAgentMessage((message) => messages.push(message))
+
+    const inbound = {
+      kind: 'relay_inbound',
+      event_id: 'inbound-1',
+      from: 'ar-1-impl',
+      target: 'broker',
+      body: 'FACTORY_NEEDS_INPUT\nQuestion: blocked',
+      thread_id: 'thread-1',
+    } satisfies BrokerEvent
+
+    harness.emit(inbound)
+    harness.emit(inbound)
+
+    expect(messages).toEqual([{
+      from: 'ar-1-impl',
+      target: 'broker',
+      body: 'FACTORY_NEEDS_INPUT\nQuestion: blocked',
+      threadId: 'thread-1',
+      eventId: 'inbound-1',
+    }])
+  })
+
   it('latches one agent death by name across lagged exit callbacks', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-06-11T00:00:00.000Z'))

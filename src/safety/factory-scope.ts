@@ -18,7 +18,7 @@ export function isInFactoryScope(
   const expected = normalizeSafety(safety)
   const payload = wrappedPayload(issue.raw)
   const title = stringValue(payload.title) ?? issue.title
-  if (!titleHasFactoryMarker(title, expected.titlePrefix)) {
+  if (!titleHasAcceptedFactoryMarker(title, expected.titlePrefix, isGithubMirrorPayload(payload))) {
     return false
   }
 
@@ -52,7 +52,7 @@ function factoryScopeFailureReason(
   const expected = normalizeSafety(safety)
   const payload = wrappedPayload(issue.raw)
   const title = stringValue(payload.title) ?? issue.title
-  if (!titleHasFactoryMarker(title, expected.titlePrefix)) {
+  if (!titleHasAcceptedFactoryMarker(title, expected.titlePrefix, isGithubMirrorPayload(payload))) {
     return `title must start with ${expected.titlePrefix} boundary`
   }
 
@@ -74,6 +74,24 @@ const normalizeSafety = (safety: FactoryScopeSafety = {}): NormalizedFactoryScop
 
 const titleHasFactoryMarker = (title: string, marker: string): boolean =>
   title === marker || title.startsWith(`${marker} `)
+
+// Accept the configured prefix always. The bare `[factory]` mirror marker is
+// only honored for GitHub mirror issues, so a stricter custom prefix (e.g.
+// `[factory-e2e]`) still rejects a human-authored issue merely titled
+// `[factory] ...`.
+const titleHasAcceptedFactoryMarker = (
+  title: string,
+  configuredMarker: string,
+  isGithubMirror: boolean,
+): boolean =>
+  titleHasFactoryMarker(title, configuredMarker) ||
+  (isGithubMirror && titleHasFactoryMarker(title, GITHUB_MIRROR_TITLE_PREFIX))
+
+// Mirror drafts created from GitHub issues carry source.provider === 'github'.
+const isGithubMirrorPayload = (payload: Record<string, unknown>): boolean =>
+  stringValue(asRecord(payload.source)?.provider)?.toLowerCase() === 'github'
+
+const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 
 const wrappedPayload = (value: unknown): Record<string, unknown> => {
   const record = asRecord(value)

@@ -7,6 +7,7 @@ export type {
   Subscription,
 } from './mount'
 export type {
+  AgentMessage,
   AgentPidResolution,
   AgentSpec,
   Capability,
