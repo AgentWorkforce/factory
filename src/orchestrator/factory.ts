@@ -164,6 +164,10 @@ export class FactoryLoop implements Factory {
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
+  // Holds back the live-event drain while the startup full pull runs, so events
+  // that arrive during the pull buffer and drain afterward (batch dedupe then
+  // suppresses any overlap with what the pull already dispatched).
+  #deferLiveEventDrain = false
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
@@ -330,17 +334,34 @@ export class FactoryLoop implements Factory {
       highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
     })
 
-    if (highWatermark.routeUnavailable) {
-      this.#increment('liveHighWatermarkFullPullFallbacks')
-      this.#logger.info?.('[factory] live subscription high-watermark route unavailable; running startup full pull before event stream')
-      await this.runOnce()
-      await this.#refreshLiveHeartbeatIfDue()
-    }
-
+    // Register the live subscription BEFORE the startup full pull so an issue
+    // that becomes Ready *during* the pull is captured, not lost in the window
+    // between listTree and subscribe. Events buffer (deferred drain) until the
+    // pull finishes; batch dedupe then suppresses any overlap with what the
+    // pull already dispatched.
     if (options.transport !== 'poll') {
       this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB], (event) => {
         this.#enqueueLiveEvent(event)
       }, { from: 'now', coalesce: 'none' })
+    }
+
+    if (highWatermark.routeUnavailable) {
+      this.#increment('liveHighWatermarkFullPullFallbacks')
+      this.#logger.info?.('[factory] live subscription high-watermark route unavailable; running startup full pull before draining buffered events')
+      this.#deferLiveEventDrain = true
+      try {
+        await this.runOnce()
+      } catch (error) {
+        // A startup pull failure must not abort the daemon: log it and fall back
+        // to the live event stream (plus any buffered events) instead of leaving
+        // the factory down.
+        this.#increment('liveHighWatermarkFullPullErrors')
+        this.#error(error)
+      } finally {
+        this.#deferLiveEventDrain = false
+        this.#scheduleLiveEventDrain()
+      }
+      await this.#refreshLiveHeartbeatIfDue()
     }
 
     if (options.transport === 'poll') {
@@ -493,7 +514,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleLiveEventDrain(): void {
-    if (this.#liveEventDrainScheduled || this.#liveEventDrainActive || !this.#started) {
+    if (this.#liveEventDrainScheduled || this.#liveEventDrainActive || this.#deferLiveEventDrain || !this.#started) {
       return
     }
     this.#liveEventDrainScheduled = true

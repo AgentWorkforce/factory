@@ -528,6 +528,35 @@ class RouteNotFoundCountingListTreeMount extends CountingListTreeMount {
   }
 }
 
+class RouteNotFoundThrowingPullMount extends FakeMountClient {
+  override async getEventHighWatermark(): Promise<string | undefined> {
+    throw Object.assign(new Error('Route not found'), { status: 404 })
+  }
+
+  override async listTree(): Promise<string[]> {
+    throw new Error('startup pull boom')
+  }
+}
+
+class ArrivesDuringPullMount extends FakeMountClient {
+  onFirstListTree?: () => void
+  #listed = false
+
+  override async getEventHighWatermark(): Promise<string | undefined> {
+    throw Object.assign(new Error('Route not found'), { status: 404 })
+  }
+
+  override async listTree(prefix: string): Promise<string[]> {
+    const result = await super.listTree(prefix)
+    if (!this.#listed) {
+      this.#listed = true
+      this.onFirstListTree?.()
+    }
+    // The startup pull never sees AR-51 — it only arrives via a live event mid-pull.
+    return result.filter((path) => !path.includes('AR-51'))
+  }
+}
+
 class BlockingIssueReadMount extends FakeMountClient {
   readCount = 0
   observedStaleWhileReading = false
@@ -2673,6 +2702,40 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-42-impl', 'ar-42-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-42'])
     expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
+    await factory.stop()
+  })
+
+  it('keeps the daemon up when the startup full pull throws', async () => {
+    const mount = new RouteNotFoundThrowingPullMount({})
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await expect(
+      factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } }),
+    ).resolves.toBeUndefined()
+
+    expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
+    expect(factory.status().counters.liveHighWatermarkFullPullErrors).toBe(1)
+    await factory.stop()
+  })
+
+  it('dispatches an issue that arrives via a live event during the startup full pull', async () => {
+    const pulledPath = issuePath(50)
+    const arrivedPath = issuePath(51)
+    const mount = new ArrivesDuringPullMount({
+      [pulledPath]: realIssueFile(50),
+      [arrivedPath]: realIssueFile(51),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    mount.onFirstListTree = () => mount.emit(changeEvent(arrivedPath, 'arrived-during-pull-51'))
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    await flush()
+
+    const names = fleet.spawns.map((spawn) => spawn.name)
+    expect(names).toContain('ar-50-impl') // dispatched by the startup full pull
+    expect(names).toContain('ar-51-impl') // captured via the buffered live event during the pull
     await factory.stop()
   })
 
