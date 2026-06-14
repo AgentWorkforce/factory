@@ -1581,6 +1581,11 @@ export class FactoryLoop implements Factory {
     }
 
     try {
+      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+        await this.#completeIssue(record)
+        return
+      }
+
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (this.#resumedExitKeys.has(resumeKey)) {
@@ -1619,6 +1624,28 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#error(error, record.issue)
+    }
+  }
+
+  async #issueHasCompletionPr(record: InFlightIssue): Promise<boolean> {
+    try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) {
+        return false
+      }
+      // Only a NON-DRAFT (ready) PR counts as completion. A draft PR means the
+      // work isn't review-ready, so an implementer exiting with only a draft PR
+      // must NOT mark the issue done / release agents — mirror the
+      // #sweepPrStateCompletions draft guard, which keeps draft-PR issues in flight.
+      const pr = await this.#completionPrForIssue(issue)
+      return Boolean(pr && !pr.draft)
+    } catch (error) {
+      this.#logger.warn?.('[factory] PR probe failed after implementer exit; preserving restart behavior', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      this.#increment('exitPrProbeFailures')
+      return false
     }
   }
 
