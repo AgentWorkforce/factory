@@ -214,6 +214,9 @@ export class FactoryLoop implements Factory {
   readonly #completionInFlight = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
+  // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
+  // cycles read the mirror directly instead of re-scanning all Linear issues.
+  readonly #githubMirrorPathCache = new Map<string, string>()
   readonly #seenLiveEvents = new Set<string>()
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
@@ -1255,7 +1258,12 @@ export class FactoryLoop implements Factory {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
         if (mirror && mirror.stateId !== this.#config.stateIds.done) {
           if (!opts.dryRun) {
-            await this.#linear.setState(mirror, this.#config.stateIds.done)
+            const record = this.#batch.getIssue(mirror)
+            if (record) {
+              await this.#completeIssue(record)
+            } else {
+              await this.#linear.setState(mirror, this.#config.stateIds.done)
+            }
           }
           this.#increment('githubIssueMirrorsClosed')
         }
@@ -1319,13 +1327,30 @@ export class FactoryLoop implements Factory {
       // source metadata on existing Linear issues for restart/replay dedupe.
     }
 
+    // Cached resolved mirror path: skip the full ISSUE_ROOT scan for mirrors we
+    // already located on an earlier cycle. Re-validate the cached path and fall
+    // back to a scan if the mirror was deleted or renamed.
+    const cacheKey = githubIssueMirrorId(ghIssue)
+    const cachedPath = this.#githubMirrorPathCache.get(cacheKey)
+    if (cachedPath) {
+      const cached = await this.#readIssue(cachedPath)
+      if (cached && linearIssueMirrorsGithubIssue(cached, ghIssue)) {
+        return cached
+      }
+      this.#githubMirrorPathCache.delete(cacheKey)
+    }
+
     // During a full ingestion pass the candidate list is loaded once and shared
     // across every GitHub issue; the live single-event path passes none and
     // loads on demand.
     const mirrorCandidates = candidates
       ? await candidates.load()
       : await this.#loadLinearMirrorCandidates()
-    return mirrorCandidates.find((issue) => linearIssueMirrorsGithubIssue(issue, ghIssue))
+    const mirror = mirrorCandidates.find((issue) => linearIssueMirrorsGithubIssue(issue, ghIssue))
+    if (mirror) {
+      this.#githubMirrorPathCache.set(cacheKey, mirror.path)
+    }
+    return mirror
   }
 
   #repoLabelForGithubIssue(ghIssue: GithubIssueSource): string | undefined {

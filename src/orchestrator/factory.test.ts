@@ -1007,6 +1007,67 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.githubIssueMirrorsClosed).toBe(1)
   })
 
+  it('caches the resolved mirror path so repeat cycles do not rescan Linear issues', async () => {
+    const ghUrl = 'https://github.com/AgentWorkforce/pear/issues/1116'
+    const ghPath = githubIssuePath('AgentWorkforce', 'pear', 1116)
+    class CountingIssueListMount extends FakeMountClient {
+      issueRootListCalls = 0
+      override async listTree(prefix: string): Promise<string[]> {
+        if (prefix === '/linear/issues') this.issueRootListCalls += 1
+        return super.listTree(prefix)
+      }
+    }
+    const mount = new CountingIssueListMount({
+      [ghPath]: githubIssueFile(1116, { url: ghUrl }),
+      [issuePath(258)]: realIssueFile(258, done, {
+        title: '[factory] GitHub mirror',
+        description: `Mirrored from GitHub.\n\nSource: ${ghUrl}`,
+        labels: [{ name: 'pear' }],
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    const afterFirst = mount.issueRootListCalls
+    await factory.runOnce()
+    const secondCycleScans = mount.issueRootListCalls - afterFirst
+
+    expect(secondCycleScans).toBeLessThan(afterFirst)
+    expect(factory.status().counters.githubIssueMirrorsDeduped).toBe(2)
+  })
+
+  it('completes an in-flight mirror when its GitHub issue closes', async () => {
+    const ghUrl = 'https://github.com/AgentWorkforce/pear/issues/1116'
+    const ghPath = githubIssuePath('AgentWorkforce', 'pear', 1116)
+    const mount = new FakeMountClient({
+      [ghPath]: githubIssueFile(1116, { url: ghUrl }),
+      [issuePath(258)]: realIssueFile(258, ready, {
+        title: '[factory] GitHub mirror',
+        description: `Mirrored from GitHub.\n\nSource: ${ghUrl}`,
+        labels: [{ name: 'pear' }],
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    expect(factory.status().inFlight.map((issue) => issue.key)).toContain('AR-258')
+
+    mount.files.set(ghPath, { content: githubIssueFile(1116, { state: 'closed', url: ghUrl }) })
+    await factory.runOnce()
+
+    expect(fleet.releases.map((release) => release.name)).toEqual(
+      expect.arrayContaining(['ar-258-impl', 'ar-258-review']),
+    )
+    expect(factory.status().counters.githubIssueMirrorsClosed).toBe(1)
+    expect(factory.status().inFlight.map((issue) => issue.key)).not.toContain('AR-258')
+  })
+
   it('uses canonical issue state when a ready alias is stale', async () => {
     const canonicalPath = '/linear/issues/AR-67__uuid-67-canonical.json'
     const aliasPath = readyAliasPath(67)

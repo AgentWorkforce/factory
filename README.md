@@ -213,6 +213,36 @@ This is why `factory run-once` may pull issues but dispatch none — they're rea
 issues that fall outside the gate. Loosen the gate deliberately; it's the primary
 guardrail against the factory acting on issues it shouldn't.
 
+> **⚠️ `[factory-e2e]` is the synthetic self-test prefix — its PRs auto-close.**
+> The default `requireTitlePrefix` is `[factory-e2e]`, which is *also* the marker
+> the factory uses to identify synthetic E2E soak issues. A `[factory-e2e]`-titled
+> issue's PR is **auto-closed, never merged** (`#isSyntheticProbeIssue`) — great
+> for self-test soaks, wrong for real work. **For real issues you want to keep,
+> set `requireTitlePrefix` to `[factory]`** and title issues `[factory] <task>`;
+> reserve `[factory-e2e]` for the soak. The synthetic check matches `[factory-e2e]`
+> exactly, so `[factory]` issues are not auto-closed. (Note: `[factory-e2e]` does
+> **not** satisfy a `[factory]` gate — the prefixes differ at the `]`/`-`, so don't
+> mix them.)
+
+### Ingesting GitHub issues (label `factory`)
+
+The factory also picks up **GitHub issues labeled `factory`** (case-insensitive),
+read from the mounted `/github/repos/**` tree (pushed in by the GitHub→relayfile
+sync — no API polling). For each, it creates one Linear mirror titled
+`[factory] <GitHub title>` in **Ready for Agent**, routes it via `repos.byLabel`,
+then dispatches it like any other Linear issue. Mirrors are deduped (one per
+GitHub issue) and set to `done` when the GitHub issue closes.
+
+So to hand the factory a GitHub issue you **just add the `factory` label** — you
+do **not** put `[factory]` in the GitHub title (the factory adds that to the
+Linear mirror). This is the cross-repo path: label, say, a `relay` repo issue
+`factory` and it flows in, routed to `AgentWorkforce/relay`.
+
+| Source | What you do | Result |
+|---|---|---|
+| Linear (direct) | title `[factory] <task>`, team AR, label = repo, Ready for Agent | dispatched directly |
+| GitHub (any configured repo) | add the **`factory` label** | mirrored to a `[factory]` Linear issue, then dispatched |
+
 ### Other notable fields (defaults in parentheses)
 
 - `mergePolicy` (`never`) — `never` keeps PRs open; `on-green-with-review` enables
