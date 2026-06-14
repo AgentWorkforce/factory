@@ -227,8 +227,9 @@ describe('MountLinearWriteback', () => {
         },
       },
     ])
-    expect(commentPath).toContain('/linear/comments/AR-99__factory-')
-    expect(commentPath).toMatch(/\/comments\/[^/]+\.json$/)
+    expect(commentPath).toContain('/comments/AR-99__factory-')
+    expect(commentPath.startsWith(`${issuePath.replace(/\.json$/u, '')}/comments/`)).toBe(true)
+    expect(commentPath).toMatch(/^\/linear\/issues\/[^/]+\/comments\/[^/]+\.json$/)
     expect(commentPath.endsWith('.json.json')).toBe(false)
     expect(await linear.verify(issue, { commentName })).toBe(true)
   })
@@ -248,7 +249,7 @@ describe('MountLinearWriteback', () => {
     class StaleMountClient extends FakeMountClient {
       override async writeFile(path: string, content: unknown): Promise<void> {
         await super.writeFile(path, content)
-        if (path.startsWith('/linear/comments/')) {
+        if (path.includes('/comments/')) {
           this.files.set(path, { content: { issueId: 'stale-issue-id' } })
         } else if (path.includes('/factory-create-')) {
           this.files.set(path, { content: { title: 'stale create mirror' } })
@@ -281,7 +282,7 @@ describe('MountLinearWriteback', () => {
     expect(warnings).toHaveLength(3)
     expect(warnings.map((warning) => warning[0])).toEqual([
       `[factory-sdk] Linear writeback read-back verification failed for ${issuePath}; treating getOp ack as success`,
-      expect.stringMatching(/^\[factory-sdk\] Linear writeback read-back verification failed for \/linear\/comments\/AR-99__factory-/u),
+      expect.stringMatching(/^\[factory-sdk\] Linear writeback read-back verification failed for \/linear\/issues\/[^/]+\/comments\/AR-99__factory-/u),
       '[factory-sdk] Linear writeback read-back verification failed for /linear/issues/factory-create-uuid-stale-create.json; treating getOp ack as success',
     ])
   })

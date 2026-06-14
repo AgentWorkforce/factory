@@ -408,27 +408,23 @@ async function isAllowedFactoryDraft(
 ): Promise<boolean> {
   if (!opts?.guarded) return false
 
-  if (path.startsWith('/linear/issues/')) {
-    if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
+  // Comment writeback nested under its issue: /linear/issues/<ref>/comments/<draft>.json.
+  // Scope-check the owning issue (the draft content is a comment, not an issue).
+  const nestedComment = /^\/linear\/issues\/([^/]+)\/comments\/[^/]+$/u.exec(path)
+  if (nestedComment) {
+    const issuePath = `/linear/issues/${nestedComment[1]}.json`
     try {
-      const issue = parseLinearIssue(path, (await mount.readFile(path)).content)
+      const issue = parseLinearIssue(issuePath, (await mount.readFile(issuePath)).content)
       return isInFactoryScope(issue, config.safety)
     } catch {
       return false
     }
   }
 
-  if (path.startsWith('/linear/comments/')) {
-    const issueKey = path.split('/').at(-1)?.split('__')[0]
-    if (!issueKey) return false
-    const candidates = await mount.listTree('/linear/issues/')
-    const issuePath = candidates.find((candidate) =>
-      candidate.startsWith(`/linear/issues/${issueKey}__`) ||
-      candidate === `/linear/issues/${issueKey}.json`
-    )
-    if (!issuePath) return false
+  if (path.startsWith('/linear/issues/')) {
+    if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
     try {
-      const issue = parseLinearIssue(issuePath, (await mount.readFile(issuePath)).content)
+      const issue = parseLinearIssue(path, (await mount.readFile(path)).content)
       return isInFactoryScope(issue, config.safety)
     } catch {
       return false

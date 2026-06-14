@@ -2705,17 +2705,16 @@ const isAllowedFactoryDraft = async (
 ): Promise<boolean> => {
   if (!opts?.guarded) return false
 
+  // Comment writeback nested under its issue: /linear/issues/<ref>/comments/<draft>.json.
+  // Scope-check the owning issue (the draft content is a comment, not an issue).
+  const nestedComment = /^\/linear\/issues\/([^/]+)\/comments\/[^/]+$/u.exec(path)
+  if (nestedComment) {
+    return isIssuePathInFactoryScope(mount, `/linear/issues/${nestedComment[1]}.json`, config)
+  }
+
   if (path.startsWith('/linear/issues/')) {
     if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
     return isIssuePathInFactoryScope(mount, path, config)
-  }
-
-  if (path.startsWith('/linear/comments/')) {
-    const issueKey = path.split('/').at(-1)?.split('__')[0]
-    if (!issueKey) return false
-    const candidates = await mount.listTree('/linear/issues/')
-    const issuePath = candidates.find((candidate) => candidate.startsWith(`/linear/issues/${issueKey}__`))
-    return issuePath ? isIssuePathInFactoryScope(mount, issuePath, config) : false
   }
 
   if (/^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)) {
