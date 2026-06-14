@@ -69,6 +69,7 @@ type SlackReply = {
   channelDir: string
   threadTs: string
   messageTs: string
+  text: string
   isThreadReply: boolean
   isBot: boolean
   raw: Record<string, unknown>
@@ -912,9 +913,10 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    if (decision.confidence === 'low') {
-      const error = new Error(`Low-confidence triage for ${decision.issue.key}; escalation required`)
-      this.#error(error, decision.issue)
+    const escalationReason = triageEscalationReason(decision)
+    if (escalationReason) {
+      await this.#escalateTriageToSlack(decision, escalationReason, dryRun)
+      this.#error(new Error(`${escalationReason}; escalation required`), decision.issue)
       return { issue: decision.issue, agents: [], dryRun }
     }
 
@@ -1068,8 +1070,10 @@ export class FactoryLoop implements Factory {
       }
 
       const decision = await this.triageIssue(issue)
-      if (decision.confidence === 'low') {
-        this.#error(new Error(`Low-confidence triage for ${decision.issue.key}; escalation required`), decision.issue)
+      const escalationReason = triageEscalationReason(decision)
+      if (escalationReason) {
+        await this.#escalateTriageToSlack(decision, escalationReason, this.#config.dryRun)
+        this.#error(new Error(`${escalationReason}; escalation required`), decision.issue)
         return
       }
 
@@ -2012,6 +2016,70 @@ export class FactoryLoop implements Factory {
     this.#recordSlackWritebackSuccess('dispatch-thread')
   }
 
+  async #escalateTriageToSlack(decision: TriageDecision, reason: string, dryRun: boolean): Promise<void> {
+    if (dryRun) {
+      return
+    }
+
+    if (!this.#slack || !this.#config.slack) {
+      this.#logger.warn?.('[factory] triage escalation has no Slack channel configured', {
+        issue: decision.issue,
+        reason,
+      })
+      return
+    }
+
+    if (await this.#shouldSkipSlackWriteback('triage-escalation')) {
+      return
+    }
+
+    const key = issueKey(decision.issue)
+    if (this.#slackThreadIds.has(key) || this.#slackWatcherStarts.has(key)) {
+      try {
+        await this.#slackWatcherStarts.get(key)
+      } catch {
+        // The initiator logs Slack watcher startup failures.
+      }
+      return
+    }
+
+    const start = this.#postAndWatchSlackEscalationThread(decision, reason)
+    this.#slackWatcherStarts.set(key, start)
+    try {
+      await start
+    } catch (error) {
+      this.#markSlackWritebackFailure('triage-escalation', error)
+      this.#logger.warn?.(`[factory] failed to establish Slack escalation thread for ${decision.issue.key}`, error)
+    } finally {
+      this.#slackWatcherStarts.delete(key)
+    }
+  }
+
+  async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<void> {
+    if (!this.#slack || !this.#config.slack) {
+      return
+    }
+
+    const issue = await this.#readIssue(decision.issue.path)
+    const root = await this.#slack.postThread({
+      channel: this.#config.slack.channel,
+      text: [
+        `${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
+        `Reason: ${reason}`,
+        `Question: Please clarify the intended repo/approach or add enough acceptance detail for the factory agent to proceed.`,
+      ].join('\n'),
+    })
+    this.#slackThreadIds.set(issueKey(decision.issue), root.threadId)
+    await this.#watchSlackThread({
+      issue: decision.issue,
+      decision,
+      agents: new Map(),
+      invocationIds: new Set(),
+      dryRun: false,
+    }, root.threadId)
+    this.#recordSlackWritebackSuccess('triage-escalation')
+  }
+
   async #watchSlackThread(record: InFlightIssue, threadId: string): Promise<void> {
     if (!this.#config.slack) {
       return
@@ -2087,7 +2155,7 @@ export class FactoryLoop implements Factory {
         }
         seenReplyMessages.add(replyMessageKey)
 
-        await this.#respondToSlackStatus(record, threadId)
+        await this.#routeSlackAnswerToImplementers(record, reply)
       } catch (error) {
         this.#logger.error?.('[factory] failed to handle Slack reply event', error)
       }
@@ -2156,39 +2224,37 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #respondToSlackStatus(record: InFlightIssue, threadId: string): Promise<void> {
-    if (!this.#slack || !this.#config.slack) {
+  async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackReply): Promise<void> {
+    if (!this.#config.slack || !this.#fleet.sendInput) {
       return
     }
 
-    if (await this.#shouldSkipSlackWriteback('status-responder')) {
+    const liveRecord = this.#batch.getIssue(record.issue)
+    if (!liveRecord || liveRecord.dryRun) {
+      this.#increment('slackAnswersIgnoredNoInFlight')
       return
     }
 
-    const issue = await this.#readIssue(record.issue.path)
-    if (!issue || !isInFactoryScope(issue, this.#config.safety)) {
+    const text = reply.text.trim()
+    if (!text) {
+      this.#increment('slackAnswersIgnoredEmpty')
       return
     }
 
-    const [roster, probe] = await Promise.all([
-      this.#fleet.roster(),
-      this.#probePrResolver(issue),
-    ])
-    const activeAgents = new Set(record.agents.keys())
-    const liveAgents = roster.agents
-      .map((agent) => agent.name)
-      .filter((name) => activeAgents.has(name))
-      .sort()
+    const implementers = [...liveRecord.agents.values()]
+      .filter((agent) => agent.spec.role === 'implementer')
+      .map((agent) => agent.result?.name ?? agent.spec.name)
+      .filter((name): name is string => Boolean(name))
 
-    try {
-      await this.#slack.reply(threadId, [
-        `${issue.key}: ${issueStateLabel(issue)}`,
-        `Agents: ${liveAgents.join(', ') || [...activeAgents].sort().join(', ') || 'none'}`,
-        `PR: ${probe ? githubPrUrl(probe.repo, probe.prNumber) : 'not found yet'}`,
-      ].join('\n'))
-      this.#recordSlackWritebackSuccess('status-responder')
-    } catch (error) {
-      this.#markSlackWritebackFailure('status-responder', error)
+    if (implementers.length === 0) {
+      this.#increment('slackAnswersIgnoredNoImplementer')
+      return
+    }
+
+    const input = slackAnswerInput(liveRecord.issue, text)
+    for (const implementer of new Set(implementers)) {
+      await this.#fleet.sendInput(implementer, input)
+      this.#increment('slackAnswersInjected')
     }
   }
 
@@ -2913,25 +2979,33 @@ const parseSlackReply = (path: string, content: unknown, botUserId: string): Sla
     channelDir,
     threadTs,
     messageTs,
+    text: stringValue(payload.text) ?? '',
     isThreadReply: Boolean(parentFromPath) || threadTs !== messageTs,
     isBot: isOwnSlackBotReply(payload, botUserId),
     raw,
   }
 }
 
+const triageEscalationReason = (decision: TriageDecision): string | undefined => {
+  const reasons: string[] = []
+  if (decision.confidence === 'low') {
+    reasons.push('low-confidence triage')
+  }
+  if (decision.thin) {
+    reasons.push('thin issue context')
+  }
+  if (reasons.length === 0) {
+    return undefined
+  }
+  return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
+}
+
+const slackAnswerInput = (issue: IssueRef, text: string): string =>
+  `Slack reply for ${issue.key}:\n${text}\r`
+
 const isOwnSlackBotReply = (payload: Record<string, unknown>, botUserId: string): boolean =>
   payload.user_is_bot === true ||
   stringValue(payload.user) === botUserId
-
-const issueStateLabel = (issue: LinearIssue): string => {
-  const name = issue.state?.name?.trim()
-  if (name && issue.stateId) {
-    return `${name} (${issue.stateId})`
-  }
-  return name || issue.stateId || 'unknown state'
-}
-
-const githubPrUrl = (repo: string, prNumber: number): string => `https://github.com/${repo}/pull/${prNumber}`
 
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)

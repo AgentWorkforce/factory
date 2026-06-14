@@ -167,6 +167,36 @@ class CountingTriage extends StaticTriage {
   }
 }
 
+class FailingSlackAnswerFleetClient extends FakeFleetClient {
+  failuresRemaining = 1
+
+  override async sendInput(name: string, data: string): Promise<void> {
+    if (data.startsWith('Slack reply for ') && this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1
+      throw new Error('sendInput failed')
+    }
+    await super.sendInput(name, data)
+  }
+}
+
+class EscalatingTriage extends StaticTriage {
+  readonly overrides: Partial<Pick<TriageDecision, 'thin' | 'confidence' | 'rationale'>>
+
+  constructor(overrides: Partial<Pick<TriageDecision, 'thin' | 'confidence' | 'rationale'>> = {}) {
+    super()
+    this.overrides = overrides
+  }
+
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    return {
+      ...await super.triage(issue),
+      thin: this.overrides.thin ?? true,
+      confidence: this.overrides.confidence ?? 'low',
+      rationale: this.overrides.rationale ?? 'Issue lacks enough acceptance detail.',
+    }
+  }
+}
+
 class SpawnFailingFleetClient extends FakeFleetClient {
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     this.spawns.push(input)
@@ -4630,7 +4660,78 @@ describe('FactoryLoop', () => {
     )).toHaveLength(1)
   })
 
-  it('watches the in-flight factory Slack thread and replies to a human status request with live state, roster, and PR', async () => {
+  it('posts low-confidence and thin triage escalation to Slack with reason and question', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(20)]: issueFile(20) })
+    const fleet = new FakeFleetClient()
+    const slack = new RecordingSlack()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new EscalatingTriage({ rationale: 'No repository route matched.' }),
+      slack,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }, reason: 'queued or escalated' })
+    expect(fleet.spawns).toEqual([])
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-20: factory triage escalation for [factory-e2e] Fix factory issue 20')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: No repository route matched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Please clarify')
+    expect(slack.roots).toEqual([])
+  })
+
+  it('ignores a human Slack thread reply after the issue has no in-flight implementer', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(21)]: issueFile(21) })
+    const fleet = new FakeFleetClient()
+    const slack = new RecordingSlack()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), issueFile(21))))
+    fleet.emitAgentExit('ar-21-impl', 'issue-done')
+    await flush()
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-after-done'), 'slack-human-after-done', {
+      text: 'please add one more test',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+
+    expect(factory.status().inFlight).toEqual([])
+    expect(slackAnswerInputs(fleet)).toEqual([])
+  })
+
+  it('does not wire Slack answer injection when Slack is unconfigured', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(22)]: issueFile(22) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(22), issueFile(22))))
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', '1780751622.222222', 'human-unconfigured'), 'slack-human-unconfigured', {
+      text: 'please use Slack answer injection',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+
+    expect(slackAnswerInputs(fleet)).toEqual([])
+  })
+
+  it('watches the in-flight factory Slack thread and routes a human reply to the implementer', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(24)]: issueFile(24) })
     const fleet = new FakeFleetClient()
     const slack = new RecordingSlack()
@@ -4639,12 +4740,11 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       slack,
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 240 }),
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(24), issueFile(24))))
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-1'), 'slack-human-1', {
-      text: 'status?',
+      text: 'Please use the existing retry helper.',
       user: 'U123',
       user_name: 'human',
       user_is_bot: false,
@@ -4652,16 +4752,12 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    const replies = slackReplyWrites(mount)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-24-impl', data: 'Slack reply for AR-24:\nPlease use the existing retry helper.\r' },
+    ])
     expect(slack.replies).toEqual([])
-    expect(replies).toHaveLength(1)
-    expect(replies[0]?.content.thread_ts).toBe(slack.threadId)
-    expect(replies[0]?.content.text).toContain('AR-24')
-    expect(replies[0]?.content.text).toContain(implementing)
-    expect(replies[0]?.content.text).toContain('ar-24-impl')
-    expect(replies[0]?.content.text).toContain('ar-24-review')
-    expect(replies[0]?.content.text).toContain('https://github.com/AgentWorkforce/pear/pull/240')
-    expect(mount.confirmedPaths.filter((path) => path.includes('/replies/'))).toEqual([replies[0]?.path])
+    expect(slackReplyWrites(mount)).toEqual([])
+    expect(mount.confirmedPaths.filter((path) => path.includes('/replies/'))).toEqual([])
   })
 
   it('watches top-level inbound Slack thread replies keyed by real reply ts', async () => {
@@ -4685,10 +4781,11 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    const replies = slackReplyWrites(mount)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-32-impl', data: 'Slack reply for AR-32:\nstatus?\r' },
+    ])
     expect(slack.replies).toEqual([])
-    expect(replies).toHaveLength(1)
-    expect(replies[0]?.content.thread_ts).toBe(slack.threadId)
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it.each([
@@ -4715,6 +4812,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackReplyWrites(mount)).toEqual([])
+    expect(slackAnswerInputs(fleet)).toEqual([])
   })
 
   it('degraded thread/channel guard: off-thread, mismatched-thread, and wrong-channel replies are skipped', async () => {
@@ -4750,6 +4848,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackReplyWrites(mount)).toEqual([])
+    expect(slackAnswerInputs(fleet)).toEqual([])
   })
 
   it('degraded positive control: genuine human reply in the watched thread is answered', async () => {
@@ -4773,9 +4872,10 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    const replies = slackReplyWrites(mount)
-    expect(replies).toHaveLength(1)
-    expect(replies[0]?.content.text).toContain('AR-35')
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-35-impl', data: 'Slack reply for AR-35:\nstatus?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it('ignores the factory bot own Slack replies to avoid self-response loops', async () => {
@@ -4800,6 +4900,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackReplyWrites(mount)).toEqual([])
+    expect(slackAnswerInputs(fleet)).toEqual([])
   })
 
   it('does not respond to Slack replies outside the watched factory-e2e issue thread', async () => {
@@ -4867,7 +4968,10 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(slackReplyWrites(mount)).toHaveLength(1)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-27-impl', data: 'Slack reply for AR-27:\nnew status?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it('dedupes duplicate inbound Slack reply delivery by event identity and content', async () => {
@@ -4892,10 +4996,13 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(slackReplyWrites(mount)).toHaveLength(1)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-28-impl', data: 'Slack reply for AR-28:\nstatus?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
-  it('dedupes Slack status responses by human message ts across poll re-reads with fresh event ids', async () => {
+  it('dedupes Slack answer injections by human message ts across poll re-reads with fresh event ids', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(42)]: issueFile(42) })
     const fleet = new FakeFleetClient()
     const slack = new RecordingSlack()
@@ -4929,7 +5036,10 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(slackReplyWrites(mount)).toHaveLength(1)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-42-impl', data: 'Slack reply for AR-42:\nstatus?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it('dispose unsubscribes Slack watchers and clears their polling timers', async () => {
@@ -4980,9 +5090,9 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-29-impl', 'ar-29-review'])
   })
 
-  it('continues processing Slack reply events after one response fails', async () => {
-    const mount = new FailFirstSlackReplyMountClient({ [issuePath(30)]: issueFile(30) })
-    const fleet = new FakeFleetClient()
+  it('continues processing Slack reply events after one answer injection fails', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(30)]: issueFile(30) })
+    const fleet = new FailingSlackAnswerFleetClient()
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -5005,9 +5115,10 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    const replies = slackReplyWrites(mount)
-    expect(replies).toHaveLength(2)
-    expect(replies[1]?.content.text).toContain('AR-30')
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-30-impl', data: 'Slack reply for AR-30:\nstatus again?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it('uses numeric Slack reply event ids without dropping fresh low-seq replies', async () => {
@@ -5052,7 +5163,10 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(slackReplyWrites(mount)).toHaveLength(1)
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-31-impl', data: 'Slack reply for AR-31:\nstatus?\r' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
     expect(warnings.flat()).not.toContain('[factory] Slack reply event missing stable identity; falling back to path/content dedupe')
   })
 })
@@ -5133,6 +5247,9 @@ const slackReplyWrites = (mount: FakeMountClient): Array<{ path: string; content
   mount.writes
     .filter((write) => write.path.includes('/replies/'))
     .map((write) => ({ path: write.path, content: record(write.content) as { text?: string; thread_ts?: string } }))
+
+const slackAnswerInputs = (fleet: FakeFleetClient): Array<{ name: string; data: string }> =>
+  fleet.inputs.filter((input) => input.data !== '\r')
 
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
