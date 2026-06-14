@@ -1,16 +1,21 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
+import { accessSync, constants } from 'node:fs'
+import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
 import type { AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 
+const requireForResolve = createRequire(import.meta.url)
+
 type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: string; sessionRef?: string; pid?: number }
 type HarnessEventListener = (event: BrokerEvent) => void
 type DriverAgentLike = { name: string; sessionId?: string; pid?: number }
 type DriverDeliveryEventLike = BrokerEvent
+type AgentRelayMcpCommand = { command: string; args: string[] }
 
 export interface HarnessDriverClientLike {
   readonly brokerPid?: number
@@ -32,6 +37,7 @@ export interface InternalFleetClientOptions {
   connectionPath?: string
   resumeCapability?: Capability
   logger?: Logger
+  resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
 }
 
 type AgentExitListener = (name: string, reason?: string) => void
@@ -62,6 +68,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #connectionPath?: string
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
+  readonly #resolveAgentRelayMcpCommand: () => AgentRelayMcpCommand | undefined
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #eventUnsubscribers: Array<() => void> = []
@@ -84,13 +91,14 @@ export class InternalFleetClient implements FleetClient {
     this.#connectionPath = options.connectionPath
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger
+    this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
     assertSelfNode(input.node)
 
-    const handle = await this.#client.spawnPty({
+    const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name,
       cli: capabilityCli[input.capability],
       channels: input.channel ? [input.channel] : undefined,
@@ -100,6 +108,7 @@ export class InternalFleetClient implements FleetClient {
       restartPolicy: input.restartPolicy,
       continueFrom: input.sessionRef,
     })
+    const handle = await this.#client.spawnPty(spawnInput)
 
     this.#clearAgentExitLatch(handle.name)
 
@@ -109,17 +118,38 @@ export class InternalFleetClient implements FleetClient {
   async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     assertSelfNode(input.node)
 
-    const handle = await this.#client.spawnPty({
+    const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name ?? input.sessionRef,
       // followups [fleet→W6]: W6 owns resume-vs-respawn and passes the per-agent capability.
       cli: capabilityCli[input.capability ?? this.#resumeCapability],
       cwd: this.#cwd,
       continueFrom: input.sessionRef,
     })
+    const handle = await this.#client.spawnPty(spawnInput)
 
     this.#clearAgentExitLatch(handle.name)
 
     return { ...spawnResultFrom(handle), sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
+  }
+
+  #withAgentRelayMcpHarness(input: SpawnPtyInput): SpawnPtyInput {
+    if (input.harnessConfig || (input.cli !== 'codex' && input.cli !== 'claude')) {
+      return input
+    }
+
+    const command = this.#resolveAgentRelayMcpCommand()
+    if (!command) {
+      this.#logger?.warn?.('[factory-sdk] agent-relay MCP command not found; spawning without MCP injection', {
+        agent: input.name,
+        cli: input.cli,
+      })
+      return input
+    }
+
+    return {
+      ...input,
+      harnessConfig: buildRelayMcpHarnessConfig(input, command),
+    }
   }
 
   async release(name: string, reason?: string): Promise<void> {
@@ -458,6 +488,137 @@ function spawnResultFrom(handle: SpawnedHandleLike, resolvedPid = handle.pid): S
   if (sessionRef) result.sessionRef = sessionRef
   if (typeof resolvedPid === 'number') result.pid = resolvedPid
   return result
+}
+
+function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined {
+  try {
+    const packageJsonPath = requireForResolve.resolve('agent-relay/package.json')
+    const cliPath = join(dirname(packageJsonPath), 'dist', 'cli', 'index.js')
+    accessSync(cliPath, constants.R_OK)
+    return { command: process.execPath, args: [cliPath, 'mcp'] }
+  } catch {
+    return undefined
+  }
+}
+
+function buildRelayMcpHarnessConfig(input: SpawnPtyInput, command: AgentRelayMcpCommand): NonNullable<SpawnPtyInput['harnessConfig']> {
+  const relayEnv = relayMcpEnv(input.name, input.agentToken)
+  return {
+    runtime: 'pty',
+    command: input.cli,
+    args: input.cli === 'claude'
+      ? claudeHarnessArgs(input, command, relayEnv)
+      : codexHarnessArgs(input, command, relayEnv),
+    ...(input.cwd ? { cwd: input.cwd } : {}),
+    env: relayEnv,
+    metadata: {
+      factoryRelayMcp: true,
+      relayMcpCommand: command.command,
+      relayMcpArgs: command.args,
+    },
+  }
+}
+
+function claudeHarnessArgs(input: SpawnPtyInput, command: AgentRelayMcpCommand, relayEnv: Record<string, string>): string[] {
+  return [
+    ...modelArgs(input.model),
+    '--mcp-config',
+    JSON.stringify({
+      mcpServers: {
+        'agent-relay': stdioMcpServer(command, relayEnv),
+      },
+    }),
+    '--strict-mcp-config',
+    ...(input.args ?? []),
+    ...taskArgs(input.task),
+  ]
+}
+
+function codexHarnessArgs(input: SpawnPtyInput, command: AgentRelayMcpCommand, relayEnv: Record<string, string>): string[] {
+  const prefix = 'mcp_servers.agent-relay'
+  return [
+    ...modelArgs(stripProviderPrefix(input.model)),
+    '--config',
+    `${prefix}.command=${tomlString(command.command)}`,
+    '--config',
+    `${prefix}.args=${tomlArray(command.args)}`,
+    '--config',
+    `${prefix}.env=${tomlInlineTable(relayEnv)}`,
+    ...(input.args ?? []),
+    ...taskArgs(input.task),
+  ]
+}
+
+function stdioMcpServer(command: AgentRelayMcpCommand, relayEnv: Record<string, string>): Record<string, unknown> {
+  return {
+    type: 'stdio',
+    command: command.command,
+    args: command.args,
+    env: relayEnv,
+  }
+}
+
+function relayMcpEnv(agentName: string, agentToken?: string): Record<string, string> {
+  const env: Record<string, string> = {
+    RELAY_AGENT_NAME: agentName,
+    RELAY_AGENT_TYPE: 'agent',
+    RELAY_STRICT_AGENT_NAME: '1',
+  }
+  const workspaceKey = nonEmpty(process.env.RELAY_WORKSPACE_KEY) ??
+    nonEmpty(process.env.AGENT_RELAY_WORKSPACE_KEY) ??
+    relayWorkspaceKeyFromApiKey(process.env.RELAY_API_KEY)
+  if (workspaceKey) {
+    env.RELAY_WORKSPACE_KEY = workspaceKey
+    env.RELAY_API_KEY = workspaceKey
+  }
+  const baseUrl = nonEmpty(process.env.RELAY_BASE_URL)
+  if (baseUrl) env.RELAY_BASE_URL = baseUrl
+  const defaultWorkspace = nonEmpty(process.env.RELAY_DEFAULT_WORKSPACE)
+  if (defaultWorkspace) env.RELAY_DEFAULT_WORKSPACE = defaultWorkspace
+  const workspacesJson = nonEmpty(process.env.RELAY_WORKSPACES_JSON)
+  if (workspacesJson) env.RELAY_WORKSPACES_JSON = workspacesJson
+  const relayAgentToken = nonEmpty(agentToken)
+  if (relayAgentToken) env.RELAY_AGENT_TOKEN = relayAgentToken
+  return env
+}
+
+function modelArgs(model: string | undefined): string[] {
+  return model ? ['--model', model] : []
+}
+
+function taskArgs(task: string | undefined): string[] {
+  return task ? [task] : []
+}
+
+function stripProviderPrefix(model: string | undefined): string | undefined {
+  if (!model) return undefined
+  const idx = model.indexOf('/')
+  return idx >= 0 ? model.slice(idx + 1) : model
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+function tomlArray(values: string[]): string {
+  return `[${values.map(tomlString).join(', ')}]`
+}
+
+function tomlInlineTable(values: Record<string, string>): string {
+  return `{ ${Object.entries(values)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${tomlString(key)} = ${tomlString(value)}`)
+    .join(', ')} }`
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed || undefined
+}
+
+function relayWorkspaceKeyFromApiKey(value: string | undefined): string | undefined {
+  const trimmed = nonEmpty(value)
+  return trimmed?.startsWith('rk_live_') ? trimmed : undefined
 }
 
 function messageInputFrom(input: SendInput): SendMessageInput {

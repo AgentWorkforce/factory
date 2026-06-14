@@ -104,7 +104,11 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
 describe('InternalFleetClient', () => {
   it('maps spawn input to harness spawnPty and returns the broker session ref', async () => {
     const harness = new FakeHarnessDriverClient()
-    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      resolveAgentRelayMcpCommand: () => ({ command: '/usr/local/bin/node', args: ['/repo/node_modules/agent-relay/dist/cli/index.js', 'mcp'] }),
+    })
 
     await expect(
       fleet.spawn({
@@ -129,8 +133,128 @@ describe('InternalFleetClient', () => {
         cwd: '/worktree',
         restartPolicy: { max_restarts: 2 },
         continueFrom: 'previous-session',
+        harnessConfig: expect.objectContaining({
+          runtime: 'pty',
+          command: 'codex',
+          cwd: '/worktree',
+          env: expect.objectContaining({
+            RELAY_AGENT_NAME: 'ar-1-impl',
+            RELAY_AGENT_TYPE: 'agent',
+            RELAY_STRICT_AGENT_NAME: '1',
+          }),
+          metadata: expect.objectContaining({
+            factoryRelayMcp: true,
+            relayMcpCommand: '/usr/local/bin/node',
+            relayMcpArgs: ['/repo/node_modules/agent-relay/dist/cli/index.js', 'mcp'],
+          }),
+        }),
       },
     ])
+    const config = harness.spawned[0]?.harnessConfig
+    expect(config?.runtime).toBe('pty')
+    if (config?.runtime !== 'pty') throw new Error('expected pty harness config')
+    expect(config.args).toEqual(expect.arrayContaining([
+      '--model',
+      'gpt-5',
+      '--config',
+      'mcp_servers.agent-relay.command="/usr/local/bin/node"',
+      'mcp_servers.agent-relay.args=["/repo/node_modules/agent-relay/dist/cli/index.js", "mcp"]',
+      'do work',
+    ]))
+    expect(config.args.join('\n')).toContain('"RELAY_AGENT_NAME" = "ar-1-impl"')
+  })
+
+  it('injects agent-relay MCP config for Claude factory spawns', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      resolveAgentRelayMcpCommand: () => ({ command: '/usr/local/bin/node', args: ['/repo/node_modules/agent-relay/dist/cli/index.js', 'mcp'] }),
+    })
+
+    await fleet.spawn({
+      name: 'ar-1-review',
+      capability: 'spawn:claude',
+      model: 'anthropic/claude-3-5-sonnet',
+      task: 'review it',
+    })
+
+    const config = harness.spawned[0]?.harnessConfig
+    expect(config?.runtime).toBe('pty')
+    if (config?.runtime !== 'pty') throw new Error('expected pty harness config')
+    expect(config.command).toBe('claude')
+    expect(config.args).toEqual(expect.arrayContaining([
+      '--model',
+      'anthropic/claude-3-5-sonnet',
+      '--mcp-config',
+      '--strict-mcp-config',
+      'review it',
+    ]))
+    const mcpConfigIndex = config.args.indexOf('--mcp-config')
+    const payload = JSON.parse(config.args[mcpConfigIndex + 1]) as {
+      mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>
+    }
+    expect(payload.mcpServers['agent-relay']).toMatchObject({
+      type: 'stdio',
+      command: '/usr/local/bin/node',
+      args: ['/repo/node_modules/agent-relay/dist/cli/index.js', 'mcp'],
+      env: {
+        RELAY_AGENT_NAME: 'ar-1-review',
+        RELAY_AGENT_TYPE: 'agent',
+        RELAY_STRICT_AGENT_NAME: '1',
+      },
+    })
+  })
+
+  it('falls back to ordinary spawn when agent-relay MCP cannot be resolved', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const logger = { warn: vi.fn() }
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      logger,
+      resolveAgentRelayMcpCommand: () => undefined,
+    })
+
+    await fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      task: 'do work',
+    })
+
+    expect(harness.spawned[0]).toEqual({
+      name: 'ar-1-impl',
+      cli: 'codex',
+      channels: undefined,
+      task: 'do work',
+      model: undefined,
+      cwd: '/worktree',
+      restartPolicy: undefined,
+      continueFrom: undefined,
+    })
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[factory-sdk] agent-relay MCP command not found; spawning without MCP injection',
+      { agent: 'ar-1-impl', cli: 'codex' },
+    )
+  })
+
+  it('resolves the default agent-relay CLI mcp command from node_modules', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+
+    await fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      task: 'do work',
+    })
+
+    const config = harness.spawned[0]!.harnessConfig
+    expect(config?.runtime).toBe('pty')
+    if (config?.runtime !== 'pty') throw new Error('expected pty harness config')
+    const args = config.args
+    expect(args).toContain(`mcp_servers.agent-relay.command=${JSON.stringify(process.execPath)}`)
+    expect(args.join('\n')).toContain('node_modules/agent-relay/dist/cli/index.js')
+    expect(args.join('\n')).toContain('"mcp"')
   })
 
   it('resolves an agent PID from the broker roster', async () => {
