@@ -40,6 +40,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.stateIds).toEqual(LINEAR_STATE_IDS)
     expect(parsed.safety).toEqual({
       requireTitlePrefix: '[factory-e2e]',
+      requireLabel: 'factory',
       requireTeamKey: 'AR',
     })
     expect(parsed.dryRun).toBe(false)

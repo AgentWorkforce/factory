@@ -30,8 +30,9 @@ const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 
-type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop'> & {
+type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop' | 'safety'> & {
   loop?: Partial<FactoryConfig['loop']>
+  safety?: Partial<FactoryConfig['safety']>
 }
 
 const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => FactoryConfigSchema.parse({
@@ -1343,6 +1344,38 @@ describe('FactoryLoop', () => {
     )).toBe(true)
   })
 
+  it('accepts Linear issues by configured title prefix or factory label while still requiring the team', async () => {
+    const safety = { requireTitlePrefix: '[factory]', requireLabel: 'factory', requireTeamKey: 'AR' }
+    const issue = (
+      title: string,
+      labels: unknown[],
+      teamKey = 'AR',
+    ) => ({
+      title,
+      labels: labels.filter((label): label is string => typeof label === 'string'),
+      team: teamKey,
+      raw: { payload: { title, labels, team: { key: teamKey } } },
+    })
+
+    expect(isInFactoryScope(issue('Implement label-only scope', [{ name: 'Factory' }]), safety)).toBe(true)
+    expect(isInFactoryScope(issue('[factory] Implement title-only scope', []), safety)).toBe(true)
+    expect(isInFactoryScope(issue('[factory] Implement both scope paths', ['factory']), safety)).toBe(true)
+    expect(isInFactoryScope(issue('Implement neither scope path', [{ name: 'pear' }]), safety)).toBe(false)
+    expect(isInFactoryScope(issue('Implement wrong team label-only scope', ['factory'], 'OTHER'), safety)).toBe(false)
+  })
+
+  it('disables the Linear label scope path when requireLabel is empty', async () => {
+    expect(isInFactoryScope(
+      {
+        title: 'Implement label-only scope',
+        labels: ['factory'],
+        team: 'AR',
+        raw: { payload: { title: 'Implement label-only scope', labels: [{ name: 'factory' }], team: { key: 'AR' } } },
+      },
+      { requireTitlePrefix: '[factory]', requireLabel: '', requireTeamKey: 'AR' },
+    )).toBe(false)
+  })
+
   it('uses canonical issue state during startup backfill when a ready alias is stale', async () => {
     const mount = new FakeMountClient({
       [issuePath(69)]: realIssueFile(69, done),
@@ -2474,6 +2507,28 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('dispatches ready Linear issues selected by the factory label without a title prefix', async () => {
+    const path = issuePath(260)
+    const mount = new FakeMountClient({
+      [path]: realIssueFile(260, ready, {
+        title: 'Accept factory label as scope marker',
+        labels: [{ name: 'factory' }],
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const triage = new CountingTriage()
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), { mount, fleet, triage })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-260'])
+    expect(report.skipped).toEqual([])
+    expect(triage.count).toBe(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-260-impl', 'ar-260-review'])
+  })
+
   it('skips factory-marked draft issues that are not reconciled provider records', async () => {
     const draftPath = '/linear/issues/AR-E2ECANARY.json'
     const mount = new FakeMountClient({
@@ -2501,6 +2556,39 @@ describe('FactoryLoop', () => {
     expect(triage.count).toBe(0)
     expect(fleet.spawns).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('does not dispatch label-only factory draft issues that are not reconciled provider records', async () => {
+    const draftPath = issuePath(261)
+    const mount = new FakeMountClient({
+      [draftPath]: {
+        provider: 'linear',
+        objectType: 'issue',
+        objectId: 'uuid-261',
+        payload: {
+          ...issuePayload(261),
+          title: 'Label-only draft should not dispatch',
+          labels: [{ name: 'factory' }],
+          url: undefined,
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const triage = new CountingTriage()
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), { mount, fleet, triage })
+
+    const report = await factory.runOnce()
+
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: 'uuid-261', key: 'AR-261', path: draftPath },
+      reason: 'not reconciled real Linear issue',
+    })
+    expect(report.triaged).toEqual([])
+    expect(report.dispatched).toEqual([])
+    expect(triage.count).toBe(0)
+    expect(fleet.spawns).toEqual([])
   })
 
   it('refuses explicit dispatch for factory-marked issues without a provider URL', async () => {
@@ -2543,6 +2631,27 @@ describe('FactoryLoop', () => {
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-27'])
     expect(report.skipped).toEqual([])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-27-impl', 'ar-27-review'])
+  })
+
+  it('dispatches ready AR issues scoped only by the factory label', async () => {
+    const path = issuePath(28)
+    const labelOnlyIssue = {
+      ...issueFile(28),
+      payload: {
+        ...issuePayload(28),
+        title: 'Label-scoped factory issue',
+        labels: [{ name: 'factory' }],
+      },
+    }
+    const mount = new FakeMountClient({ [path]: labelOnlyIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-28'])
+    expect(report.skipped).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-28-impl', 'ar-28-review'])
   })
 
   it('refuses explicit dispatch for issues outside factory-e2e scope before spawning', async () => {
@@ -3968,6 +4077,48 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('does not treat a factory label as a synthetic probe marker', async () => {
+    const labelOnlyIssue = realIssueFile(19, ready, {
+      title: 'Label-scoped probe-shaped issue',
+      labels: [{ name: 'factory' }],
+    })
+    const mount = new FakeMountClient({
+      [issuePath(19)]: labelOnlyIssue,
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/19.json': {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '19',
+        payload: {
+          number: 19,
+          title: '[factory-e2e] AR-19 probe',
+          body: 'Synthetic probe for AR-19',
+          head_ref: 'factory-e2e/ar-19-probe',
+        },
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probeCloser: async (input) => {
+        closeInputs.push(input)
+        return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(19), labelOnlyIssue)))
+    fleet.emitAgentExit('ar-19-impl', 'issue-done')
+    await flush()
+
+    expect(closeInputs).toEqual([])
+    expect(fleet.releases).toEqual([
+      { name: 'ar-19-impl', reason: 'issue-done' },
+      { name: 'ar-19-review', reason: 'issue-done' },
+    ])
+  })
+
   it('completion releases and terminates tracked pair process trees', async () => {
     const mount = new FakeMountClient({ [issuePath(64)]: issueFile(64) })
     const fleet = new CapturedPidFleetClient([
@@ -4768,9 +4919,13 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('does not close PRs for non-synthetic issues', async () => {
+  it('does not close PRs for label-only non-synthetic issues', async () => {
+    const issue = realIssueFile(230, ready, {
+      title: 'Real product fix',
+      labels: [{ name: 'factory' }],
+    })
     const mount = new FakeMountClient({
-      [issuePath(230)]: realMergeIssueFile(230),
+      [issuePath(230)]: issue,
       '/github/repos/AgentWorkforce__pear/pulls/by-id/230.json': {
         provider: 'github',
         objectType: 'pull_request',
@@ -4786,7 +4941,7 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     const closeInputs: unknown[] = []
     const factory = createFactory(config({
-      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
     }), {
       mount,
       fleet,
@@ -4797,7 +4952,7 @@ describe('FactoryLoop', () => {
       },
     })
 
-    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(230), realMergeIssueFile(230))))
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(230), issue)))
     fleet.emitAgentExit('ar-230-impl', 'issue-done')
     await flush()
 

@@ -18,6 +18,7 @@ export interface MountLinearWritebackConfig {
   stateIds?: LinearStateIds
   safety?: {
     requireTitlePrefix?: string
+    requireLabel?: string
     requireTeamKey?: string
   }
   logger?: Pick<Logger, 'warn'>
@@ -51,12 +52,15 @@ const safetyFromConfig = (configOrStateIds?: LinearStateIds | MountLinearWriteba
       requireTitlePrefix: typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
         ? safety.requireTitlePrefix
         : '[factory-e2e]',
+      requireLabel: typeof safety.requireLabel === 'string'
+        ? safety.requireLabel
+        : 'factory',
       requireTeamKey: typeof safety.requireTeamKey === 'string' && safety.requireTeamKey
         ? safety.requireTeamKey
         : 'AR',
     }
   }
-  return { requireTitlePrefix: '[factory-e2e]', requireTeamKey: 'AR' }
+  return { requireTitlePrefix: '[factory-e2e]', requireLabel: 'factory', requireTeamKey: 'AR' }
 }
 
 const payloadInFactoryScope = (

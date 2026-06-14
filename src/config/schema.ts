@@ -55,6 +55,7 @@ export const FactoryConfigSchema = z.object({
   }).default(LINEAR_STATE_IDS),
   safety: z.object({
     requireTitlePrefix: z.string().min(1).default('[factory-e2e]'),
+    requireLabel: z.string().default('factory'),
     requireTeamKey: z.string().min(1).default('AR'),
   }).default({}),
   dryRun: z.boolean().default(false),
