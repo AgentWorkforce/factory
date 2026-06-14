@@ -1,7 +1,9 @@
-import { chmod, mkdir, readFile as readLocalFile, rename, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-
+import {
+  CloudAuthError,
+  ensureCloudSession,
+  type CloudSession,
+  type CloudSessionOptions,
+} from '@agent-relay/cloud'
 import {
   RelayfileSetup,
   type ChangeEvent,
@@ -10,7 +12,6 @@ import {
   type FileReadResponse,
   type GetEventsOptions,
   type ListTreeOptions,
-  type RelayfileCloudTokenSet,
   type ResourceAtEventResult,
   type OperationStatusResponse,
   type Subscription,
@@ -28,22 +29,40 @@ import {
 } from '../subscriptions'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
-// Canonical credential store written by the unified `agent-relay login`
-// (relay#1118 / cloud#2108 auth unification — "one canonical session, one
-// credential store"). Read this first.
-const CANONICAL_CREDS_PATH = join(homedir(), '.agentworkforce', 'relay', 'cloud-auth.json')
-// Legacy store. Kept only as a fallback for environments not yet migrated; the
-// unified login no longer maintains it, so reading it alone goes stale.
-const LEGACY_CREDS_PATH = join(homedir(), '.relayfile', 'cloud-credentials.json')
-const DEFAULT_CREDS_PATHS = [CANONICAL_CREDS_PATH, LEGACY_CREDS_PATH] as const
 const DEFAULT_AGENT_NAME = 'pear-factory-sdk'
-const READ_WRITE_SCOPES = ['relayfile:fs:read:/**', 'relayfile:fs:write:/**']
+export const FACTORY_RELAYFILE_SCOPES = [
+  'relayfile:fs:read:/linear/issues/**',
+  'relayfile:fs:write:/linear/issues/**',
+  'relayfile:fs:read:/github/repos/**',
+  'relayfile:fs:read:/slack/channels/**',
+  'relayfile:fs:write:/slack/channels/**',
+] as const
+
+export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
+
+export interface RelayfileWorkspaceHandleLike {
+  info: { relayfileUrl: string }
+  client(): RelayFileClientLike
+  getToken(): Promise<string> | string
+}
+
+export type RelayfileSetupFactory = (options: {
+  cloudApiUrl: string
+  tokenProvider: () => Promise<string>
+}) => {
+  joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
+}
 
 export interface RelayfileCloudMountClientConfig {
   backend?: 'relayfile-cloud'
   workspaceId?: string
-  credsPath?: string
+  cloudApiUrl?: string
+  cloudSessionProvider?: CloudSessionProvider
+  cloudSessionRefreshTimeoutMs?: number
+  cloudSessionEnv?: NodeJS.ProcessEnv
+  relayfileSetupFactory?: RelayfileSetupFactory
   agentName?: string
+  scopes?: string[]
   client?: RelayFileClientLike
   tokenProvider?: TokenProvider
   baseUrl?: string
@@ -101,24 +120,20 @@ export class RelayfileCloudMountClient implements MountClient {
 
   static async fromConfig(config: RelayfileCloudMountClientConfig = {}): Promise<RelayfileCloudMountClient> {
     if (config.client) return new RelayfileCloudMountClient(config)
+    if ('credsPath' in config) {
+      throw new Error('RelayfileCloudMountClient no longer accepts credsPath; run `agent-relay login` to use the shared cloud session')
+    }
 
     const workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
-    const { credentials, path: credsPath } = await resolveCloudCredentials(config.credsPath)
-    const setup = RelayfileSetup.fromCloudTokens(credentials, {
-      // The SDK rotates refresh tokens on every refresh and fires onTokens with
-      // the replacement. Persist it back to the store we read from, so the next
-      // cold start (daemon restart, reaper, another consumer) reads a live token
-      // instead of the rotated-out one. Best-effort: a failed write must never
-      // break an in-flight refresh.
-      onTokens: (next) => {
-        void persistCloudCredentials(credsPath, next).catch((error) => {
-          console.warn(`[factory] failed to persist rotated relayfile cloud tokens to ${credsPath}:`, error instanceof Error ? error.message : String(error))
-        })
-      },
+    const sharedSession = createSharedCloudSessionResolver(config)
+    const initialSession = await sharedSession.resolve()
+    const setup = (config.relayfileSetupFactory ?? createDefaultRelayfileSetup)({
+      cloudApiUrl: initialSession.auth.apiUrl,
+      tokenProvider: sharedSession.getAccessToken,
     })
     const handle = await setup.joinWorkspace(workspaceId, {
       agentName: config.agentName ?? DEFAULT_AGENT_NAME,
-      scopes: READ_WRITE_SCOPES,
+      scopes: config.scopes ?? [...FACTORY_RELAYFILE_SCOPES],
     })
 
     return new RelayfileCloudMountClient({
@@ -289,74 +304,47 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 }
 
-const parseCloudCredentials = (raw: string): RelayfileCloudTokenSet => {
-  const parsed = JSON.parse(raw) as Partial<RelayfileCloudTokenSet>
-  if (!parsed.apiUrl || !parsed.accessToken || !parsed.refreshToken) {
-    throw new Error('Relayfile cloud credentials are missing apiUrl, accessToken, or refreshToken')
-  }
-  return parsed as RelayfileCloudTokenSet
-}
+const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, tokenProvider }) =>
+  new RelayfileSetup({
+    cloudApiUrl,
+    accessToken: tokenProvider,
+  })
 
-/** Filesystem seam so credential resolution + persistence are unit-testable. */
-export interface CredsFileIo {
-  readFile: (path: string, encoding: 'utf8') => Promise<string>
-  writeFile: (path: string, data: string, options: { mode: number }) => Promise<void>
-  rename: (from: string, to: string) => Promise<void>
-  chmod: (path: string, mode: number) => Promise<void>
-  mkdir: (path: string, options: { recursive: true }) => Promise<unknown>
-}
+const createSharedCloudSessionResolver = (config: RelayfileCloudMountClientConfig): {
+  resolve: () => Promise<CloudSession>
+  getAccessToken: () => Promise<string>
+} => {
+  const provider = config.cloudSessionProvider ?? ensureCloudSession
+  let session: CloudSession | undefined
+  let inFlight: Promise<CloudSession> | undefined
 
-const defaultCredsFileIo: CredsFileIo = { readFile: readLocalFile, writeFile, rename, chmod, mkdir }
+  const resolve = async (): Promise<CloudSession> => {
+    if (!inFlight) {
+      const options: CloudSessionOptions = {
+        interactive: false,
+      }
+      const apiUrl = session?.auth.apiUrl ?? config.cloudApiUrl
+      if (apiUrl) options.apiUrl = apiUrl
+      if (config.cloudSessionRefreshTimeoutMs !== undefined) options.refreshTimeoutMs = config.cloudSessionRefreshTimeoutMs
+      if (config.cloudSessionEnv !== undefined) options.env = config.cloudSessionEnv
 
-export interface ResolvedCloudCredentials {
-  credentials: RelayfileCloudTokenSet
-  /** The path the credentials were read from; rotations are persisted back here. */
-  path: string
-}
-
-/**
- * Resolve relayfile cloud credentials, preferring the canonical store the
- * unified `agent-relay login` maintains and falling back to the legacy path.
- * Completes the relay#1118 consumer migration: the login was unified onto
- * ~/.agentworkforce/relay/cloud-auth.json, but this consumer still read the
- * orphaned ~/.relayfile/cloud-credentials.json, which rots once the shared
- * session rotates the refresh token.
- */
-export async function resolveCloudCredentials(
-  explicitPath?: string,
-  io: Pick<CredsFileIo, 'readFile'> = defaultCredsFileIo,
-): Promise<ResolvedCloudCredentials> {
-  const candidates = explicitPath ? [explicitPath] : [...DEFAULT_CREDS_PATHS]
-  let lastError: unknown
-  for (const path of candidates) {
-    try {
-      return { credentials: parseCloudCredentials(await io.readFile(path, 'utf8')), path }
-    } catch (error) {
-      lastError = error
+      inFlight = provider(options).catch((error) => {
+        if (error instanceof CloudAuthError && error.code === 'AUTH_BROWSER_REQUIRED') {
+          throw new Error('Relayfile cloud session required; run `agent-relay login`')
+        }
+        throw error
+      }).finally(() => {
+        inFlight = undefined
+      })
     }
+    session = await inFlight
+    return session
   }
-  const cause = lastError instanceof Error ? lastError.message : String(lastError)
-  throw new Error(
-    `Relayfile cloud credentials not found or invalid — run \`agent-relay login\` (looked in: ${candidates.join(', ')}). Last error: ${cause}`,
-  )
-}
 
-/**
- * Atomically persist rotated cloud tokens back to `path` (write a sibling temp
- * file, fsync-free rename over the target). The rename is atomic on POSIX, so a
- * concurrent reader never sees a torn file. The temp name is pid-scoped so the
- * live daemon and the external reaper don't collide on the staging file.
- */
-export async function persistCloudCredentials(
-  path: string,
-  tokens: RelayfileCloudTokenSet,
-  io: CredsFileIo = defaultCredsFileIo,
-): Promise<void> {
-  await io.mkdir(dirname(path), { recursive: true })
-  const tmp = `${path}.${process.pid}.tmp`
-  await io.writeFile(tmp, `${JSON.stringify(tokens, null, 2)}\n`, { mode: 0o600 })
-  await io.chmod(tmp, 0o600)
-  await io.rename(tmp, path)
+  return {
+    resolve,
+    getAccessToken: async () => (await resolve()).auth.accessToken,
+  }
 }
 
 const parseRemoteContent = (response: FileReadResponse): unknown => {

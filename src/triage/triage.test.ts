@@ -97,6 +97,43 @@ describe('HeuristicTriage routing', () => {
     expect(decision.implementers).toHaveLength(2)
     expect(decision.implementers.map((agent) => agent.name)).toEqual(['ar-123-impl-pear', 'ar-123-impl-agents'])
   })
+
+  it('fans out to one implementer per route when triage.maxImplementers is raised', async () => {
+    const config = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      triage: { maxImplementers: 3 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          agents: 'AgentWorkforce/agents',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/agents': '/work/agents',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+      },
+      models: { implementer: 'codex-test', reviewer: 'claude-test' },
+    })
+
+    const decision = await new HeuristicTriage().triage(issue({
+      labels: ['pear', 'agents', 'cloud'],
+      description: richDescription('Update renderer, broker, and cloud surfaces with tests in src/main/broker.ts.'),
+    }), { ...ctx, config })
+
+    expect(decision.routes.map((route) => route.repo)).toEqual([
+      'AgentWorkforce/pear',
+      'AgentWorkforce/agents',
+      'AgentWorkforce/cloud',
+    ])
+    expect(decision.implementers).toHaveLength(3)
+    expect(decision.implementers.map((agent) => agent.name)).toEqual([
+      'ar-123-impl-pear',
+      'ar-123-impl-agents',
+      'ar-123-impl-cloud',
+    ])
+  })
 })
 
 describe('HeuristicTriage thin and scope detection', () => {

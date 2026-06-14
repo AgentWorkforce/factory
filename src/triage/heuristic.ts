@@ -6,7 +6,7 @@ type RouteSource = RepoMapEntry['source']
 type Route = TriageDecision['routes'][number]
 
 const DEFAULT_THIN_DESCRIPTION_LENGTH = 140
-const MAX_IMPLEMENTERS = 2
+const DEFAULT_MAX_IMPLEMENTERS = 2
 
 const SURFACE_BUCKETS: Array<{ name: string; patterns: RegExp[] }> = [
   { name: 'ui', patterns: [/\bui\b/i, /\brenderer\b/i, /\bfrontend\b/i, /\breact\b/i, /\bxterm\b/i] },
@@ -69,12 +69,13 @@ export function buildDecision(input: {
   scopeSlugs?: string[]
 }): TriageDecision {
   const issueRef = issueRefFor(input.issue)
-  const routes = dedupeRoutes(input.routes).slice(0, MAX_IMPLEMENTERS)
+  const maxImplementers = input.config.triage?.maxImplementers ?? DEFAULT_MAX_IMPLEMENTERS
+  const routes = dedupeRoutes(input.routes).slice(0, maxImplementers)
   const scope = routes.length >= 2 || input.scope === 'team' ? 'team' : 'single'
   const slugs = input.scopeSlugs ?? routes.map((route) => slugFromRepo(route.repo))
   const implementerAssignments = input.confidence === 'low' && routes.length === 0
     ? []
-    : implementationAssignments(routes, scope, slugs)
+    : implementationAssignments(routes, scope, slugs, maxImplementers)
   const implementers = implementerAssignments.map(({ route, slug }) => implementerSpec({
     issue: input.issue,
     config: input.config,
@@ -222,6 +223,7 @@ function implementationAssignments(
   routes: Route[],
   scope: 'single' | 'team',
   slugs: string[],
+  maxImplementers: number,
 ): Array<{ route: Route; slug: string }> {
   if (scope === 'single') {
     const route = routes[0]
@@ -229,7 +231,7 @@ function implementationAssignments(
   }
 
   if (routes.length >= 2) {
-    return routes.slice(0, MAX_IMPLEMENTERS).map((route, index) => ({
+    return routes.slice(0, maxImplementers).map((route, index) => ({
       route,
       slug: slugs[index] ?? slugFromRepo(route.repo),
     }))
@@ -241,7 +243,7 @@ function implementationAssignments(
   }
 
   const teamSlugs = slugs.length >= 2 ? slugs : [slugFromRepo(route.repo), 'scope']
-  return teamSlugs.slice(0, MAX_IMPLEMENTERS).map((slug) => ({ route, slug }))
+  return teamSlugs.slice(0, maxImplementers).map((slug) => ({ route, slug }))
 }
 
 function hasAcceptanceSignal(issue: LinearIssue): boolean {

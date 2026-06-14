@@ -27,6 +27,9 @@ export const FactoryConfigSchema = z.object({
     registryPath: z.string().min(1).default('/tmp/factory-run/factory-loop-registry.json'),
     heartbeatStaleMs: z.number().int().min(1_000).default(60_000),
   }).default({}),
+  triage: z.object({
+    maxImplementers: z.number().int().min(1).max(6).default(2),
+  }).default({}),
   repos: z.object({
     byLabel: z.record(z.string(), z.string()),
     byProject: z.record(z.string(), z.string()).default({}),

@@ -1,20 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import type { ChangeEvent, OperationStatusResponse, RelayfileCloudTokenSet } from '@relayfile/sdk'
+import { CloudAuthError, type CloudSession, type StoredAuth } from '@agent-relay/cloud'
+import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
 
 import {
+  FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
-  resolveCloudCredentials,
-  persistCloudCredentials,
-  type CredsFileIo,
+  type CloudSessionProvider,
+  type RelayfileSetupFactory,
+  type RelayfileCloudMountClientConfig,
   type RelayFileClientLike,
 } from './relayfile-cloud-mount-client'
 
-const CANONICAL = join(homedir(), '.agentworkforce', 'relay', 'cloud-auth.json')
-const LEGACY = join(homedir(), '.relayfile', 'cloud-credentials.json')
-
-const tokenSet = (overrides: Partial<RelayfileCloudTokenSet> = {}): RelayfileCloudTokenSet => ({
+const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
   accessToken: 'cld_at_aaa',
   refreshToken: 'cld_rt_aaa',
@@ -22,114 +19,9 @@ const tokenSet = (overrides: Partial<RelayfileCloudTokenSet> = {}): RelayfileClo
   ...overrides,
 })
 
-/** In-memory CredsFileIo so resolution + persistence are tested without touching the real FS. */
-const fakeCredsIo = (files: Record<string, string> = {}) => {
-  const store = new Map(Object.entries(files))
-  const calls: Array<{ op: string; args: unknown[] }> = []
-  const io: CredsFileIo = {
-    readFile: async (path) => {
-      calls.push({ op: 'readFile', args: [path] })
-      const value = store.get(path)
-      if (value === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
-      return value
-    },
-    writeFile: async (path, data) => {
-      calls.push({ op: 'writeFile', args: [path, data] })
-      store.set(path, data)
-    },
-    rename: async (from, to) => {
-      calls.push({ op: 'rename', args: [from, to] })
-      const value = store.get(from)
-      if (value === undefined) throw new Error(`rename source missing: ${from}`)
-      store.set(to, value)
-      store.delete(from)
-    },
-    chmod: async (path, mode) => {
-      calls.push({ op: 'chmod', args: [path, mode] })
-    },
-    mkdir: async (path) => {
-      calls.push({ op: 'mkdir', args: [path] })
-      return undefined
-    },
-  }
-  return { io, store, calls }
-}
-
-describe('resolveCloudCredentials', () => {
-  it('prefers the canonical agent-relay store over the legacy relayfile path', async () => {
-    const { io } = fakeCredsIo({
-      [CANONICAL]: JSON.stringify(tokenSet({ accessToken: 'cld_at_canonical' })),
-      [LEGACY]: JSON.stringify(tokenSet({ accessToken: 'cld_at_legacy' })),
-    })
-
-    const resolved = await resolveCloudCredentials(undefined, io)
-
-    expect(resolved.path).toBe(CANONICAL)
-    expect(resolved.credentials.accessToken).toBe('cld_at_canonical')
-  })
-
-  it('falls back to the legacy path when the canonical store is absent', async () => {
-    const { io } = fakeCredsIo({
-      [LEGACY]: JSON.stringify(tokenSet({ accessToken: 'cld_at_legacy' })),
-    })
-
-    const resolved = await resolveCloudCredentials(undefined, io)
-
-    expect(resolved.path).toBe(LEGACY)
-    expect(resolved.credentials.accessToken).toBe('cld_at_legacy')
-  })
-
-  it('uses only the explicit path when one is given', async () => {
-    const explicit = '/tmp/custom-creds.json'
-    const { io } = fakeCredsIo({
-      [explicit]: JSON.stringify(tokenSet({ accessToken: 'cld_at_explicit' })),
-      [CANONICAL]: JSON.stringify(tokenSet({ accessToken: 'cld_at_canonical' })),
-    })
-
-    const resolved = await resolveCloudCredentials(explicit, io)
-
-    expect(resolved.path).toBe(explicit)
-    expect(resolved.credentials.accessToken).toBe('cld_at_explicit')
-  })
-
-  it('throws an actionable error naming `agent-relay login` when nothing is found', async () => {
-    const { io } = fakeCredsIo({})
-
-    await expect(resolveCloudCredentials(undefined, io)).rejects.toThrow(/agent-relay login/)
-  })
-})
-
-describe('persistCloudCredentials', () => {
-  it('writes atomically via a pid-scoped temp file then renames over the target', async () => {
-    const { io, store, calls } = fakeCredsIo({})
-    const rotated = tokenSet({ accessToken: 'cld_at_rotated', refreshToken: 'cld_rt_rotated' })
-
-    await persistCloudCredentials(CANONICAL, rotated, io)
-
-    // Never wrote the target path directly — only the temp, then rename.
-    const tmp = `${CANONICAL}.${process.pid}.tmp`
-    const writeTargets = calls.filter((c) => c.op === 'writeFile').map((c) => c.args[0])
-    expect(writeTargets).toEqual([tmp])
-    expect(calls.some((c) => c.op === 'rename' && c.args[0] === tmp && c.args[1] === CANONICAL)).toBe(true)
-    expect(calls.some((c) => c.op === 'chmod' && c.args[0] === tmp && c.args[1] === 0o600)).toBe(true)
-
-    // Final file holds the rotated tokens.
-    expect(JSON.parse(store.get(CANONICAL) as string)).toMatchObject({
-      accessToken: 'cld_at_rotated',
-      refreshToken: 'cld_rt_rotated',
-    })
-  })
-
-  it('round-trips: a rotated token persisted back is what the next resolve reads', async () => {
-    const { io } = fakeCredsIo({
-      [CANONICAL]: JSON.stringify(tokenSet({ refreshToken: 'cld_rt_old' })),
-    })
-
-    await persistCloudCredentials(CANONICAL, tokenSet({ refreshToken: 'cld_rt_new' }), io)
-    const resolved = await resolveCloudCredentials(undefined, io)
-
-    expect(resolved.credentials.refreshToken).toBe('cld_rt_new')
-  })
+const cloudSession = (auth: StoredAuth): CloudSession => ({
+  auth,
+  client: {} as CloudSession['client'],
 })
 
 class FakeRelayFileClient implements RelayFileClientLike {
@@ -267,6 +159,135 @@ class FakeRelayFileClient implements RelayFileClientLike {
 }
 
 describe('RelayfileCloudMountClient', () => {
+  it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {
+    const fake = new FakeRelayFileClient()
+    const auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })
+    const handle = {
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const setup = {
+      joinWorkspace: vi.fn(async () => handle),
+    }
+    const cloudSessionProvider = vi.fn(async () => cloudSession(auth))
+    let capturedTokenProvider: (() => Promise<string>) | undefined
+    const relayfileSetupFactory: RelayfileSetupFactory = vi.fn(({ tokenProvider }) => {
+      capturedTokenProvider = tokenProvider
+      return setup
+    })
+
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      agentName: 'factory-agent',
+      cloudSessionProvider,
+      relayfileSetupFactory,
+    })
+
+    expect(mount.workspaceId).toBe('rw_test')
+    expect(cloudSessionProvider).toHaveBeenCalledWith(expect.objectContaining({ interactive: false }))
+    expect(relayfileSetupFactory).toHaveBeenCalledWith({
+      cloudApiUrl: 'https://cloud.example',
+      tokenProvider: expect.any(Function),
+    })
+    expect(setup.joinWorkspace).toHaveBeenCalledWith('rw_test', {
+      agentName: 'factory-agent',
+      scopes: [...FACTORY_RELAYFILE_SCOPES],
+    })
+    const joinCalls = setup.joinWorkspace.mock.calls as unknown as Array<[string, { scopes: string[] }]>
+    expect(joinCalls[0]).toBeDefined()
+    const joinOptions = joinCalls[0][1]
+    expect(joinOptions.scopes).not.toContain('relayfile:fs:read:/**')
+    expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
+    expect(capturedTokenProvider).toBeDefined()
+    await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_shared')
+  })
+
+  it('uses the shared cloud session provider for refreshed relayfile workspace token mints', async () => {
+    let auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })
+    const setup = {
+      joinWorkspace: vi.fn(async () => ({
+        client: () => new FakeRelayFileClient(),
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      })),
+    }
+    const cloudSessionProvider = vi.fn(async () => cloudSession(auth))
+    let capturedTokenProvider: (() => Promise<string>) | undefined
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => {
+      capturedTokenProvider = tokenProvider
+      return setup
+    }
+
+    await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider,
+      relayfileSetupFactory,
+    })
+    auth = storedAuth({
+      accessToken: 'cld_at_rotated',
+      refreshToken: 'cld_rt_rotated',
+    })
+
+    expect(capturedTokenProvider).toBeDefined()
+    await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_rotated')
+    expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
+  })
+
+  it('coalesces concurrent shared session resolutions for relayfile token refresh', async () => {
+    const setup = {
+      joinWorkspace: vi.fn(async () => ({
+        client: () => new FakeRelayFileClient(),
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      })),
+    }
+    const cloudSessionProvider = vi.fn<CloudSessionProvider>()
+    cloudSessionProvider.mockResolvedValueOnce(cloudSession(storedAuth({ accessToken: 'cld_at_initial' })))
+    let releaseSecondSession: (() => void) | undefined
+    cloudSessionProvider.mockImplementationOnce(async () => new Promise<CloudSession>((resolve) => {
+      releaseSecondSession = () => resolve(cloudSession(storedAuth({ accessToken: 'cld_at_coalesced' })))
+    }))
+    let capturedTokenProvider: (() => Promise<string>) | undefined
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => {
+      capturedTokenProvider = tokenProvider
+      return setup
+    }
+
+    await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider,
+      relayfileSetupFactory,
+    })
+    expect(capturedTokenProvider).toBeDefined()
+    const tokenProvider = capturedTokenProvider as () => Promise<string>
+    const first = tokenProvider()
+    const second = tokenProvider()
+
+    expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
+    releaseSecondSession?.()
+    await expect(Promise.all([first, second])).resolves.toEqual(['cld_at_coalesced', 'cld_at_coalesced'])
+  })
+
+  it('rejects explicit legacy credential paths from JavaScript callers', async () => {
+    const config = { credsPath: '/tmp/legacy-cloud-credentials.json' } as unknown as RelayfileCloudMountClientConfig
+
+    await expect(RelayfileCloudMountClient.fromConfig(config))
+      .rejects.toThrow(/no longer accepts credsPath/)
+  })
+
+  it('surfaces a cloud login action when no shared session exists', async () => {
+    const cloudSessionProvider = vi.fn(async () => {
+      throw new CloudAuthError(
+        'AUTH_BROWSER_REQUIRED',
+        'Cloud login required. Run `agent-relay login`.',
+      )
+    })
+
+    await expect(RelayfileCloudMountClient.fromConfig({ cloudSessionProvider }))
+      .rejects.toThrow('Relayfile cloud session required; run `agent-relay login`')
+  })
+
   it('delegates readFile/listTree/getEvents with the configured workspace id', async () => {
     const fake = new FakeRelayFileClient()
     fake.files.set('/linear/issues/AR-1.json', {
