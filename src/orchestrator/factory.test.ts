@@ -204,6 +204,21 @@ class SpawnFailingFleetClient extends FakeFleetClient {
   }
 }
 
+// Mimics the broker rejecting a resume because it never released the agent's
+// name on exit (relay#1116-family): http 500 "agent '<name>' already exists".
+class ResumeNameCollisionFleetClient extends FakeFleetClient {
+  override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
+    this.resumes.push(input)
+    const name = input.name ?? input.sessionRef
+    throw Object.assign(new Error(`agent '${name}' already exists`), {
+      code: 'http_500',
+      status: 500,
+      retryable: true,
+      data: { error: `agent '${name}' already exists`, name, success: false },
+    })
+  }
+}
+
 class ManualClock {
   value = 0
 
@@ -3090,6 +3105,25 @@ describe('FactoryLoop', () => {
       { name: 'ar-254-review', reason: 'issue-done' },
     ])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('does not loop when resume hits a leaked broker name ("already exists")', async () => {
+    const mount = new FakeMountClient({ [issuePath(80)]: issueFile(80) })
+    const fleet = new ResumeNameCollisionFleetClient()
+    fleet.setSessionRef('ar-80-review', 'session-review-80')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(80), issueFile(80)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-80-review', 'crash')
+    await flush()
+    // A second exit event must NOT trigger another resume attempt.
+    fleet.emitAgentExit('ar-80-review', 'crash')
+    await flush()
+
+    expect(fleet.resumes).toHaveLength(1) // resumed once, collided, then short-circuited
+    expect(factory.status().counters.resumeNameCollisions).toBe(1)
+    expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {

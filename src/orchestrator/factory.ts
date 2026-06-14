@@ -1603,6 +1603,24 @@ export class FactoryLoop implements Factory {
         try {
           await resume
           this.#resumedExitKeys.add(resumeKey)
+        } catch (error) {
+          if (isAgentAlreadyExistsError(error)) {
+            // The broker never released this agent's name on exit
+            // (relay#1116-family), so re-registering collides with the stuck
+            // name. The error is marked retryable but isn't — retrying just
+            // re-collides forever. Treat it as terminal for this name: record
+            // the resume key so subsequent exit events short-circuit, count it,
+            // and warn once instead of spamming a 500 stack trace. The external
+            // reaper / a broker restart reclaims the leaked name.
+            this.#resumedExitKeys.add(resumeKey)
+            this.#increment('resumeNameCollisions')
+            this.#logger.warn?.('[factory] resume skipped: broker still holds agent name (relay#1116); not retrying', {
+              issue: record.issue.key,
+              name,
+            })
+          } else {
+            throw error
+          }
         } finally {
           this.#resumeInFlight.delete(resumeKey)
         }
@@ -2911,6 +2929,17 @@ const labelName = (value: unknown): string | undefined => {
 
 const isCompletionReason = (reason?: string): boolean =>
   reason === 'issue-done' || reason === 'done' || reason === 'completed'
+
+// The broker rejects re-registering a name it never released on exit
+// (relay#1116-family) with a 500 "agent '<name>' already exists". Detect it from
+// the structured payload or the message so resume can treat it as terminal
+// rather than retrying the (falsely) "retryable" error forever.
+const isAgentAlreadyExistsError = (error: unknown): boolean => {
+  const record = asRecord(error)
+  const data = asRecord(record?.data)
+  const message = stringValue(data?.error) ?? (error instanceof Error ? error.message : '')
+  return /already exists/iu.test(message)
+}
 
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
   spec.role === 'implementer' ? { maxRestarts: 3, strategy: 'resume' } as AgentSpec['restartPolicy'] : spec.restartPolicy
