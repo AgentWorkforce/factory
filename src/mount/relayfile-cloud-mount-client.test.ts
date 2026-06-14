@@ -1,7 +1,136 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import type { ChangeEvent, OperationStatusResponse, RelayfileCloudTokenSet } from '@relayfile/sdk'
 
-import { RelayfileCloudMountClient, type RelayFileClientLike } from './relayfile-cloud-mount-client'
+import {
+  RelayfileCloudMountClient,
+  resolveCloudCredentials,
+  persistCloudCredentials,
+  type CredsFileIo,
+  type RelayFileClientLike,
+} from './relayfile-cloud-mount-client'
+
+const CANONICAL = join(homedir(), '.agentworkforce', 'relay', 'cloud-auth.json')
+const LEGACY = join(homedir(), '.relayfile', 'cloud-credentials.json')
+
+const tokenSet = (overrides: Partial<RelayfileCloudTokenSet> = {}): RelayfileCloudTokenSet => ({
+  apiUrl: 'https://cloud.example',
+  accessToken: 'cld_at_aaa',
+  refreshToken: 'cld_rt_aaa',
+  accessTokenExpiresAt: '2026-07-01T00:00:00.000Z',
+  ...overrides,
+})
+
+/** In-memory CredsFileIo so resolution + persistence are tested without touching the real FS. */
+const fakeCredsIo = (files: Record<string, string> = {}) => {
+  const store = new Map(Object.entries(files))
+  const calls: Array<{ op: string; args: unknown[] }> = []
+  const io: CredsFileIo = {
+    readFile: async (path) => {
+      calls.push({ op: 'readFile', args: [path] })
+      const value = store.get(path)
+      if (value === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      return value
+    },
+    writeFile: async (path, data) => {
+      calls.push({ op: 'writeFile', args: [path, data] })
+      store.set(path, data)
+    },
+    rename: async (from, to) => {
+      calls.push({ op: 'rename', args: [from, to] })
+      const value = store.get(from)
+      if (value === undefined) throw new Error(`rename source missing: ${from}`)
+      store.set(to, value)
+      store.delete(from)
+    },
+    chmod: async (path, mode) => {
+      calls.push({ op: 'chmod', args: [path, mode] })
+    },
+    mkdir: async (path) => {
+      calls.push({ op: 'mkdir', args: [path] })
+      return undefined
+    },
+  }
+  return { io, store, calls }
+}
+
+describe('resolveCloudCredentials', () => {
+  it('prefers the canonical agent-relay store over the legacy relayfile path', async () => {
+    const { io } = fakeCredsIo({
+      [CANONICAL]: JSON.stringify(tokenSet({ accessToken: 'cld_at_canonical' })),
+      [LEGACY]: JSON.stringify(tokenSet({ accessToken: 'cld_at_legacy' })),
+    })
+
+    const resolved = await resolveCloudCredentials(undefined, io)
+
+    expect(resolved.path).toBe(CANONICAL)
+    expect(resolved.credentials.accessToken).toBe('cld_at_canonical')
+  })
+
+  it('falls back to the legacy path when the canonical store is absent', async () => {
+    const { io } = fakeCredsIo({
+      [LEGACY]: JSON.stringify(tokenSet({ accessToken: 'cld_at_legacy' })),
+    })
+
+    const resolved = await resolveCloudCredentials(undefined, io)
+
+    expect(resolved.path).toBe(LEGACY)
+    expect(resolved.credentials.accessToken).toBe('cld_at_legacy')
+  })
+
+  it('uses only the explicit path when one is given', async () => {
+    const explicit = '/tmp/custom-creds.json'
+    const { io } = fakeCredsIo({
+      [explicit]: JSON.stringify(tokenSet({ accessToken: 'cld_at_explicit' })),
+      [CANONICAL]: JSON.stringify(tokenSet({ accessToken: 'cld_at_canonical' })),
+    })
+
+    const resolved = await resolveCloudCredentials(explicit, io)
+
+    expect(resolved.path).toBe(explicit)
+    expect(resolved.credentials.accessToken).toBe('cld_at_explicit')
+  })
+
+  it('throws an actionable error naming `agent-relay login` when nothing is found', async () => {
+    const { io } = fakeCredsIo({})
+
+    await expect(resolveCloudCredentials(undefined, io)).rejects.toThrow(/agent-relay login/)
+  })
+})
+
+describe('persistCloudCredentials', () => {
+  it('writes atomically via a pid-scoped temp file then renames over the target', async () => {
+    const { io, store, calls } = fakeCredsIo({})
+    const rotated = tokenSet({ accessToken: 'cld_at_rotated', refreshToken: 'cld_rt_rotated' })
+
+    await persistCloudCredentials(CANONICAL, rotated, io)
+
+    // Never wrote the target path directly — only the temp, then rename.
+    const tmp = `${CANONICAL}.${process.pid}.tmp`
+    const writeTargets = calls.filter((c) => c.op === 'writeFile').map((c) => c.args[0])
+    expect(writeTargets).toEqual([tmp])
+    expect(calls.some((c) => c.op === 'rename' && c.args[0] === tmp && c.args[1] === CANONICAL)).toBe(true)
+    expect(calls.some((c) => c.op === 'chmod' && c.args[0] === tmp && c.args[1] === 0o600)).toBe(true)
+
+    // Final file holds the rotated tokens.
+    expect(JSON.parse(store.get(CANONICAL) as string)).toMatchObject({
+      accessToken: 'cld_at_rotated',
+      refreshToken: 'cld_rt_rotated',
+    })
+  })
+
+  it('round-trips: a rotated token persisted back is what the next resolve reads', async () => {
+    const { io } = fakeCredsIo({
+      [CANONICAL]: JSON.stringify(tokenSet({ refreshToken: 'cld_rt_old' })),
+    })
+
+    await persistCloudCredentials(CANONICAL, tokenSet({ refreshToken: 'cld_rt_new' }), io)
+    const resolved = await resolveCloudCredentials(undefined, io)
+
+    expect(resolved.credentials.refreshToken).toBe('cld_rt_new')
+  })
+})
 
 class FakeRelayFileClient implements RelayFileClientLike {
   readonly readFileCalls: Array<{ workspaceId: string; path: string }> = []
