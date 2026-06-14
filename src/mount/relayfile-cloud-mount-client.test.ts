@@ -24,6 +24,15 @@ const cloudSession = (auth: StoredAuth): CloudSession => ({
   client: {} as CloudSession['client'],
 })
 
+const factoryReadScopeCovers = (path: string): boolean =>
+  FACTORY_RELAYFILE_SCOPES.some((scope) => {
+    const prefix = 'relayfile:fs:read:'
+    if (!scope.startsWith(prefix)) return false
+    const scopePath = scope.slice(prefix.length)
+    if (scopePath.endsWith('/**')) return path.startsWith(scopePath.slice(0, -3))
+    return path === scopePath
+  })
+
 class FakeRelayFileClient implements RelayFileClientLike {
   readonly readFileCalls: Array<{ workspaceId: string; path: string }> = []
   readonly writeFileCalls: Array<{
@@ -199,6 +208,8 @@ describe('RelayfileCloudMountClient', () => {
     const joinOptions = joinCalls[0][1]
     expect(joinOptions.scopes).not.toContain('relayfile:fs:read:/**')
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
+    expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')
+    expect(factoryReadScopeCovers('/slack/users/U123/messages/1781267200_000000/meta.json')).toBe(true)
     expect(capturedTokenProvider).toBeDefined()
     await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_shared')
   })
@@ -271,6 +282,16 @@ describe('RelayfileCloudMountClient', () => {
 
   it('rejects explicit legacy credential paths from JavaScript callers', async () => {
     const config = { credsPath: '/tmp/legacy-cloud-credentials.json' } as unknown as RelayfileCloudMountClientConfig
+
+    await expect(RelayfileCloudMountClient.fromConfig(config))
+      .rejects.toThrow(/no longer accepts credsPath/)
+  })
+
+  it('rejects legacy credential paths even when a client is injected', async () => {
+    const config = {
+      client: new FakeRelayFileClient(),
+      credsPath: '/tmp/legacy-cloud-credentials.json',
+    } as unknown as RelayfileCloudMountClientConfig
 
     await expect(RelayfileCloudMountClient.fromConfig(config))
       .rejects.toThrow(/no longer accepts credsPath/)

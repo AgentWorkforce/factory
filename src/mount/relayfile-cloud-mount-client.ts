@@ -36,6 +36,7 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/github/repos/**',
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
+  'relayfile:fs:read:/slack/users/**',
 ] as const
 
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
@@ -119,10 +120,10 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   static async fromConfig(config: RelayfileCloudMountClientConfig = {}): Promise<RelayfileCloudMountClient> {
-    if (config.client) return new RelayfileCloudMountClient(config)
     if ('credsPath' in config) {
       throw new Error('RelayfileCloudMountClient no longer accepts credsPath; run `agent-relay login` to use the shared cloud session')
     }
+    if (config.client) return new RelayfileCloudMountClient(config)
 
     const workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
     const sharedSession = createSharedCloudSessionResolver(config)
