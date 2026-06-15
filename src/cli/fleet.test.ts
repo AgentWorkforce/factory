@@ -266,7 +266,7 @@ describe('fleet CLI runtime', () => {
     expect(report).toMatchObject({
       dryRun: true,
       pulled: [{ key: 'AR-77' }],
-      dispatched: [{ issue: { key: 'AR-77' }, dryRun: true, agents: [{ name: 'ar-77-impl' }, { name: 'ar-77-review' }] }],
+      dispatched: [{ issue: { key: 'AR-77' }, dryRun: true, agents: [{ name: 'ar-77-impl-pear' }, { name: 'ar-77-review' }] }],
     })
     expect(fleet.spawns).toEqual([])
     expect(fleet.messages).toEqual([])

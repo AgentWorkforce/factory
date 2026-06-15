@@ -44,6 +44,7 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
     clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
     default: 'AgentWorkforce/pear',
   },
+  triage: { maxImplementers: 4 },
   batchSize: 2,
   ...overrides,
 })
@@ -64,7 +65,7 @@ const issuePayload = (n: number, stateId = ready) => ({
   description: 'Implement the requested fix in packages/factory-sdk/src/orchestrator/factory.ts and verify it with tests.',
   stateId,
   url: `https://linear.app/agent-relay/issue/AR-${n}/factory-issue-${n}`,
-  labels: undefined,
+  labels: [{ name: 'pear' }],
   labelIds: ['label-id-not-used-by-parser'],
   team: { key: 'AR', name: 'Agent Relay' },
   project: { name: 'Factory' },
@@ -838,7 +839,7 @@ describe('FactoryLoop', () => {
       key: 'AR-1',
       title: '[factory-e2e] Fix factory issue 1',
       stateId: ready,
-      labels: [],
+      labels: ['pear'],
       project: 'Factory',
     })
   })
@@ -954,11 +955,11 @@ describe('FactoryLoop', () => {
       [issuePath(4)]: issueFile(4, implementing),
     })
     const fleet = new FakeFleetClient()
-    fleet.setSessionRef('ar-1-impl', 'session-impl-1')
+    fleet.setSessionRef('ar-1-impl-pear', 'session-impl-1')
     fleet.setSessionRef('ar-1-review', 'session-review-1')
-    fleet.setSessionRef('ar-2-impl', 'session-impl-2')
+    fleet.setSessionRef('ar-2-impl-pear', 'session-impl-2')
     fleet.setSessionRef('ar-2-review', 'session-review-2')
-    fleet.setSessionRef('ar-3-impl', 'session-impl-3')
+    fleet.setSessionRef('ar-3-impl-pear', 'session-impl-3')
     fleet.setSessionRef('ar-3-review', 'session-review-3')
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
@@ -973,11 +974,11 @@ describe('FactoryLoop', () => {
     expect(factory.status().queued.map((issue) => issue.key)).toEqual(['AR-3'])
     expect(mount.writes.some((write) => write.path === issuePath(1) && (write.content as { stateId?: string }).stateId === implementing)).toBe(true)
 
-    fleet.emitAgentExit('ar-1-impl', 'issue-done')
+    fleet.emitAgentExit('ar-1-impl-pear', 'issue-done')
     await flush()
 
-    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-1-impl', 'ar-1-review'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl')
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-1-impl-pear', 'ar-1-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl-pear')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-2', 'AR-3'])
     expect(factory.status().queued).toEqual([])
   })
@@ -1189,7 +1190,7 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
 
     expect(fleet.releases.map((release) => release.name)).toEqual(
-      expect.arrayContaining(['ar-258-impl', 'ar-258-review']),
+      expect.arrayContaining(['ar-258-impl-pear', 'ar-258-review']),
     )
     expect(factory.status().counters.githubIssueMirrorsClosed).toBe(1)
     expect(factory.status().inFlight.map((issue) => issue.key)).not.toContain('AR-258')
@@ -1223,7 +1224,7 @@ describe('FactoryLoop', () => {
     const first = await factory.runOnce()
     expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
 
-    fleet.emitAgentExit('ar-364-impl', 'issue-done')
+    fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
     await flush()
     expect(factory.status().counters.done).toBe(1)
 
@@ -1233,9 +1234,9 @@ describe('FactoryLoop', () => {
     expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
     expect(reopened.skipped).toEqual([])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-      'ar-364-impl',
+      'ar-364-impl-pear',
       'ar-364-review',
-      'ar-364-impl',
+      'ar-364-impl-pear',
       'ar-364-review',
     ])
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
@@ -1252,7 +1253,7 @@ describe('FactoryLoop', () => {
     const first = await factory.runOnce()
     expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-366'])
 
-    fleet.emitAgentExit('ar-366-impl', 'issue-done')
+    fleet.emitAgentExit('ar-366-impl-pear', 'issue-done')
     await flush()
     expect(factory.status().counters.humanReview).toBe(1)
 
@@ -1262,9 +1263,9 @@ describe('FactoryLoop', () => {
     expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-366'])
     expect(reopened.skipped).toEqual([])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-      'ar-366-impl',
+      'ar-366-impl-pear',
       'ar-366-review',
-      'ar-366-impl',
+      'ar-366-impl-pear',
       'ar-366-review',
     ])
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
@@ -1276,7 +1277,7 @@ describe('FactoryLoop', () => {
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     await factory.runOnce()
-    fleet.emitAgentExit('ar-365-impl', 'issue-done')
+    fleet.emitAgentExit('ar-365-impl-pear', 'issue-done')
     await flush()
 
     await mount.writeFile(readyAliasPath(365), realIssueFile(365, ready))
@@ -1286,7 +1287,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toEqual([
       { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal' },
     ])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-365-impl', 'ar-365-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-365-impl-pear', 'ar-365-review'])
     expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
   })
 
@@ -1296,7 +1297,7 @@ describe('FactoryLoop', () => {
       [ghPath]: githubIssueFile(1116, {
         title: 'Relay issue should dispatch',
         body: 'Implement the relay fix.\n\nAcceptance: add tests.',
-        labels: [{ name: 'factory' }],
+        labels: [{ name: 'factory' }, { name: 'pear' }],
       }),
     })
     const factory = createFactory(config(), {
@@ -1669,7 +1670,7 @@ describe('FactoryLoop', () => {
       { uuid: 'uuid-68', key: 'AR-68', path: issuePath(68) },
     ])
     expect(report.skipped).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-68-impl', 'ar-68-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-68-impl-pear', 'ar-68-review'])
   })
 
   it('resolves live-shaped ready alias discovery to the canonical issue record', async () => {
@@ -1687,7 +1688,7 @@ describe('FactoryLoop', () => {
     expect(report.dispatched.map((result) => result.issue)).toEqual([
       { uuid: 'uuid-70-canonical', key: 'AR-70', path: canonicalPath },
     ])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-70-impl', 'ar-70-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-70-impl-pear', 'ar-70-review'])
   })
 
   it('fails closed when a ready alias has no canonical issue record', async () => {
@@ -1737,7 +1738,7 @@ describe('FactoryLoop', () => {
     expect(mount.readPaths).not.toContain(byIdCanonicalShapedAliasPath)
     expect(mount.readPaths).not.toContain(capturedBareUuidPhantomPath)
     expect(mount.readPaths).not.toContain('/linear/issues/dac27fce-e8de-4910-bbf6-98ad436df3dd.json')
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-133-impl', 'ar-133-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-133-impl-pear', 'ar-133-review'])
   })
 
   it('skips missing canonical-shaped issue paths without aborting discovery', async () => {
@@ -1972,7 +1973,7 @@ describe('FactoryLoop', () => {
     const staleMs = 1_000
     const clock = new ManualClock()
     const pids = new Map([
-      ['ar-363-impl', 36_301],
+      ['ar-363-impl-pear', 36_301],
       ['ar-363-review', 36_302],
     ])
     const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
@@ -2010,7 +2011,7 @@ describe('FactoryLoop', () => {
         }
       }
       const fleet = new ReaperObservingFleetClient([
-        { name: 'ar-363-impl', pid: pids.get('ar-363-impl') },
+        { name: 'ar-363-impl-pear', pid: pids.get('ar-363-impl-pear') },
         { name: 'ar-363-review', pid: pids.get('ar-363-review') },
       ])
       const factory = createFactory(config({
@@ -2037,7 +2038,7 @@ describe('FactoryLoop', () => {
       await factory.stop()
 
       expect(reaperReports).toEqual([{ stale: false, reason: 'loop stopping', reaped: [], skipped: [] }])
-      expect(fleet.releases.map((release) => release.name)).toEqual(['ar-363-impl', 'ar-363-review'])
+      expect(fleet.releases.map((release) => release.name)).toEqual(['ar-363-impl-pear', 'ar-363-review'])
       expect((await readFactoryLoopHeartbeat(heartbeatPath))?.updatedAtMs).toBe(clock.now())
       expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
       expect(killed.some((entry) => entry.signal === 'SIGTERM')).toBe(true)
@@ -2053,7 +2054,7 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(62)]: issueFile(62) })
       const harness = new RosterPidHarnessClient()
-      harness.pidsByName.set('ar-62-impl', 9_000)
+      harness.pidsByName.set('ar-62-impl-pear', 9_000)
       harness.pidsByName.set('ar-62-review', 9_001)
       const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
       const factory = createFactory(config({
@@ -2065,7 +2066,7 @@ describe('FactoryLoop', () => {
         processIdentityReader: async (pid) => ({
           pid,
           startTime: `start-${pid}`,
-          cmdline: pid === 9_000 ? 'node ar-62-impl worker' : 'node ar-62-review worker',
+          cmdline: pid === 9_000 ? 'node ar-62-impl-pear worker' : 'node ar-62-review worker',
         }),
       })
 
@@ -2079,9 +2080,9 @@ describe('FactoryLoop', () => {
         heartbeatPath,
         agents: [
           {
-            name: 'ar-62-impl',
+            name: 'ar-62-impl-pear',
             pids: [9_000],
-            processes: [{ pid: 9_000, agentName: 'ar-62-impl', startTime: 'start-9000', cmdline: 'node ar-62-impl worker' }],
+            processes: [{ pid: 9_000, agentName: 'ar-62-impl-pear', startTime: 'start-9000', cmdline: 'node ar-62-impl-pear worker' }],
           },
           {
             name: 'ar-62-review',
@@ -2118,7 +2119,7 @@ describe('FactoryLoop', () => {
 
       const registry = await readFactoryInFlightRegistry(registryPath)
       expect(registry?.agents).toMatchObject([
-        { name: 'ar-63-impl', pids: [], processes: [] },
+        { name: 'ar-63-impl-pear', pids: [], processes: [] },
         { name: 'ar-63-review', pids: [], processes: [] },
       ])
       await factory.stop()
@@ -2134,7 +2135,7 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(72)]: issueFile(72) })
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-72-impl', 'session-ar-72-impl')
+      fleet.setSessionRef('ar-72-impl-pear', 'session-ar-72-impl-pear')
       fleet.setSessionRef('ar-72-review', 'session-ar-72-review')
       const linear: LinearWriteback = {
         async postComment() {},
@@ -2167,9 +2168,9 @@ describe('FactoryLoop', () => {
       const registry = await readFactoryInFlightRegistry(registryPath)
       expect(registry?.agents).toMatchObject([
         {
-          name: 'ar-72-impl',
+          name: 'ar-72-impl-pear',
           role: 'implementer',
-          sessionRef: 'session-ar-72-impl',
+          sessionRef: 'session-ar-72-impl-pear',
           issue: { key: 'AR-72', uuid: 'uuid-72', path: issuePath(72) },
           pids: [],
           processes: [],
@@ -2195,7 +2196,7 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-76-impl', 'session-ar-76-impl')
+      fleet.setSessionRef('ar-76-impl-pear', 'session-ar-76-impl-pear')
       fleet.setSessionRef('ar-76-review', 'session-ar-76-review')
       const linear: LinearWriteback = {
         async postComment() {},
@@ -2227,7 +2228,7 @@ describe('FactoryLoop', () => {
       expect(heartbeat).toMatchObject({ status: 'idle', registryPath })
       const registry = await readFactoryInFlightRegistry(registryPath)
       expect(registry?.agents).toMatchObject([
-        { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pids: [], processes: [] },
+        { name: 'ar-76-impl-pear', sessionRef: 'session-ar-76-impl-pear', pids: [], processes: [] },
         { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pids: [], processes: [] },
       ])
     } finally {
@@ -2245,7 +2246,7 @@ describe('FactoryLoop', () => {
       const alive = new Set([7_601, 7_602, 7_603, 7_604])
       const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
       const fleet = new InjectFailingPidFleetClient([
-        { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pid: 7_601 },
+        { name: 'ar-76-impl-pear', sessionRef: 'session-ar-76-impl-pear', pid: 7_601 },
         { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pid: 7_603 },
       ])
       const factory = createFactory(config({
@@ -2255,7 +2256,7 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         processIdentityReader: async (pid) => {
-          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl launcher' }
+          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl-pear launcher' }
           if (pid === 7_603) return { pid, startTime: 'start-7603', cmdline: 'node --agent-name ar-76-review launcher' }
           return undefined
         },
@@ -2309,9 +2310,9 @@ describe('FactoryLoop', () => {
       const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
       const healthyAliveDuringFailedReap: boolean[] = []
       const fleet = new SelectiveInjectFailingPidFleetClient([
-        { name: 'ar-76-impl', sessionRef: 'session-ar-76-impl', pid: 7_601 },
+        { name: 'ar-76-impl-pear', sessionRef: 'session-ar-76-impl-pear', pid: 7_601 },
         { name: 'ar-76-review', sessionRef: 'session-ar-76-review', pid: 7_603 },
-        { name: 'ar-77-impl', sessionRef: 'session-ar-77-impl', pid: 7_701 },
+        { name: 'ar-77-impl-pear', sessionRef: 'session-ar-77-impl-pear', pid: 7_701 },
         { name: 'ar-77-review', sessionRef: 'session-ar-77-review', pid: 7_703 },
       ], 'ar-77-')
       const factory = createFactory(config({
@@ -2322,9 +2323,9 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         processIdentityReader: async (pid) => {
-          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl launcher' }
+          if (pid === 7_601) return { pid, startTime: 'start-7601', cmdline: 'node --agent-name ar-76-impl-pear launcher' }
           if (pid === 7_603) return { pid, startTime: 'start-7603', cmdline: 'node --agent-name ar-76-review launcher' }
-          if (pid === 7_701) return { pid, startTime: 'start-7701', cmdline: 'node --agent-name ar-77-impl launcher' }
+          if (pid === 7_701) return { pid, startTime: 'start-7701', cmdline: 'node --agent-name ar-77-impl-pear launcher' }
           if (pid === 7_703) return { pid, startTime: 'start-7703', cmdline: 'node --agent-name ar-77-review launcher' }
           return undefined
         },
@@ -2372,7 +2373,7 @@ describe('FactoryLoop', () => {
       const mount = new FakeMountClient({ [issuePath(78)]: issueFile(78) })
       const clock = new ManualClock()
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-78-impl', 'session-ar-78-impl')
+      fleet.setSessionRef('ar-78-impl-pear', 'session-ar-78-impl-pear')
       fleet.setSessionRef('ar-78-review', 'session-ar-78-review')
       const linear: LinearWriteback = {
         async postComment() {},
@@ -2416,14 +2417,14 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(79)]: issueFile(79) })
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-79-impl', 'session-ar-79-impl')
+      fleet.setSessionRef('ar-79-impl-pear', 'session-ar-79-impl-pear')
       fleet.setSessionRef('ar-79-review', 'session-ar-79-review')
       const resolvingFleet = fleet as FakeFleetClient & {
         resolveAgentPid: (name: string) => Promise<{ status: 'found'; pid: number } | { status: 'unresolved' }>
         protectedPids: () => Promise<number[]>
       }
       resolvingFleet.resolveAgentPid = async (name: string) => {
-        if (name === 'ar-79-impl') return { status: 'found', pid: 7_901 }
+        if (name === 'ar-79-impl-pear') return { status: 'found', pid: 7_901 }
         if (name === 'ar-79-review') return { status: 'found', pid: 7_903 }
         return { status: 'unresolved' }
       }
@@ -2456,7 +2457,7 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.dispatchFailureReaperHandoffsDroppedStaleUnresolved).toBeUndefined()
       expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
       expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
-        'ar-79-impl',
+        'ar-79-impl-pear',
         'ar-79-review',
       ])
     } finally {
@@ -2475,7 +2476,7 @@ describe('FactoryLoop', () => {
       })
       const clock = new ManualClock()
       const fleet = new FakeFleetClient()
-      for (const name of ['ar-80-impl', 'ar-80-review', 'ar-81-impl', 'ar-81-review']) {
+      for (const name of ['ar-80-impl-pear', 'ar-80-review', 'ar-81-impl-pear', 'ar-81-review']) {
         fleet.setSessionRef(name, `session-${name}`)
       }
       const resolveAttempts = new Map<string, number>()
@@ -2485,7 +2486,7 @@ describe('FactoryLoop', () => {
       resolvingFleet.resolveAgentPid = async (name: string) => {
         const attempts = (resolveAttempts.get(name) ?? 0) + 1
         resolveAttempts.set(name, attempts)
-        if (name === 'ar-80-impl') {
+        if (name === 'ar-80-impl-pear') {
           if (attempts === 1) throw new Error('broker registration pending')
           return { status: 'found', pid: 8_001 }
         }
@@ -2520,7 +2521,7 @@ describe('FactoryLoop', () => {
         clock,
         processFinder: async () => ({ status: 'missing' }),
         processIdentityReader: async (pid) => {
-          if (pid === 8_001) return { pid, startTime: 'start-8001', cmdline: 'node --agent-name ar-80-impl launcher' }
+          if (pid === 8_001) return { pid, startTime: 'start-8001', cmdline: 'node --agent-name ar-80-impl-pear launcher' }
           if (pid === 8_003) return { pid, startTime: 'start-8003', cmdline: 'node --agent-name ar-80-review launcher' }
           return undefined
         },
@@ -2544,7 +2545,7 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
       expect(killed.map((entry) => entry.pid)).toEqual(expect.arrayContaining([8_002, 8_001, 8_004, 8_003]))
       expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
-        'ar-81-impl',
+        'ar-81-impl-pear',
         'ar-81-review',
       ])
     } finally {
@@ -2559,7 +2560,7 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(73)]: issueFile(73) })
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-73-impl', 'session-ar-73-impl')
+      fleet.setSessionRef('ar-73-impl-pear', 'session-ar-73-impl-pear')
       fleet.setSessionRef('ar-73-review', 'session-ar-73-review')
       const linear: LinearWriteback = {
         async postComment() {},
@@ -2607,14 +2608,14 @@ describe('FactoryLoop', () => {
         fleet: {
           protectedPids: async () => [68_009],
           resolveAgentPid: async (name) => {
-            if (name === 'ar-73-impl') return { status: 'found', pid: 7_301 }
+            if (name === 'ar-73-impl-pear') return { status: 'found', pid: 7_301 }
             if (name === 'ar-73-review') return { status: 'found', pid: 68_009 }
             return { status: 'unresolved' }
           },
         },
         processFinder: async () => ({ status: 'missing' }),
         readProcessIdentity: async (pid) => {
-          if (pid === 7_301) return { pid, startTime: 'start-7301', cmdline: 'node --agent-name ar-73-impl launcher' }
+          if (pid === 7_301) return { pid, startTime: 'start-7301', cmdline: 'node --agent-name ar-73-impl-pear launcher' }
           if (pid === 68_009) return { pid, startTime: 'broker-start', cmdline: 'node --agent-name ar-73-review broker' }
           return undefined
         },
@@ -2648,7 +2649,7 @@ describe('FactoryLoop', () => {
       }), { mount, fleet, triage: new StaticTriage() })
 
       await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(74), issueFile(74)))))
-        .rejects.toThrow('Dispatch spawn failed for AR-74/ar-74-impl')
+        .rejects.toThrow('Dispatch spawn failed for AR-74/ar-74-impl-pear')
 
       expect(factory.status().inFlight).toEqual([])
       expect(factory.status().counters.dispatchFailureReaperHandoffs).toBeUndefined()
@@ -2665,7 +2666,7 @@ describe('FactoryLoop', () => {
     try {
       const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
       const fleet = new FakeFleetClient()
-      fleet.setSessionRef('ar-75-impl', 'session-ar-75-impl')
+      fleet.setSessionRef('ar-75-impl-pear', 'session-ar-75-impl-pear')
       fleet.setSessionRef('ar-75-review', 'session-ar-75-review')
       const linear: LinearWriteback = {
         async postComment() {},
@@ -2713,7 +2714,7 @@ describe('FactoryLoop', () => {
 
       expect(report.reaped).toEqual([])
       expect(report.skipped).toEqual([
-        { reason: 'pid missing for ar-75-impl' },
+        { reason: 'pid missing for ar-75-impl-pear' },
         { reason: 'pid missing for ar-75-review' },
       ])
     } finally {
@@ -2775,7 +2776,7 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({
       [path]: realIssueFile(260, ready, {
         title: 'Accept factory label as scope marker',
-        labels: [{ name: 'factory' }],
+        labels: [{ name: 'factory' }, { name: 'pear' }],
       }),
     })
     const fleet = new FakeFleetClient()
@@ -2789,7 +2790,7 @@ describe('FactoryLoop', () => {
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-260'])
     expect(report.skipped).toEqual([])
     expect(triage.count).toBe(1)
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-260-impl', 'ar-260-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-260-impl-pear', 'ar-260-review'])
   })
 
   it('skips factory-marked draft issues that are not reconciled provider records', async () => {
@@ -2893,7 +2894,7 @@ describe('FactoryLoop', () => {
 
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-27'])
     expect(report.skipped).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-27-impl', 'ar-27-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-27-impl-pear', 'ar-27-review'])
   })
 
   it('dispatches ready AR issues scoped only by the factory label', async () => {
@@ -2903,7 +2904,7 @@ describe('FactoryLoop', () => {
       payload: {
         ...issuePayload(28),
         title: 'Label-scoped factory issue',
-        labels: [{ name: 'factory' }],
+        labels: [{ name: 'factory' }, { name: 'pear' }],
       },
     }
     const mount = new FakeMountClient({ [path]: labelOnlyIssue })
@@ -2914,7 +2915,7 @@ describe('FactoryLoop', () => {
 
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-28'])
     expect(report.skipped).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-28-impl', 'ar-28-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-28-impl-pear', 'ar-28-review'])
   })
 
   it('refuses explicit dispatch for issues outside factory-e2e scope before spawning', async () => {
@@ -2943,7 +2944,7 @@ describe('FactoryLoop', () => {
 
     await factory.start()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-11-impl', 'ar-11-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-11-impl-pear', 'ar-11-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-11'])
     expect(factory.status().queued).toEqual([])
     await factory.stop()
@@ -2952,7 +2953,7 @@ describe('FactoryLoop', () => {
   it('stop releases each in-flight factory-dispatched agent', async () => {
     const mount = new FakeMountClient({ [issuePath(60)]: issueFile(60) })
     const fleet = new CapturedPidFleetClient([
-      { name: 'ar-60-impl', sessionRef: 'session-901969', pid: 901969 },
+      { name: 'ar-60-impl-pear', sessionRef: 'session-901969', pid: 901969 },
       { name: 'ar-60-review', sessionRef: 'session-902338', pid: 902338 },
     ])
     const children = new Map<number, number[]>([
@@ -2980,7 +2981,7 @@ describe('FactoryLoop', () => {
     await factory.stop()
 
     expect(fleet.releases).toEqual([
-      { name: 'ar-60-impl', reason: 'factory-stopped' },
+      { name: 'ar-60-impl-pear', reason: 'factory-stopped' },
       { name: 'ar-60-review', reason: 'factory-stopped' },
     ])
     expect(killed.filter((entry) => entry.signal === 'SIGTERM').map((entry) => entry.pid).sort((a, b) => a - b)).toEqual([
@@ -3025,16 +3026,16 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(63), issueFile(63))))
     expect(await harness.listAgents()).toEqual([
-      { name: 'ar-63-impl', pid: undefined },
+      { name: 'ar-63-impl-pear', pid: undefined },
       { name: 'ar-63-review', pid: undefined },
     ])
-    harness.pidsByName.set('ar-63-impl', 901969)
+    harness.pidsByName.set('ar-63-impl-pear', 901969)
     harness.pidsByName.set('ar-63-review', 902338)
     await factory.stop()
 
     expect(harness.spawned).toHaveLength(2)
     expect(harness.releases).toEqual([
-      { name: 'ar-63-impl', reason: 'factory-stopped' },
+      { name: 'ar-63-impl-pear', reason: 'factory-stopped' },
       { name: 'ar-63-review', reason: 'factory-stopped' },
     ])
     expect(killed.filter((entry) => entry.signal === 'SIGTERM').map((entry) => entry.pid).sort((a, b) => a - b)).toEqual([
@@ -3050,7 +3051,7 @@ describe('FactoryLoop', () => {
   it('stop discovers child pids before releasing broker sessions', async () => {
     const mount = new FakeMountClient({ [issuePath(66)]: issueFile(66) })
     const fleet = new CapturedPidFleetClient([
-      { name: 'ar-66-impl', sessionRef: 'session-901969', pid: 901969 },
+      { name: 'ar-66-impl-pear', sessionRef: 'session-901969', pid: 901969 },
       { name: 'ar-66-review', sessionRef: 'session-902338', pid: 902338 },
     ])
     const released = new Set<string>()
@@ -3060,7 +3061,7 @@ describe('FactoryLoop', () => {
       await originalRelease(name, reason)
     }
     const children = new Map<number, { agent: string; pids: number[] }>([
-      [901969, { agent: 'ar-66-impl', pids: [901970] }],
+      [901969, { agent: 'ar-66-impl-pear', pids: [901970] }],
       [902338, { agent: 'ar-66-review', pids: [902339] }],
     ])
     const alive = new Set([901969, 901970, 902338, 902339])
@@ -3086,7 +3087,7 @@ describe('FactoryLoop', () => {
     await factory.stop()
 
     expect(fleet.releases).toEqual([
-      { name: 'ar-66-impl', reason: 'factory-stopped' },
+      { name: 'ar-66-impl-pear', reason: 'factory-stopped' },
       { name: 'ar-66-review', reason: 'factory-stopped' },
     ])
     expect(killed.filter((entry) => entry.signal === 'SIGTERM').map((entry) => entry.pid).sort((a, b) => a - b)).toEqual([
@@ -3101,7 +3102,7 @@ describe('FactoryLoop', () => {
   it('stop reports missing terminate roots instead of silently certifying a no-op', async () => {
     const mount = new FakeMountClient({ [issuePath(65)]: issueFile(65) })
     const fleet = new CapturedPidFleetClient([
-      { name: 'ar-65-impl', sessionRef: 'session-ar-65-impl' },
+      { name: 'ar-65-impl-pear', sessionRef: 'session-ar-65-impl-pear' },
       { name: 'ar-65-review', sessionRef: 'session-ar-65-review' },
     ])
     const errors: unknown[][] = []
@@ -3126,13 +3127,13 @@ describe('FactoryLoop', () => {
     await factory.stop()
 
     expect(fleet.releases).toEqual([
-      { name: 'ar-65-impl', reason: 'factory-stopped' },
+      { name: 'ar-65-impl-pear', reason: 'factory-stopped' },
       { name: 'ar-65-review', reason: 'factory-stopped' },
     ])
     expect(killed).toEqual([])
     expect(factory.status().counters.agentTerminateMissingPid).toBe(2)
     expect(errors).toEqual([
-      ['[factory] no pid available to terminate ar-65-impl during stop', expect.objectContaining({ agentName: 'ar-65-impl' })],
+      ['[factory] no pid available to terminate ar-65-impl-pear during stop', expect.objectContaining({ agentName: 'ar-65-impl-pear' })],
       ['[factory] no pid available to terminate ar-65-review during stop', expect.objectContaining({ agentName: 'ar-65-review' })],
     ])
   })
@@ -3149,7 +3150,7 @@ describe('FactoryLoop', () => {
       processFinder: async (agentName) => ({
         status: 'found',
         identity: {
-          pid: agentName === 'ar-67-impl' ? 906700 : 906701,
+          pid: agentName === 'ar-67-impl-pear' ? 906700 : 906701,
           startTime: `start-${agentName}`,
           cmdline: `node --agent-name ${agentName}`,
         },
@@ -3174,7 +3175,7 @@ describe('FactoryLoop', () => {
   it('stop uses the anchored launcher root even when the broker resolves a worker child', async () => {
     const mount = new FakeMountClient({ [issuePath(69)]: issueFile(69) })
     const fleet = new FoundPidFleetClient(new Map([
-      ['ar-69-impl', 906910],
+      ['ar-69-impl-pear', 906910],
       ['ar-69-review', 906911],
     ]))
     const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
@@ -3190,7 +3191,7 @@ describe('FactoryLoop', () => {
       processFinder: async (agentName) => ({
         status: 'found',
         identity: {
-          pid: agentName === 'ar-69-impl' ? 906900 : 906901,
+          pid: agentName === 'ar-69-impl-pear' ? 906900 : 906901,
           startTime: `launcher-${agentName}`,
           cmdline: `node --agent-name ${agentName} launcher`,
         },
@@ -3247,7 +3248,7 @@ describe('FactoryLoop', () => {
   it('stop does not count an already-exited agent as a missing live PID', async () => {
     const mount = new FakeMountClient({ [issuePath(66)]: issueFile(66) })
     const harness = new RosterPidHarnessClient()
-    harness.pidsByName.set('ar-66-impl', 906600)
+    harness.pidsByName.set('ar-66-impl-pear', 906600)
     harness.pidsByName.set('ar-66-review', 906601)
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
     const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = []
@@ -3280,7 +3281,7 @@ describe('FactoryLoop', () => {
 
   it('stop swallows one release failure and still releases others plus tears down listeners', async () => {
     const mount = new TrackingEventsMount({ [issuePath(61)]: issueFile(61) })
-    const fleet = new ReleaseFailingFleetClient(new Set(['ar-61-impl']))
+    const fleet = new ReleaseFailingFleetClient(new Set(['ar-61-impl-pear']))
     const warnings: unknown[][] = []
     const factory = createFactory(config(), {
       mount,
@@ -3297,7 +3298,7 @@ describe('FactoryLoop', () => {
     await expect(factory.stop()).resolves.toBeUndefined()
 
     expect(fleet.releaseAttempts).toEqual([
-      { name: 'ar-61-impl', reason: 'factory-stopped' },
+      { name: 'ar-61-impl-pear', reason: 'factory-stopped' },
       { name: 'ar-61-review', reason: 'factory-stopped' },
     ])
     expect(fleet.releases).toEqual([
@@ -3307,8 +3308,8 @@ describe('FactoryLoop', () => {
     expect(mount.unsubscribeCount).toBe(1)
     expect(warnings).toEqual([
       [
-        '[factory] failed to release ar-61-impl during stop',
-        expect.objectContaining({ message: 'release failed for ar-61-impl' }),
+        '[factory] failed to release ar-61-impl-pear during stop',
+        expect.objectContaining({ message: 'release failed for ar-61-impl-pear' }),
       ],
     ])
   })
@@ -3374,7 +3375,7 @@ describe('FactoryLoop', () => {
 
     await factory.start()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-15-impl', 'ar-15-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-15-impl-pear', 'ar-15-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-15'])
     expect(factory.status().queued.map((issue) => issue.key)).toEqual(['AR-16'])
     expect(queued).toEqual(['AR-16'])
@@ -3389,7 +3390,7 @@ describe('FactoryLoop', () => {
     await Promise.all([factory.start(), factory.start()])
 
     expect(mount.subscribeCount).toBe(1)
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-12-impl', 'ar-12-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-12-impl-pear', 'ar-12-review'])
     await factory.stop()
   })
 
@@ -3403,7 +3404,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(issuePath(17), 'event-duplicate-2'))
     await flush()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-17-impl', 'ar-17-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-17-impl-pear', 'ar-17-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-17'])
     await factory.stop()
   })
@@ -3419,7 +3420,7 @@ describe('FactoryLoop', () => {
     mount.emit(event)
     mount.emit(event)
 
-    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-18-impl', 'ar-18-review']))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-18-impl-pear', 'ar-18-review']))
     expect(factory.status().counters.liveDuplicateEventsSuppressed).toBe(1)
     await factory.stop()
   })
@@ -3435,7 +3436,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(path, 'event-same-issue-b'))
 
     await vi.waitFor(() => expect(mount.readCount).toBeGreaterThanOrEqual(2))
-    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-19-impl', 'ar-19-review']))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-19-impl-pear', 'ar-19-review']))
 
     expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-19'])
@@ -3453,7 +3454,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(path, 'event-live-25'))
     await flush()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl', 'ar-25-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl-pear', 'ar-25-review'])
     expect(factory.status().counters.liveEvents).toBe(1)
     expect(factory.status().counters.liveArrivalLatencyMsLast).toBeGreaterThanOrEqual(0)
     await factory.stop()
@@ -3473,7 +3474,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(path, 'event-live-default-33'))
     await flush()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl', 'ar-33-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
     await factory.stop()
   })
 
@@ -3486,7 +3487,7 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
     expect(mount.listTreePrefixes).toEqual(['/github/repos', '/linear/issues', '/linear/issues/by-state/ready-for-agent/'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl', 'ar-40-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl-pear', 'ar-40-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-40'])
     expect(factory.status().counters.liveHighWatermarkUnavailable).toBe(1)
     expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
@@ -3518,7 +3519,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(path, 'event-after-start-42'))
     await flush()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-42-impl', 'ar-42-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-42-impl-pear', 'ar-42-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-42'])
     expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
     await factory.stop()
@@ -3553,8 +3554,8 @@ describe('FactoryLoop', () => {
     await flush()
 
     const names = fleet.spawns.map((spawn) => spawn.name)
-    expect(names).toContain('ar-50-impl') // dispatched by the startup full pull
-    expect(names).toContain('ar-51-impl') // captured via the buffered live event during the pull
+    expect(names).toContain('ar-50-impl-pear') // dispatched by the startup full pull
+    expect(names).toContain('ar-51-impl-pear') // captured via the buffered live event during the pull
     await factory.stop()
   })
 
@@ -3585,7 +3586,7 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(newPath, '100'))
     await flush()
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl', 'ar-35-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl-pear', 'ar-35-review'])
     await factory.stop()
   })
 
@@ -3614,9 +3615,9 @@ describe('FactoryLoop', () => {
 
     mount.emit(changeEvent(freshPath, '203', new Date(Date.now()).toISOString()))
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-      'ar-39-impl',
+      'ar-39-impl-pear',
       'ar-39-review',
-      'ar-38-impl',
+      'ar-38-impl-pear',
       'ar-38-review',
     ]))
     await factory.stop()
@@ -3666,7 +3667,7 @@ describe('FactoryLoop', () => {
       mount.emit(changeEvent(newPath, 'event-after-start-31'))
       await vi.advanceTimersByTimeAsync(10)
 
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-31-impl', 'ar-31-review'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-31-impl-pear', 'ar-31-review'])
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -3687,7 +3688,7 @@ describe('FactoryLoop', () => {
       mount.emit(changeEvent(path, 'event-live-poll-32'))
       await vi.advanceTimersByTimeAsync(10)
 
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl', 'ar-32-review'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -3729,8 +3730,237 @@ describe('FactoryLoop', () => {
     await factory.dispatch(decision)
     await factory.dispatch(decision)
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-5-impl', 'ar-5-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-5-impl-pear', 'ar-5-review'])
     expect(new Set(fleet.spawns.map((spawn) => spawn.invocationId)).size).toBe(2)
+  })
+
+  it('derives implementer dispatch identities from repo labels instead of triage implementers', async () => {
+    const routedIssue = realIssueFile(720, ready, {
+      title: '[factory-e2e] Relayfile webhooks to cloud',
+      labels: [{ name: 'cloud' }, { name: 'relayfile' }],
+      description: 'Implement webhook delivery from relayfile to cloud. Mentions Slack and Linear in the body should not name implementers.',
+    })
+    const mount = new FakeMountClient({ [issuePath(720)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config({
+      repos: {
+        byLabel: {
+          cloud: 'AgentWorkforce/cloud',
+          relayfile: 'AgentWorkforce/relayfile',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/cloud': '/work/cloud',
+          'AgentWorkforce/relayfile': '/work/relayfile',
+          'AgentWorkforce/pear': '/work/pear',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(720), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual([
+      'ar-720-impl-cloud',
+      'ar-720-impl-relayfile',
+      'ar-720-review',
+    ])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd])).toEqual([
+      ['ar-720-impl-cloud', '/work/cloud'],
+      ['ar-720-impl-relayfile', '/work/relayfile'],
+      ['ar-720-review', '/work/cloud'],
+    ])
+    expect(comments[0]).toContain('Implementers: ar-720-impl-cloud, ar-720-impl-relayfile')
+  })
+
+  it('filters non-repo labels when repo labels are present', async () => {
+    const routedIssue = realIssueFile(721, ready, {
+      labels: [{ name: 'factory' }, { name: 'pear' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(721)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(721), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-721-impl-pear', 'ar-721-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-721-impl-pear', 'ar-721-review'])
+  })
+
+  it('fails dispatch loudly when no labels are present', async () => {
+    const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
+    const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const warnings: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+      logger: { warn: (...args) => warnings.push(args) },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(722), unlabeledIssue)))
+
+    expect(result.agents).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(comments).toEqual([expect.stringContaining('No Linear labels were present')])
+    expect(warnings[0]?.[0]).toBe('[factory] skipped dispatch due to invalid repo labels')
+  })
+
+  it('posts the invalid-label failure comment only once for a stuck Ready issue', async () => {
+    const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
+    const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    // Same Ready issue re-evaluated across cycles (and the writeback's own
+    // change event) must not re-post the identical failure notice.
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(722), unlabeledIssue)))
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(722), unlabeledIssue)))
+
+    expect(comments).toEqual([expect.stringContaining('No Linear labels were present')])
+  })
+
+  it('fails dispatch loudly when labels do not map through repos.byLabel', async () => {
+    const unmappedIssue = realIssueFile(723, ready, { labels: [{ name: 'unknown' }] })
+    const mount = new FakeMountClient({ [issuePath(723)]: unmappedIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const warnings: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+      logger: { warn: (...args) => warnings.push(args) },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(723), unmappedIssue)))
+
+    expect(result.agents).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(comments).toEqual([expect.stringContaining('unknown')])
+    expect(comments[0]).toContain('repos.byLabel')
+    expect(warnings[0]?.[0]).toBe('[factory] skipped dispatch due to invalid repo labels')
+  })
+
+  it('fails dispatch loudly when repo labels exceed triage.maxImplementers capped at four', async () => {
+    const manyLabelsIssue = realIssueFile(724, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'relayfile' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(724)]: manyLabelsIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+          relayfile: 'AgentWorkforce/relayfile',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+          'AgentWorkforce/relayfile': '/work/relayfile',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(724), manyLabelsIssue)))
+
+    expect(result.agents).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(comments[0]).toContain('Too many repo labels')
+    expect(comments[0]).toContain('capped at 2')
   })
 
   it('dedupes dispatch attempts by issue key even when duplicate detections use different paths', async () => {
@@ -3748,7 +3978,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(first)
     await expect(factory.dispatch(duplicate)).rejects.toThrow(/dispatch already in-flight/)
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl', 'ar-40-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl-pear', 'ar-40-review'])
   })
 
   it('omits implementer and reviewer models from default heuristic dispatch spawns', async () => {
@@ -3769,7 +3999,7 @@ describe('FactoryLoop', () => {
 
     expect(fleet.spawns).toHaveLength(2)
     expect(fleet.spawns[0]).toMatchObject({
-      name: 'ar-66-impl',
+      name: 'ar-66-impl-pear',
       capability: 'spawn:codex',
     })
     expect(fleet.spawns[0]!.model).toBeUndefined()
@@ -3806,7 +4036,7 @@ describe('FactoryLoop', () => {
     expect(fleet.attemptTimes).toEqual([0, 1_000])
   })
 
-  it('dedupes dispatch spawns that retry the same invocation id under different agent names', async () => {
+  it('ignores triage-provided duplicate implementers when dispatch derives implementers from labels', async () => {
     const mount = new FakeMountClient({ [issuePath(14)]: issueFile(14) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
@@ -3823,8 +4053,11 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(duplicateDecision)
 
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-14-impl', 'ar-14-review'])
-    expect(fleet.spawns.map((spawn) => spawn.invocationId)).toEqual([sharedInvocationId, 'reviewer-invocation'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-14-impl-pear', 'ar-14-review'])
+    expect(fleet.spawns.map((spawn) => spawn.invocationId)).toEqual([
+      expect.stringMatching(/^factory:AR-14:/u),
+      'reviewer-invocation',
+    ])
   })
 
   it('resumes exited open agents by sessionRef with the original capability', async () => {
@@ -3844,14 +4077,14 @@ describe('FactoryLoop', () => {
       node: 'self',
       capability: 'spawn:claude',
     }])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl', 'ar-6-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl-pear', 'ar-6-review'])
   })
 
   it('completes an implementer exit without resuming when a PR already exists', async () => {
     const issue = realIssueFile(254, ready, { title: 'Real implementer PR exit terminal' })
     const mount = new FakeMountClient({ [issuePath(254)]: issue })
     const fleet = new FakeFleetClient()
-    fleet.setSessionRef('ar-254-impl', 'session-impl-254')
+    fleet.setSessionRef('ar-254-impl-pear', 'session-impl-254')
     const probedIssues: string[] = []
     const factory = createFactory(config({
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -3867,15 +4100,15 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(254), issue))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-254-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-254-impl-pear', 'worker_exited')
 
     await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
 
     expect(probedIssues).toEqual(['AR-254'])
     expect(fleet.resumes).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-254-impl', 'ar-254-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-254-impl-pear', 'ar-254-review'])
     expect(fleet.releases).toEqual([
-      { name: 'ar-254-impl', reason: 'issue-done' },
+      { name: 'ar-254-impl-pear', reason: 'issue-done' },
       { name: 'ar-254-review', reason: 'issue-done' },
     ])
     expect(factory.status().inFlight).toEqual([])
@@ -3904,7 +4137,7 @@ describe('FactoryLoop', () => {
     const issue = realIssueFile(256, ready, { title: 'Real implementer draft PR exit' })
     const mount = new FakeMountClient({ [issuePath(256)]: issue })
     const fleet = new FakeFleetClient()
-    fleet.setSessionRef('ar-256-impl', 'session-impl-256')
+    fleet.setSessionRef('ar-256-impl-pear', 'session-impl-256')
     const probedIssues: string[] = []
     const factory = createFactory(config({
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -3920,7 +4153,7 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(256), issue))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-256-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-256-impl-pear', 'worker_exited')
     await flush()
 
     // A draft PR is not a completion signal: no done, no release; the exit falls
@@ -3929,7 +4162,7 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.done).toBeUndefined()
     expect(fleet.releases).toEqual([])
     expect(fleet.resumes).toEqual([{
-      name: 'ar-256-impl',
+      name: 'ar-256-impl-pear',
       sessionRef: 'session-impl-256',
       node: 'self',
       capability: 'spawn:codex',
@@ -3940,7 +4173,7 @@ describe('FactoryLoop', () => {
     const issue = realIssueFile(255, ready, { title: 'Real implementer crash resumes' })
     const mount = new FakeMountClient({ [issuePath(255)]: issue })
     const fleet = new FakeFleetClient()
-    fleet.setSessionRef('ar-255-impl', 'session-impl-255')
+    fleet.setSessionRef('ar-255-impl-pear', 'session-impl-255')
     const probedIssues: string[] = []
     const factory = createFactory(config({
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -3956,12 +4189,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(255), issue))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-255-impl', 'crash')
+    fleet.emitAgentExit('ar-255-impl-pear', 'crash')
     await flush()
 
     expect(probedIssues).toEqual(['AR-255'])
     expect(fleet.resumes).toEqual([{
-      name: 'ar-255-impl',
+      name: 'ar-255-impl-pear',
       sessionRef: 'session-impl-255',
       node: 'self',
       capability: 'spawn:codex',
@@ -3999,11 +4232,11 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(7), issueFile(7)))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-7-impl', 'crash')
+    fleet.emitAgentExit('ar-7-impl-pear', 'crash')
     await flush()
 
     expect(fleet.resumes).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-7-impl', 'ar-7-review', 'ar-7-impl'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-7-impl-pear', 'ar-7-review', 'ar-7-impl-pear'])
     expect(fleet.spawns.at(-1)?.invocationId).toContain(':restart:')
   })
 
@@ -4034,7 +4267,7 @@ describe('FactoryLoop', () => {
 
     expect(fleet.messages).toHaveLength(2)
     expect(fleet.messages[0]).toMatchObject({
-      to: 'ar-62-impl',
+      to: 'ar-62-impl-pear',
       from: 'factory',
       data: { issue: { key: 'AR-62' } },
     })
@@ -4057,12 +4290,12 @@ describe('FactoryLoop', () => {
       text: 'Review is queued for AR-62. Watch implementer PR handoff and report readiness.',
     })
     expect(fleet.inputs).toEqual([
-      { name: 'ar-62-impl', data: '\r' },
+      { name: 'ar-62-impl-pear', data: '\r' },
       { name: 'ar-62-review', data: '\r' },
     ])
     expect(fleet.deliveryEvents).toEqual([
-      { kind: 'injected', to: 'ar-62-impl', eventId: 'fake-1' },
-      { kind: 'input', name: 'ar-62-impl', data: '\r' },
+      { kind: 'injected', to: 'ar-62-impl-pear', eventId: 'fake-1' },
+      { kind: 'input', name: 'ar-62-impl-pear', data: '\r' },
       { kind: 'injected', to: 'ar-62-review', eventId: 'fake-2' },
       { kind: 'input', name: 'ar-62-review', data: '\r' },
     ])
@@ -4079,12 +4312,12 @@ describe('FactoryLoop', () => {
     expect(fleet.injectionAttempts).toBe(3)
     expect(factory.status().counters.injectionRegistrationLagRetries).toBe(1)
     expect(fleet.messages.map((message) => message.to)).toEqual([
-      'ar-67-impl',
-      'ar-67-impl',
+      'ar-67-impl-pear',
+      'ar-67-impl-pear',
       'ar-67-review',
     ])
     expect(fleet.inputs).toEqual([
-      { name: 'ar-67-impl', data: '\r' },
+      { name: 'ar-67-impl-pear', data: '\r' },
       { name: 'ar-67-review', data: '\r' },
     ])
   })
@@ -4110,12 +4343,12 @@ describe('FactoryLoop', () => {
     })
 
     expect(fleet.inputs).toEqual([
-      { name: 'ar-65-impl', data: '\r' },
+      { name: 'ar-65-impl-pear', data: '\r' },
       { name: 'ar-65-review', data: '\r' },
     ])
     expect(fleet.deliveryEvents).toEqual([
-      { kind: 'injected', to: 'ar-65-impl', eventId: 'fake-1' },
-      { kind: 'input', name: 'ar-65-impl', data: '\r' },
+      { kind: 'injected', to: 'ar-65-impl-pear', eventId: 'fake-1' },
+      { kind: 'input', name: 'ar-65-impl-pear', data: '\r' },
       { kind: 'injected', to: 'ar-65-review', eventId: 'fake-2' },
       { kind: 'input', name: 'ar-65-review', data: '\r' },
     ])
@@ -4129,12 +4362,12 @@ describe('FactoryLoop', () => {
     factory.on('error', (payload) => errors.push(payload))
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(63), issueFile(63))))
-    fleet.emitDeliveryFailed({ to: 'ar-63-impl', msgId: 'fake-1', reason: 'dropped' })
+    fleet.emitDeliveryFailed({ to: 'ar-63-impl-pear', msgId: 'fake-1', reason: 'dropped' })
     await flush()
 
     expect(fleet.messages).toHaveLength(3)
     expect(fleet.messages[2]).toMatchObject({
-      to: 'ar-63-impl',
+      to: 'ar-63-impl-pear',
       from: 'factory',
       data: { issue: { key: 'AR-63' } },
     })
@@ -4143,12 +4376,12 @@ describe('FactoryLoop', () => {
     expect(fleet.messages[2]!.text).toContain('Use `gh pr create --base main` and report the PR URL.')
     expect(fleet.messages[2]!.text).toContain('DM the reviewer `ar-63-review` when the PR is ready.')
     expect(fleet.inputs).toEqual([
-      { name: 'ar-63-impl', data: '\r' },
+      { name: 'ar-63-impl-pear', data: '\r' },
       { name: 'ar-63-review', data: '\r' },
-      { name: 'ar-63-impl', data: '\r' },
+      { name: 'ar-63-impl-pear', data: '\r' },
     ])
-    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-63-impl', eventId: 'fake-3' })
-    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-63-impl', data: '\r' })
+    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-63-impl-pear', eventId: 'fake-3' })
+    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-63-impl-pear', data: '\r' })
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-63' } })
   })
@@ -4169,7 +4402,7 @@ describe('FactoryLoop', () => {
       text: 'Review is queued for AR-64. Watch implementer PR handoff and report readiness.',
     })
     expect(fleet.inputs).toEqual([
-      { name: 'ar-64-impl', data: '\r' },
+      { name: 'ar-64-impl-pear', data: '\r' },
       { name: 'ar-64-review', data: '\r' },
       { name: 'ar-64-review', data: '\r' },
     ])
@@ -4207,12 +4440,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(36), issueFile(36)))
 
     await expect(factory.dispatch(decision)).rejects.toThrow(
-      'Dispatch spawn failed for AR-36/ar-36-impl (spawn:codex) cwd=/work/pear: spawnPty failed',
+      'Dispatch spawn failed for AR-36/ar-36-impl-pear (spawn:codex) cwd=/work/pear: spawnPty failed',
     )
     expect(errors).toHaveLength(1)
     expect(JSON.parse(JSON.stringify(errors[0]))).toMatchObject({
       issue: { key: 'AR-36' },
-      errorMessage: expect.stringContaining('Dispatch spawn failed for AR-36/ar-36-impl (spawn:codex) cwd=/work/pear'),
+      errorMessage: expect.stringContaining('Dispatch spawn failed for AR-36/ar-36-impl-pear (spawn:codex) cwd=/work/pear'),
       errorStack: expect.stringContaining('Caused by: Error: spawnPty failed: cwd does not exist'),
     })
   })
@@ -4321,7 +4554,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(decision)
     order.length = 0
-    fleet.emitAgentExit('ar-18-impl', 'issue-done')
+    fleet.emitAgentExit('ar-18-impl-pear', 'issue-done')
     await flush()
 
     expect(closeInputs).toEqual([{
@@ -4335,7 +4568,7 @@ describe('FactoryLoop', () => {
       'slack-root',
       'slack-reply',
       'probe-close',
-      'release:ar-18-impl',
+      'release:ar-18-impl-pear',
       'release:ar-18-review',
     ])
   })
@@ -4343,7 +4576,7 @@ describe('FactoryLoop', () => {
   it('does not treat a factory label as a synthetic probe marker', async () => {
     const labelOnlyIssue = realIssueFile(19, ready, {
       title: 'Label-scoped probe-shaped issue',
-      labels: [{ name: 'factory' }],
+      labels: [{ name: 'factory' }, { name: 'pear' }],
     })
     const mount = new FakeMountClient({
       [issuePath(19)]: labelOnlyIssue,
@@ -4372,12 +4605,12 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(19), labelOnlyIssue)))
-    fleet.emitAgentExit('ar-19-impl', 'issue-done')
+    fleet.emitAgentExit('ar-19-impl-pear', 'issue-done')
     await flush()
 
     expect(closeInputs).toEqual([])
     expect(fleet.releases).toEqual([
-      { name: 'ar-19-impl', reason: 'issue-done' },
+      { name: 'ar-19-impl-pear', reason: 'issue-done' },
       { name: 'ar-19-review', reason: 'issue-done' },
     ])
   })
@@ -4385,7 +4618,7 @@ describe('FactoryLoop', () => {
   it('completion releases and terminates tracked pair process trees', async () => {
     const mount = new FakeMountClient({ [issuePath(64)]: issueFile(64) })
     const fleet = new CapturedPidFleetClient([
-      { name: 'ar-64-impl', sessionRef: 'session-901969', pid: 901969 },
+      { name: 'ar-64-impl-pear', sessionRef: 'session-901969', pid: 901969 },
       { name: 'ar-64-review', sessionRef: 'session-902338', pid: 902338 },
     ])
     const children = new Map<number, number[]>([[901969, [901970]]])
@@ -4406,11 +4639,11 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(64), issueFile(64))))
-    fleet.emitAgentExit('ar-64-impl', 'issue-done')
+    fleet.emitAgentExit('ar-64-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(killed.filter((entry) => entry.signal === 'SIGKILL')).toHaveLength(3))
 
     expect(fleet.releases).toEqual([
-      { name: 'ar-64-impl', reason: 'issue-done' },
+      { name: 'ar-64-impl-pear', reason: 'issue-done' },
       { name: 'ar-64-review', reason: 'issue-done' },
     ])
     expect(killed.filter((entry) => entry.signal === 'SIGTERM').map((entry) => entry.pid).sort((a, b) => a - b)).toEqual([
@@ -4444,7 +4677,7 @@ describe('FactoryLoop', () => {
     })
     const fleet = new FakeFleetClient()
     for (const n of [351, 352, 353]) {
-      fleet.setSessionRef(`ar-${n}-impl`, `session-ar-${n}-impl`)
+      fleet.setSessionRef(`ar-${n}-impl-pear`, `session-ar-${n}-impl-pear`)
       fleet.setSessionRef(`ar-${n}-review`, `session-ar-${n}-review`)
     }
     const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
@@ -4470,7 +4703,7 @@ describe('FactoryLoop', () => {
     }
 
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-351', 'AR-352'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-353-impl')
+    expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-353-impl-pear')
 
     await factory.runLoop({ maxIterations: 1 })
 
@@ -4479,12 +4712,12 @@ describe('FactoryLoop', () => {
       { repo: 'AgentWorkforce/pear', prNumber: 352, expectedIssueKey: 'AR-352', requireTitleMarker: false },
     ])
     expect(fleet.releases.filter((release) => release.reason === 'issue-done').map((release) => release.name)).toEqual([
-      'ar-351-impl',
+      'ar-351-impl-pear',
       'ar-351-review',
-      'ar-352-impl',
+      'ar-352-impl-pear',
       'ar-352-review',
     ])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-353-impl')
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-353-impl-pear')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-353'])
     expect(factory.status().queued).toEqual([])
     expect(factory.status().counters.completionSweepCompleted).toBe(2)
@@ -4610,7 +4843,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(354), issueFile(354))))
     const sweep = factory.runLoop({ maxIterations: 1 })
     await probeCloseStarted
-    fleet.emitAgentExit('ar-354-impl', 'issue-done')
+    fleet.emitAgentExit('ar-354-impl-pear', 'issue-done')
     await flush()
     releaseProbeClose()
     await sweep
@@ -4622,7 +4855,7 @@ describe('FactoryLoop', () => {
       requireTitleMarker: false,
     }])
     expect(fleet.releases.filter((release) => release.reason === 'issue-done').map((release) => release.name)).toEqual([
-      'ar-354-impl',
+      'ar-354-impl-pear',
       'ar-354-review',
     ])
     expect(factory.status().counters.done).toBe(1)
@@ -4654,7 +4887,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(240), realMergeIssueFile(240))))
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-240-impl', 'ar-240-review'])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-240-impl-pear', 'ar-240-review'])
     expect(gate.checks).toEqual([])
     expect(gate.merges).toEqual([])
     expect(factory.status().inFlight).toEqual([])
@@ -4687,7 +4920,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(243), realMergeIssueFile(243))))
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-243-impl', 'ar-243-review'])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-243-impl-pear', 'ar-243-review'])
     expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-human-review', 'issue-human-review'])
     expect(gate.checks).toEqual([])
     expect(gate.merges).toEqual([])
@@ -4828,7 +5061,7 @@ describe('FactoryLoop', () => {
       { repo: 'AgentWorkforce/pear', prNumber: 856, expectedIssueKey: 'AR-355', requireTitleMarker: false },
       { repo: 'AgentWorkforce/pear', prNumber: 857, expectedIssueKey: 'AR-356', requireTitleMarker: false },
     ])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-357-impl')
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-357-impl-pear')
     expect(factory.status().counters.probePrGhResolveHits).toBe(2)
   })
 
@@ -5050,7 +5283,7 @@ describe('FactoryLoop', () => {
       },
     })
     await markedFactory.dispatch(await markedFactory.triageIssue(parseLinearIssue(issuePath(19), issueFile(19))))
-    markedFleet.emitAgentExit('ar-19-impl', 'issue-done')
+    markedFleet.emitAgentExit('ar-19-impl-pear', 'issue-done')
     await flush()
     expect(markedCalls).toEqual([{
       repo: 'AgentWorkforce/pear',
@@ -5083,9 +5316,9 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(20), realMergeIssueFile(20))))
-    fleet.emitAgentExit('ar-20-impl', 'issue-done')
+    fleet.emitAgentExit('ar-20-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-20-impl', 'ar-20-review']))
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-20-impl-pear', 'ar-20-review']))
     expect(gate.checks).toHaveLength(12)
     expect(gate.merges).toEqual([])
   })
@@ -5109,9 +5342,9 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), realMergeIssueFile(21))))
-    fleet.emitAgentExit('ar-21-impl', 'issue-done')
+    fleet.emitAgentExit('ar-21-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-21-impl', 'ar-21-review']))
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-21-impl-pear', 'ar-21-review']))
     expect(gate.merges).toEqual([{
       repo: 'AgentWorkforce/pear',
       number: 21,
@@ -5140,9 +5373,9 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(22), realMergeIssueFile(22))))
-    fleet.emitAgentExit('ar-22-impl', 'issue-done')
+    fleet.emitAgentExit('ar-22-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-22-impl', 'ar-22-review']))
+    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-22-impl-pear', 'ar-22-review']))
     expect(gate.merges).toEqual([{
       repo: 'AgentWorkforce/pear',
       number: 22,
@@ -5205,7 +5438,7 @@ describe('FactoryLoop', () => {
       })
 
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(entry.n), issueFile(entry.n))))
-      fleet.emitAgentExit(`ar-${entry.n}-impl`, 'issue-done')
+      fleet.emitAgentExit(`ar-${entry.n}-impl-pear`, 'issue-done')
       await flush()
 
       expect(closeInputs).toEqual([{
@@ -5220,7 +5453,7 @@ describe('FactoryLoop', () => {
   it('does not close PRs for label-only non-synthetic issues', async () => {
     const issue = realIssueFile(230, ready, {
       title: 'Real product fix',
-      labels: [{ name: 'factory' }],
+      labels: [{ name: 'factory' }, { name: 'pear' }],
     })
     const mount = new FakeMountClient({
       [issuePath(230)]: issue,
@@ -5251,7 +5484,7 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(230), issue)))
-    fleet.emitAgentExit('ar-230-impl', 'issue-done')
+    fleet.emitAgentExit('ar-230-impl-pear', 'issue-done')
     await flush()
 
     expect(closeInputs).toEqual([])
@@ -5330,7 +5563,7 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(229), issueFile(229)))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-229-impl', 'issue-done')
+    fleet.emitAgentExit('ar-229-impl-pear', 'issue-done')
     await flush()
 
     expect(closeInputs).toEqual([{
@@ -5339,7 +5572,7 @@ describe('FactoryLoop', () => {
       expectedIssueKey: 'AR-229',
       requireTitleMarker: false,
     }])
-    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-229-impl', 'ar-229-review'])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-229-impl-pear', 'ar-229-review'])
   })
 
   it('skips Slack writeback while sync is stale, logs once, and keeps Linear dispatch core running', async () => {
@@ -5955,7 +6188,7 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), issueFile(21))))
-    fleet.emitAgentExit('ar-21-impl', 'issue-done')
+    fleet.emitAgentExit('ar-21-impl-pear', 'issue-done')
     await flush()
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-after-done'), 'slack-human-after-done', {
       text: 'please add one more test',
@@ -6012,7 +6245,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-24-impl', data: 'Slack reply for AR-24:\nPlease use the existing retry helper.\r' },
+      { name: 'ar-24-impl-pear', data: 'Slack reply for AR-24:\nPlease use the existing retry helper.\r' },
     ])
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
@@ -6030,7 +6263,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(36), issueFile(36))))
     fleet.emitAgentMessage({
-      from: 'ar-36-impl',
+      from: 'ar-36-impl-pear',
       target: 'broker',
       body: 'FACTORY_NEEDS_INPUT\nIssue: AR-36\nQuestion: Which retry helper should I use?',
       eventId: 'agent-question-36',
@@ -6042,7 +6275,7 @@ describe('FactoryLoop', () => {
       expect.objectContaining({
         content: expect.objectContaining({
           thread_ts: mount.threadTs,
-          text: 'AR-36: ar-36-impl needs input.\nQuestion: Which retry helper should I use?',
+          text: 'AR-36: ar-36-impl-pear needs input.\nQuestion: Which retry helper should I use?',
         }),
       }),
     ])
@@ -6050,7 +6283,7 @@ describe('FactoryLoop', () => {
     expect(slackAnswerInputs(fleet)).toEqual([])
 
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'bot-question-echo'), 'bot-question-echo', {
-      text: 'AR-36: ar-36-impl needs input.\nQuestion: Which retry helper should I use?',
+      text: 'AR-36: ar-36-impl-pear needs input.\nQuestion: Which retry helper should I use?',
       user: 'U0B2596R7EZ',
       user_is_bot: false,
     })
@@ -6067,7 +6300,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-36-impl', data: 'Slack reply for AR-36:\nUse the shared retry helper in factory.ts.\r' },
+      { name: 'ar-36-impl-pear', data: 'Slack reply for AR-36:\nUse the shared retry helper in factory.ts.\r' },
     ])
     expect(fleet.messages).toHaveLength(2)
   })
@@ -6083,7 +6316,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(37), issueFile(37))))
     fleet.emitAgentMessage({
-      from: 'ar-37-impl',
+      from: 'ar-37-impl-pear',
       target: 'ar-37-review',
       body: 'FACTORY_NEEDS_INPUT\nIssue: AR-37\nQuestion: should not bridge',
       eventId: 'agent-question-37',
@@ -6106,7 +6339,7 @@ describe('FactoryLoop', () => {
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(38), issueFile(38))))
     fleet.emitAgentMessage({
-      from: 'ar-38-impl',
+      from: 'ar-38-impl-pear',
       target: 'broker',
       body: 'FACTORY_NEEDS_INPUT\nIssue: AR-38\nQuestion: can anyone clarify?',
       eventId: 'agent-question-38',
@@ -6114,8 +6347,8 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-38-impl', 'ar-38-review'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-38-impl', 'ar-38-review'])
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
     expect(slackReplyWrites(mount)).toEqual([])
     expect(factory.status().counters.agentQuestionsSkippedNoSlack).toBe(1)
   })
@@ -6132,7 +6365,7 @@ describe('FactoryLoop', () => {
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
     fleet.emitAgentMessage({
-      from: 'ar-39-impl',
+      from: 'ar-39-impl-pear',
       target: 'factory',
       body: '[factory-needs-input] Can anyone clarify the expected retry behavior?',
       eventId: 'agent-question-39',
@@ -6140,8 +6373,8 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
 
-    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-39-impl', 'ar-39-review'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-39-impl', 'ar-39-review'])
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-39-impl-pear', 'ar-39-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-39-impl-pear', 'ar-39-review'])
     expect(mount.writes.filter((write) => isSlackRootWritePath(write.path) || write.path.includes('/replies/'))).toEqual([])
     expect(factory.status().counters.agentQuestionsSkippedSlackDegraded).toBe(1)
   })
@@ -6155,7 +6388,7 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
     })
     const question = {
-      from: 'ar-40-impl',
+      from: 'ar-40-impl-pear',
       target: 'factory',
       body: 'FACTORY_NEEDS_INPUT\nIssue: AR-40\nQuestion: Is this duplicate-safe?',
       eventId: 'agent-question-40',
@@ -6168,7 +6401,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
-      'AR-40: ar-40-impl needs input.\nQuestion: Is this duplicate-safe?',
+      'AR-40: ar-40-impl-pear needs input.\nQuestion: Is this duplicate-safe?',
     ])
     expect(factory.status().counters.agentQuestionsPostedToSlack).toBe(1)
     expect(factory.status().counters.agentQuestionDuplicatesSuppressed).toBe(1)
@@ -6196,7 +6429,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-32-impl', data: 'Slack reply for AR-32:\nstatus?\r' },
+      { name: 'ar-32-impl-pear', data: 'Slack reply for AR-32:\nstatus?\r' },
     ])
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
@@ -6287,7 +6520,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-35-impl', data: 'Slack reply for AR-35:\nstatus?\r' },
+      { name: 'ar-35-impl-pear', data: 'Slack reply for AR-35:\nstatus?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6383,7 +6616,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-27-impl', data: 'Slack reply for AR-27:\nnew status?\r' },
+      { name: 'ar-27-impl-pear', data: 'Slack reply for AR-27:\nnew status?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6411,7 +6644,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-28-impl', data: 'Slack reply for AR-28:\nstatus?\r' },
+      { name: 'ar-28-impl-pear', data: 'Slack reply for AR-28:\nstatus?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6451,7 +6684,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-42-impl', data: 'Slack reply for AR-42:\nstatus?\r' },
+      { name: 'ar-42-impl-pear', data: 'Slack reply for AR-42:\nstatus?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6478,7 +6711,7 @@ describe('FactoryLoop', () => {
       expect(mount.activeSubscriptions).toBe(0)
       expect(mount.unsubscribeCount).toBe(1)
       expect(fleet.releases).toEqual([
-        { name: 'ar-43-impl', reason: 'factory-stopped' },
+        { name: 'ar-43-impl-pear', reason: 'factory-stopped' },
         { name: 'ar-43-review', reason: 'factory-stopped' },
       ])
 
@@ -6500,8 +6733,8 @@ describe('FactoryLoop', () => {
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(29), issueFile(29))))
 
-    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-29-impl', 'ar-29-review'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-29-impl', 'ar-29-review'])
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-29-impl-pear', 'ar-29-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-29-impl-pear', 'ar-29-review'])
   })
 
   it('continues processing Slack reply events after one answer injection fails', async () => {
@@ -6530,7 +6763,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-30-impl', data: 'Slack reply for AR-30:\nstatus again?\r' },
+      { name: 'ar-30-impl-pear', data: 'Slack reply for AR-30:\nstatus again?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6578,7 +6811,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-31-impl', data: 'Slack reply for AR-31:\nstatus?\r' },
+      { name: 'ar-31-impl-pear', data: 'Slack reply for AR-31:\nstatus?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
     expect(warnings.flat()).not.toContain('[factory] Slack reply event missing stable identity; falling back to path/content dedupe')
@@ -6626,7 +6859,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
-    fleet.emitAgentExit('ar-401-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
 
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-401-babysit'))
 
@@ -6652,9 +6885,9 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(403), issue)))
-    fleet.emitAgentExit('ar-403-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-403-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-403-babysit'))
-    fleet.emitAgentExit('ar-403-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-403-impl-pear', 'worker_exited')
     await flush()
 
     expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
@@ -6677,7 +6910,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(402), issue)))
-    fleet.emitAgentExit('ar-402-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-402-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-402-babysit'))
 
     fleet.emitAgentMessage({ from: 'ar-402-babysit', target: 'factory', body: '[factory-pr-ready] AR-402' })
@@ -6686,7 +6919,7 @@ describe('FactoryLoop PR babysitter', () => {
     expect(states.at(-1)).toEqual({ key: 'AR-402', stateId: humanReviewStateId })
     expect(factory.status().counters.done).toBeUndefined()
     expect(ghCalls).toBe(0) // readiness comes from the webhook-fed mount + the babysitter's signal
-    expect(fleet.releases.map((r) => r.name).sort()).toEqual(['ar-402-babysit', 'ar-402-impl', 'ar-402-review'])
+    expect(fleet.releases.map((r) => r.name).sort()).toEqual(['ar-402-babysit', 'ar-402-impl-pear', 'ar-402-review'])
     expect(factory.status().inFlight).toEqual([])
   })
 
@@ -6706,7 +6939,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(407), issue)))
-    fleet.emitAgentExit('ar-407-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-407-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-407-babysit'))
 
     fleet.emitAgentMessage({ from: 'ar-407-babysit', target: 'factory', body: '[factory-pr-ready] AR-407' })
@@ -6732,7 +6965,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(405), issue)))
-    fleet.emitAgentExit('ar-405-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-405-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-405-babysit'))
 
     fleet.emitAgentMessage({ from: 'ar-405-babysit', target: 'factory', body: '[factory-pr-ready] AR-405' })
@@ -6887,7 +7120,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(406), issue)))
-    fleet.emitAgentExit('ar-406-impl', 'worker_exited')
+    fleet.emitAgentExit('ar-406-impl-pear', 'worker_exited')
 
     await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
     expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-406-babysit')

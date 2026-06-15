@@ -148,6 +148,7 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
+const MAX_LABEL_IMPLEMENTERS = 4
 const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 const GITHUB_FACTORY_LABEL = 'factory'
@@ -195,6 +196,10 @@ export class FactoryLoop implements Factory {
   readonly #seenAgentQuestionKeys = new Set<string>()
   readonly #seenAgentQuestionOrder: string[] = []
   readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
+  // Last invalid-label failure signature we posted per issue, so a stuck Ready
+  // issue (or the comment writeback's own change event) does not re-post the
+  // same notice every cycle. Cleared once the issue dispatches successfully.
+  readonly #labelDispatchFailures = new Map<string, string>()
   readonly #canonicalIssueStates = new Map<string, string>()
   readonly #dispatchFailureReaperHandoffs = new Map<string, RegistryHandoffAgent>()
   readonly #postMergeDoneAdvances = new Set<string>()
@@ -1057,13 +1062,44 @@ export class FactoryLoop implements Factory {
       return { issue: decision.issue, agents: [], dryRun }
     }
 
-    this.#recordDispatchAttempt(decision.issue)
-    const record = this.#batch.start(decision, dryRun)
+    // TODO(AR-274 follow-up): short-circuit LLM triage once label-derived
+    // routes are authoritative for dispatch identity.
+    const labelDispatch = labelDerivedDispatchDecision(liveIssue, decision, this.#config)
+    if (!labelDispatch.ok) {
+      const comment = labelDispatchFailureComment(decision.issue, labelDispatch)
+      this.#logger.warn?.('[factory] skipped dispatch due to invalid repo labels', {
+        issue: decision.issue.key,
+        labels: liveIssue.labels,
+        offendingLabels: labelDispatch.offendingLabels,
+        reason: labelDispatch.reason,
+      })
+      if (!dryRun) {
+        const signature = labelDispatchFailureSignature(labelDispatch)
+        if (this.#labelDispatchFailures.get(decision.issue.key) !== signature) {
+          try {
+            await this.#linear.postComment(liveIssue, comment)
+            // Record only after a successful post so a failed writeback retries
+            // next cycle rather than being suppressed as already-notified.
+            this.#labelDispatchFailures.set(decision.issue.key, signature)
+          } catch (error) {
+            this.#logger.warn?.('[factory] label dispatch block comment writeback skipped', error)
+          }
+        }
+      }
+      return { issue: decision.issue, agents: [], comments: [comment], dryRun }
+    }
+
+    const dispatchDecision = labelDispatch.decision
+    // A valid label resolution clears any prior failure notice so a later
+    // regression posts a fresh, actionable comment instead of being deduped.
+    this.#labelDispatchFailures.delete(dispatchDecision.issue.key)
+    this.#recordDispatchAttempt(dispatchDecision.issue)
+    const record = this.#batch.start(dispatchDecision, dryRun)
     if (!record) {
-      this.#clearDispatchInFlight(decision.issue)
+      this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
-      this.#emit('issue-queued', { issue: decision.issue })
-      return { issue: decision.issue, agents: [], dryRun }
+      this.#emit('issue-queued', { issue: dispatchDecision.issue })
+      return { issue: dispatchDecision.issue, agents: [], dryRun }
     }
 
     if (record.result) {
@@ -1073,7 +1109,7 @@ export class FactoryLoop implements Factory {
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
       const agents: DispatchResult['agents'] = []
-      for (const spec of [...decision.implementers, decision.reviewer]) {
+      for (const spec of [...dispatchDecision.implementers, dispatchDecision.reviewer]) {
         const spawned = await this.#spawnAgent(record, spec, dryRun)
         const tracked = record.agents.get(spawned.name)
         if (tracked) {
@@ -1088,11 +1124,11 @@ export class FactoryLoop implements Factory {
       }
       await this.#writeInFlightRegistry()
 
-      const comment = dispatchComment(decision, agents)
+      const comment = dispatchComment(dispatchDecision, agents)
       if (!dryRun) {
-        const issue = await this.#readIssue(decision.issue.path)
+        const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || issue.stateId !== this.#config.stateIds.readyForAgent) {
-          throw new Error(`Live state changed before writeback for ${decision.issue.key}`)
+          throw new Error(`Live state changed before writeback for ${dispatchDecision.issue.key}`)
         }
         try {
           await this.#linear.postComment(issue, comment)
@@ -1100,11 +1136,11 @@ export class FactoryLoop implements Factory {
           this.#logger.warn?.('[factory] comment writeback skipped', error)
         }
         await this.#linear.setState(issue, this.#config.stateIds.agentImplementing)
-        this.#emit('writeback-verified', { issue: decision.issue, path: issue.path })
+        this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
       const result = {
-        issue: decision.issue,
+        issue: dispatchDecision.issue,
         agents,
         comments: [comment],
         stateId: dryRun ? undefined : this.#config.stateIds.agentImplementing,
@@ -1112,7 +1148,7 @@ export class FactoryLoop implements Factory {
       }
       record.result = result
       this.#increment('dispatched')
-      this.#emit('dispatched', { issue: decision.issue, result })
+      this.#emit('dispatched', { issue: dispatchDecision.issue, result })
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result)
         await this.#sendImplementerTask(record)
@@ -3428,6 +3464,207 @@ const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agent
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
   `Reviewer: ${agents.find((agent) => agent.role === 'reviewer')?.name ?? 'none'}`,
 ].join('\n')
+
+type LabelDispatchResolution =
+  | { ok: true; decision: TriageDecision }
+  | {
+    ok: false
+    reason: 'no-labels' | 'unmapped-labels' | 'too-many-labels'
+    offendingLabels: string[]
+    maxImplementers?: number
+  }
+
+function labelDerivedDispatchDecision(
+  liveIssue: LinearIssue,
+  decision: TriageDecision,
+  config: FactoryConfig,
+): LabelDispatchResolution {
+  const routesByLabel = labelRoutesForIssue(liveIssue, config)
+
+  if (routesByLabel.labels.length === 0) {
+    return {
+      ok: false,
+      reason: 'no-labels',
+      offendingLabels: [],
+    }
+  }
+
+  if (routesByLabel.routes.length === 0) {
+    return {
+      ok: false,
+      reason: 'unmapped-labels',
+      offendingLabels: routesByLabel.offendingLabels.length > 0 ? routesByLabel.offendingLabels : routesByLabel.labels,
+    }
+  }
+
+  const maxImplementers = Math.min(config.triage.maxImplementers, MAX_LABEL_IMPLEMENTERS)
+  if (routesByLabel.routes.length > maxImplementers) {
+    return {
+      ok: false,
+      reason: 'too-many-labels',
+      offendingLabels: routesByLabel.routes.map((assignment) => assignment.slug),
+      maxImplementers,
+    }
+  }
+
+  const implementers = routesByLabel.routes.map(({ slug, route }) =>
+    routeImplementerSpec(liveIssue, config, slug, route),
+  )
+
+  return {
+    ok: true,
+    decision: {
+      ...decision,
+      routes: routesByLabel.routes.map(({ route }) => route),
+      scope: implementers.length >= 2 ? 'team' : 'single',
+      implementers,
+      reviewer: routeReviewerSpec(liveIssue, config, routesByLabel.routes[0]!.route, decision.reviewer),
+    },
+  }
+}
+
+function labelRoutesForIssue(
+  issue: LinearIssue,
+  config: FactoryConfig,
+): {
+  labels: string[]
+  offendingLabels: string[]
+  routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
+} {
+  const labels = uniqueNormalizedLabels(issue.labels)
+  const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
+  const offendingLabels: string[] = []
+  const seenRepos = new Set<string>()
+
+  for (const label of labels) {
+    const entry = findLabelRoute(config.repos.byLabel, label)
+    if (!entry) {
+      offendingLabels.push(label)
+      continue
+    }
+
+    const repo = entry.repo
+    if (seenRepos.has(repo)) {
+      continue
+    }
+
+    seenRepos.add(repo)
+    routes.push({
+      slug: entry.label,
+      route: {
+        repo,
+        clonePath: config.repos.clonePaths[repo],
+        rationale: `Label "${entry.label}" routes to ${repo}.`,
+      },
+    })
+  }
+
+  return { labels, offendingLabels, routes }
+}
+
+function routeImplementerSpec(
+  issue: LinearIssue,
+  config: FactoryConfig,
+  slug: string,
+  route: TriageDecision['routes'][number],
+): AgentSpec {
+  return {
+    name: `${agentBaseName(issue)}-impl-${sanitizeAgentSlug(slug)}`,
+    role: 'implementer',
+    capability: 'spawn:codex',
+    model: config.models.implementer,
+    task: taskForDispatch(issue, route, 'implementer'),
+    repo: route.repo,
+    clonePath: route.clonePath,
+    node: 'self',
+  }
+}
+
+function routeReviewerSpec(
+  issue: LinearIssue,
+  config: FactoryConfig,
+  route: TriageDecision['routes'][number],
+  reviewer: AgentSpec,
+): AgentSpec {
+  return {
+    ...reviewer,
+    name: `${agentBaseName(issue)}-review`,
+    role: 'reviewer',
+    capability: reviewer.capability ?? 'spawn:claude',
+    model: reviewer.model ?? config.models.reviewer,
+    task: taskForDispatch(issue, route, 'reviewer'),
+    repo: route.repo,
+    clonePath: route.clonePath,
+    node: reviewer.node ?? 'self',
+  }
+}
+
+function labelDispatchFailureSignature(resolution: Exclude<LabelDispatchResolution, { ok: true }>): string {
+  return `${resolution.reason}:${[...resolution.offendingLabels].sort().join(',')}`
+}
+
+function labelDispatchFailureComment(issue: IssueRef, resolution: Exclude<LabelDispatchResolution, { ok: true }>): string {
+  const lines = [`Factory dispatch for ${issue.key} skipped`]
+  if (resolution.reason === 'no-labels') {
+    lines.push('No Linear labels were present.')
+    lines.push('Add one repo label from factory.config.json repos.byLabel, then move the issue back to Ready for Agent.')
+  } else if (resolution.reason === 'too-many-labels') {
+    lines.push(`Too many repo labels matched dispatch: ${resolution.offendingLabels.join(', ')}.`)
+    lines.push(`Dispatch is capped at ${resolution.maxImplementers} implementer(s); scope the issue or raise triage.maxImplementers within the dispatch cap.`)
+  } else if (resolution.offendingLabels.length > 0) {
+    lines.push(`No repo labels matched factory.config.json repos.byLabel. Unmapped label(s): ${resolution.offendingLabels.join(', ')}.`)
+    lines.push('Update the labels or factory.config.json repos.byLabel, then move the issue back to Ready for Agent.')
+  } else {
+    lines.push('No repo labels matched factory.config.json repos.byLabel.')
+    lines.push('Update the labels or factory.config.json repos.byLabel, then move the issue back to Ready for Agent.')
+  }
+  return lines.join('\n')
+}
+
+function findLabelRoute(map: Record<string, string>, label: string): { label: string; repo: string } | undefined {
+  const exact = map[label]
+  if (exact) {
+    return { label, repo: exact }
+  }
+
+  const normalized = label.toLowerCase()
+  const entry = Object.entries(map).find(([candidate]) => candidate.toLowerCase() === normalized)
+  return entry ? { label: entry[0], repo: entry[1] } : undefined
+}
+
+function uniqueNormalizedLabels(labels: string[]): string[] {
+  const seen = new Set<string>()
+  const unique: string[] = []
+  for (const label of labels) {
+    const trimmed = label.trim()
+    const normalized = trimmed.toLowerCase()
+    if (!trimmed || seen.has(normalized)) {
+      continue
+    }
+    seen.add(normalized)
+    unique.push(trimmed)
+  }
+  return unique
+}
+
+function taskForDispatch(issue: LinearIssue, route: TriageDecision['routes'][number], role: AgentSpec['role']): string {
+  const verb = role === 'implementer' ? 'Implement' : role === 'babysitter' ? 'Babysit the PR for' : 'Review'
+  return [
+    `${verb} ${issue.key}: ${issue.title}`,
+    `Repo: ${route.repo}`,
+    `Route rationale: ${route.rationale}`,
+    issue.description,
+  ].join('\n\n')
+}
+
+function agentBaseName(issue: LinearIssue): string {
+  const number = issue.key.match(/\d+/)?.[0] ?? sanitizeAgentSlug(issue.key)
+  return `ar-${number}`
+}
+
+function sanitizeAgentSlug(slug: string): string {
+  return slug.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'scope'
+}
 
 const templateIssueFromRecord = (record: InFlightIssue, issue: LinearIssue | undefined) => ({
   key: issue?.key ?? record.issue.key,
