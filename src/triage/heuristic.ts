@@ -289,8 +289,28 @@ function reviewerSpec(issue: LinearIssue, config: FactoryConfig, route?: Route):
   }
 }
 
-function taskFor(issue: LinearIssue, route: Route, role: 'implementer' | 'reviewer'): string {
-  const verb = role === 'implementer' ? 'Implement' : 'Review'
+/**
+ * Build the babysitter agent spec for an issue. Unlike the implementer/reviewer,
+ * this is NOT spawned at dispatch time — the orchestrator spawns it lazily once
+ * the PR opens (so it carries the original spec) and overwrites `.task` with the
+ * full babysitter prompt via renderAgentTask. Defaults to sonnet (models.babysitter).
+ */
+export function babysitterSpec(issue: LinearIssue, config: FactoryConfig, route?: Route): AgentSpec {
+  const repo = route?.repo ?? config.repos.default ?? 'unroutable'
+  return {
+    name: `${agentBaseName(issue)}-babysit`,
+    role: 'babysitter',
+    capability: 'spawn:claude',
+    model: config.models.babysitter,
+    task: taskFor(issue, route ?? { repo, clonePath: config.repos.clonePaths[repo], rationale: 'Babysit the open PR to Human Review.' }, 'babysitter'),
+    repo,
+    clonePath: route?.clonePath ?? config.repos.clonePaths[repo],
+    node: 'self',
+  }
+}
+
+function taskFor(issue: LinearIssue, route: Route, role: AgentSpec['role']): string {
+  const verb = role === 'implementer' ? 'Implement' : role === 'babysitter' ? 'Babysit the PR for' : 'Review'
   return [
     `${verb} ${issue.key}: ${issue.title}`,
     `Repo: ${route.repo}`,

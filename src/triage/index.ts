@@ -1,4 +1,4 @@
-export { HeuristicTriage } from './heuristic'
+export { HeuristicTriage, babysitterSpec } from './heuristic'
 export type { HeuristicTriageOptions } from './heuristic'
 export { LlmTriage, buildPrompt } from './llm'
 export type { LlmTriageOptions } from './llm'

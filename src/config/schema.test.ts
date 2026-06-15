@@ -27,7 +27,10 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.keywordRules).toEqual([])
     expect(parsed.repos.clonePaths).toEqual({})
     expect(parsed.batchSize).toBe(5)
-    expect(parsed.models).toEqual({})
+    expect(parsed.models).toEqual({ babysitter: 'sonnet' })
+    expect(parsed.babysitter).toEqual({ enabled: false })
+    expect(parsed.terminalState).toBe('human-review')
+    expect(parsed.stateIds.humanReview).toBeUndefined()
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
     expect(parsed.loop.maxConsecutiveFailures).toBe(3)
     expect(parsed.slack).toEqual({
@@ -64,6 +67,32 @@ describe('FactoryConfigSchema', () => {
       implementer: 'gpt-5-codex',
       reviewer: 'claude-opus-4-1',
     })
+  })
+
+  it('honors explicit babysitter, terminalState, and humanReview config', () => {
+    const parsed = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+        },
+      },
+      babysitter: { enabled: true },
+      terminalState: 'done',
+      models: { babysitter: 'claude-sonnet-4-6' },
+      stateIds: {
+        readyForAgent: 'state-ready',
+        agentImplementing: 'state-impl',
+        done: 'state-done',
+        inPlanning: 'state-plan',
+        humanReview: 'state-human-review',
+      },
+    })
+
+    expect(parsed.babysitter.enabled).toBe(true)
+    expect(parsed.terminalState).toBe('done')
+    expect(parsed.models.babysitter).toBe('claude-sonnet-4-6')
+    expect(parsed.stateIds.humanReview).toBe('state-human-review')
   })
 
   it('rejects batch sizes over five', () => {

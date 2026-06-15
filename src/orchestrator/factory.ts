@@ -20,7 +20,7 @@ import type { Clock, Logger } from '../ports/system'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { renderAgentTask } from '../dispatch/templates'
-import { HeuristicTriage, TieredTriage } from '../triage'
+import { HeuristicTriage, TieredTriage, babysitterSpec } from '../triage'
 import type {
   DispatchResult,
   Factory,
@@ -108,13 +108,14 @@ const ISSUE_ROOT = '/linear/issues'
 const GITHUB_ISSUE_ROOT = '/github/repos'
 const READY_EVENTS_LIMIT = 100
 const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
-// Subscribe broadly under /github/repos and let isGithubIssueFilePath()
-// re-validate the exact shape in the callback. globMatchesPath() treats a
-// non-terminal `**` as a single-segment wildcard, so a more specific glob like
-// `.../issues/**/*.json` would miss the two-segment <owner>/<repo> prefix and
-// the nested <number>__<slug>/meta.json (and directory) event shapes this
-// factory now accepts. A terminal `**` prefix-matches every descendant, so all
-// supported path variants reach the handler.
+// Subscribe broadly under /github/repos and let isGithubIssueFilePath() /
+// githubPullPathParts() re-validate the exact shape in the callback.
+// globMatchesPath() treats a non-terminal `**` as a single-segment wildcard, so
+// a more specific glob like `.../issues/**/*.json` would miss the two-segment
+// <owner>/<repo> prefix and the nested <number>__<slug>/meta.json (and
+// directory) event shapes this factory accepts. A terminal `**` prefix-matches
+// every descendant, so all supported issue AND pull-request path variants reach
+// the handler — including the PR change events the babysitter reacts to.
 export const LIVE_GITHUB_ISSUE_GLOB = `${GITHUB_ISSUE_ROOT}/**`
 const LIVE_DEDUPE_LIMIT = 5_000
 const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
@@ -134,6 +135,10 @@ const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 const AGENT_QUESTION_DEDUPE_LIMIT = 500
 const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
 const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
+// The babysitter DMs `factory` with this marker once it believes the PR is
+// green; the orchestrator confirms readiness with one authoritative gh read
+// before transitioning the issue to Human Review.
+const AGENT_PR_READY_MARKER = '[factory-pr-ready]'
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
 const INJECTION_RETRY_DELAY_MS = 1_000
@@ -221,6 +226,12 @@ export class FactoryLoop implements Factory {
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
+  // Issue keys for which a babysitter has already been spawned, so repeated PR
+  // webhooks / agent-exit safety nets don't respawn it.
+  readonly #babysitterSpawned = new Set<string>()
+  // Issue key -> the open PR the babysitter is shepherding, including the
+  // webhook-fed mount path so readiness can re-read PR meta without a gh call.
+  readonly #babysitterPr = new Map<string, { repo: string; prNumber: number; path?: string }>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
@@ -334,6 +345,8 @@ export class FactoryLoop implements Factory {
       this.#livePollInFlight = false
       this.#liveEventQueue.length = 0
       this.#completionInFlight.clear()
+      this.#babysitterSpawned.clear()
+      this.#babysitterPr.clear()
       const subscription = this.#subscription
       this.#subscription = undefined
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
@@ -404,6 +417,9 @@ export class FactoryLoop implements Factory {
     // pull finishes; batch dedupe then suppresses any overlap with what the
     // pull already dispatched.
     if (options.transport !== 'poll') {
+      // LIVE_GITHUB_ISSUE_GLOB is a terminal `${GITHUB_ISSUE_ROOT}/**`, so it
+      // already covers the PR change events the babysitter consumes; pull-event
+      // *processing* is gated on babysitter.enabled in #prepareLiveEventForDrain.
       this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB, LIVE_GITHUB_ISSUE_GLOB], (event) => {
         this.#enqueueLiveEvent(event)
       }, { from: 'now', coalesce: 'none' })
@@ -646,7 +662,10 @@ export class FactoryLoop implements Factory {
 
   #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): string | undefined {
     const path = event.resource.path
-    if (!isIssueFilePath(path) && !isGithubIssueFilePath(path)) {
+    // PR change events only matter when the babysitter is enabled; ignore them
+    // otherwise so the legacy completion path is untouched.
+    const isPullPath = this.#config.babysitter.enabled && isGithubPullFilePath(path)
+    if (!isIssueFilePath(path) && !isGithubIssueFilePath(path) && !isPullPath) {
       return undefined
     }
 
@@ -705,6 +724,19 @@ export class FactoryLoop implements Factory {
       return path
     }
 
+    if (isPullPath) {
+      // Dedupe PR change events by path within a drain; the babysitter routing
+      // re-derives the issue from the PR head ref downstream.
+      const sourceKey = `pull:${path}`
+      if (seenIssueKeys.has(sourceKey)) {
+        this.#increment('liveDuplicatePrEventsSuppressed')
+        return undefined
+      }
+      seenIssueKeys.add(sourceKey)
+      this.#recordArrivalLatency(event)
+      return path
+    }
+
     const issueKey = keyFromPath(path)
     if (seenIssueKeys.has(issueKey)) {
       this.#increment('liveDuplicateIssueEventsSuppressed')
@@ -733,6 +765,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #handlePreparedLiveChange(path: string): Promise<void> {
+    if (this.#config.babysitter.enabled && isGithubPullFilePath(path)) {
+      await this.#handlePrChange(path)
+      return
+    }
     if (isGithubIssueFilePath(path)) {
       await this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
       return
@@ -759,6 +795,13 @@ export class FactoryLoop implements Factory {
   }
 
   async #sweepPrStateCompletions(reason: 'live-timer' | 'run-loop'): Promise<void> {
+    // When the babysitter owns PR-open, completion is driven by PR webhooks +
+    // the babysitter's readiness signal (see #handlePrChange / #handleAgentExit),
+    // not this polling sweep. Disabling it here is what makes the babysitter path
+    // webhook-driven rather than polled.
+    if (this.#config.babysitter.enabled) {
+      return
+    }
     if (this.#completionSweepActive) {
       return
     }
@@ -1889,18 +1932,36 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    const exiting = record.agents.get(name)
+
     if (isCompletionReason(reason)) {
+      if (this.#config.babysitter.enabled && !record.dryRun) {
+        // Babysitter path: an implementer/reviewer finishing does NOT mark the
+        // issue done — it hands the open PR to the babysitter. The babysitter
+        // itself finishing means it believes the PR is ready, so re-check and
+        // advance to Human Review.
+        if (exiting?.spec.role === 'babysitter') {
+          await this.#maybeAdvanceToHumanReview(record)
+        } else {
+          await this.#ensureBabysitterForIssue(record)
+        }
+        return
+      }
       await this.#completeIssue(record)
       return
     }
 
-    const tracked = record.agents.get(name)
+    const tracked = exiting
     if (!tracked || record.dryRun) {
       return
     }
 
     try {
       if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+        if (this.#config.babysitter.enabled) {
+          await this.#ensureBabysitterForIssue(record)
+          return
+        }
         await this.#completeIssue(record)
         return
       }
@@ -2025,6 +2086,25 @@ export class FactoryLoop implements Factory {
   }
 
   async #handleAgentMessage(message: AgentMessage): Promise<void> {
+    // The babysitter signals "PR is green" by DMing factory. Confirm with an
+    // authoritative readiness read before advancing to Human Review.
+    if (this.#config.babysitter.enabled && isFactoryQuestionTarget(message.target)) {
+      const ready = parsePrReadySignal(message)
+      if (ready) {
+        const record = this.#batch.getIssueByAgent(ready.agentName)
+        if (!record || record.dryRun) {
+          this.#increment('prReadySignalsIgnoredNoInFlight')
+          return
+        }
+        if (ready.issueKey && ready.issueKey !== record.issue.key) {
+          this.#increment('prReadySignalsIgnoredIssueMismatch')
+          return
+        }
+        await this.#maybeAdvanceToHumanReview(record)
+        return
+      }
+    }
+
     const question = parseAgentQuestion(message)
     if (!question || !isFactoryQuestionTarget(message.target)) {
       return
@@ -2177,7 +2257,7 @@ export class FactoryLoop implements Factory {
           issue: templateIssueFromRecord(record, issue),
           route: routeForImplementer(record, implementer.spec),
           role: 'implementer',
-          config: { mergePolicy: this.#config.mergePolicy },
+          config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
           reviewerName,
           implementerNames,
           slackDispatchThread: this.#slackDispatchThreadFor(record),
@@ -2256,17 +2336,236 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #completeIssue(record: InFlightIssue): Promise<void> {
+  // ── PR babysitter ──────────────────────────────────────────────────────────
+  // Webhook-driven: a change event on the PR's webhook-fed mount file
+  // (/github/repos/<owner>/<repo>/pulls/<n>/meta.json) — PR opened, new commits,
+  // draft toggle, closed/merged — routes here. The PR readiness *verdict* (CI
+  // green, conflicts resolved, comments addressed) is owned by the babysitter
+  // agent, which sees the same per-event webhook data in its sandbox and signals
+  // `[factory-pr-ready]`; the orchestrator never runs `gh`. PR meta events here
+  // only (a) spawn the babysitter on open and (b) carry the latest open/draft/
+  // merged state used to guard the final transition.
+  async #handlePrChange(path: string): Promise<void> {
+    const parts = githubPullPathParts(path)
+    if (!parts) {
+      return
+    }
+
+    let snapshot: PullSnapshot | undefined
+    try {
+      snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, parts.number)
+    } catch (error) {
+      this.#logger.debug?.('[factory] babysitter could not read PR snapshot', { path, error: describeError(error).errorMessage })
+      return
+    }
+    if (!snapshot) {
+      return
+    }
+
+    // Map the PR to an in-flight issue by its head ref (reuses the existing
+    // key matcher; no branch-naming assumption).
+    const headRef = snapshot.headRef ?? ''
+    const record = this.#batch.inFlight.find((candidate) =>
+      !candidate.dryRun && headRef && containsIssueKey(headRef, candidate.issue.key))
+    if (!record) {
+      return
+    }
+
+    if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
+      // Closed/merged PR — completion of Human Review -> Done stays with the
+      // merge gate / the operator; nothing for the babysitter to spawn.
+      return
+    }
+    if (snapshot.draft) {
+      this.#increment('babysitterDraftPrSkipped')
+      return
+    }
+
+    await this.#ensureBabysitter(record, { repo: `${parts.owner}/${parts.repo}`, prNumber: snapshot.number, url: snapshot.url, path })
+  }
+
+  // Safety net for a missed PR-open mount event: resolve the PR via the existing
+  // probe resolver and spawn the babysitter. Triggered by an implementer exiting
+  // after opening its PR (an event, not a poll).
+  async #ensureBabysitterForIssue(record: InFlightIssue): Promise<void> {
+    if (this.#babysitterSpawned.has(record.issue.key)) {
+      return
+    }
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue) {
+      return
+    }
+    const pr = await this.#completionPrForIssue(issue)
+    if (!pr || pr.draft) {
+      return
+    }
+    await this.#ensureBabysitter(record, { repo: pr.repo, prNumber: pr.prNumber })
+  }
+
+  async #ensureBabysitter(record: InFlightIssue, prRef: { repo: string; prNumber: number; url?: string; path?: string }): Promise<void> {
+    this.#babysitterPr.set(record.issue.key, { repo: prRef.repo, prNumber: prRef.prNumber, path: prRef.path })
+    if (this.#babysitterSpawned.has(record.issue.key)) {
+      return
+    }
+    if ([...record.agents.values()].some((agent) => agent.spec.role === 'babysitter')) {
+      this.#babysitterSpawned.add(record.issue.key)
+      return
+    }
+    // Reserve up-front so concurrent PR events in a drain don't double-spawn.
+    this.#babysitterSpawned.add(record.issue.key)
+
+    try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) {
+        this.#babysitterSpawned.delete(record.issue.key)
+        return
+      }
+
+      const route = record.decision.routes.find((candidate) => candidate.repo === prRef.repo)
+        ?? record.decision.routes[0]
+      const spec = babysitterSpec(issue, this.#config, route)
+      const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
+      const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name ?? `${spec.name.replace(/-babysit$/, '')}-review`
+      const implementerNames = [...record.agents.values()]
+        .filter((agent) => agent.spec.role === 'implementer')
+        .map((agent) => agent.result?.name ?? agent.spec.name)
+      const task = renderAgentTask({
+        issue: templateIssueFromRecord(record, issue),
+        route: route ?? { repo: prRef.repo },
+        role: 'babysitter',
+        config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
+        reviewerName,
+        implementerNames,
+        pr: { number: prRef.prNumber, url: prRef.url },
+        slackDispatchThread: this.#slackDispatchThreadFor(record),
+      })
+
+      const spawned = await this.#spawnAgent(record, { ...spec, task }, false)
+      await this.#writeInFlightRegistry()
+      this.#increment('babysittersSpawned')
+      this.#logger.info?.('[factory] babysitter spawned for open PR', {
+        issue: record.issue.key,
+        repo: prRef.repo,
+        prNumber: prRef.prNumber,
+        babysitter: spawned.name,
+      })
+
+      if (this.#fleet.waitForInjected) {
+        const tracked = record.agents.get(spawned.name)
+        const input = {
+          to: tracked?.result?.name ?? spawned.name,
+          text: task,
+          from: 'factory',
+          data: { issue: record.issue },
+        }
+        const ack = await this.#waitForInjectedAndSubmit(input)
+        this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+      }
+    } catch (error) {
+      // Allow a later event to retry the spawn.
+      this.#babysitterSpawned.delete(record.issue.key)
+      this.#increment('babysitterSpawnFailures')
+      this.#error(error, record.issue)
+    }
+  }
+
+  // The babysitter owns the readiness verdict (CI green + conflicts resolved +
+  // review comments addressed) — it sees the per-event PR webhook data in its
+  // sandbox, exactly like AgentWorkforce/agents review. It signals readiness by
+  // DMing `[factory-pr-ready]`. The orchestrator trusts that signal and only
+  // guards on the PR's OWN webhook-fed meta (still open, not a draft, not already
+  // merged) before flipping the issue to Human Review. No `gh` call.
+  async #maybeAdvanceToHumanReview(record: InFlightIssue): Promise<void> {
+    if (this.#completionInFlight.has(issueKey(record.issue))) {
+      return
+    }
+
+    const snapshot = await this.#readBabysatPrSnapshot(record)
+    if (snapshot) {
+      const guard = prMetaAllowsHumanReview(snapshot)
+      if (!guard.ok) {
+        this.#increment('babysitterReadinessGuardBlocked')
+        this.#logger.info?.('[factory] babysitter ready signal ignored; PR meta not eligible', {
+          issue: record.issue.key,
+          reason: guard.reason,
+        })
+        return
+      }
+    }
+
+    this.#increment('babysitterReadinessReady')
+    this.#logger.info?.('[factory] babysitter signalled PR ready; advancing to human review', {
+      issue: record.issue.key,
+      prMetaChecked: Boolean(snapshot),
+    })
+    await this.#completeIssue(record, { humanReview: true })
+  }
+
+  // Re-read the babysat PR's webhook-fed meta from the mount (no gh). Prefers the
+  // exact path captured when the babysitter was spawned; otherwise scans the
+  // repo's pulls subtree for the PR number across known layout shapes.
+  async #readBabysatPrSnapshot(record: InFlightIssue): Promise<PullSnapshot | undefined> {
+    const ref = this.#babysitterPr.get(record.issue.key)
+    if (!ref) {
+      return undefined
+    }
+    const candidatePaths = ref.path ? [ref.path] : await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
+    for (const path of candidatePaths) {
+      try {
+        const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, ref.prNumber)
+        if (snapshot) {
+          return snapshot
+        }
+      } catch {
+        // try the next candidate path
+      }
+    }
+    return undefined
+  }
+
+  async #pullMetaPathsFor(repo: string, prNumber: number): Promise<string[]> {
+    const [owner, name] = repo.split('/')
+    if (!owner || !name) {
+      return []
+    }
+    // Scan both the nested <owner>/<repo> and the flat <owner>__<repo> pulls
+    // roots so the readiness guard finds the PR meta regardless of mount layout.
+    const roots = [`/github/repos/${owner}/${name}/pulls/`, `/github/repos/${owner}__${name}/pulls/`]
+    // Match .../pulls/<n>(__slug)?(/...)? for this PR number, in either the
+    // nested directory or flat <n>.json / by-id/<n>.json forms.
+    const numberSegment = new RegExp(`/pulls/(?:by-id/)?${prNumber}(?:__[^/]*)?(?:/|\\.json$)`, 'u')
+    const found: string[] = []
+    for (const root of roots) {
+      try {
+        const tree = await this.#mount.listTree(root)
+        found.push(...tree.filter((path) => path.endsWith('.json') && numberSegment.test(path)))
+      } catch {
+        // try the next root
+      }
+    }
+    return found
+  }
+
+  async #completeIssue(record: InFlightIssue, opts: { humanReview?: boolean } = {}): Promise<void> {
     const completionKey = issueKey(record.issue)
     if (this.#completionInFlight.has(completionKey)) {
       return
     }
     this.#completionInFlight.add(completionKey)
+    // Land in `human-review` only when the operator opted into that terminal
+    // state AND configured its UUID; otherwise fall back to `done` (the legacy
+    // terminal) so an operator who sets terminalState: 'done' keeps it and the
+    // issue never gets stuck waiting on an unconfigured state.
+    const humanReview = opts.humanReview === true &&
+      this.#config.terminalState === 'human-review' &&
+      Boolean(this.#config.stateIds.humanReview)
+    const targetState = humanReview ? this.#config.stateIds.humanReview! : this.#config.stateIds.done
+    const statusLabel = humanReview ? 'in human review' : 'done'
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (issue) {
-        await this.#linear.setState(issue, this.#config.stateIds.done)
-        this.#recordCanonicalIssueState({ key: issue.key, stateId: this.#config.stateIds.done })
+        await this.#linear.setState(issue, targetState)
+        this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
       }
 
@@ -2274,21 +2573,24 @@ export class FactoryLoop implements Factory {
         try {
           const root = await this.#slack.postThread({
             channel: this.#config.slack.channel,
-            text: `${record.issue.key}: factory agents completed.\nStatus: done\nMerge policy: ${this.#config.mergePolicy}`,
+            text: `${record.issue.key}: factory agents completed.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`,
           })
-          await this.#slack.reply(root.threadId, `${record.issue.key}: Linear state set to done.`)
+          await this.#slack.reply(root.threadId, `${record.issue.key}: Linear state set to ${statusLabel}.`)
           this.#recordSlackWritebackSuccess('completion-thread')
         } catch (error) {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
       }
-      if (issue) {
+      // Only auto-merge on the `done` terminal path. Human Review parks the PR
+      // for an operator — the merge gate (which requires an APPROVED review)
+      // would refuse anyway, and we must not merge before the human has looked.
+      if (issue && !humanReview) {
         await this.#runCompletionMergeGate(issue)
       }
 
-      await this.#releaseAndTerminateAgents([...record.agents], 'issue-done', 'completion')
+      await this.#releaseAndTerminateAgents([...record.agents], humanReview ? 'issue-human-review' : 'issue-done', 'completion')
 
-      this.#increment('done')
+      this.#increment(humanReview ? 'humanReview' : 'done')
       this.#emit('issue-done', { issue: record.issue })
       await this.#stopSlackWatcher(record.issue)
       this.#recordDispatchTerminal(record.issue)
@@ -2303,6 +2605,8 @@ export class FactoryLoop implements Factory {
       this.#completionInFlight.delete(completionKey)
       this.#probePrGhBackoffUntilMs.delete(completionKey)
       this.#probePrResolvedCache.delete(completionKey)
+      this.#babysitterSpawned.delete(record.issue.key)
+      this.#babysitterPr.delete(record.issue.key)
     }
   }
 
@@ -2765,19 +3069,21 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const implementers = [...liveRecord.agents.values()]
-      .filter((agent) => agent.spec.role === 'implementer')
+    // Route human replies to the implementers AND the babysitter — once a PR is
+    // open the babysitter is the one chatting with the human about it.
+    const recipients = [...liveRecord.agents.values()]
+      .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
       .map((agent) => agent.result?.name ?? agent.spec.name)
       .filter((name): name is string => Boolean(name))
 
-    if (implementers.length === 0) {
+    if (recipients.length === 0) {
       this.#increment('slackAnswersIgnoredNoImplementer')
       return
     }
 
     const input = slackAnswerInput(liveRecord.issue, text)
-    for (const implementer of new Set(implementers)) {
-      await this.#fleet.sendInput(implementer, input)
+    for (const recipient of new Set(recipients)) {
+      await this.#fleet.sendInput(recipient, input)
       this.#increment('slackAnswersInjected')
     }
   }
@@ -3344,6 +3650,62 @@ const isGithubIssueFilePath = (path: string): boolean =>
 const isGithubIssueTreePath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/issues\/.+/u.test(path)
 
+const githubPullPathParts = (path: string): { owner: string; repo: string; number: number } | undefined => {
+  // Tolerate every webhook-fed PR mount layout we've seen, across both the
+  // nested <owner>/<repo> directory shape and the flat <owner>__<repo> shape
+  // (the latter is what githubPullRoot / resolveIssuePrFromMount still use):
+  //   .../<owner>/<repo>/pulls/<n>__<slug>/meta.json   (current adapters shape)
+  //   .../<owner>__<repo>/pulls/by-id/<n>.json         (flat mount shape)
+  //   .../pulls/<n>/meta.json | metadata.json | .../pulls/<n>.json   (variants)
+  // Deliberately ignores siblings like pulls/_index.json and pulls/<n>/comments/*.
+  const match = path.match(
+    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([^/]+)__([^/]+))\/pulls\/(?:by-id\/)?(\d+)(?:__[^/]*)?(?:\/(?:meta|metadata)\.json|\.json)$/u,
+  )
+  if (!match) return undefined
+  const owner = match[1] ?? match[3]
+  const repo = match[2] ?? match[4]
+  if (!owner || !repo) return undefined
+  return { owner, repo, number: Number(match[5]) }
+}
+
+const isGithubPullFilePath = (path: string): boolean =>
+  githubPullPathParts(path) !== undefined
+
+type PullSnapshot = { number: number; state?: string; headRef?: string; draft?: boolean; url?: string; title?: string; merged?: boolean }
+
+const parsePullSnapshot = (content: unknown, fallbackNumber: number): PullSnapshot | undefined => {
+  const payload = wrappedPayload(content)
+  const number = typeof payload.number === 'number' ? payload.number : fallbackNumber
+  if (!Number.isInteger(number) || number <= 0) return undefined
+  return {
+    number,
+    state: stringValue(payload.state),
+    headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? stringValue(payload.headRefName),
+    draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
+    url: stringValue(payload.url) ?? stringValue(payload.html_url),
+    title: stringValue(payload.title),
+    merged: booleanValue(payload.merged),
+  }
+}
+
+// Guard applied to the babysitter's ready signal: the PR's own webhook-fed meta
+// must still be eligible for human review. A missing `state` is treated as open
+// (older mount layouts omit it). The CI/conflict/review verdict is NOT re-derived
+// here — the babysitter already owns it.
+const prMetaAllowsHumanReview = (snapshot: PullSnapshot): { ok: boolean; reason: string } => {
+  const state = snapshot.state?.trim().toUpperCase()
+  if (state && state !== 'OPEN') {
+    return { ok: false, reason: `pr state is ${state}` }
+  }
+  if (snapshot.merged === true) {
+    return { ok: false, reason: 'pr already merged' }
+  }
+  if (snapshot.draft === true) {
+    return { ok: false, reason: 'pr is a draft' }
+  }
+  return { ok: true, reason: 'pr open and not a draft' }
+}
+
 const isIssueAliasFilePath = (path: string): boolean =>
   path.startsWith(linearByStatePath('ready-for-agent')) &&
   path.endsWith('.json') &&
@@ -3607,7 +3969,13 @@ const isAgentAlreadyExistsError = (error: unknown): boolean => {
 }
 
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
-  spec.role === 'implementer' ? { maxRestarts: 3, strategy: 'resume' } as AgentSpec['restartPolicy'] : spec.restartPolicy
+  // Implementers and babysitters are both long-running and resumable — the
+  // babysitter shepherds an open PR over many CI/review cycles, so an abnormal
+  // exit should resume its session rather than drop the PR. The reviewer is
+  // short-lived and keeps the fleet default.
+  spec.role === 'implementer' || spec.role === 'babysitter'
+    ? { maxRestarts: 3, strategy: 'resume' } as AgentSpec['restartPolicy']
+    : spec.restartPolicy
 
 const slackPayloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
 
@@ -3752,6 +4120,18 @@ const parseAgentQuestion = (message: AgentMessage): AgentQuestion | undefined =>
     question,
     eventId: message.eventId,
   }
+}
+
+const parsePrReadySignal = (message: AgentMessage): { agentName: string; issueKey?: string } | undefined => {
+  if (!message.from.trim()) {
+    return undefined
+  }
+  const markerPattern = new RegExp(`(^|\\n|\\s)${escapeRegExp(AGENT_PR_READY_MARKER)}\\s*(?::\\s*)?([A-Z]+-\\d+)?`, 'iu')
+  const match = markerPattern.exec(message.body)
+  if (!match) {
+    return undefined
+  }
+  return { agentName: message.from.trim(), issueKey: match[2]?.toUpperCase() }
 }
 
 const extractQuestionText = (bodyAfterMarker: string): string => {

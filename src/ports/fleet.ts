@@ -52,7 +52,7 @@ export interface FleetClient {
 
 export type AgentSpec = {
   name: string
-  role: 'implementer' | 'reviewer'
+  role: 'implementer' | 'reviewer' | 'babysitter'
   capability: Capability
   model?: string
   task: string

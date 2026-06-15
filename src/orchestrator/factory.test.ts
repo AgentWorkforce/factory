@@ -6518,6 +6518,240 @@ describe('FactoryLoop', () => {
   })
 })
 
+describe('FactoryLoop PR babysitter', () => {
+  const humanReviewStateId = 'state-human-review'
+  const inPlanning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
+
+  const babysitterConfig = (overrides: FactoryConfigOverrides = {}): FactoryConfig => config({
+    babysitter: { enabled: true },
+    terminalState: 'human-review',
+    stateIds: { readyForAgent: ready, agentImplementing: implementing, done, inPlanning, humanReview: humanReviewStateId },
+    safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    ...overrides,
+  })
+
+  const recordingLinear = (states: Array<{ key: string; stateId: string }>): LinearWriteback => ({
+    async setState(issue, stateId) { states.push({ key: issue.key, stateId }) },
+    async postComment() {},
+    async createIssue() { throw new Error('not used') },
+    async verify() { return true },
+  })
+
+  // Seed a webhook-fed PR meta file in the mount (the shape the github relayfile
+  // adapter materializes). The babysitter, not the orchestrator, owns the CI/
+  // review/conflict verdict — so the orchestrator only reads this meta to guard
+  // open/draft/merged, never calls gh.
+  const seedPrMeta = (mount: FakeMountClient, repo: string, n: number, payload: Record<string, unknown>) => {
+    mount.files.set(`/github/repos/${repo}/pulls/${n}/metadata.json`, {
+      content: { number: n, head_ref: `ar-${n}-fix`, url: `https://github.com/${repo}/pull/${n}`, ...payload },
+    })
+  }
+
+  it('spawns a sonnet babysitter (not done) when an implementer exits with a ready PR', async () => {
+    const issue = realIssueFile(401, ready, { title: 'Real babysitter spawn' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+    fleet.emitAgentExit('ar-401-impl', 'worker_exited')
+
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-401-babysit'))
+
+    const babysat = fleet.spawns.find((s) => s.name === 'ar-401-babysit')!
+    expect(babysat.capability).toBe('spawn:claude')
+    expect(babysat.model).toBe('sonnet')
+    // Babysitter owns the PR now: issue is NOT done/human-review yet, agents stay.
+    expect(factory.status().counters.done).toBeUndefined()
+    expect(factory.status().counters.humanReview).toBeUndefined()
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-401'])
+  })
+
+  it('does not respawn the babysitter on repeated implementer exits', async () => {
+    const issue = realIssueFile(403, ready, { title: 'Real babysitter idempotent' })
+    const mount = new FakeMountClient({ [issuePath(403)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 403 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(403), issue)))
+    fleet.emitAgentExit('ar-403-impl', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-403-babysit'))
+    fleet.emitAgentExit('ar-403-impl', 'worker_exited')
+    await flush()
+
+    expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
+  })
+
+  it('transitions to Human Review on the babysitter ready signal (open PR meta, no gh call)', async () => {
+    const issue = realIssueFile(402, ready, { title: 'Real babysitter ready' })
+    const mount = new FakeMountClient({ [issuePath(402)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 402, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const states: Array<{ key: string; stateId: string }> = []
+    let ghCalls = 0
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: recordingLinear(states),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 402 }),
+      probePrGhRunner: async () => { ghCalls += 1; return { stdout: '[]' } },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(402), issue)))
+    fleet.emitAgentExit('ar-402-impl', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-402-babysit'))
+
+    fleet.emitAgentMessage({ from: 'ar-402-babysit', target: 'factory', body: '[factory-pr-ready] AR-402' })
+
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+    expect(states.at(-1)).toEqual({ key: 'AR-402', stateId: humanReviewStateId })
+    expect(factory.status().counters.done).toBeUndefined()
+    expect(ghCalls).toBe(0) // readiness comes from the webhook-fed mount + the babysitter's signal
+    expect(fleet.releases.map((r) => r.name).sort()).toEqual(['ar-402-babysit', 'ar-402-impl', 'ar-402-review'])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('honors terminalState: done — a ready signal lands on Done, not Human Review', async () => {
+    const issue = realIssueFile(407, ready, { title: 'Real babysitter terminal done' })
+    const mount = new FakeMountClient({ [issuePath(407)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 407, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const states: Array<{ key: string; stateId: string }> = []
+    // Babysitter enabled, humanReview UUID configured, but terminalState pinned to done.
+    const factory = createFactory(babysitterConfig({ terminalState: 'done' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: recordingLinear(states),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 407 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(407), issue)))
+    fleet.emitAgentExit('ar-407-impl', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-407-babysit'))
+
+    fleet.emitAgentMessage({ from: 'ar-407-babysit', target: 'factory', body: '[factory-pr-ready] AR-407' })
+
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+    expect(factory.status().counters.humanReview).toBeUndefined()
+    expect(states.at(-1)).toEqual({ key: 'AR-407', stateId: done })
+    expect(states.some((s) => s.stateId === humanReviewStateId)).toBe(false)
+  })
+
+  it('ignores a ready signal when the PR meta shows the PR already merged/closed', async () => {
+    const issue = realIssueFile(405, ready, { title: 'Real babysitter not ready' })
+    const mount = new FakeMountClient({ [issuePath(405)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 405, { state: 'closed', merged: true })
+    const fleet = new FakeFleetClient()
+    const states: Array<{ key: string; stateId: string }> = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: recordingLinear(states),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 405 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(405), issue)))
+    fleet.emitAgentExit('ar-405-impl', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-405-babysit'))
+
+    fleet.emitAgentMessage({ from: 'ar-405-babysit', target: 'factory', body: '[factory-pr-ready] AR-405' })
+    await flush()
+
+    expect(factory.status().counters.humanReview).toBeUndefined()
+    expect(states.some((s) => s.stateId === humanReviewStateId)).toBe(false)
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-405'])
+    expect(fleet.releases).toEqual([])
+  })
+
+  it('spawns the babysitter from a PR metadata change event (webhook-driven)', async () => {
+    const issue = realIssueFile(404, ready, { title: 'Real babysitter webhook' })
+    const mount = new FakeMountClient({ [issuePath(404)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 404 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(404), issue)))
+
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/404/metadata.json'
+      mount.files.set(prPath, {
+        content: { number: 404, state: 'open', head_ref: 'ar-404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/404' },
+      })
+      mount.emit(changeEvent(prPath, 'pr-404-open'))
+
+      await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-404-babysit'))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('spawns the babysitter from a flat <owner>__<repo> PR path layout', async () => {
+    const issue = realIssueFile(409, ready, { title: 'Real babysitter flat layout' })
+    const mount = new FakeMountClient({ [issuePath(409)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 409 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(409), issue)))
+
+      // Flat <owner>__<repo>/pulls/by-id/<n>.json shape (githubPullRoot layout).
+      const prPath = '/github/repos/AgentWorkforce__pear/pulls/by-id/409.json'
+      mount.files.set(prPath, {
+        content: { number: 409, state: 'open', head_ref: 'ar-409-fix', isDraft: false },
+      })
+      mount.emit(changeEvent(prPath, 'pr-409-open'))
+
+      await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-409-babysit'))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('with the babysitter disabled, an implementer exit still completes to done (legacy)', async () => {
+    const issue = realIssueFile(406, ready, { title: 'Real babysitter disabled' })
+    const mount = new FakeMountClient({ [issuePath(406)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 406 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(406), issue)))
+    fleet.emitAgentExit('ar-406-impl', 'worker_exited')
+
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+    expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-406-babysit')
+    expect(factory.status().counters.humanReview).toBeUndefined()
+  })
+})
+
 const changeEvent = (path: string, id: string | number, occurredAt = new Date().toISOString()) => ({
   id,
   workspace: 'factory-test',
