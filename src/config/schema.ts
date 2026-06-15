@@ -2,6 +2,13 @@ import { z } from 'zod'
 
 import { LINEAR_STATE_IDS } from '../constants/linear'
 
+const DEFAULT_STATE_IDS = {
+  readyForAgent: LINEAR_STATE_IDS.readyForAgent,
+  agentImplementing: LINEAR_STATE_IDS.agentImplementing,
+  done: LINEAR_STATE_IDS.done,
+  inPlanning: LINEAR_STATE_IDS.inPlanning,
+}
+
 export const FactoryConfigSchema = z.object({
   workspaceId: z.string(),
   subscription: z.object({
@@ -75,11 +82,10 @@ export const FactoryConfigSchema = z.object({
     done: z.string(),
     inPlanning: z.string(),
     // The "In Human Review" workflow-state UUID. Optional and not part of the
-    // baked-in LINEAR_STATE_IDS default because it is workspace-specific —
-    // operators set it in factory.config.json. When unset, the factory falls
-    // back to `done` even if terminalState is `human-review`.
+    // default stateIds because it is workspace-specific. When unset, the factory
+    // falls back to `done` even if terminalState is `human-review`.
     humanReview: z.string().optional(),
-  }).default(LINEAR_STATE_IDS),
+  }).default(DEFAULT_STATE_IDS),
   safety: z.object({
     requireTitlePrefix: z.string().min(1).default('[factory-e2e]'),
     requireLabel: z.string().default('factory'),

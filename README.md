@@ -190,10 +190,13 @@ are illustrative — strip them; JSON has no comments):
   the agent has nowhere to apply changes for that repo, so set it for every repo
   you actually dispatch to.
 - **`stateIds`** — the Linear workflow-state UUIDs for `readyForAgent`,
-  `agentImplementing`, `done`, `inPlanning`. Defaults are the **AR team's** states
-  (see [`src/constants/linear.ts`](src/constants/linear.ts)). If you run against a
-  different Linear team, override all four with that team's state UUIDs (read them
-  from the Linear API / the issue JSON's `state.id`).
+  `agentImplementing`, `done`, `inPlanning`, and optionally `humanReview`.
+  Defaults cover the **AR team's** core states (see
+  [`src/constants/linear.ts`](src/constants/linear.ts)). `humanReview` is
+  intentionally omitted from the schema default so legacy configs fall back to
+  direct-to-Done behavior unless they opt into a review state. If you run against
+  a different Linear team, override the state UUIDs with that team's values (read
+  them from the Linear API / the issue JSON's `state.id`).
 - **`safety`** — the scope gate (below). Defaults `[factory-e2e]` + team `AR`;
   GitHub issue mirrors created by the factory use `[factory]` and are accepted
   by the same gate.

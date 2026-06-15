@@ -29,6 +29,7 @@ import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/inte
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
+const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 
 type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop' | 'safety'> & {
@@ -125,7 +126,7 @@ const githubIssueFile = (
 
 const prFile = (
   number: number,
-  payload: { title?: string; body?: string; head_ref?: string; isDraft?: boolean } = {},
+  payload: { title?: string; body?: string; head_ref?: string; isDraft?: boolean; state?: string; merged?: boolean } = {},
 ) => ({
   provider: 'github',
   objectType: 'pull_request',
@@ -136,6 +137,8 @@ const prFile = (
     body: payload.body ?? '',
     head_ref: payload.head_ref ?? `ar-${number}-test`,
     isDraft: payload.isDraft,
+    state: payload.state,
+    merged: payload.merged,
   },
 })
 
@@ -1234,6 +1237,35 @@ describe('FactoryLoop', () => {
       'ar-364-review',
       'ar-364-impl',
       'ar-364-review',
+    ])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+  })
+
+  it('re-dispatches a terminal issue after a canonical Human Review to Ready re-open', async () => {
+    const factoryConfig = config({
+      stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: 'state-planning' },
+    })
+    const mount = new FakeMountClient({ [issuePath(366)]: issueFile(366) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(factoryConfig, { mount, fleet, triage: new StaticTriage() })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-366'])
+
+    fleet.emitAgentExit('ar-366-impl', 'issue-done')
+    await flush()
+    expect(factory.status().counters.humanReview).toBe(1)
+
+    await mount.writeFile(issuePath(366), issuePayload(366, ready))
+    const reopened = await factory.runOnce()
+
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-366'])
+    expect(reopened.skipped).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-366-impl',
+      'ar-366-review',
+      'ar-366-impl',
+      'ar-366-review',
     ])
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
   })
@@ -4629,6 +4661,41 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toContainEqual({ path: issuePath(240), content: { stateId: done } })
   })
 
+  it('PR-state sweep parks a real issue in Human Review when configured', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(243)]: realMergeIssueFile(243),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/243.json': prFile(243, {
+        title: 'Real product issue 243',
+        body: 'Linear: AR-243',
+        head_ref: 'ar-243-real-fix',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-sha')])
+    const factory = createFactory(config({
+      mergePolicy: 'never',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+      stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: 'state-planning' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(243), realMergeIssueFile(243))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-243-impl', 'ar-243-review'])
+    expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-human-review', 'issue-human-review'])
+    expect(gate.checks).toEqual([])
+    expect(gate.merges).toEqual([])
+    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().counters.humanReview).toBe(1)
+    expect(mount.writes).toContainEqual({ path: issuePath(243), content: { stateId: humanReview } })
+  })
+
   it('PR-state sweep merges a real issue only when policy, checks, review, and head are ready', async () => {
     const mount = new FakeMountClient({
       [issuePath(242)]: realMergeIssueFile(242),
@@ -6727,6 +6794,82 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(prPath, 'pr-409-open'))
 
       await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-409-babysit'))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('advances a Human Review issue to Done when the linked PR is merged', async () => {
+    const issue = realIssueFile(410, humanReviewStateId, { title: 'Real merged after review' })
+    const related = realIssueFile(412, humanReviewStateId, { title: 'Real related review' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/410/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePath(410)]: issue,
+      [issuePath(412)]: related,
+      [prPath]: prFile(410, {
+        title: 'Real merged after review',
+        body: 'Linear: AR-412',
+        head_ref: 'ar-410-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(prPath, 'pr-410-merged'))
+
+      await vi.waitFor(() => expect(mount.writes).toContainEqual({ path: issuePath(410), content: { stateId: done } }))
+      expect(factory.status().counters.mergedPrAdvancedDone).toBe(1)
+      expect(factory.status().counters.done).toBe(1)
+      expect(mount.writes.some((write) => write.path === issuePath(412))).toBe(false)
+
+      mount.emit(changeEvent(prPath, 'pr-410-merged-replay'))
+      await flush()
+      expect(mount.writes.filter((write) => write.path === issuePath(410) && (write.content as { stateId?: string }).stateId === done)).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('advances an in-flight implementing issue to Done if the PR merges before the ready signal', async () => {
+    const issue = realIssueFile(411, ready, { title: 'Real merged before ready' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/411/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePath(411)]: issue,
+      [prPath]: prFile(411, {
+        title: 'Real merged before ready',
+        body: 'Linear: AR-411',
+        head_ref: 'ar-411-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(411), issue)))
+      mount.emit(changeEvent(prPath, 'pr-411-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      expect(mount.writes).toContainEqual({ path: issuePath(411), content: { stateId: done } })
+      expect(factory.status().counters.humanReview).toBeUndefined()
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-done', 'issue-done'])
     } finally {
       await factory.stop()
     }

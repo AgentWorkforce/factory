@@ -40,7 +40,13 @@ describe('FactoryConfigSchema', () => {
       staleAfterMs: 10 * 60_000,
     })
     expect(parsed.mergePolicy).toBe('never')
-    expect(parsed.stateIds).toEqual(LINEAR_STATE_IDS)
+    expect(LINEAR_STATE_IDS.humanReview).toBe('24462e2d-9946-4dd1-a798-931cdd678498')
+    expect(parsed.stateIds).toEqual({
+      readyForAgent: LINEAR_STATE_IDS.readyForAgent,
+      agentImplementing: LINEAR_STATE_IDS.agentImplementing,
+      done: LINEAR_STATE_IDS.done,
+      inPlanning: LINEAR_STATE_IDS.inPlanning,
+    })
     expect(parsed.safety).toEqual({
       requireTitlePrefix: '[factory-e2e]',
       requireLabel: 'factory',
