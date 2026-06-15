@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { ZodError } from 'zod'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import type { LinearIssue, TriageContext, TriageDecision, TriageEngine } from '../types'
@@ -208,6 +209,25 @@ describe('LlmTriage', () => {
     const triage = new LlmTriage(async () => '{nope')
 
     await expect(triage.triage(issue(), ctx)).rejects.toThrow()
+  })
+
+  // [surface: triage] non-vacuity (directive-02 rule 1): structurally-VALID JSON that does not
+  // match the TriageDecision zod shape must throw a ZodError — NOT slip through as a fake decision.
+  // Distinct from the malformed-JSON case above: JSON.parse SUCCEEDS here; only the zod parse fails.
+  // Proven RED with the fix reverted (llm.ts: `TriageDecisionSchema.parse(JSON.parse(response))` →
+  // `JSON.parse(response)`): without the zod guard this resolves to a malformed object instead of throwing.
+  it('throws a ZodError on valid JSON that fails the TriageDecision shape', async () => {
+    // Valid JSON object, but missing required fields (scope/implementers/reviewer/thin/confidence/rationale)
+    // and with a wrong-typed `routes` entry — parses as JSON, fails the schema.
+    const wrongShape = JSON.stringify({
+      issue: { uuid: 'uuid-123', key: 'AR-123', path: '/linear/issues/AR-123__uuid-123.json' },
+      routes: 'AgentWorkforce/pear',
+    })
+    const triage = new LlmTriage(async () => wrongShape)
+
+    // Confirm the payload is itself valid JSON (so this is NOT the malformed-JSON path).
+    expect(() => JSON.parse(wrongShape)).not.toThrow()
+    await expect(triage.triage(issue(), ctx)).rejects.toBeInstanceOf(ZodError)
   })
 
   it('throws on timeout', async () => {
