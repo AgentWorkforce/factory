@@ -22,6 +22,7 @@ export class FakeMountClient implements MountClient {
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []
+  readonly reads: string[] = []
   subscribeCount = 0
 
   #subscribers = new Set<(event: ChangeEvent) => void>()
@@ -37,6 +38,7 @@ export class FakeMountClient implements MountClient {
   }
 
   async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    this.reads.push(path)
     const entry = this.files.get(path)
     if (!entry) {
       throw new Error(`File not found: ${path}`)
