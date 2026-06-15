@@ -94,6 +94,9 @@ type GithubIssueSource = {
   path: string
   raw: Record<string, unknown>
 }
+type SlackSyncStatusSeverity = 'soft' | 'hard'
+type SlackSyncStatusCheck = { known: boolean; degraded: boolean; reason?: string; severity?: SlackSyncStatusSeverity }
+type SlackEventWatermark = { known: boolean; lastEventAtMs?: number }
 
 // Memoizes the existing Linear mirror candidates for one GitHub ingestion pass
 // so dedupe lookups reuse a single ISSUE_ROOT scan.
@@ -137,6 +140,7 @@ const INJECTION_RETRY_DELAY_MS = 1_000
 const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const STOP_TEARDOWN_TIMEOUT_MS = 2_500
+const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
@@ -192,6 +196,8 @@ export class FactoryLoop implements Factory {
   #slackDegradedReason: string | undefined
   #slackWritebackFailureDegraded = false
   #slackWritebackFailureBackoffUntilMs = 0
+  #slackEventWatermarkCache?: { checkedAtMs: number; result: SlackEventWatermark }
+  #slackEventWatermarkRefresh?: Promise<SlackEventWatermark>
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
@@ -2391,37 +2397,98 @@ export class FactoryLoop implements Factory {
   async #slackFreshness(): Promise<{ known: boolean; degraded: boolean; reason?: string; status?: ProviderSyncStatus }> {
     const staleAfterMs = this.#config.slack?.staleAfterMs ?? 10 * 60_000
     let sawSlackStatus = false
+    let softStatusResult: SlackSyncStatusCheck | undefined
+    let softStatus: ProviderSyncStatus | undefined
     try {
       const status = await this.#mount.getSyncStatus?.('slack')
       sawSlackStatus = status?.provider === 'slack'
       const statusResult = slackSyncStatusResult(status, this.#clock.now(), staleAfterMs)
       if (statusResult.known) {
-        return { known: true, degraded: statusResult.degraded, reason: statusResult.reason, status }
+        if (!statusResult.degraded || statusResult.severity === 'hard') {
+          return { known: true, degraded: statusResult.degraded, reason: statusResult.reason, status }
+        }
+        softStatusResult = statusResult
+        softStatus = status
       }
     } catch (error) {
       this.#logger.warn?.('[factory] Slack sync freshness check failed; proceeding without degradation', error)
     }
 
     try {
-      const page = await this.#mount.getEvents({ limit: 100 })
-      const lastSlackEvent = page.events
-        .filter((event) => event.resource.provider === 'slack')
-        .map((event) => Date.parse(event.occurredAt))
-        .filter((time) => Number.isFinite(time))
-        .sort((a, b) => b - a)[0]
-      if (lastSlackEvent === undefined) {
+      const watermark = await this.#slackEventWatermark()
+      if (watermark.lastEventAtMs === undefined) {
         return sawSlackStatus
-          ? { known: true, degraded: true, reason: 'slack sync has no recent event watermark' }
+          ? {
+              known: true,
+              degraded: true,
+              reason: softStatusResult?.reason ?? 'slack sync has no recent event watermark',
+              status: softStatus,
+            }
           : { known: false, degraded: false }
       }
-      const ageMs = this.#clock.now() - lastSlackEvent
-      return ageMs > staleAfterMs
-        ? { known: true, degraded: true, reason: `slack event watermark stale by ${ageMs}ms` }
-        : { known: true, degraded: false }
+      const ageMs = this.#clock.now() - watermark.lastEventAtMs
+      if (ageMs <= staleAfterMs) {
+        if (softStatusResult?.degraded) {
+          this.#increment('slackGateBypassedByEventWatermark')
+          this.#logger.info?.('[factory] Slack sync soft-degraded but event watermark is fresh; continuing Slack writeback', {
+            reason: softStatusResult.reason,
+            status: softStatus,
+            lastSlackEventAtMs: watermark.lastEventAtMs,
+            eventWatermarkAgeMs: ageMs,
+          })
+        }
+        return { known: true, degraded: false }
+      }
+      return {
+        known: true,
+        degraded: true,
+        reason: softStatusResult?.reason ?? `slack event watermark stale by ${ageMs}ms`,
+        status: softStatus,
+      }
     } catch (error) {
-      this.#logger.warn?.('[factory] Slack event freshness fallback failed; proceeding without degradation', error)
-      return { known: false, degraded: false }
+      this.#logger.warn?.(
+        softStatusResult?.degraded
+          ? '[factory] Slack event freshness fallback failed; honoring soft sync degradation'
+          : '[factory] Slack event freshness fallback failed; proceeding without degradation',
+        error,
+      )
+      return softStatusResult?.degraded
+        ? { known: true, degraded: true, reason: softStatusResult.reason, status: softStatus }
+        : { known: false, degraded: false }
     }
+  }
+
+  async #slackEventWatermark(): Promise<SlackEventWatermark> {
+    const nowMs = this.#clock.now()
+    if (this.#slackEventWatermarkCache && nowMs - this.#slackEventWatermarkCache.checkedAtMs <= SLACK_EVENT_WATERMARK_CACHE_MS) {
+      return this.#slackEventWatermarkCache.result
+    }
+
+    if (this.#slackEventWatermarkRefresh) {
+      return this.#slackEventWatermarkRefresh
+    }
+
+    this.#slackEventWatermarkRefresh = this.#refreshSlackEventWatermark()
+    try {
+      return await this.#slackEventWatermarkRefresh
+    } finally {
+      this.#slackEventWatermarkRefresh = undefined
+    }
+  }
+
+  async #refreshSlackEventWatermark(): Promise<SlackEventWatermark> {
+    this.#increment('slackEventWatermarkRefreshes')
+    const page = await this.#mount.getEvents({ provider: 'slack', last: 100, limit: 100 })
+    const lastEventAtMs = page.events
+      .filter((event) => eventProvider(event) === 'slack')
+      .map((event) => eventOccurredAtMs(event))
+      .filter((time): time is number => time !== undefined && Number.isFinite(time))
+      .sort((a, b) => b - a)[0]
+    const result = lastEventAtMs === undefined
+      ? { known: true }
+      : { known: true, lastEventAtMs }
+    this.#slackEventWatermarkCache = { checkedAtMs: this.#clock.now(), result }
+    return result
   }
 
   async #ensureSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
@@ -3427,15 +3494,26 @@ const isHighWatermarkRouteUnavailable = (error: unknown): boolean => {
   return error instanceof Error && /route not found/i.test(error.message)
 }
 
+/**
+ * Slack writeback liveness follows the provider signal hierarchy:
+ * getEvents() provider watermarks are the authoritative ingest signal, sync
+ * status is advisory, and only explicit error/failed states fail closed. Soft
+ * sync states can be stale while Slack mount writes are still live, so
+ * #slackFreshness lets fresh event watermarks override them instead of blocking
+ * operator question writebacks.
+ */
 const slackSyncStatusResult = (
   status: ProviderSyncStatus | undefined,
   nowMs: number,
   staleAfterMs: number,
-): { known: boolean; degraded: boolean; reason?: string } => {
+): SlackSyncStatusCheck => {
   if (!status) return { known: false, degraded: false }
   const normalized = status.status?.toLowerCase()
-  if (normalized && ['lagging', 'stale', 'degraded', 'error', 'failed'].includes(normalized)) {
-    return { known: true, degraded: true, reason: `slack sync status is ${status.status}` }
+  if (normalized && ['error', 'failed'].includes(normalized)) {
+    return { known: true, degraded: true, reason: `slack sync status is ${status.status}`, severity: 'hard' }
+  }
+  if (normalized && ['lagging', 'stale', 'degraded'].includes(normalized)) {
+    return { known: true, degraded: true, reason: `slack sync status is ${status.status}`, severity: 'soft' }
   }
 
   const lastEventAtMs = status.lastEventAtMs ??
@@ -3444,14 +3522,14 @@ const slackSyncStatusResult = (
   if (lastEventAtMs !== undefined && Number.isFinite(lastEventAtMs)) {
     const ageMs = nowMs - lastEventAtMs
     return ageMs > staleAfterMs
-      ? { known: true, degraded: true, reason: `slack sync watermark stale by ${ageMs}ms` }
+      ? { known: true, degraded: true, reason: `slack sync watermark stale by ${ageMs}ms`, severity: 'soft' }
       : { known: true, degraded: false }
   }
 
   if (status.lagSeconds !== undefined && Number.isFinite(status.lagSeconds)) {
     const lagMs = status.lagSeconds * 1000
     return lagMs > staleAfterMs
-      ? { known: true, degraded: true, reason: `slack sync lag is ${lagMs}ms` }
+      ? { known: true, degraded: true, reason: `slack sync lag is ${lagMs}ms`, severity: 'soft' }
       : { known: true, degraded: false }
   }
 
@@ -3460,6 +3538,18 @@ const slackSyncStatusResult = (
   }
 
   return { known: false, degraded: false }
+}
+
+const eventProvider = (event: ChangeEvent): string | undefined => {
+  const flat = asRecord(event) ?? {}
+  return stringValue(asRecord(flat.resource)?.provider) ?? stringValue(flat.provider)
+}
+
+const eventOccurredAtMs = (event: ChangeEvent): number | undefined => {
+  const flat = asRecord(event) ?? {}
+  const timestamp = stringValue(flat.occurredAt) ?? stringValue(flat.timestamp)
+  const parsed = timestamp ? Date.parse(timestamp) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 const eventSequenceNumber = (eventId: string): number | undefined => {

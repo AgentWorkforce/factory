@@ -48,16 +48,25 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
   }> = []
   readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
-  readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number } }> = []
+  readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
+  readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
   getSyncStatus?: RelayFileClientLike['getSyncStatus']
 
   files = new Map<string, { revision: string; content: string; contentType: string }>()
   ops = new Map<string, OperationStatusResponse>()
-  events = [{
+  events: Array<{
+    eventId: string
+    type: 'file.updated'
+    path: string
+    provider?: string
+    revision: string
+    timestamp: string
+  }> = [{
     eventId: 'evt-1',
     type: 'file.updated' as const,
     path: '/linear/issues/AR-1.json',
+    provider: 'linear',
     revision: '2',
     timestamp: '2026-01-01T00:00:00.000Z',
   }]
@@ -117,12 +126,13 @@ class FakeRelayFileClient implements RelayFileClientLike {
     }
   }
 
-  async getEvents(workspaceId: string, opts?: { cursor?: string; limit?: number }) {
+  async getEvents(workspaceId: string, opts?: { cursor?: string; limit?: number; provider?: string; last?: number }) {
     this.getEventsCalls.push({ workspaceId, opts })
     return { events: this.events, nextCursor: null }
   }
 
-  async listLastNChanges(_limit: number, _context?: { workspaceId: string }): Promise<{ events: ChangeEvent[] }> {
+  async listLastNChanges(limit: number, context?: { workspaceId: string }): Promise<{ events: ChangeEvent[] }> {
+    this.listLastNChangesCalls.push({ limit, context })
     return {
       events: this.events.map((event) => ({
         id: event.eventId,
@@ -133,7 +143,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
           path: event.path,
           kind: 'file',
           id: event.path,
-          provider: 'linear',
+          provider: event.provider,
         },
         summary: {},
         expand: async () => ({ level: 'summary' as const, path: event.path, summary: {} }),
@@ -334,6 +344,42 @@ describe('RelayfileCloudMountClient', () => {
       options: { path: '/linear/issues', cursor: undefined },
     })
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
+  })
+
+  it('uses recent change-log events for provider-filtered getEvents tail reads', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.events = [
+      {
+        eventId: 'evt-linear',
+        type: 'file.updated' as const,
+        path: '/linear/issues/AR-1.json',
+        provider: 'linear',
+        revision: '2',
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        eventId: 'evt-slack',
+        type: 'file.updated' as const,
+        path: '/slack/channels/C0/messages/1/meta.json',
+        provider: 'slack',
+        revision: '3',
+        timestamp: '2026-01-01T00:01:00.000Z',
+      },
+    ]
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.getEvents({ provider: 'slack', last: 100, limit: 100 })).resolves.toMatchObject({
+      events: [
+        {
+          id: 'evt-slack',
+          occurredAt: '2026-01-01T00:01:00.000Z',
+          resource: { provider: 'slack', path: '/slack/channels/C0/messages/1/meta.json' },
+        },
+      ],
+      nextCursor: null,
+    })
+    expect(fake.listLastNChangesCalls).toEqual([{ limit: 100, context: { workspaceId: 'rw_test' } }])
+    expect(fake.getEventsCalls).toEqual([])
   })
 
   it('normalizes nested provider sync freshness from integration metadata', async () => {

@@ -78,15 +78,21 @@ export class FakeMountClient implements MountClient {
     }
   }
 
-  async getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage> {
+  async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
+    const allEvents = opts.provider
+      ? this.#events.filter((event) => eventProvider(event) === opts.provider)
+      : this.#events
+    const sourceEvents = opts.last === undefined
+      ? allEvents
+      : allEvents.slice(-Math.max(0, Math.trunc(opts.last)))
     const start = opts.cursor ? Number(opts.cursor) : 0
-    const limit = opts.limit ?? this.#events.length
-    const events = this.#events.slice(start, start + limit)
+    const limit = opts.limit ?? sourceEvents.length
+    const events = sourceEvents.slice(start, start + limit)
     const next = start + events.length
 
     return {
       events,
-      nextCursor: next < this.#events.length ? String(next) : null,
+      nextCursor: next < sourceEvents.length ? String(next) : null,
     }
   }
 
@@ -129,6 +135,16 @@ export class FakeMountClient implements MountClient {
       subscriber(event)
     }
   }
+}
+
+const eventProvider = (event: ChangeEvent): string | undefined => {
+  const record = event as unknown as Record<string, unknown>
+  const resource = record.resource as Record<string, unknown> | undefined
+  return typeof resource?.provider === 'string'
+    ? resource.provider
+    : typeof record.provider === 'string'
+      ? record.provider
+      : undefined
 }
 
 const record = (value: unknown): Record<string, unknown> | undefined =>

@@ -38,7 +38,7 @@ export interface MountClient {
   ): void
   listTree(prefix: string): Promise<string[]>
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription
-  getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage>
+  getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage>
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
   confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>

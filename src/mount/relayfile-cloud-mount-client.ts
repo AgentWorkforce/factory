@@ -256,7 +256,17 @@ export class RelayfileCloudMountClient implements MountClient {
     return eventClient.subscribe(globs, onChange as Parameters<RelayfileEventClient['subscribe']>[1], opts)
   }
 
-  async getEvents(opts: { cursor?: string; limit?: number }): Promise<EventPage> {
+  async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
+    if (opts.last !== undefined && this.#client.listLastNChanges) {
+      const response = await this.#client.listLastNChanges(opts.last, { workspaceId: this.workspaceId })
+      const events = opts.provider
+        ? response.events.filter((event) => eventProvider(event) === opts.provider)
+        : response.events
+      return {
+        events: events.slice(0, opts.limit ?? events.length) as unknown as EventPage['events'],
+        nextCursor: null,
+      }
+    }
     const response = await this.#client.getEvents(this.workspaceId, opts)
     return {
       events: response.events as unknown as EventPage['events'],
@@ -466,6 +476,11 @@ const numberField = (record: Record<string, unknown>, key: string): number | und
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+
+const eventProvider = (event: ChangeEvent | unknown): string | undefined => {
+  const record = asRecord(event) ?? {}
+  return stringField(asRecord(record.resource) ?? {}, 'provider') ?? stringField(record, 'provider')
+}
 
 const arrayRecords = (value: unknown): Array<Record<string, unknown>> =>
   Array.isArray(value) ? value.map(asRecord).filter((entry): entry is Record<string, unknown> => entry !== undefined) : []
