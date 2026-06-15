@@ -1930,7 +1930,7 @@ export class FactoryLoop implements Factory {
 
     let roster
     try {
-      roster = await this.#fleet.roster()
+      roster = await retryOnTimeout(() => this.#fleet.roster(), { attempts: 3, delayMs: 2000 })
     } catch (error) {
       throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
     }
@@ -4384,6 +4384,23 @@ const isRegistrationLagInjectionError = (error: unknown): boolean => {
   const { errorMessage } = describeError(error)
   return /recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
+}
+
+const isTimeoutError = (error: unknown): boolean =>
+  error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+
+const retryOnTimeout = async <T>(fn: () => Promise<T>, opts: { attempts: number; delayMs: number }): Promise<T> => {
+  let lastError: unknown
+  for (let attempt = 0; attempt < opts.attempts; attempt += 1) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      if (!isTimeoutError(error) || attempt === opts.attempts - 1) throw error
+      await new Promise((resolve) => setTimeout(resolve, opts.delayMs))
+    }
+  }
+  throw lastError
 }
 
 const contextualError = (context: string, error: unknown): Error => {
