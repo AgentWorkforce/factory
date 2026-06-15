@@ -136,7 +136,12 @@ describe('workspace scoped event client', () => {
     }
   })
 
-  it('falls back to getEvents after repeated stream errors and skips already-seen event ids', async () => {
+  it('does NOT tear down the sync on repeated stream errors — the SDK self-heals', async () => {
+    // Regression (relayfile-ws-self-heal-latch): the bridge used to stop the
+    // sync after 5 errors and run its own getEvents poll loop forever. That
+    // killed the SDK's own WS self-heal (which already delivers via
+    // sync.on('event')) and stranded the factory on redundant polling. The
+    // bridge now leaves recovery entirely to the SDK.
     vi.useFakeTimers()
     try {
       const sync = new FakeSync()
@@ -144,13 +149,7 @@ describe('workspace scoped event client', () => {
       const logger = { debug: vi.fn(), warn: vi.fn() }
       const telemetry = { increment: vi.fn(), gauge: vi.fn() }
       const client = {
-        getEvents: vi.fn(async () => ({
-          events: [
-            event({ eventId: 'evt-1', revision: '1' }),
-            event({ eventId: 'evt-2', revision: '2', path: '/linear/issues/AR-2__uuid.json' }),
-          ],
-          nextCursor: null,
-        })),
+        getEvents: vi.fn(),
         getResourceAtEvent: vi.fn(),
       } as unknown as WorkspaceEventClientSource
 
@@ -167,19 +166,30 @@ describe('workspace scoped event client', () => {
 
       await vi.runOnlyPendingTimersAsync()
       await Promise.resolve()
-      sync.emit(event({ eventId: 'evt-1', revision: '1' }))
-      for (let index = 0; index < 5; index += 1) sync.emitError(new Error(`boom-${index}`))
-      await vi.waitFor(() => expect(client.getEvents).toHaveBeenCalledTimes(1))
 
-      expect(sync.stopped).toBe(true)
+      // Five consecutive stream errors — previously the trip wire.
+      for (let index = 0; index < 5; index += 1) sync.emitError(new Error(`boom-${index}`))
+      await Promise.resolve()
+
+      // The sync is left alive and the bridge never ran its own poll.
+      expect(sync.stopped).toBe(false)
+      expect(client.getEvents).not.toHaveBeenCalled()
+
+      // Events keep flowing through the still-live sync — including ones the
+      // SDK's own internal polling surfaces via sync.on('event').
+      sync.emit(event({ eventId: 'evt-1', revision: '1' }))
+      sync.emit(event({ eventId: 'evt-2', revision: '2', path: '/linear/issues/AR-2__uuid.json' }))
+      await Promise.resolve()
       expect(changes).toEqual(['evt-1', 'evt-2'])
-      expect(logger.warn).toHaveBeenCalledWith('remote stream forced polling fallback', expect.objectContaining({
+
+      // Errors are surfaced, but no forced-polling-fallback warning fires.
+      expect(logger.warn).toHaveBeenCalledWith('remote stream error', expect.objectContaining({
         workspaceId: 'ws-1',
-        reason: 'repeated-stream-errors',
       }))
-      expect(telemetry.increment).toHaveBeenCalledWith('subscription.warning', 1, expect.objectContaining({
-        key: 'remote stream forced polling fallback:ws-1',
-      }))
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'remote stream forced polling fallback',
+        expect.anything(),
+      )
     } finally {
       vi.useRealTimers()
     }
