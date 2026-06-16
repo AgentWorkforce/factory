@@ -411,6 +411,7 @@ describe('fleet CLI runtime', () => {
       } as unknown as Factory
       const waitForStopSignal = vi.fn(async () => undefined)
       const createFactory = vi.fn(() => factory)
+      const ensureLocalMount = vi.fn(async () => {})
 
       const code = await runFleetCli([
         'factory',
@@ -423,12 +424,14 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         createFactory,
+        ensureLocalMount,
         waitForStopSignal,
         stdout: buffer(),
         stderr: buffer(),
       })
 
       expect(code).toBe(0)
+      expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', process.cwd())
       expect(createFactory).toHaveBeenCalledTimes(1)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
       expect(factory.runLoop).not.toHaveBeenCalled()
@@ -469,6 +472,7 @@ describe('fleet CLI runtime', () => {
         dispose: vi.fn(),
       } as unknown as Factory
       const createFactory = vi.fn(() => factory)
+      const ensureLocalMount = vi.fn(async () => {})
       const daemonExits: number[] = []
 
       const run = runFleetCli([
@@ -482,6 +486,7 @@ describe('fleet CLI runtime', () => {
         fleet: new FakeFleetClient(),
         mount: new FakeMountClient(),
         createFactory,
+        ensureLocalMount,
         stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
         flushDaemonOutput: async () => {
           calls.push('flush')

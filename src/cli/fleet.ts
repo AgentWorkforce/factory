@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
+import { ensureLocalMount } from '../mount/local-mount-preflight'
 import {
   FactoryConfigSchema,
   RelayfileCloudMountClient,
@@ -32,6 +33,7 @@ interface FleetCliDeps {
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
   cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
+  ensureLocalMount?: (workspaceId: string, startDir: string) => Promise<void>
   waitForStopSignal?: () => Promise<number | void>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
@@ -223,6 +225,7 @@ async function runFactoryCommand(
 ): Promise<number> {
   if (command.kind === 'factory') {
     if (command.action === 'start') {
+      await (deps.ensureLocalMount ?? ensureLocalMount)(config.workspaceId, process.cwd())
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndExit = async (code: number): Promise<void> => {
