@@ -208,7 +208,11 @@ The node pushes its `repoPaths` keys + `capabilities` up on registration so clou
 
 **Phase 0 — unblock** ✅ *Already satisfied (see §6).* relayfile→cloud webhook delivery exists; no verification/build needed. The only "unblock" is defining the pluggable dispatch-target interface (folds into Phase 2).
 
-**Phase 0.5 — land [pear#368](https://github.com/AgentWorkforce/pear/pull/368) first** (dynamic per-team Linear states). It rewrites `config/schema.ts` / `orchestrator/factory.ts` / `types.ts` / `cli/fleet.ts` — the exact files p1/p2/p3 edit, so it must merge before wave1 or the workflow PRs conflict. p2 folds its `linear.states` / `linear.statesByTeam` + `stateIds` fallback into `WorkspaceConfig`. Carries a provider dep: `/linear/states` (relayfile-adapters `feat/linear-states-adapter`) — needed again by the cloud lift (p6/p8). Note: p1's `StateStore` (runtime in-flight state) is distinct from #368's `resolveFactoryStates` (Linear workflow-state UUIDs) — don't conflate them.
+**Phase 0.5 — land the factory-sdk config PRs before wave1.** Both rewrite `config/schema.ts` (the file p2 edits):
+- **[pear#368](https://github.com/AgentWorkforce/pear/pull/368) — LANDED.** Dynamic per-team Linear states (`linear.states`/`linear.statesByTeam`/`stateIds`; `resolveFactoryStates` reads `/linear/states`). Also touched `orchestrator/factory.ts`/`types.ts` (p1) + `cli/fleet.ts` (p3). Provider dep `/linear/states` (relayfile-adapters `feat/linear-states-adapter`) flows to the cloud lift (p6/p8).
+- **[pear#369](https://github.com/AgentWorkforce/pear/pull/369) — OPEN, land next.** Compact `repos` (`org`/`cloneRoot`/`names`/`overrides`) → Zod `.transform()` derives `byLabel`/`clonePaths`/`labels`. Only `config/schema.ts` — overlaps p2.
+
+p2 splits #369's compact form along the seam: identity (`org`/`names`/`overrides`/`byLabel`/`default`) → `WorkspaceConfig`; per-machine `cloneRoot`/`clonePaths` → `NodeConfig` (this *is* `repoPaths`). Plus #368's states → `WorkspaceConfig`. Preserve both transforms. Note: p1's `StateStore` (runtime in-flight state) ≠ #368's `resolveFactoryStates` (Linear workflow-state UUIDs) — don't conflate.
 
 **Phase 1 — extract the package** (children p1–p4)
 - [ ] p1: `StateStore` port + `InMemoryStateStore`; route `BatchTracker` / `InFlightRegistry` / clarification through it.
