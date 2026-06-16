@@ -113,6 +113,65 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.stateIds).toEqual({})
   })
 
+  it('derives byLabel, clonePaths, and subscription.labels from a compact repos config', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: {
+        org: 'AgentWorkforce',
+        cloneRoot: '/work/AgentWorkforce/',
+        names: ['pear', 'cloud', 'agentswarm'],
+        overrides: { agentswarm: 'AgentWorkforce/AgentSwarm' },
+        default: 'pear',
+      },
+    })
+
+    expect(parsed.repos.byLabel).toEqual({
+      pear: 'AgentWorkforce/pear',
+      cloud: 'AgentWorkforce/cloud',
+      agentswarm: 'AgentWorkforce/AgentSwarm',
+    })
+    expect(parsed.repos.clonePaths).toEqual({
+      'AgentWorkforce/pear': '/work/AgentWorkforce/pear',
+      'AgentWorkforce/cloud': '/work/AgentWorkforce/cloud',
+      'AgentWorkforce/AgentSwarm': '/work/AgentWorkforce/AgentSwarm',
+    })
+    // subscription.labels defaults to the repo names
+    expect(parsed.subscription.labels).toEqual(['pear', 'cloud', 'agentswarm'])
+    expect(parsed.repos.default).toBe('pear')
+  })
+
+  it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {
+    const parsed = FactoryConfigSchema.parse({
+      subscription: { labels: ['pear'] },
+      repos: {
+        org: 'AgentWorkforce',
+        cloneRoot: '/work',
+        names: ['pear', 'cloud'],
+        byLabel: { cloud: 'Other/cloud-fork' },
+        clonePaths: { 'AgentWorkforce/pear': '/custom/pear' },
+      },
+    })
+
+    expect(parsed.repos.byLabel.cloud).toBe('Other/cloud-fork')
+    expect(parsed.repos.byLabel.pear).toBe('AgentWorkforce/pear')
+    expect(parsed.repos.clonePaths['AgentWorkforce/pear']).toBe('/custom/pear')
+    expect(parsed.repos.clonePaths['Other/cloud-fork']).toBe('/work/cloud-fork')
+    // explicit subscription.labels is preserved (not overwritten by names)
+    expect(parsed.subscription.labels).toEqual(['pear'])
+  })
+
+  it('still accepts the legacy explicit-only repos form', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    })
+
+    expect(parsed.repos.byLabel).toEqual({ pear: 'AgentWorkforce/pear' })
+    expect(parsed.repos.clonePaths).toEqual({ 'AgentWorkforce/pear': '/work/pear' })
+  })
+
   it('rejects batch sizes over five', () => {
     expect(() => FactoryConfigSchema.parse({
       workspaceId: 'ws_123',

@@ -56,7 +56,19 @@ export const FactoryConfigSchema = z.object({
     maxImplementers: z.number().int().min(1).max(6).default(2),
   }).default({}),
   repos: z.object({
-    byLabel: z.record(z.string(), z.string()),
+    // Compact, single-source repo config. Most setups only need these: `names`
+    // is the label/repo list, and byLabel + clonePaths + subscription.labels are
+    // derived from them at parse time (see the transform below).
+    //   byLabel[name]   = overrides[name] ?? `${org}/${name}`
+    //   clonePaths[repo] = `${cloneRoot}/${repoName}`
+    org: z.string().optional(),
+    cloneRoot: z.string().optional(),
+    names: z.array(z.string()).optional(),
+    overrides: z.record(z.string(), z.string()).default({}),
+    // Explicit forms remain supported as an escape hatch and are merged over the
+    // derived maps (explicit entries win). byLabel is optional now that it can be
+    // derived from `names`.
+    byLabel: z.record(z.string(), z.string()).default({}),
     byProject: z.record(z.string(), z.string()).default({}),
     keywordRules: z.array(z.object({ pattern: z.string(), repo: z.string() })).default([]),
     clonePaths: z.record(z.string(), z.string()).default({}),
@@ -123,6 +135,45 @@ export const FactoryConfigSchema = z.object({
     requireTeamKey: z.string().min(1).default('AR'),
   }).default({}),
   dryRun: z.boolean().default(false),
+}).transform((cfg) => {
+  const { org, cloneRoot, names, overrides, byLabel, byProject, keywordRules, clonePaths, default: defaultRepo } = cfg.repos
+  const repoNames = names ?? []
+
+  // Derive byLabel from `names` (label === repo name): overrides[name] wins,
+  // else `${org}/${name}` when an org is set, else the bare name. Explicit
+  // byLabel entries are merged last so they always win.
+  const derivedByLabel: Record<string, string> = {}
+  for (const name of repoNames) {
+    derivedByLabel[name] = overrides[name] ?? (org ? `${org}/${name}` : name)
+  }
+  const resolvedByLabel = { ...derivedByLabel, ...byLabel }
+
+  // Derive clonePaths as `${cloneRoot}/${repoName}` for every routed repo.
+  // Explicit clonePaths entries win.
+  const derivedClonePaths: Record<string, string> = {}
+  if (cloneRoot) {
+    const root = cloneRoot.replace(/\/+$/u, '')
+    for (const repo of Object.values(resolvedByLabel)) {
+      const repoName = repo.includes('/') ? repo.slice(repo.lastIndexOf('/') + 1) : repo
+      derivedClonePaths[repo] = `${root}/${repoName}`
+    }
+  }
+  const resolvedClonePaths = { ...derivedClonePaths, ...clonePaths }
+
+  // Subscription labels default to the repo names when not given explicitly.
+  const labels = cfg.subscription.labels.length > 0 ? cfg.subscription.labels : repoNames
+
+  return {
+    ...cfg,
+    subscription: { ...cfg.subscription, labels },
+    repos: {
+      byLabel: resolvedByLabel,
+      byProject,
+      keywordRules,
+      clonePaths: resolvedClonePaths,
+      ...(defaultRepo !== undefined ? { default: defaultRepo } : {}),
+    },
+  }
 })
 
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>
