@@ -112,6 +112,25 @@ export type {
   MountSlackWritebackConfig,
 } from './writeback'
 export {
+  AGENT_RELAY_FACTORY_NODE_CONFIG_ENV,
+  createFactoryNodeDefinition,
+  DEFAULT_FACTORY_NODE_CONFIG_PATH,
+  FACTORY_NODE_CONFIG_ENV,
+  factoryNodeInventorySync,
+  parseFactoryNodeConfig,
+  readFactoryNodeConfigSync,
+  resolveFactoryNodeConfigPath,
+  runRelayflowsWorkflow,
+} from './node/factory-node'
+export type {
+  FactoryNodeDefinitionOptions,
+  FactoryNodeInventoryAgent,
+  FactoryNodeInventorySync,
+  WorkflowRunner,
+  WorkflowRunnerInput,
+  WorkflowRunnerResult,
+} from './node/factory-node'
+export {
   assertInFactoryScope,
   factoryScopeSafety,
   isInFactoryScope,

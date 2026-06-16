@@ -7,3 +7,4 @@ dist/
 .workflow-artifacts/*
 !.workflow-artifacts/factory-p7-label-scope/
 !.workflow-artifacts/factory-p10-fleet-client/
+!.workflow-artifacts/factory-p13-factory-node-definition/
