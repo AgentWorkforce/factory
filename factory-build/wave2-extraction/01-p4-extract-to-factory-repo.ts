@@ -27,7 +27,7 @@ async function main() {
     .channel('wf-factory-p4-extraction')
     .maxConcurrency(3)
     .timeout(7_200_000)
-    .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'lead-claude' });
+    .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'lead-claude', onExhaustion: 'needs-human' });
 
   wf.agent('lead-claude', { cli: 'claude', role: 'Lead + QA for the extraction. Coordinates the seed, verification, and publish-prep; runs repair on red gates.', retries: 1 });
   wf.agent('impl-codex', { cli: 'codex', role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling (CI/publish/LICENSE/.gitignore), and pushes.', retries: 2 });

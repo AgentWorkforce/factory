@@ -378,7 +378,10 @@ export function buildFactoryWorkflow(o: FactoryWorkflowOptions): Wf {
     // Repair-not-skip: any failing gate auto-invokes the repair agent to FIX it and
     // reruns the gate, up to repairRetries times — it never skips/blocks. 5 is enough
     // to self-heal real issues without a runaway loop eating hours on a stuck gate.
-    .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'fixer-claude' });
+    // onExhaustion:'needs-human' (relayflows#6) → an exhausted repair budget ends the run
+    // 'needs_human' (handled, awaiting a human) instead of 'failed' — so a genuine run
+    // failure is unreachable short of a real crash.
+    .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'fixer-claude', onExhaustion: 'needs-human' });
 
   addSquad(wf, o.tier);
   addSetup(wf, o);
