@@ -11,6 +11,8 @@ Project: Factory (f97660a3-a08c-4157-998f-e2d91951f3e7)
 
 Prep PR #2 of 4 for the factory extraction epic. See PR #1 (state store) for the audit and the broader plan. This PR is independent of PR #1 — can be done in parallel or after.
 
+**Depends on [pear#368](https://github.com/AgentWorkforce/pear/pull/368) (land first).** #368 rewrites `config/schema.ts` with dynamic per-team Linear states: `linear.states` (workspace default role→state-name map), `linear.statesByTeam` (per-team overrides), and `stateIds` as the explicit-UUID fallback (`resolveFactoryStates` reads `/linear/states`). All three are **workspace policy → they belong in `WorkspaceConfig`** below. Build on #368's post-merge schema; do not revert its dynamic resolution. Provider dep carried in by #368: the `/linear/states` resource (relayfile-adapters `feat/linear-states-adapter`) must be materialized — and the cloud lift (p6/p8) needs it too.
+
 Today's `FactoryConfig` (`packages/factory-sdk/src/config/schema.ts`) mixes two concerns: (a) per-workspace orchestration policy that lives in the cloud worker, and (b) per-node local execution details that live on the user's machine. After extraction + Phase 2 cloud lift, those two halves live in completely separate locations — they need clean schema boundaries before the lift.
 
 ## Goal

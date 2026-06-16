@@ -208,6 +208,8 @@ The node pushes its `repoPaths` keys + `capabilities` up on registration so clou
 
 **Phase 0 — unblock** ✅ *Already satisfied (see §6).* relayfile→cloud webhook delivery exists; no verification/build needed. The only "unblock" is defining the pluggable dispatch-target interface (folds into Phase 2).
 
+**Phase 0.5 — land [pear#368](https://github.com/AgentWorkforce/pear/pull/368) first** (dynamic per-team Linear states). It rewrites `config/schema.ts` / `orchestrator/factory.ts` / `types.ts` / `cli/fleet.ts` — the exact files p1/p2/p3 edit, so it must merge before wave1 or the workflow PRs conflict. p2 folds its `linear.states` / `linear.statesByTeam` + `stateIds` fallback into `WorkspaceConfig`. Carries a provider dep: `/linear/states` (relayfile-adapters `feat/linear-states-adapter`) — needed again by the cloud lift (p6/p8). Note: p1's `StateStore` (runtime in-flight state) is distinct from #368's `resolveFactoryStates` (Linear workflow-state UUIDs) — don't conflate them.
+
 **Phase 1 — extract the package** (children p1–p4)
 - [ ] p1: `StateStore` port + `InMemoryStateStore`; route `BatchTracker` / `InFlightRegistry` / clarification through it.
 - [ ] p2: split `FactoryConfig` → `WorkspaceConfig` + `NodeConfig`.
