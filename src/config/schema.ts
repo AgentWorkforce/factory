@@ -10,7 +10,11 @@ const DEFAULT_STATE_IDS = {
 }
 
 export const FactoryConfigSchema = z.object({
-  workspaceId: z.string(),
+  // Optional. When omitted, the CLI derives the workspace from the cloud session
+  // via `resolveActiveWorkspace()` (returns the active `relayfileWorkspaceId`),
+  // falling back to the SDK's built-in default. Set it only to pin a non-active
+  // workspace. See resolveFactoryWorkspace() in relayfile-cloud-mount-client.ts.
+  workspaceId: z.string().optional(),
   subscription: z.object({
     teams: z.array(z.string()).default([]),
     projects: z.array(z.string()).default([]),

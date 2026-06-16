@@ -98,6 +98,11 @@ export function resolveRelayfileMountBinary(startDir = __dirname): string {
 export function checkMountStaleness(
   stateFilePath: string,
   workspaceId: string,
+  // Alternate identifiers that name the SAME workspace (e.g. the cloud-side
+  // UUID for a `rw_` handle). The local mount records the cloud UUID in its
+  // state.json, so without these aliases a handle-vs-UUID comparison would
+  // report a false "workspace mismatch".
+  acceptableWorkspaceIds: readonly string[] = [],
 ): { stale: boolean; reason?: string; pid?: number } {
   let parsed: MountState
   try {
@@ -114,10 +119,11 @@ export function checkMountStaleness(
   }
 
   const registeredWorkspaceId = typeof parsed.workspaceId === 'string' ? parsed.workspaceId : undefined
-  if (registeredWorkspaceId !== workspaceId) {
+  const accepted = new Set([workspaceId, ...acceptableWorkspaceIds])
+  if (registeredWorkspaceId === undefined || !accepted.has(registeredWorkspaceId)) {
     return {
       stale: true,
-      reason: `workspace mismatch: registered=${registeredWorkspaceId ?? 'unknown'} expected=${workspaceId}`,
+      reason: `workspace mismatch: registered=${registeredWorkspaceId ?? 'unknown'} expected=${[...accepted].join('|')}`,
     }
   }
 

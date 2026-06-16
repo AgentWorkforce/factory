@@ -1,6 +1,8 @@
 import {
   CloudAuthError,
   ensureCloudSession,
+  resolveActiveWorkspace,
+  type ActiveWorkspaceDescriptor,
   type CloudSession,
   type CloudSessionOptions,
 } from '@agent-relay/cloud'
@@ -40,6 +42,46 @@ export const FACTORY_RELAYFILE_SCOPES = [
 ] as const
 
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
+
+export type ActiveWorkspaceResolver = (
+  options?: { interactive?: boolean },
+) => Promise<ActiveWorkspaceDescriptor>
+
+export interface ResolvedFactoryWorkspace {
+  /** Relayfile workspace handle (e.g. `rw_7ccfea89`) — what the mount/config use. */
+  workspaceId: string
+  /**
+   * Cloud-side UUID for the same workspace (e.g. `50587328-…`). The local
+   * relayfile mount records this form in its state.json, so it is passed to the
+   * staleness check as an accepted alias to avoid a spurious "workspace
+   * mismatch" warning when handle and UUID refer to the same workspace.
+   */
+  cloudWorkspaceId?: string
+}
+
+/**
+ * Derive the factory's workspace from the active cloud session rather than a
+ * hardcoded config value. `resolveActiveWorkspace()` resolves the locally
+ * pinned workspace against the cloud API and returns both identifier forms.
+ * Falls back to the built-in default when resolution fails (offline / no
+ * session), so callers always get a usable handle.
+ */
+export async function resolveFactoryWorkspace(
+  resolver: ActiveWorkspaceResolver = resolveActiveWorkspace,
+): Promise<ResolvedFactoryWorkspace> {
+  try {
+    const descriptor = await resolver({ interactive: false })
+    if (descriptor.relayfileWorkspaceId) {
+      return {
+        workspaceId: descriptor.relayfileWorkspaceId,
+        cloudWorkspaceId: descriptor.cloudWorkspaceId,
+      }
+    }
+  } catch {
+    // fall through to the built-in default below
+  }
+  return { workspaceId: DEFAULT_WORKSPACE_ID }
+}
 
 export interface RelayfileWorkspaceHandleLike {
   info: { relayfileUrl: string }

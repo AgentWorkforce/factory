@@ -9,6 +9,10 @@ const STATE_FILE = '.integrations/.relay/state.json'
 interface EnsureLocalMountOptions {
   stateWaitTimeoutMs?: number
   stateWaitPollMs?: number
+  // Alternate identifiers for the same workspace (e.g. the cloud UUID for a
+  // `rw_` handle). Passed through to the staleness check so a handle-vs-UUID
+  // state.json does not register as a spurious mismatch.
+  acceptableWorkspaceIds?: readonly string[]
 }
 
 export async function ensureLocalMount(
@@ -20,11 +24,17 @@ export async function ensureLocalMount(
 
   if (!(await isMountStatePresent(stateFilePath))) {
     await spawnMount(workspaceId, startDir)
-    await waitForStateFile(stateFilePath, workspaceId, options.stateWaitTimeoutMs, options.stateWaitPollMs)
+    await waitForStateFile(
+      stateFilePath,
+      workspaceId,
+      options.stateWaitTimeoutMs,
+      options.stateWaitPollMs,
+      options.acceptableWorkspaceIds,
+    )
     return
   }
 
-  const staleness = checkMountStaleness(stateFilePath, workspaceId)
+  const staleness = checkMountStaleness(stateFilePath, workspaceId, options.acceptableWorkspaceIds)
   if (staleness.stale) {
     const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
     process.stderr.write(
@@ -81,6 +91,7 @@ async function waitForStateFile(
   workspaceId: string,
   timeoutMs = 10_000,
   pollMs = 200,
+  acceptableWorkspaceIds: readonly string[] = [],
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let lastInvalidReason = 'state file was not created'
@@ -88,7 +99,7 @@ async function waitForStateFile(
     try {
       const raw = await readFile(stateFilePath, 'utf8')
       const state = JSON.parse(raw) as unknown
-      if (isValidMountState(state, workspaceId)) return
+      if (isValidMountState(state, workspaceId, acceptableWorkspaceIds)) return
       lastInvalidReason = `state file is malformed or for another workspace: ${stateFilePath}`
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
@@ -103,10 +114,15 @@ async function waitForStateFile(
   throw new Error(`[factory] relayfile mount did not become ready within ${timeoutMs}ms (${lastInvalidReason})`)
 }
 
-function isValidMountState(value: unknown, workspaceId: string): boolean {
+function isValidMountState(
+  value: unknown,
+  workspaceId: string,
+  acceptableWorkspaceIds: readonly string[] = [],
+): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const state = value as { workspaceId?: unknown; lastReconcileAt?: unknown; pid?: unknown }
-  return state.workspaceId === workspaceId &&
+  const accepted = new Set([workspaceId, ...acceptableWorkspaceIds])
+  return typeof state.workspaceId === 'string' && accepted.has(state.workspaceId) &&
     typeof state.lastReconcileAt === 'string' &&
     Number.isFinite(Date.parse(state.lastReconcileAt)) &&
     typeof state.pid === 'number' &&

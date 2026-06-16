@@ -15,6 +15,7 @@ import {
   parseLinearIssue,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
+  resolveFactoryWorkspace,
   type Capability,
   type Factory,
   type FactoryConfig,
@@ -24,6 +25,7 @@ import {
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
+  type ResolvedFactoryWorkspace,
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
@@ -33,7 +35,12 @@ interface FleetCliDeps {
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
   cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
-  ensureLocalMount?: (workspaceId: string, startDir: string) => Promise<void>
+  resolveWorkspace?: () => Promise<ResolvedFactoryWorkspace>
+  ensureLocalMount?: (
+    workspaceId: string,
+    startDir: string,
+    options?: { acceptableWorkspaceIds?: readonly string[] },
+  ) => Promise<void>
   waitForStopSignal?: () => Promise<number | void>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
@@ -132,13 +139,25 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           }))
           return 0
         }
+        // Derive the workspace from the cloud session when it isn't pinned in
+        // config. resolveFactoryWorkspace() returns the relayfile handle plus
+        // the cloud UUID for the same workspace; the UUID is forwarded to the
+        // mount staleness check as an accepted alias.
+        let acceptableMountIds: readonly string[] | undefined
+        if (!loaded.config.workspaceId) {
+          const workspace = await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()
+          loaded.config.workspaceId = workspace.workspaceId
+          if (workspace.cloudWorkspaceId) acceptableMountIds = [workspace.cloudWorkspaceId]
+        }
+        const workspaceId = loaded.config.workspaceId
+        if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         const mount = await buildMount(loaded, deps)
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
         })
-        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps)
+        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
       }
     }
     return 1
@@ -222,10 +241,14 @@ async function runFactoryCommand(
   globals: GlobalOptions,
   out: Pick<NodeJS.WriteStream, 'write'>,
   deps: FleetCliDeps = {},
+  workspaceId: string = config.workspaceId ?? '',
+  acceptableMountIds?: readonly string[],
 ): Promise<number> {
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      await (deps.ensureLocalMount ?? ensureLocalMount)(config.workspaceId, process.cwd())
+      await (deps.ensureLocalMount ?? ensureLocalMount)(workspaceId, process.cwd(), {
+        acceptableWorkspaceIds: acceptableMountIds,
+      })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndExit = async (code: number): Promise<void> => {

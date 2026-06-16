@@ -38,10 +38,13 @@ export type {
 export { RelayFleetClient } from './fleet/relay-fleet-client'
 export {
   RelayfileCloudMountClient,
+  resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export type {
+  ActiveWorkspaceResolver,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
+  ResolvedFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export {
   GhCliGithubMergeGate,

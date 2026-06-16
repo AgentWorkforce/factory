@@ -392,6 +392,100 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('derives the workspace from the cloud session when config omits workspaceId and forwards the cloud UUID alias', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-derive-'))
+    try {
+      const path = join(root, 'factory.config.json')
+      const { workspaceId: _omitted, ...withoutWorkspace } = config
+      await writeFile(path, JSON.stringify(withoutWorkspace))
+
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const ensureLocalMount = vi.fn(async () => {})
+      const resolveWorkspace = vi.fn(async () => ({
+        workspaceId: 'rw_7ccfea89',
+        cloudWorkspaceId: '50587328-441d-4acb-b8f3-dbe1b3c5de99',
+      }))
+
+      const code = await runFleetCli([
+        'factory',
+        'start',
+        '--mode',
+        'live',
+        '--config',
+        path,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        resolveWorkspace,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(resolveWorkspace).toHaveBeenCalledTimes(1)
+      expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', process.cwd(), {
+        acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not resolve the workspace when config pins workspaceId', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-pinned-'))
+    try {
+      const configPath = await writeConfig(root)
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const resolveWorkspace = vi.fn(async () => ({ workspaceId: 'rw_unused' }))
+
+      const code = await runFleetCli([
+        'factory',
+        'start',
+        '--mode',
+        'live',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount: vi.fn(async () => {}),
+        resolveWorkspace,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(resolveWorkspace).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('starts the factory live daemon and waits for an injected stop signal boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-'))
     try {
@@ -431,7 +525,9 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', process.cwd())
+      expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', process.cwd(), {
+        acceptableWorkspaceIds: undefined,
+      })
       expect(createFactory).toHaveBeenCalledTimes(1)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
       expect(factory.runLoop).not.toHaveBeenCalled()

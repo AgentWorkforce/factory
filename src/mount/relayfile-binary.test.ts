@@ -107,6 +107,35 @@ describe('checkMountStaleness', () => {
     })
   })
 
+  it('accepts a registered id that matches an alternate workspace alias (handle vs cloud UUID)', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: '50587328-441d-4acb-b8f3-dbe1b3c5de99',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
+      })
+
+      expect(
+        checkMountStaleness(statePath, 'rw_7ccfea89', ['50587328-441d-4acb-b8f3-dbe1b3c5de99']),
+      ).toEqual({ stale: false, pid: process.pid })
+    })
+  })
+
+  it('still reports a mismatch when the registered id matches neither the workspace nor an alias', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_other',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test', ['rw_alias'])).toEqual({
+        stale: true,
+        reason: 'workspace mismatch: registered=rw_other expected=rw_test|rw_alias',
+      })
+    })
+  })
+
   it('marks an old reconcile timestamp stale before checking process liveness', async () => {
     await withTempDir(async (dir) => {
       const statePath = await writeState(dir, {
