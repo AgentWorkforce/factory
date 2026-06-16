@@ -1,0 +1,104 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version bump (ignored if custom_version is set)'
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major, prepatch, preminor, premajor, prerelease, none]
+      custom_version:
+        description: 'Exact version (e.g. 0.1.0). Overrides bump type.'
+        required: false
+      tag:
+        description: 'npm dist-tag'
+        required: true
+        default: latest
+        type: choice
+        options: [latest, next, beta, alpha]
+      dry_run:
+        description: 'Dry run (no publish, no version commit, no tag)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write   # required for npm OIDC provenance (trusted publisher)
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install deps
+        run: npm ci || npm install
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Test
+        run: npm run test --if-present
+
+      - name: Bump version
+        id: bump
+        run: |
+          CUSTOM='${{ github.event.inputs.custom_version }}'
+          BUMP='${{ github.event.inputs.version }}'
+          if [ -n "$CUSTOM" ]; then
+            npm version "$CUSTOM" --no-git-tag-version --allow-same-version
+          elif [ "$BUMP" != "none" ]; then
+            npm version "$BUMP" --no-git-tag-version
+          fi
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version is unpublished
+        run: |
+          V='${{ steps.bump.outputs.version }}'
+          if [ -n "$(npm view @agent-relay/factory@"$V" version 2>/dev/null || true)" ]; then
+            echo "::error::@agent-relay/factory@$V is already on npm. Pick a higher version."; exit 1
+          fi
+          echo "@agent-relay/factory@$V: unpublished — OK"
+
+      # npm >= 11.5.1 for the OIDC trusted-publisher (provenance) flow.
+      - name: Install latest npm
+        run: npm install -g npm@latest
+
+      # No NPM_TOKEN: relies on npm OIDC trusted-publisher. Register this
+      # repo/workflow as a trusted publisher for @agent-relay/factory on
+      # npmjs.com before the first CI publish.
+      - name: Publish
+        run: |
+          FLAGS="--access public --tag ${{ github.event.inputs.tag }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            npm publish --dry-run $FLAGS
+          else
+            npm publish --provenance $FLAGS
+          fi
+
+      - name: Commit + tag + push
+        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
+        run: |
+          V='${{ steps.bump.outputs.version }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): @agent-relay/factory@$V" || echo "nothing to commit"
+          git tag -a "v$V" -m "@agent-relay/factory@$V"
+          git push origin HEAD --follow-tags
