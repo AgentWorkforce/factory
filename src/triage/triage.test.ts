@@ -158,6 +158,53 @@ describe('HeuristicTriage thin and scope detection', () => {
     expect(decision.scope).toBe(scope)
   })
 
+  it.each([
+    {
+      name: 'agent:single keeps one implementer even with multiple repo labels',
+      labels: ['pear', 'agents', 'agent:single'],
+      expectedScope: 'single',
+      expectedImplementers: ['ar-123-impl'],
+      expectedWorkflow: undefined,
+    },
+    {
+      name: 'agent:workflow emits one workflow spec and no implementers',
+      labels: ['pear', 'agent:workflow'],
+      expectedScope: 'workflow',
+      expectedImplementers: [],
+      expectedWorkflow: {
+        name: 'ar-123-workflow',
+        role: 'workflow',
+        capability: 'workflow:run',
+        workflow: 'workflows/factory/linear-issue.ts',
+      },
+    },
+    {
+      name: 'agent:team fans out from one repo when requested explicitly',
+      labels: ['pear', 'agent:team'],
+      expectedScope: 'team',
+      expectedImplementers: ['ar-123-impl-pear', 'ar-123-impl-scope'],
+      expectedWorkflow: undefined,
+    },
+  ])('$name', async ({ labels, expectedScope, expectedImplementers, expectedWorkflow }) => {
+    const decision = await new HeuristicTriage().triage(issue({
+      labels,
+      description: richDescription('Fix renderer resizing in src/renderer/terminal.ts.'),
+    }), ctx)
+
+    expect(decision.scope).toBe(expectedScope)
+    expect(decision.implementers.map((agent) => agent.name)).toEqual(expectedImplementers)
+    if (expectedWorkflow) {
+      expect(decision.workflow).toMatchObject(expectedWorkflow)
+      expect(decision.workflow?.inputs).toMatchObject({
+        issue: decision.issue,
+        repoLabels: ['pear'],
+        routes: [{ repo: 'AgentWorkforce/pear', clonePath: '/work/pear' }],
+      })
+    } else {
+      expect(decision.workflow).toBeUndefined()
+    }
+  })
+
   it('creates two scoped implementers for a same-repo team split', async () => {
     const decision = await new HeuristicTriage().triage(issue({
       description: richDescription('Fix renderer IPC with main broker tests in src/main/broker.ts.'),
@@ -203,6 +250,17 @@ describe('LlmTriage', () => {
     await expect(triage.triage(issue(), ctx)).resolves.toEqual(expected)
     expect(prompts[0]).toContain('Repo routing precedence')
     expect(prompts[0]).toContain('AR-123')
+  })
+
+  it('parses a workflow TriageDecision shape from an injected complete function', async () => {
+    const expected = decisionJson({
+      scope: 'workflow',
+      implementers: [],
+      workflow: workflowAgent(),
+    })
+    const triage = new LlmTriage(async () => JSON.stringify(expected))
+
+    await expect(triage.triage(issue(), ctx)).resolves.toEqual(expected)
   })
 
   it('throws on malformed JSON', async () => {
@@ -307,6 +365,36 @@ describe('TieredTriage', () => {
     expect(decision.implementers.map((implementer) => implementer.name)).toEqual(['ar-123-impl-bad-name', 'ar-123-impl-also-bad'])
     expect(decision.reviewer.name).toBe('ar-123-review')
   })
+
+  it('preserves an explicit workflow label when LLM suggests team', async () => {
+    const heuristic = new HeuristicTriage()
+    const llm = new StubTriage(decisionJson({
+      scope: 'team',
+      routes: [
+        { repo: 'AgentWorkforce/pear', clonePath: '/work/pear', rationale: 'one' },
+        { repo: 'AgentWorkforce/agents', clonePath: '/work/agents', rationale: 'two' },
+      ],
+      implementers: [
+        agent('bad-one', 'AgentWorkforce/pear'),
+        agent('bad-two', 'AgentWorkforce/agents'),
+      ],
+      thin: false,
+      confidence: 'high',
+    }))
+
+    const decision = await new TieredTriage(heuristic, llm).triage(issue({
+      labels: ['pear', 'agent:workflow'],
+      description: 'Fix workflow routing in src/triage/tiered.ts.',
+    }), ctx)
+
+    expect(decision.scope).toBe('workflow')
+    expect(decision.implementers).toEqual([])
+    expect(decision.workflow).toMatchObject({
+      name: 'ar-123-workflow',
+      capability: 'workflow:run',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })
+  })
 })
 
 class StubTriage implements TriageEngine {
@@ -385,6 +473,24 @@ function agent(name: string, repo: string) {
     task: `Task for ${name}`,
     repo,
     clonePath: `/work/${repo.split('/').at(-1)}`,
+    node: 'self' as const,
+  }
+}
+
+function workflowAgent() {
+  return {
+    name: 'ar-123-workflow',
+    role: 'workflow' as const,
+    capability: 'workflow:run' as const,
+    task: 'Run workflow for AR-123',
+    workflow: 'workflows/factory/linear-issue.ts',
+    inputs: {
+      issue: { uuid: 'uuid-123', key: 'AR-123', path: '/linear/issues/AR-123__uuid-123.json' },
+      repoLabels: ['pear'],
+      routes: [{ repo: 'AgentWorkforce/pear', clonePath: '/work/pear', rationale: 'matched label' }],
+    },
+    repo: 'AgentWorkforce/pear',
+    clonePath: '/work/pear',
     node: 'self' as const,
   }
 }

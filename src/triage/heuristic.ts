@@ -4,9 +4,16 @@ import type { IssueRef, LinearIssue, RepoMapEntry, TriageContext, TriageDecision
 
 type RouteSource = RepoMapEntry['source']
 type Route = TriageDecision['routes'][number]
+type Scope = TriageDecision['scope']
 
 const DEFAULT_THIN_DESCRIPTION_LENGTH = 140
 const DEFAULT_MAX_IMPLEMENTERS = 2
+const DEFAULT_WORKFLOW_PATH = 'workflows/factory/linear-issue.ts'
+const SHAPE_LABELS: Record<string, Scope> = {
+  'agent:single': 'single',
+  'agent:workflow': 'workflow',
+  'agent:team': 'team',
+}
 
 const SURFACE_BUCKETS: Array<{ name: string; patterns: RegExp[] }> = [
   { name: 'ui', patterns: [/\bui\b/i, /\brenderer\b/i, /\bfrontend\b/i, /\breact\b/i, /\bxterm\b/i] },
@@ -40,7 +47,8 @@ export class HeuristicTriage implements TriageEngine {
     const routed = routeIssue(issue, ctx)
     const thin = isThinIssue(issue, this.#thinDescriptionLength)
     const surfaces = detectSurfaceBuckets(issue)
-    const scope = routed.routes.length >= 2 || surfaces.length >= 2 ? 'team' : 'single'
+    const explicitScope = scopeFromLabels(issue.labels)
+    const scope = explicitScope ?? (routed.routes.length >= 2 || surfaces.length >= 2 ? 'team' : 'single')
     const confidence = routed.routes.length === 0 ? 'low' : 'high'
 
     return buildDecision({
@@ -48,9 +56,12 @@ export class HeuristicTriage implements TriageEngine {
       config: ctx.config,
       routes: routed.routes,
       scope,
+      scopeSource: explicitScope ? 'label' : 'inference',
       thin,
       confidence,
-      rationale: routed.rationale,
+      rationale: explicitScope
+        ? `${routed.rationale} Scope selected from Linear label agent:${explicitScope}.`
+        : routed.rationale,
       scopeSlugs: routed.routes.length >= 2
         ? routed.routes.map((route) => slugFromRepo(route.repo))
         : surfaces,
@@ -62,7 +73,8 @@ export function buildDecision(input: {
   issue: LinearIssue
   config: FactoryConfig
   routes: Route[]
-  scope: 'single' | 'team'
+  scope: Scope
+  scopeSource?: 'label' | 'inference'
   thin: boolean
   confidence: 'high' | 'low'
   rationale: string
@@ -71,9 +83,15 @@ export function buildDecision(input: {
   const issueRef = issueRefFor(input.issue)
   const maxImplementers = input.config.triage?.maxImplementers ?? DEFAULT_MAX_IMPLEMENTERS
   const routes = dedupeRoutes(input.routes).slice(0, maxImplementers)
-  const scope = routes.length >= 2 || input.scope === 'team' ? 'team' : 'single'
+  const scope = input.scopeSource === 'label'
+    ? input.scope
+    : routes.length >= 2 || input.scope === 'team'
+      ? 'team'
+      : input.scope === 'workflow'
+        ? 'workflow'
+        : 'single'
   const slugs = input.scopeSlugs ?? routes.map((route) => slugFromRepo(route.repo))
-  const implementerAssignments = input.confidence === 'low' && routes.length === 0
+  const implementerAssignments = scope === 'workflow' || input.confidence === 'low' && routes.length === 0
     ? []
     : implementationAssignments(routes, scope, slugs, maxImplementers)
   const implementers = implementerAssignments.map(({ route, slug }) => implementerSpec({
@@ -89,6 +107,7 @@ export function buildDecision(input: {
     routes,
     scope,
     implementers,
+    workflow: scope === 'workflow' && routes.length > 0 ? workflowSpec(input.issue, input.config, routes) : undefined,
     reviewer: reviewerSpec(input.issue, input.config, routes[0]),
     thin: input.thin,
     confidence: input.confidence,
@@ -143,6 +162,7 @@ export function normalizeDecision(decision: TriageDecision, issue: LinearIssue, 
       clonePath: route.clonePath ?? config.repos.clonePaths[route.repo],
     })),
     scope: decision.scope,
+    scopeSource: scopeFromLabels(issue.labels) ? 'label' : 'inference',
     thin: decision.thin,
     confidence: decision.routes.length === 0 ? 'low' : decision.confidence,
     rationale: decision.rationale,
@@ -152,6 +172,7 @@ export function normalizeDecision(decision: TriageDecision, issue: LinearIssue, 
 
 function routeByLabels(issue: LinearIssue, ctx: TriageContext): Route[] {
   const routes = issue.labels
+    .filter((label) => !isShapeLabel(label))
     .map((label) => {
       const repo = findCaseInsensitive(ctx.config.repos.byLabel, label)
       return repo ? routeForRepo(repo, ctx, 'label', `Label "${label}" routes to ${repo}.`) : null
@@ -221,11 +242,11 @@ function dedupeRoutes(routes: Route[]): Route[] {
 
 function implementationAssignments(
   routes: Route[],
-  scope: 'single' | 'team',
+  scope: Scope,
   slugs: string[],
   maxImplementers: number,
 ): Array<{ route: Route; slug: string }> {
-  if (scope === 'single') {
+  if (scope === 'single' || scope === 'workflow') {
     const route = routes[0]
     return route ? [{ route, slug: slugFromRepo(route.repo) }] : []
   }
@@ -258,7 +279,7 @@ function implementerSpec(input: {
   issue: LinearIssue
   config: FactoryConfig
   route: Route
-  scope: 'single' | 'team'
+  scope: Scope
   slug: string
 }): AgentSpec {
   const base = agentBaseName(input.issue)
@@ -271,6 +292,33 @@ function implementerSpec(input: {
     task: taskFor(input.issue, input.route, 'implementer'),
     repo: input.route.repo,
     clonePath: input.route.clonePath,
+    node: 'self',
+  }
+}
+
+function workflowSpec(issue: LinearIssue, _config: FactoryConfig, routes: Route[]): AgentSpec {
+  const primaryRoute = routes[0]
+  // NOTE: this derives repoLabels from raw label strings, whereas the dispatch
+  // path (routeWorkflowSpec in factory.ts) rebuilds inputs from route slugs. The
+  // dispatch-path rebuild is authoritative — the live workflow spawn never
+  // consumes this version, so the two can diverge without an observable bug.
+  const repoLabels = issue.labels.filter((label) => !isShapeLabel(label))
+  return {
+    name: `${agentBaseName(issue)}-workflow`,
+    role: 'workflow',
+    capability: 'workflow:run',
+    task: taskFor(issue, primaryRoute, 'workflow'),
+    workflow: DEFAULT_WORKFLOW_PATH,
+    inputs: {
+      issue: issueRefFor(issue),
+      title: issue.title,
+      description: issue.description,
+      labels: issue.labels,
+      repoLabels,
+      routes,
+    },
+    repo: primaryRoute.repo,
+    clonePath: primaryRoute.clonePath,
     node: 'self',
   }
 }
@@ -310,7 +358,13 @@ export function babysitterSpec(issue: LinearIssue, config: FactoryConfig, route?
 }
 
 function taskFor(issue: LinearIssue, route: Route, role: AgentSpec['role']): string {
-  const verb = role === 'implementer' ? 'Implement' : role === 'babysitter' ? 'Babysit the PR for' : 'Review'
+  const verb = role === 'implementer'
+    ? 'Implement'
+    : role === 'babysitter'
+      ? 'Babysit the PR for'
+      : role === 'workflow'
+        ? 'Run workflow for'
+        : 'Review'
   return [
     `${verb} ${issue.key}: ${issue.title}`,
     `Repo: ${route.repo}`,
@@ -330,4 +384,16 @@ function slugFromRepo(repo: string): string {
 
 function sanitizeSlug(slug: string): string {
   return slug.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'scope'
+}
+
+export function scopeFromLabels(labels: string[]): Scope | undefined {
+  const normalized = new Set(labels.map((label) => label.trim().toLowerCase()))
+  if (normalized.has('agent:team')) return 'team'
+  if (normalized.has('agent:workflow')) return 'workflow'
+  if (normalized.has('agent:single')) return 'single'
+  return undefined
+}
+
+export function isShapeLabel(label: string): boolean {
+  return SHAPE_LABELS[label.trim().toLowerCase()] !== undefined
 }
