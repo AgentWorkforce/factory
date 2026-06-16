@@ -183,8 +183,9 @@ export interface RepoMapEntry {
 export interface TriageDecision {
   issue: IssueRef
   routes: Array<{ repo: string; clonePath?: string; rationale: string }>
-  scope: 'single' | 'team'
+  scope: 'single' | 'workflow' | 'team'
   implementers: AgentSpec[]
+  workflow?: AgentSpec
   reviewer: AgentSpec
   thin: boolean
   confidence: 'high' | 'low'

@@ -1,5 +1,5 @@
 import type { LinearIssue, TriageContext, TriageDecision, TriageEngine } from '../types'
-import { buildDecision, HeuristicTriage, normalizeDecision } from './heuristic'
+import { buildDecision, HeuristicTriage, normalizeDecision, scopeFromLabels } from './heuristic'
 
 export class TieredTriage implements TriageEngine {
   readonly #heuristic: TriageEngine
@@ -36,13 +36,20 @@ export function mergeDecisions(
   ctx: TriageContext,
 ): TriageDecision {
   const mergedRoutes = llmDecision.routes.length > 0 ? llmDecision.routes : heuristicDecision.routes
-  const mergedScope = mergedRoutes.length >= 2 || llmDecision.scope === 'team' || heuristicDecision.scope === 'team' ? 'team' : 'single'
+  const explicitScope = scopeFromLabels(issue.labels)
+  const mergedScope = explicitScope
+    ?? (mergedRoutes.length >= 2 || llmDecision.scope === 'team' || heuristicDecision.scope === 'team'
+      ? 'team'
+      : llmDecision.scope === 'workflow' || heuristicDecision.scope === 'workflow'
+        ? 'workflow'
+        : 'single')
 
   return normalizeDecision(buildDecision({
     issue,
     config: ctx.config,
     routes: mergedRoutes,
     scope: mergedScope,
+    scopeSource: explicitScope ? 'label' : 'inference',
     thin: llmDecision.thin && heuristicDecision.thin,
     confidence: mergedRoutes.length === 0 ? 'low' : llmDecision.confidence,
     rationale: llmDecision.rationale || heuristicDecision.rationale,

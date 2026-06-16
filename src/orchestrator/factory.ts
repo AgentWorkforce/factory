@@ -27,7 +27,7 @@ import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { renderAgentTask } from '../dispatch/templates'
-import { HeuristicTriage, TieredTriage, babysitterSpec } from '../triage'
+import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import type {
   DispatchResult,
   Factory,
@@ -1119,8 +1119,9 @@ export class FactoryLoop implements Factory {
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
+      const specs = dispatchSpecs(dispatchDecision)
       const agents: DispatchResult['agents'] = []
-      for (const spec of [...dispatchDecision.implementers, dispatchDecision.reviewer]) {
+      for (const spec of specs) {
         const spawned = await this.#spawnAgent(record, spec, dryRun)
         const tracked = record.agents.get(spawned.name)
         if (tracked) {
@@ -1971,6 +1972,8 @@ export class FactoryLoop implements Factory {
         capability: spec.capability,
         node: spec.node ?? 'self',
         task: spec.task,
+        workflow: spec.workflow,
+        inputs: spec.inputs,
         model: spec.model,
         cwd: spec.clonePath,
         sessionRef: spec.sessionRef,
@@ -3486,8 +3489,17 @@ const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefin
 const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
+  decision.scope === 'workflow' ? `Workflow: ${agents.find((agent) => agent.role === 'workflow')?.name ?? 'none'}` : undefined,
   `Reviewer: ${agents.find((agent) => agent.role === 'reviewer')?.name ?? 'none'}`,
-].join('\n')
+].filter((line): line is string => line !== undefined).join('\n')
+
+function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
+  if (decision.scope === 'workflow') {
+    return decision.workflow ? [decision.workflow] : []
+  }
+
+  return [...decision.implementers, decision.reviewer]
+}
 
 type LabelDispatchResolution =
   | { ok: true; decision: TriageDecision }
@@ -3521,8 +3533,16 @@ function labelDerivedDispatchDecision(
     }
   }
 
+  const explicitScope = scopeFromLabels(liveIssue.labels)
+  const scope = explicitScope
+    ?? (routesByLabel.routes.length >= 2 || decision.scope === 'team'
+      ? 'team'
+      : decision.scope === 'workflow'
+        ? 'workflow'
+        : 'single')
+
   const maxImplementers = Math.min(config.triage.maxImplementers, MAX_LABEL_IMPLEMENTERS)
-  if (routesByLabel.routes.length > maxImplementers) {
+  if (scope === 'team' && routesByLabel.routes.length > maxImplementers) {
     return {
       ok: false,
       reason: 'too-many-labels',
@@ -3534,15 +3554,26 @@ function labelDerivedDispatchDecision(
   const implementers = routesByLabel.routes.map(({ slug, route }) =>
     routeImplementerSpec(liveIssue, config, slug, route),
   )
+  const selectedRoutes = scope === 'single' ? routesByLabel.routes.slice(0, 1) : routesByLabel.routes
+  const selectedImplementers = scope === 'team'
+    ? implementers
+    : scope === 'single'
+      ? implementers.slice(0, 1)
+      : []
+  const routes = selectedRoutes.map(({ route }) => route)
+  const workflow = scope === 'workflow'
+    ? routeWorkflowSpec(liveIssue, config, selectedRoutes, decision.workflow)
+    : undefined
 
   return {
     ok: true,
     decision: {
       ...decision,
-      routes: routesByLabel.routes.map(({ route }) => route),
-      scope: implementers.length >= 2 ? 'team' : 'single',
-      implementers,
-      reviewer: routeReviewerSpec(liveIssue, config, routesByLabel.routes[0]!.route, decision.reviewer),
+      routes,
+      scope,
+      implementers: selectedImplementers,
+      workflow,
+      reviewer: routeReviewerSpec(liveIssue, config, selectedRoutes[0]!.route, decision.reviewer),
     },
   }
 }
@@ -3555,7 +3586,7 @@ function labelRoutesForIssue(
   offendingLabels: string[]
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
-  const labels = uniqueNormalizedLabels(issue.labels)
+  const labels = uniqueNormalizedLabels(issue.labels).filter((label) => !isShapeLabel(label))
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []
   const seenRepos = new Set<string>()
@@ -3623,6 +3654,35 @@ function routeReviewerSpec(
   }
 }
 
+function routeWorkflowSpec(
+  issue: LinearIssue,
+  _config: FactoryConfig,
+  routesByLabel: Array<{ slug: string; route: TriageDecision['routes'][number] }>,
+  workflow?: AgentSpec,
+): AgentSpec {
+  const route = routesByLabel[0]!.route
+  return {
+    ...workflow,
+    name: workflow?.name ?? `${agentBaseName(issue)}-workflow`,
+    role: 'workflow',
+    capability: 'workflow:run',
+    task: workflow?.task ?? taskForDispatch(issue, route, 'workflow'),
+    workflow: workflow?.workflow ?? 'workflows/factory/linear-issue.ts',
+    inputs: {
+      ...workflow?.inputs,
+      issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
+      title: issue.title,
+      description: issue.description,
+      labels: issue.labels,
+      repoLabels: routesByLabel.map(({ slug }) => slug),
+      routes: routesByLabel.map(({ route }) => route),
+    },
+    repo: route.repo,
+    clonePath: route.clonePath,
+    node: workflow?.node ?? 'self',
+  }
+}
+
 function labelDispatchFailureSignature(resolution: Exclude<LabelDispatchResolution, { ok: true }>): string {
   return `${resolution.reason}:${[...resolution.offendingLabels].sort().join(',')}`
 }
@@ -3672,7 +3732,13 @@ function uniqueNormalizedLabels(labels: string[]): string[] {
 }
 
 function taskForDispatch(issue: LinearIssue, route: TriageDecision['routes'][number], role: AgentSpec['role']): string {
-  const verb = role === 'implementer' ? 'Implement' : role === 'babysitter' ? 'Babysit the PR for' : 'Review'
+  const verb = role === 'implementer'
+    ? 'Implement'
+    : role === 'babysitter'
+      ? 'Babysit the PR for'
+      : role === 'workflow'
+        ? 'Run workflow for'
+        : 'Review'
   return [
     `${verb} ${issue.key}: ${issue.title}`,
     `Repo: ${route.repo}`,

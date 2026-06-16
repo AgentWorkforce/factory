@@ -386,7 +386,7 @@ describe('InternalFleetClient', () => {
     expect(harness.released).toEqual([{ name: 'ar-1-impl', reason: 'done' }])
     await expect(fleet.roster()).resolves.toEqual({
       agents: [{ name: 'ar-1-impl' }],
-      nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex'], live: true }],
+      nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
     })
   })
 

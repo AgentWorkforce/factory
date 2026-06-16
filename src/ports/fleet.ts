@@ -1,4 +1,4 @@
-export type Capability = 'spawn:codex' | 'spawn:claude'
+export type Capability = 'spawn:codex' | 'spawn:claude' | 'workflow:run'
 export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput['restartPolicy']
 
 export interface SpawnInput {
@@ -6,6 +6,8 @@ export interface SpawnInput {
   capability: Capability
   node?: 'self' | string
   task?: string
+  workflow?: string
+  inputs?: Record<string, unknown>
   model?: string
   cwd?: string
   sessionRef?: string
@@ -52,10 +54,12 @@ export interface FleetClient {
 
 export type AgentSpec = {
   name: string
-  role: 'implementer' | 'reviewer' | 'babysitter'
+  role: 'implementer' | 'reviewer' | 'babysitter' | 'workflow'
   capability: Capability
   model?: string
   task: string
+  workflow?: string
+  inputs?: Record<string, unknown>
   repo: string
   clonePath?: string
   channel?: string
