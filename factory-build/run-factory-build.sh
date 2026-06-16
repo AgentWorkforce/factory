@@ -44,7 +44,7 @@ run() {
   local cmd
   if [[ -n "$RUNNER_OVERRIDE" ]]; then cmd=("$RUNNER_OVERRIDE" run); else cmd=(node "$CLI_BIN" run); fi
   if [[ "$DRY" == "--dry-run" ]]; then
-    "${cmd[@]}" --dry-run "$f"
+    FACTORY_BUILD_DRY=1 "${cmd[@]}" --dry-run "$f"
   else
     "${cmd[@]}" "$f"
   fi

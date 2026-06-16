@@ -18,7 +18,7 @@ async function main() {
       'src/types.ts',
     ],
     acceptanceCmd: 'npm run build --if-present 2>&1 | tail -40 && npm test --if-present 2>&1 | tail -40',
-    tier: 'deep',
+    tier: 'standard',
     task: 'Widen TriageDecision.scope from single|team to single|workflow|team across the triage engine and orchestrator dispatch. Map explicit labels (agent:single/agent:workflow/agent:team) deterministically; otherwise TieredTriage (heuristic -> LLM) emits scope + confidence and routes low-confidence issues to Slack clarification before spawning. Define the workflow-scope spec so it maps onto cloud\'s existing workflow execution path (no new dialect). One knob, not three code paths. Unit-test all three labels + inference + clarification branches.',
     prTitle: '[factory] p7: scope single|workflow|team driven by issue labels',
     prSummary: 'Three-value scope knob bound to agent:single/workflow/team labels, with tiered inference + Slack clarification fallback. Emits specs into cloud\'s existing execution paths.',

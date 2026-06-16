@@ -18,7 +18,7 @@ async function main() {
       'packages/factory-sdk/tsconfig.build.json',
       'packages/factory-sdk/bin',
     ],
-    acceptanceCmd: 'npm run build -w @pear/factory-sdk 2>&1 | tail -40 && npm pack --dry-run -w @pear/factory-sdk 2>&1 | tail -30',
+    acceptanceCmd: 'cd packages/factory-sdk && npm run build --if-present 2>&1 | tail -40 && npm pack --dry-run 2>&1 | tail -30',
     tier: 'standard',
     task: 'Make the package publishable as @agent-relay/factory: build with tsc into dist/, point exports at dist/, drop private:true, set npm public access, and rename the bin fleet -> factory. Pear continues consuming the local workspace package (no behavior change) until p4 swaps the dep. npm pack --dry-run must list only dist/, bin/, package.json, README.md.',
     prTitle: '[factory] p3: publishable build + bin rename (fleet -> factory)',

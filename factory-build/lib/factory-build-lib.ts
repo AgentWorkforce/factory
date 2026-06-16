@@ -25,8 +25,11 @@
  */
 
 import { workflow } from '@relayflows/core';
+import { execSync } from 'node:child_process';
 
 export const AW_ROOT = '/Users/khaliqgant/Projects/AgentWorkforce';
+/** Isolated git worktrees so parallel workflows never share a working tree. */
+export const WORKTREES = `${AW_ROOT}/.factory-worktrees`;
 export const PLANNING = `${AW_ROOT}/factory/planning`;
 export const EPIC = `${PLANNING}/factory-cloud-watches-local-node-linear-issue.md`;
 export const RULES = `${AW_ROOT}/ricky/workflows/shared/WORKFLOW_AUTHORING_RULES.md`;
@@ -151,9 +154,8 @@ function addSetup(wf: Wf, o: FactoryWorkflowOptions): void {
     failOnError: true,
     command: j([
       'set -e',
-      'git rev-parse --show-toplevel >/dev/null',
-      'git fetch origin --quiet || true',
-      `git checkout -B ${o.branch}`,
+      // Already in the isolated worktree on this branch (setupWorktree did the checkout).
+      `git rev-parse --abbrev-ref HEAD | grep -qx "${o.branch}" || { echo "not on ${o.branch}"; exit 1; }`,
       'gh auth status >/dev/null 2>&1 || { echo "MISSING_ENV_VAR: gh auth (run: gh auth login)"; exit 1; }',
       `mkdir -p ${dir}`,
       'echo PREFLIGHT_OK',
@@ -247,54 +249,22 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     failOnError: true,
     command: scopedChangeCmd(o.fileTargets),
   });
-  wf.step('self-reflection-gate', {
+  // Single acceptance gate. A red gate auto-invokes the repair agent and reruns it
+  // (.repairable()), so it self-heals without verbose soft/repair/hard scaffolding.
+  wf.step('validate', {
     type: 'deterministic',
-    dependsOn: ['lead-coordinate'],
+    dependsOn: ['change-detection'],
     captureOutput: true,
-    failOnError: false,
-    command: `test -f ${dir}/self-reflection.md && echo SELF_REFLECTION_OK || { echo "MISSING_SELF_REFLECTION"; exit 1; }`,
-  });
-  wf.step('repair-self-reflection', {
-    agent: 'impl-codex',
-    dependsOn: ['self-reflection-gate'],
-    task: `If ${dir}/self-reflection.md is missing, write it now (changed files, spec coverage, tests/proofs, repo-rule alignment, risks). Output:\n{{steps.self-reflection-gate.output}}`,
-    verification: { type: 'file_exists', value: `${dir}/self-reflection.md` },
+    failOnError: true,
+    command: `${acc}`,
   });
 
-  // Soft → repair → hard validation.
-  wf.step('validate-soft', {
-    type: 'deterministic',
-    dependsOn: ['change-detection', 'repair-self-reflection'],
-    captureOutput: true,
-    failOnError: false,
-    command: `${acc} 2>&1 | tail -80; echo "EXIT: $?"`,
-  });
-  wf.step('repair-validate', {
-    agent: 'lead-claude',
-    dependsOn: ['validate-soft'],
-    task: j([
-      `Acting as QA. If validation passed, summarize the green evidence.`,
-      `If it failed, use this output to assign and fix issues, then rerun "${acc}" locally until green:`,
-      `{{steps.validate-soft.output}}`,
-    ]),
-    verification: { type: 'exit_code' },
-  });
-  wf.step('validate-hard', {
-    type: 'deterministic',
-    dependsOn: ['repair-validate'],
-    captureOutput: true,
-    failOnError: false,
-    command: `${acc} 2>&1 | tail -80; echo "EXIT: $?"`,
-  });
-
-  // Claude fresh-eyes loop.
+  // One fresh-eyes review/fix loop (Claude) — catches logic the gates miss.
   wf.step('claude-review', {
     agent: 'reviewer-claude',
-    dependsOn: ['validate-hard'],
+    dependsOn: ['validate'],
     task: j([
-      `First-pass fresh-eyes review of the post-implementation state for issue ${o.id}.`,
-      `Read the actual changed files, git diff, repo rules (AGENTS.md/CLAUDE.md), the spec, and validation output:`,
-      `{{steps.validate-hard.output}}`,
+      `Fresh-eyes review of the post-implementation state for issue ${o.id}. Read the changed files, git diff, repo rules (AGENTS.md/CLAUDE.md), and the spec.`,
       `Write ${dir}/claude-review.md with actionable findings (file + required fix + required test) or NO_ISSUES_FOUND.`,
     ]),
     verification: { type: 'file_exists', value: `${dir}/claude-review.md` },
@@ -303,47 +273,21 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     agent: 'fixer-claude',
     dependsOn: ['claude-review'],
     task: j([
-      `Read ${dir}/claude-review.md. Fix every valid finding, add/update tests or proofs, rerun the relevant checks, and keep iterating locally until this round has no remaining valid issues.`,
-      `Write ${dir}/claude-fix.md with fixes and commands run. If the review said NO_ISSUES_FOUND, record that no fix was needed.`,
-    ]),
-    verification: { type: 'exit_code' },
-  });
-  wf.step('claude-review-final', {
-    agent: 'reviewer-claude',
-    dependsOn: ['claude-fix'],
-    task: j([
-      `Fresh post-fix review from scratch (do not rely on prior review text or the fixer summary). Read files, diff, rules, spec.`,
-      `Write ${dir}/claude-review-final.md with findings or NO_ISSUES_FOUND.`,
-    ]),
-    verification: { type: 'file_exists', value: `${dir}/claude-review-final.md` },
-  });
-  wf.step('claude-fix-final', {
-    agent: 'fixer-claude',
-    dependsOn: ['claude-review-final'],
-    task: j([
-      `If ${dir}/claude-review-final.md has findings, fix them, add/update tests or proofs, and rerun checks until green. Do NOT skip or give up — keep fixing.`,
-      `If NO_ISSUES_FOUND, record Claude signoff in ${dir}/claude-signoff.md.`,
+      `Read ${dir}/claude-review.md. Fix every valid finding, add/update tests or proofs, rerun the relevant checks until clean. Do NOT skip — keep fixing.`,
+      `Write ${dir}/claude-fix.md with fixes and commands run. If NO_ISSUES_FOUND, record that no fix was needed.`,
     ]),
     verification: { type: 'exit_code' },
   });
 
-  let lastReviewStep = 'claude-fix-final';
+  let lastReviewStep = 'claude-fix';
 
   if (o.tier === 'deep') {
-    wf.step('validate-after-claude', {
-      type: 'deterministic',
-      dependsOn: ['claude-fix-final'],
-      captureOutput: true,
-      failOnError: false,
-      command: `${acc} 2>&1 | tail -80; echo "EXIT: $?"`,
-    });
+    // Second fresh-eyes loop (Codex) — only for the crux / high-risk workflows.
     wf.step('codex-review', {
       agent: 'reviewer-codex',
-      dependsOn: ['validate-after-claude'],
+      dependsOn: ['claude-fix'],
       task: j([
-        `Second-pass fresh-eyes review of the post-Claude-fix state for issue ${o.id}.`,
-        `Read the actual changed files, git diff, repo rules, the spec, and validation output:`,
-        `{{steps.validate-after-claude.output}}`,
+        `Second-pass fresh-eyes review of the post-Claude-fix state for issue ${o.id}. Read the changed files, git diff, repo rules, and the spec.`,
         `Write ${dir}/codex-review.md with actionable findings or NO_ISSUES_FOUND.`,
       ]),
       verification: { type: 'file_exists', value: `${dir}/codex-review.md` },
@@ -351,25 +295,10 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     wf.step('codex-fix', {
       agent: 'fixer-codex',
       dependsOn: ['codex-review'],
-      task: `Read ${dir}/codex-review.md. Fix every valid finding, add/update tests or proofs, rerun checks until this round is clean. Write ${dir}/codex-fix.md. If NO_ISSUES_FOUND, record that no fix was needed.`,
+      task: `Read ${dir}/codex-review.md. Fix every valid finding, add/update tests or proofs, rerun checks until clean. Do NOT skip — keep fixing. Write ${dir}/codex-fix.md. If NO_ISSUES_FOUND, record that no fix was needed.`,
       verification: { type: 'exit_code' },
     });
-    wf.step('codex-review-final', {
-      agent: 'reviewer-codex',
-      dependsOn: ['codex-fix'],
-      task: `Fresh post-Codex-fix review from scratch. Write ${dir}/codex-review-final.md with findings or NO_ISSUES_FOUND.`,
-      verification: { type: 'file_exists', value: `${dir}/codex-review-final.md` },
-    });
-    wf.step('codex-fix-final', {
-      agent: 'fixer-codex',
-      dependsOn: ['codex-review-final'],
-      task: j([
-        `If ${dir}/codex-review-final.md has findings, fix them, add/update tests or proofs, rerun checks until green. Do NOT skip or give up — keep fixing.`,
-        `If NO_ISSUES_FOUND, record Codex signoff in ${dir}/codex-signoff.md.`,
-      ]),
-      verification: { type: 'exit_code' },
-    });
-    lastReviewStep = 'codex-fix-final';
+    lastReviewStep = 'codex-fix';
   }
 
   // Repair-not-skip: final acceptance fails hard on red, which (under .repairable())
@@ -454,10 +383,9 @@ export function buildFactoryWorkflow(o: FactoryWorkflowOptions): Wf {
     .maxConcurrency(4)
     .timeout(7_200_000)
     // Repair-not-skip: any failing gate auto-invokes the repair agent to FIX it and
-    // reruns the gate, up to repairRetries times — it never skips/blocks. A high
-    // budget makes a genuine run failure practically unreachable (only an exhausted
-    // repair budget can end a run unfixed). repairAgent picks the Claude fixer.
-    .repairable({ repairRetries: 12, maxRetries: 12, retryDelayMs: 10_000, repairAgent: 'fixer-claude' });
+    // reruns the gate, up to repairRetries times — it never skips/blocks. 5 is enough
+    // to self-heal real issues without a runaway loop eating hours on a stuck gate.
+    .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'fixer-claude' });
 
   addSquad(wf, o.tier);
   addSetup(wf, o);
@@ -469,12 +397,37 @@ export function buildFactoryWorkflow(o: FactoryWorkflowOptions): Wf {
   return wf;
 }
 
-/** Build + run with the correct repo cwd. */
-export async function runFactoryWorkflow(o: FactoryWorkflowOptions): Promise<void> {
-  const cwd = REPOS[o.repo];
-  if (!cwd) {
+/**
+ * Create an isolated git worktree for this workflow off origin/main, so parallel
+ * workflows on the same repo never share a working tree (the wave1 collision bug).
+ * node_modules is symlinked from the parent repo so build/test resolve deps without
+ * a fresh (slow) install per worktree.
+ */
+export function setupWorktree(o: FactoryWorkflowOptions): string {
+  const repo = REPOS[o.repo];
+  if (!repo) {
     throw new Error(`Unknown repo "${o.repo}" — expected one of ${Object.keys(REPOS).join(', ')}`);
   }
+  const wt = `${WORKTREES}/${o.repo}-${o.id}-${o.slug}`;
+  const sh = (cmd: string) => execSync(cmd, { stdio: 'pipe' });
+  const quiet = (cmd: string) => { try { sh(cmd); } catch { /* best effort */ } };
+  quiet(`git -C "${repo}" worktree remove --force "${wt}"`);
+  quiet(`rm -rf "${wt}"`);
+  sh(`mkdir -p "${WORKTREES}"`);
+  quiet(`git -C "${repo}" fetch origin --quiet`);
+  // -B resets the branch to a fresh checkout off the latest main, in an isolated dir.
+  sh(`git -C "${repo}" worktree add -f -B "${o.branch}" "${wt}" origin/main`);
+  // Symlink deps (gitignored, so not in the worktree). Read-mostly; build/test resolve up-tree.
+  quiet(`test -d "${repo}/node_modules" && ln -snf "${repo}/node_modules" "${wt}/node_modules"`);
+  return wt;
+}
+
+/** Build + run in an isolated worktree (parallel-safe). */
+export async function runFactoryWorkflow(o: FactoryWorkflowOptions): Promise<void> {
+  // FACTORY_BUILD_DRY=1 (set by the runner on --dry-run) skips the real worktree
+  // side-effect and validates against the repo root instead.
+  const cwd = process.env.FACTORY_BUILD_DRY === '1' ? REPOS[o.repo] : setupWorktree(o);
+  if (process.env.FACTORY_BUILD_DRY !== '1') console.log(`[factory ${o.id}] worktree: ${cwd}`);
   const wf = buildFactoryWorkflow(o);
   const result = await wf.run({ cwd });
   console.log(`[factory ${o.id}] done: ${result.status} (${result.id})`);

@@ -18,7 +18,7 @@ async function main() {
       'src/node',
     ],
     acceptanceCmd: 'npm run build --if-present 2>&1 | tail -50 && npm test --if-present 2>&1 | tail -40',
-    tier: 'deep',
+    tier: 'standard',
     task: 'Ship a factory node-definition (defineNode({...})) in @agent-relay/factory that reads NodeConfig (workspaceId, capabilities, repoPaths), advertises spawn:claude/spawn:codex, pushes repoPaths keys up on registration (for p12 placement), runs cloud-placed spawns locally via the existing harness path (InternalFleetClient / harness-driver) in the mapped checkout, and streams exit/messages back. Document the one-command flow: `agent-relay fleet serve ./factory.node.ts`. NO new CLI command — fleet serve is the entry point.',
     prTitle: '[factory] p13: factory node-definition for `agent-relay fleet serve`',
     prSummary: 'One command (`agent-relay fleet serve <factory-node-def>`) registers a node from NodeConfig and executes cloud-placed spawns locally. fleet serve already auto-starts the broker, so this is genuinely zero-infra for the user.',

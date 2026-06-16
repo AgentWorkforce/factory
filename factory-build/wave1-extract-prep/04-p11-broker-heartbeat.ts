@@ -17,7 +17,7 @@ async function main() {
       'packages/sdk/src/messaging/relaycast.ts',
     ],
     acceptanceCmd: 'npm run build --if-present 2>&1 | tail -50 && npm test --if-present 2>&1 | tail -40',
-    tier: 'deep',
+    tier: 'standard',
     task: 'Add node outbound heartbeat (~10-15s: name, capabilities, activeAgents, load, lastHeartbeatAt) populating the RelayNode roster fields, reconnect inventory sync (re-announce live agents for reconciliation; first-to-completed wins), and graceful deregister. Mark a node offline when heartbeats lapse; the bounded-durable mailbox holds messages until TTL.',
     prTitle: '[factory] p11: broker heartbeat + reconnect inventory sync',
     prSummary: 'Outbound liveness/load heartbeat, reconnect re-announce/reconcile, graceful deregister. The load-bearing piece for laptop-closed -> queue -> drain-on-reopen.',

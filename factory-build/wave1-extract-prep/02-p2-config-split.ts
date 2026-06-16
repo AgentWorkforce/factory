@@ -15,7 +15,7 @@ async function main() {
     fileTargets: [
       'packages/factory-sdk/src/config/schema.ts',
     ],
-    acceptanceCmd: 'npm run build -w @pear/factory-sdk 2>&1 | tail -40 && npm test -w @pear/factory-sdk 2>&1 | tail -40',
+    acceptanceCmd: 'cd packages/factory-sdk && npm run build --if-present 2>&1 | tail -40 && npm test --if-present 2>&1 | tail -40',
     tier: 'standard',
     task: 'BUILD ON pear#368 (LANDED — dynamic per-team Linear states) AND pear#369 (LANDED — compact repos: org/cloneRoot/names/overrides + Zod .transform deriving byLabel/clonePaths/labels). Both config/schema.ts PRs are merged. Split FactoryConfig into two Zod schemas, splitting #369\'s compact form along the workspace/node seam: WorkspaceConfig = subscription + repos identity (org, names, overrides, byLabel, default) + batchSize + mergePolicy + safety + slack + #368 Linear states (linear.states, linear.statesByTeam, stateIds) — all cloud/workspace policy. NodeConfig = workspaceId + capabilities + #369\'s cloneRoot + clonePaths (THIS is the per-machine repoPaths — keep #369\'s derivation: clonePaths[repo] = cloneRoot/repoName). The loader must accept the legacy combined shape, #369\'s compact form, AND the new split shape so nothing regresses; preserve #369\'s .transform derivation and #368\'s dynamic state resolution. Behavior-preserving.',
     prTitle: '[factory] p2: split FactoryConfig into WorkspaceConfig + NodeConfig',
