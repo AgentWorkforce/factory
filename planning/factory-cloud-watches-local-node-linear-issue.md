@@ -210,7 +210,7 @@ The node pushes its `repoPaths` keys + `capabilities` up on registration so clou
 
 **Phase 0.5 — land the factory-sdk config PRs before wave1.** Both rewrite `config/schema.ts` (the file p2 edits):
 - **[pear#368](https://github.com/AgentWorkforce/pear/pull/368) — LANDED.** Dynamic per-team Linear states (`linear.states`/`linear.statesByTeam`/`stateIds`; `resolveFactoryStates` reads `/linear/states`). Also touched `orchestrator/factory.ts`/`types.ts` (p1) + `cli/fleet.ts` (p3). Provider dep `/linear/states` (relayfile-adapters `feat/linear-states-adapter`) flows to the cloud lift (p6/p8).
-- **[pear#369](https://github.com/AgentWorkforce/pear/pull/369) — OPEN, land next.** Compact `repos` (`org`/`cloneRoot`/`names`/`overrides`) → Zod `.transform()` derives `byLabel`/`clonePaths`/`labels`. Only `config/schema.ts` — overlaps p2.
+- **[pear#369](https://github.com/AgentWorkforce/pear/pull/369) — LANDED.** Compact `repos` (`org`/`cloneRoot`/`names`/`overrides`) → Zod `.transform()` derives `byLabel`/`clonePaths`/`labels`. Only `config/schema.ts` — overlaps p2.
 
 p2 splits #369's compact form along the seam: identity (`org`/`names`/`overrides`/`byLabel`/`default`) → `WorkspaceConfig`; per-machine `cloneRoot`/`clonePaths` → `NodeConfig` (this *is* `repoPaths`). Plus #368's states → `WorkspaceConfig`. Preserve both transforms. Note: p1's `StateStore` (runtime in-flight state) ≠ #368's `resolveFactoryStates` (Linear workflow-state UUIDs) — don't conflate.
 

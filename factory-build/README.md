@@ -35,13 +35,13 @@ targets, acceptance command, tier, and the implementation goal.
 ## ⚠️ Prerequisites before wave1 (factory-sdk config PRs)
 Two in-flight pear PRs rewrite `packages/factory-sdk/config/schema.ts` — the file **p2** edits — so land them before wave1 or the workflow PRs conflict:
 - **[pear#368](https://github.com/AgentWorkforce/pear/pull/368) — LANDED.** Dynamic per-team Linear states (`linear.states`, `linear.statesByTeam`, `stateIds` fallback; `resolveFactoryStates` reads `/linear/states`). Also touched `orchestrator/factory.ts` + `types.ts` (p1) + `cli/fleet.ts` (p3). Provider dep: the `/linear/states` resource (relayfile-adapters `feat/linear-states-adapter`) must be materialized — flows into the cloud lift (**p6/p8**).
-- **[pear#369](https://github.com/AgentWorkforce/pear/pull/369) — OPEN, land next.** Compact `repos` form (`org`/`cloneRoot`/`names`/`overrides`) with a Zod `.transform()` deriving `byLabel`/`clonePaths`/`labels`. Only touches `config/schema.ts` — overlaps **p2**.
+- **[pear#369](https://github.com/AgentWorkforce/pear/pull/369) — LANDED.** Compact `repos` form (`org`/`cloneRoot`/`names`/`overrides`) with a Zod `.transform()` deriving `byLabel`/`clonePaths`/`labels`. Only touches `config/schema.ts` — overlaps **p2**.
 
 **p2 splits #369's compact form along the workspace/node seam:** `org`/`names`/`overrides`/`byLabel`/`default` → **WorkspaceConfig**; `cloneRoot`/`clonePaths` (the per-machine checkout paths) → **NodeConfig** (this *is* `repoPaths`). It also folds #368's `linear.states`/`statesByTeam`/`stateIds` into WorkspaceConfig. Preserve both #369's `.transform` derivation and #368's dynamic state resolution.
 
 ## Waves & dependency order
 ```
-wave0 (prereq)    pear#368 (LANDED) + pear#369 (land next) — config/schema.ts
+wave0 (prereq)    pear#368 + pear#369 — config/schema.ts — ✅ BOTH LANDED
 wave1 (parallel)  p1 p2 p3 (pear prep)   p11 (relay broker — independent)
 wave2             p4  extraction  ──►  ⛔ PUBLISH GATE (human: npm publish + pear swap)
 wave3 (parallel)  p5 (pear teardown)     p6 (cloud host orchestrator)
