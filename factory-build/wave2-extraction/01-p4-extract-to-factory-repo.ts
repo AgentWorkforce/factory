@@ -30,10 +30,10 @@ async function main() {
     .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'lead-claude', onExhaustion: 'needs-human' });
 
   wf.agent('lead-claude', { cli: 'claude', role: 'Lead + QA for the extraction. Coordinates the seed, verification, and publish-prep; runs repair on red gates.', retries: 1 });
-  wf.agent('impl-codex', { cli: 'codex', role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling (CI/publish/LICENSE/.gitignore), and pushes.', retries: 2 });
+  wf.agent('impl-codex', { cli: 'codex', interactive: false, role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling (CI/publish/LICENSE/.gitignore), and pushes. Worker (interactive:false) → completes on process exit, no broker owner-completion-decision to drop.', retries: 2 });
   // (assist-opencode removed — flaky headless; impl-codex owns the tooling. See factory-build-lib.ts.)
   wf.agent('reviewer-claude', { cli: 'claude', preset: 'reviewer', role: 'Reviews the seeded repo + the post-publish swap plan from scratch.', retries: 1 });
-  wf.agent('reviewer-codex', { cli: 'codex', preset: 'reviewer', role: 'Second-pass review of the extraction integrity (history preserved, publish shape, swap plan).', retries: 1 });
+  wf.agent('reviewer-codex', { cli: 'codex', interactive: false, preset: 'reviewer', role: 'Second-pass review of the extraction integrity (history preserved, publish shape, swap plan). Worker (interactive:false) → completes on process exit.', retries: 1 });
 
   wf.step('preflight', {
     type: 'deterministic',

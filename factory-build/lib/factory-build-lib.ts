@@ -83,6 +83,9 @@ type Wf = ReturnType<typeof workflow>;
 
 const j = (lines: string[]) => lines.join('\n');
 
+/** A worker (non-interactive) agent runs as a single subprocess call; give it a generous deadline. */
+const WORKER_TIMEOUT_MS = 3_600_000;
+
 function artifactDir(o: FactoryWorkflowOptions): string {
   return `.workflow-artifacts/factory-${o.id}-${o.slug}`;
 }
@@ -97,25 +100,21 @@ function scopedChangeCmd(targets: string[]): string {
   ]);
 }
 
-/** Add the standard factory squad. */
+/** Add the factory squad. Codex agents are WORKERS (interactive:false). */
 function addSquad(wf: Wf, tier: FactoryWorkflowOptions['tier']): void {
-  wf.agent('lead-claude', {
-    cli: 'claude',
-    role: 'Lead + QA. Plans, assigns impl-codex, watches the channel with shadow-claude, runs QA repair on red gates, and exits only when the declared file targets are implemented and the implementer self-reflection is written.',
-    retries: 1,
-  });
+  // impl-codex is a WORKER (`interactive: false`): relayflows spawns it via spawnAgent, which
+  // runs the codex CLI as a single subprocess and resolves on process EXIT — never on a broker
+  // "owner completion decision" that can drop. That owner-completion drop is what stalled
+  // codex-as-an-interactive-step-owner at `implement` (p1/p2, 2026-06-16), and the conversation
+  // shape before it. Workers are excluded from channel message edges (coordinator.js) — they
+  // don't need them in a pipeline. claude reviewer/fixer stay interactive (reliable as owners +
+  // fixer-claude is the .repairable repair agent). If a worker exits non-zero / skips its
+  // artifact, the gate fails → .repairable hands to fixer-claude.
   wf.agent('impl-codex', {
     cli: 'codex',
-    role: 'Primary implementer. Implements the declared file targets per the spec and the lead plan.',
+    interactive: false,
+    role: 'Primary implementer (worker). Implements the declared file targets per the spec in one pass, with tests/proofs.',
     retries: 2,
-  });
-  // assist-opencode removed: OpenCode TUI never runs the injected prompt headlessly,
-  // and even rebound to claude the assist step fails `owner completion decision missing`
-  // and FAILS the run (p11/p3, 2026-06-16). lead + impl + shadow is the reliable squad.
-  wf.agent('shadow-claude', {
-    cli: 'claude',
-    role: 'Live shadow reviewer. Reads actual files and channel updates while work is happening and posts concise spec-drift feedback before the implementers exit.',
-    retries: 1,
   });
   wf.agent('reviewer-claude', {
     cli: 'claude',
@@ -125,19 +124,22 @@ function addSquad(wf: Wf, tier: FactoryWorkflowOptions['tier']): void {
   });
   wf.agent('fixer-claude', {
     cli: 'claude',
-    role: 'Review-finding fixer. Repairs valid findings, adds/updates tests or proofs, reruns checks.',
+    role: 'Review-finding fixer + repair agent. Repairs valid findings / red gates, adds/updates tests or proofs, reruns checks.',
     retries: 2,
   });
   if (tier === 'deep') {
+    // Second review/fix pass (Codex) — also WORKERS, same completion-reliability reason.
     wf.agent('reviewer-codex', {
       cli: 'codex',
+      interactive: false,
       preset: 'reviewer',
-      role: 'Fresh-eyes reviewer (second pass). Reviews the post-Claude-fix state from scratch.',
+      role: 'Fresh-eyes reviewer (second pass, worker). Reviews the post-Claude-fix state from scratch.',
       retries: 1,
     });
     wf.agent('fixer-codex', {
       cli: 'codex',
-      role: 'Second-pass review-finding fixer. Repairs valid findings, adds/updates tests or proofs, reruns checks.',
+      interactive: false,
+      role: 'Second-pass review-finding fixer (worker). Repairs valid findings, adds/updates tests or proofs, reruns checks.',
       retries: 2,
     });
   }
@@ -177,56 +179,33 @@ function addSetup(wf: Wf, o: FactoryWorkflowOptions): void {
   });
 }
 
-/** Implementation (conversation shape). Terminal step: 'lead-coordinate'. */
+/** Implementation: impl-codex worker (interactive:false → spawnAgent, exits on done). Terminal: 'implement'. */
 function addImplementation(wf: Wf, o: FactoryWorkflowOptions): void {
   const dir = artifactDir(o);
   const targets = o.fileTargets.join(', ');
-  const crossNote = o.crossRepoNote
-    ? `\nCROSS-REPO: ${o.crossRepoNote}`
-    : '';
-  wf.step('lead-coordinate', {
-    agent: 'lead-claude',
+  const crossNote = o.crossRepoNote ? `\nCROSS-REPO: ${o.crossRepoNote}` : '';
+  // impl-codex is a worker (declared interactive:false), so this agent step runs codex as a single
+  // subprocess that completes on process exit — no broker owner-completion-decision to drop. The
+  // spec is passed via the captured read-spec output. If codex exits non-zero or skips
+  // self-reflection.md, the step/verification fails → .repairable hands off to fixer-claude.
+  wf.step('implement', {
+    agent: 'impl-codex',
     dependsOn: ['read-spec'],
+    timeoutMs: WORKER_TIMEOUT_MS,
     task: j([
-      `You are lead-claude on this channel. Worker: impl-codex (primary implementer). Shadow: shadow-claude.`,
-      `Issue: ${o.id} — ${o.description}`,
-      `Full spec (read it in full at ${PLANNING}/${o.specFile}):`,
+      `You are the implementer for factory issue ${o.id} — ${o.description}.`,
+      `Full spec (also at ${PLANNING}/${o.specFile}):`,
       `{{steps.read-spec.output}}`,
       ``,
       `Declared file targets (do not edit outside these): ${targets}`,
       o.task,
       crossNote,
       ``,
-      `Run the squad: post the plan, assign files (no two agents edit the same file at once), let shadow-claude flag drift, review their work, and iterate in-channel until the spec is satisfied.`,
-      `Before you exit, confirm impl-codex wrote ${dir}/self-reflection.md.`,
-      `Exit only when the declared file targets are implemented and the work matches the spec. End your final message with LEAD_DONE.`,
+      `Implement the spec end to end in a single pass — you are the sole implementer, do not wait for any other agent. Follow repo conventions (AGENTS.md / CLAUDE.md). Add or update tests/proofs for every testable change and run them.`,
+      `When done, write ${dir}/self-reflection.md covering: changed files, spec coverage, tests/proofs run, repo-rule alignment, and remaining risks.`,
+      `Do not stop until every declared file target is implemented and matches the spec.`,
     ]),
-  });
-  wf.step('impl-work', {
-    agent: 'impl-codex',
-    dependsOn: ['read-spec'],
-    task: j([
-      `You are impl-codex. Wait for lead-claude's plan on the channel, then implement your assigned file targets for issue ${o.id}.`,
-      `Spec: {{steps.read-spec.output}}`,
-      `Declared file targets: ${targets}`,
-      o.task,
-      crossNote,
-      `Follow repo conventions (AGENTS.md / CLAUDE.md). Add or update tests/proofs for testable changes.`,
-      `When done, write ${dir}/self-reflection.md covering: changed files, spec coverage, tests/proofs run, repo-rule alignment, and remaining risks. Post a completion message and address lead/shadow feedback.`,
-    ]),
-  });
-  // NOTE: the former 'assist-work' step (assist-opencode) is removed. OpenCode's TUI
-  // never runs the injected prompt headlessly (splash-only), and even rebound to claude
-  // the step routinely fails `owner completion decision missing` and FAILS the whole run
-  // (observed on p11/p3, 2026-06-16). lead + impl + shadow is a complete, reliable squad.
-  wf.step('shadow-review', {
-    agent: 'shadow-claude',
-    dependsOn: ['read-spec'],
-    task: j([
-      `You are shadow-claude, the live shadow reviewer for issue ${o.id}. As impl-codex works, read the actual changed files and the channel, and post concise, specific feedback when you see spec drift, missed file targets, or repo-rule violations.`,
-      `Spec: {{steps.read-spec.output}}`,
-      `Declared file targets: ${targets}. Do not implement; review and steer. End with SHADOW_DONE when the implementers have addressed your feedback.`,
-    ]),
+    verification: { type: 'file_exists', value: `${dir}/self-reflection.md` },
   });
 }
 
@@ -237,7 +216,7 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
 
   wf.step('change-detection', {
     type: 'deterministic',
-    dependsOn: ['lead-coordinate'],
+    dependsOn: ['implement'],
     captureOutput: true,
     failOnError: true,
     command: scopedChangeCmd(o.fileTargets),
@@ -275,10 +254,13 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
   let lastReviewStep = 'claude-fix';
 
   if (o.tier === 'deep') {
-    // Second fresh-eyes loop (Codex) — only for the crux / high-risk workflows.
+    // Second fresh-eyes loop (Codex) — only for the crux / high-risk workflows. reviewer-codex
+    // and fixer-codex are workers (interactive:false), so these agent steps complete on process
+    // exit, not on a broker owner-completion-decision.
     wf.step('codex-review', {
       agent: 'reviewer-codex',
       dependsOn: ['claude-fix'],
+      timeoutMs: WORKER_TIMEOUT_MS,
       task: j([
         `Second-pass fresh-eyes review of the post-Claude-fix state for issue ${o.id}. Read the changed files, git diff, repo rules, and the spec.`,
         `Write ${dir}/codex-review.md with actionable findings or NO_ISSUES_FOUND.`,
@@ -288,6 +270,7 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     wf.step('codex-fix', {
       agent: 'fixer-codex',
       dependsOn: ['codex-review'],
+      timeoutMs: WORKER_TIMEOUT_MS,
       task: `Read ${dir}/codex-review.md. Fix every valid finding, add/update tests or proofs, rerun checks until clean. Do NOT skip — keep fixing. Write ${dir}/codex-fix.md. If NO_ISSUES_FOUND, record that no fix was needed.`,
       verification: { type: 'exit_code' },
     });
@@ -351,7 +334,7 @@ function addShip(wf: Wf, o: FactoryWorkflowOptions): void {
     failOnError: true,
     command: j([
       'BODY=$(mktemp)',
-      `printf "%s\\n" "## Summary" "${o.prSummary}" "" "Factory issue ${o.id} (${o.slug}). Built autonomously via the relayflows factory squad loop (${o.tier} review)." "" "Spec: factory/planning/${o.specFile}" "" "## Review" "- [x] squad implement + live shadow review" "- [x] ${o.tier === 'deep' ? 'Claude + Codex' : 'Claude'} fresh-eyes review/fix loop" "- [x] deterministic acceptance: ${o.acceptanceCmd}" > "$BODY"`,
+      `printf "%s\\n" "## Summary" "${o.prSummary}" "" "Factory issue ${o.id} (${o.slug}). Built autonomously via the relayflows factory squad loop (${o.tier} review)." "" "Spec: factory/planning/${o.specFile}" "" "## Review" "- [x] single-pass implement (impl-codex)" "- [x] ${o.tier === 'deep' ? 'Claude + Codex' : 'Claude'} fresh-eyes review/fix loop" "- [x] deterministic acceptance: ${o.acceptanceCmd}" > "$BODY"`,
       `gh pr view ${o.branch} --json url >/dev/null 2>&1 || gh pr create --repo ${gh} --base main --head ${o.branch} --title "${o.prTitle}" --body-file "$BODY" --draft`,
       `gh pr edit ${o.branch} --repo ${gh} --add-label no-agent-relay-review 2>/dev/null || true`,
       'rm -f "$BODY"',

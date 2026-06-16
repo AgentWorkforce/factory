@@ -89,6 +89,21 @@ Concrete example (today's AR-267 team): labels `cloud`, `relayfile`, `agent:team
 
 ---
 
+## 3.6 Source-agnostic input — issues are the convergence point
+
+The factory watches Linear issues; it does not care how an issue came to exist. Multiple source systems all converge on the same thing — a recipe-labeled Linear issue — and from there the factory's spec-emitter path (§3, §3.5) is identical regardless of origin:
+
+| Source | Path to a recipe-labeled Linear issue |
+|---|---|
+| Linear webhooks | a `[factory]` issue is authored / labeled directly |
+| GitHub events | a `factory`-labeled GitHub issue is mirrored into Linear |
+| Slack triggers | a Slack message escalates into a filed issue |
+| **Audio transcripts (relayscribe / meeting-actions)** | a recorded meeting/brainstorm is transcribed, then `meeting-actions` extracts action items and files recipe-labeled issues — see Deliverable 8 (`linear-issue-meeting-actions-fleet-recipe-multilang.md`) |
+
+The unified-node model makes this clean: each source is just a producer of Linear issues with shape labels; the factory neither knows nor branches on the source. Audio transcripts are one such input source among several, with the added wrinkle that they carry a `source_language` the implementer prompt should preserve (Deliverable 8 §5).
+
+---
+
 ## 4. Package extraction (PRESERVED from v1 — choices locked, do not relitigate)
 
 The factory moves out of `pear/packages/factory-sdk` into its own published package, **`@agent-relay/factory`** (GitHub **`AgentWorkforce/factory`**). Locked choices:

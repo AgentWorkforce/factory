@@ -12,7 +12,7 @@ Related: relay/specs/fleet-delivery.md §6/§7
 
 ## Problem
 
-`cloud/packages/web/lib/proactive-runtime/team-launch-n1.ts` hardcodes Daytona for every proactive spawn (granola, hn-monitor, spotify-releases, daytona-monitor):
+`cloud/packages/web/lib/proactive-runtime/team-launch-n1.ts` hardcodes Daytona for every proactive spawn (granola, hn-monitor, spotify-releases, daytona-monitor, and — once migrated into `agents/` — meeting-actions):
 
 - `const MEMBER_LOCAL_ROOT = "/home/daytona/workspace";` (line 245)
 - `const daytonaAuth = resolveServerDaytonaAuthParams();` (line 803), spread into the credential bundle (line 829)
@@ -48,9 +48,17 @@ Reframe proactive spawns as fleet spawns:
 - The factory extraction itself (epic v2 Phases 1–4) — this is a sibling.
 - Relaycast's autospawn implementation (fleet-side; consumed here).
 
+## Consumers benefiting from this unification
+
+The proactive personas that fire on storage/cron events all benefit from this change — they stop being Daytona-bound and become fleet spawns placed by Relaycast:
+
+- `granola` (Granola recordings), `hn-monitor`, `spotify-releases`, `daytona-monitor`.
+- **`meeting-actions`** (relayscribe audio transcripts → Linear + Slack digest → factory dispatch). meeting-actions watches `/recall/recordings/**`, the same proactive `file.created` trigger shape this issue unifies. **Deliverable 8 (`linear-issue-meeting-actions-fleet-recipe-multilang.md`) has a HARD dependency on this issue** — meeting-actions cannot become a fleet recipe until the proactive launch path stops hardcoding Daytona, or it just inherits the hardcode.
+
 ## Related
 
 - Epic v2 §2 (nodes + autospawn fallback), §8 Q4 (persona registry).
+- Deliverable 8: `linear-issue-meeting-actions-fleet-recipe-multilang.md` (depends on this unification).
 - `cloud/packages/web/lib/proactive-runtime/team-launch-n1.ts:245,803,829` (Daytona hardcodes), `dispatchTeamLaunchN1` (453–498).
 - RFC §6 (placement + autospawn), §7 (invocation lifecycle).
 - Phase 3 (RelayFleetClient pattern reused here).
