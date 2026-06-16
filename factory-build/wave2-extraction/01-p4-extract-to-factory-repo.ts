@@ -27,7 +27,7 @@ async function main() {
     .channel('wf-factory-p4-extraction')
     .maxConcurrency(3)
     .timeout(7_200_000)
-    .onError('retry', { maxRetries: 1, retryDelayMs: 10_000 });
+    .repairable({ repairRetries: 12, maxRetries: 12, retryDelayMs: 10_000, repairAgent: 'lead-claude' });
 
   wf.agent('lead-claude', { cli: 'claude', role: 'Lead + QA for the extraction. Coordinates the seed, verification, and publish-prep; runs repair on red gates.', retries: 1 });
   wf.agent('impl-codex', { cli: 'codex', role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling, and pushes.', retries: 2 });
@@ -145,7 +145,7 @@ async function main() {
   wf.step('repair-review', {
     agent: 'impl-codex',
     dependsOn: ['review-codex'],
-    task: 'Fix every valid finding from claude-review.md and codex-review.md in ' + FACTORY + ', rerun build + pack, and record fixes in ' + ART + '/review-fixes.md. If a finding cannot be fixed safely, write ' + ART + '/BLOCKED_NO_COMMIT.md with evidence.',
+    task: 'Fix every valid finding from claude-review.md and codex-review.md in ' + FACTORY + ', rerun build + pack until green, and record fixes in ' + ART + '/review-fixes.md. Do NOT skip or give up — keep fixing.',
     verification: { type: 'exit_code' },
   });
 
@@ -155,7 +155,6 @@ async function main() {
     captureOutput: true,
     failOnError: true,
     command: [
-      `if [ -f ${ART}/BLOCKED_NO_COMMIT.md ]; then echo "FACTORY_P4_BLOCKED"; cat ${ART}/BLOCKED_NO_COMMIT.md; exit 0; fi`,
       `printf "%s\\n" "# Factory p4 signoff (extraction)" "" "factory repo seeded + pushed (main), build + pack clean, history preserved." "PUBLISH is the operator gate — see PUBLISH_READY.md." "pear dep-swap is post-publish; Phase 1.5 (p5) removes the daemon." "" "FACTORY_P4_SEEDED_PUBLISH_PENDING" > ${ART}/signoff.md`,
       `cat ${ART}/signoff.md`,
     ].join(' && '),

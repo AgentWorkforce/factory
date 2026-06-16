@@ -82,8 +82,13 @@ cloud-placed spawns on their own machine.
 - PR creation uses local `gh` (the broker runs on the user's machine where `gh` is authed).
   For cloud execution, swap the `open-pr` step in the lib for `createGitHubStep({action:'createPR'})`
   (imported from `@relayflows/core/integrations/github`).
-- Acceptance gates are **green-or-blocked**: a red final gate writes `BLOCKED_NO_COMMIT.md`
-  and skips commit/PR, so red work never signs off as complete.
+- **Repair-not-skip:** the workflow is `.repairable({ repairRetries: 12 })`. Any failing
+  gate **auto-invokes the repair (fixer) agent to fix it and reruns the gate** — it never
+  skips, never writes a "blocked" artifact, never signs off red work. Only an exhausted
+  repair budget (12 fix→rerun cycles per gate) can end a run unfixed, which in practice
+  means a human is genuinely needed. To make failure literally unreachable, raise
+  `repairRetries` in `lib/factory-build-lib.ts` (the engine bounds repair; there is no
+  unbounded mode without a relayflows change).
 
 ## Cross-repo workflows (residual risk)
 p4, p10, p11 touch two repos. They set `cwd` to the primary repo and reference the secondary

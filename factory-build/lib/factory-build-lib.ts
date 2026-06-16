@@ -321,8 +321,7 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     agent: 'fixer-claude',
     dependsOn: ['claude-review-final'],
     task: j([
-      `If ${dir}/claude-review-final.md has findings, fix them, add/update tests or proofs, and rerun checks until green.`,
-      `If something cannot be fixed safely, write ${dir}/BLOCKED_NO_COMMIT.md with exact evidence and stop.`,
+      `If ${dir}/claude-review-final.md has findings, fix them, add/update tests or proofs, and rerun checks until green. Do NOT skip or give up — keep fixing.`,
       `If NO_ISSUES_FOUND, record Claude signoff in ${dir}/claude-signoff.md.`,
     ]),
     verification: { type: 'exit_code' },
@@ -336,7 +335,7 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
       dependsOn: ['claude-fix-final'],
       captureOutput: true,
       failOnError: false,
-      command: `test ! -f ${dir}/BLOCKED_NO_COMMIT.md && ${acc} 2>&1 | tail -80; echo "EXIT: $?"`,
+      command: `${acc} 2>&1 | tail -80; echo "EXIT: $?"`,
     });
     wf.step('codex-review', {
       agent: 'reviewer-codex',
@@ -365,8 +364,7 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
       agent: 'fixer-codex',
       dependsOn: ['codex-review-final'],
       task: j([
-        `If ${dir}/codex-review-final.md has findings, fix them, add/update tests or proofs, rerun checks until green.`,
-        `If something cannot be fixed safely, write ${dir}/BLOCKED_NO_COMMIT.md with exact evidence.`,
+        `If ${dir}/codex-review-final.md has findings, fix them, add/update tests or proofs, rerun checks until green. Do NOT skip or give up — keep fixing.`,
         `If NO_ISSUES_FOUND, record Codex signoff in ${dir}/codex-signoff.md.`,
       ]),
       verification: { type: 'exit_code' },
@@ -374,18 +372,15 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     lastReviewStep = 'codex-fix-final';
   }
 
-  // Green-or-blocked: a red final acceptance writes BLOCKED_NO_COMMIT so signoff
-  // and ship are skipped — the workflow never signs off red work as complete.
+  // Repair-not-skip: final acceptance fails hard on red, which (under .repairable())
+  // auto-invokes the repair agent to fix it and reruns the gate — never skips, never
+  // signs off red work. Only an exhausted repair budget can end the run unfixed.
   wf.step('final-validate', {
     type: 'deterministic',
     dependsOn: [lastReviewStep],
     captureOutput: true,
-    failOnError: false,
-    command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "ALREADY_BLOCKED"; cat ${dir}/BLOCKED_NO_COMMIT.md; exit 0; fi`,
-      `if ! { ${acc}; }; then printf "%s\\n" "# BLOCKED_NO_COMMIT" "Final acceptance was red for issue ${o.id}." "Command: ${acc}" "Fix the failing gate and re-run this workflow before shipping." > ${dir}/BLOCKED_NO_COMMIT.md; echo "ACCEPTANCE_RED -> BLOCKED"; exit 0; fi`,
-      'echo FINAL_VALIDATE_GREEN',
-    ]),
+    failOnError: true,
+    command: `${acc}`,
   });
   wf.step('signoff', {
     type: 'deterministic',
@@ -393,7 +388,6 @@ function addReviewLadder(wf: Wf, o: FactoryWorkflowOptions): void {
     captureOutput: true,
     failOnError: true,
     command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "FACTORY_${o.id.toUpperCase()}_BLOCKED"; exit 0; fi`,
       `printf "%s\\n" "# Factory ${o.id} signoff (${o.slug})" "" "Spec: ${o.specFile}" "Targets: ${o.fileTargets.join(' ')}" "Review tier: ${o.tier}" "" "FACTORY_${o.id.toUpperCase()}_COMPLETE" > ${dir}/signoff.md`,
       `cat ${dir}/signoff.md`,
     ]),
@@ -409,30 +403,20 @@ function addShip(wf: Wf, o: FactoryWorkflowOptions): void {
     type: 'deterministic',
     dependsOn: ['signoff'],
     captureOutput: true,
-    failOnError: false,
+    failOnError: true,
     command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "BLOCKED — no commit"; exit 0; fi`,
       'set -e',
       `git add ${addPaths}`,
       `git commit -m "${o.prTitle}" -m "Factory issue ${o.id}. Autonomous build via relayflows squad loop." || echo "NOTHING_TO_COMMIT"`,
       'echo COMMIT_DONE',
     ]),
   });
-  wf.step('repair-commit', {
-    agent: 'lead-claude',
-    dependsOn: ['commit'],
-    task: `If the commit failed (and the issue is not BLOCKED), fix the blocker, re-stage only the declared targets, and commit. If it succeeded or is blocked, confirm. Output:\n{{steps.commit.output}}`,
-    verification: { type: 'exit_code' },
-  });
   wf.step('push', {
     type: 'deterministic',
-    dependsOn: ['repair-commit'],
+    dependsOn: ['commit'],
     captureOutput: true,
-    failOnError: false,
-    command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "BLOCKED — no push"; exit 0; fi`,
-      `git push -u origin ${o.branch} 2>&1 | tail -20`,
-    ]),
+    failOnError: true,
+    command: `git push -u origin ${o.branch} 2>&1 | tail -20`,
   });
   // Local transport uses gh (broker runs on the user's machine; gh is authed in
   // preflight). For cloud execution, swap this for createGitHubStep({action:'createPR'}).
@@ -442,9 +426,8 @@ function addShip(wf: Wf, o: FactoryWorkflowOptions): void {
     type: 'deterministic',
     dependsOn: ['push'],
     captureOutput: true,
-    failOnError: false,
+    failOnError: true,
     command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "BLOCKED — no PR"; exit 0; fi`,
       'BODY=$(mktemp)',
       `printf "%s\\n" "## Summary" "${o.prSummary}" "" "Factory issue ${o.id} (${o.slug}). Built autonomously via the relayflows factory squad loop (${o.tier} review)." "" "Spec: factory/planning/${o.specFile}" "" "## Review" "- [x] squad implement + live shadow review" "- [x] ${o.tier === 'deep' ? 'Claude + Codex' : 'Claude'} fresh-eyes review/fix loop" "- [x] deterministic acceptance: ${o.acceptanceCmd}" > "$BODY"`,
       `gh pr view ${o.branch} --json url >/dev/null 2>&1 || gh pr create --repo ${gh} --base main --head ${o.branch} --title "${o.prTitle}" --body-file "$BODY" --draft`,
@@ -457,11 +440,8 @@ function addShip(wf: Wf, o: FactoryWorkflowOptions): void {
     type: 'deterministic',
     dependsOn: ['open-pr'],
     captureOutput: true,
-    failOnError: false,
-    command: j([
-      `if [ -f ${dir}/BLOCKED_NO_COMMIT.md ]; then echo "FACTORY_${o.id.toUpperCase()}_BLOCKED_NO_PR"; exit 0; fi`,
-      `gh pr view ${o.branch} --repo ${gh} --json url,isDraft,state || { echo "PR_NOT_FOUND"; exit 1; }`,
-    ]),
+    failOnError: true,
+    command: `gh pr view ${o.branch} --repo ${gh} --json url,isDraft,state || { echo "PR_NOT_FOUND"; exit 1; }`,
   });
 }
 
@@ -473,7 +453,11 @@ export function buildFactoryWorkflow(o: FactoryWorkflowOptions): Wf {
     .channel(`wf-factory-${o.id}-${o.slug}`)
     .maxConcurrency(4)
     .timeout(7_200_000)
-    .onError('retry', { maxRetries: 2, retryDelayMs: 10_000 });
+    // Repair-not-skip: any failing gate auto-invokes the repair agent to FIX it and
+    // reruns the gate, up to repairRetries times — it never skips/blocks. A high
+    // budget makes a genuine run failure practically unreachable (only an exhausted
+    // repair budget can end a run unfixed). repairAgent picks the Claude fixer.
+    .repairable({ repairRetries: 12, maxRetries: 12, retryDelayMs: 10_000, repairAgent: 'fixer-claude' });
 
   addSquad(wf, o.tier);
   addSetup(wf, o);
