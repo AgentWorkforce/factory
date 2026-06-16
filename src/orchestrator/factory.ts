@@ -17,7 +17,13 @@ import type {
   SlackWriteback,
   Subscription,
 } from '../ports'
+import type {
+  BatchSnapshot,
+  RegistryHandoffAgent,
+  StateStore,
+} from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
+import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { renderAgentTask } from '../dispatch/templates'
@@ -45,7 +51,7 @@ import type {
 } from '../types'
 import { MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
-import { BatchTracker, type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
+import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
 import { terminatePids } from './reaper'
 
@@ -53,18 +59,6 @@ type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-ve
 type Listener = (payload: FactoryEventPayload) => void
 type SlackThreadWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
-type RegistryHandoffAgent = {
-  issue: IssueRef
-  name: string
-  tracked: TrackedAgent
-  persistedAtMs: number
-}
-type DispatchAttemptState = {
-  attempts: number
-  inFlight: boolean
-  terminal: boolean
-  backoffUntilMs: number
-}
 type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type SlackReply = {
@@ -179,24 +173,19 @@ export class FactoryLoop implements Factory {
   readonly #kill: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readonly #readChildPids: ((pid: number) => Promise<number[]>) | undefined
   readonly #terminationGraceMs: number | undefined
-  readonly #batch: BatchTracker
+  readonly #state: StateStore
+  readonly #workspaceId: string
+  #batchView?: BatchSnapshot
+  #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
   readonly #counters: Record<string, number> = {}
-  readonly #criticalMessages = new Map<string, { issue: IssueRef; input: Parameters<FleetClient['sendMessage']>[0] }>()
   readonly #resumeInFlight = new Map<string, Promise<void>>()
-  readonly #resumedExitKeys = new Set<string>()
-  readonly #slackThreadIds = new Map<string, string>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
-  readonly #seenAgentQuestionKeys = new Set<string>()
-  readonly #seenAgentQuestionOrder: string[] = []
-  readonly #dispatchAttempts = new Map<string, DispatchAttemptState>()
   // Last invalid-label failure signature we posted per issue, so a stuck Ready
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
   readonly #labelDispatchFailures = new Map<string, string>()
-  readonly #canonicalIssueStates = new Map<string, string>()
-  readonly #dispatchFailureReaperHandoffs = new Map<string, RegistryHandoffAgent>()
   readonly #postMergeDoneAdvances = new Set<string>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
@@ -278,8 +267,25 @@ export class FactoryLoop implements Factory {
     this.#kill = ports.kill ?? process.kill
     this.#readChildPids = ports.readChildPids
     this.#terminationGraceMs = ports.terminationGraceMs
-    this.#batch = new BatchTracker(config.batchSize)
+    this.#workspaceId = config.workspaceId ?? 'default'
+    this.#state = ports.stateStore ?? new InMemoryStateStore({
+      batchSize: config.batchSize,
+      agentQuestionDedupeLimit: AGENT_QUESTION_DEDUPE_LIMIT,
+    })
+    this.#batchReady = this.#state.getBatch(this.#workspaceId).then((batch) => {
+      this.#batchView = batch
+      return batch
+    })
     this.#wireFleetEvents()
+  }
+
+  async #batch(): Promise<BatchSnapshot> {
+    if (this.#batchView) {
+      return this.#batchView
+    }
+    const batch = await this.#batchReady
+    this.#batchView = batch
+    return batch
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {
@@ -359,7 +365,7 @@ export class FactoryLoop implements Factory {
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
       await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
       this.#slackWatchers.clear()
-      this.#slackThreadIds.clear()
+      await this.#state.clearSlackThreads(this.#workspaceId)
       this.#slackWatcherStarts.clear()
       this.#offAgentExit?.()
       this.#offDeliveryFailed?.()
@@ -636,9 +642,13 @@ export class FactoryLoop implements Factory {
     const seenIssueKeys = new Set<string>()
     while (events.length > 0 && this.#started) {
       const batch = events.splice(0, LIVE_EVENT_DRAIN_BATCH_SIZE)
-      const paths = batch
-        .map((event) => this.#prepareLiveEventForDrain(event, seenIssueKeys))
-        .filter((path): path is string => Boolean(path))
+      const paths: string[] = []
+      for (const event of batch) {
+        const path = await this.#prepareLiveEventForDrain(event, seenIssueKeys)
+        if (path) {
+          paths.push(path)
+        }
+      }
       await Promise.all(paths.map((path) => this.#handlePreparedLiveChange(path)))
       handled += batch.length
       await this.#refreshLiveHeartbeatIfDue()
@@ -667,7 +677,7 @@ export class FactoryLoop implements Factory {
     await this.#refreshLiveHeartbeat()
   }
 
-  #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): string | undefined {
+  async #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): Promise<string | undefined> {
     const path = event.resource.path
     const isPullPath = isGithubPullFilePath(path)
     if (!isIssueFilePath(path) && !isGithubIssueFilePath(path) && !isPullPath) {
@@ -754,7 +764,8 @@ export class FactoryLoop implements Factory {
     }
 
     const issueRef = { key: issueKey, uuid: uuidFromPath(path) ?? issueKey, path }
-    if (this.#batch.isInFlight(issueRef) || this.#batch.isQueued(issueRef)) {
+    const batch = await this.#batch()
+    if (batch.isInFlight(issueRef) || batch.isQueued(issueRef)) {
       this.#increment('liveDuplicateIssueEventsSuppressed')
       this.#logger.debug?.('[factory] suppressed duplicate live issue event for tracked issue', {
         id: event.id,
@@ -812,7 +823,8 @@ export class FactoryLoop implements Factory {
     }
     this.#completionSweepActive = true
     try {
-      const records = this.#batch.inFlight
+      const batch = await this.#batch()
+      const records = batch.inFlight
         .filter((record) => !record.dryRun && !this.#completionInFlight.has(issueKey(record.issue)))
       if (records.length === 0) {
         return
@@ -841,7 +853,7 @@ export class FactoryLoop implements Factory {
         )
 
         for (const candidate of candidates) {
-          if (!candidate || this.#batch.getIssue(candidate.record.issue) !== candidate.record) {
+          if (!candidate || batch.getIssue(candidate.record.issue) !== candidate.record) {
             continue
           }
           this.#increment('completionSweepCompleted')
@@ -924,20 +936,21 @@ export class FactoryLoop implements Factory {
     for (const path of paths) {
       const issue = await this.#readIssue(path)
       if (issue) {
-        this.#recordCanonicalIssueState(issue)
+        await this.#recordCanonicalIssueState(issue)
       }
       if (!issue) {
         continue
       }
 
       pulled.push(issueRef(issue))
-      const dispatchBlock = this.#dispatchBlockReason(issue)
+      const dispatchBlock = await this.#dispatchBlockReason(issue)
       if (dispatchBlock) {
         skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
         continue
       }
 
-      if (this.#batch.isInFlight(issue) || this.#batch.isQueued(issue)) {
+      const batch = await this.#batch()
+      if (batch.isInFlight(issue) || batch.isQueued(issue)) {
         skipped.push({ issue: issueRef(issue), reason: 'already tracked' })
         continue
       }
@@ -1027,12 +1040,13 @@ export class FactoryLoop implements Factory {
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
-    const existingRecord = this.#batch.getIssue(decision.issue)
+    const batch = await this.#batch()
+    const existingRecord = batch.getIssue(decision.issue)
     if (existingRecord?.result) {
       return existingRecord.result
     }
 
-    const blockReason = this.#dispatchBlockReason(decision.issue)
+    const blockReason = await this.#dispatchBlockReason(decision.issue)
     if (blockReason) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason}`)
       this.#error(error, decision.issue)
@@ -1090,10 +1104,10 @@ export class FactoryLoop implements Factory {
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(dispatchDecision.issue.key)
-    this.#recordDispatchAttempt(dispatchDecision.issue)
-    const record = this.#batch.start(dispatchDecision, dryRun)
+    await this.#recordDispatchAttempt(dispatchDecision.issue)
+    const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
-      this.#clearDispatchInFlight(dispatchDecision.issue)
+      await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
       return { issue: dispatchDecision.issue, agents: [], dryRun }
@@ -1156,17 +1170,18 @@ export class FactoryLoop implements Factory {
       return result
     } catch (error) {
       await this.#persistDispatchFailureReaperHandoff(record, spawnedForReaperHandoff)
-      this.#recordDispatchFailure(decision.issue)
-      this.#batch.abandon(decision.issue)
+      await this.#recordDispatchFailure(decision.issue)
+      batch.abandon(decision.issue)
       this.#error(error, decision.issue)
       throw error
     }
   }
 
   status(): FactoryStatus {
+    const batch = this.#batchView
     return {
-      inFlight: this.#batch.inFlight.map((record) => record.issue),
-      queued: this.#batch.queued.map((queued) => queued.issue),
+      inFlight: batch?.inFlight.map((record) => record.issue) ?? [],
+      queued: batch?.queued.map((queued) => queued.issue) ?? [],
       counters: { ...this.#counters },
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
@@ -1225,7 +1240,7 @@ export class FactoryLoop implements Factory {
     try {
       const issue = await this.#readIssue(path)
       if (issue) {
-        this.#recordCanonicalIssueState(issue)
+        await this.#recordCanonicalIssueState(issue)
       }
       if (!issue || !this.#states.isRole(issue.stateId, 'readyForAgent')) {
         return
@@ -1243,11 +1258,12 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (this.#batch.isInFlight(issue) || this.#batch.isQueued(issue)) {
+      const batch = await this.#batch()
+      if (batch.isInFlight(issue) || batch.isQueued(issue)) {
         return
       }
 
-      if (this.#dispatchBlockReason(issue)) {
+      if (await this.#dispatchBlockReason(issue)) {
         return
       }
 
@@ -1259,10 +1275,10 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (this.#batch.canStart()) {
+      if (batch.canStart()) {
         await this.dispatch(decision, { dryRun: this.#config.dryRun })
       } else {
-        if (this.#batch.queue(decision, this.#config.dryRun)) {
+        if (batch.queue(decision, this.#config.dryRun)) {
           this.#emit('issue-queued', { issue: decision.issue })
         }
       }
@@ -1371,7 +1387,7 @@ export class FactoryLoop implements Factory {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
         if (mirror && !this.#states.isRole(mirror.stateId, 'done')) {
           if (!opts.dryRun) {
-            const record = this.#batch.getIssue(mirror)
+            const record = (await this.#batch()).getIssue(mirror)
             if (record) {
               await this.#completeIssue(record)
             } else {
@@ -1494,9 +1510,9 @@ export class FactoryLoop implements Factory {
     return entry?.[0]
   }
 
-  #dispatchBlockReason(issue: IssueRef): string | undefined {
+  async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
     const key = issue.key
-    const state = this.#dispatchAttempts.get(key)
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
     if (!state) return undefined
     if (state.terminal) return 'dispatch already terminal'
     if (state.inFlight) return 'dispatch already in-flight'
@@ -1506,14 +1522,15 @@ export class FactoryLoop implements Factory {
     }
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       state.terminal = true
+      await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
       return 'dispatch retry limit reached'
     }
     return undefined
   }
 
-  #recordDispatchAttempt(issue: IssueRef): void {
+  async #recordDispatchAttempt(issue: IssueRef): Promise<void> {
     const key = issue.key
-    const state = this.#dispatchAttempts.get(key) ?? {
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, key) ?? {
       attempts: 0,
       inFlight: false,
       terminal: false,
@@ -1522,30 +1539,31 @@ export class FactoryLoop implements Factory {
     state.attempts += 1
     state.inFlight = true
     state.backoffUntilMs = 0
-    this.#dispatchAttempts.set(key, state)
+    await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
-  #clearDispatchInFlight(issue: IssueRef): void {
-    const state = this.#dispatchAttempts.get(issue.key)
-    if (state) state.inFlight = false
+  async #clearDispatchInFlight(issue: IssueRef): Promise<void> {
+    await this.#state.releaseInFlight(this.#workspaceId, issue.key)
   }
 
-  #recordDispatchFailure(issue: IssueRef): void {
-    const state = this.#dispatchAttempts.get(issue.key)
+  async #recordDispatchFailure(issue: IssueRef): Promise<void> {
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key)
     if (!state) return
     state.inFlight = false
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       state.terminal = true
       state.backoffUntilMs = 0
       this.#increment('dispatchTerminalFailures')
+      await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
       return
     }
     state.backoffUntilMs = this.#clock.now() + this.#config.dispatch.errorCooldownMs
+    await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
     this.#increment('dispatchBackoffs')
   }
 
-  #recordDispatchTerminal(issue: IssueRef): void {
-    const state = this.#dispatchAttempts.get(issue.key) ?? {
+  async #recordDispatchTerminal(issue: IssueRef): Promise<void> {
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key) ?? {
       attempts: 0,
       inFlight: false,
       terminal: false,
@@ -1554,24 +1572,25 @@ export class FactoryLoop implements Factory {
     state.inFlight = false
     state.terminal = true
     state.backoffUntilMs = 0
-    this.#dispatchAttempts.set(issue.key, state)
+    await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
   }
 
-  #recordCanonicalIssueState(issue: Pick<LinearIssue, 'key' | 'stateId'>): void {
-    const previousStateId = this.#canonicalIssueStates.get(issue.key)
+  async #recordCanonicalIssueState(issue: Pick<LinearIssue, 'key' | 'stateId'>): Promise<void> {
+    const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, issue.key)
     const previousRole = this.#states.roleOf(previousStateId)
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && this.#states.isRole(issue.stateId, 'readyForAgent')) {
-      const dispatchState = this.#dispatchAttempts.get(issue.key)
+      const dispatchState = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key)
       if (dispatchState?.terminal) {
         dispatchState.attempts = 0
         dispatchState.inFlight = false
         dispatchState.terminal = false
         dispatchState.backoffUntilMs = 0
+        await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, dispatchState)
         this.#increment('dispatchTerminalReopened')
       }
     }
-    this.#canonicalIssueStates.set(issue.key, issue.stateId)
+    await this.#state.recordCanonicalState(this.#workspaceId, issue.key, issue.stateId)
   }
 
   async #writeLoopHeartbeat(
@@ -1597,14 +1616,15 @@ export class FactoryLoop implements Factory {
   }
 
   async #reapDispatchFailureHandoffsNow(heartbeatPath: string, registryPath: string): Promise<void> {
-    if (this.#dispatchFailureReaperHandoffs.size === 0) {
+    const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
+    if (handoffs.length === 0) {
       return
     }
 
     try {
       const protectedPids = await this.#protectedPids()
       let registryChanged = false
-      for (const [key, handoff] of [...this.#dispatchFailureReaperHandoffs]) {
+      for (const [key, handoff] of handoffs) {
         const roots = await this.#terminationRoots(handoff.name, handoff.tracked, protectedPids)
         if (roots.pids.length === 0 && roots.status === 'unresolved') {
           const unresolvedAgeMs = this.#clock.now() - handoff.persistedAtMs
@@ -1616,7 +1636,7 @@ export class FactoryLoop implements Factory {
             unresolvedAgeMs,
           })
           if (unresolvedAgeMs >= DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS) {
-            this.#dispatchFailureReaperHandoffs.delete(key)
+            await this.#state.clearFailureHandoff(this.#workspaceId, key)
             registryChanged = true
             this.#increment('dispatchFailureReaperHandoffsDroppedStaleUnresolved')
             this.#logger.warn?.('[factory] dropped stale unresolved dispatch-failed handoff', {
@@ -1661,7 +1681,7 @@ export class FactoryLoop implements Factory {
         }
 
         if (!blockingSkip) {
-          this.#dispatchFailureReaperHandoffs.delete(key)
+          await this.#state.clearFailureHandoff(this.#workspaceId, key)
           registryChanged = true
           try {
             await this.#fleet.release(handoff.name, 'dispatch failed')
@@ -1720,7 +1740,7 @@ export class FactoryLoop implements Factory {
 
   async #releaseInFlightAgents(reason: string): Promise<void> {
     const agents = new Map<string, TrackedAgent>()
-    for (const record of this.#batch.inFlight) {
+    for (const record of (await this.#batch()).inFlight) {
       if (record.dryRun) {
         continue
       }
@@ -1840,7 +1860,7 @@ export class FactoryLoop implements Factory {
 
     try {
       for (const agent of handoffAgents) {
-        this.#dispatchFailureReaperHandoffs.set(registryHandoffKey(agent.issue, agent.name), agent)
+        await this.#state.recordFailureHandoff(this.#workspaceId, registryHandoffKey(agent.issue, agent.name), agent)
       }
       await this.#writeInFlightRegistry()
       this.#increment('dispatchFailureReaperHandoffs')
@@ -1851,7 +1871,7 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#increment('dispatchFailureReaperHandoffFailures')
       for (const agent of handoffAgents) {
-        this.#dispatchFailureReaperHandoffs.delete(registryHandoffKey(agent.issue, agent.name))
+        await this.#state.clearFailureHandoff(this.#workspaceId, registryHandoffKey(agent.issue, agent.name))
       }
       this.#logger.error?.('[factory] failed to persist dispatch-failed agents for orphan reaper', {
         issue: record.issue,
@@ -1894,14 +1914,14 @@ export class FactoryLoop implements Factory {
     }
 
     if (!empty) {
-      for (const record of this.#batch.inFlight) {
+      for (const record of (await this.#batch()).inFlight) {
         if (record.dryRun) continue
         for (const [agentName, tracked] of record.agents) {
           await appendAgent(record.issue, agentName, tracked)
         }
       }
     }
-    for (const agent of this.#dispatchFailureReaperHandoffs.values()) {
+    for (const [, agent] of await this.#state.listFailureHandoffs(this.#workspaceId)) {
       await appendAgent(agent.issue, agent.name, agent.tracked)
     }
 
@@ -1917,18 +1937,19 @@ export class FactoryLoop implements Factory {
   }
 
   async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean): Promise<{ name: string }> {
-    const invocationId = this.#batch.invocationIdFor(record.issue, spec)
+    const batch = await this.#batch()
+    const invocationId = batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
     if (existing) {
       return { name: existing.result?.name ?? spec.name }
     }
 
-    if (!this.#batch.shouldSpawn(record, invocationId)) {
+    if (!batch.shouldSpawn(record, invocationId)) {
       return { name: spec.name }
     }
 
     if (dryRun) {
-      this.#batch.recordDryRun(record, spec, invocationId)
+      batch.recordDryRun(record, spec, invocationId)
       return { name: spec.name }
     }
 
@@ -1939,7 +1960,7 @@ export class FactoryLoop implements Factory {
       throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
     }
     if (roster.agents.some((agent) => agent.name === spec.name)) {
-      this.#batch.recordSpawn(record, spec, invocationId, { name: spec.name, sessionRef: spec.sessionRef })
+      batch.recordSpawn(record, spec, invocationId, { name: spec.name, sessionRef: spec.sessionRef })
       return { name: spec.name }
     }
 
@@ -1963,7 +1984,7 @@ export class FactoryLoop implements Factory {
         error,
       )
     }
-    this.#batch.recordSpawn(record, spec, invocationId, result)
+    batch.recordSpawn(record, spec, invocationId, result)
     return { name: result.name }
   }
 
@@ -1972,7 +1993,8 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const record = this.#batch.getIssueByAgent(name)
+    const batch = await this.#batch()
+    const record = batch.getIssueByAgent(name)
     if (!record) {
       return
     }
@@ -2013,7 +2035,7 @@ export class FactoryLoop implements Factory {
 
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
-        if (this.#resumedExitKeys.has(resumeKey)) {
+        if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
           return
         }
 
@@ -2027,7 +2049,7 @@ export class FactoryLoop implements Factory {
         this.#resumeInFlight.set(resumeKey, resume)
         try {
           await resume
-          this.#resumedExitKeys.add(resumeKey)
+          await this.#state.markResumed(this.#workspaceId, resumeKey)
         } catch (error) {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
@@ -2037,7 +2059,7 @@ export class FactoryLoop implements Factory {
             // the resume key so subsequent exit events short-circuit, count it,
             // and warn once instead of spamming a 500 stack trace. The external
             // reaper / a broker restart reclaims the leaked name.
-            this.#resumedExitKeys.add(resumeKey)
+            await this.#state.markResumed(this.#workspaceId, resumeKey)
             this.#increment('resumeNameCollisions')
             this.#logger.warn?.('[factory] resume skipped: broker still holds agent name (relay#1116); not retrying', {
               issue: record.issue.key,
@@ -2050,7 +2072,7 @@ export class FactoryLoop implements Factory {
           this.#resumeInFlight.delete(resumeKey)
         }
       } else {
-        const invocationId = `${this.#batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
+        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
         const result = await this.#fleet.spawn({
           name: tracked.spec.name,
           capability: tracked.spec.capability,
@@ -2063,7 +2085,7 @@ export class FactoryLoop implements Factory {
           restartPolicy: defaultRestartPolicy(tracked.spec),
           channel: tracked.spec.channel,
         })
-        this.#batch.recordSpawn(record, tracked.spec, invocationId, result)
+        batch.recordSpawn(record, tracked.spec, invocationId, result)
       }
     } catch (error) {
       this.#error(error, record.issue)
@@ -2114,8 +2136,8 @@ export class FactoryLoop implements Factory {
   }
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
-    const critical = this.#criticalMessages.get(info.msgId ?? '')
-    const record = this.#batch.getIssueByAgent(info.to)
+    const critical = await this.#state.consumeCritical(this.#workspaceId, info.msgId ?? '')
+    const record = (await this.#batch()).getIssueByAgent(info.to)
     const issue = critical?.issue ?? record?.issue
     const error = new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`)
     this.#error(error, issue)
@@ -2123,7 +2145,7 @@ export class FactoryLoop implements Factory {
     if (critical && this.#fleet.waitForInjected) {
       try {
         const ack = await this.#waitForInjectedAndSubmit(critical.input)
-        this.#criticalMessages.set(ack.eventId, critical)
+        await this.#state.recordCritical(this.#workspaceId, ack.eventId, critical)
       } catch (retryError) {
         this.#error(retryError, critical.issue)
       }
@@ -2136,7 +2158,7 @@ export class FactoryLoop implements Factory {
     if (this.#config.babysitter.enabled && isFactoryQuestionTarget(message.target)) {
       const ready = parsePrReadySignal(message)
       if (ready) {
-        const record = this.#batch.getIssueByAgent(ready.agentName)
+        const record = (await this.#batch()).getIssueByAgent(ready.agentName)
         if (!record || record.dryRun) {
           this.#increment('prReadySignalsIgnoredNoInFlight')
           return
@@ -2155,7 +2177,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const record = this.#batch.getIssueByAgent(question.agentName)
+    const record = (await this.#batch()).getIssueByAgent(question.agentName)
     if (!record || record.dryRun) {
       this.#increment('agentQuestionsIgnoredNoInFlight')
       return
@@ -2172,7 +2194,7 @@ export class FactoryLoop implements Factory {
     }
 
     const dedupeKey = agentQuestionDedupeKey(record.issue, question)
-    if (this.#seenAgentQuestionKeys.has(dedupeKey)) {
+    if (!await this.#state.claimAgentQuestion(this.#workspaceId, dedupeKey)) {
       this.#increment('agentQuestionDuplicatesSuppressed')
       this.#logger.debug?.('[factory] suppressed duplicate agent question', {
         from: question.agentName,
@@ -2180,7 +2202,6 @@ export class FactoryLoop implements Factory {
       })
       return
     }
-    this.#rememberAgentQuestion(dedupeKey)
 
     if (!question.eventId) {
       this.#increment('agentQuestionsMissingIdentity')
@@ -2215,7 +2236,7 @@ export class FactoryLoop implements Factory {
       // The initiator logs Slack watcher startup failures.
     }
 
-    const threadId = this.#slackThreadIds.get(key)
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
     if (!threadId) {
       this.#increment('agentQuestionsSkippedMissingThread')
       this.#logger.warn?.('[factory] agent question has no Slack dispatch thread', {
@@ -2232,18 +2253,6 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#markSlackWritebackFailure('agent-question', error)
       this.#logger.warn?.(`[factory] failed to post agent question for ${record.issue.key}`, error)
-    }
-  }
-
-  #rememberAgentQuestion(key: string): void {
-    if (this.#seenAgentQuestionKeys.has(key)) {
-      return
-    }
-    this.#seenAgentQuestionKeys.add(key)
-    this.#seenAgentQuestionOrder.push(key)
-    while (this.#seenAgentQuestionOrder.length > AGENT_QUESTION_DEDUPE_LIMIT) {
-      const oldest = this.#seenAgentQuestionOrder.shift()
-      if (oldest) this.#seenAgentQuestionKeys.delete(oldest)
     }
   }
 
@@ -2278,7 +2287,7 @@ export class FactoryLoop implements Factory {
       data: { issue: record.issue },
     }
     const ack = await this.#waitForInjectedAndSubmit(input)
-    this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+    await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
   }
 
   async #sendImplementerTask(record: InFlightIssue): Promise<void> {
@@ -2305,13 +2314,13 @@ export class FactoryLoop implements Factory {
           config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
           reviewerName,
           implementerNames,
-          slackDispatchThread: this.#slackDispatchThreadFor(record),
+          slackDispatchThread: await this.#slackDispatchThreadFor(record),
         }),
         from: 'factory',
         data: { issue: record.issue },
       }
       const ack = await this.#waitForInjectedAndSubmit(input)
-      this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+      await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
     }
   }
 
@@ -2410,7 +2419,7 @@ export class FactoryLoop implements Factory {
     // Map the PR to an in-flight issue by its head ref (reuses the existing
     // key matcher; no branch-naming assumption).
     const headRef = snapshot.headRef ?? ''
-    const record = this.#batch.inFlight.find((candidate) =>
+    const record = (await this.#batch()).inFlight.find((candidate) =>
       !candidate.dryRun && headRef && containsIssueKey(headRef, candidate.issue.key))
 
     if (prMetaShowsMerged(snapshot)) {
@@ -2458,7 +2467,7 @@ export class FactoryLoop implements Factory {
     try {
       const doneStateId = this.#states.idFor(issue.team, 'done')
       await this.#linear.setState(issue, doneStateId)
-      this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
+      await this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
       this.#increment('mergedPrAdvancedDone')
       this.#increment('done')
@@ -2577,7 +2586,7 @@ export class FactoryLoop implements Factory {
         reviewerName,
         implementerNames,
         pr: { number: prRef.prNumber, url: prRef.url },
-        slackDispatchThread: this.#slackDispatchThreadFor(record),
+        slackDispatchThread: await this.#slackDispatchThreadFor(record),
       })
 
       const spawned = await this.#spawnAgent(record, { ...spec, task }, false)
@@ -2599,7 +2608,7 @@ export class FactoryLoop implements Factory {
           data: { issue: record.issue },
         }
         const ack = await this.#waitForInjectedAndSubmit(input)
-        this.#criticalMessages.set(ack.eventId, { issue: record.issue, input })
+        await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
       }
     } catch (error) {
       // Allow a later event to retry the spawn.
@@ -2712,7 +2721,7 @@ export class FactoryLoop implements Factory {
       const statusLabel = humanReview ? 'In Human Review' : 'Done'
       if (issue) {
         await this.#linear.setState(issue, targetState)
-        this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
+        await this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
       }
 
@@ -2749,8 +2758,8 @@ export class FactoryLoop implements Factory {
       this.#increment(humanReview ? 'humanReview' : 'done')
       this.#emit('issue-done', { issue: record.issue })
       await this.#stopSlackWatcher(record.issue)
-      this.#recordDispatchTerminal(record.issue)
-      const next = this.#batch.complete(record.issue)
+      await this.#recordDispatchTerminal(record.issue)
+      const next = (await this.#batch()).complete(record.issue)
       if (next) {
         await this.dispatch(next.decision, { dryRun: next.dryRun })
       }
@@ -2961,7 +2970,7 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(record.issue)
-    if (this.#slackThreadIds.has(key) || this.#slackWatcherStarts.has(key)) {
+    if (await this.#state.getSlackThread(this.#workspaceId, key) || this.#slackWatcherStarts.has(key)) {
       try {
         await this.#slackWatcherStarts.get(key)
       } catch {
@@ -2995,7 +3004,7 @@ export class FactoryLoop implements Factory {
         `Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
       ].join('\n'),
     })
-    this.#slackThreadIds.set(issueKey(record.issue), root.threadId)
+    await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
     await this.#watchSlackThread(record, root.threadId)
     this.#recordSlackWritebackSuccess('dispatch-thread')
   }
@@ -3018,7 +3027,7 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(decision.issue)
-    if (this.#slackThreadIds.has(key) || this.#slackWatcherStarts.has(key)) {
+    if (await this.#state.getSlackThread(this.#workspaceId, key) || this.#slackWatcherStarts.has(key)) {
       try {
         await this.#slackWatcherStarts.get(key)
       } catch {
@@ -3053,7 +3062,7 @@ export class FactoryLoop implements Factory {
         `Question: Please clarify the intended repo/approach or add enough acceptance detail for the factory agent to proceed.`,
       ].join('\n'),
     })
-    this.#slackThreadIds.set(issueKey(decision.issue), root.threadId)
+    await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
     await this.#watchSlackThread({
       issue: decision.issue,
       decision,
@@ -3194,7 +3203,7 @@ export class FactoryLoop implements Factory {
     const key = issueKey(issue)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
-    this.#slackThreadIds.delete(key)
+    await this.#state.clearSlackThread(this.#workspaceId, key)
     await watcher?.stop()
   }
 
@@ -3213,7 +3222,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const liveRecord = this.#batch.getIssue(record.issue)
+    const liveRecord = (await this.#batch()).getIssue(record.issue)
     if (!liveRecord || liveRecord.dryRun) {
       this.#increment('slackAnswersIgnoredNoInFlight')
       return
@@ -3244,12 +3253,12 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  #slackDispatchThreadFor(record: InFlightIssue): { channel: string; threadId: string } | undefined {
+  async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string } | undefined> {
     if (!this.#config.slack) {
       return undefined
     }
 
-    const threadId = this.#slackThreadIds.get(issueKey(record.issue))
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
     return threadId ? { channel: this.#config.slack.channel, threadId } : undefined
   }
 
