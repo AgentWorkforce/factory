@@ -51,9 +51,18 @@ run() {
 }
 
 run_parallel() {
-  local pids=() rc=0
-  for f in "$@"; do run "$f" & pids+=("$!"); done
-  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  # Cap concurrency: the shared relayflows broker degrades under sustained
+  # 4-wide load and wedges in `init` ~30min in (relayflows#9). Run in batches
+  # of FACTORY_MAX_PARALLEL (default 2) until that's fixed. Set to 4 once #9 lands.
+  local rc=0 batch=() max="${FACTORY_MAX_PARALLEL:-2}"
+  for f in "$@"; do
+    run "$f" & batch+=("$!")
+    if [ "${#batch[@]}" -ge "$max" ]; then
+      for p in "${batch[@]}"; do wait "$p" || rc=1; done
+      batch=()
+    fi
+  done
+  for p in "${batch[@]}"; do wait "$p" || rc=1; done
   return $rc
 }
 
