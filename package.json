@@ -24,6 +24,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json || true",
-    "test": "true"
+    "test": "true",
+    "factory-build": "factory-build/run-factory-build.sh"
+  },
+  "devDependencies": {
+    "@relayflows/core": "^1.0.1",
+    "@relayflows/cli": "^1.0.1"
   }
 }
