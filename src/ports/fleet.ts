@@ -8,6 +8,8 @@ export interface SpawnInput {
   name: string
   capability: Capability
   node?: 'self' | string
+  repo?: string
+  clonePath?: string
   task?: string
   workflow?: string
   inputs?: Record<string, unknown>

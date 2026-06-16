@@ -38,6 +38,10 @@
     "./writeback": {
       "types": "./dist/writeback/index.d.ts",
       "import": "./dist/writeback/index.js"
+    },
+    "./node": {
+      "types": "./dist/node/factory.node.d.ts",
+      "import": "./dist/node/factory.node.js"
     }
   },
   "publishConfig": {

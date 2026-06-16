@@ -55,6 +55,65 @@ factory factory start --mode live --config ./factory.config.json
 Global options (accepted anywhere in the args): `--config <path>`,
 `--dry-run`, `--backend <internal\|relay>`.
 
+## Serving as a fleet node (one-command flow)
+
+The package also ships a **fleet node definition** so a machine (e.g. a Mac mini)
+can advertise `spawn:claude` / `spawn:codex` / `workflow:run` capabilities to the
+cloud and run agents in the local checkouts it owns. The wire-level
+register/heartbeat/deregister/ack handshake is owned by the installed
+`agent-relay` sidecar — this package only supplies the node definition and its
+capability handlers.
+
+Serve the packaged default definition by name:
+
+```bash
+# Reads the NodeConfig from ./factory.node.json in the current directory.
+agent-relay fleet serve @agent-relay/factory/node
+```
+
+The default export resolves its `NodeConfig` from (first match wins):
+
+1. `$AGENT_RELAY_FACTORY_NODE_CONFIG`
+2. `$FACTORY_NODE_CONFIG`
+3. `$FACTORY_CONFIG`
+4. `./factory.node.json` (relative to the current working directory)
+
+To point at a config elsewhere:
+
+```bash
+FACTORY_NODE_CONFIG=/etc/factory/factory.node.json \
+  agent-relay fleet serve @agent-relay/factory/node
+```
+
+Prefer building the definition yourself? Import the builder from the package
+root and hand it your own `NodeConfig`:
+
+```ts
+import { createFactoryNodeDefinition, readFactoryNodeConfigSync } from '@agent-relay/factory'
+
+export default createFactoryNodeDefinition({ config: readFactoryNodeConfigSync() })
+```
+
+### Minimal `NodeConfig` (`factory.node.json`)
+
+```json
+{
+  "workspaceId": "your-workspace-id",
+  "capabilities": ["spawn:claude", "spawn:codex", "workflow:run"],
+  "cloneRoot": "/work",
+  "clonePaths": {
+    "AgentWorkforce/factory": "/work/factory",
+    "AgentWorkforce/relay": "/work/relay"
+  }
+}
+```
+
+`capabilities` is the only field that must be non-empty; the node advertises
+exactly what it lists. `clonePaths` (and/or `cloneRoot`) is the **checkout
+allowlist** — the cloud may only direct a spawn into a configured `clonePath` or
+a directory under `cloneRoot`. A config that advertises a `spawn:*` capability
+but provides neither will reject every cloud-supplied checkout path.
+
 ## The 2-process production model
 
 The factory runs as **two** coordinated processes (see issue #321 §4):

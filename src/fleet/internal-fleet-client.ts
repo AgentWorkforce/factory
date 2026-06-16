@@ -15,7 +15,7 @@ type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: strin
 type HarnessEventListener = (event: BrokerEvent) => void
 type DriverAgentLike = { name: string; sessionId?: string; pid?: number }
 type DriverDeliveryEventLike = BrokerEvent
-type AgentRelayMcpCommand = { command: string; args: string[] }
+export type AgentRelayMcpCommand = { command: string; args: string[] }
 
 export interface HarnessDriverClientLike {
   readonly brokerPid?: number
@@ -50,7 +50,7 @@ type PendingInjectedWait = {
   reject: (error: Error) => void
 }
 
-const capabilityCli: Record<Capability, string> = {
+export const capabilityCli: Record<Capability, string> = {
   'spawn:claude': 'claude',
   'spawn:codex': 'codex',
   'workflow:run': 'relayflows',
@@ -523,7 +523,7 @@ function spawnResultFrom(handle: SpawnedHandleLike, resolvedPid = handle.pid): S
   return result
 }
 
-function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined {
+export function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined {
   try {
     const packageJsonPath = requireForResolve.resolve('agent-relay/package.json')
     const cliPath = join(dirname(packageJsonPath), 'dist', 'cli', 'index.js')
@@ -534,7 +534,7 @@ function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined {
   }
 }
 
-function buildRelayMcpHarnessConfig(input: SpawnPtyInput, command: AgentRelayMcpCommand): NonNullable<SpawnPtyInput['harnessConfig']> {
+export function buildRelayMcpHarnessConfig(input: SpawnPtyInput, command: AgentRelayMcpCommand): NonNullable<SpawnPtyInput['harnessConfig']> {
   const relayEnv = relayMcpEnv(input.name, input.agentToken)
   return {
     runtime: 'pty',
