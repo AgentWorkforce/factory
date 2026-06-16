@@ -2,10 +2,18 @@ import type { FactoryConfig } from './config/schema'
 
 export * from './webhook/index.js'
 export * from './state/index.js'
-export type { FactoryConfig } from './config/schema'
-export { FactoryConfigSchema } from './config/schema'
+export type { FactoryConfig, FactoryStateRole } from './config/schema'
+export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export {
-  LINEAR_STATE_IDS,
+  resolveFactoryStates,
+  stateResolutionFromIds,
+} from './linear/state-resolver'
+export type {
+  FactoryStateResolution,
+  LinearStateReader,
+  ResolveFactoryStatesInput,
+} from './linear/state-resolver'
+export {
   linearByStatePath,
   linearCommentPath,
   linearIssuePath,

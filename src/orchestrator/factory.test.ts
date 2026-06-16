@@ -31,6 +31,7 @@ const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
 const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
+const planning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
 
 type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop' | 'safety'> & {
   loop?: Partial<FactoryConfig['loop']>
@@ -46,6 +47,10 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
   },
   triage: { maxImplementers: 4 },
   batchSize: 2,
+  // Explicit state UUIDs (the factory no longer defaults these). humanReview is
+  // intentionally omitted so terminalState: 'human-review' falls back to done
+  // unless a test opts in — preserving the prior default behavior.
+  stateIds: { readyForAgent: ready, agentImplementing: implementing, done, inPlanning: planning },
   ...overrides,
 })
 
@@ -867,7 +872,10 @@ describe('FactoryLoop', () => {
     })
   })
 
-  it('maps state_name-only Ready for Agent records to the configured ready state id', () => {
+  it('does not infer a state id from state_name alone (no hardcoded name->id map)', () => {
+    // State names/ids are workspace-dynamic, so parseLinearIssue no longer maps a
+    // bare state_name to a UUID. The record parses with an empty stateId and is
+    // simply not role-matched (never mis-routed) until it carries a real state.id.
     expect(parseLinearIssue(issuePath(26), {
       provider: 'linear',
       objectType: 'issue',
@@ -885,7 +893,7 @@ describe('FactoryLoop', () => {
     })).toMatchObject({
       uuid: 'uuid-26',
       key: 'AR-26',
-      stateId: ready,
+      stateId: '',
       state: { name: 'Ready for Agent' },
     })
   })
@@ -2873,7 +2881,10 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toEqual([])
   })
 
-  it('dispatches factory-scoped real issues that only carry state_name for readiness', async () => {
+  it('does not dispatch issues that carry only a state_name (no resolvable state id)', async () => {
+    // Without a resolvable state.id (and no hardcoded name->id map), a
+    // state_name-only record can't be matched to the readyForAgent role, so it
+    // is left alone rather than mis-dispatched.
     const path = issuePath(27)
     const stateNameOnly = {
       provider: 'linear',
@@ -2892,9 +2903,8 @@ describe('FactoryLoop', () => {
 
     const report = await factory.runOnce()
 
-    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-27'])
-    expect(report.skipped).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-27-impl-pear', 'ar-27-review'])
+    expect(report.dispatched).toEqual([])
+    expect(fleet.spawns).toEqual([])
   })
 
   it('dispatches ready AR issues scoped only by the factory label', async () => {

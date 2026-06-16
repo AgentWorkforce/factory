@@ -1,4 +1,5 @@
 import type { FactoryConfig } from './config/schema'
+import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
@@ -8,6 +9,10 @@ import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process
 export interface FactoryPorts {
   mount: MountClient
   fleet: FleetClient
+  // Resolved Linear state mapping (role <-> UUID, per team). When omitted the
+  // factory builds one from config.stateIds (explicit UUIDs only). The CLI
+  // resolves names against /linear/states and injects it here.
+  stateResolution?: FactoryStateResolution
   triage?: TriageEngine
   linear?: LinearWriteback
   slack?: SlackWriteback

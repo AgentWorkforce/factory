@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 
-import { LINEAR_STATE_IDS } from '../constants/linear'
 import { FactoryConfigSchema } from './schema'
 
 describe('FactoryConfigSchema', () => {
@@ -40,13 +39,10 @@ describe('FactoryConfigSchema', () => {
       staleAfterMs: 10 * 60_000,
     })
     expect(parsed.mergePolicy).toBe('never')
-    expect(LINEAR_STATE_IDS.humanReview).toBe('24462e2d-9946-4dd1-a798-931cdd678498')
-    expect(parsed.stateIds).toEqual({
-      readyForAgent: LINEAR_STATE_IDS.readyForAgent,
-      agentImplementing: LINEAR_STATE_IDS.agentImplementing,
-      done: LINEAR_STATE_IDS.done,
-      inPlanning: LINEAR_STATE_IDS.inPlanning,
-    })
+    // No hardcoded state defaults: omitted stateIds resolve to {} and are filled
+    // at runtime from linear.states (by name) or explicit stateIds.
+    expect(parsed.stateIds).toEqual({})
+    expect(parsed.linear).toEqual({ states: {}, statesByTeam: {} })
     expect(parsed.safety).toEqual({
       requireTitlePrefix: '[factory-e2e]',
       requireLabel: 'factory',
@@ -99,6 +95,22 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.terminalState).toBe('done')
     expect(parsed.models.babysitter).toBe('claude-sonnet-4-6')
     expect(parsed.stateIds.humanReview).toBe('state-human-review')
+  })
+
+  it('parses dynamic per-team Linear state name mappings', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      linear: {
+        states: { readyForAgent: 'Ready for Agent', done: 'Done' },
+        statesByTeam: {
+          ENG: { readyForAgent: 'To Do', done: 'Shipped' },
+        },
+      },
+    })
+
+    expect(parsed.linear.states.readyForAgent).toBe('Ready for Agent')
+    expect(parsed.linear.statesByTeam.ENG).toEqual({ readyForAgent: 'To Do', done: 'Shipped' })
+    expect(parsed.stateIds).toEqual({})
   })
 
   it('rejects batch sizes over five', () => {

@@ -3,12 +3,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { LINEAR_STATE_IDS } from '../constants/linear'
 import type { CloseProbePrInput, Factory } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
+
+// Explicit state UUIDs for the CLI tests (pinned via config.stateIds, which the
+// resolver uses directly without reading /linear/states).
+const TEST_STATE_IDS = {
+  readyForAgent: 'state-ready-for-agent',
+  agentImplementing: 'state-agent-implementing',
+  done: 'state-done',
+  inPlanning: 'state-in-planning',
+  humanReview: 'state-human-review',
+}
 
 const config = {
   workspaceId: 'factory-cli-test',
@@ -17,7 +26,7 @@ const config = {
     clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
     default: 'AgentWorkforce/pear',
   },
-  stateIds: LINEAR_STATE_IDS,
+  stateIds: TEST_STATE_IDS,
 }
 
 const issueFile = {
@@ -30,10 +39,10 @@ const issueFile = {
     title: '[factory-e2e] CLI dry run',
     description: 'Implement a small fix in packages/factory-sdk/src/cli/fleet.ts and verify with tests. Ensure the fleet CLI parses arguments, calls the SDK facades, prints an IterationReport, and keeps dry-run execution free of writes or spawns.',
     url: 'https://linear.app/agent-relay/issue/AR-77/cli-dry-run',
-    stateId: LINEAR_STATE_IDS.readyForAgent,
+    stateId: TEST_STATE_IDS.readyForAgent,
     labels: ['pear'],
     team: { key: 'AR', name: 'Agent Relay' },
-    state: { id: LINEAR_STATE_IDS.readyForAgent, name: 'Ready for Agent' },
+    state: { id: TEST_STATE_IDS.readyForAgent, name: 'Ready for Agent' },
   },
 }
 

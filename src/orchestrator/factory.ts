@@ -2,7 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
-import { LINEAR_STATE_IDS, linearByStatePath } from '../constants/linear'
+import { linearByStatePath } from '../constants/linear'
+import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type {
   AgentMessage,
@@ -123,13 +124,6 @@ const COMPLETION_SWEEP_INTERVAL_MS = 15_000
 const COMPLETION_SWEEP_BATCH_SIZE = 2
 const PROBE_PR_GH_BACKOFF_MS = 60_000
 const PROBE_PR_GH_CANDIDATE_LIMIT = 200
-const STATE_NAME_TO_ID: Record<string, string> = {
-  'Ready for Agent': LINEAR_STATE_IDS.readyForAgent,
-  'Agent Implementing': LINEAR_STATE_IDS.agentImplementing,
-  Implementing: LINEAR_STATE_IDS.agentImplementing,
-  Done: LINEAR_STATE_IDS.done,
-  'In Planning': LINEAR_STATE_IDS.inPlanning,
-}
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 const AGENT_QUESTION_DEDUPE_LIMIT = 500
@@ -168,6 +162,7 @@ export function createFactory(config: FactoryConfig, ports: FactoryPorts): Facto
 export class FactoryLoop implements Factory {
   readonly #config: FactoryConfig
   readonly #mount: MountClient
+  readonly #states: FactoryStateResolution
   readonly #fleet: FleetClient
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
@@ -257,11 +252,13 @@ export class FactoryLoop implements Factory {
   constructor(config: FactoryConfig, ports: FactoryPorts) {
     this.#config = config
     this.#mount = ports.mount
+    // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
+    // resolution via ports; fall back to one built from explicit stateIds.
+    this.#states = ports.stateResolution ?? stateResolutionFromIds(config.stateIds)
     installFactoryDraftPredicate(this.#mount, config)
     this.#fleet = ports.fleet
     this.#triage = ports.triage ?? new TieredTriage(new HeuristicTriage())
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
-      stateIds: config.stateIds,
       safety: config.safety,
     })
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
@@ -945,7 +942,7 @@ export class FactoryLoop implements Factory {
         continue
       }
 
-      if (issue.stateId !== this.#config.stateIds.readyForAgent) {
+      if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
         skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
         continue
       }
@@ -1125,17 +1122,19 @@ export class FactoryLoop implements Factory {
       await this.#writeInFlightRegistry()
 
       const comment = dispatchComment(dispatchDecision, agents)
+      let implementingStateId: string | undefined
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
-        if (!issue || issue.stateId !== this.#config.stateIds.readyForAgent) {
+        if (!issue || !this.#states.isRole(issue.stateId, 'readyForAgent')) {
           throw new Error(`Live state changed before writeback for ${dispatchDecision.issue.key}`)
         }
+        implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
         try {
           await this.#linear.postComment(issue, comment)
         } catch (error) {
           this.#logger.warn?.('[factory] comment writeback skipped', error)
         }
-        await this.#linear.setState(issue, this.#config.stateIds.agentImplementing)
+        await this.#linear.setState(issue, implementingStateId)
         this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
@@ -1143,7 +1142,7 @@ export class FactoryLoop implements Factory {
         issue: dispatchDecision.issue,
         agents,
         comments: [comment],
-        stateId: dryRun ? undefined : this.#config.stateIds.agentImplementing,
+        stateId: implementingStateId,
         dryRun,
       }
       record.result = result
@@ -1228,7 +1227,7 @@ export class FactoryLoop implements Factory {
       if (issue) {
         this.#recordCanonicalIssueState(issue)
       }
-      if (issue?.stateId !== this.#config.stateIds.readyForAgent) {
+      if (!issue || !this.#states.isRole(issue.stateId, 'readyForAgent')) {
         return
       }
 
@@ -1370,13 +1369,13 @@ export class FactoryLoop implements Factory {
 
       if (githubIssueIsClosed(ghIssue)) {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
-        if (mirror && mirror.stateId !== this.#config.stateIds.done) {
+        if (mirror && !this.#states.isRole(mirror.stateId, 'done')) {
           if (!opts.dryRun) {
             const record = this.#batch.getIssue(mirror)
             if (record) {
               await this.#completeIssue(record)
             } else {
-              await this.#linear.setState(mirror, this.#config.stateIds.done)
+              await this.#linear.setState(mirror, this.#states.idFor(mirror.team, 'done'))
             }
           }
           this.#increment('githubIssueMirrorsClosed')
@@ -1406,7 +1405,12 @@ export class FactoryLoop implements Factory {
       }
 
       if (!opts.dryRun) {
-        await this.#linear.createIssue(githubIssueMirrorPayload(ghIssue, repoLabel, this.#config))
+        await this.#linear.createIssue(githubIssueMirrorPayload(
+          ghIssue,
+          repoLabel,
+          this.#config,
+          this.#states.idFor(this.#config.safety.requireTeamKey, 'readyForAgent'),
+        ))
       }
       this.#increment('githubIssueMirrorsCreated')
     } catch (error) {
@@ -1555,9 +1559,9 @@ export class FactoryLoop implements Factory {
 
   #recordCanonicalIssueState(issue: Pick<LinearIssue, 'key' | 'stateId'>): void {
     const previousStateId = this.#canonicalIssueStates.get(issue.key)
-    const reopenedFromTerminal = previousStateId === this.#config.stateIds.done ||
-      previousStateId === this.#config.stateIds.humanReview
-    if (reopenedFromTerminal && issue.stateId === this.#config.stateIds.readyForAgent) {
+    const previousRole = this.#states.roleOf(previousStateId)
+    const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
+    if (reopenedFromTerminal && this.#states.isRole(issue.stateId, 'readyForAgent')) {
       const dispatchState = this.#dispatchAttempts.get(issue.key)
       if (dispatchState?.terminal) {
         dispatchState.attempts = 0
@@ -2452,8 +2456,9 @@ export class FactoryLoop implements Factory {
     this.#postMergeDoneAdvances.add(advanceKey)
 
     try {
-      await this.#linear.setState(issue, this.#config.stateIds.done)
-      this.#recordCanonicalIssueState({ key: issue.key, stateId: this.#config.stateIds.done })
+      const doneStateId = this.#states.idFor(issue.team, 'done')
+      await this.#linear.setState(issue, doneStateId)
+      this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
       this.#increment('mergedPrAdvancedDone')
       this.#increment('done')
@@ -2482,10 +2487,13 @@ export class FactoryLoop implements Factory {
   }
 
   async #findMergeAdvanceIssueForPr(snapshot: PullSnapshot): Promise<LinearIssue | undefined> {
-    const upstreamStates = new Set([
-      this.#config.stateIds.agentImplementing,
-      this.#config.stateIds.humanReview,
-    ].filter((stateId): stateId is string => Boolean(stateId)))
+    // An issue is "upstream" of a merge if it sits in the agent-implementing or
+    // human-review role for its team. UUIDs are globally unique, so the reverse
+    // role lookup covers every team without per-team scoping here.
+    const isUpstreamState = (stateId: string | undefined): boolean => {
+      const role = this.#states.roleOf(stateId)
+      return role === 'agentImplementing' || role === 'humanReview'
+    }
     let best: { issue: LinearIssue; score: number } | undefined
     const scanStartedAtMs = this.#clock.now()
     // This no-record path runs after agents are released, so there is no
@@ -2496,7 +2504,7 @@ export class FactoryLoop implements Factory {
         continue
       }
       const issue = await this.#readIssue(path)
-      if (!issue || !upstreamStates.has(issue.stateId)) {
+      if (!issue || !isUpstreamState(issue.stateId)) {
         continue
       }
       if (!isRealLinearIssue(issue) || !isInFactoryScope(issue, this.#config.safety)) {
@@ -2687,17 +2695,21 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#completionInFlight.add(completionKey)
-    // Land in `human-review` only when the operator opted into that terminal
-    // state AND configured its UUID; otherwise fall back to `done` (the legacy
-    // terminal) so an operator who sets terminalState: 'done' keeps it and the
-    // issue never gets stuck waiting on an unconfigured state.
-    const humanReview = opts.targetState !== 'done' &&
-      this.#config.terminalState === 'human-review' &&
-      Boolean(this.#config.stateIds.humanReview)
-    const targetState = humanReview ? this.#config.stateIds.humanReview! : this.#config.stateIds.done
-    const statusLabel = humanReview ? 'In Human Review' : 'Done'
     try {
       const issue = await this.#readIssue(record.issue.path)
+      // Resolve the terminal state for the issue's own team. Land in
+      // `human-review` only when the operator opted into that terminal state AND
+      // the team actually has a human-review state; otherwise fall back to `done`
+      // (the legacy terminal) so the issue never gets stuck on an unconfigured
+      // state.
+      const issueTeam = issue?.team
+      const humanReview = opts.targetState !== 'done' &&
+        this.#config.terminalState === 'human-review' &&
+        this.#states.hasHumanReview(issueTeam)
+      const targetState = humanReview
+        ? this.#states.idFor(issueTeam, 'humanReview')
+        : this.#states.idFor(issueTeam, 'done')
+      const statusLabel = humanReview ? 'In Human Review' : 'Done'
       if (issue) {
         await this.#linear.setState(issue, targetState)
         this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
@@ -3358,7 +3370,10 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   const key = stringValue(payload.identifier) ?? keyFromPath(path)
   const uuid = stringValue(payload.id) ?? stringValue(wrapper.objectId) ?? uuidFromPath(path) ?? key
   const stateName = stringValue(state?.name) ?? stringValue(payload.state_name)
-  const stateId = stringValue(payload.stateId) ?? stringValue(state?.id) ?? stateNameToId(stateName) ?? ''
+  // Resolve the issue's state UUID from the payload only. The factory maps that
+  // UUID to a role via the runtime state resolution (no hardcoded name->id), so
+  // an unknown state simply matches no role rather than being mis-routed.
+  const stateId = stringValue(payload.stateId) ?? stringValue(state?.id) ?? ''
 
   return {
     uuid,
@@ -3763,11 +3778,12 @@ const githubIssueMirrorPayload = (
   issue: GithubIssueSource,
   repoLabel: string,
   config: FactoryConfig,
+  readyForAgentStateId: string,
 ): Record<string, unknown> => ({
   id: githubIssueMirrorId(issue),
   title: `${GITHUB_MIRROR_TITLE_PREFIX} ${issue.title}`.trim(),
   description: githubIssueMirrorDescription(issue),
-  stateId: config.stateIds.readyForAgent,
+  stateId: readyForAgentStateId,
   labels: [{ name: repoLabel }],
   team: { key: config.safety.requireTeamKey },
   source: {
@@ -4090,8 +4106,6 @@ const stringValue = (value: unknown): string | undefined => typeof value === 'st
 const booleanValue = (value: unknown): boolean | undefined => typeof value === 'boolean' ? value : undefined
 const numberValue = (value: unknown): number | undefined => typeof value === 'number' ? value : undefined
 
-const stateNameToId = (name: string | undefined): string | undefined =>
-  name ? STATE_NAME_TO_ID[name] : undefined
 
 const liveHeartbeatIntervalMs = (staleMs: number): number =>
   Math.min(DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS, Math.max(500, Math.floor(staleMs / 4)))

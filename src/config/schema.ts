@@ -1,13 +1,27 @@
 import { z } from 'zod'
 
-import { LINEAR_STATE_IDS } from '../constants/linear'
+// The five workflow-state roles the factory drives an issue through. Each is
+// configured either by name (config.linear.states.<role>, resolved to a
+// workspace UUID at startup) or by explicit UUID (config.stateIds.<role>).
+export const FACTORY_STATE_ROLES = [
+  'readyForAgent',
+  'agentImplementing',
+  'inPlanning',
+  'done',
+  'humanReview',
+] as const
+export type FactoryStateRole = (typeof FACTORY_STATE_ROLES)[number]
 
-const DEFAULT_STATE_IDS = {
-  readyForAgent: LINEAR_STATE_IDS.readyForAgent,
-  agentImplementing: LINEAR_STATE_IDS.agentImplementing,
-  done: LINEAR_STATE_IDS.done,
-  inPlanning: LINEAR_STATE_IDS.inPlanning,
-}
+// A mapping from factory roles to a team's workflow-state NAMES (e.g.
+// readyForAgent -> "Ready for Agent", or "To Do" for a team that names it
+// differently). All optional: unset roles fall back to global/explicit config.
+const linearRoleNamesSchema = z.object({
+  readyForAgent: z.string().optional(),
+  agentImplementing: z.string().optional(),
+  inPlanning: z.string().optional(),
+  done: z.string().optional(),
+  humanReview: z.string().optional(),
+}).default({})
 
 export const FactoryConfigSchema = z.object({
   // Optional. When omitted, the CLI derives the workspace from the cloud session
@@ -77,19 +91,32 @@ export const FactoryConfigSchema = z.object({
   }).default({}),
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
-  // actual merge); `done` is the legacy behavior. Only honored when
-  // `stateIds.humanReview` is configured — otherwise it falls back to `done`.
+  // actual merge); `done` is the legacy behavior. Only honored when the
+  // `humanReview` role resolves to a state — otherwise it falls back to `done`.
   terminalState: z.enum(['done', 'human-review']).default('human-review'),
+  // Dynamic, workspace-agnostic Linear configuration. Nothing about state names
+  // or UUIDs is hardcoded — customers map the factory's semantic roles to
+  // whatever their teams call those states, and the names are resolved to UUIDs
+  // at startup against /linear/states (see resolveFactoryStates).
+  //
+  // `states` is the workspace-wide default mapping; `statesByTeam.<TEAM>`
+  // overrides individual roles for teams that name their states differently
+  // (resolution per issue uses the issue's team, falling back to `states`).
+  linear: z.object({
+    states: linearRoleNamesSchema,
+    statesByTeam: z.record(z.string(), linearRoleNamesSchema).default({}),
+  }).default({}),
+  // Explicit workflow-state UUIDs. Lowest-precedence fallback / single-team
+  // escape hatch for setups that prefer pinning ids over name resolution; any
+  // role resolved by name (per-team or global) takes precedence. Populated in
+  // place once resolution runs, so the orchestrator always sees concrete UUIDs.
   stateIds: z.object({
-    readyForAgent: z.string(),
-    agentImplementing: z.string(),
-    done: z.string(),
-    inPlanning: z.string(),
-    // The "In Human Review" workflow-state UUID. Optional and not part of the
-    // default stateIds because it is workspace-specific. When unset, the factory
-    // falls back to `done` even if terminalState is `human-review`.
+    readyForAgent: z.string().optional(),
+    agentImplementing: z.string().optional(),
+    done: z.string().optional(),
+    inPlanning: z.string().optional(),
     humanReview: z.string().optional(),
-  }).default(DEFAULT_STATE_IDS),
+  }).default({}),
   safety: z.object({
     requireTitlePrefix: z.string().min(1).default('[factory-e2e]'),
     requireLabel: z.string().default('factory'),

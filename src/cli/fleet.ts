@@ -15,6 +15,7 @@ import {
   parseLinearIssue,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
+  resolveFactoryStates,
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
@@ -22,6 +23,7 @@ import {
   type FleetBackend,
   type FleetClient,
   type GhRunner,
+  type FactoryStateResolution,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
@@ -36,6 +38,7 @@ interface FleetCliDeps {
   createFleet?: typeof createFleet
   cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
   resolveWorkspace?: () => Promise<ResolvedFactoryWorkspace>
+  resolveStates?: (mount: MountClient, config: FactoryConfig) => Promise<FactoryStateResolution>
   ensureLocalMount?: (
     workspaceId: string,
     startDir: string,
@@ -152,9 +155,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         const mount = await buildMount(loaded, deps)
+        // Resolve the factory's Linear states (role <-> UUID, per team) from
+        // /linear/states by name, with config.stateIds as an explicit-UUID
+        // fallback. Nothing about state names/ids is hardcoded.
+        const stateResolution = await (deps.resolveStates ?? defaultResolveStates)(mount, loaded.config)
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
+          stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
         })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
@@ -409,6 +417,15 @@ export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | 
     }
     current = parent
   }
+}
+
+async function defaultResolveStates(mount: MountClient, config: FactoryConfig): Promise<FactoryStateResolution> {
+  return resolveFactoryStates(mount, {
+    states: config.linear.states,
+    statesByTeam: config.linear.statesByTeam,
+    stateIds: config.stateIds,
+    teams: config.subscription.teams,
+  })
 }
 
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
