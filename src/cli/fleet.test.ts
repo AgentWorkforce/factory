@@ -283,17 +283,30 @@ describe('fleet CLI runtime', () => {
     expect(mount.writes).toEqual([])
   })
 
-  it('selects the RelayFleetClient stub when --backend relay is requested', async () => {
-    const output = buffer()
-    const errors = buffer()
+  it('drives the real RelayFleetClient when --backend relay is requested', async () => {
+    // Strip every relay credential so the lazily-built HTTP transport surfaces a
+    // deterministic auth error instead of attempting a real network request.
+    // Independent of host env (a developer's ambient RELAY_API_KEY).
+    vi.stubEnv('RELAY_AGENT_TOKEN', '')
+    vi.stubEnv('RELAY_WORKSPACE_KEY', '')
+    vi.stubEnv('RELAY_API_KEY', '')
+    try {
+      const output = buffer()
+      const errors = buffer()
 
-    const code = await runFleetCli(['roster', '--backend', 'relay'], {
-      stdout: output,
-      stderr: errors,
-    })
+      const code = await runFleetCli(['roster', '--backend', 'relay'], {
+        stdout: output,
+        stderr: errors,
+      })
 
-    expect(code).toBe(1)
-    expect(errors.text()).toContain('RelayFleetClient not implemented')
+      // The relay backend is selected (no more 'not implemented' stub) and the
+      // RelayFleetClient surfaces the relay auth error on first transport use.
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('requires agentToken or workspaceKey')
+      expect(output.text()).toBe('')
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it('refuses targeted factory dispatch for an issue outside factory-e2e scope', async () => {
