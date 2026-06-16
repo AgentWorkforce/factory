@@ -18,7 +18,7 @@ const cliArgs = rawArgs.filter((arg) => arg !== '--rebuild')
 
 mkdirSync(cacheDir, { recursive: true })
 
-// The SDK package is type=commonjs, so Node strip-types loads .ts as CJS and rejects ESM imports.
+// The workspace passthrough runs raw TS sources before p4 makes the dist CLI Node-runnable.
 // Bundle the thin CLI entry locally instead; esbuild is declared in this package for that launcher path.
 const { buildSync } = require('esbuild')
 const buildOptions = {

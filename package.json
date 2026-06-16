@@ -1,25 +1,21 @@
 {
-  "name": "@pear/factory-sdk",
-  "private": true,
-  "type": "commonjs",
-  "bin": {
-    "fleet": "bin/fleet.mjs"
-  },
-  "devDependencies": {
-    "esbuild": "^0.24.2"
-  },
+  "name": "@agent-relay/factory",
+  "version": "0.1.0",
+  "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/AgentWorkforce/factory" },
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "bin/factory.mjs", "package.json", "README.md"],
+  "bin": { "factory": "bin/factory.mjs" },
   "exports": {
-    ".": {
-      "types": "./src/index.ts",
-      "default": "./src/index.ts"
-    },
-    "./testing": {
-      "types": "./src/testing/index.ts",
-      "default": "./src/testing/index.ts"
-    },
-    "./writeback": {
-      "types": "./src/writeback/index.ts",
-      "default": "./src/writeback/index.ts"
-    }
-  }
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./testing": { "types": "./dist/testing/index.d.ts", "import": "./dist/testing/index.js" },
+    "./writeback": { "types": "./dist/writeback/index.d.ts", "import": "./dist/writeback/index.js" }
+  },
+  "scripts": { "build": "tsc -p tsconfig.build.json", "test": "vitest run" },
+  "devDependencies": { "esbuild": "^0.24.2" }
 }
