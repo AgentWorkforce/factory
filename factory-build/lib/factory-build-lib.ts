@@ -31,7 +31,7 @@ export const AW_ROOT = '/Users/khaliqgant/Projects/AgentWorkforce';
 /** Isolated git worktrees so parallel workflows never share a working tree. */
 export const WORKTREES = `${AW_ROOT}/.factory-worktrees`;
 export const PLANNING = `${AW_ROOT}/factory/planning`;
-export const EPIC = `${PLANNING}/factory-cloud-watches-local-node-linear-issue.md`;
+export const EPIC = `${PLANNING}/factory-unified-node-architecture-linear-issue.md`;
 export const RULES = `${AW_ROOT}/ricky/workflows/shared/WORKFLOW_AUTHORING_RULES.md`;
 
 export const REPOS: Record<string, string> = {
@@ -109,11 +109,9 @@ function addSquad(wf: Wf, tier: FactoryWorkflowOptions['tier']): void {
     role: 'Primary implementer. Implements the declared file targets per the spec and the lead plan.',
     retries: 2,
   });
-  wf.agent('assist-opencode', {
-    cli: 'opencode',
-    role: 'Assisting implementer. Picks up secondary files, tests, and fixtures the lead assigns; never edits the same file as impl-codex concurrently.',
-    retries: 2,
-  });
+  // assist-opencode removed: OpenCode TUI never runs the injected prompt headlessly,
+  // and even rebound to claude the assist step fails `owner completion decision missing`
+  // and FAILS the run (p11/p3, 2026-06-16). lead + impl + shadow is the reliable squad.
   wf.agent('shadow-claude', {
     cli: 'claude',
     role: 'Live shadow reviewer. Reads actual files and channel updates while work is happening and posts concise spec-drift feedback before the implementers exit.',
@@ -190,7 +188,7 @@ function addImplementation(wf: Wf, o: FactoryWorkflowOptions): void {
     agent: 'lead-claude',
     dependsOn: ['read-spec'],
     task: j([
-      `You are lead-claude on this channel. Workers: impl-codex (primary), assist-opencode (assist). Shadow: shadow-claude.`,
+      `You are lead-claude on this channel. Worker: impl-codex (primary implementer). Shadow: shadow-claude.`,
       `Issue: ${o.id} — ${o.description}`,
       `Full spec (read it in full at ${PLANNING}/${o.specFile}):`,
       `{{steps.read-spec.output}}`,
@@ -217,20 +215,15 @@ function addImplementation(wf: Wf, o: FactoryWorkflowOptions): void {
       `When done, write ${dir}/self-reflection.md covering: changed files, spec coverage, tests/proofs run, repo-rule alignment, and remaining risks. Post a completion message and address lead/shadow feedback.`,
     ]),
   });
-  wf.step('assist-work', {
-    agent: 'assist-opencode',
-    dependsOn: ['read-spec'],
-    task: j([
-      `You are assist-opencode. Wait for lead-claude's assignment, then implement the secondary files / tests / fixtures you are given for issue ${o.id}.`,
-      `Spec: {{steps.read-spec.output}}`,
-      `Never edit a file impl-codex is actively editing. Post completion messages and address feedback.`,
-    ]),
-  });
+  // NOTE: the former 'assist-work' step (assist-opencode) is removed. OpenCode's TUI
+  // never runs the injected prompt headlessly (splash-only), and even rebound to claude
+  // the step routinely fails `owner completion decision missing` and FAILS the whole run
+  // (observed on p11/p3, 2026-06-16). lead + impl + shadow is a complete, reliable squad.
   wf.step('shadow-review', {
     agent: 'shadow-claude',
     dependsOn: ['read-spec'],
     task: j([
-      `You are shadow-claude, the live shadow reviewer for issue ${o.id}. As impl-codex and assist-opencode work, read the actual changed files and the channel, and post concise, specific feedback when you see spec drift, missed file targets, or repo-rule violations.`,
+      `You are shadow-claude, the live shadow reviewer for issue ${o.id}. As impl-codex works, read the actual changed files and the channel, and post concise, specific feedback when you see spec drift, missed file targets, or repo-rule violations.`,
       `Spec: {{steps.read-spec.output}}`,
       `Declared file targets: ${targets}. Do not implement; review and steer. End with SHADOW_DONE when the implementers have addressed your feedback.`,
     ]),

@@ -17,7 +17,6 @@ The runner uses the locally-installed CLI (`node_modules/@relayflows/cli`); rick
 ## The squad (per the user's spec)
 - **lead-claude** — lead + QA (plans, assigns, repairs red gates)
 - **impl-codex** — primary implementer
-- **assist-opencode** — assisting implementer (needs `opencode` on PATH, `~/.opencode/bin`)
 - **shadow-claude** — live shadow reviewer (flags spec drift while work happens)
 - **reviewer-claude / fixer-claude** — first fresh-eyes review/fix loop
 - **reviewer-codex / fixer-codex** — second loop (deep tier only)
@@ -45,10 +44,11 @@ wave0 (prereq)    pear#368 + pear#369 — config/schema.ts — ✅ BOTH LANDED
 wave1 (parallel)  p1 p2 p3 (pear prep)   p11 (relay broker — independent)
 wave2             p4  extraction  ──►  ⛔ PUBLISH GATE (human: npm publish + pear swap)
 wave3 (parallel)  p5 (pear teardown)     p6 (cloud host orchestrator)
-wave4 (parallel)  p7 (label→scope)  p8 (linear webhook)  p9 (dispatch-target seam)
-wave5             p10 (RelayFleetClient + cloud fleet-node branch)
-wave6             p12 (node placement)
-wave7             p13 (factory node-definition for `agent-relay fleet serve`)
+wave4 (parallel)  p7 (label→recipe)  p8 (linear webhook)        [p9 deleted — no daytona|fleet-node branch]
+wave5             p10 (RelayFleetClient — thin fleet-protocol client, Phase 3)
+wave6             p12 (node-targeted placement — relay-side, RFC §6/§7)
+wave7             p13 (node registration — Phase 4)
+wave8 (sibling)   proactive-runtime fleet unification (independent; run anytime)
 ```
 
 Run:

@@ -30,8 +30,8 @@ async function main() {
     .repairable({ repairRetries: 5, maxRetries: 5, retryDelayMs: 5_000, repairAgent: 'lead-claude' });
 
   wf.agent('lead-claude', { cli: 'claude', role: 'Lead + QA for the extraction. Coordinates the seed, verification, and publish-prep; runs repair on red gates.', retries: 1 });
-  wf.agent('impl-codex', { cli: 'codex', role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling, and pushes.', retries: 2 });
-  wf.agent('assist-opencode', { cli: 'opencode', role: 'Assists with repo tooling (CI/publish workflow, LICENSE, .gitignore, README).', retries: 2 });
+  wf.agent('impl-codex', { cli: 'codex', role: 'Runs the git filter-repo extraction playbook, seeds the factory repo tooling (CI/publish/LICENSE/.gitignore), and pushes.', retries: 2 });
+  // (assist-opencode removed — flaky headless; impl-codex owns the tooling. See factory-build-lib.ts.)
   wf.agent('reviewer-claude', { cli: 'claude', preset: 'reviewer', role: 'Reviews the seeded repo + the post-publish swap plan from scratch.', retries: 1 });
   wf.agent('reviewer-codex', { cli: 'codex', preset: 'reviewer', role: 'Second-pass review of the extraction integrity (history preserved, publish shape, swap plan).', retries: 1 });
 
@@ -78,16 +78,9 @@ async function main() {
       `3. RECONCILE with the existing scaffold already committed in ${FACTORY}: keep package.json "repository" + "publishConfig", keep .github/workflows/publish.yml (provenance), keep planning/. REPLACE the placeholder index.js/index.d.ts/README.md with the real package entrypoints, and merge the real factory-sdk package.json code fields onto the scaffold (do NOT drop repository/publishConfig). Add .github/workflows/ci.yml (node 20: npm ci, build, test, npm pack --dry-run), LICENSE, .gitignore (dist, node_modules, *.tsbuildinfo). The first real release is 0.1.0 (placeholder was 0.0.0).`,
       '4. Push factory main: git push -u origin main.',
       'DO NOT run npm publish — that is a human gate (next step writes the exact command).',
-      `Write ${ART}/seed-report.md: commits imported (git log --oneline | head), tooling added, and any deviations. Use assist-opencode for the CI/publish/LICENSE/.gitignore tooling. End with SEED_DONE.`,
+      `Write ${ART}/seed-report.md: commits imported (git log --oneline | head), tooling added, and any deviations. You (impl-codex) author the CI/publish/LICENSE/.gitignore tooling yourself. End with SEED_DONE.`,
     ].join('\n'),
     verification: { type: 'file_exists', value: `${ART}/seed-report.md` },
-  });
-  wf.step('assist-tooling', {
-    agent: 'assist-opencode',
-    dependsOn: ['read-spec'],
-    task: [
-      'Wait for lead/impl direction, then author the new repo tooling in ' + FACTORY + ': CI workflow, publish workflow, LICENSE, README, .gitignore — mirroring the org conventions (read @agent-relay/cloud for the publish pattern). Do not run npm publish. End with ASSIST_DONE.',
-    ].join('\n'),
   });
 
   wf.step('verify-factory-seed', {

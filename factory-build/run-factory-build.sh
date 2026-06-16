@@ -73,13 +73,15 @@ wave2() {
   echo "============================================================"
 }
 wave3() { run_parallel wave3-cloud-lift/01-p5-pear-teardown.ts wave3-cloud-lift/02-p6-host-orchestrator.ts; }
+# wave4 = recipe selection + Linear ingress (p9 deleted — no daytona|fleet-node branch under unified-node)
 wave4() { run_parallel \
     wave4-cloud-dispatch/01-p7-label-scope.ts \
-    wave4-cloud-dispatch/02-p8-linear-webhook.ts \
-    wave4-cloud-dispatch/03-p9-dispatch-target.ts; }
-wave5() { run wave5-fleet-seam/01-p10-relayfleetclient-seam.ts; }
-wave6() { run wave6-placement/01-p12-node-placement.ts; }
-wave7() { run wave7-node/01-p13-factory-node-definition.ts; }
+    wave4-cloud-dispatch/02-p8-linear-webhook.ts; }
+wave5() { run wave5-fleet-seam/01-p10-relayfleetclient-seam.ts; }   # Phase 3 fleet client
+wave6() { run wave6-placement/01-p12-node-placement.ts; }          # relay-side placement (RFC §6/§7)
+wave7() { run wave7-node/01-p13-factory-node-definition.ts; }      # Phase 4 node registration
+# Sibling, independent of the factory phases (run anytime):
+wave8() { run wave8-proactive/01-proactive-runtime-fleet-unification.ts; }
 
 MODE="${1:-help}"
 case "$MODE" in
@@ -90,6 +92,7 @@ case "$MODE" in
   wave5) ensure_built; wave5 ;;
   wave6) ensure_built; wave6 ;;
   wave7) ensure_built; wave7 ;;
+  wave8|proactive) ensure_built; wave8 ;;
   post-publish) ensure_built; wave3 && wave4 && wave5 && wave6 && wave7 ;;
   all)
     ensure_built; wave1 && wave2
