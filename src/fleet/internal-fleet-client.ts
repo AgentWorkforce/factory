@@ -53,11 +53,12 @@ type PendingInjectedWait = {
 const capabilityCli: Record<Capability, string> = {
   'spawn:claude': 'claude',
   'spawn:codex': 'codex',
+  'workflow:run': 'relayflows',
 }
 
 const selfNode: RosterEntry['nodes'][number] = {
   name: 'self',
-  capabilities: ['spawn:claude', 'spawn:codex'],
+  capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'],
   live: true,
 }
 const PID_RESOLVE_ATTEMPTS = 3

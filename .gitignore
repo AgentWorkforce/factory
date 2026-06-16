@@ -4,4 +4,5 @@ dist/
 *.tgz
 .DS_Store
 *.log
-.workflow-artifacts/
+.workflow-artifacts/*
+!.workflow-artifacts/factory-p7-label-scope/

@@ -3817,6 +3817,193 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-721-impl-pear', 'ar-721-review'])
   })
 
+  it('dispatches explicit workflow labels as one workflow run spawn', async () => {
+    const routedIssue = realIssueFile(725, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:workflow' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(725)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(725), routedIssue)))
+
+    expect(result.agents).toEqual([{ name: 'ar-725-workflow', role: 'workflow' }])
+    expect(fleet.spawns).toHaveLength(1)
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-725-workflow',
+      capability: 'workflow:run',
+      workflow: 'workflows/factory/linear-issue.ts',
+      cwd: '/work/pear',
+    })
+    expect(fleet.spawns[0]?.inputs).toMatchObject({
+      issue: { uuid: 'uuid-725', key: 'AR-725', path: issuePath(725) },
+      repoLabels: ['pear'],
+      routes: [{ repo: 'AgentWorkforce/pear', clonePath: '/work/pear' }],
+    })
+  })
+
+  it('dispatches explicit single labels as one implementer even with multiple repo labels', async () => {
+    const routedIssue = realIssueFile(726, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'agent:single' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(726)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(726), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-726-impl-pear', 'ar-726-review'])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd])).toEqual([
+      ['ar-726-impl-pear', '/work/pear'],
+      ['ar-726-review', '/work/pear'],
+    ])
+  })
+
+  // Pins the `scope === 'team' &&` relaxation of the too-many-labels guard: an
+  // explicit single-scope issue must win even when its mapped repo labels exceed
+  // the effective implementer cap (here min(maxImplementers=2, 4) = 2 < 3 routes),
+  // where a team-scoped issue with the same labels would fail dispatch.
+  it('dispatches explicit single labels even when repo labels exceed the implementer cap', async () => {
+    const routedIssue = realIssueFile(727, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'relayfile' }, { name: 'agent:single' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(727)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+          relayfile: 'AgentWorkforce/relayfile',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+          'AgentWorkforce/relayfile': '/work/relayfile',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(727), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-727-impl-pear', 'ar-727-review'])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd])).toEqual([
+      ['ar-727-impl-pear', '/work/pear'],
+      ['ar-727-review', '/work/pear'],
+    ])
+    // Dispatch succeeded (a single implementer summary, not a too-many-labels skip).
+    expect(comments).toEqual([expect.stringContaining('Implementers: ar-727-impl-pear')])
+    expect(comments[0]).not.toContain('Too many repo labels')
+  })
+
+  // Companion to the single-scope guard test: an explicit workflow-scope issue
+  // must also bypass the too-many-labels cap and emit exactly one workflow spawn.
+  it('dispatches explicit workflow labels even when repo labels exceed the implementer cap', async () => {
+    const routedIssue = realIssueFile(728, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'relayfile' }, { name: 'agent:workflow' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(728)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+          relayfile: 'AgentWorkforce/relayfile',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+          'AgentWorkforce/relayfile': '/work/relayfile',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(728), routedIssue)))
+
+    expect(result.agents).toEqual([{ name: 'ar-728-workflow', role: 'workflow' }])
+    expect(fleet.spawns).toHaveLength(1)
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-728-workflow',
+      capability: 'workflow:run',
+      workflow: 'workflows/factory/linear-issue.ts',
+      cwd: '/work/pear',
+    })
+    // Workflow scope spans every mapped repo (one workflow run, all routes) —
+    // proving the implementer cap (2) did not truncate or reject the 3 routes.
+    expect(fleet.spawns[0]?.inputs).toMatchObject({
+      repoLabels: ['pear', 'cloud', 'relayfile'],
+      routes: [
+        { repo: 'AgentWorkforce/pear', clonePath: '/work/pear' },
+        { repo: 'AgentWorkforce/cloud', clonePath: '/work/cloud' },
+        { repo: 'AgentWorkforce/relayfile', clonePath: '/work/relayfile' },
+      ],
+    })
+    // Dispatch succeeded (a workflow-run summary, not a too-many-labels skip).
+    expect(comments).toEqual([expect.stringContaining('Workflow: ar-728-workflow')])
+    expect(comments[0]).not.toContain('Too many repo labels')
+  })
+
   it('fails dispatch loudly when no labels are present', async () => {
     const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })

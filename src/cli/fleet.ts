@@ -186,7 +186,7 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
   if (verb === 'spawn') {
     const [capability, ...flags] = rest
     if (!isCapability(capability)) {
-      throw new Error('fleet spawn requires capability spawn:codex or spawn:claude')
+      throw new Error('fleet spawn requires capability spawn:codex, spawn:claude, or workflow:run')
     }
     const parsed = parseFlags(flags)
     return {
@@ -543,11 +543,11 @@ function flushWritable(stream: NodeJS.WriteStream): Promise<void> {
 }
 
 function isCapability(value: string | undefined): value is Capability {
-  return value === 'spawn:codex' || value === 'spawn:claude'
+  return value === 'spawn:codex' || value === 'spawn:claude' || value === 'workflow:run'
 }
 
 function defaultAgentName(capability: Capability, now: number): string {
-  return `fleet-${capability.replace('spawn:', '')}-${now}`
+  return `fleet-${capability.replace('spawn:', '').replace(':', '-')}-${now}`
 }
 
 export function installFactoryStopSignalHandlers(

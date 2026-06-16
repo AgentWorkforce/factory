@@ -209,7 +209,7 @@ export class FakeFleetClient implements FleetClient {
   async roster(): Promise<RosterEntry> {
     return {
       agents: await this.listAgents(),
-      nodes: [{ name: 'self', capabilities: ['spawn:codex', 'spawn:claude'], live: true }],
+      nodes: [{ name: 'self', capabilities: ['spawn:codex', 'spawn:claude', 'workflow:run'], live: true }],
     }
   }
 
