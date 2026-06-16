@@ -412,7 +412,24 @@ export function setupWorktree(o: FactoryWorkflowOptions): string {
   sh(`mkdir -p "${WORKTREES}"`);
   quiet(`git -C "${repo}" fetch origin --quiet`);
   // -B resets the branch to a fresh checkout off the latest main, in an isolated dir.
-  sh(`git -C "${repo}" worktree add -f -B "${o.branch}" "${wt}" origin/main`);
+  // RETRY: multiple workflows targeting the SAME repo (e.g. p1/p2/p3 → pear) call this
+  // concurrently, and `git worktree add` locks .git/worktrees + refs — parallel adds on
+  // one repo race and all-but-one fail. Retry with backoff until the lock frees.
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    try {
+      quiet(`git -C "${repo}" worktree prune`);
+      sh(`git -C "${repo}" worktree add -f -B "${o.branch}" "${wt}" origin/main`);
+      lastErr = undefined;
+      break;
+    } catch (e) {
+      lastErr = e;
+      // staggered backoff (attempt seconds + per-branch offset) to avoid lockstep retries
+      const jitter = (o.branch.length % 3) + 1;
+      try { execSync(`sleep ${attempt + jitter}`); } catch { /* noop */ }
+    }
+  }
+  if (lastErr) throw lastErr;
   // Symlink deps (gitignored, so not in the worktree). Read-mostly; build/test resolve up-tree.
   quiet(`test -d "${repo}/node_modules" && ln -snf "${repo}/node_modules" "${wt}/node_modules"`);
   return wt;
