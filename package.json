@@ -1,7 +1,7 @@
 {
   "name": "@agent-relay/factory",
-  "version": "0.0.0",
-  "description": "Autonomous Linear-issue → triage → PR factory. Placeholder reservation; real package lands via the p4 extraction (pear/packages/factory-sdk → here).",
+  "version": "0.1.0",
+  "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -12,23 +12,55 @@
     "url": "https://github.com/AgentWorkforce/factory/issues"
   },
   "type": "module",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "files": [
-    "index.js",
-    "index.d.ts",
-    "dist"
+    "dist",
+    "bin/factory.mjs",
+    "package.json",
+    "README.md"
   ],
+  "bin": {
+    "factory": "bin/factory.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./writeback": {
+      "types": "./dist/writeback/index.d.ts",
+      "import": "./dist/writeback/index.js"
+    }
+  },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json || true",
-    "test": "true",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
     "factory-build": "factory-build/run-factory-build.sh"
+  },
+  "dependencies": {
+    "@agent-relay/cloud": "^8.7.2",
+    "@agent-relay/harness-driver": "^8.3.7",
+    "@relayfile/sdk": "^0.8.29",
+    "agent-relay": "^8.8.1",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@relayflows/cli": "^1.0.3",
-    "@relayflows/core": "^1.0.3"
+    "@relayflows/core": "^1.0.3",
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.8"
   }
 }

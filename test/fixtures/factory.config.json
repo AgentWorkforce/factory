@@ -1,0 +1,37 @@
+{
+  "workspaceId": "factory-cli-fixture",
+  "repos": {
+    "byLabel": {
+      "pear": "AgentWorkforce/pear"
+    },
+    "clonePaths": {
+      "AgentWorkforce/pear": "/tmp/factory-wt/factory-sdk-w7-cli"
+    },
+    "default": "AgentWorkforce/pear"
+  },
+  "batchSize": 1,
+  "mergePolicy": "never",
+  "stateIds": {
+    "readyForAgent": "state-ready-for-agent",
+    "agentImplementing": "state-agent-implementing",
+    "done": "state-done",
+    "inPlanning": "state-in-planning"
+  },
+  "fixtureFiles": {
+    "/linear/issues/AR-77__uuid-77.json": {
+      "provider": "linear",
+      "objectType": "issue",
+      "objectId": "uuid-77",
+      "payload": {
+        "id": "uuid-77",
+        "identifier": "AR-77",
+        "title": "[factory-e2e] CLI dry run",
+        "description": "Implement a small fix in packages/factory-sdk/src/cli/fleet.ts and verify with tests. Ensure the fleet CLI parses arguments, calls the SDK facades, prints an IterationReport, and keeps dry-run execution free of writes or spawns.",
+        "stateId": "state-ready-for-agent",
+        "labels": ["pear"],
+        "team": { "key": "AR", "name": "Agent Relay" },
+        "state": { "id": "state-ready-for-agent", "name": "Ready for Agent" }
+      }
+    }
+  }
+}

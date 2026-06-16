@@ -1,0 +1,507 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "linear issues",
+  "description": "Record shape for /linear/issues (inferred from synced linear issues). Fields marked readOnly are server-managed; omit them from create payloads.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "_connection": {
+      "type": "object",
+      "readOnly": true,
+      "additionalProperties": true,
+      "properties": {
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "_webhook": {
+      "type": "object",
+      "readOnly": true,
+      "additionalProperties": true,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "actor": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "avatarUrl": {
+              "type": "string"
+            },
+            "email": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "objectId": {
+          "type": "string"
+        },
+        "objectType": {
+          "type": "string"
+        },
+        "organizationId": {
+          "type": "string"
+        },
+        "previousData": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "assigneeId": {
+              "type": "null"
+            },
+            "completedAt": {
+              "type": "null"
+            },
+            "delegateId": {
+              "type": "null"
+            },
+            "description": {
+              "type": "null"
+            },
+            "dueDate": {
+              "type": "null"
+            },
+            "sortOrder": {
+              "type": "integer"
+            },
+            "startedAt": {
+              "type": "null"
+            },
+            "stateId": {
+              "type": "string"
+            },
+            "subscriberIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "updatedAt": {
+              "type": "string"
+            }
+          }
+        },
+        "url": {
+          "type": "string"
+        },
+        "webhookId": {
+          "type": "string"
+        },
+        "webhookTimestamp": {
+          "type": "integer"
+        }
+      }
+    },
+    "activitySummary": {
+      "type": "null"
+    },
+    "addedToCycleAt": {
+      "type": "null"
+    },
+    "addedToProjectAt": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "addedToTeamAt": {
+      "type": "string"
+    },
+    "archivedAt": {
+      "type": "null",
+      "readOnly": true
+    },
+    "assignee": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "avatarUrl": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "assignee_name": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "assigneeId": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "autoArchivedAt": {
+      "type": "null"
+    },
+    "autoClosedAt": {
+      "type": "null"
+    },
+    "botActor": {
+      "type": "null"
+    },
+    "canceledAt": {
+      "type": "null",
+      "readOnly": true
+    },
+    "completedAt": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "readOnly": true
+    },
+    "created_at": {
+      "type": "string",
+      "readOnly": true
+    },
+    "createdAt": {
+      "type": "string",
+      "readOnly": true
+    },
+    "creatorId": {
+      "type": "string"
+    },
+    "cycleId": {
+      "type": "null"
+    },
+    "delegate": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "avatarUrl": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "delegateId": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "description": {
+      "type": "string"
+    },
+    "descriptionData": {
+      "type": "string"
+    },
+    "dueDate": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "estimate": {
+      "type": "null"
+    },
+    "externalUserCreatorId": {
+      "type": "null"
+    },
+    "id": {
+      "type": "string",
+      "readOnly": true
+    },
+    "identifier": {
+      "type": "string",
+      "readOnly": true
+    },
+    "inheritsSharedAccess": {
+      "type": "boolean"
+    },
+    "integrationSourceType": {
+      "type": "string"
+    },
+    "labelIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "color": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parentId": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "lastAppliedTemplateId": {
+      "type": "null"
+    },
+    "milestone": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "targetDate": {
+          "type": "string"
+        }
+      }
+    },
+    "number": {
+      "type": "integer",
+      "readOnly": true
+    },
+    "parentId": {
+      "type": "null"
+    },
+    "previousIdentifiers": {
+      "type": "array",
+      "items": {}
+    },
+    "priority": {
+      "type": "integer"
+    },
+    "priorityLabel": {
+      "type": "string"
+    },
+    "prioritySortOrder": {
+      "type": [
+        "integer",
+        "number"
+      ]
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "projectId": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "projectMilestoneId": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "reactionData": {
+      "type": "array",
+      "items": {}
+    },
+    "recurringIssueTemplateId": {
+      "type": "null"
+    },
+    "slaBreachesAt": {
+      "type": "null"
+    },
+    "slaHighRiskAt": {
+      "type": "null"
+    },
+    "slaMediumRiskAt": {
+      "type": "null"
+    },
+    "slaStartedAt": {
+      "type": "null"
+    },
+    "slaType": {
+      "type": "string"
+    },
+    "snoozedById": {
+      "type": "null"
+    },
+    "snoozedUntilAt": {
+      "type": "null"
+    },
+    "sortOrder": {
+      "type": [
+        "integer",
+        "number"
+      ]
+    },
+    "sourceCommentId": {
+      "type": "null"
+    },
+    "startedAt": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "startedTriageAt": {
+      "type": "null"
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "color": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      }
+    },
+    "state_name": {
+      "type": "string"
+    },
+    "stateId": {
+      "type": "string"
+    },
+    "subIssueSortOrder": {
+      "type": "null"
+    },
+    "subscriberIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "syncedWith": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "number": {
+                "type": "integer"
+              },
+              "owner": {
+                "type": "string"
+              },
+              "repo": {
+                "type": "string"
+              }
+            }
+          },
+          "service": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "team": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "teamId": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "trashed": {
+      "type": "null"
+    },
+    "triagedAt": {
+      "type": "null"
+    },
+    "trusted": {
+      "type": "null"
+    },
+    "updated_at": {
+      "type": "string",
+      "readOnly": true
+    },
+    "updatedAt": {
+      "type": "string",
+      "readOnly": true
+    },
+    "url": {
+      "type": "string",
+      "readOnly": true
+    }
+  }
+}
