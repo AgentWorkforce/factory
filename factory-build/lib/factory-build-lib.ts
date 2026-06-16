@@ -6,7 +6,7 @@
  * wave file stays thin and consistent:
  *
  *   squad: lead-claude (lead + QA) · impl-codex (implementer) ·
- *          assist-opencode (assist) · shadow-claude (live shadow reviewer)
+ *          shadow-claude (live shadow reviewer)
  *   review ladder: self-reflection → scoped change-detection →
  *          soft validate → repair → hard validate →
  *          claude review/fix/review-final/fix-final
@@ -101,7 +101,7 @@ function scopedChangeCmd(targets: string[]): string {
 function addSquad(wf: Wf, tier: FactoryWorkflowOptions['tier']): void {
   wf.agent('lead-claude', {
     cli: 'claude',
-    role: 'Lead + QA. Plans, assigns impl-codex and assist-opencode, watches the channel, runs QA repair on red gates, and exits only when the declared file targets are implemented and the implementer self-reflection is written.',
+    role: 'Lead + QA. Plans, assigns impl-codex, watches the channel with shadow-claude, runs QA repair on red gates, and exits only when the declared file targets are implemented and the implementer self-reflection is written.',
     retries: 1,
   });
   wf.agent('impl-codex', {
