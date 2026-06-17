@@ -1,8 +1,8 @@
-# @agent-relay/factory
+# Agent Workforce Factory
 
 **Turn issues into reviewed pull requests, automatically.**
 
-Point the factory at your Linear (or GitHub) issues and it does the loop a human
+Point the factory at your ticketing system (Linear, GitHub, Shortcut, Asana etc) and it does the loop a human
 otherwise babysits: it discovers the issues that are ready, decides how to tackle
 each one, spawns coding agents to implement and review the change, opens a PR,
 drives it through a merge gate, and closes the issue — all inside a safety scope
