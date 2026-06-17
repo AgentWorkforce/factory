@@ -132,6 +132,62 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Merge policy: on-green-with-review')
   })
 
+  it('appends integration instructions for an implementer task', () => {
+    const instructions = 'Connected integrations:\n- Slack: write messages to .integrations/slack/channels/{id}/messages\n- Linear: write state updates to .integrations/linear/issues/{id}/state'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('appends integration instructions for a reviewer task', () => {
+    const instructions = 'To dispatch an integration action, write a JSON file under the resource path. Do NOT use relay messaging.'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'reviewer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('appends integration instructions for a babysitter task', () => {
+    const instructions = 'Writeback paths:\n- .integrations/linear/issues/{id}/state'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'babysitter',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      pr: { number: 482 },
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('omits integration block when integrationInstructions is not provided', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+    })
+
+    // Should not add an extra trailing blank line + integration section.
+    expect(task).not.toMatch(/\[factory-needs-input\].*\n\n\S/m)
+  })
+
   it('uses the consistent factory needs-input format across both blocked-input clauses', () => {
     const task = renderAgentTask({
       issue,

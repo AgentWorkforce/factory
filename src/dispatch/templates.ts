@@ -31,6 +31,8 @@ export interface RenderAgentTaskInput {
     channel: string
     threadId: string
   }
+  /** Pre-rendered writeback instructions for connected integrations. */
+  integrationInstructions?: string
 }
 
 export function renderAgentTask(input: RenderAgentTaskInput): string {
@@ -111,6 +113,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       finishLine,
       mergePolicyLine(input.config.mergePolicy),
       ...questionInstructions,
+      ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ].join('\n')
   }
 
@@ -124,12 +127,14 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       'Post review comments via the GitHub writeback path.',
       'DM the implementer with specific feedback if changes needed, or approve if good.',
       'DM `broker` when the review cycle is complete.',
+      ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ].join('\n')
   }
 
   return [
     ...common,
     ...questionInstructions,
+    ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
   ].join('\n')
 }
 
