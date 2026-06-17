@@ -331,15 +331,22 @@ export class FactoryLoop implements Factory {
 
     await this.#backfillReadyIssues()
     this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB], (event) => {
-      if (isGithubPullFilePath(event.resource.path)) {
-        void this.#handlePrChange(event.resource.path)
+      // The SDK types `resource` as always-present, but the polling fallback and
+      // degraded-sync paths can deliver events without it. Skip those rather
+      // than throwing (which would otherwise crash the subscription handler).
+      const path = changeEventPath(event)
+      if (!path) {
         return
       }
-      if (isGithubIssueFilePath(event.resource.path)) {
-        void this.#handleGithubIssueChange(event.resource.path, { dryRun: this.#config.dryRun })
+      if (isGithubPullFilePath(path)) {
+        void this.#handlePrChange(path)
         return
       }
-      void this.#handleChange(event.resource.path)
+      if (isGithubIssueFilePath(path)) {
+        void this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
+        return
+      }
+      void this.#handleChange(path)
     })
     this.#started = true
     this.#scheduleCompletionSweep(0)
@@ -678,7 +685,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): Promise<string | undefined> {
-    const path = event.resource.path
+    const path = changeEventPath(event)
+    if (!path) {
+      return undefined
+    }
     const isPullPath = isGithubPullFilePath(path)
     if (!isIssueFilePath(path) && !isGithubIssueFilePath(path) && !isPullPath) {
       return undefined
@@ -1221,8 +1231,9 @@ export class FactoryLoop implements Factory {
 
   async #backfillReadyIssues(): Promise<void> {
     const page = await this.#mount.getEvents({ limit: READY_EVENTS_LIMIT })
-    const eventPaths = page.events.map((event) => event.resource.path).filter(isIssueFilePath)
-    const githubEventPaths = page.events.map((event) => event.resource.path).filter(isGithubIssueFilePath)
+    const allPaths = page.events.map((event) => changeEventPath(event)).filter((p): p is string => Boolean(p))
+    const eventPaths = allPaths.filter(isIssueFilePath)
+    const githubEventPaths = allPaths.filter(isGithubIssueFilePath)
     for (const path of new Set(githubEventPaths)) {
       await this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
     }
@@ -1727,7 +1738,16 @@ export class FactoryLoop implements Factory {
   async #readIssue(path: string): Promise<LinearIssue | undefined> {
     try {
       const { content } = await this.#mount.readFile(path)
-      return parseLinearIssue(path, content)
+      const issue = parseLinearIssue(path, content)
+      // Synced Linear records may carry only the state NAME, not the state UUID
+      // (relayfile-adapters#205). The factory matches state by UUID, so backfill
+      // the id from the name when the payload omitted it — otherwise every issue
+      // reads as stateId='' and no role (incl. readyForAgent) ever matches.
+      if (issue && !issue.stateId && issue.state?.name) {
+        const backfilled = this.#states.idForName(issue.state.name, issue.team)
+        if (backfilled) return { ...issue, stateId: backfilled }
+      }
+      return issue
     } catch (error) {
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
@@ -2268,7 +2288,7 @@ export class FactoryLoop implements Factory {
     this.#counters.liveArrivalLatencyMsMax = Math.max(this.#counters.liveArrivalLatencyMsMax ?? 0, latencyMs)
     this.#logger.debug?.('[factory] live issue event latency recorded', {
       eventId: event.id,
-      path: event.resource.path,
+      path: changeEventPath(event),
       latencyMs,
     })
   }
@@ -3101,8 +3121,9 @@ export class FactoryLoop implements Factory {
         const page = await this.#mount.getEvents({ limit: SLACK_REPLY_EVENTS_LIMIT })
         cursor = page.nextCursor ?? undefined
         for (const event of page.events) {
-          if (event.resource.path.startsWith(messagesPrefix)) {
-            preExistingPaths.add(event.resource.path)
+          const path = changeEventPath(event)
+          if (path && path.startsWith(messagesPrefix)) {
+            preExistingPaths.add(path)
           }
         }
       } catch (error) {
@@ -3112,7 +3133,11 @@ export class FactoryLoop implements Factory {
 
     const handle = async (event: ChangeEvent): Promise<void> => {
       try {
-        if (stopped || !event.resource.path.startsWith(messagesPrefix)) {
+        // Polling-fallback / degraded-sync events can lack `resource.path`
+        // despite the SDK type. Skip them quietly so one malformed event never
+        // wedges Slack reply processing (replies that DO carry a path still flow).
+        const path = changeEventPath(event)
+        if (stopped || !path || !path.startsWith(messagesPrefix)) {
           return
         }
 
@@ -3124,24 +3149,24 @@ export class FactoryLoop implements Factory {
           }
         }
 
-        if (preExistingPaths.has(event.resource.path)) {
+        if (preExistingPaths.has(path)) {
           return
         }
 
-        const reply = await this.#readSlackReply(event.resource.path)
+        const reply = await this.#readSlackReply(path)
         if (!reply || !reply.isThreadReply || reply.threadTs !== threadId || reply.channelDir !== channelDir) {
           return
         }
 
         const replyMessageKey = `${reply.threadTs}:${reply.messageTs}`
         if (seenReplyMessages.has(replyMessageKey)) {
-          this.#logger.debug?.('[factory] suppressed duplicate Slack reply message', { issue: record.issue.key, path: event.resource.path })
+          this.#logger.debug?.('[factory] suppressed duplicate Slack reply message', { issue: record.issue.key, path })
           return
         }
 
-        const replyKey = `${eventKey ?? event.resource.path}:${stableHash(JSON.stringify(reply.raw))}`
+        const replyKey = `${eventKey ?? path}:${stableHash(JSON.stringify(reply.raw))}`
         if (seenReplies.has(replyKey)) {
-          this.#logger.debug?.('[factory] suppressed duplicate Slack reply payload', { issue: record.issue.key, path: event.resource.path })
+          this.#logger.debug?.('[factory] suppressed duplicate Slack reply payload', { issue: record.issue.key, path })
           return
         }
         seenReplies.add(replyKey)
@@ -3518,6 +3543,30 @@ function labelDerivedDispatchDecision(
   const routesByLabel = labelRoutesForIssue(liveIssue, config)
 
   if (routesByLabel.labels.length === 0) {
+    // No repo labels — which is also what a label-less sync produces
+    // (relayfile-adapters#205, labels dropped from the synced record). Fall back
+    // to the configured default repo (consistent with triage, which already
+    // routes unlabeled issues to repos.default) rather than refusing to dispatch.
+    const defaultRepo = config.repos.default
+    if (defaultRepo) {
+      const route: TriageDecision['routes'][number] = {
+        repo: defaultRepo,
+        clonePath: config.repos.clonePaths[defaultRepo],
+        rationale: 'No repo label present; routed to repos.default.',
+      }
+      const implementer = routeImplementerSpec(liveIssue, config, 'default', route)
+      return {
+        ok: true,
+        decision: {
+          ...decision,
+          routes: [route],
+          scope: 'single',
+          implementers: [implementer],
+          workflow: undefined,
+          reviewer: routeReviewerSpec(liveIssue, config, route, decision.reviewer),
+        },
+      }
+    }
     return {
       ok: false,
       reason: 'no-labels',
@@ -4258,7 +4307,7 @@ const liveEventDedupeKey = (event: ChangeEvent): string | undefined => {
   return [
     event.id,
     event.type,
-    event.resource.path,
+    stringValue(resource.path) ?? '',
     stringValue(resource.revision) ?? '',
     event.digest ?? '',
   ].join('\u001f')
@@ -4431,6 +4480,16 @@ const eventIdentity = (event: ChangeEvent): string | undefined => {
   const rawId = record.id ?? record.event_id ?? record.seq
   const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId) : undefined
   return id ? `event:${id}` : undefined
+}
+
+// Safe accessor for an event's resource path. The SDK types `resource` as
+// always-present, but the HTTP polling fallback and degraded-sync paths can
+// deliver events without it — reading `.path` directly then throws and (in a
+// subscription/poll handler) crash-loops. Returns undefined for such events so
+// callers skip them and keep processing the well-formed ones.
+export const changeEventPath = (event: ChangeEvent): string | undefined => {
+  const path = (event as { resource?: { path?: unknown } } | undefined)?.resource?.path
+  return typeof path === 'string' && path ? path : undefined
 }
 
 const describeError = (error: unknown): { errorMessage: string; errorStack?: string } => {
