@@ -26,6 +26,9 @@ export interface HarnessDriverClientLike {
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
   disconnect?(): void
+  // Shut the broker down. Only used when this client OWNS the broker (we spawned
+  // it); reused brokers are only ever disconnected, never shut down.
+  shutdown?(): Promise<void> | void
   onEvent?(listener: HarnessEventListener): () => void
   addListener?(event: 'agentExited', listener: (agent: DriverAgentLike) => void): () => void
   addListener?(event: 'deliveryUpdate', listener: (event: DriverDeliveryEventLike) => void): () => void
@@ -33,6 +36,9 @@ export interface HarnessDriverClientLike {
 
 export interface InternalFleetClientOptions {
   client?: HarnessDriverClientLike
+  // True when the injected client owns a broker we spawned, so dispose() shuts it
+  // down instead of merely disconnecting (which would leave it running).
+  ownsBroker?: boolean
   cwd?: string
   connectionPath?: string
   resumeCapability?: Capability
@@ -66,6 +72,7 @@ const PID_RESOLVE_BACKOFF_MS = 75
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
+  readonly #ownsBroker: boolean
   readonly #cwd?: string
   readonly #connectionPath?: string
   readonly #resumeCapability: Capability
@@ -96,6 +103,7 @@ export class InternalFleetClient implements FleetClient {
     this.#logger = options.logger
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
+    this.#ownsBroker = options.ownsBroker ?? false
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -297,7 +305,20 @@ export class InternalFleetClient implements FleetClient {
     this.#agentMessageListeners.clear()
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
-    this.#client.disconnect?.()
+    // If we started the broker, shut it down so the process can exit cleanly
+    // (a spawned broker's owner-lease renewal otherwise keeps the event loop
+    // alive). A reused broker is only disconnected — never shut down — so we
+    // never take down the operator's running broker.
+    if (this.#ownsBroker && this.#client.shutdown) {
+      try {
+        await this.#client.shutdown()
+      } catch (error) {
+        this.#logger?.warn?.('[factory-sdk] failed to shut down the spawned relay broker on dispose', error)
+        this.#client.disconnect?.()
+      }
+    } else {
+      this.#client.disconnect?.()
+    }
     this.#subscribed = false
   }
 

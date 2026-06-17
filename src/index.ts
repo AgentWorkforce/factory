@@ -38,6 +38,8 @@ export type {
   CreateFleetOptions,
   FleetBackend,
 } from './fleet/create-fleet'
+export { ensureRelayBroker } from './fleet/ensure-relay-broker'
+export type { EnsureRelayBrokerOptions } from './fleet/ensure-relay-broker'
 export { InternalFleetClient } from './fleet/internal-fleet-client'
 export type {
   HarnessDriverClientLike,

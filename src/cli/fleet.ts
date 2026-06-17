@@ -10,6 +10,7 @@ import {
   closeProbePr,
   createFactory,
   createFleet,
+  ensureRelayBroker,
   defaultGhRunner,
   isInFactoryScope,
   parseLinearIssue,
@@ -24,6 +25,7 @@ import {
   type FleetClient,
   type GhRunner,
   type FactoryStateResolution,
+  type Logger,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
@@ -36,6 +38,7 @@ interface FleetCliDeps {
   mount?: MountClient
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
+  ensureRelayBroker?: typeof ensureRelayBroker
   cloudMountFromConfig?: (config?: RelayfileCloudMountClientConfig) => Promise<MountClient>
   resolveWorkspace?: () => Promise<ResolvedFactoryWorkspace>
   resolveStates?: (mount: MountClient, config: FactoryConfig) => Promise<FactoryStateResolution>
@@ -397,11 +400,39 @@ async function loadConfig(path?: string): Promise<LoadedConfig> {
 async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefined, deps: FleetCliDeps): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
-  return (deps.createFleet ?? createFleet)({
-    backend: globals.backend,
-    cwd: process.cwd(),
-    connectionPath: resolveBrokerConnectionPath(process.cwd()),
-  })
+
+  const cwd = process.cwd()
+  const connectionPath = resolveBrokerConnectionPath(cwd)
+
+  // An injected createFleet owns fleet construction entirely (tests), so skip the
+  // real broker bootstrap.
+  if (deps.createFleet) {
+    return deps.createFleet({ backend: globals.backend, cwd, connectionPath })
+  }
+
+  // The internal backend talks to a relay broker. Reuse the one already running
+  // for this workspace, or start one if none is up, so `factory <run-once|loop>`
+  // works without a separately-started broker. The relay backend manages its own
+  // connection and needs no local broker.
+  if (globals.backend === 'internal') {
+    const stderr = deps.stderr ?? process.stderr
+    const logger: Logger = {
+      info: (message, ...args) => stderr.write(`${message}${formatLogArgs(args)}\n`),
+    }
+    const { client, started } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
+    return createFleet({ backend: 'internal', cwd, connectionPath }, { harnessClient: client, ownsBroker: started })
+  }
+
+  return createFleet({ backend: globals.backend, cwd, connectionPath })
+}
+
+function formatLogArgs(args: unknown[]): string {
+  if (args.length === 0) return ''
+  try {
+    return ` ${args.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))).join(' ')}`
+  } catch {
+    return ''
+  }
 }
 
 export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {

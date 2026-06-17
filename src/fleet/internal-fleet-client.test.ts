@@ -15,6 +15,8 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   readonly exitListeners = new Set<(agent: { name: string; sessionId?: string }) => void>()
   connectEventsCalls = 0
   disconnectCalls = 0
+  shutdownCalls = 0
+  throwOnShutdown = false
   throwOnConnect = false
   partiallyConnected = false
 
@@ -57,6 +59,13 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   disconnect(): void {
     this.disconnectCalls += 1
     this.partiallyConnected = false
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownCalls += 1
+    if (this.throwOnShutdown) {
+      throw new Error('shutdown failed')
+    }
   }
 
   onEvent(listener: (event: BrokerEvent) => void): () => void {
@@ -304,6 +313,36 @@ describe('InternalFleetClient', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('shuts down the broker on dispose when it owns one (spawned)', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, ownsBroker: true, cwd: '/worktree' })
+
+    await fleet.dispose()
+
+    expect(harness.shutdownCalls).toBe(1)
+    expect(harness.disconnectCalls).toBe(0)
+  })
+
+  it('only disconnects on dispose when reusing an existing broker (never shuts it down)', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+
+    await fleet.dispose()
+
+    expect(harness.disconnectCalls).toBe(1)
+    expect(harness.shutdownCalls).toBe(0)
+  })
+
+  it('falls back to disconnect if shutting down an owned broker fails', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.throwOnShutdown = true
+    const fleet = new InternalFleetClient({ client: harness, ownsBroker: true, cwd: '/worktree' })
+
+    await expect(fleet.dispose()).resolves.toBeUndefined()
+    expect(harness.shutdownCalls).toBe(1)
+    expect(harness.disconnectCalls).toBe(1)
   })
 
   it('surfaces the broker pid as protected process state', async () => {
