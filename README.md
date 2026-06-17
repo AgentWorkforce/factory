@@ -1,92 +1,148 @@
 # @agent-relay/factory
 
-The autonomous issue factory: a loop that discovers Linear issues, triages them,
-dispatches agents to implement fixes, opens PRs, drives them to completion through
-a merge gate, and closes the issues — all under a hard safety scope.
+**Turn issues into reviewed pull requests, automatically.**
 
-The package publishes the **`factory`** CLI (`bin/factory.mjs`). From a repo
-checkout, build first and invoke the CLI through the package bin:
+Point the factory at your Linear (or GitHub) issues and it does the loop a human
+otherwise babysits: it discovers the issues that are ready, decides how to tackle
+each one, spawns coding agents to implement and review the change, opens a PR,
+drives it through a merge gate, and closes the issue — all inside a safety scope
+you define, so it only ever acts on work you've explicitly opted in.
 
-```bash
-npm ci
-npm run build
+## Why use it
 
-node bin/factory.mjs factory <action> --config <cfg>
+- **Clear the small-but-real backlog.** The well-scoped fixes and chores that pile
+  up get done without a person shepherding each one.
+- **It only touches what you allow.** A safety gate (title prefix + team) means
+  the factory dispatches *exactly* the issues you mark for it and ignores
+  everything else — opt-in by construction.
+- **Real PRs, not blind merges.** Every change goes through an implement → review
+  → merge-gate flow and lands as a normal PR. It defaults to *never* auto-merging
+  until you turn that on.
+- **You stay in the loop.** It posts threaded status to Slack and can ask a human
+  for clarification mid-task when an issue is ambiguous.
+- **Drop in by label.** Hand it new work just by labeling a Linear or GitHub
+  issue — no new tooling in your day-to-day.
+
+A good fit when you have a steady stream of scoped issues and want them turned
+into PRs without standing up your own agent orchestration.
+
+## How it works
+
+```
+discover ready issues → triage (how to do it) → dispatch agents (implement + review)
+        → open PR → merge gate → close issue
 ```
 
-Once installed from npm, the ergonomic form is:
+Each step is gated by your config and the safety scope. Issues outside the scope
+are pulled but never dispatched.
+
+## Install
 
 ```bash
-factory factory <action> [options]
+npm install @agent-relay/factory
 ```
 
-> **Heads-up:** every `factory` action requires `--config <path>` (see
-> [Configuration](#configuration)). Commands fail fast with
-> `factory commands require --config <path>` if it's missing.
+The factory talks to a relay broker through the **`agent-relay`** sidecar; install
+and sign in to that separately (it's a peer of this package). Once installed, the
+CLI is available as `factory`:
 
----
+```bash
+factory factory run-once --config ./factory.config.json --dry-run
+```
+
+> Yes, `factory factory` — the `factory` CLI groups its commands under a `factory`
+> subcommand. From a source checkout instead of an npm install, run
+> `npm ci && npm run build` first, then `node bin/factory.mjs factory <action> …`.
 
 ## Quick start
 
-```bash
-# One-shot batch — discover + triage + dispatch one cycle, then exit.
-# Add --dry-run to plan without writing or spawning anything.
-factory factory run-once --config ./factory.config.json --dry-run
+1. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
+   repo route are required:
 
-# Live daemon — subscription-driven; runs until SIGINT/SIGTERM.
-factory factory start --mode live --config ./factory.config.json
-```
+   ```json
+   {
+     "workspaceId": "your-workspace-id",
+     "repos": {
+       "byLabel": { "pear": "AgentWorkforce/pear" },
+       "clonePaths": { "AgentWorkforce/pear": "/path/to/your/pear/checkout" },
+       "default": "AgentWorkforce/pear"
+     }
+   }
+   ```
+
+   `workspaceId` is your relay workspace; `repos.byLabel` maps a Linear label to a
+   repo; `clonePaths` tells the agent where that repo lives locally so it has
+   somewhere to make changes.
+
+2. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
+   but writes nothing and spawns no agents:
+
+   ```bash
+   factory factory run-once --config ./factory.config.json --dry-run
+   ```
+
+3. **Let it work for real:**
+
+   ```bash
+   # One discovery→dispatch cycle, then exit.
+   factory factory run-once --config ./factory.config.json
+
+   # Or run continuously as a daemon (the production form).
+   factory factory start --mode live --config ./factory.config.json
+   ```
+
+> **Pulled some issues but dispatched none?** That's the safety gate doing its
+> job — the issues are real but outside your scope. See
+> [Tell it what to work on](#tell-it-what-to-work-on).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `factory run-once` | One discovery→triage→dispatch cycle, then exit. Honors `--dry-run`. |
-| `factory loop` | Bounded multi-iteration loop (`loop.maxIterations`), then exit. |
-| `factory start --mode live` | Long-lived daemon. Subscription-driven; writes + refreshes a loop heartbeat. The production entrypoint. |
-| `factory status` | Print the in-memory factory status as JSON. |
-| `factory loop-status` | Read the heartbeat file and report liveness (stale vs. alive). |
-| `factory kill-loop` | Send SIGTERM to the daemon PID recorded in the heartbeat. |
-| `factory reap-orphans` | Crash backstop: reap orphaned agent pairs whose heartbeat is stale. Run as a scheduled job. |
-| `factory triage <KEY\|path>` | Triage a single issue and print the decision. |
-| `factory dispatch <KEY\|path>` | Triage + dispatch a single issue. Honors `--dry-run`. |
-| `factory close-probe <PR#> --repo <owner/repo> --issue <KEY>` | Manually close a synthetic E2E probe PR. |
+| `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
+| `factory loop` | A bounded multi-iteration loop, then exit. |
+| `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
+| `factory status` | Print current factory status as JSON. |
+| `factory triage <KEY\|path>` | Triage one issue and print the decision. |
+| `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 
-Global options (accepted anywhere in the args): `--config <path>`,
-`--dry-run`, `--backend <internal\|relay>`.
+Global options work anywhere in the args: `--config <path>`, `--dry-run`,
+`--backend <internal|relay>`. The internal backend reuses a relay broker that's
+already running for your workspace, and starts one if none is.
 
-## Serving as a fleet node (one-command flow)
+(There are a few more operational commands — `loop-status`, `kill-loop`,
+`reap-orphans`, `close-probe` — for running the daemon in production.)
 
-The package also ships a **fleet node definition** so a machine (e.g. a Mac mini)
-can advertise `spawn:claude` / `spawn:codex` / `workflow:run` capabilities to the
-cloud and run agents in the local checkouts it owns. The wire-level
-register/heartbeat/deregister/ack handshake is owned by the installed
-`agent-relay` sidecar — this package only supplies the node definition and its
-capability handlers.
+## Tell it what to work on
 
-Serve the packaged default definition by name:
+Two ways to hand the factory an issue — both are just labeling/titling, nothing
+to install:
+
+| Source | What you do | Result |
+|---|---|---|
+| **Linear** | Title it `[factory] <task>`, set the team + a repo label, move it to **Ready for Agent** | dispatched directly |
+| **GitHub** | Add the **`factory`** label to the issue | mirrored into a `[factory]` Linear issue, then dispatched |
+
+The **safety gate** is what keeps this opt-in: by default the factory only
+dispatches an issue whose **title starts with your configured prefix** *and* whose
+**team matches** your configured team. Everything else is ignored. Loosen it
+deliberately — it's the main guardrail.
+
+> Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
+> auto-close). For real work you want to keep, use the `[factory]` prefix.
+
+## Run it as a fleet node (optional)
+
+The package also ships a fleet **node definition** so a machine can advertise
+`spawn:claude` / `spawn:codex` / `workflow:run` to the cloud and run agents in the
+checkouts it owns:
 
 ```bash
-# Reads the NodeConfig from ./factory.node.json in the current directory.
 agent-relay fleet serve @agent-relay/factory/node
 ```
 
-The default export resolves its `NodeConfig` from (first match wins):
-
-1. `$AGENT_RELAY_FACTORY_NODE_CONFIG`
-2. `$FACTORY_NODE_CONFIG`
-3. `$FACTORY_CONFIG`
-4. `./factory.node.json` (relative to the current working directory)
-
-To point at a config elsewhere:
-
-```bash
-FACTORY_NODE_CONFIG=/etc/factory/factory.node.json \
-  agent-relay fleet serve @agent-relay/factory/node
-```
-
-Prefer building the definition yourself? Import the builder from the package
-root and hand it your own `NodeConfig`:
+It reads its node config from `./factory.node.json` (or `$FACTORY_NODE_CONFIG`).
+Prefer to build the definition yourself?
 
 ```ts
 import { createFactoryNodeDefinition, readFactoryNodeConfigSync } from '@agent-relay/factory'
@@ -94,214 +150,25 @@ import { createFactoryNodeDefinition, readFactoryNodeConfigSync } from '@agent-r
 export default createFactoryNodeDefinition({ config: readFactoryNodeConfigSync() })
 ```
 
-### Minimal `NodeConfig` (`factory.node.json`)
-
-```json
-{
-  "workspaceId": "your-workspace-id",
-  "capabilities": ["spawn:claude", "spawn:codex", "workflow:run"],
-  "cloneRoot": "/work",
-  "clonePaths": {
-    "AgentWorkforce/factory": "/work/factory",
-    "AgentWorkforce/relay": "/work/relay"
-  }
-}
-```
-
-`capabilities` is the only field that must be non-empty; the node advertises
-exactly what it lists. `clonePaths` (and/or `cloneRoot`) is the **checkout
-allowlist** — the cloud may only direct a spawn into a configured `clonePath` or
-a directory under `cloneRoot`. A config that advertises a `spawn:*` capability
-but provides neither will reject every cloud-supplied checkout path.
-
-## The 2-process production model
-
-The factory runs as **two** coordinated processes (see issue #321 §4):
-
-1. **Live daemon** — `factory factory start --mode live --config <live>`. Drives the
-   loop and refreshes a heartbeat file.
-2. **External reaper** — a *scheduled* `factory factory reap-orphans --config <live>`
-   that acts as a crash backstop, cleaning up orphaned agent pairs if the daemon dies.
-
-> **HARD precondition:** the reaper **must** use the **same `--config`** as the
-> live daemon. A mismatched config reaps nothing *and* leaves the backstop broken
-> (the coupling is load-bearing — see §7 of issue #321).
-
-### Other operating preconditions (issue #321 §7)
-
-- **`gh`-authenticated environment.** The gh-resolver is completion-load-bearing
-  while the cloud GitHub→mount PR-sync is degraded; a `gh` auth drop halts completion.
-- Run the real binary path (`factory` / `node bin/factory.mjs`), not a shim.
-
 ## Configuration
 
-Pass a JSON file via `--config`. The full schema (with every default) lives in
-[`src/config/schema.ts`](src/config/schema.ts), validated by Zod at load time —
-an invalid config fails fast with a field-level error.
+Pass a JSON file via `--config`. Beyond the two required fields above, useful
+knobs include issue **routing** (`repos.byLabel` / `byProject` / `keywordRules` /
+`default`), the **safety gate** (`safety.requireTitlePrefix`, `safety.requireTeamKey`),
+`mergePolicy` (defaults to `never`), per-role **model** overrides, and an optional
+**Slack** channel for status threads.
 
-The file is either a bare config object, or a `{ "factoryConfig": { … } }`
-wrapper (the wrapper form also allows a sibling `fixtureFiles` map — see
-[Fixture mode](#fixture-mode-offline-testing)).
-
-### Minimal config
-
-Only two fields are required — `workspaceId` and `repos.byLabel`. Everything else
-has a default:
-
-```json
-{
-  "workspaceId": "your-workspace-id",
-  "repos": {
-    "byLabel": { "pear": "AgentWorkforce/pear" },
-    "default": "AgentWorkforce/pear"
-  }
-}
-```
-
-### Complete annotated config
-
-A realistic live config, showing the fields you'll actually want to set (comments
-are illustrative — strip them; JSON has no comments):
-
-```jsonc
-{
-  // relayfile cloud mount workspace id — the workspace whose /linear and /slack
-  // trees the factory reads. Same id the Pear app uses for this workspace.
-  "workspaceId": "ws_abc123",
-
-  // Which Linear issues to pull. Empty arrays = no filter on that dimension.
-  // Values are Linear team keys / project names / label names / assignee ids.
-  "subscription": {
-    "teams": ["AR"],
-    "labels": ["pear"],
-    "projects": [],
-    "assignees": []
-  },
-
-  // Issue → repo routing. Precedence (first match wins):
-  //   byLabel  →  byProject  →  keywordRules (regex on title/desc)  →  default
-  // No match and no default → the issue is escalated, never dispatched.
-  "repos": {
-    "byLabel":  { "pear": "AgentWorkforce/pear", "cloud": "AgentWorkforce/cloud" },
-    "byProject": { "Pear": "AgentWorkforce/pear" },
-    "keywordRules": [{ "pattern": "relayfile|mount", "repo": "AgentWorkforce/relayfile" }],
-    // Where each repo is checked out locally for the agent to work in.
-    "clonePaths": { "AgentWorkforce/pear": "/Users/you/Projects/pear" },
-    "default": "AgentWorkforce/pear"
-  },
-
-  // SAFETY GATE — an issue is only dispatched if BOTH hold (see below):
-  "safety": {
-    "requireTitlePrefix": "[factory-e2e]",
-    "requireTeamKey": "AR"
-  },
-
-  "batchSize": 5,                       // max issues dispatched per cycle
-  "dispatch": { "maxAttempts": 2, "errorCooldownMs": 60000 },
-  "mergePolicy": "never",               // see mergePolicy note below
-  "models": {                           // optional per-role model overrides
-    "implementer": "claude-opus-4-8",
-    "reviewer": "claude-opus-4-8",
-    "triage": "claude-haiku-4-5-20251001"
-  },
-  "slack": { "channel": "C0B902XR6PN" },   // optional threaded status updates
-  "loop": {
-    "heartbeatPath": "/tmp/factory-run/factory-loop-heartbeat.json",
-    "registryPath":  "/tmp/factory-run/factory-loop-registry.json",
-    "heartbeatStaleMs": 60000
-  }
-}
-```
-
-### Where the values come from
-
-- **`workspaceId`** *(required)* — the relayfile cloud mount workspace id for this
-  workspace (the same one the Pear app mounts `/linear` and `/slack` under).
-- **`repos.byLabel`** *(required)* — map a Linear label → `owner/repo`. The other
-  routing maps are optional; **precedence is `byLabel` → `byProject` →
-  `keywordRules` → `default`**, else the issue is escalated (never dispatched).
-- **`repos.clonePaths`** — `owner/repo` → local working-tree path. Without an entry
-  the agent has nowhere to apply changes for that repo, so set it for every repo
-  you actually dispatch to.
-- **`stateIds`** — the Linear workflow-state UUIDs for `readyForAgent`,
-  `agentImplementing`, `done`, `inPlanning`, and optionally `humanReview`.
-  Defaults cover the **AR team's** core states (see
-  [`src/constants/linear.ts`](src/constants/linear.ts)). `humanReview` is
-  intentionally omitted from the schema default so legacy configs fall back to
-  direct-to-Done behavior unless they opt into a review state. If you run against
-  a different Linear team, override the state UUIDs with that team's values (read
-  them from the Linear API / the issue JSON's `state.id`).
-- **`safety`** — the scope gate (below). Defaults `[factory-e2e]` + team `AR`;
-  GitHub issue mirrors created by the factory use `[factory]` and are accepted
-  by the same gate.
-
-### The safety gate (what actually gets dispatched)
-
-`isInFactoryScope` ([`src/safety/factory-scope.ts`](src/safety/factory-scope.ts))
-dispatches an issue only when **both** are true:
-
-1. The issue **title starts with `safety.requireTitlePrefix`** — exactly
-   `[factory-e2e]`, or `[factory-e2e] <rest>` by default. Factory-created
-   GitHub mirrors titled `[factory] <GitHub title>` are also accepted. Anything
-   else is out of scope.
-2. The issue's **team key equals `safety.requireTeamKey`** (`AR`).
-
-This is why `factory run-once` may pull issues but dispatch none — they're real
-issues that fall outside the gate. Loosen the gate deliberately; it's the primary
-guardrail against the factory acting on issues it shouldn't.
-
-> **⚠️ `[factory-e2e]` is the synthetic self-test prefix — its PRs auto-close.**
-> The default `requireTitlePrefix` is `[factory-e2e]`, which is *also* the marker
-> the factory uses to identify synthetic E2E soak issues. A `[factory-e2e]`-titled
-> issue's PR is **auto-closed, never merged** (`#isSyntheticProbeIssue`) — great
-> for self-test soaks, wrong for real work. **For real issues you want to keep,
-> set `requireTitlePrefix` to `[factory]`** and title issues `[factory] <task>`;
-> reserve `[factory-e2e]` for the soak. The synthetic check matches `[factory-e2e]`
-> exactly, so `[factory]` issues are not auto-closed. (Note: `[factory-e2e]` does
-> **not** satisfy a `[factory]` gate — the prefixes differ at the `]`/`-`, so don't
-> mix them.)
-
-### Ingesting GitHub issues (label `factory`)
-
-The factory also picks up **GitHub issues labeled `factory`** (case-insensitive),
-read from the mounted `/github/repos/**` tree (pushed in by the GitHub→relayfile
-sync — no API polling). For each, it creates one Linear mirror titled
-`[factory] <GitHub title>` in **Ready for Agent**, routes it via `repos.byLabel`,
-then dispatches it like any other Linear issue. Mirrors are deduped (one per
-GitHub issue) and set to `done` when the GitHub issue closes.
-
-So to hand the factory a GitHub issue you **just add the `factory` label** — you
-do **not** put `[factory]` in the GitHub title (the factory adds that to the
-Linear mirror). This is the cross-repo path: label, say, a `relay` repo issue
-`factory` and it flows in, routed to `AgentWorkforce/relay`.
-
-| Source | What you do | Result |
-|---|---|---|
-| Linear (direct) | title `[factory] <task>`, team AR, label = repo, Ready for Agent | dispatched directly |
-| GitHub (any configured repo) | add the **`factory` label** | mirrored to a `[factory]` Linear issue, then dispatched |
-
-### Other notable fields (defaults in parentheses)
-
-- `mergePolicy` (`never`) — `never` keeps PRs open; `on-green-with-review` enables
-  autonomous merge on green + approved review. **Stays `never` until the flip is
-  thrown** (issue #321 §6).
-- `loop.heartbeatPath` / `loop.registryPath` / `loop.heartbeatStaleMs` (`60000`) —
-  daemon/reaper coupling (the reaper must point at the same paths via the same
-  `--config`).
-- `batchSize` (`5`), `dispatch.maxAttempts` (`2`), `dispatch.errorCooldownMs`
-  (`60000`), `models.{implementer,reviewer,triage}`, `slack.channel`,
-  `subscription.*`, `liveSubscription.*`, `stateIds.*`.
-
-### Fixture mode (offline testing)
-
-If the config (or a `{ "factoryConfig": …, "fixtureFiles": … }` wrapper) includes a
-`fixtureFiles` map, the CLI swaps in fake fleet + mount clients backed by those files —
-no cloud, no real agents. See [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json).
+The full schema — every field and default — is validated by Zod at load time, so
+an invalid config fails fast with a field-level error. See
+[`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,
+and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
+worked example (including offline fixture mode).
 
 ## Notes
 
-- The daemon is headless by design. Pear consumes this package and may expose its
-  own `pear factory ...` passthrough, but this repository's published CLI is
-  `factory`.
-- Build output lives in `dist/`; `npm pack --dry-run` should include only
-  `dist/`, `bin/factory.mjs`, `package.json`, and `README.md`.
+- The daemon is headless by design; tools like Pear can consume this package and
+  wrap it, but the published CLI is `factory`.
+- The published `dist/` is plain ESM, runnable directly by Node (`node bin/factory.mjs`)
+  and importable by ESM consumers.
+- For production operation (the live-daemon + reaper backstop model, heartbeats,
+  and `gh`-auth preconditions), see the operations notes alongside the config schema.
