@@ -19,6 +19,7 @@ import {
   type TriageDecision,
   type TriageEngine,
 } from '../index'
+import { changeEventPath } from './factory'
 import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
@@ -4004,13 +4005,15 @@ describe('FactoryLoop', () => {
     expect(comments[0]).not.toContain('Too many repo labels')
   })
 
-  it('fails dispatch loudly when no labels are present', async () => {
+  it('fails dispatch loudly when no labels are present and no default repo is configured', async () => {
     const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
     const fleet = new FakeFleetClient()
     const comments: string[] = []
     const warnings: unknown[][] = []
-    const factory = createFactory(config(), {
+    // No repos.default → the label-less fallback cannot apply, so dispatch must
+    // fail loudly with the actionable comment.
+    const factory = createFactory(config({ repos: { byLabel: { pear: 'AgentWorkforce/pear' }, clonePaths: { 'AgentWorkforce/pear': '/work/pear' } } }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -4044,7 +4047,8 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
     const fleet = new FakeFleetClient()
     const comments: string[] = []
-    const factory = createFactory(config(), {
+    // No repos.default → label-less issue takes the failure path (see above).
+    const factory = createFactory(config({ repos: { byLabel: { pear: 'AgentWorkforce/pear' }, clonePaths: { 'AgentWorkforce/pear': '/work/pear' } } }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -4070,6 +4074,44 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(722), unlabeledIssue)))
 
     expect(comments).toEqual([expect.stringContaining('No Linear labels were present')])
+  })
+
+  it('dispatches a label-less issue to repos.default as a single implementer', async () => {
+    // The synced Linear record can drop labels entirely (relayfile-adapters#205),
+    // so a label-less but otherwise-valid issue must still dispatch — to the
+    // configured default repo — rather than stalling on a missing label.
+    const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
+    const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
+    const fleet = new FakeFleetClient()
+    const comments: string[] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState(issue, stateId) {
+          await mount.writeFile(issue.path, { stateId })
+        },
+        async postComment(_issue, text) {
+          comments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(722), unlabeledIssue)))
+
+    // One implementer (slug 'default' → repos.default route) + reviewer; no failure comment.
+    // The 'ar-722-impl-default' name (slug 'default') is produced only by the
+    // repos.default fallback branch, confirming the label-less route.
+    expect(result.agents.map((a) => a.role)).toEqual(['implementer', 'reviewer'])
+    expect(fleet.spawns.map((s) => s.name)).toEqual(['ar-722-impl-default', 'ar-722-review'])
+    expect(comments.some((c) => c.includes('No Linear labels were present'))).toBe(false)
   })
 
   it('fails dispatch loudly when labels do not map through repos.byLabel', async () => {
@@ -7407,3 +7449,21 @@ const slackAnswerInputs = (fleet: FakeFleetClient): Array<{ name: string; data: 
 
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+
+describe('changeEventPath (resource-less event tolerance)', () => {
+  it('returns the path for a well-formed event', () => {
+    const event = { resource: { path: '/linear/issues/AR-1__u.json' } } as unknown as ChangeEvent
+    expect(changeEventPath(event)).toBe('/linear/issues/AR-1__u.json')
+  })
+
+  it('returns undefined when resource is missing (polling-fallback shape)', () => {
+    expect(changeEventPath({} as unknown as ChangeEvent)).toBeUndefined()
+    expect(changeEventPath(undefined as unknown as ChangeEvent)).toBeUndefined()
+  })
+
+  it('returns undefined when resource has no usable path', () => {
+    expect(changeEventPath({ resource: {} } as unknown as ChangeEvent)).toBeUndefined()
+    expect(changeEventPath({ resource: { path: '' } } as unknown as ChangeEvent)).toBeUndefined()
+    expect(changeEventPath({ resource: { path: 123 } } as unknown as ChangeEvent)).toBeUndefined()
+  })
+})

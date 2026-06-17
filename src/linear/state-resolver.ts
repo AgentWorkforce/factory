@@ -47,6 +47,10 @@ export interface FactoryStateResolution {
   // so reads/filters need no team context.
   roleOf(stateId: string | undefined): FactoryStateRole | undefined
   isRole(stateId: string | undefined, role: FactoryStateRole): boolean
+  // Resolve a workflow-state NAME to its UUID. Lets read paths backfill the
+  // state UUID for issues whose synced payload carries only `state.name` (no id)
+  // — see relayfile-adapters#205. Returns undefined when the name is unknown.
+  idForName(stateName: string | undefined, teamToken?: string): string | undefined
   // True when any team resolves a humanReview state (gates terminalState).
   hasHumanReview(teamToken?: string): boolean
 }
@@ -54,11 +58,14 @@ export interface FactoryStateResolution {
 // Build a resolution from explicit, already-known UUIDs (no mount reads). Used
 // as the back-compat / test path when names aren't configured: the global ids
 // apply to every team. Lenient — unresolved roles only throw when used.
-export function stateResolutionFromIds(stateIds: RoleIds): FactoryStateResolution {
+export function stateResolutionFromIds(stateIds: RoleIds, stateNames: RoleNames = {}): FactoryStateResolution {
   const roleById = new Map<string, FactoryStateRole>()
+  const idByName = new Map<string, string>()
   for (const role of FACTORY_STATE_ROLES) {
     const id = stateIds[role]
     if (id) roleById.set(id, role)
+    const name = stateNames[role]
+    if (id && name) idByName.set(norm(name), id)
   }
   return {
     idFor(_teamToken, role) {
@@ -74,6 +81,9 @@ export function stateResolutionFromIds(stateIds: RoleIds): FactoryStateResolutio
     },
     isRole(stateId, role) {
       return Boolean(stateId) && roleById.get(stateId as string) === role
+    },
+    idForName(stateName) {
+      return stateName ? idByName.get(norm(stateName)) : undefined
     },
     hasHumanReview() {
       return Boolean(stateIds.humanReview)
@@ -199,11 +209,21 @@ export async function resolveFactoryStates(
   }
 
   // Resolve one role for one team token, applying precedence:
-  // per-team name > global name > explicit UUID.
+  // per-team name > global name > explicit UUID. When a name is configured but
+  // the states catalog is unavailable (e.g. /linear/states unreadable under the
+  // mount token), fall back to the pinned UUID rather than failing startup — the
+  // name still feeds the reverse name->id map below for read-side backfill.
   const resolveRole = async (teamToken: string | undefined, role: FactoryStateRole): Promise<string | undefined> => {
     const perTeamName = teamToken ? byTeamNames[norm(teamToken)]?.[role] : undefined
     const name = perTeamName ?? globalNames[role]
-    if (name) return catalog.resolve(name, teamToken)
+    if (name) {
+      try {
+        return await catalog.resolve(name, teamToken)
+      } catch (error) {
+        if (explicitIds[role]) return explicitIds[role]
+        throw error
+      }
+    }
     return explicitIds[role]
   }
 
@@ -254,6 +274,22 @@ export async function resolveFactoryStates(
     }
   }
 
+  // Reverse name->id map: lets a read path backfill the state UUID for issues
+  // whose synced payload only carries `state.name` (relayfile-adapters#205).
+  // Built from configured names paired with their resolved UUID (global + team).
+  const idByName = new Map<string, string>()
+  const recordNames = (names: RoleNames, ids: RoleIds): void => {
+    for (const role of FACTORY_STATE_ROLES) {
+      const name = names[role]
+      const id = ids[role]
+      if (name && id) idByName.set(norm(name), id)
+    }
+  }
+  recordNames(globalNames, defaultIds)
+  for (const [key, team] of teamTokenByNorm) {
+    recordNames(byTeamNames[key] ?? {}, byTeam.get(key) ?? {})
+  }
+
   return {
     idFor(teamToken, role) {
       const id = idsFor(teamToken)[role]
@@ -268,6 +304,9 @@ export async function resolveFactoryStates(
     },
     isRole(stateId, role) {
       return Boolean(stateId) && roleById.get(stateId as string) === role
+    },
+    idForName(stateName) {
+      return stateName ? idByName.get(norm(stateName)) : undefined
     },
     hasHumanReview(teamToken) {
       return Boolean(idsFor(teamToken).humanReview)

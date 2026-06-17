@@ -174,4 +174,64 @@ describe('stateResolutionFromIds', () => {
     expect(states.isRole('r', 'readyForAgent')).toBe(true)
     expect(() => states.idFor(undefined, 'agentImplementing')).toThrow(/No resolved Linear state/)
   })
+
+  it('resolves a configured state NAME to its UUID (case-insensitive)', () => {
+    const states = stateResolutionFromIds(
+      { readyForAgent: 'r', done: 'd' },
+      { readyForAgent: 'Ready for Agent', done: 'Done' },
+    )
+    expect(states.idForName('Ready for Agent')).toBe('r')
+    expect(states.idForName('ready for agent')).toBe('r')
+    expect(states.idForName('  DONE  ')).toBe('d')
+  })
+
+  it('returns undefined from idForName for unknown or missing names', () => {
+    const states = stateResolutionFromIds({ readyForAgent: 'r' }, { readyForAgent: 'Ready for Agent' })
+    expect(states.idForName('Backlog')).toBeUndefined()
+    expect(states.idForName(undefined)).toBeUndefined()
+    expect(states.idForName('')).toBeUndefined()
+    // A role with an id but no configured name is not in the name index.
+    expect(stateResolutionFromIds({ done: 'd' }).idForName('Done')).toBeUndefined()
+  })
+})
+
+describe('resolveFactoryStates name-only sync tolerance (relayfile-adapters#205)', () => {
+  it('falls back to pinned stateIds when the states catalog is unreadable', async () => {
+    const reader: LinearStateReader = {
+      async readFile() { throw new Error('missing required scope: fs:read') },
+    }
+    const states = await resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent', agentImplementing: 'Agent Implementing', inPlanning: 'In Planning', done: 'Done' },
+      stateIds: { readyForAgent: 'r', agentImplementing: 'a', inPlanning: 'p', done: 'd' },
+    })
+    // Catalog read failed, but the pinned UUIDs satisfy every required role.
+    expect(states.idFor(undefined, 'readyForAgent')).toBe('r')
+    expect(states.isRole('r', 'readyForAgent')).toBe(true)
+  })
+
+  it('backfills state UUIDs by name (catalog unreadable) so name-only payloads match', async () => {
+    const reader: LinearStateReader = {
+      async readFile() { throw new Error('missing required scope: fs:read') },
+    }
+    const states = await resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent', agentImplementing: 'Agent Implementing', inPlanning: 'In Planning', done: 'Done' },
+      stateIds: { readyForAgent: 'r', agentImplementing: 'a', inPlanning: 'p', done: 'd' },
+    })
+    // A synced issue carries only "Ready for Agent" (no UUID) → resolve to 'r' → role matches.
+    const backfilled = states.idForName('Ready for Agent')
+    expect(backfilled).toBe('r')
+    expect(states.isRole(backfilled, 'readyForAgent')).toBe(true)
+    expect(states.idForName('Done')).toBe('d')
+    expect(states.idForName('Nonexistent')).toBeUndefined()
+  })
+
+  it('still resolves names via the catalog when it is readable', async () => {
+    const reader = makeReader(AR_STATES, AR_RECORDS)
+    const states = await resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent', agentImplementing: 'Agent Implementing', inPlanning: 'In Planning', done: 'Done' },
+      teams: ['AR'],
+    })
+    expect(states.idFor('AR', 'readyForAgent')).toBe('s1')
+    expect(states.idForName('Ready for Agent', 'AR')).toBe('s1')
+  })
 })
