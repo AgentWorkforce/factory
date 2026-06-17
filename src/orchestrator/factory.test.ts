@@ -3498,7 +3498,7 @@ describe('FactoryLoop', () => {
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
-    expect(mount.listTreePrefixes).toEqual(['/github/repos', '/linear/issues', '/linear/issues/by-state/ready-for-agent/'])
+    expect(mount.listTreePrefixes).toEqual(['/github/repos', '/linear/issues', '/linear/issues/by-state/ready-for-agent/', '.integrations/discovery'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl-pear', 'ar-40-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-40'])
     expect(factory.status().counters.liveHighWatermarkUnavailable).toBe(1)
