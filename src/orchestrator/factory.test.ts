@@ -23,7 +23,8 @@ import { changeEventPath } from './factory'
 import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
-import { BatchTracker } from './batch-tracker'
+import { BatchTracker, issueKey } from './batch-tracker'
+import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { LIVE_GITHUB_ISSUE_GLOB, githubIssuePathParts, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
@@ -6858,6 +6859,116 @@ describe('FactoryLoop', () => {
       { name: 'ar-27-impl-pear', data: 'Slack reply for AR-27:\nnew status?\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
+  })
+
+  it('re-arms the Slack reply watcher when a dispatch thread already persists (restart without a live watcher)', async () => {
+    // A persisted dispatch thread with no in-process watcher is exactly the
+    // post-restart shape: the old guard saw the thread and returned early,
+    // leaving replies watched by nobody. The fix re-arms instead.
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    const persistedThread = '1780751612.176219'
+    await state.setSlackThread('factory-test', issueKey(parseLinearIssue(issuePath(80), issueFile(80))), persistedThread)
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(80)]: issueFile(80) })
+    const fleet = new FakeFleetClient()
+    const slack = new RecordingSlack()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+      stateStore: state,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(80), issueFile(80))))
+    await flush()
+    await flush()
+
+    // The thread already exists, so no new root thread is posted...
+    expect(slack.roots).toEqual([])
+    // ...but the reply watcher is re-armed against the persisted thread.
+    expect(factory.status().counters.slackWatchersRearmed).toBe(1)
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', persistedThread, 'human'), 'slack-human', {
+      text: 'how is it going?',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-80-impl-pear', data: 'Slack reply for AR-80:\nhow is it going?\r' },
+    ])
+  })
+
+  it('rehydrates Slack reply watchers on start() for in-flight issues that persist across a restart', async () => {
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(81)]: issueFile(81) })
+    const dispatchFleet = new FakeFleetClient()
+    const dispatchSlack = new RecordingSlack()
+    const dispatcher = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: dispatchFleet,
+      triage: new StaticTriage(),
+      slack: dispatchSlack,
+      stateStore: state,
+    })
+    await dispatcher.dispatch(await dispatcher.triageIssue(parseLinearIssue(issuePath(81), issueFile(81))))
+    await flush()
+    await flush()
+    const persistedThread = dispatchSlack.threadId
+
+    // Simulate a restart: a fresh factory instance over the same persisted state
+    // and mount, with its own fleet and an empty in-process watcher map.
+    const restartFleet = new FakeFleetClient()
+    const restartSlack = new RecordingSlack()
+    const restarted = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: restartFleet,
+      triage: new StaticTriage(),
+      slack: restartSlack,
+      stateStore: state,
+    })
+    await restarted.start()
+    expect(restarted.status().counters.slackWatchersRearmed).toBe(1)
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', persistedThread, 'after-restart'), 'slack-after-restart', {
+      text: 'any update?',
+      user: 'U777',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+
+    expect(slackAnswerInputs(restartFleet)).toEqual([
+      { name: 'ar-81-impl-pear', data: 'Slack reply for AR-81:\nany update?\r' },
+    ])
+
+    await restarted.stop()
+    await dispatcher.stop()
+  })
+
+  it('does not re-arm a Slack watcher on start() when no dispatch thread persists', async () => {
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    // Issue is already implementing, so backfill leaves nothing in-flight and the
+    // rehydration pass has no persisted thread to re-attach to.
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(82)]: issueFile(82, implementing) })
+    const fleet = new FakeFleetClient()
+    const slack = new RecordingSlack()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+      stateStore: state,
+    })
+
+    await factory.start()
+
+    expect(factory.status().counters.slackWatchersRearmed).toBeUndefined()
+    expect(slack.roots).toEqual([])
+
+    await factory.stop()
   })
 
   it('dedupes duplicate inbound Slack reply delivery by event identity and content', async () => {

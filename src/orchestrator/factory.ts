@@ -320,6 +320,7 @@ export class FactoryLoop implements Factory {
       this.#started = true
       try {
         await this.#startLiveSubscription(opts.liveSubscription)
+        await this.#rearmSlackReplyWatchers()
         this.#scheduleCompletionSweep(0)
         return
       } catch (error) {
@@ -349,6 +350,7 @@ export class FactoryLoop implements Factory {
       void this.#handleChange(path)
     })
     this.#started = true
+    await this.#rearmSlackReplyWatchers()
     this.#scheduleCompletionSweep(0)
   }
 
@@ -1004,6 +1006,11 @@ export class FactoryLoop implements Factory {
     let consecutiveFailures = 0
     let completed = false
     try {
+      // Re-arm Slack reply watchers for any issue that is already in-flight with
+      // a persisted dispatch thread before the first iteration runs. The loop
+      // path never calls #start(), so without this a watcher only lives for the
+      // process that originally dispatched — replies after a restart are dropped.
+      await this.#rearmSlackReplyWatchers()
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
         await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration, maxIterations)
         try {
@@ -2993,11 +3000,19 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(record.issue)
-    if (await this.#state.getSlackThread(this.#workspaceId, key) || this.#slackWatcherStarts.has(key)) {
+    const existingThread = await this.#state.getSlackThread(this.#workspaceId, key)
+    if (existingThread || this.#slackWatcherStarts.has(key)) {
       try {
         await this.#slackWatcherStarts.get(key)
       } catch {
         // The initiator logs Slack watcher startup failures.
+      }
+      // A dispatch thread already exists (often persisted from a previous
+      // process) but the in-process watcher map starts empty on restart. Re-arm
+      // the reply watcher instead of returning early, otherwise human replies in
+      // the existing thread are watched by nobody and silently dropped.
+      if (existingThread) {
+        await this.#rearmSlackWatcher(record, existingThread)
       }
       return
     }
@@ -3050,11 +3065,18 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(decision.issue)
-    if (await this.#state.getSlackThread(this.#workspaceId, key) || this.#slackWatcherStarts.has(key)) {
+    const existingThread = await this.#state.getSlackThread(this.#workspaceId, key)
+    if (existingThread || this.#slackWatcherStarts.has(key)) {
       try {
         await this.#slackWatcherStarts.get(key)
       } catch {
         // The initiator logs Slack watcher startup failures.
+      }
+      // Re-arm the reply watcher for an escalation thread that already exists but
+      // has no live in-process watcher (e.g. after a restart), matching the
+      // dispatch-thread path.
+      if (existingThread) {
+        await this.#rearmSlackWatcher(escalationWatchRecord(decision), existingThread)
       }
       return
     }
@@ -3086,13 +3108,7 @@ export class FactoryLoop implements Factory {
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
-    await this.#watchSlackThread({
-      issue: decision.issue,
-      decision,
-      agents: new Map(),
-      invocationIds: new Set(),
-      dryRun: false,
-    }, root.threadId)
+    await this.#watchSlackThread(escalationWatchRecord(decision), root.threadId)
     this.#recordSlackWritebackSuccess('triage-escalation')
   }
 
@@ -3225,6 +3241,53 @@ export class FactoryLoop implements Factory {
         await this.#boundedStopTeardown('Slack reply subscription unsubscribe', () => subscription?.unsubscribe())
       },
     })
+  }
+
+  // Re-attach a live reply watcher to a dispatch/escalation thread that already
+  // exists (persisted thread id) but has no in-process watcher. #watchSlackThread
+  // is itself idempotent on #slackWatchers; the guard here keeps the counter (and
+  // the seeding getEvents call) limited to genuine re-arms.
+  async #rearmSlackWatcher(record: InFlightIssue, threadId: string): Promise<void> {
+    const key = issueKey(record.issue)
+    if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) {
+      return
+    }
+    try {
+      await this.#watchSlackThread(record, threadId)
+      this.#increment('slackWatchersRearmed')
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to re-arm Slack reply watcher', { issue: record.issue.key, error })
+    }
+  }
+
+  // On start()/runLoop() init, re-arm Slack reply watchers for every in-flight
+  // issue that has a persisted dispatch thread. A watcher otherwise only lives as
+  // long as the process that dispatched it, so replies after a restart (or a
+  // run-once exit followed by a loop) would be watched by nobody.
+  async #rearmSlackReplyWatchers(): Promise<void> {
+    if (!this.#slack || !this.#config.slack) {
+      return
+    }
+    for (const record of (await this.#batch()).inFlight) {
+      if (record.dryRun) {
+        continue
+      }
+      const key = issueKey(record.issue)
+      if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) {
+        continue
+      }
+      let threadId: string | undefined
+      try {
+        threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+      } catch (error) {
+        this.#logger.warn?.('[factory] unable to read persisted Slack thread during watcher rehydration', { issue: record.issue.key, error })
+        continue
+      }
+      if (!threadId) {
+        continue
+      }
+      await this.#rearmSlackWatcher(record, threadId)
+    }
   }
 
   async #stopSlackWatcher(issue: IssueRef): Promise<void> {
@@ -4564,6 +4627,17 @@ const contextualError = (context: string, error: unknown): Error => {
 
 const registryHandoffKey = (issue: IssueRef, agentName: string): string =>
   `${issueKey(issue)}:${agentName}`
+
+// Synthetic in-flight record used to watch an escalation thread. Escalations have
+// no spawned agents; reply routing re-reads the live batch record by issue, so
+// the empty agents/invocations here are only placeholders for the watcher key.
+const escalationWatchRecord = (decision: TriageDecision): InFlightIssue => ({
+  issue: decision.issue,
+  decision,
+  agents: new Map(),
+  invocationIds: new Set(),
+  dryRun: false,
+})
 
 const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   spec: { ...tracked.spec },
