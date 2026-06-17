@@ -55,6 +55,7 @@
   "dependencies": {
     "@agent-relay/cloud": "^8.7.2",
     "@agent-relay/harness-driver": "^8.3.7",
+    "@agent-relay/integration-prompts": "^8.8.3",
     "@relayfile/sdk": "^0.8.29",
     "agent-relay": "^8.8.1",
     "zod": "^3.25.76"

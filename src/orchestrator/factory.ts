@@ -26,6 +26,10 @@ import type { Clock, Logger } from '../ports/system'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
+import {
+  deriveDescriptorsFromMount,
+  prescriptiveInstructions,
+} from '@agent-relay/integration-prompts'
 import { renderAgentTask } from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import type {
@@ -234,6 +238,8 @@ export class FactoryLoop implements Factory {
   // undefined = readiness not yet probed; resolved lazily so the standalone
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
+  #integrationInstructions?: string
+  #integrationInstructionsRefresh?: Promise<string | undefined>
   #starting?: Promise<void>
   #started = false
   #stopping = false
@@ -277,6 +283,45 @@ export class FactoryLoop implements Factory {
       return batch
     })
     this.#wireFleetEvents()
+  }
+
+  async #resolveIntegrationInstructions(): Promise<string | undefined> {
+    if (this.#integrationInstructionsRefresh) {
+      return this.#integrationInstructionsRefresh
+    }
+    this.#integrationInstructionsRefresh = this.#doResolveIntegrationInstructions()
+    try {
+      return await this.#integrationInstructionsRefresh
+    } finally {
+      this.#integrationInstructionsRefresh = undefined
+    }
+  }
+
+  async #doResolveIntegrationInstructions(): Promise<string | undefined> {
+    if (this.#integrationInstructions !== undefined) {
+      return this.#integrationInstructions
+    }
+    try {
+      const reader = {
+        readFile: async (path: string): Promise<string | undefined> => {
+          try {
+            const { content } = await this.#mount.readFile(path)
+            return typeof content === 'string' ? content : undefined
+          } catch {
+            return undefined
+          }
+        },
+        listPaths: async (prefix: string): Promise<string[]> => {
+          return this.#mount.listTree(prefix)
+        },
+      }
+      const descriptors = await deriveDescriptorsFromMount(reader)
+      this.#integrationInstructions = prescriptiveInstructions(descriptors)
+      return this.#integrationInstructions
+    } catch {
+      this.#logger.warn?.('[factory] failed to resolve integration instructions from mount')
+      return undefined
+    }
   }
 
   async #batch(): Promise<BatchSnapshot> {
@@ -2334,6 +2379,7 @@ export class FactoryLoop implements Factory {
     const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
     const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name ?? 'reviewer'
     const implementerNames = implementers.map((agent) => agent.result?.name ?? agent.spec.name)
+    const integrationInstructions = await this.#resolveIntegrationInstructions()
     for (const implementer of implementers) {
       const input = {
         to: implementer.result?.name ?? implementer.spec.name,
@@ -2345,6 +2391,7 @@ export class FactoryLoop implements Factory {
           reviewerName,
           implementerNames,
           slackDispatchThread: await this.#slackDispatchThreadFor(record),
+          integrationInstructions,
         }),
         from: 'factory',
         data: { issue: record.issue },
@@ -2608,6 +2655,7 @@ export class FactoryLoop implements Factory {
       const implementerNames = [...record.agents.values()]
         .filter((agent) => agent.spec.role === 'implementer')
         .map((agent) => agent.result?.name ?? agent.spec.name)
+      const integrationInstructions = await this.#resolveIntegrationInstructions()
       const task = renderAgentTask({
         issue: templateIssueFromRecord(record, issue),
         route: route ?? { repo: prRef.repo },
@@ -2617,6 +2665,7 @@ export class FactoryLoop implements Factory {
         implementerNames,
         pr: { number: prRef.prNumber, url: prRef.url },
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
+        integrationInstructions,
       })
 
       const spawned = await this.#spawnAgent(record, { ...spec, task }, false)

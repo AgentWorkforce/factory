@@ -34,7 +34,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Open a PR targeting `main` when done.')
     expect(task).toContain('Use `gh pr create --base main` and report the PR URL.')
     expect(task).toContain('DM the reviewer `ar-123-review` when the PR is ready.')
-    expect(task).toContain('DM `factory` with `[factory-needs-input] <your question>` so the factory can relay it to the issue Slack thread.')
+    expect(task).toContain('write to the .integrations mount path so the factory can relay it to the issue thread.')
     expect(task).toContain('DM `broker` when fully done.')
     expect(task).toContain('Do NOT auto-merge.')
     expect(task).toContain('Merge policy: never')
@@ -132,7 +132,63 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Merge policy: on-green-with-review')
   })
 
-  it('uses the consistent factory needs-input format across both blocked-input clauses', () => {
+  it('appends integration instructions for an implementer task', () => {
+    const instructions = 'Connected integrations:\n- Slack: write messages to .integrations/slack/channels/{id}/messages\n- Linear: write state updates to .integrations/linear/issues/{id}/state'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('appends integration instructions for a reviewer task', () => {
+    const instructions = 'To dispatch an integration action, write a JSON file under the resource path. Do NOT use relay messaging.'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'reviewer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('appends integration instructions for a babysitter task', () => {
+    const instructions = 'Writeback paths:\n- .integrations/linear/issues/{id}/state'
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'babysitter',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      pr: { number: 482 },
+      integrationInstructions: instructions,
+    })
+
+    expect(task).toContain(instructions)
+  })
+
+  it('omits integration block when integrationInstructions is not provided', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+    })
+
+    // Should not add an extra trailing blank line + integration section.
+    expect(task).not.toMatch(/\n\n(.integrations|Connected integrations)/m)
+  })
+
+  it('directs agent questions to .integrations writeback instead of relay DM', () => {
     const task = renderAgentTask({
       issue,
       route: { repo: 'pear', clonePath: '/tmp/pear' },
@@ -142,12 +198,14 @@ describe('renderAgentTask', () => {
       slackDispatchThread: { channel: 'C123', threadId: '169.000' },
     })
 
-    // The always-present clause and the Slack-thread fallback both point at
-    // `factory` with the [factory-needs-input] marker; no legacy
-    // FACTORY_NEEDS_INPUT / DM `broker` blocked-input wording remains.
-    expect(task).toContain('If blocked and you need human input, DM `factory` with `[factory-needs-input] <your question>`')
-    expect(task).toContain('Fallback: DM `factory` with `[factory-needs-input] <your question>`')
+    // The Slack-thread writeback replaces the old relay DM pattern.
+    expect(task).toContain('write your question to this issue\'s Slack dispatch thread via the .integrations mount')
+    expect(task).toContain('Write path: .integrations/slack/channels/C123/messages/169_000/replies/question.json')
+    expect(task).toContain('Write a JSON object with a "text" field')
+    expect(task).toContain('Continue with safe reversible work while waiting for a reply.')
+    // No relay DM or legacy patterns.
     expect(task).not.toContain('FACTORY_NEEDS_INPUT')
     expect(task).not.toContain('DM `broker` with')
+    expect(task).not.toContain('[factory-needs-input]')
   })
 })

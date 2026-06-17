@@ -31,6 +31,8 @@ export interface RenderAgentTaskInput {
     channel: string
     threadId: string
   }
+  /** Pre-rendered writeback instructions for connected integrations. */
+  integrationInstructions?: string
 }
 
 export function renderAgentTask(input: RenderAgentTaskInput): string {
@@ -57,7 +59,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'Open a PR targeting `main` when done.',
     'Use `gh pr create --base main` and report the PR URL.',
     `DM the reviewer \`${input.reviewerName}\` when the PR is ready.`,
-    'If blocked and you need human input, DM `factory` with `[factory-needs-input] <your question>` so the factory can relay it to the issue Slack thread.',
+    'If blocked and you need human input, write to the .integrations mount path so the factory can relay it to the issue thread.',
     'DM `broker` when fully done.',
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
@@ -65,11 +67,10 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   const questionInstructions = input.slackDispatchThread
     ? [
         '',
-        'If you are blocked or need a human answer mid-task, ask in this issue\'s Slack dispatch thread.',
-        `Slack dispatch channel: ${input.slackDispatchThread.channel}`,
-        `Slack dispatch thread: ${input.slackDispatchThread.threadId}`,
-        'Prefer the injected Agent Relay MCP thread reply tool when it is available.',
-        'Fallback: DM `factory` with `[factory-needs-input] <your question>` and continue with safe reversible work while waiting.',
+        'If you are blocked or need a human answer mid-task, write your question to this issue\'s Slack dispatch thread via the .integrations mount.',
+        `Write path: .integrations/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replace('.', '_')}/replies/question.json`,
+        'Write a JSON object with a "text" field containing your question.',
+        'Continue with safe reversible work while waiting for a reply.',
       ]
     : []
 
@@ -78,8 +79,8 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ? `PR #${input.pr.number}${input.pr.url ? ` (${input.pr.url})` : ''}`
       : 'the open PR for this issue'
     const chatLine = input.slackDispatchThread
-      ? 'You can also use this issue\'s Slack dispatch thread to discuss the PR with the human (status, trade-offs, open questions) — proactively offer to chat there if it would help.'
-      : 'If a human can be reached, proactively offer to discuss the PR (status, trade-offs, open questions) via `[factory-needs-input]`.'
+      ? 'You can also use this issue\'s Slack dispatch thread to discuss the PR with the human (status, trade-offs, open questions) — proactively write via .integrations/slack if it would help.'
+      : 'If a human can be reached, proactively offer to discuss the PR (status, trade-offs, open questions) via the .integrations writeback path.'
     // Match the prompt to where the issue actually lands so the babysitter is not
     // told to "stop at Human Review" while the factory is configured to finish at
     // Done (and possibly auto-merge under on-green-with-review).
@@ -111,6 +112,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       finishLine,
       mergePolicyLine(input.config.mergePolicy),
       ...questionInstructions,
+      ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ].join('\n')
   }
 
@@ -124,12 +126,14 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       'Post review comments via the GitHub writeback path.',
       'DM the implementer with specific feedback if changes needed, or approve if good.',
       'DM `broker` when the review cycle is complete.',
+      ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ].join('\n')
   }
 
   return [
     ...common,
     ...questionInstructions,
+    ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
   ].join('\n')
 }
 
