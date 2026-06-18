@@ -2413,6 +2413,7 @@ export class FactoryLoop implements Factory {
           reviewerName,
           implementerNames,
           slackDispatchThread: await this.#slackDispatchThreadFor(record),
+          integrationsMountRoot: this.#integrationsMountRoot(),
           integrationInstructions,
         }),
         from: 'factory',
@@ -2687,6 +2688,7 @@ export class FactoryLoop implements Factory {
         implementerNames,
         pr: { number: prRef.prNumber, url: prRef.url },
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
+          integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
       })
 

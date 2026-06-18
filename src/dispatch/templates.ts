@@ -40,10 +40,20 @@ export interface RenderAgentTaskInput {
   }
   /** Pre-rendered writeback instructions for connected integrations. */
   integrationInstructions?: string
+  /**
+   * Absolute path to the .integrations mount root. The agent runs in its repo
+   * clonePath, not the daemon cwd where .integrations lives, so every
+   * `.integrations/...` reference (github reads, slack writes) must be absolute.
+   * Falls back to the bare relative root when absent (e.g. tests).
+   */
+  integrationsMountRoot?: string
 }
 
 export function renderAgentTask(input: RenderAgentTaskInput): string {
   const repo = normalizeRepo(input.route.repo)
+  // Absolute mount root for every .integrations reference (the agent's cwd is
+  // its repo clone, where a relative .integrations/... does not resolve).
+  const mountRoot = input.integrationsMountRoot ?? '.integrations'
   const cloneInstruction = input.route.clonePath
     ? `Repo path: ${input.route.clonePath}`
     : `Clone/worktree: clone AgentWorkforce/${repo} and work in your own isolated git worktree before editing.`
@@ -88,7 +98,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ? `PR #${input.pr.number}${input.pr.url ? ` (${input.pr.url})` : ''}`
       : 'the open PR for this issue'
     const chatLine = input.slackDispatchThread
-      ? 'You can also use this issue\'s Slack dispatch thread to discuss the PR with the human (status, trade-offs, open questions) — proactively write via .integrations/slack if it would help.'
+      ? `You can also use this issue's Slack dispatch thread to discuss the PR with the human (status, trade-offs, open questions) — proactively write via ${mountRoot}/slack if it would help.`
       : 'If a human can be reached, proactively offer to discuss the PR (status, trade-offs, open questions) via the .integrations writeback path.'
     // Match the prompt to where the issue actually lands so the babysitter is not
     // told to "stop at Human Review" while the factory is configured to finish at
@@ -109,7 +119,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       `You are the PR babysitter for ${input.issue.key}. A PR is already open: ${prRef}.`,
       jobLine,
       'Unlike a conservative reviewer, you SHOULD fix things directly and aggressively — you hold the original issue spec as the definition of done, and you have the rest of the dispatched team to draw on.',
-      'Read the PR diff, CI checks, and review threads via `.integrations/github/repos`.',
+      `Read the PR diff, CI checks, and review threads via ${mountRoot}/github/repos.`,
       'Address every review comment for real — make substantive code changes when the feedback calls for it, not just lint/format touch-ups.',
       'Resolve any merge conflicts: rebase onto the base branch and reconcile using judgment anchored in the issue spec; never weaken tests or flip safety defaults just to force a merge.',
       'Fix failing CI — change the code and tests as needed until the checks pass. A red check is not done.',
@@ -131,7 +141,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ...questionInstructions,
       '',
       `Wait for a DM from the implementer(s): ${implementers}.`,
-      'Read the PR diff via `.integrations/github/repos`.',
+      `Read the PR diff via ${mountRoot}/github/repos.`,
       'Post review comments via the GitHub writeback path.',
       'DM the implementer with specific feedback if changes needed, or approve if good.',
       'DM `broker` when the review cycle is complete.',

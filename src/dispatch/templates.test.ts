@@ -52,7 +52,7 @@ describe('renderAgentTask', () => {
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
     expect(task).toContain('Wait for a DM from the implementer(s): ar-123-impl-ui, ar-123-impl-broker.')
-    expect(task).toContain('Read the PR diff via `.integrations/github/repos`.')
+    expect(task).toContain('Read the PR diff via .integrations/github/repos.')
     expect(task).toContain('Post review comments via the GitHub writeback path.')
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
     expect(task).toContain('DM `broker` when the review cycle is complete.')
