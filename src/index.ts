@@ -85,6 +85,7 @@ export {
   issueKey,
   isRealLinearIssue,
   parseLinearIssue,
+  readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
   reapFactoryOrphansOnce,

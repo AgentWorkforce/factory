@@ -6,6 +6,14 @@ export const linearIssuePath = (key: string, uuid: string) => `/linear/issues/${
 
 export const linearByStatePath = (slug: string) => `/linear/issues/by-state/${slug}/`
 
+// Canonical record aliases. The active-issues sync writes the full issue body
+// to these stable lookup paths while the primary <key>__<uuid>.json path may
+// hold only a change-event STUB. The factory reads these when the primary
+// parses empty (see readLinearIssueWithCanonicalFallback).
+export const linearByIdPath = (key: string) => `/linear/issues/by-id/${key}.json`
+
+export const linearByUuidPath = (uuid: string) => `/linear/issues/by-uuid/${uuid}.json`
+
 // Comment writeback must be nested under its issue — the relayfile cloud
 // writeback executor only accepts /linear/issues/<issueRef>/comments/<draft>.json
 // (top-level /linear/comments/<name>.json is rejected as "unsupported Linear

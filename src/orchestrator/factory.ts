@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
-import { linearByStatePath } from '../constants/linear'
+import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type {
@@ -248,8 +248,10 @@ export class FactoryLoop implements Factory {
     this.#config = config
     this.#mount = ports.mount
     // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
-    // resolution via ports; fall back to one built from explicit stateIds.
-    this.#states = ports.stateResolution ?? stateResolutionFromIds(config.stateIds)
+    // resolution via ports; fall back to one built from explicit stateIds plus
+    // the configured role NAMES so name->UUID backfill still works for sparse
+    // synced records (state.name but no state.id) without the states catalog.
+    this.#states = ports.stateResolution ?? stateResolutionFromIds(config.stateIds, config.linear.states)
     installFactoryDraftPredicate(this.#mount, config)
     this.#fleet = ports.fleet
     this.#triage = ports.triage ?? new TieredTriage(new HeuristicTriage())
@@ -1789,8 +1791,11 @@ export class FactoryLoop implements Factory {
 
   async #readIssue(path: string): Promise<LinearIssue | undefined> {
     try {
-      const { content } = await this.#mount.readFile(path)
-      const issue = parseLinearIssue(path, content)
+      // Newly-synced issues land as a change-event STUB at the primary
+      // /linear/issues/<key>__<uuid>.json path (no state/url/team); the full
+      // record lands at the by-id / by-uuid aliases. Read the canonical sibling
+      // when the primary parses empty so triage sees real state.
+      const issue = await readLinearIssueWithCanonicalFallback(this.#mount, path)
       // Synced Linear records may carry only the state NAME, not the state UUID
       // (relayfile-adapters#205). The factory matches state by UUID, so backfill
       // the id from the name when the payload omitted it — otherwise every issue
@@ -3538,6 +3543,49 @@ export function parseLinearIssue(path: string, content: unknown): LinearIssue {
     path,
     raw: asRecord(parsed) ?? payload,
   }
+}
+
+// A primary issue file that parsed without any usable state is a change-event
+// STUB ({created,path,externalId,ts,id}) — the active-issues sync wrote the full
+// body to the by-id/by-uuid aliases instead. Distinguishes a stub from a real
+// record (which always carries at least a state name from sync).
+const isUsableIssueRecord = (issue: LinearIssue): boolean =>
+  Boolean(issue.stateId || issue.state?.name)
+
+// The canonical sibling records for a primary /linear/issues/<key>__<uuid>.json
+// path: by-id keyed on the human key, by-uuid keyed on the Linear UUID.
+const canonicalIssueRecordPaths = (path: string): string[] => {
+  const key = keyFromPath(path)
+  const uuid = uuidFromPath(path)
+  return [
+    ...(key ? [linearByIdPath(key)] : []),
+    ...(uuid ? [linearByUuidPath(uuid)] : []),
+  ].filter((candidate) => candidate !== path)
+}
+
+// Read an issue, falling back to the canonical by-id/by-uuid alias when the
+// primary path holds only a stub. The canonical content is re-parsed against
+// the ORIGINAL primary path so issue.path/key/uuid stay primary-anchored (the
+// rest of the factory dedupes and dispatches by the primary path). A missing
+// alias is tolerated; the original (stub) record is returned if no alias helps.
+export async function readLinearIssueWithCanonicalFallback(
+  mount: Pick<MountClient, 'readFile'>,
+  path: string,
+): Promise<LinearIssue> {
+  const { content } = await mount.readFile(path)
+  const issue = parseLinearIssue(path, content)
+  if (isUsableIssueRecord(issue)) return issue
+  for (const candidate of canonicalIssueRecordPaths(path)) {
+    try {
+      const canonical = await mount.readFile(candidate)
+      const parsed = parseLinearIssue(path, canonical.content)
+      if (isUsableIssueRecord(parsed)) return parsed
+    } catch (error) {
+      if (isMissingIssueFileError(error)) continue
+      throw error
+    }
+  }
+  return issue
 }
 
 export function parseGithubIssue(path: string, content: unknown): GithubIssueSource {

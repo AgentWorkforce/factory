@@ -993,6 +993,64 @@ describe('FactoryLoop', () => {
     expect(factory.status().queued).toEqual([])
   })
 
+  it('triages a stub-primary issue by reading the canonical by-id record (sparse sync tolerance)', async () => {
+    // Regression (live AR-305): the active-issues sync writes a change-event
+    // STUB to the primary <key>__<uuid>.json path and the full — but SPARSE
+    // (no state.id / team / labels) — body to by-id/<key>.json. The factory
+    // must read the canonical sibling and resolve readyForAgent from the state
+    // NAME, else every freshly-synced issue reads as "not ready-for-agent".
+    const stubPrimary = {
+      created: '2026-06-18T12:00:00.000Z',
+      path: issuePath(7),
+      externalId: 'AR-7',
+      ts: 1750000000,
+      id: 'uuid-7',
+    }
+    const canonicalById = {
+      provider: 'linear',
+      objectType: 'issue',
+      objectId: 'uuid-7',
+      payload: {
+        id: 'uuid-7',
+        identifier: 'AR-7',
+        title: '[factory-e2e] Add a CLI flag to redact secrets from log output',
+        description: 'Sparse synced record — carries state.name but no state.id, team, or labels.',
+        state_name: 'Ready for Agent',
+        priority: 2,
+        assignee_name: null,
+        url: 'https://linear.app/agent-relay/issue/AR-7/factory-issue-7',
+        created_at: '2026-06-18T12:00:00.000Z',
+        updated_at: '2026-06-18T12:00:00.000Z',
+        state: { name: 'Ready for Agent' },
+      },
+    }
+    const mount = new FakeMountClient({
+      [issuePath(7)]: stubPrimary,
+      '/linear/issues/by-id/AR-7.json': canonicalById,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      linear: {
+        states: {
+          readyForAgent: 'Ready for Agent',
+          agentImplementing: 'Implementing',
+          done: 'Done',
+          inPlanning: 'In Planning',
+        },
+        statesByTeam: {},
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce({ dryRun: true })
+
+    // The stub must NOT be rejected as not-ready...
+    expect(report.skipped.find((s) => s.issue.key === 'AR-7')).toBeUndefined()
+    // ...and the canonical record must carry it through triage/dispatch.
+    const carried = report.dispatched.some((d) => d.issue.key === 'AR-7')
+      || report.triaged.some((t) => t.issue.key === 'AR-7')
+    expect(carried).toBe(true)
+  })
+
   it('mirrors factory-labeled GitHub issues from the relayfile mount into Linear create drafts', async () => {
     const ghPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 1116)
     const mount = new FakeMountClient({

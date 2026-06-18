@@ -14,6 +14,7 @@ import {
   defaultGhRunner,
   isInFactoryScope,
   parseLinearIssue,
+  readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
   resolveFactoryStates,
@@ -21,6 +22,7 @@ import {
   type Capability,
   type Factory,
   type FactoryConfig,
+  type IterationReport,
   type FleetBackend,
   type FleetClient,
   type GhRunner,
@@ -75,6 +77,7 @@ type ParsedCommand =
   | { kind: 'release'; name: string; reason?: string }
   | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
   | { kind: 'factory'; action: 'start'; mode?: 'live' }
+  | { kind: 'factory-canary'; issue: string }
   | { kind: 'factory-triage'; issue: string }
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
@@ -133,6 +136,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         writeJson(out, { released: command.name })
         return 0
       case 'factory':
+      case 'factory-canary':
       case 'factory-triage':
       case 'factory-dispatch': {
         if (!loaded) throw new Error('factory command requires config')
@@ -244,7 +248,7 @@ export function parseGlobalOptions(argv: string[]): { globals: GlobalOptions; ar
 }
 
 async function runFactoryCommand(
-  command: Extract<ParsedCommand, { kind: 'factory' | 'factory-triage' | 'factory-dispatch' }>,
+  command: Extract<ParsedCommand, { kind: 'factory' | 'factory-canary' | 'factory-triage' | 'factory-dispatch' }>,
   factory: Factory,
   mount: MountClient,
   fleet: FleetClient,
@@ -334,6 +338,13 @@ async function runFactoryCommand(
     return 0
   }
 
+  if (command.kind === 'factory-canary') {
+    const report = await factory.runOnce({ dryRun: true })
+    const result = evaluateFactoryCanary(report, command.issue)
+    writeJson(out, result)
+    return result.ok ? 0 : 1
+  }
+
   const issue = await readIssueArg(mount, command.issue)
   const decision = await factory.triageIssue(issue)
   if (command.kind === 'factory-triage') {
@@ -353,6 +364,10 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
   if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop' || action === 'reap-orphans') {
     return { kind: 'factory', action }
   }
+  if (action === 'canary') {
+    if (!issueOrPr) throw new Error('fleet factory canary requires an issue key or path')
+    return { kind: 'factory-canary', issue: issueOrPr }
+  }
   if (action === 'triage') {
     if (!issueOrPr) throw new Error('fleet factory triage requires an issue key or path')
     return { kind: 'factory-triage', issue: issueOrPr }
@@ -369,6 +384,45 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
     return { kind: 'factory-close-probe', prNumber, repo: parsed.repo, issue: parsed.issue }
   }
   throw new Error(`Unknown fleet factory action: ${action ?? ''}`)
+}
+
+// Canary: assert a known "Ready for Agent" issue is classified dispatch-ready
+// by the REAL triage path against the live mount. This is the regression
+// detector for sync-fidelity drift (sparse records / stub primaries) — if it
+// flips to skipped, the adapter/sync contract broke. Exits non-zero with the
+// offending skip reason so CI/cron can alert.
+function evaluateFactoryCanary(
+  report: IterationReport,
+  issueArg: string,
+): { ok: boolean; issue: string; status: string; reason?: string } {
+  const wantKey = issueArg.startsWith('/')
+    ? (issueArg.split('/').at(-1) ?? '').replace(/\.json$/u, '').split('__')[0]
+    : issueArg
+  const matches = (ref: { key: string }): boolean => ref.key === wantKey
+  if (report.dispatched.some((d) => matches(d.issue))) {
+    return { ok: true, issue: wantKey, status: 'dispatched' }
+  }
+  if (report.triaged.some((t) => matches(t.issue))) {
+    return { ok: true, issue: wantKey, status: 'triaged' }
+  }
+  const skipped = report.skipped.find((s) => matches(s.issue))
+  if (skipped) {
+    return { ok: false, issue: wantKey, status: 'skipped', reason: skipped.reason }
+  }
+  if (!report.pulled.some(matches)) {
+    return {
+      ok: false,
+      issue: wantKey,
+      status: 'not-found',
+      reason: 'issue was not enumerated from the mount (sync may be missing it or it is in-flight)',
+    }
+  }
+  return {
+    ok: false,
+    issue: wantKey,
+    status: 'unknown',
+    reason: 'issue pulled but neither dispatched, triaged, nor skipped',
+  }
 }
 
 function parseFactoryStartFlags(args: Array<string | undefined>): { mode?: 'live' } {
@@ -488,7 +542,7 @@ async function isAllowedFactoryDraft(
   if (nestedComment) {
     const issuePath = `/linear/issues/${nestedComment[1]}.json`
     try {
-      const issue = parseLinearIssue(issuePath, (await mount.readFile(issuePath)).content)
+      const issue = await readLinearIssueWithCanonicalFallback(mount, issuePath)
       return isInFactoryScope(issue, config.safety)
     } catch {
       return false
@@ -498,7 +552,7 @@ async function isAllowedFactoryDraft(
   if (path.startsWith('/linear/issues/')) {
     if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
     try {
-      const issue = parseLinearIssue(path, (await mount.readFile(path)).content)
+      const issue = await readLinearIssueWithCanonicalFallback(mount, path)
       return isInFactoryScope(issue, config.safety)
     } catch {
       return false
@@ -522,8 +576,7 @@ const scopeIssueFromDraftContent = (content: unknown) => ({
 
 async function readIssueArg(mount: MountClient, issueArg: string) {
   const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg)
-  const { content } = await mount.readFile(path)
-  return parseLinearIssue(path, content)
+  return readLinearIssueWithCanonicalFallback(mount, path)
 }
 
 async function findIssuePath(mount: MountClient, key: string): Promise<string> {

@@ -8,6 +8,7 @@ export {
   FactoryLoop,
   isRealLinearIssue,
   parseLinearIssue,
+  readLinearIssueWithCanonicalFallback,
   readFactoryLoopHeartbeat,
 } from './factory'
 export {
