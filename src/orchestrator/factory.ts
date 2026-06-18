@@ -186,6 +186,10 @@ export class FactoryLoop implements Factory {
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
+  // Agents we've already logged an ambiguous-PID-lookup warning for, so the
+  // reaper doesn't spam the same benign "ambiguous process lookup" line on every
+  // poll (a joined/cloud agent has no local PID to resolve — expected).
+  readonly #ambiguousLookupWarned = new Set<string>()
   // Last invalid-label failure signature we posted per issue, so a stuck Ready
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
@@ -1913,7 +1917,10 @@ export class FactoryLoop implements Factory {
       return { pids: [scan.identity.pid], status: 'found' }
     }
     if (scan.status === 'ambiguous') {
-      this.#logger.warn?.(`[factory] ambiguous process lookup for ${agentName}`)
+      if (!this.#ambiguousLookupWarned.has(agentName)) {
+        this.#ambiguousLookupWarned.add(agentName)
+        this.#logger.warn?.(`[factory] ambiguous process lookup for ${agentName} (suppressing repeats)`)
+      }
       return { pids: [], status: 'unresolved' }
     }
 
