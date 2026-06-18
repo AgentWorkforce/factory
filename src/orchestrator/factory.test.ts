@@ -2941,10 +2941,11 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toEqual([])
   })
 
-  it('does not dispatch issues that carry only a state_name (no resolvable state id)', async () => {
-    // Without a resolvable state.id (and no hardcoded name->id map), a
-    // state_name-only record can't be matched to the readyForAgent role, so it
-    // is left alone rather than mis-dispatched.
+  it('does not dispatch issues whose state_name matches no configured role (no resolvable state id)', async () => {
+    // A state_name-only record whose name is NOT in linear.states (nor a default
+    // role name) can't be matched to the readyForAgent role, so it is left alone
+    // rather than mis-dispatched. (A conventional name like "Ready for Agent"
+    // DOES resolve via the default name map — see the canonical-fallback test.)
     const path = issuePath(27)
     const stateNameOnly = {
       provider: 'linear',
@@ -2954,7 +2955,7 @@ describe('FactoryLoop', () => {
         ...issuePayload(27),
         stateId: undefined,
         state: undefined,
-        state_name: 'Ready for Agent',
+        state_name: 'Some Workspace-Specific Column',
       },
     }
     const mount = new FakeMountClient({ [path]: stateNameOnly })

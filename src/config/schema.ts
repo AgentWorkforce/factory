@@ -98,10 +98,22 @@ const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
 }).default({})
 
+// The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
+// don't hand-configure them. These names let the factory resolve a role from a
+// synced record that carries state.name but no state.id (sparse-sync fallback).
+// A workspace that names states differently can override via config.
+const DEFAULT_LINEAR_STATE_NAMES = {
+  readyForAgent: 'Ready for Agent',
+  agentImplementing: 'Agent Implementing',
+  done: 'Done',
+  inPlanning: 'In Planning',
+  humanReview: 'In Human Review',
+}
+
 const linearSchema = z.object({
-  states: linearRoleNamesSchema,
+  states: linearRoleNamesSchema.default(DEFAULT_LINEAR_STATE_NAMES),
   statesByTeam: z.record(z.string(), linearRoleNamesSchema).default({}),
-}).default({})
+}).default({ states: DEFAULT_LINEAR_STATE_NAMES, statesByTeam: {} })
 
 const stateIdsSchema = z.object({
   readyForAgent: z.string().optional(),

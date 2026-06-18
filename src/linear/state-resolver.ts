@@ -220,7 +220,13 @@ export async function resolveFactoryStates(
       try {
         return await catalog.resolve(name, teamToken)
       } catch (error) {
+        // Fall back to the pinned UUID when the catalog can't resolve the name.
         if (explicitIds[role]) return explicitIds[role]
+        // No pinned UUID: a REQUIRED role must still fail loudly (preserves the
+        // clear ambiguous-name / cross-team / catalog-unavailable errors). But an
+        // OPTIONAL role (e.g. humanReview) with a default NAME but no UUID must
+        // not abort resolution on a catalog-less mount — leave it unresolved.
+        if (!REQUIRED_ROLES.includes(role)) return undefined
         throw error
       }
     }

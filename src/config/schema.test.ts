@@ -42,7 +42,18 @@ describe('FactoryConfigSchema', () => {
     // No hardcoded state defaults: omitted stateIds resolve to {} and are filled
     // at runtime from linear.states (by name) or explicit stateIds.
     expect(parsed.stateIds).toEqual({})
-    expect(parsed.linear).toEqual({ states: {}, statesByTeam: {} })
+    // The factory ships its workflow-state NAME conventions as defaults (so a
+    // consumer needn't configure them); statesByTeam stays empty.
+    expect(parsed.linear).toEqual({
+      states: {
+        readyForAgent: 'Ready for Agent',
+        agentImplementing: 'Agent Implementing',
+        done: 'Done',
+        inPlanning: 'In Planning',
+        humanReview: 'In Human Review',
+      },
+      statesByTeam: {},
+    })
     expect(parsed.safety).toEqual({
       requireTitlePrefix: '[factory-e2e]',
       requireLabel: 'factory',
