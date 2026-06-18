@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the factory sync-fidelity canary (see factory-canary.sh).
+
+  Install (macOS):
+    1. Replace __FACTORY_WORKDIR__ with your factory deployment dir (the one with
+       factory.config.json), and __FACTORY_BIN__ with the path to factory.mjs
+       (e.g. node_modules/@agent-relay/factory/bin/factory.mjs). Set the issue key
+       and, optionally, FACTORY_CANARY_SLACK_WEBHOOK.
+    2. cp scripts/com.agentrelay.factory-canary.plist.example \
+         ~/Library/LaunchAgents/com.agentrelay.factory-canary.plist
+    3. launchctl load ~/Library/LaunchAgents/com.agentrelay.factory-canary.plist
+    4. launchctl start com.agentrelay.factory-canary   # run once now to verify
+
+  Runs every 6h (StartInterval 21600). Logs to <workdir>/.factory-canary.log.
+  Run from the deployment dir so the canary reuses the running relay broker.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentrelay.factory-canary</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__FACTORY_WORKDIR__/scripts/factory-canary.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__FACTORY_WORKDIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FACTORY_CANARY_ISSUE</key>
+    <string>AR-305</string>
+    <key>FACTORY_WORKDIR</key>
+    <string>__FACTORY_WORKDIR__</string>
+    <key>FACTORY_BIN</key>
+    <string>__FACTORY_BIN__</string>
+    <key>FACTORY_CANARY_SLACK_WEBHOOK</key>
+    <string></string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__FACTORY_WORKDIR__/.factory-canary.log</string>
+  <key>StandardErrorPath</key>
+  <string>__FACTORY_WORKDIR__/.factory-canary.log</string>
+</dict>
+</plist>

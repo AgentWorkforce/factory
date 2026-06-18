@@ -105,6 +105,7 @@ factory factory run-once --config ./factory.config.json --dry-run
 | `factory status` | Print current factory status as JSON. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
+| `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`. The internal backend reuses a relay broker that's
@@ -112,6 +113,20 @@ already running for your workspace, and starts one if none is.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+### Scheduled sync-fidelity canary
+
+`factory canary` is the regression detector for upstream sync drift: if a synced
+issue stops carrying enough state to be dispatchable (e.g. the Linear sync
+regresses to records without `state.id`), a known-good issue flips from
+dispatch-ready to skipped. Run it on a schedule against a standing "Ready for
+Agent" canary issue and alert on failure.
+
+`scripts/factory-canary.sh` wraps the command for cron/launchd: it runs from your
+deployment dir (reusing the running relay broker), bounds a hung run, and posts a
+Slack alert via `FACTORY_CANARY_SLACK_WEBHOOK` on failure. See
+`scripts/com.agentrelay.factory-canary.plist.example` for an every-6h launchd
+template.
 
 ## Tell it what to work on
 
