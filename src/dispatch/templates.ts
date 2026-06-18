@@ -89,6 +89,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         // where .integrations lives, so a relative path would be unreachable.
         `Write path: ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json`,
         'Write a JSON object with a "text" field containing your question.',
+        'The human\'s reply will be delivered to you as an `<integration-event>` system message injected into your session — wait for it, do not poll.',
         'Continue with safe reversible work while waiting for a reply.',
       ]
     : []

@@ -3410,11 +3410,19 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const input = slackAnswerInput(liveRecord.issue, text)
     for (const recipient of new Set(recipients)) {
-      await this.#fleet.sendInput(recipient, input)
+      await this.#injectSlackReplyEvent(recipient, liveRecord.issue, text)
       this.#increment('slackAnswersInjected')
     }
+  }
+
+  // Inject the human's Slack reply into the agent framed as the
+  // <integration-event> the spawn prompt tells it to expect (not an ambiguous
+  // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
+  // event. (A broker confirmed-delivery path via waitForInjected is a possible
+  // robustness follow-up.)
+  async #injectSlackReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
+    await this.#fleet.sendInput?.(recipient, slackReplyEvent(issue, text))
   }
 
   // Absolute path to the local .integrations mount the daemon manages. The mount
@@ -4811,6 +4819,12 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
 
 const slackAnswerInput = (issue: IssueRef, text: string): string =>
   `Slack reply for ${issue.key}:\n${text}\r`
+
+// The human's Slack-thread reply, framed as an <integration-event> the agent is
+// told (at spawn) to expect — a recognizable injected event, not an ambiguous
+// keystroke. Trailing CR submits it to the agent's PTY.
+const slackReplyEvent = (issue: IssueRef, text: string): string =>
+  `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
 
 const isFactoryQuestionTarget = (target: string): boolean => {
   const normalized = target.trim().replace(/^@/u, '').toLowerCase()
