@@ -130,6 +130,10 @@ const createIssuePath = (payload: LinearCreateIssuePayload): string => {
 const looksLikeProviderIssueIdentifier = (value: string): boolean =>
   /^[A-Z][A-Z0-9]*-/u.test(value)
 
+const READBACK_CONFIRM_ATTEMPTS = 3
+const READBACK_CONFIRM_DELAY_MS = 250
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 const confirmWriteback = async (
   mount: MountClient,
   path: string,
@@ -137,13 +141,27 @@ const confirmWriteback = async (
   logger: Pick<Logger, 'warn'>,
 ): Promise<void> => {
   await assertWritebackAcked(mount, path)
-  try {
-    if (!await verify()) {
-      logger.warn?.(`[factory-sdk] Linear writeback read-back verification failed for ${path}; treating getOp ack as success`)
+  // getOp can return a FAKED success on a busy/wedged mount ("workspace write
+  // path is busy"), so the read-back is the source of truth. Retry to absorb
+  // eventual-consistency lag; if it never confirms, the write did NOT land —
+  // throw instead of silently faking success (which previously left issues
+  // un-advanced while the factory believed they had advanced).
+  for (let attempt = 0; attempt < READBACK_CONFIRM_ATTEMPTS; attempt += 1) {
+    let confirmed = false
+    try {
+      confirmed = await verify()
+    } catch {
+      confirmed = false
     }
-  } catch (error) {
-    logger.warn?.(`[factory-sdk] Linear writeback read-back verification errored for ${path}; treating getOp ack as success`, error)
+    if (confirmed) {
+      return
+    }
+    if (attempt < READBACK_CONFIRM_ATTEMPTS - 1) {
+      logger.warn?.(`[factory-sdk] Linear writeback read-back for ${path} not yet confirmed (attempt ${attempt + 1}/${READBACK_CONFIRM_ATTEMPTS}); retrying`)
+      await delay(READBACK_CONFIRM_DELAY_MS)
+    }
   }
+  throw new Error(`[factory-sdk] Linear writeback for ${path} acked but the read-back never confirmed it landed; the write did not propagate`)
 }
 
 const assertWritebackAcked = async (
