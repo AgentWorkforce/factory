@@ -1,5 +1,10 @@
 import { accessSync, constants, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// ESM has no __dirname; derive this module's directory for the default search
+// start (used when no caller-supplied deployment dir is available).
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 
 const STALE_RECONCILE_MS = 15 * 60 * 1000
 const NOT_FOUND_ERROR = '[factory] relayfile-mount binary not found. Install dependencies or run: npm run relayfile-mount:install'
@@ -72,7 +77,7 @@ function optionalPackageCandidates(pearRoot: string): string[] {
   ]
 }
 
-export function resolveRelayfileMountBinary(startDir = __dirname): string {
+export function resolveRelayfileMountBinary(startDir = MODULE_DIR): string {
   if (process.env.RELAYFILE_MOUNT_BIN) {
     const explicitBinary = resolve(process.env.RELAYFILE_MOUNT_BIN)
     if (canExecute(explicitBinary)) return explicitBinary

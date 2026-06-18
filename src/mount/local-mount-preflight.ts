@@ -54,7 +54,9 @@ async function isMountStatePresent(stateFilePath: string): Promise<boolean> {
 }
 
 async function spawnMount(workspaceId: string, startDir: string): Promise<void> {
-  const binaryPath = resolveRelayfileMountBinary()
+  // Search from the deployment dir (where factory.config.json + the bundled
+  // @relayfile/mount live), not this module's install location.
+  const binaryPath = resolveRelayfileMountBinary(startDir)
 
   return new Promise<void>((resolve, reject) => {
     const child = spawn(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], {
