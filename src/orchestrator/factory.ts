@@ -2133,6 +2133,12 @@ export class FactoryLoop implements Factory {
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
+          // Already resumed once and STILL exiting with no completion PR — the
+          // agent isn't making progress. Escalate so a human notices, instead of
+          // leaving the issue silently in-flight forever.
+          if (tracked.spec.role === 'implementer') {
+            await this.#escalateStalledIssue(record, name)
+          }
           return
         }
 
@@ -2186,6 +2192,30 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#error(error, record.issue)
+    }
+  }
+
+  // An implementer that exited, was resumed once, and STILL produced no PR is
+  // not making progress. Surface it (counter + a best-effort Slack note to the
+  // dispatch thread) so a human can step in, instead of the issue sitting
+  // silently "in flight" with nothing happening. We do NOT fake a Linear state
+  // change here (the mount may be wedged); the human owns the next step.
+  async #escalateStalledIssue(record: InFlightIssue, name: string): Promise<void> {
+    this.#increment('issuesStalledNoPr')
+    this.#logger.warn?.('[factory] implementer exited without a PR after a resume; escalating for human attention', {
+      issue: record.issue.key,
+      agent: name,
+    })
+    try {
+      const thread = await this.#slackDispatchThreadFor(record)
+      if (thread && this.#slack) {
+        await this.#slack.reply(
+          thread.threadId,
+          `:warning: ${record.issue.key}: the implementer exited without opening a PR (after a retry). It needs a human look.`,
+        )
+      }
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to post stalled-issue escalation to Slack', error)
     }
   }
 
