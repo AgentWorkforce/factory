@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
-import { checkMountStaleness, resolveRelayfileMountBinary } from './relayfile-binary'
+import { checkMountStaleness, resolveRelayfileCli, resolveRelayfileMountBinary } from './relayfile-binary'
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
@@ -82,12 +82,37 @@ async function isMountStatePresent(stateFilePath: string): Promise<boolean> {
 }
 
 async function spawnMount(workspaceId: string, startDir: string): Promise<void> {
+  // Prefer the relayfile CLI: it resolves workspace credentials itself (the raw
+  // relayfile-mount binary requires a --token the factory has no clean way to
+  // supply) and bundles an up-to-date mount, so the factory can self-start the
+  // writeback mount unattended. Fall back to the raw binary only when no CLI is
+  // available.
+  const cli = resolveRelayfileCli()
+  if (cli) {
+    await spawnMountViaCli(cli, workspaceId, startDir)
+    return
+  }
+  await spawnMountViaRawBinary(workspaceId, startDir)
+}
+
+async function spawnMountViaCli(cli: string, workspaceId: string, startDir: string): Promise<void> {
+  // Best-effort stop first so a stale/dead mount registration does not make
+  // `start` reject (matches the documented `relayfile stop && relayfile start`
+  // recovery). A no-op when nothing is mounted here.
+  await runRelayfile(cli, ['stop'], startDir, workspaceId).catch(() => {})
+  await runRelayfile(cli, ['start', workspaceId, '.integrations', '--background'], startDir, workspaceId)
+}
+
+async function spawnMountViaRawBinary(workspaceId: string, startDir: string): Promise<void> {
   // Search from the deployment dir (where factory.config.json + the bundled
   // @relayfile/mount live), not this module's install location.
   const binaryPath = resolveRelayfileMountBinary(startDir)
+  await runRelayfile(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], startDir, workspaceId)
+}
 
+function runRelayfile(command: string, args: string[], startDir: string, workspaceId: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], {
+    const child = spawn(command, args, {
       cwd: startDir,
       stdio: ['ignore', 'ignore', 'pipe'],
     })
@@ -104,14 +129,14 @@ async function spawnMount(workspaceId: string, startDir: string): Promise<void> 
         return
       }
       if (code !== 0) {
-        reject(new Error(`[factory] relayfile mount start failed (exit ${code ?? 'null'}): ${stderr.trim()}`))
+        reject(new Error(`[factory] relayfile mount ${args[0]} failed (exit ${code ?? 'null'}): ${stderr.trim()}`))
         return
       }
       resolve()
     })
 
     child.on('error', (err: Error) => {
-      reject(new Error(`[factory] relayfile mount start error: ${err.message}`))
+      reject(new Error(`[factory] relayfile mount ${args[0]} error: ${err.message}`))
     })
   })
 }
