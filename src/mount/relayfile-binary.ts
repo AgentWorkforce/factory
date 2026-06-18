@@ -1,5 +1,10 @@
 import { accessSync, constants, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// ESM has no __dirname; derive this module's directory for the default search
+// start (used when no caller-supplied deployment dir is available).
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 
 const STALE_RECONCILE_MS = 15 * 60 * 1000
 const NOT_FOUND_ERROR = '[factory] relayfile-mount binary not found. Install dependencies or run: npm run relayfile-mount:install'
@@ -72,7 +77,7 @@ function optionalPackageCandidates(pearRoot: string): string[] {
   ]
 }
 
-export function resolveRelayfileMountBinary(startDir = __dirname): string {
+export function resolveRelayfileMountBinary(startDir = MODULE_DIR): string {
   if (process.env.RELAYFILE_MOUNT_BIN) {
     const explicitBinary = resolve(process.env.RELAYFILE_MOUNT_BIN)
     if (canExecute(explicitBinary)) return explicitBinary
@@ -93,6 +98,29 @@ export function resolveRelayfileMountBinary(startDir = __dirname): string {
   }
 
   throw new Error(NOT_FOUND_ERROR)
+}
+
+function cliName(): string {
+  return process.platform === 'win32' ? 'relayfile.exe' : 'relayfile'
+}
+
+// The `relayfile` CLI (as opposed to the raw relayfile-mount binary) resolves
+// workspace credentials itself and bundles an up-to-date mount, so the factory
+// can start/refresh the writeback mount without plumbing a token — and without
+// depending on a possibly-stale @relayfile/mount-* node_modules binary. Prefer
+// it; fall back to the raw binary only when no CLI is on PATH.
+export function resolveRelayfileCli(): string | undefined {
+  const explicit = process.env.RELAYFILE_BIN
+  if (explicit) return canExecute(explicit) ? resolve(explicit) : undefined
+
+  const exe = cliName()
+  const separator = process.platform === 'win32' ? ';' : ':'
+  for (const dir of (process.env.PATH ?? '').split(separator)) {
+    if (!dir) continue
+    const candidate = join(dir, exe)
+    if (canExecute(candidate)) return resolve(candidate)
+  }
+  return undefined
 }
 
 export function checkMountStaleness(

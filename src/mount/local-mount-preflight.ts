@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
-import { checkMountStaleness, resolveRelayfileMountBinary } from './relayfile-binary'
+import { checkMountStaleness, resolveRelayfileCli, resolveRelayfileMountBinary } from './relayfile-binary'
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
@@ -13,6 +13,12 @@ interface EnsureLocalMountOptions {
   // `rw_` handle). Passed through to the staleness check so a handle-vs-UUID
   // state.json does not register as a spurious mismatch.
   acceptableWorkspaceIds?: readonly string[]
+  // When true (default), a stale mount is auto-refreshed (re-spawned) instead of
+  // merely warned about. A standalone `relayfile start` mount has no supervisor,
+  // so it can silently stop reconciling — and the factory would then ship
+  // writebacks into a mirror that never propagates them. Set false to restore
+  // warn-only behavior.
+  refreshStaleMount?: boolean
 }
 
 export async function ensureLocalMount(
@@ -35,11 +41,33 @@ export async function ensureLocalMount(
   }
 
   const staleness = checkMountStaleness(stateFilePath, workspaceId, options.acceptableWorkspaceIds)
-  if (staleness.stale) {
-    const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
-    process.stderr.write(
-      `[factory] local mount is stale${suffix}; writeback may not propagate. Run: relayfile stop && relayfile start ${workspaceId} .integrations --background\n`,
+  if (!staleness.stale) return
+
+  const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
+  const manualHint = `Run: relayfile stop && relayfile start ${workspaceId} .integrations --background`
+
+  if (options.refreshStaleMount === false) {
+    process.stderr.write(`[factory] local mount is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
+    return
+  }
+
+  // Self-heal: re-spawn the mount so writebacks propagate, rather than silently
+  // shipping them into a stale mirror. spawnMount runs the relayfile-mount
+  // binary with --rehome, which re-establishes the mount in place.
+  process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+  try {
+    await spawnMount(workspaceId, startDir)
+    await waitForStateFile(
+      stateFilePath,
+      workspaceId,
+      options.stateWaitTimeoutMs,
+      options.stateWaitPollMs,
+      options.acceptableWorkspaceIds,
     )
+    process.stderr.write('[factory] local mount refreshed\n')
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
   }
 }
 
@@ -54,10 +82,37 @@ async function isMountStatePresent(stateFilePath: string): Promise<boolean> {
 }
 
 async function spawnMount(workspaceId: string, startDir: string): Promise<void> {
-  const binaryPath = resolveRelayfileMountBinary()
+  // Prefer the relayfile CLI: it resolves workspace credentials itself (the raw
+  // relayfile-mount binary requires a --token the factory has no clean way to
+  // supply) and bundles an up-to-date mount, so the factory can self-start the
+  // writeback mount unattended. Fall back to the raw binary only when no CLI is
+  // available.
+  const cli = resolveRelayfileCli()
+  if (cli) {
+    await spawnMountViaCli(cli, workspaceId, startDir)
+    return
+  }
+  await spawnMountViaRawBinary(workspaceId, startDir)
+}
 
+async function spawnMountViaCli(cli: string, workspaceId: string, startDir: string): Promise<void> {
+  // Best-effort stop first so a stale/dead mount registration does not make
+  // `start` reject (matches the documented `relayfile stop && relayfile start`
+  // recovery). A no-op when nothing is mounted here.
+  await runRelayfile(cli, ['stop'], startDir, workspaceId).catch(() => {})
+  await runRelayfile(cli, ['start', workspaceId, '.integrations', '--background'], startDir, workspaceId)
+}
+
+async function spawnMountViaRawBinary(workspaceId: string, startDir: string): Promise<void> {
+  // Search from the deployment dir (where factory.config.json + the bundled
+  // @relayfile/mount live), not this module's install location.
+  const binaryPath = resolveRelayfileMountBinary(startDir)
+  await runRelayfile(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], startDir, workspaceId)
+}
+
+function runRelayfile(command: string, args: string[], startDir: string, workspaceId: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], {
+    const child = spawn(command, args, {
       cwd: startDir,
       stdio: ['ignore', 'ignore', 'pipe'],
     })
@@ -74,14 +129,14 @@ async function spawnMount(workspaceId: string, startDir: string): Promise<void> 
         return
       }
       if (code !== 0) {
-        reject(new Error(`[factory] relayfile mount start failed (exit ${code ?? 'null'}): ${stderr.trim()}`))
+        reject(new Error(`[factory] relayfile mount ${args[0]} failed (exit ${code ?? 'null'}): ${stderr.trim()}`))
         return
       }
       resolve()
     })
 
     child.on('error', (err: Error) => {
-      reject(new Error(`[factory] relayfile mount start error: ${err.message}`))
+      reject(new Error(`[factory] relayfile mount ${args[0]} error: ${err.message}`))
     })
   })
 }

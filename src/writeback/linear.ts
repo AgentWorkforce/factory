@@ -1,4 +1,4 @@
-import { linearCommentPath, linearIssuePath } from '../constants/linear'
+import { linearByIdPath, linearByUuidPath, linearCommentPath, linearIssuePath } from '../constants/linear'
 import type { MountClient } from '../ports'
 import type { Logger } from '../ports/system'
 import { assertInFactoryScope, isInFactoryScope } from '../safety/factory-scope'
@@ -70,16 +70,46 @@ const payloadInFactoryScope = (
   return isInFactoryScope(scopeIssueFromPayload(payload, 'createIssue payload'), safety)
 }
 
+const hasGuardFields = (payload: Record<string, unknown>): boolean =>
+  typeof payload.title === 'string' || Array.isArray(payload.labels) || asRecord(payload.team) !== undefined
+
 const readIssuePayloadForGuard = async (
   mount: MountClient,
   issue: LinearIssue,
 ): Promise<Record<string, unknown>> => {
-  const path = issuePath(issue)
-  try {
-    return wrappedPayload((await mount.readFile(path)).content)
-  } catch {
-    throw new Error(`Refusing Linear writeback for ${issue.key}: unable to read guard fields from ${path}`)
+  // The primary <key>__<uuid>.json may be a change-event STUB (no title/labels/
+  // team — the sparse-sync case); fall back to the canonical by-id/by-uuid
+  // records so the factory-scope guard sees the real fields and doesn't refuse a
+  // legitimately-[factory] issue.
+  const candidates = [
+    issuePath(issue),
+    ...(issue.key ? [linearByIdPath(issue.key)] : []),
+    ...(issue.uuid ? [linearByUuidPath(issue.uuid)] : []),
+  ]
+  let primaryPayload: Record<string, unknown> | undefined
+  let lastError: unknown
+  for (const path of candidates) {
+    try {
+      const payload = wrappedPayload((await mount.readFile(path)).content)
+      if (primaryPayload === undefined) {
+        primaryPayload = payload
+      }
+      if (hasGuardFields(payload)) {
+        return payload
+      }
+    } catch (error) {
+      lastError = error
+    }
   }
+  // No record carried guard fields. Preserve prior behavior: return the primary
+  // payload (the scope guard then decides) rather than failing the read outright.
+  if (primaryPayload !== undefined) {
+    return primaryPayload
+  }
+  throw new Error(
+    `Refusing Linear writeback for ${issue.key}: unable to read guard fields` +
+    (lastError instanceof Error ? ` (${lastError.message})` : ''),
+  )
 }
 
 interface CachedIssuePayload {
@@ -100,6 +130,10 @@ const createIssuePath = (payload: LinearCreateIssuePayload): string => {
 const looksLikeProviderIssueIdentifier = (value: string): boolean =>
   /^[A-Z][A-Z0-9]*-/u.test(value)
 
+const READBACK_CONFIRM_ATTEMPTS = 3
+const READBACK_CONFIRM_DELAY_MS = 250
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 const confirmWriteback = async (
   mount: MountClient,
   path: string,
@@ -107,13 +141,27 @@ const confirmWriteback = async (
   logger: Pick<Logger, 'warn'>,
 ): Promise<void> => {
   await assertWritebackAcked(mount, path)
-  try {
-    if (!await verify()) {
-      logger.warn?.(`[factory-sdk] Linear writeback read-back verification failed for ${path}; treating getOp ack as success`)
+  // getOp can return a FAKED success on a busy/wedged mount ("workspace write
+  // path is busy"), so the read-back is the source of truth. Retry to absorb
+  // eventual-consistency lag; if it never confirms, the write did NOT land —
+  // throw instead of silently faking success (which previously left issues
+  // un-advanced while the factory believed they had advanced).
+  for (let attempt = 0; attempt < READBACK_CONFIRM_ATTEMPTS; attempt += 1) {
+    let confirmed = false
+    try {
+      confirmed = await verify()
+    } catch {
+      confirmed = false
     }
-  } catch (error) {
-    logger.warn?.(`[factory-sdk] Linear writeback read-back verification errored for ${path}; treating getOp ack as success`, error)
+    if (confirmed) {
+      return
+    }
+    if (attempt < READBACK_CONFIRM_ATTEMPTS - 1) {
+      logger.warn?.(`[factory-sdk] Linear writeback read-back for ${path} not yet confirmed (attempt ${attempt + 1}/${READBACK_CONFIRM_ATTEMPTS}); retrying`)
+      await delay(READBACK_CONFIRM_DELAY_MS)
+    }
   }
+  throw new Error(`[factory-sdk] Linear writeback for ${path} acked but the read-back never confirmed it landed; the write did not propagate`)
 }
 
 const assertWritebackAcked = async (

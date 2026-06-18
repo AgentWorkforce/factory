@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { dirname, isAbsolute, resolve } from 'node:path'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
@@ -186,6 +186,10 @@ export class FactoryLoop implements Factory {
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
+  // Agents we've already logged an ambiguous-PID-lookup warning for, so the
+  // reaper doesn't spam the same benign "ambiguous process lookup" line on every
+  // poll (a joined/cloud agent has no local PID to resolve — expected).
+  readonly #ambiguousLookupWarned = new Set<string>()
   // Last invalid-label failure signature we posted per issue, so a stuck Ready
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
@@ -318,7 +322,24 @@ export class FactoryLoop implements Factory {
         },
       }
       const descriptors = await deriveDescriptorsFromMount(reader)
-      this.#integrationInstructions = prescriptiveInstructions(descriptors)
+      // The package emits paths relative to the daemon's .integrations mount,
+      // but the agent runs in its repo clonePath — a relative `.integrations/...`
+      // path is unreachable from there. Absolutize every writeback path to the
+      // daemon's mount root so the prescriptive instructions are actionable.
+      const root = this.#integrationsMountRoot()
+      const abs = (p: string): string => (isAbsolute(p) ? p : resolve(root, '..', p))
+      const absoluteDescriptors = descriptors.map((descriptor) => ({
+        ...descriptor,
+        mountRoot: abs(descriptor.mountRoot),
+        ...(descriptor.discoveryRoot ? { discoveryRoot: abs(descriptor.discoveryRoot) } : {}),
+        writableResources: descriptor.writableResources.map((res) => ({
+          ...res,
+          path: abs(res.path),
+          ...(res.createExamplePath ? { createExamplePath: abs(res.createExamplePath) } : {}),
+          ...(res.schemaPath ? { schemaPath: abs(res.schemaPath) } : {}),
+        })),
+      }))
+      this.#integrationInstructions = prescriptiveInstructions(absoluteDescriptors)
       return this.#integrationInstructions
     } catch {
       this.#logger.warn?.('[factory] failed to resolve integration instructions from mount')
@@ -1896,7 +1917,10 @@ export class FactoryLoop implements Factory {
       return { pids: [scan.identity.pid], status: 'found' }
     }
     if (scan.status === 'ambiguous') {
-      this.#logger.warn?.(`[factory] ambiguous process lookup for ${agentName}`)
+      if (!this.#ambiguousLookupWarned.has(agentName)) {
+        this.#ambiguousLookupWarned.add(agentName)
+        this.#logger.warn?.(`[factory] ambiguous process lookup for ${agentName} (suppressing repeats)`)
+      }
       return { pids: [], status: 'unresolved' }
     }
 
@@ -2116,6 +2140,12 @@ export class FactoryLoop implements Factory {
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
+          // Already resumed once and STILL exiting with no completion PR — the
+          // agent isn't making progress. Escalate so a human notices, instead of
+          // leaving the issue silently in-flight forever.
+          if (tracked.spec.role === 'implementer') {
+            await this.#escalateStalledIssue(record, name)
+          }
           return
         }
 
@@ -2169,6 +2199,30 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#error(error, record.issue)
+    }
+  }
+
+  // An implementer that exited, was resumed once, and STILL produced no PR is
+  // not making progress. Surface it (counter + a best-effort Slack note to the
+  // dispatch thread) so a human can step in, instead of the issue sitting
+  // silently "in flight" with nothing happening. We do NOT fake a Linear state
+  // change here (the mount may be wedged); the human owns the next step.
+  async #escalateStalledIssue(record: InFlightIssue, name: string): Promise<void> {
+    this.#increment('issuesStalledNoPr')
+    this.#logger.warn?.('[factory] implementer exited without a PR after a resume; escalating for human attention', {
+      issue: record.issue.key,
+      agent: name,
+    })
+    try {
+      const thread = await this.#slackDispatchThreadFor(record)
+      if (thread && this.#slack) {
+        await this.#slack.reply(
+          thread.threadId,
+          `:warning: ${record.issue.key}: the implementer exited without opening a PR (after a retry). It needs a human look.`,
+        )
+      }
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to post stalled-issue escalation to Slack', error)
     }
   }
 
@@ -2396,6 +2450,7 @@ export class FactoryLoop implements Factory {
           reviewerName,
           implementerNames,
           slackDispatchThread: await this.#slackDispatchThreadFor(record),
+          integrationsMountRoot: this.#integrationsMountRoot(),
           integrationInstructions,
         }),
         from: 'factory',
@@ -2670,6 +2725,7 @@ export class FactoryLoop implements Factory {
         implementerNames,
         pr: { number: prRef.prNumber, url: prRef.url },
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
+          integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
       })
 
@@ -3391,20 +3447,38 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const input = slackAnswerInput(liveRecord.issue, text)
     for (const recipient of new Set(recipients)) {
-      await this.#fleet.sendInput(recipient, input)
+      await this.#injectSlackReplyEvent(recipient, liveRecord.issue, text)
       this.#increment('slackAnswersInjected')
     }
   }
 
-  async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string } | undefined> {
+  // Inject the human's Slack reply into the agent framed as the
+  // <integration-event> the spawn prompt tells it to expect (not an ambiguous
+  // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
+  // event. (A broker confirmed-delivery path via waitForInjected is a possible
+  // robustness follow-up.)
+  async #injectSlackReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
+    await this.#fleet.sendInput?.(recipient, slackReplyEvent(issue, text))
+  }
+
+  // Absolute path to the local .integrations mount the daemon manages. The mount
+  // is created at the daemon's cwd (see ensureLocalMount), and spawned agents run
+  // in their repo clonePath, so writeback paths handed to agents must be absolute
+  // against this root rather than a bare relative `.integrations/...`.
+  #integrationsMountRoot(): string {
+    return resolve(process.cwd(), '.integrations')
+  }
+
+  async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string; mountRoot: string } | undefined> {
     if (!this.#config.slack) {
       return undefined
     }
 
     const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
-    return threadId ? { channel: this.#config.slack.channel, threadId } : undefined
+    return threadId
+      ? { channel: this.#config.slack.channel, threadId, mountRoot: this.#integrationsMountRoot() }
+      : undefined
   }
 
   async #runCompletionMergeGate(issue: LinearIssue): Promise<void> {
@@ -4782,6 +4856,12 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
 
 const slackAnswerInput = (issue: IssueRef, text: string): string =>
   `Slack reply for ${issue.key}:\n${text}\r`
+
+// The human's Slack-thread reply, framed as an <integration-event> the agent is
+// told (at spawn) to expect — a recognizable injected event, not an ambiguous
+// keystroke. Trailing CR submits it to the agent's PTY.
+const slackReplyEvent = (issue: IssueRef, text: string): string =>
+  `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
 
 const isFactoryQuestionTarget = (target: string): boolean => {
   const normalized = target.trim().replace(/^@/u, '').toLowerCase()

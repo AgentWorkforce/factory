@@ -52,7 +52,7 @@ describe('renderAgentTask', () => {
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
     expect(task).toContain('Wait for a DM from the implementer(s): ar-123-impl-ui, ar-123-impl-broker.')
-    expect(task).toContain('Read the PR diff via `.integrations/github/repos`.')
+    expect(task).toContain('Read the PR diff via .integrations/github/repos.')
     expect(task).toContain('Post review comments via the GitHub writeback path.')
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
     expect(task).toContain('DM `broker` when the review cycle is complete.')
@@ -67,7 +67,7 @@ describe('renderAgentTask', () => {
       reviewerName: 'ar-123-review',
       implementerNames: ['ar-123-impl'],
       pr: { number: 482, url: 'https://github.com/AgentWorkforce/pear/pull/482' },
-      slackDispatchThread: { channel: 'C123', threadId: '170.000' },
+      slackDispatchThread: { channel: 'C123', threadId: '170.000', mountRoot: '/work/.integrations' },
     })
 
     // Carries the original spec (definition of done) and the open PR ref.
@@ -195,12 +195,12 @@ describe('renderAgentTask', () => {
       role: 'implementer',
       config: baseConfig,
       reviewerName: 'ar-123-review',
-      slackDispatchThread: { channel: 'C123', threadId: '169.000' },
+      slackDispatchThread: { channel: 'C123', threadId: '169.000', mountRoot: '/work/.integrations' },
     })
 
     // The Slack-thread writeback replaces the old relay DM pattern.
     expect(task).toContain('write your question to this issue\'s Slack dispatch thread via the .integrations mount')
-    expect(task).toContain('Write path: .integrations/slack/channels/C123/messages/169_000/replies/question.json')
+    expect(task).toContain('Write path: /work/.integrations/slack/channels/C123/messages/169_000/replies/question.json')
     expect(task).toContain('Write a JSON object with a "text" field')
     expect(task).toContain('Continue with safe reversible work while waiting for a reply.')
     // No relay DM or legacy patterns.

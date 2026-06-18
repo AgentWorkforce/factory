@@ -245,7 +245,10 @@ describe('MountLinearWriteback', () => {
     await expect(linear.verify(issue, { stateId: 'implementing-state' })).rejects.toThrow(/not acked/)
   })
 
-  it('treats stale read-back as advisory after getOp ack for state, comment, and create writebacks', async () => {
+  it('throws (no faked success) when the read-back never confirms the write landed', async () => {
+    // A getOp ack can be faked-success by a busy/wedged mount; if the read-back
+    // never reflects the write, it did NOT land — the writeback must fail loudly
+    // rather than leave the caller believing it advanced.
     class StaleMountClient extends FakeMountClient {
       override async writeFile(path: string, content: unknown): Promise<void> {
         await super.writeFile(path, content)
@@ -262,29 +265,17 @@ describe('MountLinearWriteback', () => {
     const mount = new StaleMountClient({
       [issuePath]: wrappedIssueRecord(),
     })
-    const warnings: unknown[][] = []
-    const linear = MountLinearWriteback(mount, {
-      logger: {
-        warn: (...args: unknown[]) => warnings.push(args),
-      },
-    })
+    const linear = MountLinearWriteback(mount, { logger: { warn: () => {} } })
 
-    await expect(linear.setState(issue, 'implementing-state')).resolves.toBeUndefined()
-    await expect(linear.postComment(issue, 'Agent dispatched after stale mirror')).resolves.toBeUndefined()
+    await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/read-back never confirmed it landed/u)
+    await expect(linear.postComment(issue, 'Agent dispatched after stale mirror')).rejects.toThrow(/read-back never confirmed it landed/u)
     await expect(linear.createIssue({
       id: 'uuid-stale-create',
       identifier: 'AR-STALE',
       title: '[factory-e2e] synthetic issue with stale mirror',
       team: { key: 'AR', name: 'Agent Relay' },
       stateId: 'ready-state',
-    })).resolves.toEqual({ path: '/linear/issues/factory-create-uuid-stale-create.json' })
-
-    expect(warnings).toHaveLength(3)
-    expect(warnings.map((warning) => warning[0])).toEqual([
-      `[factory-sdk] Linear writeback read-back verification failed for ${issuePath}; treating getOp ack as success`,
-      expect.stringMatching(/^\[factory-sdk\] Linear writeback read-back verification failed for \/linear\/issues\/[^/]+\/comments\/AR-99__factory-/u),
-      '[factory-sdk] Linear writeback read-back verification failed for /linear/issues/factory-create-uuid-stale-create.json; treating getOp ack as success',
-    ])
+    })).rejects.toThrow(/read-back never confirmed it landed/u)
   })
 
   it('refuses setState and postComment on an issue without factory-e2e before writing', async () => {

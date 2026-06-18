@@ -164,6 +164,69 @@ describe('resolveFactoryStates', () => {
       states: { readyForAgent: 'Done', agentImplementing: 'Done', inPlanning: 'Done', done: 'Done' },
     })).rejects.toThrow(/ambiguous/)
   })
+
+  it('tolerates a team-less-ambiguous global default when each subscribed team resolves', async () => {
+    // The factory's default state NAMES exist in BOTH teams, so a team-less
+    // lookup is ambiguous — but with teams configured, per-team resolution is
+    // authoritative and startup must NOT fail (regression guard for the
+    // global-default-forces-teamless-lookup P1).
+    const reader = makeReader(
+      [{ id: 'ar-r' }, { id: 'ar-i' }, { id: 'ar-p' }, { id: 'ar-d' }, { id: 'eng-r' }, { id: 'eng-i' }, { id: 'eng-p' }, { id: 'eng-d' }],
+      {
+        'ar-r': { name: 'Ready for Agent', team_key: 'AR' },
+        'ar-i': { name: 'Agent Implementing', team_key: 'AR' },
+        'ar-p': { name: 'In Planning', team_key: 'AR' },
+        'ar-d': { name: 'Done', team_key: 'AR' },
+        'eng-r': { name: 'Ready for Agent', team_key: 'ENG' },
+        'eng-i': { name: 'Agent Implementing', team_key: 'ENG' },
+        'eng-p': { name: 'In Planning', team_key: 'ENG' },
+        'eng-d': { name: 'Done', team_key: 'ENG' },
+      },
+    )
+    const states = await resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent', agentImplementing: 'Agent Implementing', inPlanning: 'In Planning', done: 'Done' },
+      teams: ['AR', 'ENG'],
+    })
+    expect(states.idFor('AR', 'readyForAgent')).toBe('ar-r')
+    expect(states.idFor('ENG', 'done')).toBe('eng-d')
+  })
+
+  it('surfaces an ambiguous OPTIONAL role instead of silently disabling it', async () => {
+    // humanReview is optional, but an ambiguous NAME is a real misconfig — it must
+    // throw, not resolve to undefined (which would quietly drop humanReview).
+    const reader = makeReader(
+      [{ id: 's1' }, { id: 's2' }, { id: 's3' }, { id: 's4' }, { id: 'h1' }, { id: 'h2' }],
+      {
+        s1: { name: 'Ready for Agent' },
+        s2: { name: 'Agent Implementing' },
+        s3: { name: 'In Planning' },
+        s4: { name: 'Done' },
+        h1: { name: 'In Human Review', team_key: 'AR' },
+        h2: { name: 'In Human Review', team_key: 'ENG' },
+      },
+    )
+    await expect(resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent', agentImplementing: 'Agent Implementing', inPlanning: 'In Planning', done: 'Done', humanReview: 'In Human Review' },
+    })).rejects.toThrow(/ambiguous/)
+  })
+
+  it('leaves an OPTIONAL role unresolved when the states catalog is unavailable', async () => {
+    // No /linear/states (e.g. unreadable under the mount token): required roles
+    // fall back to pinned UUIDs and the optional humanReview is left unresolved,
+    // rather than aborting startup.
+    const reader: LinearStateReader = {
+      async readFile() {
+        throw new Error('mount has no /linear/states')
+      },
+    }
+    const states = await resolveFactoryStates(reader, {
+      states: { humanReview: 'In Human Review' },
+      stateIds: { readyForAgent: 'x1', agentImplementing: 'x2', inPlanning: 'x3', done: 'x4' },
+    })
+    expect(states.idFor(undefined, 'readyForAgent')).toBe('x1')
+    expect(states.optionalIdFor(undefined, 'humanReview')).toBeUndefined()
+    expect(states.hasHumanReview()).toBe(false)
+  })
 })
 
 describe('stateResolutionFromIds', () => {

@@ -220,7 +220,7 @@ class FailingSlackAnswerFleetClient extends FakeFleetClient {
   failuresRemaining = 1
 
   override async sendInput(name: string, data: string): Promise<void> {
-    if (data.startsWith('Slack reply for ') && this.failuresRemaining > 0) {
+    if (data.startsWith('<integration-event source="slack"') && this.failuresRemaining > 0) {
       this.failuresRemaining -= 1
       throw new Error('sendInput failed')
     }
@@ -2941,10 +2941,11 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toEqual([])
   })
 
-  it('does not dispatch issues that carry only a state_name (no resolvable state id)', async () => {
-    // Without a resolvable state.id (and no hardcoded name->id map), a
-    // state_name-only record can't be matched to the readyForAgent role, so it
-    // is left alone rather than mis-dispatched.
+  it('does not dispatch issues whose state_name matches no configured role (no resolvable state id)', async () => {
+    // A state_name-only record whose name is NOT in linear.states (nor a default
+    // role name) can't be matched to the readyForAgent role, so it is left alone
+    // rather than mis-dispatched. (A conventional name like "Ready for Agent"
+    // DOES resolve via the default name map — see the canonical-fallback test.)
     const path = issuePath(27)
     const stateNameOnly = {
       provider: 'linear',
@@ -2954,7 +2955,7 @@ describe('FactoryLoop', () => {
         ...issuePayload(27),
         stateId: undefined,
         state: undefined,
-        state_name: 'Ready for Agent',
+        state_name: 'Some Workspace-Specific Column',
       },
     }
     const mount = new FakeMountClient({ [path]: stateNameOnly })
@@ -6543,7 +6544,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-24-impl-pear', data: 'Slack reply for AR-24:\nPlease use the existing retry helper.\r' },
+      { name: 'ar-24-impl-pear', data: '<integration-event source="slack" issue="AR-24">\nHuman reply in the Slack thread:\nPlease use the existing retry helper.\n</integration-event>\r' },
     ])
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
@@ -6598,7 +6599,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-36-impl-pear', data: 'Slack reply for AR-36:\nUse the shared retry helper in factory.ts.\r' },
+      { name: 'ar-36-impl-pear', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
     ])
     expect(fleet.messages).toHaveLength(2)
   })
@@ -6727,7 +6728,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-32-impl-pear', data: 'Slack reply for AR-32:\nstatus?\r' },
+      { name: 'ar-32-impl-pear', data: '<integration-event source="slack" issue="AR-32">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
     ])
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
@@ -6818,7 +6819,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-35-impl-pear', data: 'Slack reply for AR-35:\nstatus?\r' },
+      { name: 'ar-35-impl-pear', data: '<integration-event source="slack" issue="AR-35">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6914,7 +6915,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-27-impl-pear', data: 'Slack reply for AR-27:\nnew status?\r' },
+      { name: 'ar-27-impl-pear', data: '<integration-event source="slack" issue="AR-27">\nHuman reply in the Slack thread:\nnew status?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -6955,7 +6956,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-80-impl-pear', data: 'Slack reply for AR-80:\nhow is it going?\r' },
+      { name: 'ar-80-impl-pear', data: '<integration-event source="slack" issue="AR-80">\nHuman reply in the Slack thread:\nhow is it going?\n</integration-event>\r' },
     ])
   })
 
@@ -6999,7 +7000,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(restartFleet)).toEqual([
-      { name: 'ar-81-impl-pear', data: 'Slack reply for AR-81:\nany update?\r' },
+      { name: 'ar-81-impl-pear', data: '<integration-event source="slack" issue="AR-81">\nHuman reply in the Slack thread:\nany update?\n</integration-event>\r' },
     ])
 
     await restarted.stop()
@@ -7052,7 +7053,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-28-impl-pear', data: 'Slack reply for AR-28:\nstatus?\r' },
+      { name: 'ar-28-impl-pear', data: '<integration-event source="slack" issue="AR-28">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -7092,7 +7093,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-42-impl-pear', data: 'Slack reply for AR-42:\nstatus?\r' },
+      { name: 'ar-42-impl-pear', data: '<integration-event source="slack" issue="AR-42">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -7171,7 +7172,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-30-impl-pear', data: 'Slack reply for AR-30:\nstatus again?\r' },
+      { name: 'ar-30-impl-pear', data: '<integration-event source="slack" issue="AR-30">\nHuman reply in the Slack thread:\nstatus again?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -7219,7 +7220,7 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-31-impl-pear', data: 'Slack reply for AR-31:\nstatus?\r' },
+      { name: 'ar-31-impl-pear', data: '<integration-event source="slack" issue="AR-31">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
     ])
     expect(slackReplyWrites(mount)).toEqual([])
     expect(warnings.flat()).not.toContain('[factory] Slack reply event missing stable identity; falling back to path/content dedupe')

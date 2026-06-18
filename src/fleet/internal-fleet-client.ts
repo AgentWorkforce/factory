@@ -624,6 +624,16 @@ function relayMcpEnv(agentName: string, agentToken?: string): Record<string, str
   if (workspaceKey) {
     env.RELAY_WORKSPACE_KEY = workspaceKey
     env.RELAY_API_KEY = workspaceKey
+  } else {
+    // No workspace key in the daemon env: the spawned agent's agent-relay MCP
+    // will boot WITHOUT credentials, so it joins a bare relaycast workspace and
+    // can't reach .integrations (no GitHub reads, no Slack/Linear writebacks).
+    // That silently breaks the whole dispatch — make it loud so it's diagnosable.
+    console.warn(
+      `[factory] spawning ${agentName} with NO relay workspace key ` +
+        '(set RELAY_WORKSPACE_KEY / AGENT_RELAY_WORKSPACE_KEY / RELAY_API_KEY); ' +
+        'its agent-relay MCP cannot reach .integrations — writebacks and GitHub reads will fail.',
+    )
   }
   const baseUrl = nonEmpty(process.env.RELAY_BASE_URL)
   if (baseUrl) env.RELAY_BASE_URL = baseUrl

@@ -20,6 +20,8 @@
   "files": [
     "dist",
     "bin/factory.mjs",
+    "scripts/factory-canary.sh",
+    "scripts/com.agentrelay.factory-canary.plist.example",
     "package.json",
     "README.md"
   ],
