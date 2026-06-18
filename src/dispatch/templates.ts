@@ -30,6 +30,13 @@ export interface RenderAgentTaskInput {
   slackDispatchThread?: {
     channel: string
     threadId: string
+    /**
+     * Absolute path to the .integrations mount root the agent can write to. The
+     * agent runs in its repo clonePath, NOT the daemon's cwd where .integrations
+     * lives, so a bare relative `.integrations/...` path is unreachable — the
+     * writeback path must be absolute.
+     */
+    mountRoot: string
   }
   /** Pre-rendered writeback instructions for connected integrations. */
   integrationInstructions?: string
@@ -68,7 +75,9 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ? [
         '',
         'If you are blocked or need a human answer mid-task, write your question to this issue\'s Slack dispatch thread via the .integrations mount.',
-        `Write path: .integrations/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replace('.', '_')}/replies/question.json`,
+        // Absolute path: the agent runs in its repo clone, not the daemon cwd
+        // where .integrations lives, so a relative path would be unreachable.
+        `Write path: ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json`,
         'Write a JSON object with a "text" field containing your question.',
         'Continue with safe reversible work while waiting for a reply.',
       ]

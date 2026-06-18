@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { dirname, isAbsolute, resolve } from 'node:path'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
@@ -318,7 +318,24 @@ export class FactoryLoop implements Factory {
         },
       }
       const descriptors = await deriveDescriptorsFromMount(reader)
-      this.#integrationInstructions = prescriptiveInstructions(descriptors)
+      // The package emits paths relative to the daemon's .integrations mount,
+      // but the agent runs in its repo clonePath — a relative `.integrations/...`
+      // path is unreachable from there. Absolutize every writeback path to the
+      // daemon's mount root so the prescriptive instructions are actionable.
+      const root = this.#integrationsMountRoot()
+      const abs = (p: string): string => (isAbsolute(p) ? p : resolve(root, '..', p))
+      const absoluteDescriptors = descriptors.map((descriptor) => ({
+        ...descriptor,
+        mountRoot: abs(descriptor.mountRoot),
+        ...(descriptor.discoveryRoot ? { discoveryRoot: abs(descriptor.discoveryRoot) } : {}),
+        writableResources: descriptor.writableResources.map((res) => ({
+          ...res,
+          path: abs(res.path),
+          ...(res.createExamplePath ? { createExamplePath: abs(res.createExamplePath) } : {}),
+          ...(res.schemaPath ? { schemaPath: abs(res.schemaPath) } : {}),
+        })),
+      }))
+      this.#integrationInstructions = prescriptiveInstructions(absoluteDescriptors)
       return this.#integrationInstructions
     } catch {
       this.#logger.warn?.('[factory] failed to resolve integration instructions from mount')
@@ -3398,13 +3415,23 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string } | undefined> {
+  // Absolute path to the local .integrations mount the daemon manages. The mount
+  // is created at the daemon's cwd (see ensureLocalMount), and spawned agents run
+  // in their repo clonePath, so writeback paths handed to agents must be absolute
+  // against this root rather than a bare relative `.integrations/...`.
+  #integrationsMountRoot(): string {
+    return resolve(process.cwd(), '.integrations')
+  }
+
+  async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string; mountRoot: string } | undefined> {
     if (!this.#config.slack) {
       return undefined
     }
 
     const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
-    return threadId ? { channel: this.#config.slack.channel, threadId } : undefined
+    return threadId
+      ? { channel: this.#config.slack.channel, threadId, mountRoot: this.#integrationsMountRoot() }
+      : undefined
   }
 
   async #runCompletionMergeGate(issue: LinearIssue): Promise<void> {
