@@ -9,10 +9,15 @@ export interface EnsureRelayBrokerOptions {
   // When false, never start a broker — surface the connect error instead. This
   // lets callers opt back into strict reuse-only behavior.
   autoStart?: boolean
+  // Workspace key the spawned broker uses to JOIN the existing workspace instead
+  // of creating a new (colliding) one. Defaults to RELAY_WORKSPACE_KEY /
+  // AGENT_RELAY_WORKSPACE_KEY / RELAY_API_KEY from the env.
+  workspaceKey?: string
   logger?: Logger
   // Seams for tests so they never connect to or spawn a real broker.
   connect?: (options: { cwd?: string; connectionPath?: string }) => HarnessDriverClientLike
-  spawn?: (options: { cwd?: string }) => Promise<HarnessDriverClientLike>
+  spawn?: (options: { cwd?: string; workspaceKey?: string }) => Promise<HarnessDriverClientLike>
+  env?: NodeJS.ProcessEnv
 }
 
 export interface RelayBrokerHandle {
@@ -33,6 +38,7 @@ export interface RelayBrokerHandle {
 export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}): Promise<RelayBrokerHandle> {
   const connect = options.connect ?? ((opts) => HarnessDriverClient.connect(opts))
   const spawn = options.spawn ?? ((opts) => HarnessDriverClient.spawn(opts))
+  const env = options.env ?? process.env
 
   try {
     const client = connect({ cwd: options.cwd, connectionPath: options.connectionPath })
@@ -42,10 +48,36 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
     if (options.autoStart === false) {
       throw error
     }
+    // Spawn a broker. It must JOIN the existing workspace, not create a new one:
+    // a keyless `init` tries to create a workspace and collides ("failed to
+    // initialize relaycast session: insert into workspaces"). The workspace key
+    // (rk_live_…) makes the broker join. Pear injects it at spawn; standalone the
+    // operator supplies it via RELAY_WORKSPACE_KEY.
+    const workspaceKey = options.workspaceKey
+      ?? nonEmpty(env.RELAY_WORKSPACE_KEY)
+      ?? nonEmpty(env.AGENT_RELAY_WORKSPACE_KEY)
+      ?? nonEmpty(env.RELAY_API_KEY)
     options.logger?.info?.('[factory] no relay broker running; starting one', {
       reason: error instanceof Error ? error.message : String(error),
+      joiningWorkspace: Boolean(workspaceKey),
     })
-    const client = await spawn({ cwd: options.cwd })
-    return { client, started: true }
+    try {
+      const client = await spawn({ cwd: options.cwd, workspaceKey })
+      return { client, started: true }
+    } catch (spawnError) {
+      if (!workspaceKey) {
+        throw new Error(
+          'Failed to start a relay broker and no workspace key was available to join the existing workspace. ' +
+          'Set RELAY_WORKSPACE_KEY (your rk_live_… workspace key) so the broker can JOIN your workspace, ' +
+          'or start a broker first. ' +
+          `Underlying error: ${spawnError instanceof Error ? spawnError.message : String(spawnError)}`,
+          { cause: spawnError },
+        )
+      }
+      throw spawnError
+    }
   }
 }
+
+const nonEmpty = (value: string | undefined): string | undefined =>
+  typeof value === 'string' && value.trim().length > 0 ? value : undefined
