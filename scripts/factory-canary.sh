@@ -49,21 +49,32 @@ cd "$WORKDIR" || { echo "[$TS] factory-canary: cannot cd to $WORKDIR" >&2; exit 
 # JSON verdict {ok,issue,status,reason}; exit code mirrors ok. A hung run
 # (broker/mount wedge) is bounded by FACTORY_CANARY_TIMEOUT.
 RUN=(node "$BIN" factory canary "$ISSUE" --config "$CONFIG" --backend "$BACKEND")
+# A hung run (broker/mount wedge) MUST be bounded — an unbounded canary on a
+# scheduler (launchd/cron) can wedge the slot forever and suppress later alerts.
+# macOS has no `timeout` by default; coreutils ships it as `gtimeout`. If neither
+# is present, fail closed rather than run without a deadline.
+TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
-  OUT="$(timeout "$TIMEOUT" "${RUN[@]}" 2>/dev/null)"
-else
-  OUT="$("${RUN[@]}" 2>/dev/null)"
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
 fi
+if [[ -z "$TIMEOUT_BIN" ]]; then
+  echo "[$TS] factory-canary: no timeout utility found (install coreutils for 'timeout'/'gtimeout'); refusing to run unbounded" >&2
+  exit 1
+fi
+OUT="$("$TIMEOUT_BIN" "$TIMEOUT" "${RUN[@]}" 2>/dev/null)"
 CODE=$?
 if [[ $CODE -eq 124 ]]; then
   echo "[$TS] factory-canary: TIMED OUT after ${TIMEOUT}s (broker/mount may be wedged)" >&2
 fi
 
-VERDICT="$(printf '%s\n' "$OUT" | tail -1)"
-echo "[$TS] factory-canary $ISSUE -> $VERDICT (exit $CODE)"
+# The CLI prints a pretty-printed (multi-line) JSON verdict, so parse the whole
+# output — not just the last line (which is only the closing `}`).
+echo "[$TS] factory-canary $ISSUE -> exit $CODE"
 [[ $CODE -eq 0 ]] && exit 0
 
-REASON="$(printf '%s' "$VERDICT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const v=JSON.parse(s);console.log(`${v.status||"error"}: ${v.reason||"unknown"}`)}catch{console.log("unparseable verdict")}})' 2>/dev/null)"
+REASON="$(printf '%s' "$OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const v=JSON.parse(s);console.log(`${v.status||"error"}: ${v.reason||"unknown"}`)}catch{console.log("unparseable verdict")}})' 2>/dev/null)"
 MSG=":rotating_light: factory canary FAILED for ${ISSUE} — ${REASON}. Sync fidelity may have regressed (issue no longer dispatch-ready)."
 echo "[$TS] $MSG" >&2
 

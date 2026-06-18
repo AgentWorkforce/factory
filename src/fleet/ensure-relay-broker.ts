@@ -53,7 +53,7 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
     // initialize relaycast session: insert into workspaces"). The workspace key
     // (rk_live_…) makes the broker join. Pear injects it at spawn; standalone the
     // operator supplies it via RELAY_WORKSPACE_KEY.
-    const workspaceKey = options.workspaceKey
+    const workspaceKey = nonEmpty(options.workspaceKey)
       ?? nonEmpty(env.RELAY_WORKSPACE_KEY)
       ?? nonEmpty(env.AGENT_RELAY_WORKSPACE_KEY)
       ?? nonEmpty(env.RELAY_API_KEY)
@@ -79,5 +79,8 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
   }
 }
 
-const nonEmpty = (value: string | undefined): string | undefined =>
-  typeof value === 'string' && value.trim().length > 0 ? value : undefined
+const nonEmpty = (value: string | undefined): string | undefined => {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}

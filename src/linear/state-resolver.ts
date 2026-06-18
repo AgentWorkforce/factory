@@ -123,6 +123,14 @@ const str = (value: unknown): string | undefined => (typeof value === 'string' &
 
 // Lazily load and cache the /linear/states catalog. Only invoked when at least
 // one role is configured by name, so explicit-UUID setups never read it.
+// The states catalog could not be read at all (e.g. /linear/states unreadable
+// under the mount token). Distinct from a *resolution* failure (ambiguous name,
+// cross-team, no match) so optional roles can tolerate an absent catalog without
+// also swallowing genuine misconfiguration.
+class CatalogUnavailableError extends Error {}
+
+const isCatalogUnavailable = (error: unknown): boolean => error instanceof CatalogUnavailableError
+
 class StateCatalog {
   #records: StateRecord[] | undefined
   constructor(private readonly reader: LinearStateReader) {}
@@ -133,7 +141,7 @@ class StateCatalog {
     try {
       index = (await this.reader.readFile(STATES_INDEX_PATH)).content
     } catch (error) {
-      throw new Error(
+      throw new CatalogUnavailableError(
         `Cannot resolve Linear state names: ${STATES_INDEX_PATH} is unavailable ` +
         `(${error instanceof Error ? error.message : String(error)}). ` +
         `Deploy the workflow-states resource or pin stateIds (UUIDs) in config.`,
@@ -213,7 +221,14 @@ export async function resolveFactoryStates(
   // the states catalog is unavailable (e.g. /linear/states unreadable under the
   // mount token), fall back to the pinned UUID rather than failing startup — the
   // name still feeds the reverse name->id map below for read-side backfill.
-  const resolveRole = async (teamToken: string | undefined, role: FactoryStateRole): Promise<string | undefined> => {
+  // `tolerant` is for the team-less default pass when subscribed teams exist:
+  // each team is resolved authoritatively below, so a team-less ambiguity must
+  // not abort startup (addresses the global-default-forces-teamless-lookup P1).
+  const resolveRole = async (
+    teamToken: string | undefined,
+    role: FactoryStateRole,
+    tolerant: boolean,
+  ): Promise<string | undefined> => {
     const perTeamName = teamToken ? byTeamNames[norm(teamToken)]?.[role] : undefined
     const name = perTeamName ?? globalNames[role]
     if (name) {
@@ -222,11 +237,13 @@ export async function resolveFactoryStates(
       } catch (error) {
         // Fall back to the pinned UUID when the catalog can't resolve the name.
         if (explicitIds[role]) return explicitIds[role]
-        // No pinned UUID: a REQUIRED role must still fail loudly (preserves the
-        // clear ambiguous-name / cross-team / catalog-unavailable errors). But an
-        // OPTIONAL role (e.g. humanReview) with a default NAME but no UUID must
-        // not abort resolution on a catalog-less mount — leave it unresolved.
-        if (!REQUIRED_ROLES.includes(role)) return undefined
+        // Best-effort team-less default pass: another team will fill this role.
+        if (tolerant) return undefined
+        // An OPTIONAL role (e.g. humanReview) tolerates an *absent* catalog
+        // (no /linear/states under the mount token) — but a real resolution
+        // failure (ambiguous name, cross-team, no match) must still surface, even
+        // for optional roles, rather than silently disabling the role.
+        if (!REQUIRED_ROLES.includes(role) && isCatalogUnavailable(error)) return undefined
         throw error
       }
     }
@@ -242,10 +259,14 @@ export async function resolveFactoryStates(
   }
   const byTeam = new Map<string, RoleIds>()
 
-  const resolveAllRoles = async (teamToken: string | undefined, enforce: boolean): Promise<RoleIds> => {
+  const resolveAllRoles = async (
+    teamToken: string | undefined,
+    enforce: boolean,
+    tolerant = false,
+  ): Promise<RoleIds> => {
     const resolved: RoleIds = {}
     for (const role of FACTORY_STATE_ROLES) {
-      const id = await resolveRole(teamToken, role)
+      const id = await resolveRole(teamToken, role, tolerant)
       if (id) resolved[role] = id
     }
     const missing = REQUIRED_ROLES.filter((role) => !resolved[role])
@@ -262,8 +283,15 @@ export async function resolveFactoryStates(
   // global config meant to fill it; a per-team-only setup leaves it best-effort
   // (each subscribed team is enforced below, and idFor() throws at use if an
   // unconfigured team's issue ever appears).
+  //
+  // When teams ARE configured, the team-less default pass is tolerant: the
+  // factory's default `linear.states` names are global, so resolving them
+  // team-lessly would be ambiguous in a multi-team workspace and wrongly fail
+  // startup — even though each subscribed team resolves cleanly. Per-team passes
+  // (below) are authoritative; the team-less default is only a fallback.
   const hasGlobalConfig = Object.keys(globalNames).length > 0 || Object.keys(explicitIds).length > 0
-  const defaultIds = await resolveAllRoles(undefined, hasGlobalConfig)
+  const hasTeamScopes = teamTokenByNorm.size > 0
+  const defaultIds = await resolveAllRoles(undefined, hasGlobalConfig && !hasTeamScopes, hasTeamScopes)
   for (const [key, team] of teamTokenByNorm) {
     byTeam.set(key, await resolveAllRoles(team, true))
   }
