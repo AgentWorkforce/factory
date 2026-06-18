@@ -13,6 +13,12 @@ interface EnsureLocalMountOptions {
   // `rw_` handle). Passed through to the staleness check so a handle-vs-UUID
   // state.json does not register as a spurious mismatch.
   acceptableWorkspaceIds?: readonly string[]
+  // When true (default), a stale mount is auto-refreshed (re-spawned) instead of
+  // merely warned about. A standalone `relayfile start` mount has no supervisor,
+  // so it can silently stop reconciling — and the factory would then ship
+  // writebacks into a mirror that never propagates them. Set false to restore
+  // warn-only behavior.
+  refreshStaleMount?: boolean
 }
 
 export async function ensureLocalMount(
@@ -35,11 +41,33 @@ export async function ensureLocalMount(
   }
 
   const staleness = checkMountStaleness(stateFilePath, workspaceId, options.acceptableWorkspaceIds)
-  if (staleness.stale) {
-    const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
-    process.stderr.write(
-      `[factory] local mount is stale${suffix}; writeback may not propagate. Run: relayfile stop && relayfile start ${workspaceId} .integrations --background\n`,
+  if (!staleness.stale) return
+
+  const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
+  const manualHint = `Run: relayfile stop && relayfile start ${workspaceId} .integrations --background`
+
+  if (options.refreshStaleMount === false) {
+    process.stderr.write(`[factory] local mount is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
+    return
+  }
+
+  // Self-heal: re-spawn the mount so writebacks propagate, rather than silently
+  // shipping them into a stale mirror. spawnMount runs the relayfile-mount
+  // binary with --rehome, which re-establishes the mount in place.
+  process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+  try {
+    await spawnMount(workspaceId, startDir)
+    await waitForStateFile(
+      stateFilePath,
+      workspaceId,
+      options.stateWaitTimeoutMs,
+      options.stateWaitPollMs,
+      options.acceptableWorkspaceIds,
     )
+    process.stderr.write('[factory] local mount refreshed\n')
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
   }
 }
 

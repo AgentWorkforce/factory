@@ -82,6 +82,51 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('auto-refreshes a stale mount by re-spawning so writebacks propagate', async () => {
+    await withTempDir(async (dir) => {
+      await installFakeBinary(dir)
+      const stateDir = join(dir, '.integrations', '.relay')
+      const statePath = join(stateDir, 'state.json')
+      await mkdir(stateDir, { recursive: true })
+      // stale: last reconcile well past the staleness threshold.
+      await writeFile(statePath, JSON.stringify({
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      }), 'utf8')
+      mockSuccessfulSpawn(async () => {
+        await writeFile(statePath, JSON.stringify({
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+          pid: process.pid,
+        }), 'utf8')
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+      expect(spawnMock).toHaveBeenCalled()
+    })
+  })
+
+  it('warns without re-spawning a stale mount when refreshStaleMount is false', async () => {
+    await withTempDir(async (dir) => {
+      await installFakeBinary(dir)
+      const stateDir = join(dir, '.integrations', '.relay')
+      await mkdir(stateDir, { recursive: true })
+      await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      }), 'utf8')
+      mockSuccessfulSpawn()
+
+      await expect(ensureLocalMount('rw_test', dir, { refreshStaleMount: false })).resolves.toBeUndefined()
+      expect(spawnMock).not.toHaveBeenCalled()
+    })
+  })
+
   it('rejects a malformed state file instead of silently continuing', async () => {
     await withTempDir(async (dir) => {
       await installFakeBinary(dir)
