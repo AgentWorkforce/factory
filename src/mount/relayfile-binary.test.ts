@@ -27,7 +27,7 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 
 async function writeState(
   dir: string,
-  state: { workspaceId?: string; lastReconcileAt?: string; pid?: number },
+  state: { workspaceId?: string; lastReconcileAt?: string; pid?: number; daemon?: { pid?: number } },
 ): Promise<string> {
   const statePath = join(dir, 'state.json')
   await writeFile(statePath, JSON.stringify(state), 'utf8')
@@ -167,6 +167,62 @@ describe('checkMountStaleness', () => {
         reason: 'mount process (pid 12345) is not running',
         pid: 12345,
       })
+    })
+  })
+
+  it('treats a fresh pid-less state as healthy (CLI-daemonized mount records no pid)', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        // no pid: relayfile start --background does not always record one
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false })
+    })
+  })
+
+  it('uses daemon.pid for liveness when the top-level pid is absent (CLI-daemonized mount)', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        daemon: { pid: process.pid },
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false, pid: process.pid })
+    })
+  })
+
+  it('marks a stale mount via a dead daemon.pid even within the reconcile window', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        daemon: { pid: 12345 },
+      })
+      vi.spyOn(process, 'kill').mockImplementation(() => {
+        throw Object.assign(new Error('not found'), { code: 'ESRCH' })
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({
+        stale: true,
+        reason: 'mount process (pid 12345) is not running',
+        pid: 12345,
+      })
+    })
+  })
+
+  it('still marks a pid-less state stale when the reconcile timestamp is old', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+      })
+
+      const result = checkMountStaleness(statePath, 'rw_test')
+      expect(result.stale).toBe(true)
+      expect(result.reason).toMatch(/^last reconcile 16m ago$/u)
     })
   })
 
