@@ -231,6 +231,43 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('confirms a CLI mount that records its pid under daemon.pid (not top-level pid)', async () => {
+    await withTempDir(async (dir) => {
+      const cli = join(dir, 'relayfile')
+      await writeFile(cli, '#!/bin/sh\n', 'utf8')
+      await chmod(cli, 0o755)
+      resolveCliMock.mockReturnValue(cli)
+      const stateDir = join(dir, '.integrations', '.relay')
+      const statePath = join(stateDir, 'state.json')
+
+      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+        const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter }
+        child.stderr = new EventEmitter()
+        const isStart = args[0] === 'start'
+        setTimeout(() => {
+          const finish = async (): Promise<void> => {
+            if (isStart) {
+              await mkdir(stateDir, { recursive: true })
+              // CLI-daemonized mount: pid lives under daemon.pid, no top-level pid.
+              await writeFile(statePath, JSON.stringify({
+                workspaceId: 'rw_test',
+                lastReconcileAt: new Date().toISOString(),
+                daemon: { pid: process.pid },
+              }), 'utf8')
+            }
+          }
+          void finish().then(() => child.emit('close', 0), () => child.emit('close', 1))
+        }, 0)
+        return child
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+    })
+  })
+
   it('rejects a malformed state file instead of silently continuing', async () => {
     await withTempDir(async (dir) => {
       await installFakeBinary(dir)

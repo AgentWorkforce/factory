@@ -19,7 +19,7 @@ type MountState = {
   daemon?: { pid?: unknown }
 }
 
-function coercePid(value: unknown): number | undefined {
+export function coercePid(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
 }
 
