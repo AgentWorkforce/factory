@@ -12,7 +12,15 @@ const NOT_FOUND_ERROR = '[factory] relayfile-mount binary not found. Install dep
 type MountState = {
   workspaceId?: unknown
   lastReconcileAt?: unknown
+  // The mount process pid. Older mounts wrote a top-level `pid`; the
+  // CLI-daemonized mount (`relayfile start --background`) records it under
+  // `daemon.pid` instead. Either may be absent.
   pid?: unknown
+  daemon?: { pid?: unknown }
+}
+
+function coercePid(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
 }
 
 function canExecute(filePath: string | undefined): filePath is string {
@@ -155,9 +163,8 @@ export function checkMountStaleness(
     }
   }
 
-  const pid = typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0
-    ? parsed.pid
-    : undefined
+  // Prefer the top-level pid; fall back to the CLI-daemonized mount's daemon.pid.
+  const pid = coercePid(parsed.pid) ?? coercePid(parsed.daemon?.pid)
 
   const lastReconcileAt = typeof parsed.lastReconcileAt === 'string'
     ? Date.parse(parsed.lastReconcileAt)
@@ -176,7 +183,12 @@ export function checkMountStaleness(
   }
 
   if (pid === undefined) {
-    return { stale: true, reason: 'mount process pid is missing' }
+    // Neither a top-level pid nor daemon.pid was recorded. The fresh
+    // lastReconcileAt validated above is itself proof the mount is live and
+    // reconciling, so fall back to that rather than declaring a healthy mount
+    // stale and forcing a spurious refresh (which previously tore down the live
+    // mount and then failed to re-spawn).
+    return { stale: false }
   }
 
   try {
