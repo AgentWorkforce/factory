@@ -6,6 +6,15 @@ import { checkMountStaleness, coercePid, resolveRelayfileCli, resolveRelayfileMo
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
+// How long to wait for a freshly-spawned mount to write a valid state.json
+// (workspace match + a live pid). A CLI mount over a large `.integrations` tree
+// can take well over 10s to complete its FIRST reconcile (early cycles hit
+// `context deadline exceeded` while it materializes the tree), so a 10s wait
+// reported a spurious "did not become ready" on a mount that was simply still
+// bootstrapping. 60s covers that without blocking startup indefinitely. Callers
+// can still override via `stateWaitTimeoutMs`.
+const DEFAULT_STATE_READY_TIMEOUT_MS = 60_000
+
 interface EnsureLocalMountOptions {
   stateWaitTimeoutMs?: number
   stateWaitPollMs?: number
@@ -144,7 +153,7 @@ function runRelayfile(command: string, args: string[], startDir: string, workspa
 async function waitForStateFile(
   stateFilePath: string,
   workspaceId: string,
-  timeoutMs = 10_000,
+  timeoutMs = DEFAULT_STATE_READY_TIMEOUT_MS,
   pollMs = 200,
   acceptableWorkspaceIds: readonly string[] = [],
 ): Promise<void> {
