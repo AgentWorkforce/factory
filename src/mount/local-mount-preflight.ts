@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
-import { checkMountStaleness, resolveRelayfileCli, resolveRelayfileMountBinary } from './relayfile-binary'
+import { checkMountStaleness, coercePid, resolveRelayfileCli, resolveRelayfileMountBinary } from './relayfile-binary'
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
@@ -175,14 +175,16 @@ function isValidMountState(
   acceptableWorkspaceIds: readonly string[] = [],
 ): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
-  const state = value as { workspaceId?: unknown; lastReconcileAt?: unknown; pid?: unknown }
+  const state = value as { workspaceId?: unknown; lastReconcileAt?: unknown; pid?: unknown; daemon?: { pid?: unknown } }
   const accepted = new Set([workspaceId, ...acceptableWorkspaceIds])
+  // A CLI-daemonized mount (`relayfile start --background`) records its pid under
+  // `daemon.pid`, not the top-level `pid` — accept either, matching
+  // checkMountStaleness (else a freshly-started CLI mount is never confirmed ready).
+  const pid = coercePid(state.pid) ?? coercePid(state.daemon?.pid)
   return typeof state.workspaceId === 'string' && accepted.has(state.workspaceId) &&
     typeof state.lastReconcileAt === 'string' &&
     Number.isFinite(Date.parse(state.lastReconcileAt)) &&
-    typeof state.pid === 'number' &&
-    Number.isInteger(state.pid) &&
-    state.pid > 0
+    pid !== undefined
 }
 
 const isAuthError = (stderr: string): boolean =>
