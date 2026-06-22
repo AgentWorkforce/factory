@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import type { CloseProbePrInput, Factory } from '../index'
+import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -314,6 +314,55 @@ describe('fleet CLI runtime', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('routes factory progress logs to stderr so run-once stdout stays JSON', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-logs-'))
+    try {
+      const configPath = await writeConfig(root)
+      const stdout = buffer()
+      const stderr = buffer()
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        dispose: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({
+          pulled: [],
+          triaged: [],
+          dispatched: [],
+          skipped: [],
+          dryRun: false,
+        })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+        on: vi.fn(() => () => undefined),
+      } as unknown as Factory
+      const createFactoryWithLog = vi.fn((_config, ports: FactoryPorts) => {
+        ports.logger?.info?.('[factory] run-once started', { dryRun: false })
+        return factory
+      }) as typeof createFactory
+
+      const code = await runFleetCli([
+        'run-once',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: createFactoryWithLog,
+        stdout,
+        stderr,
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(stdout.text())).toMatchObject({ dryRun: false, pulled: [] })
+      expect(stdout.text()).not.toContain('[factory]')
+      expect(stderr.text()).toContain('[factory] run-once started {\"dryRun\":false}')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('prints factory status from the top-level status command', async () => {

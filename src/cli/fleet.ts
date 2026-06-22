@@ -170,11 +170,13 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // /linear/states by name, with config.stateIds as an explicit-UUID
         // fallback. Nothing about state names/ids is hardcoded.
         const stateResolution = await (deps.resolveStates ?? defaultResolveStates)(mount, loaded.config)
+        const logger = streamLogger(err)
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
           stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
+          logger,
         })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
       }
@@ -487,14 +489,24 @@ async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefin
   // connection and needs no local broker.
   if (globals.backend === 'internal') {
     const stderr = deps.stderr ?? process.stderr
-    const logger: Logger = {
-      info: (message, ...args) => stderr.write(`${message}${formatLogArgs(args)}\n`),
-    }
+    const logger = streamLogger(stderr)
     const { client, started } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
     return createFleet({ backend: 'internal', cwd, connectionPath }, { harnessClient: client, ownsBroker: started })
   }
 
   return createFleet({ backend: globals.backend, cwd, connectionPath })
+}
+
+function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {
+  const write = (message: string, args: unknown[]) => {
+    stream.write(`${message}${formatLogArgs(args)}\n`)
+  }
+  return {
+    debug: (message, ...args) => write(message, args),
+    info: (message, ...args) => write(message, args),
+    warn: (message, ...args) => write(message, args),
+    error: (message, ...args) => write(message, args),
+  }
 }
 
 function formatLogArgs(args: unknown[]): string {
