@@ -142,6 +142,8 @@ describe('InternalFleetClient', () => {
         cwd: '/worktree',
         restartPolicy: { max_restarts: 2 },
         continueFrom: 'previous-session',
+        spawnMode: 'task_exit',
+        exitAfterTask: true,
         harnessConfig: expect.objectContaining({
           runtime: 'pty',
           command: 'codex',
@@ -215,6 +217,28 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('threads a resolved workspace key into spawned agent MCP env', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({
+      client: harness,
+      workspaceKey: 'rk_live_from_broker',
+      resolveAgentRelayMcpCommand: () => ({ command: '/usr/local/bin/node', args: ['/repo/node_modules/agent-relay/dist/cli/index.js', 'mcp'] }),
+    })
+
+    await fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      task: 'do work',
+    })
+
+    const env = harness.spawned[0]?.harnessConfig?.env
+    expect(env).toEqual(expect.objectContaining({
+      RELAY_WORKSPACE_KEY: 'rk_live_from_broker',
+      RELAY_API_KEY: 'rk_live_from_broker',
+    }))
+    expect(harness.spawned[0]?.harnessConfig?.args.join('\n')).toContain('"RELAY_WORKSPACE_KEY" = "rk_live_from_broker"')
+  })
+
   it('falls back to ordinary spawn when agent-relay MCP cannot be resolved', async () => {
     const harness = new FakeHarnessDriverClient()
     const logger = { warn: vi.fn() }
@@ -240,6 +264,8 @@ describe('InternalFleetClient', () => {
       cwd: '/worktree',
       restartPolicy: undefined,
       continueFrom: undefined,
+      spawnMode: 'task_exit',
+      exitAfterTask: true,
     })
     expect(logger.warn).toHaveBeenCalledWith(
       '[factory-sdk] agent-relay MCP command not found; spawning without MCP injection',

@@ -8,6 +8,7 @@ import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@a
 
 import type { AgentMessage, AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
+import { resolveRelayWorkspaceKey } from './relay-workspace-key'
 
 const requireForResolve = createRequire(import.meta.url)
 
@@ -41,6 +42,7 @@ export interface InternalFleetClientOptions {
   ownsBroker?: boolean
   cwd?: string
   connectionPath?: string
+  workspaceKey?: string
   resumeCapability?: Capability
   logger?: Logger
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
@@ -75,6 +77,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #ownsBroker: boolean
   readonly #cwd?: string
   readonly #connectionPath?: string
+  readonly #workspaceKey?: string
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
   readonly #resolveAgentRelayMcpCommand: () => AgentRelayMcpCommand | undefined
@@ -99,6 +102,7 @@ export class InternalFleetClient implements FleetClient {
   constructor(options: InternalFleetClientOptions = {}) {
     this.#cwd = options.cwd
     this.#connectionPath = options.connectionPath
+    this.#workspaceKey = options.workspaceKey
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
@@ -118,6 +122,8 @@ export class InternalFleetClient implements FleetClient {
       cwd: input.cwd ?? this.#cwd,
       restartPolicy: input.restartPolicy,
       continueFrom: input.sessionRef,
+      spawnMode: 'task_exit',
+      exitAfterTask: true,
     })
     const handle = await this.#client.spawnPty(spawnInput)
 
@@ -159,7 +165,7 @@ export class InternalFleetClient implements FleetClient {
 
     return {
       ...input,
-      harnessConfig: buildRelayMcpHarnessConfig(input, command),
+      harnessConfig: buildRelayMcpHarnessConfig(input, command, this.#workspaceKey),
     }
   }
 
@@ -555,8 +561,12 @@ export function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined 
   }
 }
 
-export function buildRelayMcpHarnessConfig(input: SpawnPtyInput, command: AgentRelayMcpCommand): NonNullable<SpawnPtyInput['harnessConfig']> {
-  const relayEnv = relayMcpEnv(input.name, input.agentToken)
+export function buildRelayMcpHarnessConfig(
+  input: SpawnPtyInput,
+  command: AgentRelayMcpCommand,
+  workspaceKey?: string,
+): NonNullable<SpawnPtyInput['harnessConfig']> {
+  const relayEnv = relayMcpEnv(input.name, input.agentToken, workspaceKey)
   return {
     runtime: 'pty',
     command: input.cli,
@@ -612,18 +622,16 @@ function stdioMcpServer(command: AgentRelayMcpCommand, relayEnv: Record<string, 
   }
 }
 
-function relayMcpEnv(agentName: string, agentToken?: string): Record<string, string> {
+function relayMcpEnv(agentName: string, agentToken?: string, workspaceKey?: string): Record<string, string> {
   const env: Record<string, string> = {
     RELAY_AGENT_NAME: agentName,
     RELAY_AGENT_TYPE: 'agent',
     RELAY_STRICT_AGENT_NAME: '1',
   }
-  const workspaceKey = nonEmpty(process.env.RELAY_WORKSPACE_KEY) ??
-    nonEmpty(process.env.AGENT_RELAY_WORKSPACE_KEY) ??
-    relayWorkspaceKeyFromApiKey(process.env.RELAY_API_KEY)
-  if (workspaceKey) {
-    env.RELAY_WORKSPACE_KEY = workspaceKey
-    env.RELAY_API_KEY = workspaceKey
+  const resolvedWorkspaceKey = resolveRelayWorkspaceKey({ workspaceKey })
+  if (resolvedWorkspaceKey) {
+    env.RELAY_WORKSPACE_KEY = resolvedWorkspaceKey
+    env.RELAY_API_KEY = resolvedWorkspaceKey
   } else {
     // No workspace key in the daemon env: the spawned agent's agent-relay MCP
     // will boot WITHOUT credentials, so it joins a bare relaycast workspace and
@@ -678,11 +686,6 @@ function tomlInlineTable(values: Record<string, string>): string {
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
   return trimmed || undefined
-}
-
-function relayWorkspaceKeyFromApiKey(value: string | undefined): string | undefined {
-  const trimmed = nonEmpty(value)
-  return trimmed?.startsWith('rk_live_') ? trimmed : undefined
 }
 
 function messageInputFrom(input: SendInput): SendMessageInput {

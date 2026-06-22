@@ -245,6 +245,39 @@ describe('MountLinearWriteback', () => {
     await expect(linear.verify(issue, { stateId: 'implementing-state' })).rejects.toThrow(/not acked/)
   })
 
+  it('waits through delayed Linear read-back propagation', async () => {
+    class EventuallyConsistentMountClient extends FakeMountClient {
+      staleReadsRemaining = new Map<string, number>()
+
+      override async writeFile(path: string, content: unknown): Promise<void> {
+        await super.writeFile(path, content)
+        this.staleReadsRemaining.set(path, 3)
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        const remaining = this.staleReadsRemaining.get(path) ?? 0
+        if (remaining > 0) {
+          this.staleReadsRemaining.set(path, remaining - 1)
+          return { content: { stateId: 'old-state' } }
+        }
+        return super.readFile(path)
+      }
+    }
+
+    const mount = new EventuallyConsistentMountClient({
+      [issuePath]: wrappedIssueRecord(),
+    })
+    const warn = () => {}
+    const linear = MountLinearWriteback(mount, {
+      logger: { warn },
+      readbackConfirmAttempts: 5,
+      readbackConfirmDelayMs: 1,
+    })
+
+    await expect(linear.setState(issue, 'implementing-state')).resolves.toBeUndefined()
+    expect(await linear.verify(issue, { stateId: 'implementing-state' })).toBe(true)
+  })
+
   it('throws (no faked success) when the read-back never confirms the write landed', async () => {
     // A getOp ack can be faked-success by a busy/wedged mount; if the read-back
     // never reflects the write, it did NOT land — the writeback must fail loudly
@@ -265,7 +298,11 @@ describe('MountLinearWriteback', () => {
     const mount = new StaleMountClient({
       [issuePath]: wrappedIssueRecord(),
     })
-    const linear = MountLinearWriteback(mount, { logger: { warn: () => {} } })
+    const linear = MountLinearWriteback(mount, {
+      logger: { warn: () => {} },
+      readbackConfirmAttempts: 3,
+      readbackConfirmDelayMs: 1,
+    })
 
     await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/read-back never confirmed it landed/u)
     await expect(linear.postComment(issue, 'Agent dispatched after stale mirror')).rejects.toThrow(/read-back never confirmed it landed/u)

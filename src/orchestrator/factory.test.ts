@@ -4467,7 +4467,7 @@ describe('FactoryLoop', () => {
     const mirrorIssue = realIssueFile(724, ready, {
       labels: [],
       title: '[factory] GitHub mirror without synced labels',
-      description: 'Issue body\n\nSource: https://github.com/AgentWorkforce/relayfile-adapters/issues/224',
+      description: 'Issue body\n\nSource: [https://github.com/AgentWorkforce/relayfile-adapters/issues/224](<https://github.com/AgentWorkforce/relayfile-adapters/issues/224>)',
     })
     const mount = new FakeMountClient({ [issuePath(724)]: mirrorIssue })
     const fleet = new FakeFleetClient()

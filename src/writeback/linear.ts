@@ -22,6 +22,8 @@ export interface MountLinearWritebackConfig {
     requireTeamKey?: string
   }
   logger?: Pick<Logger, 'warn'>
+  readbackConfirmAttempts?: number
+  readbackConfirmDelayMs?: number
 }
 
 export interface LinearCreateIssuePayload extends Record<string, unknown> {
@@ -130,8 +132,8 @@ const createIssuePath = (payload: LinearCreateIssuePayload): string => {
 const looksLikeProviderIssueIdentifier = (value: string): boolean =>
   /^[A-Z][A-Z0-9]*-/u.test(value)
 
-const READBACK_CONFIRM_ATTEMPTS = 3
-const READBACK_CONFIRM_DELAY_MS = 250
+const READBACK_CONFIRM_ATTEMPTS = 30
+const READBACK_CONFIRM_DELAY_MS = 1000
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 const confirmWriteback = async (
@@ -139,6 +141,7 @@ const confirmWriteback = async (
   path: string,
   verify: () => Promise<boolean>,
   logger: Pick<Logger, 'warn'>,
+  options: { attempts: number; delayMs: number },
 ): Promise<void> => {
   await assertWritebackAcked(mount, path)
   // getOp can return a FAKED success on a busy/wedged mount ("workspace write
@@ -146,7 +149,7 @@ const confirmWriteback = async (
   // eventual-consistency lag; if it never confirms, the write did NOT land —
   // throw instead of silently faking success (which previously left issues
   // un-advanced while the factory believed they had advanced).
-  for (let attempt = 0; attempt < READBACK_CONFIRM_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < options.attempts; attempt += 1) {
     let confirmed = false
     try {
       confirmed = await verify()
@@ -156,9 +159,9 @@ const confirmWriteback = async (
     if (confirmed) {
       return
     }
-    if (attempt < READBACK_CONFIRM_ATTEMPTS - 1) {
-      logger.warn?.(`[factory-sdk] Linear writeback read-back for ${path} not yet confirmed (attempt ${attempt + 1}/${READBACK_CONFIRM_ATTEMPTS}); retrying`)
-      await delay(READBACK_CONFIRM_DELAY_MS)
+    if (attempt < options.attempts - 1) {
+      logger.warn?.(`[factory-sdk] Linear writeback read-back for ${path} not yet confirmed (attempt ${attempt + 1}/${options.attempts}); retrying`)
+      await delay(options.delayMs)
     }
   }
   throw new Error(`[factory-sdk] Linear writeback for ${path} acked but the read-back never confirmed it landed; the write did not propagate`)
@@ -174,12 +177,20 @@ const assertWritebackAcked = async (
   }
 }
 
+function positiveInteger(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback
+}
+
 export const MountLinearWriteback = (
   mount: MountClient,
   configOrStateIds?: LinearStateIds | MountLinearWritebackConfig,
 ) => {
   const safety = safetyFromConfig(configOrStateIds)
   const logger = (asRecord(configOrStateIds)?.logger as Pick<Logger, 'warn'> | undefined) ?? console
+  const readbackConfirm = {
+    attempts: positiveInteger(asRecord(configOrStateIds)?.readbackConfirmAttempts, READBACK_CONFIRM_ATTEMPTS),
+    delayMs: positiveInteger(asRecord(configOrStateIds)?.readbackConfirmDelayMs, READBACK_CONFIRM_DELAY_MS),
+  }
   const canonicalByPath = new Map<string, CachedIssuePayload>()
 
   const seedCanonical = (
@@ -255,7 +266,7 @@ export const MountLinearWriteback = (
         stateId,
       }, { guarded: true })
       updateCanonicalState(path, issue, canonical, stateId)
-      await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger)
+      await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
     },
 
     async postComment(issue: LinearIssue, body: string): Promise<void> {
@@ -264,7 +275,7 @@ export const MountLinearWriteback = (
       const name = linearCommentName(issue, body)
       const path = linearCommentPath(issuePath(issue), name)
       await mount.writeFile(path, linearCommentPayload(issue, body), { guarded: true })
-      await confirmWriteback(mount, path, () => verifyCommentReadback(mount, issue, name), logger)
+      await confirmWriteback(mount, path, () => verifyCommentReadback(mount, issue, name), logger, readbackConfirm)
     },
 
     async createIssue(payload: LinearCreateIssuePayload): Promise<{ path: string }> {
@@ -279,7 +290,7 @@ export const MountLinearWriteback = (
         } catch {
           return false
         }
-      }, logger)
+      }, logger, readbackConfirm)
       return { path }
     },
 
