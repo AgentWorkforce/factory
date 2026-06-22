@@ -4079,7 +4079,7 @@ export const githubIssuePathParts = (path: string): { owner: string; repo: strin
   // Keep the legacy flat and by-id forms for older mount state, and accept
   // metadata.json as a read-only compatibility alias for historical snapshots.
   const match = path.match(
-    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([^/]+)__([^/]+))\/issues\/(?:(?:by-id\/)?(\d+)\.json|(\d+)(?:__([^/]+))?\/(?:meta|metadata)\.json)$/u,
+    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(?:(?:by-id\/)?(\d+)\.json|(\d+)(?:__([^/]+))?\/(?:meta|metadata)\.json)$/u,
   )
   if (!match) {
     return undefined
@@ -4120,7 +4120,7 @@ const githubIssueReadCandidatePaths = (path: string): string[] => {
 }
 
 const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: string; number: number; slug?: string } | undefined => {
-  const match = path.match(/^\/github\/repos\/(?:([^/]+)\/([^/]+)|([^/]+)__([^/]+))\/issues\/(\d+)(?:__([^/]+))?$/u)
+  const match = path.match(/^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(\d+)(?:__([^/]+))?$/u)
   if (!match) {
     return undefined
   }

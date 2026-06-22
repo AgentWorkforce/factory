@@ -949,6 +949,18 @@ describe('FactoryLoop', () => {
     expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/2174/metadata.json')).toEqual(expected)
     expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/by-id/2174.json')).toEqual(expected)
     expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/by-id/2174.json')).toEqual(expected)
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud__platform/issues/by-id/2174.json')).toEqual({
+      owner: 'AgentWorkforce',
+      repo: 'cloud__platform',
+      number: 2174,
+      slug: undefined,
+    })
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud__platform/issues/2174__factory-path-regression/meta.json')).toEqual({
+      owner: 'AgentWorkforce',
+      repo: 'cloud__platform',
+      number: 2174,
+      slug: 'factory-path-regression',
+    })
   })
 
   it('LIVE_GITHUB_ISSUE_GLOB matches every supported relayfile issue shape under the real glob matcher', () => {
@@ -969,6 +981,8 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce__cloud/issues/2174/metadata.json',
       '/github/repos/AgentWorkforce__cloud/issues/2174__factory-path-regression/meta.json',
       '/github/repos/AgentWorkforce__pear/issues/1126__directory-event',
+      '/github/repos/AgentWorkforce__cloud__platform/issues/by-id/2174.json',
+      '/github/repos/AgentWorkforce__cloud__platform/issues/1126__directory-event',
     ]
     for (const path of supported) {
       expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, path)).toBe(true)
@@ -1191,7 +1205,7 @@ describe('FactoryLoop', () => {
     // listTree surfaces the issue directory alongside its meta.json file; both
     // resolve to the same metadata, so the backfill scan must collect only the
     // file path and skip the directory to avoid processing the issue twice.
-    const dirPath = '/github/repos/AgentWorkforce/pear/issues/1116__route-github-factory-issues'
+    const dirPath = '/github/repos/AgentWorkforce__pear__tools/issues/1116__route-github-factory-issues'
     const metaPath = `${dirPath}/meta.json`
     const mount = new FakeMountClient({
       [dirPath]: githubIssueFile(1116, { title: 'Directory and file both listed' }),
