@@ -248,6 +248,24 @@ class EscalatingTriage extends StaticTriage {
   }
 }
 
+class SlackClarifiedTriage extends EscalatingTriage {
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    if (issue.description.includes('Human clarification from Slack:')) {
+      const decision = await super.triage({
+        ...issue,
+        description: `${issue.description}\nImplement the clarified behavior and verify it with tests.`,
+      })
+      return {
+        ...decision,
+        thin: false,
+        confidence: 'high',
+        rationale: 'Human Slack clarification supplied enough acceptance detail.',
+      }
+    }
+    return super.triage(issue)
+  }
+}
+
 class SpawnFailingFleetClient extends FakeFleetClient {
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     this.spawns.push(input)
@@ -6782,7 +6800,7 @@ describe('FactoryLoop', () => {
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
       fleet,
-      triage: new EscalatingTriage({ rationale: 'No repository route matched.' }),
+      triage: new EscalatingTriage({ rationale: 'Matched repository from Linear label.' }),
       slack,
     })
 
@@ -6794,9 +6812,37 @@ describe('FactoryLoop', () => {
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-20: factory triage escalation for [factory-e2e] Fix factory issue 20')
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: No repository route matched.')
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Please clarify')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: Matched repository from Linear label.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Factory matched AgentWorkforce/pear. Please clarify the concrete expected behavior, constraints, and acceptance criteria/tests before dispatch.')
+    expect(factory.status().counters.errors).toBeUndefined()
+    expect(factory.status().counters.triageEscalations).toBe(1)
     expect(slack.roots).toEqual([])
+  })
+
+  it('uses a human Slack answer to retry pre-dispatch triage and dispatch when clarified', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(23)]: issueFile(23) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new SlackClarifiedTriage({ rationale: 'Matched repository from Linear label.' }),
+    })
+
+    await factory.runOnce()
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().counters.triageEscalations).toBe(1)
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-clarifies-23'), 'slack-human-clarifies-23', {
+      text: 'When deployed via ./workforce, one-click deploy in cloud should auto-join the configured Slack channel and ask there if blocked. Verify with tests.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.slackTriageAnswersDispatched).toBe(1))
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-23-impl-pear', 'ar-23-review'])
+    expect(factory.status().counters.slackTriageAnswersDispatched).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersStillEscalated).toBeUndefined()
+    expect(factory.status().counters.errors).toBeUndefined()
   })
 
   it('ignores a human Slack thread reply after the issue has no in-flight implementer', async () => {
