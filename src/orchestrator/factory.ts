@@ -2756,11 +2756,9 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    // Map the PR to an in-flight issue by its head ref (reuses the existing
-    // key matcher; no branch-naming assumption).
-    const headRef = snapshot.headRef ?? ''
-    const record = (await this.#batch()).inFlight.find((candidate) =>
-      !candidate.dryRun && headRef && containsIssueKey(headRef, candidate.issue.key))
+    // Map the PR to an in-flight issue using the same precedence as the
+    // post-merge path: branch name first, then title/body issue references.
+    const record = this.#inFlightIssueForPrSnapshot(snapshot, await this.#batch())
 
     if (prMetaShowsMerged(snapshot)) {
       await this.#advanceMergedPrToDone(snapshot, record)
@@ -2784,6 +2782,20 @@ export class FactoryLoop implements Factory {
     }
 
     await this.#ensureBabysitter(record, { repo: `${parts.owner}/${parts.repo}`, prNumber: snapshot.number, url: snapshot.url, path })
+  }
+
+  #inFlightIssueForPrSnapshot(snapshot: PullSnapshot, batch: BatchSnapshot): InFlightIssue | undefined {
+    let best: { record: InFlightIssue; score: number } | undefined
+    for (const record of batch.inFlight) {
+      if (record.dryRun) {
+        continue
+      }
+      const score = prSnapshotIssueMatchScore(snapshot, record.issue.key)
+      if (score > 0 && (!best || score > best.score)) {
+        best = { record, score }
+      }
+    }
+    return best?.record
   }
 
   async #advanceMergedPrToDone(snapshot: PullSnapshot, record?: InFlightIssue): Promise<void> {

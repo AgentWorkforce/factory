@@ -7637,6 +7637,40 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('spawns the babysitter from a PR body issue reference when the branch omits the issue key', async () => {
+    const issue = realIssueFile(408, ready, { title: 'Real babysitter body match' })
+    const mount = new FakeMountClient({ [issuePath(408)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 408 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(408), issue)))
+
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/408/metadata.json'
+      mount.files.set(prPath, {
+        content: {
+          number: 408,
+          state: 'open',
+          head_ref: 'feature/fix-ci',
+          body: 'Issue: AR-408',
+          isDraft: false,
+          url: 'https://github.com/AgentWorkforce/pear/pull/408',
+        },
+      })
+      mount.emit(changeEvent(prPath, 'pr-408-open'))
+
+      await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-408-babysit'))
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('spawns the babysitter from a flat <owner>__<repo> PR path layout', async () => {
     const issue = realIssueFile(409, ready, { title: 'Real babysitter flat layout' })
     const mount = new FakeMountClient({ [issuePath(409)]: issue })
