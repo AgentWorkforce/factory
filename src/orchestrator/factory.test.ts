@@ -739,6 +739,35 @@ class ListingReadTrackingMount extends FakeMountClient {
   }
 }
 
+class BlockingRelayfileReadMount extends FakeMountClient {
+  readonly started: Promise<void>
+  #releaseRead: (() => void) | undefined
+  #markStarted: () => void = () => undefined
+  #blocked = false
+
+  constructor(initialFiles: Record<string, unknown>, readonly targetPath: string) {
+    super(initialFiles)
+    this.started = new Promise((resolve) => {
+      this.#markStarted = resolve
+    })
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    if (path === this.targetPath && !this.#blocked) {
+      this.#blocked = true
+      this.#markStarted()
+      await new Promise<void>((resolve) => {
+        this.#releaseRead = resolve
+      })
+    }
+    return super.readFile(path)
+  }
+
+  releaseRead(): void {
+    this.#releaseRead?.()
+  }
+}
+
 class RecordingSlack implements SlackWriteback {
   readonly roots: Array<{ channel: string; text: string }> = []
   readonly replies: Array<{ threadId: string; text: string }> = []
@@ -1121,6 +1150,104 @@ describe('FactoryLoop', () => {
       },
     })
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
+  })
+
+  it('logs relayfile scan counts and the run-once summary during dry-run', async () => {
+    const ghPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 1116)
+    const infos: unknown[][] = []
+    const mount = new FakeMountClient({
+      [ghPath]: githubIssueFile(1116, {
+        owner: 'AgentWorkforce',
+        repo: 'pear',
+        title: 'Route GitHub factory issues',
+        body: 'Use progress logs for remote relayfile scans.',
+      }),
+    })
+    const factory = createFactory(config({
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {
+        info: (...args: unknown[]) => infos.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.runOnce({ dryRun: true })
+
+    expect(infos).toEqual(expect.arrayContaining([
+      ['[factory] run-once started', { dryRun: true }],
+      ['[factory] relayfile listTree completed', expect.objectContaining({
+        operation: 'listTree',
+        phase: 'GitHub issue ingestion',
+        prefix: '/github/repos',
+        count: 1,
+      })],
+      ['[factory] relayfile listTree completed', expect.objectContaining({
+        operation: 'listTree',
+        phase: 'GitHub mirror candidate loading',
+        prefix: '/linear/issues',
+        count: 0,
+      })],
+      ['[factory] relayfile listTree completed', expect.objectContaining({
+        operation: 'listTree',
+        phase: 'Linear ready issue alias discovery',
+        prefix: '/linear/issues/by-state/ready-for-agent/',
+        count: 0,
+      })],
+      ['[factory] GitHub issue ingestion completed', expect.objectContaining({
+        dryRun: true,
+        issues: 1,
+      })],
+      ['[factory] run-once completed', expect.objectContaining({
+        dryRun: true,
+        readyIssues: 0,
+        dispatched: 0,
+        relayfileWaitWarnings: 0,
+        relayfileSlowOperations: 0,
+        relayfileOperationFailures: 0,
+      })],
+    ]))
+  })
+
+  it('warns with the relayfile path while a remote read is still pending', async () => {
+    vi.useFakeTimers()
+    try {
+      const path = issuePath(18)
+      const warnings: unknown[][] = []
+      const mount = new BlockingRelayfileReadMount({ [path]: issueFile(18) }, path)
+      const factory = createFactory(config(), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        logger: {
+          warn: (...args: unknown[]) => warnings.push(args),
+          error: () => undefined,
+        },
+      })
+
+      const run = factory.runOnce({ dryRun: true })
+      await mount.started
+      await vi.advanceTimersByTimeAsync(15_000)
+
+      expect(warnings).toContainEqual([
+        '[factory] relayfile operation still waiting on relayfile cloud',
+        expect.objectContaining({
+          operation: 'readFile',
+          phase: 'Linear canonical issue read',
+          path,
+          elapsedMs: 15_000,
+        }),
+      ])
+
+      mount.releaseRead()
+      await run
+      expect(factory.status().counters.relayfileOperationWaitWarnings).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('mirrors factory-labeled GitHub issues from compact owner__repo relayfile paths to the repo label', async () => {

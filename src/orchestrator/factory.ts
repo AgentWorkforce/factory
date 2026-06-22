@@ -102,6 +102,12 @@ type SlackEventWatermark = { known: boolean; lastEventAtMs?: number }
 type MirrorCandidateCache = {
   load: () => Promise<LinearIssue[]>
 }
+type RelayfileOperation = 'ensureSubRoot' | 'listTree' | 'readFile'
+type RelayfileOperationDetails = {
+  phase: string
+  prefix?: string
+  path?: string
+}
 
 const ISSUE_ROOT = '/linear/issues'
 const GITHUB_ISSUE_ROOT = '/github/repos'
@@ -143,6 +149,8 @@ const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
 const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
+const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
+const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
 const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
@@ -1006,61 +1014,214 @@ export class FactoryLoop implements Factory {
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
-    await this.#ingestGithubIssues({ dryRun })
-    const paths = await this.#readyIssuePaths()
-    const pulled: IssueRef[] = []
-    const triaged: TriageDecision[] = []
-    const dispatched: DispatchResult[] = []
-    const skipped: IterationReport['skipped'] = []
+    const startedAtMs = this.#clock.now()
+    const relayfileWaitWarningsAtStart = this.#counters.relayfileOperationWaitWarnings ?? 0
+    const relayfileSlowOperationsAtStart = this.#counters.relayfileSlowOperations ?? 0
+    const relayfileOperationFailuresAtStart = this.#counters.relayfileOperationFailures ?? 0
+    this.#logger.info?.('[factory] run-once started', { dryRun })
+    let report: IterationReport | undefined
+    try {
+      await this.#ingestGithubIssues({ dryRun })
+      const paths = await this.#readyIssuePaths()
+      const pulled: IssueRef[] = []
+      const triaged: TriageDecision[] = []
+      const dispatched: DispatchResult[] = []
+      const skipped: IterationReport['skipped'] = []
+      let lastReadyReadProgressAtMs = this.#clock.now()
+      let readyIssueReads = 0
 
-    for (const path of paths) {
-      const issue = await this.#readIssue(path)
-      if (issue) {
-        await this.#recordCanonicalIssueState(issue)
-      }
-      if (!issue) {
-        continue
+      for (const path of paths) {
+        const issue = await this.#readIssue(path)
+        readyIssueReads += 1
+        lastReadyReadProgressAtMs = this.#logTimedProgress(
+          '[factory] Linear ready issue read progress',
+          startedAtMs,
+          lastReadyReadProgressAtMs,
+          { read: readyIssueReads, total: paths.length, path },
+        )
+        if (issue) {
+          await this.#recordCanonicalIssueState(issue)
+        }
+        if (!issue) {
+          continue
+        }
+
+        pulled.push(issueRef(issue))
+        const dispatchBlock = await this.#dispatchBlockReason(issue)
+        if (dispatchBlock) {
+          skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+          continue
+        }
+
+        const batch = await this.#batch()
+        if (batch.isInFlight(issue) || batch.isQueued(issue)) {
+          skipped.push({ issue: issueRef(issue), reason: 'already tracked' })
+          continue
+        }
+
+        if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
+          skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
+          continue
+        }
+
+        if (!isInFactoryScope(issue, this.#config.safety)) {
+          skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+          continue
+        }
+
+        if (!isRealLinearIssue(issue)) {
+          skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+          continue
+        }
+
+        const decision = await this.triageIssue(issue)
+        triaged.push(decision)
+        const result = await this.dispatch(decision, { dryRun })
+        if (result.agents.length === 0 && !dryRun) {
+          skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
+        } else {
+          dispatched.push(result)
+        }
       }
 
-      pulled.push(issueRef(issue))
-      const dispatchBlock = await this.#dispatchBlockReason(issue)
-      if (dispatchBlock) {
-        skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
-        continue
-      }
-
-      const batch = await this.#batch()
-      if (batch.isInFlight(issue) || batch.isQueued(issue)) {
-        skipped.push({ issue: issueRef(issue), reason: 'already tracked' })
-        continue
-      }
-
-      if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
-        skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
-        continue
-      }
-
-      if (!isInFactoryScope(issue, this.#config.safety)) {
-        skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
-        continue
-      }
-
-      if (!isRealLinearIssue(issue)) {
-        skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
-        continue
-      }
-
-      const decision = await this.triageIssue(issue)
-      triaged.push(decision)
-      const result = await this.dispatch(decision, { dryRun })
-      if (result.agents.length === 0 && !dryRun) {
-        skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
-      } else {
-        dispatched.push(result)
+      report = { pulled, triaged, dispatched, skipped, dryRun, slackDegraded: this.#slackDegraded }
+      return report
+    } catch (error) {
+      this.#logger.warn?.('[factory] run-once failed', {
+        dryRun,
+        elapsedMs: this.#elapsedSince(startedAtMs),
+        error: describeError(error).errorMessage,
+      })
+      throw error
+    } finally {
+      if (report) {
+        this.#logger.info?.('[factory] run-once completed', {
+          dryRun,
+          elapsedMs: this.#elapsedSince(startedAtMs),
+          readyIssues: report.pulled.length,
+          triaged: report.triaged.length,
+          dispatched: report.dispatched.length,
+          skipped: report.skipped.length,
+          slackDegraded: report.slackDegraded ?? false,
+          relayfileWaitWarnings: (this.#counters.relayfileOperationWaitWarnings ?? 0) - relayfileWaitWarningsAtStart,
+          relayfileSlowOperations: (this.#counters.relayfileSlowOperations ?? 0) - relayfileSlowOperationsAtStart,
+          relayfileOperationFailures: (this.#counters.relayfileOperationFailures ?? 0) - relayfileOperationFailuresAtStart,
+        })
       }
     }
+  }
 
-    return { pulled, triaged, dispatched, skipped, dryRun, slackDegraded: this.#slackDegraded }
+  async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
+    return this.#withRelayfileOperation('listTree', { phase, prefix }, () => this.#mount.listTree(prefix), {
+      count: (paths) => paths.length,
+      logFailure: true,
+      logStart: true,
+      logComplete: true,
+    })
+  }
+
+  async #ensureRelayfileSubRoot(prefix: string, phase: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
+    return this.#withRelayfileOperation('ensureSubRoot', { phase, prefix }, () => this.#mount.ensureSubRoot(prefix, opts), {
+      logFailure: true,
+      logStart: true,
+      logComplete: true,
+    })
+  }
+
+  async #readRelayfileFile(
+    path: string,
+    phase: string,
+  ): Promise<{ content: unknown; revision?: string }> {
+    return this.#withRelayfileOperation('readFile', { phase, path }, () => this.#mount.readFile(path))
+  }
+
+  async #withRelayfileOperation<T>(
+    operation: RelayfileOperation,
+    details: RelayfileOperationDetails,
+    fn: () => Promise<T>,
+    opts: {
+      count?: (result: T) => number | undefined
+      logFailure?: boolean
+      logStart?: boolean
+      logComplete?: boolean
+    } = {},
+  ): Promise<T> {
+    const startedAtMs = this.#clock.now()
+    const metadata = { operation, ...details }
+    let waitWarnings = 0
+    if (opts.logStart) {
+      this.#logger.info?.(`[factory] relayfile ${operation} started`, metadata)
+    }
+
+    const progressTimer = this.#logger.warn
+      ? setInterval(() => {
+        waitWarnings += 1
+        this.#increment('relayfileOperationWaitWarnings')
+        this.#logger.warn?.('[factory] relayfile operation still waiting on relayfile cloud', {
+          ...metadata,
+          elapsedMs: this.#elapsedSince(startedAtMs),
+        })
+      }, REMOTE_OPERATION_PROGRESS_INTERVAL_MS)
+      : undefined
+    if (progressTimer) {
+      (progressTimer as { unref?: () => void }).unref?.()
+    }
+
+    try {
+      const result = await fn()
+      const elapsedMs = this.#elapsedSince(startedAtMs)
+      const count = opts.count?.(result)
+      if (opts.logComplete) {
+        this.#logger.info?.(`[factory] relayfile ${operation} completed`, {
+          ...metadata,
+          elapsedMs,
+          ...(count === undefined ? {} : { count }),
+        })
+      }
+      if (waitWarnings === 0 && elapsedMs >= REMOTE_OPERATION_SLOW_WARN_MS) {
+        this.#increment('relayfileSlowOperations')
+        this.#logger.warn?.('[factory] relayfile operation was slow', {
+          ...metadata,
+          elapsedMs,
+        })
+      }
+      return result
+    } catch (error) {
+      if (opts.logFailure || waitWarnings > 0) {
+        this.#increment('relayfileOperationFailures')
+        this.#logger.warn?.('[factory] relayfile operation failed', {
+          ...metadata,
+          elapsedMs: this.#elapsedSince(startedAtMs),
+          error: describeError(error).errorMessage,
+        })
+      }
+      throw error
+    } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer)
+      }
+    }
+  }
+
+  #elapsedSince(startedAtMs: number): number {
+    return Math.max(0, this.#clock.now() - startedAtMs)
+  }
+
+  #logTimedProgress(
+    message: string,
+    startedAtMs: number,
+    lastLoggedAtMs: number,
+    metadata: Record<string, unknown>,
+  ): number {
+    const now = this.#clock.now()
+    if (now - lastLoggedAtMs < REMOTE_OPERATION_PROGRESS_INTERVAL_MS) {
+      return lastLoggedAtMs
+    }
+    this.#logger.info?.(message, {
+      ...metadata,
+      elapsedMs: Math.max(0, now - startedAtMs),
+    })
+    return now
   }
 
   async runLoop(opts: FactoryLoopRunOptions = {}): Promise<IterationReport[]> {
@@ -1380,7 +1541,11 @@ export class FactoryLoop implements Factory {
     if (this.#githubIngestionEnabled !== undefined) {
       return this.#githubIngestionEnabled
     }
-    const githubReady = await this.#mount.ensureSubRoot(GITHUB_ISSUE_ROOT, { timeoutMs: 90_000 })
+    const githubReady = await this.#ensureRelayfileSubRoot(
+      GITHUB_ISSUE_ROOT,
+      'GitHub issue ingestion readiness',
+      { timeoutMs: 90_000 },
+    )
     this.#githubIngestionEnabled = githubReady === 'ready'
     if (!this.#githubIngestionEnabled) {
       this.#logger.warn?.(`[factory] ${GITHUB_ISSUE_ROOT} sub-root is not mounted; GitHub issue ingestion disabled`)
@@ -1392,13 +1557,30 @@ export class FactoryLoop implements Factory {
     if (!await this.#ensureGithubIngestionReady()) {
       return
     }
+    const startedAtMs = this.#clock.now()
+    this.#logger.info?.('[factory] GitHub issue ingestion started', { dryRun: opts.dryRun ?? false })
     // Load the existing Linear mirror candidates once for the whole pass so
     // dedupe stays O(N + M) reads instead of re-scanning ISSUE_ROOT for every
     // GitHub issue (gemini perf finding on #findGithubIssueMirror).
     const candidates = this.#newMirrorCandidateCache()
-    for (const path of await this.#githubIssuePaths()) {
+    const paths = await this.#githubIssuePaths()
+    let processed = 0
+    let lastProgressAtMs = this.#clock.now()
+    for (const path of paths) {
       await this.#handleGithubIssueChange(path, { ...opts, candidates })
+      processed += 1
+      lastProgressAtMs = this.#logTimedProgress(
+        '[factory] GitHub issue ingestion progress',
+        startedAtMs,
+        lastProgressAtMs,
+        { processed, total: paths.length, path },
+      )
     }
+    this.#logger.info?.('[factory] GitHub issue ingestion completed', {
+      dryRun: opts.dryRun ?? false,
+      elapsedMs: this.#elapsedSince(startedAtMs),
+      issues: paths.length,
+    })
   }
 
   // Lazily lists+reads ISSUE_ROOT mirror candidates at most once, then memoizes
@@ -1416,22 +1598,38 @@ export class FactoryLoop implements Factory {
   }
 
   async #loadLinearMirrorCandidates(): Promise<LinearIssue[]> {
+    const startedAtMs = this.#clock.now()
+    this.#logger.info?.('[factory] Linear mirror candidate loading started')
     const candidates: LinearIssue[] = []
-    for (const path of await this.#mount.listTree(ISSUE_ROOT)) {
+    let scanned = 0
+    let lastProgressAtMs = startedAtMs
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading')) {
       if (!isLinearIssueMirrorCandidatePath(path)) {
         continue
       }
+      scanned += 1
       const issue = await this.#readIssue(path)
       if (issue) {
         candidates.push(issue)
       }
+      lastProgressAtMs = this.#logTimedProgress(
+        '[factory] Linear mirror candidate loading progress',
+        startedAtMs,
+        lastProgressAtMs,
+        { scanned, candidates: candidates.length, path },
+      )
     }
+    this.#logger.info?.('[factory] Linear mirror candidate loading completed', {
+      elapsedMs: this.#elapsedSince(startedAtMs),
+      scanned,
+      candidates: candidates.length,
+    })
     return candidates
   }
 
   async #githubIssuePaths(): Promise<string[]> {
     try {
-      const paths = await this.#mount.listTree(GITHUB_ISSUE_ROOT)
+      const paths = await this.#listRelayfileTree(GITHUB_ISSUE_ROOT, 'GitHub issue ingestion')
       const issuePaths: string[] = []
       for (const path of paths) {
         if (githubIssuePathParts(path) !== undefined) {
@@ -1526,7 +1724,7 @@ export class FactoryLoop implements Factory {
     try {
       for (const candidatePath of candidatePaths) {
         try {
-          const { content } = await this.#mount.readFile(candidatePath)
+          const { content } = await this.#readRelayfileFile(candidatePath, 'GitHub issue ingestion')
           return parseGithubIssue(candidatePath, content)
         } catch (error) {
           if (isMissingIssueFileError(error) && candidatePath !== candidatePaths.at(-1)) {
@@ -1551,7 +1749,7 @@ export class FactoryLoop implements Factory {
   ): Promise<LinearIssue | undefined> {
     const draftPath = githubIssueMirrorDraftPath(ghIssue)
     try {
-      return parseLinearIssue(draftPath, (await this.#mount.readFile(draftPath)).content)
+      return parseLinearIssue(draftPath, (await this.#readRelayfileFile(draftPath, 'GitHub issue mirror lookup')).content)
     } catch {
       // The draft path only exists before the Linear provider reconciles the
       // create writeback into a canonical AR-* issue. Fall through to persisted
@@ -1789,14 +1987,17 @@ export class FactoryLoop implements Factory {
   async #readyIssuePaths(): Promise<string[]> {
     const pathsByKey = new Map<string, string>()
     const canonicalPathsByKey = new Map<string, string>()
-    for (const path of await this.#mount.listTree(ISSUE_ROOT)) {
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery')) {
       if (isIssueFilePath(path)) {
         const key = keyFromPath(path)
         canonicalPathsByKey.set(key, path)
         pathsByKey.set(key, path)
       }
     }
-    for (const path of await this.#mount.listTree(linearByStatePath('ready-for-agent'))) {
+    for (const path of await this.#listRelayfileTree(
+      linearByStatePath('ready-for-agent'),
+      'Linear ready issue alias discovery',
+    )) {
       if (isIssueAliasFilePath(path)) {
         const canonicalPath = canonicalPathsByKey.get(keyFromPath(path))
         if (canonicalPath) {
@@ -1816,7 +2017,9 @@ export class FactoryLoop implements Factory {
       // /linear/issues/<key>__<uuid>.json path (no state/url/team); the full
       // record lands at the by-id / by-uuid aliases. Read the canonical sibling
       // when the primary parses empty so triage sees real state.
-      const issue = await readLinearIssueWithCanonicalFallback(this.#mount, path)
+      const issue = await readLinearIssueWithCanonicalFallback({
+        readFile: (candidatePath) => this.#readRelayfileFile(candidatePath, 'Linear canonical issue read'),
+      }, path)
       // Synced Linear records may carry only the state NAME, not the state UUID
       // (relayfile-adapters#205). The factory matches state by UUID, so backfill
       // the id from the name when the payload omitted it — otherwise every issue
