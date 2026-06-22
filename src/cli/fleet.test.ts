@@ -121,6 +121,14 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('defaults factory start to live mode', () => {
+    expect(parseFleetCommand(['start'])).toEqual({
+      kind: 'factory',
+      action: 'start',
+      mode: 'live',
+    })
+  })
+
   it('rejects the removed nested factory namespace', () => {
     expect(() => parseFleetCommand(['factory', 'run-once'])).toThrow(/Unknown factory command: factory/)
   })
@@ -158,7 +166,8 @@ describe('fleet CLI runtime', () => {
     expect(errors.text()).toBe('')
     expect(output.text()).toContain('usage: factory <command> [options]')
     expect(output.text()).toContain('run-once')
-    expect(output.text()).toContain('start --mode live')
+    expect(output.text()).toContain('start')
+    expect(output.text()).toContain('default: ./factory.config.json')
     expect(output.text()).toContain('fleet <command>')
     expect(output.text()).not.toContain('usage: fleet')
   })
@@ -599,8 +608,6 @@ describe('fleet CLI runtime', () => {
 
       const code = await runFleetCli([
         'start',
-        '--mode',
-        'live',
         '--config',
         configPath,
       ], {
@@ -668,6 +675,41 @@ describe('fleet CLI runtime', () => {
       expect(waitForStopSignal).toHaveBeenCalledTimes(1)
       expect(factory.stop).toHaveBeenCalledTimes(1)
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses ./factory.config.json by default for factory commands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-default-config-'))
+    const previousCwd = process.cwd()
+    try {
+      await writeConfig(root)
+      process.chdir(root)
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const code = await runFleetCli(['start'], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount: vi.fn(async () => {}),
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+    } finally {
+      process.chdir(previousCwd)
       await rm(root, { recursive: true, force: true })
     }
   })
