@@ -49,6 +49,7 @@ const issueFile = {
 describe('fleet CLI parsing', () => {
   it('parses spawn flags into a FleetClient spawn input shape', () => {
     expect(parseFleetCommand([
+      'fleet',
       'spawn',
       'spawn:codex',
       '--node',
@@ -77,7 +78,6 @@ describe('fleet CLI parsing', () => {
 
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
     expect(parseGlobalOptions([
-      'factory',
       'run-once',
       '--dry-run',
       '--backend',
@@ -86,13 +86,12 @@ describe('fleet CLI parsing', () => {
       'factory.json',
     ])).toEqual({
       globals: { backend: 'relay', dryRun: true, config: 'factory.json' },
-      args: ['factory', 'run-once'],
+      args: ['run-once'],
     })
   })
 
   it('parses manual probe close command', () => {
     expect(parseFleetCommand([
-      'factory',
       'close-probe',
       '42',
       '--repo',
@@ -108,18 +107,22 @@ describe('fleet CLI parsing', () => {
   })
 
   it('parses the factory orphan reaper command', () => {
-    expect(parseFleetCommand(['factory', 'reap-orphans'])).toEqual({
+    expect(parseFleetCommand(['reap-orphans'])).toEqual({
       kind: 'factory',
       action: 'reap-orphans',
     })
   })
 
   it('parses the factory live start command', () => {
-    expect(parseFleetCommand(['factory', 'start', '--mode', 'live'])).toEqual({
+    expect(parseFleetCommand(['start', '--mode', 'live'])).toEqual({
       kind: 'factory',
       action: 'start',
       mode: 'live',
     })
+  })
+
+  it('rejects the removed nested factory namespace', () => {
+    expect(() => parseFleetCommand(['factory', 'run-once'])).toThrow(/Unknown factory command: factory/)
   })
 
   it('resolves a broker connection path by walking up from the command cwd', async () => {
@@ -139,6 +142,40 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it('prints factory help for -h without requiring config or showing internal fleet as the binary', async () => {
+    const output = buffer()
+    const errors = buffer()
+
+    const code = await runFleetCli(['-h'], {
+      createFleet: () => {
+        throw new Error('help should not construct a fleet')
+      },
+      stdout: output,
+      stderr: errors,
+    })
+
+    expect(code).toBe(0)
+    expect(errors.text()).toBe('')
+    expect(output.text()).toContain('usage: factory <command> [options]')
+    expect(output.text()).toContain('run-once')
+    expect(output.text()).toContain('start --mode live')
+    expect(output.text()).toContain('fleet <command>')
+    expect(output.text()).not.toContain('usage: fleet')
+  })
+
+  it('prints factory help for --help even when passed after the fleet namespace', async () => {
+    const output = buffer()
+
+    const code = await runFleetCli(['fleet', '--help'], {
+      stdout: output,
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(output.text()).toContain('usage: factory <command> [options]')
+    expect(output.text()).not.toContain('usage: fleet')
+  })
+
   it('uses real fleet and cloud mount for fixture-less factory configs on the operator path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-real-default-'))
     try {
@@ -151,7 +188,6 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
 
       const code = await runFleetCli([
-        'factory',
         'run-once',
         '--dry-run',
         '--config',
@@ -193,7 +229,6 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
 
       const code = await runFleetCli([
-        'factory',
         'run-once',
         '--dry-run',
         '--config',
@@ -233,7 +268,6 @@ describe('fleet CLI runtime', () => {
       const stderr = buffer()
 
       const code = await runFleetCli([
-        'factory',
         'run-once',
         '--config',
         configPath,
@@ -258,7 +292,6 @@ describe('fleet CLI runtime', () => {
     const output = buffer()
 
     const code = await runFleetCli([
-      'factory',
       'run-once',
       '--dry-run',
       '--config',
@@ -283,6 +316,43 @@ describe('fleet CLI runtime', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('prints factory status from the top-level status command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-status-'))
+    try {
+      const configPath = await writeConfig(root)
+      const output = buffer()
+      const factoryStatus = { inFlight: [], queued: [], counters: { pulled: 0 } }
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => factoryStatus),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const code = await runFleetCli([
+        'status',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('drives the real RelayFleetClient when --backend relay is requested', async () => {
     // Strip every relay credential so the lazily-built HTTP transport surfaces a
     // deterministic auth error instead of attempting a real network request.
@@ -294,7 +364,7 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
       const errors = buffer()
 
-      const code = await runFleetCli(['roster', '--backend', 'relay'], {
+      const code = await runFleetCli(['fleet', 'roster', '--backend', 'relay'], {
         stdout: output,
         stderr: errors,
       })
@@ -323,7 +393,6 @@ describe('fleet CLI runtime', () => {
     const errors = buffer()
 
     const code = await runFleetCli([
-      'factory',
       'dispatch',
       'AR-77',
       '--config',
@@ -345,7 +414,6 @@ describe('fleet CLI runtime', () => {
     const output = buffer()
     const calls: unknown[] = []
     const code = await runFleetCli([
-      'factory',
       'close-probe',
       '42',
       '--repo',
@@ -376,7 +444,6 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
 
       const code = await runFleetCli([
-        'factory',
         'loop',
         '--dry-run',
         '--config',
@@ -397,7 +464,6 @@ describe('fleet CLI runtime', () => {
 
       const statusOut = buffer()
       const statusCode = await runFleetCli([
-        'factory',
         'loop-status',
         '--config',
         configPath,
@@ -439,7 +505,6 @@ describe('fleet CLI runtime', () => {
       }))
 
       const code = await runFleetCli([
-        'factory',
         'start',
         '--mode',
         'live',
@@ -484,7 +549,6 @@ describe('fleet CLI runtime', () => {
       const resolveWorkspace = vi.fn(async () => ({ workspaceId: 'rw_unused' }))
 
       const code = await runFleetCli([
-        'factory',
         'start',
         '--mode',
         'live',
@@ -530,7 +594,6 @@ describe('fleet CLI runtime', () => {
       const ensureLocalMount = vi.fn(async () => {})
 
       const code = await runFleetCli([
-        'factory',
         'start',
         '--mode',
         'live',
@@ -594,7 +657,6 @@ describe('fleet CLI runtime', () => {
       const daemonExits: number[] = []
 
       const run = runFleetCli([
-        'factory',
         'start',
         '--mode',
         'live',
@@ -651,7 +713,6 @@ describe('fleet CLI runtime', () => {
 
       const runOnceCode = await runFleetCli([
         '--dry-run',
-        'factory',
         'run-once',
         '--config',
         configPath,
@@ -670,7 +731,6 @@ describe('fleet CLI runtime', () => {
       })
 
       const reapCode = await runFleetCli([
-        'factory',
         'reap-orphans',
         '--config',
         configPath,
@@ -718,7 +778,6 @@ describe('fleet CLI runtime', () => {
 
       const output = buffer()
       const code = await runFleetCli([
-        'factory',
         'kill-loop',
         '--config',
         configPath,
@@ -761,7 +820,6 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
 
       const code = await runFleetCli([
-        'factory',
         'reap-orphans',
         '--config',
         configPath,

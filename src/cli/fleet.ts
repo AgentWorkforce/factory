@@ -88,6 +88,10 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   let fleet: FleetClient | undefined
 
   try {
+    if (argv.some(isHelpFlag)) {
+      out.write(helpText())
+      return 0
+    }
     const { globals, args } = parseGlobalOptions(argv)
     const command = parseFleetCommand(args)
 
@@ -190,10 +194,27 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     throw new Error(usage())
   }
 
+  if (isFactoryAction(verb)) {
+    return parseFactoryCommand(args)
+  }
+
+  if (verb === 'fleet') {
+    return parseFleetSubcommand(rest)
+  }
+
+  throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseFleetSubcommand(args: string[]): ParsedCommand {
+  const [verb, ...rest] = args
+  if (!verb) {
+    throw new Error('factory fleet requires a command')
+  }
+
   if (verb === 'spawn') {
     const [capability, ...flags] = rest
     if (!isCapability(capability)) {
-      throw new Error('fleet spawn requires capability spawn:codex, spawn:claude, or workflow:run')
+      throw new Error('factory fleet spawn requires capability spawn:codex, spawn:claude, or workflow:run')
     }
     const parsed = parseFlags(flags)
     return {
@@ -216,15 +237,11 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
 
   if (verb === 'release') {
     const [name, ...flags] = rest
-    if (!name) throw new Error('fleet release requires agent name')
+    if (!name) throw new Error('factory fleet release requires agent name')
     return { kind: 'release', name, reason: parseFlags(flags).reason }
   }
 
-  if (verb === 'factory') {
-    return parseFactoryCommand(rest)
-  }
-
-  throw new Error(`Unknown fleet command: ${verb}`)
+  throw new Error(`Unknown factory fleet command: ${verb}`)
 }
 
 export function parseGlobalOptions(argv: string[]): { globals: GlobalOptions; args: string[] } {
@@ -365,25 +382,25 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
     return { kind: 'factory', action }
   }
   if (action === 'canary') {
-    if (!issueOrPr) throw new Error('fleet factory canary requires an issue key or path')
+    if (!issueOrPr) throw new Error('factory canary requires an issue key or path')
     return { kind: 'factory-canary', issue: issueOrPr }
   }
   if (action === 'triage') {
-    if (!issueOrPr) throw new Error('fleet factory triage requires an issue key or path')
+    if (!issueOrPr) throw new Error('factory triage requires an issue key or path')
     return { kind: 'factory-triage', issue: issueOrPr }
   }
   if (action === 'dispatch') {
-    if (!issueOrPr) throw new Error('fleet factory dispatch requires an issue key or path')
+    if (!issueOrPr) throw new Error('factory dispatch requires an issue key or path')
     return { kind: 'factory-dispatch', issue: issueOrPr }
   }
   if (action === 'close-probe') {
     const prNumber = Number(issueOrPr)
-    if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error('fleet factory close-probe requires a PR number')
+    if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error('factory close-probe requires a PR number')
     const parsed = parseFlags(flags)
-    if (!parsed.repo || !parsed.issue) throw new Error('fleet factory close-probe requires --repo <owner/repo> --issue <KEY>')
+    if (!parsed.repo || !parsed.issue) throw new Error('factory close-probe requires --repo <owner/repo> --issue <KEY>')
     return { kind: 'factory-close-probe', prNumber, repo: parsed.repo, issue: parsed.issue }
   }
-  throw new Error(`Unknown fleet factory action: ${action ?? ''}`)
+  throw new Error(`Unknown factory action: ${action ?? ''}`)
 }
 
 // Canary: assert a known "Ready for Agent" issue is classified dispatch-ready
@@ -436,7 +453,7 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode?: 'live
       mode = value
       continue
     }
-    throw new Error(`Unknown fleet factory start option: ${flag}`)
+    throw new Error(`Unknown factory start option: ${flag}`)
   }
   return { mode }
 }
@@ -630,6 +647,20 @@ function isCapability(value: string | undefined): value is Capability {
   return value === 'spawn:codex' || value === 'spawn:claude' || value === 'workflow:run'
 }
 
+function isFactoryAction(value: string): boolean {
+  return value === 'start' ||
+    value === 'run-once' ||
+    value === 'loop' ||
+    value === 'status' ||
+    value === 'loop-status' ||
+    value === 'kill-loop' ||
+    value === 'reap-orphans' ||
+    value === 'canary' ||
+    value === 'triage' ||
+    value === 'dispatch' ||
+    value === 'close-probe'
+}
+
 function defaultAgentName(capability: Capability, now: number): string {
   return `fleet-${capability.replace('spawn:', '').replace(':', '-')}-${now}`
 }
@@ -685,7 +716,36 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function usage(): string {
-  return 'usage: fleet <spawn|roster|ls|release|factory> [options]'
+  return 'usage: factory <command> [options]'
+}
+
+function helpText(): string {
+  return `${usage()}
+
+Commands:
+  run-once              Run one discovery -> triage -> dispatch cycle
+  start --mode live     Run the live factory daemon
+  status                Print current factory status as JSON
+  loop                  Run the bounded loop configured in factory.config.json
+  loop-status           Print heartbeat/liveness status for the loop
+  kill-loop             Send SIGTERM to the heartbeat pid
+  reap-orphans          Reap stale factory-owned agents
+  canary <KEY|path>     Check that a known issue is dispatch-ready
+  triage <KEY|path>     Triage one issue and print the decision
+  dispatch <KEY|path>   Triage and dispatch one issue
+  close-probe <PR>      Probe/close a PR for an issue
+  fleet <command>       Low-level fleet commands: spawn, roster, release
+
+Options:
+  --config <path>       Factory config JSON path
+  --dry-run             Discover and triage without writes or agent spawns
+  --backend <backend>   Fleet backend: internal or relay
+  -h, --help            Show this help
+`
+}
+
+function isHelpFlag(arg: string): boolean {
+  return arg === '-h' || arg === '--help'
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
