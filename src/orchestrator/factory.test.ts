@@ -6843,6 +6843,37 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.errors).toBeUndefined()
   })
 
+  it('replays an existing human Slack answer when a triage escalation watcher starts', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(32)]: issueFile(32) })
+    const replyPath = slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-already-answered-32')
+    emitSlackReply(mount, replyPath, 'slack-human-already-answered-32', {
+      text: 'The cloud deploy path should auto-join the configured Slack channel before asking follow-up questions there.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new SlackStillEscalatingTriage({ rationale: 'Matched repository from Linear label.' }),
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(32), issueFile(32))))
+
+    expect(result.agents).toEqual([
+      { name: 'ar-32-impl-pear', role: 'implementer' },
+      { name: 'ar-32-review', role: 'reviewer' },
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-32-impl-pear', data: '<integration-event source="slack" issue="AR-32">\nHuman reply in the Slack thread:\nThe cloud deploy path should auto-join the configured Slack channel before asking follow-up questions there.\n</integration-event>\r' },
+    ])
+    expect(factory.status().counters.slackTriageAnswersReplayed).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBe(1)
+    expect(factory.status().counters.errors).toBeUndefined()
+  })
+
   it('ignores a human Slack thread reply after the issue has no in-flight implementer', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(21)]: issueFile(21) })
     const fleet = new FakeFleetClient()
