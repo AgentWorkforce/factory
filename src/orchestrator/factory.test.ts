@@ -59,7 +59,9 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
 const readyAliasPath = (n: number) => `/linear/issues/by-state/ready-for-agent/AR-${n}.json`
 const githubIssuePath = (owner: string, repo: string, number: number) => `/github/repos/${owner}/${repo}/issues/by-id/${number}.json`
+const githubIssueCompactPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}__${repo}/issues/by-id/${number}.json`
 const githubIssueNestedMetaPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}/${repo}/issues/${number}/meta.json`
+const githubIssueCompactNestedMetaPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}__${repo}/issues/${number}/meta.json`
 const capturedReadyCanaryPath = '/linear/issues/AR-133__dac27fce-e8de-4910-bbf6-98ad436df3dd.json'
 const capturedStaleDoneCanonicalPath = '/linear/issues/AR-173__40c7e780-59ad-47ee-8809-3a9b8434d8fb.json'
 const capturedStaleReadyAliasPath = '/linear/issues/by-state/ready-for-agent/AR-173.json'
@@ -906,13 +908,21 @@ describe('FactoryLoop', () => {
   })
 
   it('extracts GitHub issue path parts from legacy and nested relayfile shapes', () => {
-    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/2174.json')).toEqual({
+    const expected = {
+      owner: 'AgentWorkforce',
+      repo: 'cloud',
+      number: 2174,
+      slug: undefined,
+    }
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/2174.json')).toEqual(expected)
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/2174.json')).toEqual(expected)
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/2174/meta.json')).toEqual({
       owner: 'AgentWorkforce',
       repo: 'cloud',
       number: 2174,
       slug: undefined,
     })
-    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/2174/meta.json')).toEqual({
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/2174/meta.json')).toEqual({
       owner: 'AgentWorkforce',
       repo: 'cloud',
       number: 2174,
@@ -924,18 +934,21 @@ describe('FactoryLoop', () => {
       number: 2174,
       slug: 'factory-path-regression',
     })
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/2174__factory-path-regression/meta.json')).toEqual({
+      owner: 'AgentWorkforce',
+      repo: 'cloud',
+      number: 2174,
+      slug: 'factory-path-regression',
+    })
     expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/2174/metadata.json')).toEqual({
       owner: 'AgentWorkforce',
       repo: 'cloud',
       number: 2174,
       slug: undefined,
     })
-    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/by-id/2174.json')).toEqual({
-      owner: 'AgentWorkforce',
-      repo: 'cloud',
-      number: 2174,
-      slug: undefined,
-    })
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/2174/metadata.json')).toEqual(expected)
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce/cloud/issues/by-id/2174.json')).toEqual(expected)
+    expect(githubIssuePathParts('/github/repos/AgentWorkforce__cloud/issues/by-id/2174.json')).toEqual(expected)
   })
 
   it('LIVE_GITHUB_ISSUE_GLOB matches every supported relayfile issue shape under the real glob matcher', () => {
@@ -950,6 +963,12 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce/cloud/issues/2174/metadata.json',
       '/github/repos/AgentWorkforce/cloud/issues/2174__factory-path-regression/meta.json',
       '/github/repos/AgentWorkforce/pear/issues/1126__directory-event',
+      '/github/repos/AgentWorkforce__cloud/issues/by-id/2174.json',
+      '/github/repos/AgentWorkforce__cloud/issues/2174.json',
+      '/github/repos/AgentWorkforce__cloud/issues/2174/meta.json',
+      '/github/repos/AgentWorkforce__cloud/issues/2174/metadata.json',
+      '/github/repos/AgentWorkforce__cloud/issues/2174__factory-path-regression/meta.json',
+      '/github/repos/AgentWorkforce__pear/issues/1126__directory-event',
     ]
     for (const path of supported) {
       expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, path)).toBe(true)
@@ -1087,6 +1106,49 @@ describe('FactoryLoop', () => {
         path: ghPath,
       },
     })
+    expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
+  })
+
+  it('mirrors factory-labeled GitHub issues from compact owner__repo relayfile paths to the repo label', async () => {
+    const ghPath = githubIssueCompactPath('AgentWorkforce', 'relayfile-adapters', 222)
+    const mount = new FakeMountClient({
+      [ghPath]: githubIssueFile(222, {
+        owner: 'AgentWorkforce',
+        repo: 'relayfile-adapters',
+        title: 'Telegram helper parity',
+        body: 'Mirror the compact Relayfile GitHub issue path.',
+        labels: ['factory'],
+      }),
+    })
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { 'relayfile-adapters': 'AgentWorkforce/relayfile-adapters' },
+        clonePaths: { 'AgentWorkforce/relayfile-adapters': '/work/relayfile-adapters' },
+        default: 'AgentWorkforce/relayfile-adapters',
+      },
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), { mount, fleet: new FakeFleetClient(), triage: new StaticTriage() })
+
+    await factory.runOnce({ dryRun: false })
+
+    expect(githubIssuePathParts(ghPath)).toEqual({
+      owner: 'AgentWorkforce',
+      repo: 'relayfile-adapters',
+      number: 222,
+      slug: undefined,
+    })
+    expect(mount.writes).toHaveLength(1)
+    expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
+      title: '[factory] Telegram helper parity',
+      labels: [{ name: 'relayfile-adapters' }],
+      source: expect.objectContaining({
+        provider: 'github',
+        owner: 'AgentWorkforce',
+        repo: 'relayfile-adapters',
+        number: 222,
+        path: ghPath,
+      }),
+    }))
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
   })
 
@@ -1515,6 +1577,27 @@ describe('FactoryLoop', () => {
       {
         path: '/github/repos/AgentWorkforce/pear/issues/1124/metadata.json',
         number: 1124,
+      },
+      {
+        path: '/github/repos/AgentWorkforce__pear/issues/1125.json',
+        number: 1125,
+      },
+      {
+        path: '/github/repos/AgentWorkforce__pear/issues/by-id/1126.json',
+        number: 1126,
+      },
+      {
+        path: githubIssueCompactNestedMetaPath('AgentWorkforce', 'pear', 1127),
+        number: 1127,
+      },
+      {
+        path: '/github/repos/AgentWorkforce__pear/issues/1128__route-github-factory/meta.json',
+        number: 1128,
+        slug: 'route-github-factory',
+      },
+      {
+        path: '/github/repos/AgentWorkforce__pear/issues/1129/metadata.json',
+        number: 1129,
       },
     ]
     const mount = new FakeMountClient(Object.fromEntries(cases.map(({ path, number }) => [
