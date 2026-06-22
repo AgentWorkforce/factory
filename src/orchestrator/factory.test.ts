@@ -248,19 +248,13 @@ class EscalatingTriage extends StaticTriage {
   }
 }
 
-class SlackClarifiedTriage extends EscalatingTriage {
+class SlackStillEscalatingTriage extends EscalatingTriage {
   override async triage(issue: LinearIssue): Promise<TriageDecision> {
     if (issue.description.includes('Human clarification from Slack:')) {
-      const decision = await super.triage({
+      return super.triage({
         ...issue,
         description: `${issue.description}\nImplement the clarified behavior and verify it with tests.`,
       })
-      return {
-        ...decision,
-        thin: false,
-        confidence: 'high',
-        rationale: 'Human Slack clarification supplied enough acceptance detail.',
-      }
     }
     return super.triage(issue)
   }
@@ -6819,13 +6813,13 @@ describe('FactoryLoop', () => {
     expect(slack.roots).toEqual([])
   })
 
-  it('uses a human Slack answer to retry pre-dispatch triage and dispatch when clarified', async () => {
+  it('dispatches a matched agent to read a Slack triage answer even when factory still finds the issue thin', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(23)]: issueFile(23) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
       fleet,
-      triage: new SlackClarifiedTriage({ rationale: 'Matched repository from Linear label.' }),
+      triage: new SlackStillEscalatingTriage({ rationale: 'Matched repository from Linear label.' }),
     })
 
     await factory.runOnce()
@@ -6838,9 +6832,13 @@ describe('FactoryLoop', () => {
       user_is_bot: false,
     })
 
-    await vi.waitFor(() => expect(factory.status().counters.slackTriageAnswersDispatched).toBe(1))
+    await vi.waitFor(() => expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1))
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-23-impl-pear', 'ar-23-review'])
-    expect(factory.status().counters.slackTriageAnswersDispatched).toBe(1)
+    await vi.waitFor(() => expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-23-impl-pear', data: '<integration-event source="slack" issue="AR-23">\nHuman reply in the Slack thread:\nWhen deployed via ./workforce, one-click deploy in cloud should auto-join the configured Slack channel and ask there if blocked. Verify with tests.\n</integration-event>\r' },
+    ]))
+    expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBe(1)
     expect(factory.status().counters.slackTriageAnswersStillEscalated).toBeUndefined()
     expect(factory.status().counters.errors).toBeUndefined()
   })

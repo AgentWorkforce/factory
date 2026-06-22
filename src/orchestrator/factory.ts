@@ -204,6 +204,7 @@ export class FactoryLoop implements Factory {
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
   readonly #labelDispatchFailures = new Map<string, string>()
+  readonly #pendingSlackClarifications = new Map<string, string>()
   readonly #postMergeDoneAdvances = new Set<string>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
@@ -1415,6 +1416,7 @@ export class FactoryLoop implements Factory {
         await this.#ensureSlackDispatchThread(record, result)
         await this.#sendImplementerTask(record)
         await this.#sendCriticalReviewerMessage(record)
+        await this.#injectPendingSlackClarification(record)
       }
       return result
     } catch (error) {
@@ -3722,6 +3724,12 @@ export class FactoryLoop implements Factory {
     })
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
+      if (hasDispatchableRoute(decision)) {
+        this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
+        await this.#startOrQueueSlackClarifiedDecision(dispatchAfterSlackClarification(decision, escalationReason))
+        this.#increment('slackTriageAnswersDispatchedWithRemainingEscalation')
+        return
+      }
       this.#increment('slackTriageAnswersStillEscalated')
       this.#logger.warn?.('[factory] Slack triage answer still leaves issue escalated', {
         issue: record.issue,
@@ -3730,9 +3738,15 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
+    await this.#startOrQueueSlackClarifiedDecision(decision)
+    this.#increment('slackTriageAnswersDispatched')
+  }
+
+  async #startOrQueueSlackClarifiedDecision(decision: TriageDecision): Promise<void> {
+    const batch = await this.#batch()
     if (batch.canStart()) {
       await this.dispatch(decision, { dryRun: this.#config.dryRun })
-      this.#increment('slackTriageAnswersDispatched')
       return
     }
 
@@ -3740,6 +3754,36 @@ export class FactoryLoop implements Factory {
       this.#increment('slackTriageAnswersQueued')
       this.#emit('issue-queued', { issue: decision.issue })
     }
+  }
+
+  async #injectPendingSlackClarification(record: InFlightIssue): Promise<void> {
+    const key = issueKey(record.issue)
+    const text = this.#pendingSlackClarifications.get(key)
+    if (!text || !this.#fleet.sendInput) {
+      return
+    }
+
+    const recipients = [...record.agents.values()]
+      .filter((agent) =>
+        agent.spec.role === 'implementer' ||
+        agent.spec.role === 'workflow' ||
+        agent.spec.role === 'babysitter')
+      .map((agent) => agent.result?.name ?? agent.spec.name)
+      .filter((name): name is string => Boolean(name))
+
+    for (const recipient of new Set(recipients)) {
+      try {
+        await this.#injectSlackReplyEvent(recipient, record.issue, text)
+        this.#increment('slackTriageAnswersInjectedToAgents')
+      } catch (error) {
+        this.#logger.warn?.('[factory] failed to inject Slack triage clarification into agent', {
+          issue: record.issue.key,
+          recipient,
+          error,
+        })
+      }
+    }
+    this.#pendingSlackClarifications.delete(key)
   }
 
   // Inject the human's Slack reply into the agent framed as the
@@ -5357,6 +5401,19 @@ const triageEscalationQuestion = (decision: TriageDecision): string => {
 
 const isTriageEscalationWatchRecord = (record: InFlightIssue): boolean =>
   record.agents.size === 0 && record.invocationIds.size === 0 && triageEscalationReason(record.decision) !== undefined
+
+const hasDispatchableRoute = (decision: TriageDecision): boolean =>
+  decision.routes.length > 0 && dispatchSpecs(decision).length > 0
+
+const dispatchAfterSlackClarification = (decision: TriageDecision, escalationReason: string): TriageDecision => ({
+  ...decision,
+  thin: false,
+  confidence: 'high',
+  rationale: [
+    decision.rationale,
+    `Human answered the Slack triage escalation (${escalationReason}); dispatching to the matched agent so it can acknowledge the answer and ask follow-up questions if needed.`,
+  ].filter(Boolean).join(' '),
+})
 
 const issueWithSlackClarification = (issue: LinearIssue, text: string): LinearIssue => ({
   ...issue,
