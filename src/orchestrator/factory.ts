@@ -1317,7 +1317,7 @@ export class FactoryLoop implements Factory {
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
       await this.#escalateTriageToSlack(decision, escalationReason, dryRun)
-      this.#error(new Error(`${escalationReason}; escalation required`), decision.issue)
+      this.#recordTriageEscalation(decision, escalationReason)
       return { issue: decision.issue, agents: [], dryRun }
     }
 
@@ -1521,7 +1521,7 @@ export class FactoryLoop implements Factory {
       const escalationReason = triageEscalationReason(decision)
       if (escalationReason) {
         await this.#escalateTriageToSlack(decision, escalationReason, this.#config.dryRun)
-        this.#error(new Error(`${escalationReason}; escalation required`), decision.issue)
+        this.#recordTriageEscalation(decision, escalationReason)
         return
       }
 
@@ -3156,6 +3156,14 @@ export class FactoryLoop implements Factory {
     this.#counters[name] = (this.#counters[name] ?? 0) + 1
   }
 
+  #recordTriageEscalation(decision: TriageDecision, reason: string): void {
+    this.#increment('triageEscalations')
+    this.#logger.warn?.('[factory] triage escalation required', {
+      issue: decision.issue,
+      reason,
+    })
+  }
+
   async #shouldSkipSlackWriteback(context: string): Promise<boolean> {
     if (!this.#config.slack) return false
 
@@ -3439,7 +3447,7 @@ export class FactoryLoop implements Factory {
       text: [
         `${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
         `Reason: ${reason}`,
-        `Question: Please clarify the intended repo/approach or add enough acceptance detail for the factory agent to proceed.`,
+        `Question: ${triageEscalationQuestion(decision)}`,
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
@@ -3644,19 +3652,27 @@ export class FactoryLoop implements Factory {
   }
 
   async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackReply): Promise<void> {
-    if (!this.#config.slack || !this.#fleet.sendInput) {
-      return
-    }
-
-    const liveRecord = (await this.#batch()).getIssue(record.issue)
-    if (!liveRecord || liveRecord.dryRun) {
-      this.#increment('slackAnswersIgnoredNoInFlight')
+    if (!this.#config.slack) {
       return
     }
 
     const text = reply.text.trim()
     if (!text) {
       this.#increment('slackAnswersIgnoredEmpty')
+      return
+    }
+
+    const liveRecord = (await this.#batch()).getIssue(record.issue)
+    if (!liveRecord || liveRecord.dryRun) {
+      if (isTriageEscalationWatchRecord(record)) {
+        await this.#handleTriageEscalationSlackAnswer(record, text)
+        return
+      }
+      this.#increment('slackAnswersIgnoredNoInFlight')
+      return
+    }
+
+    if (!this.#fleet.sendInput) {
       return
     }
 
@@ -3675,6 +3691,54 @@ export class FactoryLoop implements Factory {
     for (const recipient of new Set(recipients)) {
       await this.#injectSlackReplyEvent(recipient, liveRecord.issue, text)
       this.#increment('slackAnswersInjected')
+    }
+  }
+
+  async #handleTriageEscalationSlackAnswer(record: InFlightIssue, text: string): Promise<void> {
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isRealLinearIssue(issue)) {
+      this.#increment('slackTriageAnswersIgnoredIssueUnavailable')
+      return
+    }
+    if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
+      this.#increment('slackTriageAnswersIgnoredIssueNotReady')
+      return
+    }
+
+    const batch = await this.#batch()
+    if (batch.isInFlight(record.issue) || batch.isQueued(record.issue)) {
+      this.#increment('slackTriageAnswersIgnoredAlreadyActive')
+      return
+    }
+    if (await this.#dispatchBlockReason(record.issue)) {
+      this.#increment('slackTriageAnswersIgnoredBlocked')
+      return
+    }
+
+    const clarifiedIssue = issueWithSlackClarification(issue, text)
+    const decision = await this.#triage.triage(clarifiedIssue, {
+      config: this.#config,
+      repoMap: repoMapFromConfig(this.#config),
+    })
+    const escalationReason = triageEscalationReason(decision)
+    if (escalationReason) {
+      this.#increment('slackTriageAnswersStillEscalated')
+      this.#logger.warn?.('[factory] Slack triage answer still leaves issue escalated', {
+        issue: record.issue,
+        reason: escalationReason,
+      })
+      return
+    }
+
+    if (batch.canStart()) {
+      await this.dispatch(decision, { dryRun: this.#config.dryRun })
+      this.#increment('slackTriageAnswersDispatched')
+      return
+    }
+
+    if (batch.queue(decision, this.#config.dryRun)) {
+      this.#increment('slackTriageAnswersQueued')
+      this.#emit('issue-queued', { issue: decision.issue })
     }
   }
 
@@ -5270,6 +5334,39 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   }
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
+
+const triageEscalationQuestion = (decision: TriageDecision): string => {
+  const routedRepos = decision.routes.map((route) => route.repo).filter(Boolean)
+  if (routedRepos.length === 0) {
+    return [
+      'Which repository or repositories should handle this issue?',
+      'Please include the intended approach and the acceptance criteria/tests the agent should satisfy.',
+    ].join(' ')
+  }
+  if (decision.thin) {
+    return [
+      `Factory matched ${routedRepos.join(', ')}.`,
+      'Please clarify the concrete expected behavior, constraints, and acceptance criteria/tests before dispatch.',
+    ].join(' ')
+  }
+  return [
+    `Factory matched ${routedRepos.join(', ')}, but triage confidence is low.`,
+    'Please confirm the intended repo/approach or correct the route before dispatch.',
+  ].join(' ')
+}
+
+const isTriageEscalationWatchRecord = (record: InFlightIssue): boolean =>
+  record.agents.size === 0 && record.invocationIds.size === 0 && triageEscalationReason(record.decision) !== undefined
+
+const issueWithSlackClarification = (issue: LinearIssue, text: string): LinearIssue => ({
+  ...issue,
+  description: [
+    issue.description,
+    '',
+    'Human clarification from Slack:',
+    text,
+  ].join('\n'),
+})
 
 const slackAnswerInput = (issue: IssueRef, text: string): string =>
   `Slack reply for ${issue.key}:\n${text}\r`
