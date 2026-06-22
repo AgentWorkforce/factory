@@ -14,6 +14,7 @@ export interface CreateFleetDeps {
   // True when harnessClient owns a broker we spawned, so the fleet shuts it down
   // on dispose instead of leaving it running.
   ownsBroker?: boolean
+  workspaceKey?: string
 }
 
 export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetDeps = {}) {
@@ -26,6 +27,7 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
   return new InternalFleetClient({
     client: deps.harnessClient,
     ownsBroker: deps.ownsBroker,
+    workspaceKey: deps.workspaceKey,
     cwd: options.cwd,
     connectionPath: options.connectionPath,
   })

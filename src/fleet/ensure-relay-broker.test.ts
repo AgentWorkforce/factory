@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { ensureRelayBroker } from './ensure-relay-broker'
 import type { HarnessDriverClientLike } from './internal-fleet-client'
 
+const noStoredWorkspaceKey = () => undefined
+
 const fakeClient = (tag: string): HarnessDriverClientLike => ({
   // tag lets a test assert which client (connected vs spawned) came back.
   brokerPid: tag === 'connected' ? 111 : 222,
@@ -42,10 +44,11 @@ describe('ensureRelayBroker', () => {
     })
     const spawn = vi.fn(async () => spawned)
 
-    const handle = await ensureRelayBroker({ cwd: '/work', connect, spawn, env: {} })
+    const handle = await ensureRelayBroker({ cwd: '/work', connect, spawn, env: {}, resolveWorkspaceKey: noStoredWorkspaceKey })
 
     expect(handle.client).toBe(spawned)
     expect(handle.started).toBe(true)
+    expect(handle.workspaceKey).toBeUndefined()
     expect(spawn).toHaveBeenCalledWith({ cwd: '/work', workspaceKey: undefined })
   })
 
@@ -72,18 +75,48 @@ describe('ensureRelayBroker', () => {
       spawn: async () => fakeClient('spawned'),
       logger: { info },
       env: {},
+      resolveWorkspaceKey: noStoredWorkspaceKey,
     })
     expect(info).toHaveBeenCalledWith('[factory] no relay broker running; starting one', { reason: 'boom', joiningWorkspace: false })
   })
 
   it('threads a workspace key (env or option) into spawn so the broker JOINS', async () => {
     const spawn = vi.fn(async () => fakeClient('spawned'))
-    await ensureRelayBroker({ connect: () => { throw new Error('no broker') }, spawn, env: { RELAY_WORKSPACE_KEY: 'rk_live_test' } })
+    const envHandle = await ensureRelayBroker({ connect: () => { throw new Error('no broker') }, spawn, env: { RELAY_WORKSPACE_KEY: 'rk_live_test' } })
+    expect(envHandle.workspaceKey).toBe('rk_live_test')
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ workspaceKey: 'rk_live_test' }))
 
     spawn.mockClear()
-    await ensureRelayBroker({ connect: () => { throw new Error('no broker') }, spawn, workspaceKey: 'rk_live_explicit', env: {} })
+    const explicitHandle = await ensureRelayBroker({ connect: () => { throw new Error('no broker') }, spawn, workspaceKey: 'rk_live_explicit', env: {} })
+    expect(explicitHandle.workspaceKey).toBe('rk_live_explicit')
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ workspaceKey: 'rk_live_explicit' }))
+  })
+
+  it('uses the active Agent Relay workspace key when env is empty', async () => {
+    const spawn = vi.fn(async () => fakeClient('spawned'))
+    const handle = await ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn,
+      env: {},
+      resolveWorkspaceKey: () => 'rk_live_stored',
+    })
+
+    expect(handle.workspaceKey).toBe('rk_live_stored')
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ workspaceKey: 'rk_live_stored' }))
+  })
+
+  it('returns the resolved workspace key when reusing an existing broker', async () => {
+    const connected = fakeClient('connected')
+    const handle = await ensureRelayBroker({
+      connect: () => connected,
+      spawn: async () => fakeClient('spawned'),
+      env: {},
+      resolveWorkspaceKey: () => 'rk_live_reused',
+    })
+
+    expect(handle.client).toBe(connected)
+    expect(handle.started).toBe(false)
+    expect(handle.workspaceKey).toBe('rk_live_reused')
   })
 
   it('fails with actionable guidance when there is no broker and no workspace key', async () => {
@@ -91,6 +124,7 @@ describe('ensureRelayBroker', () => {
       connect: () => { throw new Error('no broker') },
       spawn: async () => { throw new Error('insert into workspaces failed') },
       env: {},
+      resolveWorkspaceKey: noStoredWorkspaceKey,
     })).rejects.toThrow(/RELAY_WORKSPACE_KEY/u)
   })
 })

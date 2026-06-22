@@ -4219,8 +4219,26 @@ function githubMirrorRepoForIssue(issue: LinearIssue): string | undefined {
 }
 
 function githubRepoFromUrl(url: string | undefined): string | undefined {
-  const match = url?.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+(?:[/?#].*)?$/iu)
-  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : undefined
+  for (const candidate of githubUrlCandidates(url)) {
+    const match = candidate.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+(?:[/?#].*)?$/iu)
+    if (match?.[1] && match[2]) {
+      return `${match[1]}/${match[2]}`
+    }
+  }
+  return undefined
+}
+
+function githubUrlCandidates(value: string | undefined): string[] {
+  if (!value) {
+    return []
+  }
+  const candidates = new Set<string>()
+  const trimmed = value.trim()
+  candidates.add(trimmed.replace(/^<|>$/gu, ''))
+  for (const match of trimmed.matchAll(/https:\/\/github\.com\/[^\s<>)\]]+/giu)) {
+    candidates.add(match[0].replace(/[),.;]+$/gu, ''))
+  }
+  return [...candidates]
 }
 
 function labelRoutesForIssue(
