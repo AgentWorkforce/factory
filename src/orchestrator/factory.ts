@@ -4074,21 +4074,27 @@ const repoMapFromConfig = (config: FactoryConfig) => {
 
 export const githubIssuePathParts = (path: string): { owner: string; repo: string; number: number; slug?: string } | undefined => {
   // Canonical GitHub relayfile issue entries are nested as
-  // /github/repos/<owner>/<repo>/issues/<number>__<slug>/meta.json. Keep the
-  // legacy flat and by-id forms for older mount state, and accept metadata.json
-  // as a read-only compatibility alias for historical local mount snapshots.
+  // /github/repos/<owner>/<repo>/issues/<number>__<slug>/meta.json. Some
+  // mounts compact the repo directory to <owner>__<repo>; accept both layouts.
+  // Keep the legacy flat and by-id forms for older mount state, and accept
+  // metadata.json as a read-only compatibility alias for historical snapshots.
   const match = path.match(
-    /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/(?:(?:by-id\/)?(\d+)\.json|(\d+)(?:__([^/]+))?\/(?:meta|metadata)\.json)$/u,
+    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(?:(?:by-id\/)?(\d+)\.json|(\d+)(?:__([^/]+))?\/(?:meta|metadata)\.json)$/u,
   )
   if (!match) {
     return undefined
   }
-  const number = Number(match[3] ?? match[4])
+  const owner = match[1] ?? match[3]
+  const repo = match[2] ?? match[4]
+  if (!owner || !repo) {
+    return undefined
+  }
+  const number = Number(match[5] ?? match[6])
   return {
-    owner: match[1]!,
-    repo: match[2]!,
+    owner,
+    repo,
     number,
-    slug: match[5],
+    slug: match[7],
   }
 }
 
@@ -4114,15 +4120,20 @@ const githubIssueReadCandidatePaths = (path: string): string[] => {
 }
 
 const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: string; number: number; slug?: string } | undefined => {
-  const match = path.match(/^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:__([^/]+))?$/u)
+  const match = path.match(/^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(\d+)(?:__([^/]+))?$/u)
   if (!match) {
     return undefined
   }
+  const owner = match[1] ?? match[3]
+  const repo = match[2] ?? match[4]
+  if (!owner || !repo) {
+    return undefined
+  }
   return {
-    owner: match[1]!,
-    repo: match[2]!,
-    number: Number(match[3]),
-    slug: match[4],
+    owner,
+    repo,
+    number: Number(match[5]),
+    slug: match[6],
   }
 }
 
@@ -4367,7 +4378,7 @@ const isGithubIssueFilePath = (path: string): boolean =>
   githubIssuePathParts(path) !== undefined || githubIssueDirectoryPathParts(path) !== undefined
 
 const isGithubIssueTreePath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/issues\/.+/u.test(path)
+  /^\/github\/repos\/(?:[^/]+\/[^/]+|[^/]+__[^/]+)\/issues\/.+/u.test(path)
 
 const githubPullPathParts = (path: string): { owner: string; repo: string; number: number } | undefined => {
   // Tolerate every webhook-fed PR mount layout we've seen, across both the
