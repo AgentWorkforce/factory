@@ -54,4 +54,4 @@ if (forceRebuild || !existsSync(outfile)) {
 }
 
 const mod = await import(pathToFileURL(outfile).href)
-await mod.main(cliArgs)
+await mod.main(['fleet', ...cliArgs])

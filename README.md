@@ -47,12 +47,11 @@ and sign in to that separately (it's a peer of this package). Once installed, th
 CLI is available as `factory`:
 
 ```bash
-factory factory run-once --config ./factory.config.json --dry-run
+factory run-once --config ./factory.config.json --dry-run
 ```
 
-> Yes, `factory factory` — the `factory` CLI groups its commands under a `factory`
-> subcommand. From a source checkout instead of an npm install, run
-> `npm ci && npm run build` first, then `node bin/factory.mjs factory <action> …`.
+From a source checkout instead of an npm install, run
+`npm ci && npm run build` first, then `node bin/factory.mjs <action> …`.
 
 ## Quick start
 
@@ -78,17 +77,17 @@ factory factory run-once --config ./factory.config.json --dry-run
    but writes nothing and spawns no agents:
 
    ```bash
-   factory factory run-once --config ./factory.config.json --dry-run
+   factory run-once --config ./factory.config.json --dry-run
    ```
 
 3. **Let it work for real:**
 
    ```bash
    # One discovery→dispatch cycle, then exit.
-   factory factory run-once --config ./factory.config.json
+   factory run-once --config ./factory.config.json
 
    # Or run continuously as a daemon (the production form).
-   factory factory start --mode live --config ./factory.config.json
+   factory start --mode live --config ./factory.config.json
    ```
 
 > **Pulled some issues but dispatched none?** That's the safety gate doing its

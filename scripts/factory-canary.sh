@@ -48,7 +48,7 @@ cd "$WORKDIR" || { echo "[$TS] factory-canary: cannot cd to $WORKDIR" >&2; exit 
 # The canary runs the real dry-run triage path (no agents spawned) and prints a
 # JSON verdict {ok,issue,status,reason}; exit code mirrors ok. A hung run
 # (broker/mount wedge) is bounded by FACTORY_CANARY_TIMEOUT.
-RUN=(node "$BIN" factory canary "$ISSUE" --config "$CONFIG" --backend "$BACKEND")
+RUN=(node "$BIN" canary "$ISSUE" --config "$CONFIG" --backend "$BACKEND")
 # A hung run (broker/mount wedge) MUST be bounded — an unbounded canary on a
 # scheduler (launchd/cron) can wedge the slot forever and suppress later alerts.
 # macOS has no `timeout` by default; coreutils ships it as `gtimeout`. If neither
