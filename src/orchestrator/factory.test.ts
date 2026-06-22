@@ -6875,6 +6875,39 @@ describe('FactoryLoop', () => {
     expect(mount.confirmedPaths.filter((path) => path.includes('/replies/'))).toEqual([])
   })
 
+  it('resolves a configured Slack channel name to the mounted channel directory', async () => {
+    const channelDir = 'C0FACTORY__factory-e2e'
+    const mount = new ConfirmRecordingSlackMountClient({
+      [issuePath(35)]: issueFile(35),
+      [`/slack/channels/${channelDir}/meta.json`]: {},
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig('factory-e2e') }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(35), issueFile(35))))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect(slackRoots[0]?.path).toMatch(new RegExp(`^/slack/channels/${channelDir}/messages/`))
+    expect(fleet.messages[0]?.text).toContain(`/slack/channels/${channelDir}/messages/${mount.threadTs.replace(/\./g, '_')}/replies/question.json`)
+
+    emitSlackReply(mount, slackReplyFixturePath(channelDir, mount.threadTs, 'human-answer-35'), 'human-answer-35', {
+      text: 'Use the mounted channel directory.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+
+    expect(slackAnswerInputs(fleet)).toEqual([
+      { name: 'ar-35-impl-pear', data: '<integration-event source="slack" issue="AR-35">\nHuman reply in the Slack thread:\nUse the mounted channel directory.\n</integration-event>\r' },
+    ])
+  })
+
   it('routes a mid-task agent question to the Slack dispatch thread and returns the human answer via sendInput', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(36)]: issueFile(36) })
     const fleet = new FakeFleetClient()

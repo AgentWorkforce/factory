@@ -16,14 +16,14 @@ interface ThreadRef {
 
 const channelIdFromDir = (channelDir: string): string => channelDir.split('__')[0] ?? channelDir
 
-const channelSegment = (value: string): string => {
+export const slackChannelSegment = (value: string): string => {
   const trimmed = value.trim().replace(/^#/u, '')
   const match = trimmed.match(/(?:^|\/)slack\/channels\/([^/]+)/u)
   return match?.[1] ?? trimmed.split('/')[0] ?? trimmed
 }
 
-const channelAliases = (value?: string): Set<string> => {
-  const segment = typeof value === 'string' ? channelSegment(value) : ''
+export const slackChannelAliases = (value?: string): Set<string> => {
+  const segment = typeof value === 'string' ? slackChannelSegment(value) : ''
   if (!segment) return new Set()
 
   const aliases = new Set<string>()
@@ -45,8 +45,8 @@ const assertSlackChannelAllowed = (
   targetChannel: string | undefined,
   context: string,
 ): void => {
-  const configured = channelAliases(configuredChannel)
-  const target = channelAliases(targetChannel)
+  const configured = slackChannelAliases(configuredChannel)
+  const target = slackChannelAliases(targetChannel)
   if (configured.size === 0) {
     throw new Error(`Refusing Slack writeback for ${context}: configured factory-e2e channel is required`)
   }
