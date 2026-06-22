@@ -444,8 +444,8 @@ function evaluateFactoryCanary(
   }
 }
 
-function parseFactoryStartFlags(args: Array<string | undefined>): { mode?: 'live' } {
-  let mode: 'live' | undefined
+function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live' } {
+  let mode: 'live' = 'live'
   const flags = args.filter((arg): arg is string => Boolean(arg))
   for (let index = 0; index < flags.length; index += 1) {
     const flag = flags[index]
@@ -461,8 +461,8 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode?: 'live
 }
 
 async function loadConfig(path?: string): Promise<LoadedConfig> {
-  if (!path) throw new Error('factory commands require --config <path>')
-  const raw = JSON.parse(await readFile(path, 'utf8')) as unknown
+  const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
+  const raw = JSON.parse(await readFile(configPath, 'utf8')) as unknown
   const record = asRecord(raw)
   return {
     config: FactoryConfigSchema.parse(record.factoryConfig ?? record),
@@ -736,7 +736,7 @@ function helpText(): string {
 
 Commands:
   run-once              Run one discovery -> triage -> dispatch cycle
-  start --mode live     Run the live factory daemon
+  start                 Run the live factory daemon
   status                Print current factory status as JSON
   loop                  Run the bounded loop configured in factory.config.json
   loop-status           Print heartbeat/liveness status for the loop
@@ -749,7 +749,7 @@ Commands:
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
-  --config <path>       Factory config JSON path
+  --config <path>       Factory config JSON path (default: ./factory.config.json)
   --dry-run             Discover and triage without writes or agent spawns
   --backend <backend>   Fleet backend: internal or relay
   -h, --help            Show this help

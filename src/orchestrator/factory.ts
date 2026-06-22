@@ -392,7 +392,7 @@ export class FactoryLoop implements Factory {
 
     this.#wireFleetEvents()
 
-    if (opts.mode === 'live') {
+    if ((opts.mode ?? 'live') === 'live') {
       this.#started = true
       try {
         await this.#startLiveSubscription(opts.liveSubscription)

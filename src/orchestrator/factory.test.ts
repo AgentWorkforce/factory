@@ -1999,7 +1999,7 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
 
     expect(fleet.spawns).toEqual([])
     expect(factory.status().inFlight).toEqual([])
@@ -3296,7 +3296,7 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-11-impl-pear', 'ar-11-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-11'])
@@ -3647,7 +3647,7 @@ describe('FactoryLoop', () => {
       },
     })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
     expect(mount.activeSubscriptions).toBe(1)
     await expect(factory.stop()).resolves.toBeUndefined()
 
@@ -3727,7 +3727,7 @@ describe('FactoryLoop', () => {
       }
     })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-15-impl-pear', 'ar-15-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-15'])
@@ -3741,7 +3741,7 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
-    await Promise.all([factory.start(), factory.start()])
+    await Promise.all([factory.start({ mode: 'backfill-and-subscribe' }), factory.start({ mode: 'backfill-and-subscribe' })])
 
     expect(mount.subscribeCount).toBe(1)
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-12-impl-pear', 'ar-12-review'])
@@ -3753,7 +3753,7 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
     mount.emit(changeEvent(issuePath(17), 'event-duplicate-1'))
     mount.emit(changeEvent(issuePath(17), 'event-duplicate-2'))
     await flush()
@@ -4869,7 +4869,7 @@ describe('FactoryLoop', () => {
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
     const errors: unknown[] = []
     factory.on('error', (payload) => errors.push(payload))
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
 
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(8), issueFile(8)))
     await factory.dispatch(decision)
@@ -5413,7 +5413,7 @@ describe('FactoryLoop', () => {
         },
       })
 
-      await factory.start()
+      await factory.start({ mode: 'backfill-and-subscribe' })
       expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-243'])
 
       await vi.advanceTimersByTimeAsync(0)
@@ -7346,7 +7346,7 @@ describe('FactoryLoop', () => {
       stateStore: state,
     })
 
-    await factory.start()
+    await factory.start({ mode: 'backfill-and-subscribe' })
 
     expect(factory.status().counters.slackWatchersRearmed).toBeUndefined()
     expect(slack.roots).toEqual([])
