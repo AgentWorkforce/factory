@@ -53,6 +53,7 @@ describe('FactoryConfigSchema', () => {
         humanReview: 'In Human Review',
       },
       statesByTeam: {},
+      teamIds: {},
     })
     expect(parsed.safety).toEqual({
       requireTitlePrefix: '[factory-e2e]',
@@ -113,6 +114,7 @@ describe('FactoryConfigSchema', () => {
       repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
       linear: {
         states: { readyForAgent: 'Ready for Agent', done: 'Done' },
+        teamIds: { AR: 'team-ar' },
         statesByTeam: {
           ENG: { readyForAgent: 'To Do', done: 'Shipped' },
         },
@@ -120,6 +122,7 @@ describe('FactoryConfigSchema', () => {
     })
 
     expect(parsed.linear.states.readyForAgent).toBe('Ready for Agent')
+    expect(parsed.linear.teamIds.AR).toBe('team-ar')
     expect(parsed.linear.statesByTeam.ENG).toEqual({ readyForAgent: 'To Do', done: 'Shipped' })
     expect(parsed.stateIds).toEqual({})
   })

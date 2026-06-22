@@ -1268,6 +1268,7 @@ describe('FactoryLoop', () => {
         default: 'AgentWorkforce/relayfile-adapters',
       },
       safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+      linear: { teamIds: { AR: 'team-ar' } },
     }), { mount, fleet: new FakeFleetClient(), triage: new StaticTriage() })
 
     await factory.runOnce({ dryRun: false })
@@ -1287,6 +1288,64 @@ describe('FactoryLoop', () => {
         owner: 'AgentWorkforce',
         repo: 'relayfile-adapters',
         number: 222,
+        path: ghPath,
+      }),
+    }))
+    expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
+  })
+
+  it('mirrors compact GitHub issues when the repo root listing is shallow', async () => {
+    const ghPath = githubIssueCompactPath('AgentWorkforce', 'relayfile-adapters', 224)
+    class ShallowGithubRootMount extends FakeMountClient {
+      readonly listTreePrefixes: string[] = []
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.listTreePrefixes.push(prefix)
+        if (prefix === '/github/repos') {
+          return [
+            '/github/repos/AgentWorkforce/relayfile-adapters',
+            '/github/repos/AgentWorkforce__relayfile-adapters',
+            '/github/repos/AgentWorkforce__relayfile-adapters/issues',
+          ]
+        }
+        return super.listTree(prefix)
+      }
+    }
+    const mount = new ShallowGithubRootMount({
+      [ghPath]: githubIssueFile(224, {
+        owner: 'AgentWorkforce',
+        repo: 'relayfile-adapters',
+        title: 'Export shared mount-path parser',
+        body: 'The root listing is shallow in the cloud mount.',
+        labels: ['factory'],
+      }),
+    })
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { 'relayfile-adapters': 'AgentWorkforce/relayfile-adapters' },
+        clonePaths: { 'AgentWorkforce/relayfile-adapters': '/work/relayfile-adapters' },
+        default: 'AgentWorkforce/relayfile-adapters',
+      },
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+      linear: { teamIds: { AR: 'team-ar' } },
+    }), { mount, fleet: new FakeFleetClient(), triage: new StaticTriage() })
+
+    await factory.runOnce({ dryRun: false })
+
+    expect(mount.listTreePrefixes).toEqual(expect.arrayContaining([
+      '/github/repos',
+      '/github/repos/AgentWorkforce__relayfile-adapters/issues/by-id',
+    ]))
+    expect(mount.writes).toHaveLength(1)
+    expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
+      title: '[factory] Export shared mount-path parser',
+      teamId: 'team-ar',
+      labels: [{ name: 'relayfile-adapters' }],
+      source: expect.objectContaining({
+        provider: 'github',
+        owner: 'AgentWorkforce',
+        repo: 'relayfile-adapters',
+        number: 224,
         path: ghPath,
       }),
     }))
@@ -3781,7 +3840,13 @@ describe('FactoryLoop', () => {
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
-    expect(mount.listTreePrefixes).toEqual(['/github/repos', '/linear/issues', '/linear/issues/by-state/ready-for-agent/', '.integrations/discovery'])
+    expect(mount.listTreePrefixes).toEqual([
+      '/github/repos',
+      '/github/repos/AgentWorkforce__pear/issues/by-id',
+      '/linear/issues',
+      '/linear/issues/by-state/ready-for-agent/',
+      '.integrations/discovery',
+    ])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-40-impl-pear', 'ar-40-review'])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-40'])
     expect(factory.status().counters.liveHighWatermarkUnavailable).toBe(1)
@@ -4396,6 +4461,41 @@ describe('FactoryLoop', () => {
     expect(result.agents.map((a) => a.role)).toEqual(['implementer', 'reviewer'])
     expect(fleet.spawns.map((s) => s.name)).toEqual(['ar-722-impl-default', 'ar-722-review'])
     expect(comments.some((c) => c.includes('No Linear labels were present'))).toBe(false)
+  })
+
+  it('routes a label-less GitHub mirror from its source URL before repos.default', async () => {
+    const mirrorIssue = realIssueFile(724, ready, {
+      labels: [],
+      title: '[factory] GitHub mirror without synced labels',
+      description: 'Issue body\n\nSource: https://github.com/AgentWorkforce/relayfile-adapters/issues/224',
+    })
+    const mount = new FakeMountClient({ [issuePath(724)]: mirrorIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { 'relayfile-adapters': 'AgentWorkforce/relayfile-adapters' },
+        clonePaths: {
+          'AgentWorkforce/factory': '/work/factory',
+          'AgentWorkforce/relayfile-adapters': '/work/relayfile-adapters',
+        },
+        default: 'AgentWorkforce/factory',
+      },
+      safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(724), mirrorIssue)))
+
+    expect(result.agents.map((a) => a.role)).toEqual(['implementer', 'reviewer'])
+    expect(fleet.spawns.map((s) => s.cwd)).toEqual([
+      '/work/relayfile-adapters',
+      '/work/relayfile-adapters',
+    ])
+    expect(fleet.spawns.map((s) => s.name)).toEqual(['ar-724-impl-relayfile-adapters', 'ar-724-review'])
   })
 
   it('fails dispatch loudly when labels do not map through repos.byLabel', async () => {
