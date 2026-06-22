@@ -10,6 +10,8 @@ export type {
 } from './linear'
 export {
   MountSlackWriteback,
+  slackChannelAliases,
+  slackChannelSegment,
 } from './slack'
 export type {
   MountSlackWritebackConfig,

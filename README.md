@@ -127,6 +127,13 @@ Slack alert via `FACTORY_CANARY_SLACK_WEBHOOK` on failure. See
 `scripts/com.agentrelay.factory-canary.plist.example` for an every-6h launchd
 template.
 
+### Slack questions
+
+Set `slack.channel` to the Slack channel name, channel ID, or mounted channel
+directory. For example, `factory`, `C1234567890`, and
+`C1234567890__factory` are all accepted when the channel is present under the
+relayfile Slack mount.
+
 ## Tell it what to work on
 
 Two ways to hand the factory an issue — both are just labeling/titling, nothing

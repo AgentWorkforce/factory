@@ -53,7 +53,7 @@ import type {
   TriageDecision,
   TriageEngine,
 } from '../types'
-import { MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../writeback'
+import { MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
@@ -194,6 +194,8 @@ export class FactoryLoop implements Factory {
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<void>>()
+  #resolvedSlackChannelDir?: string
+  #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
   // reaper doesn't spam the same benign "ambiguous process lookup" line on every
   // poll (a joined/cloud agent has no local PID to resolve — expected).
@@ -2833,12 +2835,15 @@ export class FactoryLoop implements Factory {
 
       if (this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('merge-done-thread')) {
         try {
-          const root = await this.#slack.postThread({
-            channel: this.#config.slack.channel,
-            text: `${issue.key}: PR merged; Linear state set to Done.`,
-          })
-          await this.#slack.reply(root.threadId, `${issue.key}: Linear state set to Done.`)
-          this.#recordSlackWritebackSuccess('merge-done-thread')
+          const channel = await this.#slackChannelDir()
+          if (channel) {
+            const root = await this.#slack.postThread({
+              channel,
+              text: `${issue.key}: PR merged; Linear state set to Done.`,
+            })
+            await this.#slack.reply(root.threadId, `${issue.key}: Linear state set to Done.`)
+            this.#recordSlackWritebackSuccess('merge-done-thread')
+          }
         } catch (error) {
           this.#markSlackWritebackFailure('merge-done-thread', error)
         }
@@ -3084,21 +3089,24 @@ export class FactoryLoop implements Factory {
 
       if (this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('completion-thread')) {
         try {
-          const merged = opts.completionReason === 'pr-merged'
-          const completionText = merged
-            ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
-            : `${record.issue.key}: factory agents completed${humanReview ? '; awaiting human review' : ''}.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`
-          const stateText = merged
-            ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
-            : humanReview
-              ? `${record.issue.key}: awaiting human review; Linear state set to ${statusLabel}.`
-              : `${record.issue.key}: Linear state set to ${statusLabel}.`
-          const root = await this.#slack.postThread({
-            channel: this.#config.slack.channel,
-            text: completionText,
-          })
-          await this.#slack.reply(root.threadId, stateText)
-          this.#recordSlackWritebackSuccess('completion-thread')
+          const channel = await this.#slackChannelDir()
+          if (channel) {
+            const merged = opts.completionReason === 'pr-merged'
+            const completionText = merged
+              ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
+              : `${record.issue.key}: factory agents completed${humanReview ? '; awaiting human review' : ''}.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`
+            const stateText = merged
+              ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
+              : humanReview
+                ? `${record.issue.key}: awaiting human review; Linear state set to ${statusLabel}.`
+                : `${record.issue.key}: Linear state set to ${statusLabel}.`
+            const root = await this.#slack.postThread({
+              channel,
+              text: completionText,
+            })
+            await this.#slack.reply(root.threadId, stateText)
+            this.#recordSlackWritebackSuccess('completion-thread')
+          }
         } catch (error) {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
@@ -3362,7 +3370,7 @@ export class FactoryLoop implements Factory {
     }
 
     const root = await this.#slack.postThread({
-      channel: this.#config.slack.channel,
+      channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
         `${record.issue.key}: factory agents dispatched.`,
         `State: ${result.stateId ?? 'dispatching'}`,
@@ -3427,7 +3435,7 @@ export class FactoryLoop implements Factory {
 
     const issue = await this.#readIssue(decision.issue.path)
     const root = await this.#slack.postThread({
-      channel: this.#config.slack.channel,
+      channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
         `${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
         `Reason: ${reason}`,
@@ -3449,7 +3457,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const channelDir = this.#config.slack.channel
+    const channelDir = await this.#slackChannelDir() ?? this.#config.slack.channel
     const messagesPrefix = slackChannelMessagesPrefix(channelDir)
     const preExistingPaths = new Set<string>()
     const seenReplies = new Set<string>()
@@ -3687,14 +3695,86 @@ export class FactoryLoop implements Factory {
     return resolve(process.cwd(), '.integrations')
   }
 
+  async #slackChannelDir(): Promise<string | undefined> {
+    if (!this.#config.slack) {
+      return undefined
+    }
+    if (this.#resolvedSlackChannelDir) {
+      return this.#resolvedSlackChannelDir
+    }
+    if (this.#slackChannelDirRefresh) {
+      return this.#slackChannelDirRefresh
+    }
+
+    this.#slackChannelDirRefresh = this.#resolveSlackChannelDir()
+      .finally(() => {
+        this.#slackChannelDirRefresh = undefined
+      })
+    return this.#slackChannelDirRefresh
+  }
+
+  async #resolveSlackChannelDir(): Promise<string | undefined> {
+    const configured = this.#config.slack?.channel.trim()
+    if (!configured) {
+      return undefined
+    }
+
+    const configuredSegment = slackChannelSegment(configured)
+    const configuredAliases = slackChannelAliases(configured)
+    if (configuredAliases.size === 0) {
+      return undefined
+    }
+
+    let paths: string[]
+    try {
+      paths = await this.#mount.listTree('/slack/channels')
+    } catch (error) {
+      this.#logger.warn?.('[factory] unable to resolve Slack channel from mount; using configured channel value', {
+        channel: configured,
+        error,
+      })
+      this.#resolvedSlackChannelDir = configuredSegment
+      return this.#resolvedSlackChannelDir
+    }
+
+    const channelDirs = [...new Set(paths
+      .map((path) => path.match(/^\/slack\/channels\/([^/]+)/u)?.[1])
+      .filter((channelDir): channelDir is string => Boolean(channelDir)))]
+      .sort()
+    const matches = channelDirs.filter((channelDir) => {
+      const aliases = slackChannelAliases(channelDir)
+      return [...aliases].some((alias) => configuredAliases.has(alias))
+    })
+
+    if (matches.length === 0) {
+      this.#logger.warn?.('[factory] Slack channel was not found in mount; using configured channel value', {
+        channel: configured,
+      })
+      this.#resolvedSlackChannelDir = configuredSegment
+      return this.#resolvedSlackChannelDir
+    }
+
+    const exact = matches.find((channelDir) => slackChannelSegment(channelDir).toLowerCase() === configuredSegment.toLowerCase())
+    this.#resolvedSlackChannelDir = exact ?? matches[0]
+    if (matches.length > 1 && !exact) {
+      this.#logger.warn?.('[factory] Slack channel name matched multiple mount directories; using first match', {
+        channel: configured,
+        selected: this.#resolvedSlackChannelDir,
+        matches,
+      })
+    }
+    return this.#resolvedSlackChannelDir
+  }
+
   async #slackDispatchThreadFor(record: InFlightIssue): Promise<{ channel: string; threadId: string; mountRoot: string } | undefined> {
     if (!this.#config.slack) {
       return undefined
     }
 
     const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
+    const channel = await this.#slackChannelDir() ?? this.#config.slack.channel
     return threadId
-      ? { channel: this.#config.slack.channel, threadId, mountRoot: this.#integrationsMountRoot() }
+      ? { channel, threadId, mountRoot: this.#integrationsMountRoot() }
       : undefined
   }
 
