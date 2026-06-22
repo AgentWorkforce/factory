@@ -113,7 +113,8 @@ const DEFAULT_LINEAR_STATE_NAMES = {
 const linearSchema = z.object({
   states: linearRoleNamesSchema.default(DEFAULT_LINEAR_STATE_NAMES),
   statesByTeam: z.record(z.string(), linearRoleNamesSchema).default({}),
-}).default({ states: DEFAULT_LINEAR_STATE_NAMES, statesByTeam: {} })
+  teamIds: z.record(z.string(), z.string()).default({}),
+}).default({ states: DEFAULT_LINEAR_STATE_NAMES, statesByTeam: {}, teamIds: {} })
 
 const stateIdsSchema = z.object({
   readyForAgent: z.string().optional(),

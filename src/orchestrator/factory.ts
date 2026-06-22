@@ -1629,24 +1629,26 @@ export class FactoryLoop implements Factory {
 
   async #githubIssuePaths(): Promise<string[]> {
     try {
-      const paths = await this.#listRelayfileTree(GITHUB_ISSUE_ROOT, 'GitHub issue ingestion')
-      const issuePaths: string[] = []
-      for (const path of paths) {
-        if (githubIssuePathParts(path) !== undefined) {
-          issuePaths.push(path)
-        } else if (githubIssueDirectoryPathParts(path) !== undefined) {
-          // listTree returns the issue directory entry alongside its
-          // meta.json file; githubIssuePathParts() already collected the
-          // file, so skip the directory to avoid reading the same issue
-          // twice in one backfill pass. Directory paths are only meaningful
-          // for live change events, not the tree scan.
-          continue
-        } else if (isGithubIssueTreePath(path)) {
-          this.#increment('githubIssuesIgnoredByPathRegex')
-          this.#logger.debug?.('[factory] ignored GitHub issue path with unsupported relayfile shape', { path })
+      const issuePaths = new Set<string>()
+      for (const root of githubIssueScanRoots(this.#config)) {
+        const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
+        for (const path of paths) {
+          if (githubIssuePathParts(path) !== undefined) {
+            issuePaths.add(path)
+          } else if (githubIssueDirectoryPathParts(path) !== undefined) {
+            // listTree returns the issue directory entry alongside its
+            // meta.json file; githubIssuePathParts() already collected the
+            // file, so skip the directory to avoid reading the same issue
+            // twice in one backfill pass. Directory paths are only meaningful
+            // for live change events, not the tree scan.
+            continue
+          } else if (isGithubIssueTreePath(path)) {
+            this.#increment('githubIssuesIgnoredByPathRegex')
+            this.#logger.debug?.('[factory] ignored GitHub issue path with unsupported relayfile shape', { path })
+          }
         }
       }
-      return issuePaths.sort()
+      return [...issuePaths].sort()
     } catch (error) {
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
@@ -3992,6 +3994,22 @@ function labelDerivedDispatchDecision(
   const routesByLabel = labelRoutesForIssue(liveIssue, config)
 
   if (routesByLabel.labels.length === 0) {
+    const githubMirrorRoute = githubMirrorRouteForIssue(liveIssue, config)
+    if (githubMirrorRoute) {
+      const implementer = routeImplementerSpec(liveIssue, config, githubMirrorRoute.slug, githubMirrorRoute.route)
+      return {
+        ok: true,
+        decision: {
+          ...decision,
+          routes: [githubMirrorRoute.route],
+          scope: 'single',
+          implementers: [implementer],
+          workflow: undefined,
+          reviewer: routeReviewerSpec(liveIssue, config, githubMirrorRoute.route, decision.reviewer),
+        },
+      }
+    }
+
     // No repo labels — which is also what a label-less sync produces
     // (relayfile-adapters#205, labels dropped from the synced record). Fall back
     // to the configured default repo (consistent with triage, which already
@@ -4074,6 +4092,55 @@ function labelDerivedDispatchDecision(
       reviewer: routeReviewerSpec(liveIssue, config, selectedRoutes[0]!.route, decision.reviewer),
     },
   }
+}
+
+function githubMirrorRouteForIssue(
+  issue: LinearIssue,
+  config: FactoryConfig,
+): { slug: string; route: TriageDecision['routes'][number] } | undefined {
+  const repo = githubMirrorRepoForIssue(issue)
+  if (!repo) {
+    return undefined
+  }
+  const entry = findLabelRoute(config.repos.byLabel, repo)
+    ?? findLabelRoute(config.repos.byLabel, repo.split('/').at(-1) ?? repo)
+  if (!entry) {
+    return undefined
+  }
+  return {
+    slug: entry.label,
+    route: {
+      repo: entry.repo,
+      clonePath: config.repos.clonePaths[entry.repo],
+      rationale: `GitHub mirror source ${repo} routes to ${entry.repo}.`,
+    },
+  }
+}
+
+function githubMirrorRepoForIssue(issue: LinearIssue): string | undefined {
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  if (stringValue(source?.provider)?.toLowerCase() === 'github') {
+    const owner = stringValue(source?.owner)
+    const repo = stringValue(source?.repo)
+    if (owner && repo) {
+      return `${owner}/${repo}`
+    }
+    const urlRepo = githubRepoFromUrl(stringValue(source?.url))
+    if (urlRepo) {
+      return urlRepo
+    }
+  }
+  const sourceUrlLine = issue.description
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith(GITHUB_MIRROR_SOURCE_PREFIX))
+  return githubRepoFromUrl(sourceUrlLine?.slice(GITHUB_MIRROR_SOURCE_PREFIX.length))
+}
+
+function githubRepoFromUrl(url: string | undefined): string | undefined {
+  const match = url?.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+(?:[/?#].*)?$/iu)
+  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : undefined
 }
 
 function labelRoutesForIssue(
@@ -4363,22 +4430,26 @@ const githubIssueMirrorPayload = (
   repoLabel: string,
   config: FactoryConfig,
   readyForAgentStateId: string,
-): Record<string, unknown> => ({
-  id: githubIssueMirrorId(issue),
-  title: `${GITHUB_MIRROR_TITLE_PREFIX} ${issue.title}`.trim(),
-  description: githubIssueMirrorDescription(issue),
-  stateId: readyForAgentStateId,
-  labels: [{ name: repoLabel }],
-  team: { key: config.safety.requireTeamKey },
-  source: {
-    provider: 'github',
-    owner: issue.owner,
-    repo: issue.repoName,
-    number: issue.number,
-    url: issue.url,
-    path: issue.path,
-  },
-})
+): Record<string, unknown> => {
+  const teamId = config.linear.teamIds[config.safety.requireTeamKey]
+  return {
+    id: githubIssueMirrorId(issue),
+    title: `${GITHUB_MIRROR_TITLE_PREFIX} ${issue.title}`.trim(),
+    description: githubIssueMirrorDescription(issue),
+    stateId: readyForAgentStateId,
+    labels: [{ name: repoLabel }],
+    ...(teamId ? { teamId } : {}),
+    team: { key: config.safety.requireTeamKey, ...(teamId ? { id: teamId } : {}) },
+    source: {
+      provider: 'github',
+      owner: issue.owner,
+      repo: issue.repoName,
+      number: issue.number,
+      url: issue.url,
+      path: issue.path,
+    },
+  }
+}
 
 const githubIssueMirrorDescription = (issue: GithubIssueSource): string => {
   const body = issue.body.trim()
@@ -4507,6 +4578,28 @@ const reposFromConfig = (config: FactoryConfig): string[] => {
     config.repos.default,
   ].filter((repo): repo is string => Boolean(repo)))
   return [...repos]
+}
+
+const githubIssueScanRoots = (config: FactoryConfig): string[] => {
+  const roots = new Set([GITHUB_ISSUE_ROOT])
+  for (const repo of reposFromConfig(config)) {
+    const parts = githubRepoParts(repo)
+    if (!parts) continue
+    roots.add(`/github/repos/${parts.owner}__${parts.repo}/issues/by-id`)
+  }
+  return [...roots]
+}
+
+const githubRepoParts = (repo: string): { owner: string; repo: string } | undefined => {
+  const split = repo.match(/^([^/]+)\/([^/]+)$/u)
+  if (split) {
+    return { owner: split[1]!, repo: split[2]! }
+  }
+  const compact = repo.match(/^([^/]+)__([^/]+)$/u)
+  if (compact) {
+    return { owner: compact[1]!, repo: compact[2]! }
+  }
+  return undefined
 }
 
 const githubPullRoot = (repo: string): string => {
