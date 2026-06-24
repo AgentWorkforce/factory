@@ -34,6 +34,7 @@ const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
 export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/issues/**',
+  'relayfile:fs:read:/linear/states/**',
   'relayfile:fs:write:/linear/issues/**',
   'relayfile:fs:read:/github/repos/**',
   'relayfile:fs:read:/slack/channels/**',
