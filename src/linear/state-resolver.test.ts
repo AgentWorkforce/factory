@@ -21,6 +21,25 @@ function makeReader(
   }
 }
 
+function makeIssueFallbackReader(
+  issues: Record<string, { stateId?: string; state?: { id?: string; name?: string }; team?: { key?: string; name?: string } }>,
+): LinearStateReader & { reads: string[] } {
+  const reads: string[] = []
+  return {
+    reads,
+    async readFile(path: string) {
+      reads.push(path)
+      if (path === '/linear/states/_index.json') throw new Error('not found')
+      const issue = issues[path]
+      if (issue) return { content: { provider: 'linear', objectType: 'issue', payload: issue } }
+      throw Object.assign(new Error('not found'), { code: 'ENOENT' })
+    },
+    async listTree(prefix: string) {
+      return prefix === '/linear/issues' ? Object.keys(issues) : []
+    },
+  }
+}
+
 const AR_STATES = [{ id: 's1' }, { id: 's2' }, { id: 's3' }, { id: 's4' }, { id: 's5' }]
 const AR_RECORDS = {
   s1: { name: 'Ready for Agent', team_key: 'AR' },
@@ -210,6 +229,20 @@ describe('resolveFactoryStates', () => {
     })).rejects.toThrow(/ambiguous/)
   })
 
+  it('surfaces a misspelled OPTIONAL role when the states catalog is readable', async () => {
+    const reader = makeReader(AR_STATES, AR_RECORDS)
+    await expect(resolveFactoryStates(reader, {
+      states: {
+        readyForAgent: 'Ready for Agent',
+        agentImplementing: 'Agent Implementing',
+        inPlanning: 'In Planning',
+        done: 'Done',
+        humanReview: 'In Human Revue',
+      },
+      teams: ['AR'],
+    })).rejects.toThrow(/No Linear workflow state named "In Human Revue" for team "AR"/)
+  })
+
   it('leaves an OPTIONAL role unresolved when the states catalog is unavailable', async () => {
     // No /linear/states (e.g. unreadable under the mount token): required roles
     // fall back to pinned UUIDs and the optional humanReview is left unresolved,
@@ -296,5 +329,75 @@ describe('resolveFactoryStates name-only sync tolerance (relayfile-adapters#205)
     })
     expect(states.idFor('AR', 'readyForAgent')).toBe('s1')
     expect(states.idForName('Ready for Agent', 'AR')).toBe('s1')
+  })
+
+  it('falls back to synced issue state data when the states catalog is absent', async () => {
+    const reader = makeIssueFallbackReader({
+      '/linear/issues/AR-1__ready.json': { stateId: 's-ready', state: { name: 'Ready for Agent' }, team: { key: 'AR' } },
+      '/linear/issues/AR-2__impl.json': { stateId: 's-impl', state: { name: 'Agent Implementing' }, team: { key: 'AR' } },
+      '/linear/issues/AR-3__plan.json': { stateId: 's-plan', state: { name: 'In Planning' }, team: { key: 'AR' } },
+      '/linear/issues/AR-4__done.json': { stateId: 's-done', state: { name: 'Done' }, team: { key: 'AR' } },
+      '/linear/issues/AR-5__review.json': { stateId: 's-review', state: { name: 'In Human Review' }, team: { key: 'AR' } },
+    })
+
+    const states = await resolveFactoryStates(reader, {
+      states: {
+        readyForAgent: 'Ready for Agent',
+        agentImplementing: 'Agent Implementing',
+        inPlanning: 'In Planning',
+        done: 'Done',
+        humanReview: 'In Human Review',
+      },
+      teams: ['AR'],
+    })
+
+    expect(states.idFor('AR', 'readyForAgent')).toBe('s-ready')
+    expect(states.idFor('AR', 'done')).toBe('s-done')
+    expect(states.roleOf('s-impl')).toBe('agentImplementing')
+    expect(states.idForName('Done', 'AR')).toBe('s-done')
+    expect(states.hasHumanReview('AR')).toBe(true)
+  })
+
+  it('stops issue fallback scanning once configured state names are found', async () => {
+    const issues: Record<string, { stateId?: string; state?: { id?: string; name?: string }; team?: { key?: string; name?: string } }> = {
+      '/linear/issues/AR-1__ready.json': { stateId: 's-ready', state: { name: 'Ready for Agent' }, team: { key: 'AR' } },
+      '/linear/issues/AR-2__impl.json': { stateId: 's-impl', state: { name: 'Agent Implementing' }, team: { key: 'AR' } },
+      '/linear/issues/AR-3__plan.json': { stateId: 's-plan', state: { name: 'In Planning' }, team: { key: 'AR' } },
+      '/linear/issues/AR-4__done.json': { stateId: 's-done', state: { name: 'Done' }, team: { key: 'AR' } },
+    }
+    for (let index = 0; index < 200; index += 1) {
+      issues[`/linear/issues/ZZ-${index}.json`] = { stateId: `junk-${index}`, state: { name: `Junk ${index}` }, team: { key: 'AR' } }
+    }
+    const reader = makeIssueFallbackReader(issues)
+
+    const states = await resolveFactoryStates(reader, {
+      states: {
+        readyForAgent: 'Ready for Agent',
+        agentImplementing: 'Agent Implementing',
+        inPlanning: 'In Planning',
+        done: 'Done',
+      },
+      teams: ['AR'],
+    })
+
+    expect(states.idFor('AR', 'done')).toBe('s-done')
+    expect(reader.reads).not.toContain('/linear/issues/ZZ-199.json')
+    expect(reader.reads.length).toBeLessThan(30)
+  })
+
+  it('caps issue fallback scanning when configured state names are not found', async () => {
+    const issues: Record<string, { stateId?: string; state?: { id?: string; name?: string }; team?: { key?: string; name?: string } }> = {}
+    for (let index = 0; index < 200; index += 1) {
+      issues[`/linear/issues/ZZ-${index}.json`] = { stateId: `junk-${index}`, state: { name: `Junk ${index}` }, team: { key: 'AR' } }
+    }
+    const reader = makeIssueFallbackReader(issues)
+
+    await expect(resolveFactoryStates(reader, {
+      states: { readyForAgent: 'Ready for Agent' },
+      teams: ['AR'],
+    })).rejects.toThrow(/No Linear workflow state named "Ready for Agent" for team "AR"/)
+
+    expect(reader.reads).not.toContain('/linear/issues/ZZ-199.json')
+    expect(reader.reads.filter((path) => path.startsWith('/linear/issues/')).length).toBe(150)
   })
 })

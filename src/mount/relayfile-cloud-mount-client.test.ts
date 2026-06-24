@@ -218,7 +218,10 @@ describe('RelayfileCloudMountClient', () => {
     const joinOptions = joinCalls[0][1]
     expect(joinOptions.scopes).not.toContain('relayfile:fs:read:/**')
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
+    expect(joinOptions.scopes).toContain('relayfile:fs:read:/linear/states/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')
+    expect(factoryReadScopeCovers('/linear/states/_index.json')).toBe(true)
+    expect(factoryReadScopeCovers('/linear/states/state-ready.json')).toBe(true)
     expect(factoryReadScopeCovers('/slack/users/U123/messages/1781267200_000000/meta.json')).toBe(true)
     expect(capturedTokenProvider).toBeDefined()
     await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_shared')

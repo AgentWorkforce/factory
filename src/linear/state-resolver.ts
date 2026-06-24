@@ -15,11 +15,13 @@ const stateCanonicalPath = (id: string): string => `/linear/states/${id}.json`
 // Cap concurrent canonical-record reads so a large states catalog can't flood a
 // remote/cloud mount (rate limits, timeouts, fd exhaustion).
 const CATALOG_READ_CONCURRENCY = 10
+const ISSUE_FALLBACK_SCAN_LIMIT = 150
 
 // Minimal read surface so the resolver is decoupled from the full MountClient
 // and trivially testable with an in-memory map.
 export interface LinearStateReader {
   readFile(path: string): Promise<{ content: unknown }>
+  listTree?(prefix: string): Promise<string[]>
 }
 
 type RoleNames = Partial<Record<FactoryStateRole, string>>
@@ -98,6 +100,11 @@ interface StateRecord {
   teamName?: string
 }
 
+interface TargetStateLookup {
+  name: string
+  teamToken?: string
+}
+
 const norm = (value: string | undefined): string => (value ?? '').trim().toLowerCase()
 
 const asArray = (value: unknown): unknown[] => {
@@ -119,6 +126,11 @@ const unwrap = (value: unknown): Record<string, unknown> => {
     : record
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+
 const str = (value: unknown): string | undefined => (typeof value === 'string' && value ? value : undefined)
 
 // Lazily load and cache the /linear/states catalog. Only invoked when at least
@@ -133,7 +145,16 @@ const isCatalogUnavailable = (error: unknown): boolean => error instanceof Catal
 
 class StateCatalog {
   #records: StateRecord[] | undefined
-  constructor(private readonly reader: LinearStateReader) {}
+  #isFallback = false
+
+  constructor(
+    private readonly reader: LinearStateReader,
+    private readonly targetLookups: readonly TargetStateLookup[],
+  ) {}
+
+  get isFallback(): boolean {
+    return this.#isFallback
+  }
 
   async records(): Promise<StateRecord[]> {
     if (this.#records) return this.#records
@@ -141,6 +162,12 @@ class StateCatalog {
     try {
       index = (await this.reader.readFile(STATES_INDEX_PATH)).content
     } catch (error) {
+      const issueRecords = await this.recordsFromIssues()
+      if (issueRecords.length > 0) {
+        this.#isFallback = true
+        this.#records = issueRecords
+        return issueRecords
+      }
       throw new CatalogUnavailableError(
         `Cannot resolve Linear state names: ${STATES_INDEX_PATH} is unavailable ` +
         `(${error instanceof Error ? error.message : String(error)}). ` +
@@ -168,6 +195,55 @@ class StateCatalog {
     }
     this.#records = records
     return records
+  }
+
+  async recordsFromIssues(): Promise<StateRecord[]> {
+    if (!this.reader.listTree) return []
+    let paths: string[]
+    try {
+      paths = await this.reader.listTree('/linear/issues')
+    } catch {
+      return []
+    }
+
+    const byKey = new Map<string, StateRecord>()
+    const foundTargets = new Set<string>()
+    const issuePaths = paths.filter((path) =>
+      path.endsWith('.json') &&
+      !path.includes('/comments/') &&
+      !path.startsWith('/linear/issues/by-uuid/'),
+    )
+    const max = Math.min(issuePaths.length, ISSUE_FALLBACK_SCAN_LIMIT)
+    for (let i = 0; i < max; i += CATALOG_READ_CONCURRENCY) {
+      if (this.targetLookups.length > 0 && foundTargets.size >= this.targetLookups.length) break
+      const batch = await Promise.all(
+        issuePaths.slice(i, Math.min(i + CATALOG_READ_CONCURRENCY, max)).map(async (path): Promise<StateRecord | undefined> => {
+          try {
+            const payload = unwrap((await this.reader.readFile(path)).content)
+            const state = asRecord(payload.state)
+            const id = str(payload.stateId) ?? str(state?.id)
+            const name = str(state?.name)
+            if (!id || !name) return undefined
+            return {
+              id,
+              name,
+              teamKey: str(asRecord(payload.team)?.key) ?? str(payload.teamKey),
+              teamName: str(asRecord(payload.team)?.name) ?? str(payload.teamName),
+            }
+          } catch {
+            return undefined
+          }
+        }),
+      )
+      for (const record of batch) {
+        if (!record) continue
+        byKey.set(`${norm(record.teamKey) || norm(record.teamName)}:${norm(record.name)}:${record.id}`, record)
+        for (const target of this.targetLookups) {
+          if (targetMatchesRecord(target, record)) foundTargets.add(targetKey(target))
+        }
+      }
+    }
+    return [...byKey.values()]
   }
 
   // Resolve a state NAME to a UUID, optionally scoped to a team token (matched
@@ -198,6 +274,16 @@ class StateCatalog {
   }
 }
 
+const targetKey = (target: TargetStateLookup): string =>
+  `${norm(target.teamToken)}:${norm(target.name)}`
+
+const targetMatchesRecord = (target: TargetStateLookup, record: StateRecord): boolean => {
+  if (norm(record.name) !== norm(target.name)) return false
+  if (!target.teamToken) return true
+  const teamless = !record.teamKey && !record.teamName
+  return teamless || norm(record.teamKey) === norm(target.teamToken) || norm(record.teamName) === norm(target.teamToken)
+}
+
 // Resolve every configured role for every known team to concrete UUIDs, building
 // the forward (team,role)->id map and the reverse id->role map. Throws if a
 // required role cannot be resolved for any team.
@@ -205,7 +291,6 @@ export async function resolveFactoryStates(
   reader: LinearStateReader,
   input: ResolveFactoryStatesInput,
 ): Promise<FactoryStateResolution> {
-  const catalog = new StateCatalog(reader)
   const globalNames = input.states ?? {}
   const explicitIds = input.stateIds ?? {}
   // Normalize statesByTeam keys up front so per-team lookups are case-insensitive
@@ -215,6 +300,15 @@ export async function resolveFactoryStates(
   for (const [team, names] of Object.entries(input.statesByTeam ?? {})) {
     byTeamNames[norm(team)] = names
   }
+
+  // Dedupe team tokens by normalized form while keeping the first original
+  // casing for resolution + error messages.
+  const teamTokenByNorm = new Map<string, string>()
+  for (const team of [...Object.keys(input.statesByTeam ?? {}), ...(input.teams ?? [])]) {
+    const key = norm(team)
+    if (key && !teamTokenByNorm.has(key)) teamTokenByNorm.set(key, team)
+  }
+  const catalog = new StateCatalog(reader, targetStateLookups(globalNames, byTeamNames, [...teamTokenByNorm.values()]))
 
   // Resolve one role for one team token, applying precedence:
   // per-team name > global name > explicit UUID. When a name is configured but
@@ -239,24 +333,19 @@ export async function resolveFactoryStates(
         if (explicitIds[role]) return explicitIds[role]
         // Best-effort team-less default pass: another team will fill this role.
         if (tolerant) return undefined
-        // An OPTIONAL role (e.g. humanReview) tolerates an *absent* catalog
-        // (no /linear/states under the mount token) — but a real resolution
-        // failure (ambiguous name, cross-team, no match) must still surface, even
-        // for optional roles, rather than silently disabling the role.
-        if (!REQUIRED_ROLES.includes(role) && isCatalogUnavailable(error)) return undefined
+        // An OPTIONAL role (e.g. humanReview) tolerates an absent catalog, or an
+        // incomplete issue-derived fallback catalog. A healthy /linear/states
+        // catalog still fails on missing/typoed optional names.
+        if (!REQUIRED_ROLES.includes(role)) {
+          if (isCatalogUnavailable(error)) return undefined
+          if (catalog.isFallback && !isAmbiguousStateError(error)) return undefined
+        }
         throw error
       }
     }
     return explicitIds[role]
   }
 
-  // Dedupe team tokens by normalized form while keeping the first original
-  // casing for resolution + error messages.
-  const teamTokenByNorm = new Map<string, string>()
-  for (const team of [...Object.keys(input.statesByTeam ?? {}), ...(input.teams ?? [])]) {
-    const key = norm(team)
-    if (key && !teamTokenByNorm.has(key)) teamTokenByNorm.set(key, team)
-  }
   const byTeam = new Map<string, RoleIds>()
 
   const resolveAllRoles = async (
@@ -346,4 +435,39 @@ export async function resolveFactoryStates(
       return Boolean(idsFor(teamToken).humanReview)
     },
   }
+}
+
+const isAmbiguousStateError = (error: unknown): boolean =>
+  /ambiguous/u.test(error instanceof Error ? error.message : String(error))
+
+const targetStateLookups = (
+  globalNames: RoleNames,
+  byTeamNames: Record<string, RoleNames>,
+  teamTokens: readonly string[],
+): TargetStateLookup[] => {
+  const byKey = new Map<string, TargetStateLookup>()
+  const record = (teamToken: string | undefined, names: RoleNames): void => {
+    for (const role of FACTORY_STATE_ROLES) {
+      const name = names[role]
+      if (!name) continue
+      const target = { name, teamToken }
+      byKey.set(targetKey(target), target)
+    }
+  }
+
+  if (teamTokens.length === 0) {
+    record(undefined, globalNames)
+    return [...byKey.values()]
+  }
+
+  for (const teamToken of teamTokens) {
+    const teamNames = byTeamNames[norm(teamToken)] ?? {}
+    for (const role of FACTORY_STATE_ROLES) {
+      const name = teamNames[role] ?? globalNames[role]
+      if (!name) continue
+      const target = { name, teamToken }
+      byKey.set(targetKey(target), target)
+    }
+  }
+  return [...byKey.values()]
 }
