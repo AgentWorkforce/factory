@@ -192,6 +192,7 @@ export class FactoryLoop implements Factory {
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
   readonly #counters: Record<string, number> = {}
   readonly #resumeInFlight = new Map<string, Promise<void>>()
+  readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
   #resolvedSlackChannelDir?: string
@@ -1288,6 +1289,27 @@ export class FactoryLoop implements Factory {
   }
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
+    const dryRun = opts.dryRun ?? this.#config.dryRun
+    const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
+    const key = `${decision.issue.key}:${dryRun ? 'dry-run' : 'live'}:${phase}`
+    const inFlight = this.#dispatchInFlight.get(key)
+    if (inFlight) {
+      this.#increment('dispatchDuplicateSuppressed')
+      return inFlight
+    }
+
+    const dispatched = this.#dispatchUnlocked(decision, opts)
+    this.#dispatchInFlight.set(key, dispatched)
+    try {
+      return await dispatched
+    } finally {
+      if (this.#dispatchInFlight.get(key) === dispatched) {
+        this.#dispatchInFlight.delete(key)
+      }
+    }
+  }
+
+  async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const batch = await this.#batch()
     const existingRecord = batch.getIssue(decision.issue)

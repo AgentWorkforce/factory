@@ -3809,6 +3809,29 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('dedupes concurrent dispatches for the same Linear key across mirror paths', async () => {
+    const canonicalPath = issuePath(190)
+    const aliasPath = '/linear/issues/by-id/AR-190.json'
+    const issue = realIssueFile(190)
+    const mount = new DelayedIssueReadMount({
+      [canonicalPath]: issue,
+      [aliasPath]: issue,
+    }, 25)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const canonicalDecision = await factory.triageIssue(parseLinearIssue(canonicalPath, issue))
+    const aliasDecision = await factory.triageIssue(parseLinearIssue(aliasPath, issue))
+
+    await Promise.all([
+      factory.dispatch(canonicalDecision),
+      factory.dispatch(aliasDecision),
+    ])
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-190-impl-pear', 'ar-190-review'])
+    expect(factory.status().counters.dispatchDuplicateSuppressed).toBe(1)
+    expect(factory.status().inFlight.map((inFlightIssue) => inFlightIssue.key)).toEqual(['AR-190'])
+  })
+
   it('live subscription dispatches a newly-arrived in-scope ready issue from subscribe events', async () => {
     const path = issuePath(25)
     const mount = new FakeMountClient()
