@@ -26,6 +26,7 @@ import type { Clock, Logger } from '../ports/system'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { isInFactoryScope } from '../safety/factory-scope'
+import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
 import {
   deriveDescriptorsFromMount,
   prescriptiveInstructions,
@@ -187,6 +188,7 @@ export class FactoryLoop implements Factory {
   readonly #terminationGraceMs: number | undefined
   readonly #state: StateStore
   readonly #workspaceId: string
+  readonly #relayflows?: FactoryPorts['relayflows']
   #batchView?: BatchSnapshot
   #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
@@ -292,6 +294,7 @@ export class FactoryLoop implements Factory {
     this.#readChildPids = ports.readChildPids
     this.#terminationGraceMs = ports.terminationGraceMs
     this.#workspaceId = config.workspaceId ?? 'default'
+    this.#relayflows = ports.relayflows
     this.#state = ports.stateStore ?? new InMemoryStateStore({
       batchSize: config.batchSize,
       agentQuestionDedupeLimit: AGENT_QUESTION_DEDUPE_LIMIT,
@@ -412,6 +415,7 @@ export class FactoryLoop implements Factory {
 
     await this.#backfillReadyIssues()
     this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB], (event) => {
+      void this.#dispatchRelayflowEvent(event)
       // The SDK types `resource` as always-present, but the polling fallback and
       // degraded-sync paths can deliver events without it. Skip those rather
       // than throwing (which would otherwise crash the subscription handler).
@@ -733,6 +737,7 @@ export class FactoryLoop implements Factory {
       const batch = events.splice(0, LIVE_EVENT_DRAIN_BATCH_SIZE)
       const paths: string[] = []
       for (const event of batch) {
+        await this.#dispatchRelayflowEvent(event)
         const path = await this.#prepareLiveEventForDrain(event, seenIssueKeys)
         if (path) {
           paths.push(path)
@@ -870,6 +875,35 @@ export class FactoryLoop implements Factory {
     seenIssueKeys.add(issueKey)
     this.#recordArrivalLatency(event)
     return path
+  }
+
+  async #dispatchRelayflowEvent(event: ChangeEvent): Promise<void> {
+    const relayflows = this.#relayflows
+    if (!relayflows) return
+
+    try {
+      const result = await dispatchRelayflowForChangeEvent(event, relayflows.registry, {
+        cwd: relayflows.cwd ?? process.cwd(),
+        mountRoot: relayflows.mountRoot ?? this.#integrationsMountRoot(),
+        workflowRunner: relayflows.workflowRunner,
+      })
+      if (!result) return
+
+      this.#increment('relayflowEventsDispatched')
+      this.#logger.info?.('[factory] relayflow dispatched for integration event', {
+        trigger: result.trigger,
+        templatePath: result.templatePath,
+        runId: result.runId,
+        status: result.status,
+      })
+    } catch (error) {
+      this.#increment('relayflowDispatchErrors')
+      this.#logger.warn?.('[factory] relayflow dispatch failed for integration event', {
+        eventId: event.id,
+        path: changeEventPath(event),
+        error,
+      })
+    }
   }
 
   async #handlePreparedLiveChange(path: string): Promise<void> {

@@ -17,6 +17,7 @@ import { globMatchesPath, relayfileSdkPathFiltersFor } from './globs'
 
 export type ChangeEvent = Omit<SdkChangeEvent, 'type' | 'expand'> & {
   type: SdkChangeEvent['type'] | FilesystemEventType | 'relayfile.changed.summary'
+  filesystemEventType?: FilesystemEventType
   origin?: FilesystemEvent['origin']
   expand: (level?: ExpansionLevel) => Promise<Expansion>
 }
@@ -152,6 +153,7 @@ export function filesystemEventToChangeEvent(
     id: event.eventId || `${workspaceId}:${path}:${event.revision}`,
     workspace: workspaceId,
     type: 'relayfile.changed',
+    filesystemEventType: event.type,
     occurredAt: event.timestamp || new Date().toISOString(),
     resource: {
       path,

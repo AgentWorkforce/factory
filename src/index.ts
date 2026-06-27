@@ -32,6 +32,24 @@ export type {
   TemplateIssue,
   TemplateRoute,
 } from './dispatch/templates'
+export {
+  createRelayflowPolicyRegistry,
+  dispatchRelayflowForChangeEvent,
+  dispatchRelayflowForTrigger,
+  RelayflowPolicyRegistry,
+  triggerEventFromChangeEvent,
+} from './dispatch/relayflow-registry'
+export type {
+  DispatchRelayflowOptions,
+  IntegrationTrigger,
+  RelayflowDynamicClient,
+  RelayflowDynamicProviderClient,
+  RelayflowDispatchResult,
+  RelayflowPolicyEntry,
+  TriggerEvent,
+  TriggerInputMapper,
+  TriggerMapperContext,
+} from './dispatch/relayflow-registry'
 export { createFleet } from './fleet/create-fleet'
 export type {
   CreateFleetDeps,
@@ -215,6 +233,7 @@ export type {
   FactoryLoopRunOptions,
   FactoryLiveSubscriptionOptions,
   FactoryPorts,
+  FactoryRelayflowDispatchPort,
   FactoryStartOptions,
   FactoryStatus,
   IssueRef,

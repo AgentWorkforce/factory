@@ -584,6 +584,9 @@ describe('fleet CLI runtime', () => {
       expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', process.cwd(), {
         acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
       })
+      expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', '/work/pear', {
+        acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -667,6 +670,9 @@ describe('fleet CLI runtime', () => {
 
       expect(code).toBe(0)
       expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', process.cwd(), {
+        acceptableWorkspaceIds: undefined,
+      })
+      expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', '/work/pear', {
         acceptableWorkspaceIds: undefined,
       })
       expect(createFactory).toHaveBeenCalledTimes(1)

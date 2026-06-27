@@ -10,6 +10,7 @@ import {
   checkFactoryLoopLiveness,
   closeProbePr,
   createFactory,
+  createRelayflowPolicyRegistry,
   isInFactoryScope,
   parseLinearIssue,
   readFactoryInFlightRegistry,
@@ -18,6 +19,7 @@ import {
   type FactoryConfig,
   type TriageDecision,
   type TriageEngine,
+  type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
 import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
@@ -3864,6 +3866,69 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
+    await factory.stop()
+  })
+
+  it('dispatches relayflow policies from subscribe events without polling', async () => {
+    const mount = new CountingEventsMount()
+    const fleet = new FakeFleetClient()
+    const registry = createRelayflowPolicyRegistry()
+    const workflowCalls: WorkflowRunnerInput[] = []
+    registry.register('notion.page.changed', {
+      templatePath: 'workflows/notion-page.yaml',
+      mapInputs: (event) => ({
+        pageId: event.resourceId,
+        sourcePath: event.payload?.path,
+      }),
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      relayflows: {
+        registry,
+        cwd: '/work/factory',
+        mountRoot: '/mnt/.integrations',
+        workflowRunner: async (input) => {
+          workflowCalls.push(input)
+          return {
+            cwd: input.cwd,
+            runner: '@relayflows/core',
+            status: 'completed',
+            runId: 'run-notion-page',
+          }
+        },
+      },
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.emit({
+      id: 'event-relayflow-notion',
+      workspace: 'factory-test',
+      type: 'relayfile.changed',
+      occurredAt: new Date().toISOString(),
+      resource: {
+        path: '/notion/pages/page-1.json',
+        kind: 'file',
+        id: 'page-1',
+        provider: 'notion',
+      },
+      summary: {},
+      expand: async () => ({ level: 'summary', path: '/notion/pages/page-1.json', summary: {} }),
+    } as unknown as ChangeEvent)
+
+    await vi.waitFor(() => expect(workflowCalls).toHaveLength(1))
+
+    expect(mount.getEventsCalls).toBe(0)
+    expect(workflowCalls[0]).toEqual({
+      workflow: 'workflows/notion-page.yaml',
+      cwd: '/work/factory',
+      inputs: {
+        pageId: 'page-1',
+        sourcePath: '/notion/pages/page-1.json',
+      },
+    })
+    expect(factory.status().counters.relayflowEventsDispatched).toBe(1)
     await factory.stop()
   })
 

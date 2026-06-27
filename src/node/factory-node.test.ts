@@ -11,6 +11,7 @@ import {
   factoryNodeInventorySync,
   FACTORY_NODE_CONFIG_ENV,
   parseFactoryNodeConfig,
+  runRelayflowsWorkflow,
   resolveFactoryNodeConfigPath,
   type WorkflowRunnerInput,
 } from './factory-node'
@@ -159,7 +160,7 @@ describe('factory node definition', () => {
     expect(spawns[0].agent.harness_config.args.join('\n')).toContain('mcp_servers.agent-relay.command="/usr/local/bin/node"')
   })
 
-  it('runs workflow:run by shelling out to relayflows in the mapped checkout', async () => {
+  it('runs workflow:run through the Relayflows SDK in the mapped checkout', async () => {
     const calls: WorkflowRunnerInput[] = []
     const { ctx } = fakeContext('workflow-inv')
     const definition = createFactoryNodeDefinition({
@@ -167,12 +168,11 @@ describe('factory node definition', () => {
       workflowRunner: async (input) => {
         calls.push(input)
         return {
-          command: 'relayflows',
-          args: ['run', input.workflow],
           cwd: input.cwd,
-          exitCode: 0,
-          stdout: 'ok',
-          stderr: '',
+          runner: '@relayflows/core',
+          status: 'completed',
+          runId: 'run-1',
+          workflowName: 'default',
         }
       },
     })
@@ -186,11 +186,10 @@ describe('factory node definition', () => {
       workflow: 'workflows/factory/linear-issue.ts',
       cwd: '/work/relay',
       invocationId: 'workflow-inv',
-      command: 'relayflows',
-      args: ['run', 'workflows/factory/linear-issue.ts'],
-      exitCode: 0,
-      stdout: 'ok',
-      stderr: '',
+      runner: '@relayflows/core',
+      status: 'completed',
+      runId: 'run-1',
+      workflowName: 'default',
     })
     expect(calls).toEqual([{
       workflow: 'workflows/factory/linear-issue.ts',
@@ -198,6 +197,39 @@ describe('factory node definition', () => {
       inputs: { issue: 'AR-13', repo: 'relay' },
       invocationId: 'workflow-inv',
     }])
+  })
+
+  it('runs the default Relayflows SDK runner without a CLI binary', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'factory-relayflows-sdk-'))
+    writeFileSync(join(cwd, 'workflow.yaml'), [
+      "version: '1.0'",
+      'name: sdk-smoke',
+      'swarm:',
+      '  pattern: pipeline',
+      'workflows:',
+      '  - name: default',
+      '    steps:',
+      '      - name: verify',
+      '        type: deterministic',
+      '        command: printf "%s" "{{issue}}" | grep -q "AR-13"',
+      '        failOnError: true',
+      '',
+    ].join('\n'))
+
+    const result = await runRelayflowsWorkflow({
+      workflow: 'workflow.yaml',
+      cwd,
+      inputs: { issue: 'AR-13' },
+      invocationId: 'sdk-inv',
+    })
+
+    expect(result).toMatchObject({
+      cwd,
+      runner: '@relayflows/core',
+      status: 'completed',
+      workflowName: 'default',
+    })
+    expect(result.runId).toBeTruthy()
   })
 
   it('rejects an action that asks for a checkout not advertised by NodeConfig', async () => {

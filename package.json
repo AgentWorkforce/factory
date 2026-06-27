@@ -13,7 +13,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.18.1"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -59,13 +59,17 @@
     "@agent-relay/fleet": "^9.0.2",
     "@agent-relay/harness-driver": "^9.0.2",
     "@agent-relay/integration-prompts": "^9.0.2",
+    "@relayfile/relay-helpers": "^0.4.2",
     "@relayfile/sdk": "^0.10.9",
+    "@relayflows/core": "^1.0.3",
     "agent-relay": "^9.0.1",
     "zod": "^3.25.76"
   },
+  "overrides": {
+    "@scalar/postman-to-openapi": "0.4.10",
+    "listr2": "9.0.5"
+  },
   "devDependencies": {
-    "@relayflows/cli": "^1.0.3",
-    "@relayflows/core": "^1.0.3",
     "@types/node": "^22.10.2",
     "esbuild": "^0.24.2",
     "tsc-alias": "^1.8.17",

@@ -283,6 +283,7 @@ async function runFactoryCommand(
       await (deps.ensureLocalMount ?? ensureLocalMount)(workspaceId, process.cwd(), {
         acceptableWorkspaceIds: acceptableMountIds,
       })
+      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndExit = async (code: number): Promise<void> => {
@@ -313,6 +314,7 @@ async function runFactoryCommand(
       }
     }
     if (command.action === 'run-once') {
+      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
     }
@@ -344,6 +346,7 @@ async function runFactoryCommand(
       return 0
     }
 
+    await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
@@ -373,6 +376,35 @@ async function runFactoryCommand(
 
   writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
   return 0
+}
+
+/**
+ * Ensures the relayfile mount is running at each configured clone path so
+ * spawned agents can resolve `.integrations` relative to their working
+ * directory (the checkout path). The mount daemon started at the daemon CWD
+ * is not automatically accessible from a different directory, and agents need
+ * these paths for integration writebacks (Slack, GitHub, etc.).
+ */
+async function ensureClonePathMounts(
+  deps: FleetCliDeps,
+  workspaceId: string,
+  config: FactoryConfig,
+  acceptableMountIds?: readonly string[],
+): Promise<void> {
+  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
+  const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
+  const daemonCwd = resolve(process.cwd())
+  for (const clonePath of new Set(Object.values(config.clonePaths))) {
+    const resolved = resolve(clonePath)
+    if (resolved !== daemonCwd) {
+      try {
+        await mountFn(workspaceId, resolved, mountOpts)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        process.stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
+      }
+    }
+  }
 }
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
