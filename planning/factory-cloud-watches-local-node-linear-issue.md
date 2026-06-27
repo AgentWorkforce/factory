@@ -1,4 +1,31 @@
-Title: [factory] EPIC — cloud watches → local-node execution; label-driven single agent / workflow / team
+# ⚠️ HISTORICAL — v1 epic, superseded 2026-06-18
+
+This document is the **original (v1) factory extraction epic** written 2026-06-15. It captures the initial framing — a local-vs-cloud execution split, with the factory brain on the operator's laptop and a "minimal slice" of fleet placement.
+
+**That framing was superseded mid-extraction** by Will Washburn's `relay/specs/fleet-delivery.md` RFC (2026-06-06) and the conversation it triggered. The unified-node model that shipped is meaningfully different from what's described below:
+
+- **There is no local-vs-cloud execution split.** Daytona sandboxes, laptops, mac minis, EC2 boxes are all the same primitive: nodes. Each advertises capabilities; placement picks an eligible node.
+- **The factory is a spec-emitter**, not an executor. It emits `spawn { capability, persona, … }` invocations into the relay fleet; placement is the fleet's job.
+- **`single | workflow | team` are recipes** — patterns over one spawn primitive — not three distinct code paths.
+
+**Current architecture (read these, not this doc):**
+
+- `relay/specs/fleet-delivery.md` — the load-bearing RFC. Two planes (messaging fabric + compute layer), spawn-as-action, idempotency + at-least-once + reconcile.
+- `cloud/packages/web/lib/proactive-runtime/factory-cloud-orchestrator.ts` — the cloud-hosted factory brain (Phase 2 / the v1 doc's "cloud lift", now real).
+- `cloud/packages/web/lib/proactive-runtime/factory-fleet-emitter.ts` — emits fleet spawns from the orchestrator.
+- `cloud/packages/web/lib/proactive-runtime/team-launch-n1.ts` — proactive runtime, **explicitly cut over from the legacy Daytona `launchMember` path to fleet** (see the cutover comment around line 503).
+- `factory/` repo (`AgentWorkforce/factory`, published as `@agent-relay/factory` on npm) — the extracted package.
+- `factory/src/fleet/relay-fleet-client.ts` — `RelayFleetClient`, the thin client over the fleet protocol.
+
+**Phases that actually shipped under the unified model:** P1 StateStore port (pear#371), P2 config split (pear#372), P3 publish-prep (pear#370), P4 extraction (factory `5f32a5a` + npm `@agent-relay/factory@0.1.1`), P5 Pear teardown (pear#373), p7 recipe scoping (factory#1), p10 RelayFleetClient (factory#2), p13 node-definition (factory#3), plus the proactive cutover (cloud `factory-cloud-orchestrator.ts` + `factory-fleet-emitter.ts` + `team-launch-n1.ts`).
+
+**Why this doc is preserved:** §4 (package extraction details), §5 (config split), and §8 (phased plan structure) were correct in v1 and were used as-is during execution. §2 (architecture diagram), §3 (label → shape), §6 ("minimal slice" of #1056), and §10 (non-goals) are wrong under the shipped architecture — they describe a local-cloud split that does not exist in the code.
+
+A proper v2 rewrite was planned (see the v2 handoff drafted at `pear/handoff-factory-unified-node-architecture.md`, Deliverable 1) but was never produced because the unified-node architecture shipped directly as code without an intermediate v2 document. This stamp serves in its place.
+
+---
+
+Title: [factory] EPIC — cloud watches → local-node execution; label-driven single agent / workflow / team (HISTORICAL — see stamp above)
 
 Team: AR
 Suggested status: Design / Epic

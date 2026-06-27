@@ -3,10 +3,12 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   createWorkspaceScopedEventClient,
   filesystemEventToChangeEvent,
+  type ChangeEvent,
   type FilesystemEventLike,
   type RelayFileSyncLike,
   type WorkspaceEventClientSource,
 } from '../event-client'
+import { triggerEventFromChangeEvent } from '../../dispatch/relayflow-registry'
 
 type FakeSyncState = 'idle' | 'connecting' | 'open' | 'polling' | 'reconnecting' | 'closed'
 type FakeSyncHandler =
@@ -75,6 +77,8 @@ describe('workspace scoped event client', () => {
     }))
 
     expect(change.id).toBe('ws-1:/linear/issues/AR-1__uuid.json:7')
+    expect(change.type).toBe('relayfile.changed')
+    expect(change.filesystemEventType).toBe('file.deleted')
     expect(change.resource).toMatchObject({
       path: '/linear/issues/AR-1__uuid.json',
       provider: 'linear',
@@ -84,6 +88,42 @@ describe('workspace scoped event client', () => {
       level: 'full',
       path: '/linear/issues/AR-1__uuid.json',
       data: { path: '/linear/issues/AR-1__uuid.json', deleted: true },
+    })
+  })
+
+  it('preserves created action semantics through the live subscription callback', async () => {
+    const sync = new FakeSync()
+    const changes: ChangeEvent[] = []
+    const client = {
+      getEvents: vi.fn(),
+      getResourceAtEvent: vi.fn(),
+    } as unknown as WorkspaceEventClientSource
+
+    createWorkspaceScopedEventClient(
+      client,
+      'ws-1',
+      async () => undefined,
+      'https://relayfile.invalid',
+      () => sync,
+    ).subscribe(['/linear/issues/**'], (change) => {
+      changes.push(change)
+    }, { coalesce: 'none' })
+
+    await Promise.resolve()
+    sync.emit(event({
+      eventId: 'evt-created',
+      type: 'file.created',
+      path: '/linear/issues/AR-2__uuid.json',
+      revision: '1',
+    }))
+    await Promise.resolve()
+
+    expect(changes).toHaveLength(1)
+    expect(changes[0]!.type).toBe('relayfile.changed')
+    expect(changes[0]!.filesystemEventType).toBe('file.created')
+    expect(triggerEventFromChangeEvent(changes[0]!)).toMatchObject({
+      trigger: 'linear.issue.created',
+      resourceId: 'AR-2__uuid.json',
     })
   })
 

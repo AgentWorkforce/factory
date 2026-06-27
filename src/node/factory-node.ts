@@ -1,12 +1,12 @@
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { hostname } from 'node:os'
-import { basename, dirname, join, resolve, sep } from 'node:path'
-import { spawn as spawnProcess } from 'node:child_process'
+import { basename, extname, join, resolve, sep } from 'node:path'
 
 import { action, defineNode, type FleetActionContext, type FleetCapabilityValue, type FleetNodeDefinition } from '@agent-relay/fleet'
 import type { AgentSpec, JsonValue, RestartPolicy } from '@agent-relay/harness-driver/protocol'
 import type { SpawnPtyInput } from '@agent-relay/harness-driver'
+import { runScriptWorkflow, runWorkflow } from '@relayflows/core'
+import type { WorkflowRunRow } from '@relayflows/core'
 import { z } from 'zod'
 
 import { loadFactoryConfig, NodeConfigSchema, type NodeConfig } from '../config/schema'
@@ -26,7 +26,7 @@ const factoryNodeCapabilities = ['spawn:claude', 'spawn:codex', 'workflow:run'] 
 type FactoryNodeCapability = (typeof factoryNodeCapabilities)[number]
 
 const knownFactoryNodeCapabilities = new Set<string>(factoryNodeCapabilities)
-const requireForResolve = createRequire(import.meta.url)
+let workflowEnvLock: Promise<void> = Promise.resolve()
 
 const restartPolicySchema: z.ZodType<RestartPolicy> = z.object({
   enabled: z.boolean().optional(),
@@ -109,12 +109,12 @@ export interface WorkflowRunnerInput {
 }
 
 export interface WorkflowRunnerResult {
-  command: string
-  args: string[]
   cwd: string
-  exitCode: number
-  stdout: string
-  stderr: string
+  runner: '@relayflows/core'
+  status: WorkflowRunRow['status'] | 'completed'
+  runId?: string
+  workflowName?: string
+  result?: WorkflowRunRow
 }
 
 export type WorkflowRunner = (input: WorkflowRunnerInput) => Promise<WorkflowRunnerResult>
@@ -292,53 +292,78 @@ async function runWorkflowCapability(
 }
 
 export async function runRelayflowsWorkflow(input: WorkflowRunnerInput): Promise<WorkflowRunnerResult> {
-  const { command, args } = resolveRelayflowsInvocation(input.workflow)
-  const childEnv = {
-    ...process.env,
+  const workflowPath = resolve(input.cwd, input.workflow)
+  const env = {
     RELAYFLOWS_INPUTS_JSON: JSON.stringify(input.inputs),
     FACTORY_WORKFLOW_INPUTS_JSON: JSON.stringify(input.inputs),
     ...(input.invocationId ? { RELAY_INVOCATION_ID: input.invocationId } : {}),
   }
+  const ext = extname(workflowPath).toLowerCase()
 
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawnProcess(command, args, {
+  if (ext === '.yaml' || ext === '.yml') {
+    const result = await withProcessEnv(env, () => runWorkflow(workflowPath, {
       cwd: input.cwd,
-      env: childEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let stdout = ''
-    let stderr = ''
-    child.stdout?.setEncoding('utf8')
-    child.stderr?.setEncoding('utf8')
-    child.stdout?.on('data', (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on('data', (chunk) => {
-      stderr += chunk
-    })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      const exitCode = code ?? 1
-      const result = { command, args, cwd: input.cwd, exitCode, stdout, stderr }
-      if (exitCode === 0) {
-        resolvePromise(result)
-        return
-      }
-      reject(new Error(`relayflows run ${input.workflow} failed with exit code ${exitCode}${stderr ? `: ${stderr.trim()}` : ''}`))
-    })
-  })
+      vars: input.inputs,
+    }))
+    if (result.status !== 'completed' && result.status !== 'needs_human') {
+      throw new Error(`Relayflows workflow ${input.workflow} ${result.status}${result.error ? `: ${result.error}` : ''}`)
+    }
+    return {
+      cwd: input.cwd,
+      runner: '@relayflows/core',
+      status: result.status,
+      runId: result.id,
+      workflowName: result.workflowName,
+      result,
+    }
+  }
+
+  if (ext === '.ts' || ext === '.tsx' || ext === '.py') {
+    await withProcessEnv(env, () => runScriptWorkflowWithCwd(workflowPath, input.cwd))
+    return {
+      cwd: input.cwd,
+      runner: '@relayflows/core',
+      status: 'completed',
+    }
+  }
+
+  throw new Error(`Unsupported workflow file type: ${ext || '(none)'}. Use .yaml, .yml, .ts, .tsx, or .py`)
 }
 
-function resolveRelayflowsInvocation(workflow: string): { command: string; args: string[] } {
-  if (process.env.RELAYFLOWS_BIN) {
-    return { command: process.env.RELAYFLOWS_BIN, args: ['run', workflow] }
+function runScriptWorkflowWithCwd(workflowPath: string, cwd: string): Promise<void> {
+  const runner = runScriptWorkflow as (filePath: string, options?: { cwd?: string }) => Promise<void>
+  return runner(workflowPath, { cwd })
+}
+
+async function withProcessEnv<T>(
+  values: Record<string, string>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const run = async (): Promise<T> => {
+    const previous = new Map<string, string | undefined>()
+    for (const [key, value] of Object.entries(values)) {
+      previous.set(key, process.env[key])
+      process.env[key] = value
+    }
+    try {
+      return await fn()
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
   }
-  try {
-    const packageJsonPath = requireForResolve.resolve('@relayflows/cli/package.json')
-    return { command: process.execPath, args: [join(dirname(packageJsonPath), 'dist', 'cli.js'), 'run', workflow] }
-  } catch {
-    return { command: 'relayflows', args: ['run', workflow] }
-  }
+
+  const result = workflowEnvLock.then(run, run)
+  workflowEnvLock = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
 }
 
 function resolveCheckoutPath(

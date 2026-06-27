@@ -6,6 +6,7 @@ import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
+import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -30,6 +31,12 @@ export interface FactoryPorts {
   kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readChildPids?: (pid: number) => Promise<number[]>
   terminationGraceMs?: number
+  relayflows?: FactoryRelayflowDispatchPort
+}
+
+export interface FactoryRelayflowDispatchPort extends Omit<DispatchRelayflowOptions, 'cwd'> {
+  registry: RelayflowPolicyRegistry
+  cwd?: string
 }
 
 export interface Factory {

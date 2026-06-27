@@ -28,7 +28,7 @@ Implement `RelayFleetClient implements FleetClient` (the port at `pear/packages/
 
 - **`SpawnInput.capability`** is `'spawn:claude' | 'spawn:codex'` today (ports/fleet.ts:4–15); extend the type to include **`'workflow:run'`** for the workflow recipe.
 - **invocationId lifecycle (RFC §7):** the client supplies an `invocationId` (idempotency key); observes `pending → dispatched(node) → completed(agent_id)`; relies on the fleet for dedup, reschedule-on-node-loss, and reconcile (first-to-`completed` wins). The factory does NOT implement placement, scheduling, or reconcile — it observes the lifecycle and reports completion upward.
-- **`workflow:run` capability handler (open question 1 — proposed):** the node-side handler for `{capability:'workflow:run', workflow:<path>}` **shells out to `relayflows run <workflow>`** in the node's repo checkout. Rationale: the node already has the harness + checkout; child spawns the workflow emits ride the same fleet; no embedded runtime or service dependency. The `relayflows` CLI is a dependency of the node's harness definition (Phase 4). Confirm with operator before building.
+- **`workflow:run` capability handler:** the node-side handler for `{capability:'workflow:run', workflow:<path>}` invokes `@relayflows/core` in the node's repo checkout. The node already has the harness + checkout; child spawns the workflow emits ride the same fleet. No globally installed Relayflows CLI is required.
 - **No reuse of `InternalFleetClient`'s broker-direct path** beyond reference — `RelayFleetClient` talks the fleet protocol, not the local `HarnessDriverClient`.
 
 ## End-to-end verification (captured artifact required)
@@ -46,7 +46,7 @@ Implement `RelayFleetClient implements FleetClient` (the port at `pear/packages/
 3. An `agent:single` spawn round-trips the fleet and lands on whichever eligible node is live (factory targeted none).
 4. Completion observed via the `invocationId` lifecycle; Linear writeback fires.
 5. Node-loss mid-spawn reschedules the same `invocationId` with no double-spawn (captured).
-6. The `workflow:run` handler decision (shell-out to `relayflows run`) is documented + implemented or explicitly deferred with the chosen alternative recorded.
+6. The `workflow:run` handler decision (embedded Relayflows SDK) is documented + implemented.
 
 ## Out of scope
 

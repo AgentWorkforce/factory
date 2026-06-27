@@ -82,7 +82,7 @@ The recipe is one knob with three expansions — not three execution paths. The 
 | Recipe (label) | Spawn-set emitted | Capability | Persona / workflow source | Roster from repo labels |
 |---|---|---|---|---|
 | `agent:single` | **1** spawn `{ capability: 'spawn:claude' (or per-persona harness), persona: <X>, node?: <repo-label placement>, session_ref? }` | `spawn:claude` / `spawn:codex` | `agents/<persona>/persona.ts` | ignored for count (always 1); repo label still informs placement (which checkout/node) |
-| `agent:workflow` | **1** spawn `{ capability: 'workflow:run', workflow: '<path>.{yaml,ts,py}', inputs }` — the node runs `relayflows run <workflow>`, which may emit further **child spawns** | `workflow:run` | workflow file defines its own roster; personas referenced by its steps resolve from `agents/` | ignored for roster; repo labels become workflow inputs |
+| `agent:workflow` | **1** spawn `{ capability: 'workflow:run', workflow: '<path>.{yaml,ts,py}', inputs }` — the node invokes the Relayflows SDK in-process, which may emit further **child spawns** | `workflow:run` | workflow file defines its own roster; personas referenced by its steps resolve from `agents/` | ignored for roster; repo labels become workflow inputs |
 | `agent:team` | **N** implementer spawns + **1** reviewer spawn + roster metadata. This is the logic that today lives in `cloud/.../teams/spawn-team.ts`, reconstructed as a recipe over the spawn primitive | `spawn:claude` / `spawn:codex` per member | `agents/cloud-team-implementer/persona.ts`, `agents/cloud-team-reviewer/persona.ts` | **one implementer per repo label** (capped at 4 per AR-272); reviewer naming unchanged |
 
 Concrete example (today's AR-267 team): labels `cloud`, `relayfile`, `agent:team` → emit `spawn{spawn:claude, persona: cloud-team-implementer, node-target via cloud checkout}`, `spawn{… relayfile checkout}`, and `spawn{spawn:claude, persona: cloud-team-reviewer}`. Placement, execution, and completion are all fleet-side.
@@ -155,7 +155,7 @@ v1 called relay#1056 "a minimal slice the factory needs." Under unified-node, **
 
 ## 8. Open questions (surface to operator)
 
-1. **`workflow:run` capability handler shape.** When a node picks up `{capability:'workflow:run'}`, does it (a) shell out to the `relayflows` CLI, (b) embed the runtime in-process, or (c) call relayflows as a service? Proposed in Phase 3: shell out to `relayflows run <workflow>` on the node (simplest; the node already has the harness + repo checkout; child spawns ride the same fleet). Confirm.
+1. **`workflow:run` capability handler shape.** Decided: the node embeds the Relayflows runtime through `@relayflows/core`; it does not depend on a globally installed CLI. The node already has the harness + repo checkout, and child spawns ride the same fleet.
 2. **Single-recipe in cloud.** Cloud has no single-agent path today (only team via `spawn-team.ts`, proactive via `team-launch-n1`). `agent:single` is just a 1-spawn recipe — confirm it needs nothing beyond team-recipe at N=1.
 3. **Multi-node placement preference.** Laptop + mac-mini both advertise `spawn:claude` — RFC §6 says least-loaded. Good enough for v1? (Assumed yes.)
 4. **Persona discovery single source.** Both cloud (team-recipe construction) and the node-side workflow runtime must read `AgentWorkforce/agents/`. Confirm both point at the same registry.

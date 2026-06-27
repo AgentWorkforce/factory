@@ -1,5 +1,5 @@
 // `workflow:run` is a fleet node capability. The node-side Phase 4 handler
-// shells out to `relayflows run <workflow>` in that node's repo checkout; the
+// invokes the Relayflows SDK in that node's repo checkout; the
 // factory only emits the workflow path and inputs through the relay fleet.
 export type Capability = 'spawn:codex' | 'spawn:claude' | 'workflow:run'
 export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput['restartPolicy']
