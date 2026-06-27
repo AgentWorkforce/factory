@@ -66,6 +66,7 @@ type SlackThreadWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
 type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
+type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type SlackReply = {
   channelDir: string
   threadTs: string
@@ -114,6 +115,7 @@ const ISSUE_ROOT = '/linear/issues'
 const GITHUB_ISSUE_ROOT = '/github/repos'
 const READY_EVENTS_LIMIT = 100
 const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
+const LIVE_RELAYFLOW_GLOB = '/**'
 // Subscribe broadly under /github/repos and let isGithubIssueFilePath() /
 // githubPullPathParts() re-validate the exact shape in the callback.
 // globMatchesPath() treats a non-terminal `**` as a single-segment wildcard, so
@@ -414,7 +416,7 @@ export class FactoryLoop implements Factory {
     }
 
     await this.#backfillReadyIssues()
-    this.#subscription = this.#mount.subscribe([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB], (event) => {
+    this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB]), (event) => {
       void this.#dispatchRelayflowEvent(event)
       // The SDK types `resource` as always-present, but the polling fallback and
       // degraded-sync paths can deliver events without it. Skip those rather
@@ -526,7 +528,7 @@ export class FactoryLoop implements Factory {
       // LIVE_GITHUB_ISSUE_GLOB is a terminal `${GITHUB_ISSUE_ROOT}/**`, so it
       // already covers the PR change events the babysitter consumes; pull-event
       // *processing* is gated on babysitter.enabled in #prepareLiveEventForDrain.
-      this.#subscription = this.#mount.subscribe([LIVE_ISSUE_GLOB, LIVE_GITHUB_ISSUE_GLOB], (event) => {
+      this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs([LIVE_ISSUE_GLOB, LIVE_GITHUB_ISSUE_GLOB]), (event) => {
         this.#enqueueLiveEvent(event)
       }, { from: 'now', coalesce: 'none' })
     }
@@ -737,10 +739,12 @@ export class FactoryLoop implements Factory {
       const batch = events.splice(0, LIVE_EVENT_DRAIN_BATCH_SIZE)
       const paths: string[] = []
       for (const event of batch) {
-        await this.#dispatchRelayflowEvent(event)
-        const path = await this.#prepareLiveEventForDrain(event, seenIssueKeys)
-        if (path) {
-          paths.push(path)
+        const prepared = await this.#prepareLiveEventForDrain(event, seenIssueKeys)
+        if (prepared.dispatchRelayflow) {
+          void this.#dispatchRelayflowEvent(event)
+        }
+        if (prepared.path) {
+          paths.push(prepared.path)
         }
       }
       await Promise.all(paths.map((path) => this.#handlePreparedLiveChange(path)))
@@ -771,14 +775,19 @@ export class FactoryLoop implements Factory {
     await this.#refreshLiveHeartbeat()
   }
 
-  async #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): Promise<string | undefined> {
+  #subscriptionGlobs(factoryGlobs: string[]): string[] {
+    return this.#relayflows ? [LIVE_RELAYFLOW_GLOB] : factoryGlobs
+  }
+
+  async #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): Promise<PreparedLiveEvent> {
     const path = changeEventPath(event)
     if (!path) {
-      return undefined
+      return { dispatchRelayflow: false }
     }
     const isPullPath = isGithubPullFilePath(path)
-    if (!isIssueFilePath(path) && !isGithubIssueFilePath(path) && !isPullPath) {
-      return undefined
+    const isFactoryPath = isIssueFilePath(path) || isGithubIssueFilePath(path) || isPullPath
+    if (!isFactoryPath && !this.#relayflows) {
+      return { dispatchRelayflow: false }
     }
 
     if (isBeforeLiveCutoff(event.occurredAt, this.#liveConnectStartedAtMs, this.#liveReplaySkewMarginMs)) {
@@ -791,7 +800,7 @@ export class FactoryLoop implements Factory {
         connectStartedAt: new Date(this.#liveConnectStartedAtMs).toISOString(),
         replaySkewMarginMs: this.#liveReplaySkewMarginMs,
       })
-      return undefined
+      return { dispatchRelayflow: false }
     }
 
     if (isAtOrBeforeHighWatermark(event.id, this.#liveEventHighWatermark)) {
@@ -802,7 +811,7 @@ export class FactoryLoop implements Factory {
         highWatermark: this.#liveEventHighWatermark,
         path,
       })
-      return undefined
+      return { dispatchRelayflow: false }
     }
 
     const dedupeKey = liveEventDedupeKey(event)
@@ -813,12 +822,16 @@ export class FactoryLoop implements Factory {
           id: event.id,
           path,
         })
-        return undefined
+        return { dispatchRelayflow: false }
       }
       rememberLiveEvent(this.#seenLiveEvents, dedupeKey)
     } else {
       this.#increment('liveEventsMissingIdentity')
       this.#logger.warn?.('[factory] live issue event missing stable identity', { path })
+    }
+
+    if (!isFactoryPath) {
+      return { dispatchRelayflow: true }
     }
 
     if (isGithubIssueFilePath(path)) {
@@ -829,11 +842,11 @@ export class FactoryLoop implements Factory {
           id: event.id,
           path,
         })
-        return undefined
+        return { dispatchRelayflow: false }
       }
       seenIssueKeys.add(sourceKey)
       this.#recordArrivalLatency(event)
-      return path
+      return { path, dispatchRelayflow: true }
     }
 
     if (isPullPath) {
@@ -842,11 +855,11 @@ export class FactoryLoop implements Factory {
       const sourceKey = `pull:${path}`
       if (seenIssueKeys.has(sourceKey)) {
         this.#increment('liveDuplicatePrEventsSuppressed')
-        return undefined
+        return { dispatchRelayflow: false }
       }
       seenIssueKeys.add(sourceKey)
       this.#recordArrivalLatency(event)
-      return path
+      return { path, dispatchRelayflow: true }
     }
 
     const issueKey = keyFromPath(path)
@@ -857,7 +870,7 @@ export class FactoryLoop implements Factory {
         path,
         issue: issueKey,
       })
-      return undefined
+      return { dispatchRelayflow: false }
     }
 
     const issueRef = { key: issueKey, uuid: uuidFromPath(path) ?? issueKey, path }
@@ -869,12 +882,12 @@ export class FactoryLoop implements Factory {
         path,
         issue: issueKey,
       })
-      return undefined
+      return { dispatchRelayflow: false }
     }
 
     seenIssueKeys.add(issueKey)
     this.#recordArrivalLatency(event)
-    return path
+    return { path, dispatchRelayflow: true }
   }
 
   async #dispatchRelayflowEvent(event: ChangeEvent): Promise<void> {

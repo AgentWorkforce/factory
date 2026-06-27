@@ -537,6 +537,12 @@ class RosterPidHarnessClient implements HarnessDriverClientLike {
 
 class CountingEventsMount extends FakeMountClient {
   getEventsCalls = 0
+  subscribeGlobs: string[][] = []
+
+  override subscribe(...args: Parameters<FakeMountClient['subscribe']>): ReturnType<FakeMountClient['subscribe']> {
+    this.subscribeGlobs.push([...args[0]])
+    return super.subscribe(...args)
+  }
 
   override async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
     this.getEventsCalls += 1
@@ -3902,6 +3908,7 @@ describe('FactoryLoop', () => {
     })
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    expect(mount.subscribeGlobs.at(-1)).toEqual(['/**'])
     mount.emit({
       id: 'event-relayflow-notion',
       workspace: 'factory-test',
@@ -3928,6 +3935,60 @@ describe('FactoryLoop', () => {
         sourcePath: '/notion/pages/page-1.json',
       },
     })
+    expect(factory.status().counters.relayflowEventsDispatched).toBe(1)
+    await factory.stop()
+  })
+
+  it('suppresses replayed relayflow integration events before dispatching workflows', async () => {
+    const mount = new CountingEventsMount()
+    const fleet = new FakeFleetClient()
+    const registry = createRelayflowPolicyRegistry()
+    const workflowCalls: WorkflowRunnerInput[] = []
+    registry.register('notion.page.changed', {
+      templatePath: 'workflows/notion-page.yaml',
+      mapInputs: (relayEvent) => ({ path: relayEvent.path }),
+    })
+    const event = (id: string) => ({
+      id,
+      workspace: 'factory-test',
+      type: 'relayfile.changed',
+      occurredAt: new Date().toISOString(),
+      resource: {
+        path: '/notion/pages/page-1.json',
+        kind: 'file',
+        id: 'page-1',
+        provider: 'notion',
+      },
+      summary: {},
+      expand: async () => ({ level: 'summary', path: '/notion/pages/page-1.json', summary: {} }),
+    }) as unknown as ChangeEvent
+    mount.emit(event('10'))
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      relayflows: {
+        registry,
+        cwd: '/work/factory',
+        workflowRunner: async (input) => {
+          workflowCalls.push(input)
+          return {
+            cwd: input.cwd,
+            runner: '@relayflows/core',
+            status: 'completed',
+          }
+        },
+      },
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.emit(event('10'))
+    await flush()
+    expect(workflowCalls).toHaveLength(0)
+    expect(factory.status().counters.liveReplayEventsSuppressedByWatermark).toBe(1)
+
+    mount.emit(event('11'))
+    await vi.waitFor(() => expect(workflowCalls).toHaveLength(1))
     expect(factory.status().counters.relayflowEventsDispatched).toBe(1)
     await factory.stop()
   })

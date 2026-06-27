@@ -394,7 +394,7 @@ async function ensureClonePathMounts(
   const mountFn = deps.ensureLocalMount ?? ensureLocalMount
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
-  for (const clonePath of new Set(Object.values(config.clonePaths))) {
+  for (const clonePath of new Set(Object.values(config.clonePaths ?? {}))) {
     const resolved = resolve(clonePath)
     if (resolved !== daemonCwd) {
       try {
