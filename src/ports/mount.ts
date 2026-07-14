@@ -28,8 +28,36 @@ export interface ProviderSyncStatus {
   lagSeconds?: number
 }
 
+export interface GithubPublishPullRequestInput {
+  repo: string
+  clonePath: string
+  baseRef: string
+  title: string
+  body: string
+}
+
+export interface GithubPublishPullRequestResult {
+  repo: string
+  number: number
+  url: string
+  headRef: string
+  headSha?: string
+}
+
+/**
+ * GitHub mutations that require the authenticated workspace connection rather
+ * than a file-native Relayfile draft. The current Relayfile adapter does not
+ * expose these operations yet, so mounts advertise the capability only when
+ * their backing connection can execute it.
+ */
+export interface GithubConnectionWrite {
+  publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
+  closePullRequest(input: { repo: string; number: number }): Promise<void>
+}
+
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
+  readonly githubWrite?: GithubConnectionWrite
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>
