@@ -10,12 +10,16 @@ import type {
 
 const execFileAsync = promisify(execFile)
 const WRITE_CONFIRM_TIMEOUT_MS = 90_000
+const RECEIPT_READ_ATTEMPTS = 5
+const RECEIPT_READ_DELAY_MS = 100
 
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
   mount: Pick<MountClient, 'confirmWrite' | 'readFile' | 'writeFile'>
   gitRunner?: GitCommandRunner
+  receiptReadAttempts?: number
+  receiptReadDelayMs?: number
 }
 
 /**
@@ -26,16 +30,23 @@ export interface RelayfileGithubConnectionWriteConfig {
 export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #mount: RelayfileGithubConnectionWriteConfig['mount']
   readonly #git: GitCommandRunner
+  readonly #receiptReadAttempts: number
+  readonly #receiptReadDelayMs: number
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
     this.#mount = config.mount
     this.#git = config.gitRunner ?? defaultGitRunner
+    this.#receiptReadAttempts = positiveInteger(config.receiptReadAttempts) ?? RECEIPT_READ_ATTEMPTS
+    this.#receiptReadDelayMs = nonNegativeInteger(config.receiptReadDelayMs) ?? RECEIPT_READ_DELAY_MS
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
     const { owner, repo } = githubRepoParts(input.repo)
     const headRef = await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
     const headSha = await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
+    if (headRef === input.baseRef) {
+      throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
+    }
     const draftName = githubDraftName(headRef, headSha)
     const repoRoot = `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
     const fullHeadRef = `refs/heads/${headRef}`
@@ -57,12 +68,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       author: 'app',
     })
 
-    const receipt = record((await this.#mount.readFile(pullRequestPath)).content)
-    const number = positiveInteger(receipt.created)
-    const url = stringValue(receipt.url)
-    if (!number || !url) {
-      throw new Error(`GitHub pull request writeback returned an incomplete receipt for ${input.repo}`)
-    }
+    const { number, url } = await this.#readPullRequestReceipt(pullRequestPath, input.repo)
 
     return {
       repo: input.repo,
@@ -92,6 +98,23 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       throw new Error(`Unable to resolve ${description} for GitHub PR publication: ${errorMessage(error)}`)
     }
     throw new Error(`Unable to resolve ${description} for GitHub PR publication`)
+  }
+
+  async #readPullRequestReceipt(path: string, repo: string): Promise<{ number: number; url: string }> {
+    for (let attempt = 0; attempt < this.#receiptReadAttempts; attempt += 1) {
+      try {
+        const receipt = record((await this.#mount.readFile(path)).content)
+        const number = positiveInteger(receipt.created)
+        const url = stringValue(receipt.url)
+        if (number && url) return { number, url }
+      } catch {
+        // Receipt propagation is eventually consistent after the write ack.
+      }
+      if (attempt < this.#receiptReadAttempts - 1) {
+        await delay(this.#receiptReadDelayMs)
+      }
+    }
+    throw new Error(`GitHub pull request writeback returned an incomplete receipt for ${repo}`)
   }
 
   async #writeAndConfirm(path: string, content: unknown): Promise<void> {
@@ -133,5 +156,10 @@ const positiveInteger = (value: unknown): number | undefined => {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN
   return Number.isInteger(number) && number > 0 ? number : undefined
 }
+
+const nonNegativeInteger = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)

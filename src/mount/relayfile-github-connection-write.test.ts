@@ -9,6 +9,12 @@ const gitRunner = (): GitCommandRunner => vi.fn(async (args) => {
   throw new Error(`unexpected git args: ${args.join(' ')}`)
 })
 
+const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (args) => {
+  if (args.includes('symbolic-ref')) return { stdout: `${branch}\n` }
+  if (args.includes('rev-parse')) return { stdout: '1234567890abcdef1234567890abcdef12345678\n' }
+  throw new Error(`unexpected git args: ${args.join(' ')}`)
+})
+
 describe('RelayfileGithubConnectionWrite', () => {
   it('pushes the current ref before creating a pull request through Relayfile', async () => {
     const draft = 'factory-fix-issue-52-1234567890ab'
@@ -93,5 +99,58 @@ describe('RelayfileGithubConnectionWrite', () => {
       title: 'Title',
       body: 'Body',
     })).rejects.toThrow(`GitHub writeback did not complete for ${refPath}: timeout`)
+  })
+
+  it('rejects publishing from the base branch before writing a ref', async () => {
+    const mount = new FakeMountClient()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunnerForBranch('main') })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).rejects.toThrow('Refusing to publish GitHub PR with head equal to base branch: main')
+    expect(mount.writes).toEqual([])
+  })
+
+  it('retries until the created pull request receipt is visible', async () => {
+    const draft = 'factory-fix-issue-52-1234567890ab'
+    const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
+    class LaggingReceiptMount extends FakeMountClient {
+      receiptReads = 0
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === pullRequestPath) {
+          this.receiptReads += 1
+          if (this.receiptReads === 1) return { content: { title: 'draft not rewritten yet' } }
+          return {
+            content: {
+              created: 65,
+              path: '/github/repos/AgentWorkforce/factory/pull-requests/65.json',
+              url: 'https://github.com/AgentWorkforce/factory/pull/65',
+            },
+          }
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new LaggingReceiptMount()
+    const write = new RelayfileGithubConnectionWrite({
+      mount,
+      gitRunner: gitRunner(),
+      receiptReadAttempts: 3,
+      receiptReadDelayMs: 0,
+    })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 65 })
+    expect(mount.receiptReads).toBe(2)
   })
 })
