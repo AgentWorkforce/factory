@@ -526,7 +526,10 @@ async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefin
     const stderr = deps.stderr ?? process.stderr
     const logger = streamLogger(stderr)
     const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
-    return createFleet({ backend: 'internal', cwd, connectionPath }, { harnessClient: client, ownsBroker: started, workspaceKey })
+    return createFleet(
+      { backend: 'internal', cwd, connectionPath },
+      { harnessClient: client, ownsBroker: started, workspaceKey, logger },
+    )
   }
 
   return createFleet({ backend: globals.backend, cwd, connectionPath })

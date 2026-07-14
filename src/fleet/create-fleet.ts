@@ -1,5 +1,6 @@
 import { InternalFleetClient, type HarnessDriverClientLike } from './internal-fleet-client'
 import { RelayFleetClient } from './relay-fleet-client'
+import type { Logger } from '../ports/system'
 
 export type FleetBackend = 'internal' | 'relay'
 
@@ -15,6 +16,7 @@ export interface CreateFleetDeps {
   // on dispose instead of leaving it running.
   ownsBroker?: boolean
   workspaceKey?: string
+  logger?: Logger
 }
 
 export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetDeps = {}) {
@@ -28,6 +30,7 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
     client: deps.harnessClient,
     ownsBroker: deps.ownsBroker,
     workspaceKey: deps.workspaceKey,
+    logger: deps.logger,
     cwd: options.cwd,
     connectionPath: options.connectionPath,
   })
