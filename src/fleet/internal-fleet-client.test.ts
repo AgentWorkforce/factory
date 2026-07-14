@@ -791,6 +791,42 @@ describe('InternalFleetClient', () => {
     ])
   })
 
+  it('confirms injection by target name when the broker delivery id differs from the send id and worker_ready never fires', async () => {
+    // Regression for the cold-start dispatch race: on a real (non-fake) broker,
+    // sendMessage returns an inbound-request id (`http_…`) while the broker's
+    // delivery_injected event carries its own delivery-tracking id and NEVER the
+    // send id. worker_ready is also not observed on a freshly spawned broker.
+    // The waiter must still resolve, correlating by the target agent name.
+    class MismatchedIdHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        // The id the broker hands back on the send has no relationship to the
+        // id it will later report on delivery_injected.
+        return { event_id: `http_${this.sent.length}`, targets: [input.to] }
+      }
+    }
+    const harness = new MismatchedIdHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:codex' })
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 5000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+
+    // No worker_ready is ever emitted. The broker reports the injection under a
+    // delivery id that does not match any send id, only the target name.
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'broker-delivery-99',
+      event_id: 'broker-snowflake-202823817304596480',
+    })
+
+    await expect(injected).resolves.toEqual({
+      eventId: 'broker-snowflake-202823817304596480',
+      targets: ['ar-1-impl'],
+    })
+  })
+
   it('re-sends a pending injection when its target registers through a fresh spawn', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness })

@@ -456,7 +456,7 @@ export class InternalFleetClient implements FleetClient {
     }
 
     if (event.kind === 'delivery_injected') {
-      this.#resolveInjected(event.event_id)
+      this.#resolveInjected(event.event_id, event.name)
       return
     }
 
@@ -520,15 +520,40 @@ export class InternalFleetClient implements FleetClient {
     }
   }
 
-  #resolveInjected(eventId: string): void {
+  #resolveInjected(eventId: string, name?: string): void {
     rememberRecent(eventId, this.#injectedEventIds, this.#injectedEventIdSet)
 
     const pending = this.#pendingInjected.get(eventId)
-    if (!pending) {
+    if (pending) {
+      this.#resolvePendingInjected(pending, eventId)
       return
     }
 
-    this.#resolvePendingInjected(pending, eventId)
+    // The broker's delivery_injected event id belongs to its own
+    // delivery-tracking id space (a snowflake/`init_…` id) and does NOT equal
+    // the id sendMessage returned for our send — that is an inbound-request
+    // correlation id (`http_…`) the broker never re-emits on delivery events.
+    // So matching purely by event id can never confirm a real cold-start
+    // injection; the delivery lands and is read, yet the waiter times out.
+    // Correlate by the delivery target name instead: a delivery_injected for
+    // the agent we are waiting on confirms our injection reached its terminal.
+    // Waits are serialized per target (the orchestrator awaits each injection
+    // before the next), so at most one active waiter matches a given name.
+    if (name) {
+      const waiter = this.#activeInjectedWaitFor(name)
+      if (waiter) {
+        this.#resolvePendingInjected(waiter, eventId)
+      }
+    }
+  }
+
+  #activeInjectedWaitFor(name: string): PendingInjectedWait | undefined {
+    for (const waiter of this.#activeInjectedWaits) {
+      if (!waiter.settled && waiter.input.to === name) {
+        return waiter
+      }
+    }
+    return undefined
   }
 
   #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
