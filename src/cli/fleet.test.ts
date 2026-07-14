@@ -99,10 +99,48 @@ describe('fleet CLI parsing', () => {
       'relay',
       '--config',
       'factory.json',
+      '--agent-exit-timeout',
+      '45000',
     ])).toEqual({
-      globals: { backend: 'relay', dryRun: true, config: 'factory.json' },
+      globals: { backend: 'relay', dryRun: true, config: 'factory.json', agentExitTimeoutMs: 45_000 },
       args: ['run-once'],
     })
+  })
+
+  it('reads the owned-broker agent exit timeout from the environment and lets the CLI override it', () => {
+    vi.stubEnv('FACTORY_AGENT_EXIT_TIMEOUT_MS', '30000')
+    try {
+      expect(parseGlobalOptions(['roster'])).toEqual({
+        globals: { backend: 'internal', dryRun: false, agentExitTimeoutMs: 30_000 },
+        args: ['roster'],
+      })
+      expect(parseGlobalOptions(['roster', '--agent-exit-timeout', '45000']).globals.agentExitTimeoutMs).toBe(45_000)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('rejects invalid owned-broker agent exit timeouts', () => {
+    expect(() => parseGlobalOptions(['roster', '--agent-exit-timeout', '0'])).toThrow(
+      '--agent-exit-timeout must be a positive integer number of milliseconds',
+    )
+  })
+
+  it('forwards the CLI agent exit timeout into fleet construction', async () => {
+    const fleet = new FakeFleetClient()
+    const createFleetDeps: unknown[] = []
+
+    const code = await runFleetCli(['fleet', 'roster', '--agent-exit-timeout', '45000'], {
+      createFleet: (_options, deps) => {
+        createFleetDeps.push(deps)
+        return fleet
+      },
+      stdout: buffer(),
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(createFleetDeps).toEqual([{ ownedBrokerAgentExitTimeoutMs: 45_000 }])
   })
 
   it('parses manual probe close command', () => {
