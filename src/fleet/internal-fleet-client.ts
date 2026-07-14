@@ -85,6 +85,13 @@ const READY_RESEND_DELAY_MS = 1_000
 // One-shot commands normally finish well inside this guard. Keep it bounded so
 // a hung task_exit worker cannot hold a cold-started broker open indefinitely.
 const OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 30 * 60 * 1_000
+// Broker release replies occasionally drop under cold-start races and surface
+// as an explicitly `retryable: true` HTTP 500 (`internal reply dropped`). The
+// agent is already teardown-bound on our side, so a bounded retry recovers a
+// graceful release without holding up completion. Kept small — a truly wedged
+// broker still falls through to the caller's warn-and-continue path quickly.
+const RELEASE_RETRY_MAX_ATTEMPTS = 3
+const RELEASE_RETRY_BACKOFF_MS = 250
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
@@ -218,7 +225,7 @@ export class InternalFleetClient implements FleetClient {
 
   async release(name: string, reason?: string): Promise<void> {
     try {
-      await this.#client.release(name, reason)
+      await this.#releaseWithRetry(name, reason)
     } finally {
       this.#readyAgentNames.delete(name)
       // An explicit release attempt is terminal for this client's lifecycle
@@ -226,6 +233,31 @@ export class InternalFleetClient implements FleetClient {
       // that error and dispose() must not then wait for the full agent timeout.
       this.#trackAgentExit(name)
     }
+  }
+
+  async #releaseWithRetry(name: string, reason?: string): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await this.#client.release(name, reason)
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS || !isRetryableReleaseError(error)) {
+          throw error
+        }
+        this.#logger?.warn?.('[factory-sdk] release rejected as retryable; retrying', {
+          name,
+          attempt,
+          maxAttempts: RELEASE_RETRY_MAX_ATTEMPTS,
+          error,
+        })
+        await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
+      }
+    }
+    // Loop only exits via return or throw; this line is unreachable but keeps
+    // the type checker satisfied.
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
   async roster(): Promise<RosterEntry> {
@@ -826,6 +858,13 @@ function connectionPathForCwd(cwd: string | undefined): string | undefined {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+function isRetryableReleaseError(error: unknown): boolean {
+  // HarnessDriverProtocolError carries a first-class `retryable` flag. Duck-type
+  // rather than instanceof so mocks and cross-realm instances match too.
+  if (!error || typeof error !== 'object') return false
+  return (error as { retryable?: unknown }).retryable === true
+}
 
 function assertSelfNode(node: SpawnInput['node']): void {
   if (node && node !== 'self') {
