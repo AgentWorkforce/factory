@@ -585,6 +585,55 @@ describe('InternalFleetClient', () => {
     await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
   })
 
+  it('disposes a logical waiter while its readiness re-send response is blocked', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+    harness.emit({
+      kind: 'delivery_failed',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+      reason: 'recipient unavailable',
+    })
+
+    const rejected = expect(injected).rejects.toThrow('InternalFleetClient disposed')
+    await fleet.dispose()
+    await rejected
+
+    // A response arriving after disconnect must not resurrect the waiter.
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await Promise.resolve()
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+    await fleet.dispose()
+
+    expect(harness.disconnectCalls).toBe(1)
+    expect(harness.eventListeners.size).toBe(0)
+    expect(harness.deliveryListeners.size).toBe(0)
+  })
+
   it('keeps the first event viable when the readiness re-send transport fails', async () => {
     class FailingResendHarnessDriverClient extends FakeHarnessDriverClient {
       override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {

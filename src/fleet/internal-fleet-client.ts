@@ -96,6 +96,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #seenEvents: string[] = []
   readonly #seenEventKeys = new Set<string>()
   readonly #pendingInjected = new Map<string, PendingInjectedWait>()
+  readonly #activeInjectedWaits = new Set<PendingInjectedWait>()
   readonly #injectedEventIds: string[] = []
   readonly #injectedEventIdSet = new Set<string>()
   readonly #failedDeliveries = new Map<string, Error>()
@@ -284,6 +285,7 @@ export class InternalFleetClient implements FleetClient {
         settled: false,
       }
       this.#pendingInjected.set(eventId, pending)
+      this.#activeInjectedWaits.add(pending)
 
       // worker_ready may arrive while sendMessage is in flight, before the
       // pending waiter is installed. Re-check after installation to close that
@@ -336,7 +338,8 @@ export class InternalFleetClient implements FleetClient {
     }
     this.#disposed = true
 
-    const pending = [...new Set(this.#pendingInjected.values())]
+    const pending = [...this.#activeInjectedWaits]
+    this.#activeInjectedWaits.clear()
     this.#pendingInjected.clear()
     for (const entry of pending) {
       clearTimeout(entry.timeout)
@@ -473,6 +476,7 @@ export class InternalFleetClient implements FleetClient {
   #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
     if (pending.settled) return
     pending.settled = true
+    this.#activeInjectedWaits.delete(pending)
     clearTimeout(pending.timeout)
     if (pending.resendTimer) clearTimeout(pending.resendTimer)
     for (const pendingEventId of pending.eventIds) {
@@ -484,6 +488,7 @@ export class InternalFleetClient implements FleetClient {
   #rejectPendingInjected(pending: PendingInjectedWait, error: Error): void {
     if (pending.settled) return
     pending.settled = true
+    this.#activeInjectedWaits.delete(pending)
     clearTimeout(pending.timeout)
     if (pending.resendTimer) clearTimeout(pending.resendTimer)
     for (const pendingEventId of pending.eventIds) {
