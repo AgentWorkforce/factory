@@ -481,6 +481,189 @@ describe('InternalFleetClient', () => {
     ])
   })
 
+  it('re-sends an unconfirmed injection when the matching worker becomes ready', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+
+    harness.emit({ kind: 'worker_ready', name: 'ar-2-impl', runtime: 'pty' })
+    await Promise.resolve()
+    expect(harness.sent).toHaveLength(1)
+
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    // A failure for the superseded first send must not reject the logical
+    // waiter while the readiness-triggered re-send can still be acknowledged.
+    harness.emit({
+      kind: 'delivery_failed',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+      reason: 'recipient unavailable',
+    })
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+    expect(harness.sent).toEqual([
+      { to: 'ar-1-impl', text: 'do work', from: undefined, data: undefined },
+      { to: 'ar-1-impl', text: 'do work', from: undefined, data: undefined },
+    ])
+  })
+
+  it('re-sends when worker_ready races the first sendMessage response', async () => {
+    class ReadyDuringSendHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        const eventId = `event-${this.sent.length}`
+        if (this.sent.length === 1) {
+          this.emit({ kind: 'worker_ready', name: input.to, runtime: 'pty' })
+        }
+        return { event_id: eventId, targets: [input.to] }
+      }
+    }
+    const harness = new ReadyDuringSendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps waiting when the first event fails while the readiness re-send is in flight', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    harness.emit({
+      kind: 'delivery_failed',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+      reason: 'recipient unavailable',
+    })
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await Promise.resolve()
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps the first event viable when the readiness re-send transport fails', async () => {
+    class FailingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 2) {
+          throw new Error('resend transport failed')
+        }
+        return { event_id: 'event-1', targets: [input.to] }
+      }
+    }
+    const harness = new FailingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-1', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps the ready-before-injection fast path to one send when the first send is acknowledged', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = new FakeHarnessDriverClient()
+      const fleet = new InternalFleetClient({ client: harness })
+      fleet.onAgentExit(() => {})
+      harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+
+      const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 5000 })
+      await Promise.resolve()
+      harness.emit({
+        kind: 'delivery_injected',
+        name: 'ar-1-impl',
+        delivery_id: 'delivery-1',
+        event_id: 'event-1',
+      })
+
+      await expect(injected).resolves.toEqual({ eventId: 'event-1', targets: ['ar-1-impl'] })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(harness.sent).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-sends once when readiness precedes an unacknowledged first send', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = new FakeHarnessDriverClient()
+      const fleet = new InternalFleetClient({ client: harness })
+      fleet.onAgentExit(() => {})
+      harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+
+      const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 5000 })
+      await Promise.resolve()
+      expect(harness.sent).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(harness.sent).toHaveLength(2)
+      harness.emit({
+        kind: 'delivery_injected',
+        name: 'ar-1-impl',
+        delivery_id: 'delivery-2',
+        event_id: 'event-2',
+      })
+
+      await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('normalizes missing injected targets from the live broker ack', async () => {
     class NoTargetsHarnessDriverClient extends FakeHarnessDriverClient {
       override async sendMessage(input: SendMessageInput): Promise<{ event_id: string }> {
