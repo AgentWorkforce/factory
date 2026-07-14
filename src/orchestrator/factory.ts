@@ -113,6 +113,7 @@ type GithubIssueSource = {
   url: string
   state: string
   labels: string[]
+  author?: string
   path: string
   raw: Record<string, unknown>
 }
@@ -4857,6 +4858,7 @@ export function parseGithubIssue(path: string, content: unknown): GithubIssueSou
     labels: Array.isArray(payload.labels)
       ? payload.labels.map(labelName).filter((label): label is string => Boolean(label))
       : [],
+    author: githubAuthorLogin(payload),
     path,
     raw: asRecord(parsed) ?? payload,
   }
@@ -4987,11 +4989,9 @@ const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefi
 const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
-  const author = asRecord(payload.author) ?? asRecord(payload.user)
   return (
-    stringValue(author?.login) ??
-    stringValue(author?.name) ??
-    stringValue(source?.author)
+    githubAuthorLogin(payload) ??
+    githubAuthorLogin(source ?? {})
   )?.trim() || undefined
 }
 
@@ -5575,6 +5575,7 @@ const githubIssueMirrorPayload = (
   readyForAgentStateId: string,
 ): Record<string, unknown> => {
   const teamId = config.linear.teamIds[config.safety.requireTeamKey]
+  const reporter = issue.author
   return {
     id: githubIssueMirrorId(issue),
     title: `${GITHUB_MIRROR_TITLE_PREFIX} ${issue.title}`.trim(),
@@ -5590,6 +5591,7 @@ const githubIssueMirrorPayload = (
       number: issue.number,
       url: issue.url,
       path: issue.path,
+      ...(reporter ? { author: reporter, reporter } : {}),
     },
   }
 }
@@ -5925,6 +5927,18 @@ const uuidFromPath = (path: string): string | undefined => path.split('__')[1]?.
 const stringValue = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined
 const booleanValue = (value: unknown): boolean | undefined => typeof value === 'boolean' ? value : undefined
 const numberValue = (value: unknown): number | undefined => typeof value === 'number' ? value : undefined
+
+const githubAuthorLogin = (payload: Record<string, unknown>): string | undefined => {
+  for (const value of [payload.author, payload.user, payload.reporter]) {
+    const login = (
+      stringValue(value) ??
+      stringValue(asRecord(value)?.login) ??
+      stringValue(asRecord(value)?.name)
+    )?.trim()
+    if (login) return login
+  }
+  return undefined
+}
 
 
 const liveHeartbeatIntervalMs = (staleMs: number): number =>

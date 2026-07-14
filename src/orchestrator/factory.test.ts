@@ -1456,6 +1456,8 @@ describe('FactoryLoop', () => {
         number: 1116,
         url: 'https://github.com/AgentWorkforce/pear/issues/1116',
         path: ghPath,
+        author: 'issue-author',
+        reporter: 'issue-author',
       },
     })
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
@@ -1963,6 +1965,8 @@ describe('FactoryLoop', () => {
         number: 1116,
         url: 'https://github.com/AgentWorkforce/pear/issues/1116',
         path: ghPath,
+        author: 'issue-author',
+        reporter: 'issue-author',
       },
     })
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
@@ -7309,6 +7313,75 @@ describe('FactoryLoop', () => {
       glob,
       '/github/repos/OtherOrg/pear/issues/55/comments/9003/meta.json',
     ))).toBe(false)
+  })
+
+  it('preserves the GitHub reporter on a Linear mirror and authorizes their escalation reply', async () => {
+    const githubNumber = 1064
+    const githubPath = githubIssuePath('AgentWorkforce', 'pear', githubNumber)
+    const githubIssue = githubIssueFile(githubNumber, {
+      labels: ['factory'],
+      author: 'github-reporter',
+      title: 'Clarify retry behavior',
+    })
+    const ingestionMount = new FakeMountClient({ [githubPath]: githubIssue })
+    const ingestionFactory = createFactory(config(), {
+      mount: ingestionMount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+
+    await ingestionFactory.runOnce()
+
+    const mirrorDraft = record(ingestionMount.writes[0]?.content)
+    expect(mirrorDraft).toMatchObject({
+      source: expect.objectContaining({
+        provider: 'github',
+        owner: 'AgentWorkforce',
+        repo: 'pear',
+        number: githubNumber,
+        url: `https://github.com/AgentWorkforce/pear/issues/${githubNumber}`,
+        author: 'github-reporter',
+        reporter: 'github-reporter',
+      }),
+    })
+
+    const linearMirror = realIssueFile(64, ready, {
+      ...mirrorDraft,
+      id: 'uuid-64',
+      identifier: 'AR-64',
+      url: 'https://linear.app/agent-relay/issue/AR-64/github-mirror',
+      stateId: ready,
+      state: { id: ready, name: 'Ready for Agent' },
+    })
+    const mount = new FakeMountClient({
+      [issuePath(64)]: linearMirror,
+      [githubPath]: githubIssue,
+    })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new GithubClarifiedTriage(),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]).toMatchObject({ key: 'AR-64' })
+    expect(githubWriteback.comments[0]?.body).toContain('Authorized responder: @github-reporter (the issue reporter).')
+    const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
+    expect(githubWriteback.comments[0]?.body).toContain(`Reply with a comment that starts with \`${prefix}\`.`)
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', githubNumber, 9401, {
+      body: `${prefix} Use bounded retries and cover the timeout case.`,
+      author: { login: 'github-reporter' },
+    })
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-64-impl-pear', 'ar-64-review']))
+    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
   })
 
   it('prefers Slack over a GitHub issue comment for triage escalation when Slack is configured', async () => {
