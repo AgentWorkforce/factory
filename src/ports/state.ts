@@ -23,6 +23,7 @@ export type GithubIssueCommentWatchPending = {
   kind: 'triage' | 'agent-question'
   authorizedAuthor: string
   decision?: TriageDecision
+  claimedByCommentId?: string
 }
 
 export type GithubIssueCommentWatchState = {
@@ -34,7 +35,9 @@ export type GithubIssueCommentWatchState = {
     url: string
   }
   pending: GithubIssueCommentWatchPending[]
+  sinceCommentId?: string
   lastSeenCommentId?: string
+  processedCommentIds?: string[]
 }
 
 export interface BatchSnapshot {

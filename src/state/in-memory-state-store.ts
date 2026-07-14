@@ -182,6 +182,7 @@ const cloneGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): Gith
   ...watch,
   issue: { ...watch.issue },
   source: { ...watch.source },
+  processedCommentIds: watch.processedCommentIds ? [...watch.processedCommentIds] : undefined,
   pending: watch.pending.map((pending) => ({
     ...pending,
     ...(pending.decision ? {

@@ -29,6 +29,7 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
+import { FileStateStore } from '../state/file-state-store'
 import { LIVE_GITHUB_ISSUE_GLOB, githubIssuePathParts, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
@@ -7477,11 +7478,13 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({ [path]: issue })
     const fleet = new FakeFleetClient()
     const githubWriteback = new RecordingGithubWriteback()
+    const infos: unknown[][] = []
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
       triage: new GithubClarifiedTriage(),
       githubWriteback,
+      logger: { info: (...args: unknown[]) => infos.push(args) },
     })
 
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
@@ -7499,61 +7502,190 @@ describe('FactoryLoop', () => {
       body: `${prefix} An unauthorized user must not dispatch agents.`,
       author: { login: 'drive-by-user' },
     })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9104, {
+      body: '[factory-reply:factory-triage-unknown] Unknown correlation must be observable.',
+      author: { login: 'reporter' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9105, {
+      body: `${prefix} A bot must not resolve this escalation.`,
+      author: { login: 'reporter', type: 'Bot' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9106, {
+      body: `${prefix} A display name without a verified login is insufficient.`,
+      author: { name: 'reporter' },
+    })
     await flush()
     await flush()
 
     expect(fleet.spawns).toEqual([])
     expect(factory.status().counters.githubAnswersIgnoredMissingCorrelationPrefix).toBe(1)
-    expect(factory.status().counters.githubAnswersIgnoredUnauthorizedAuthor).toBe(1)
+    expect(factory.status().counters.githubAnswersIgnoredUnauthorizedAuthor).toBe(2)
+    expect(factory.status().counters.githubAnswersIgnoredUnknownCorrelation).toBe(1)
+    expect(factory.status().counters.githubAnswersIgnoredBot).toBe(1)
+    expect(infos).toContainEqual([
+      '[factory] ignored GitHub issue answer with unknown correlation',
+      expect.objectContaining({
+        issue: expect.objectContaining({ key: '61' }),
+        commentId: '9104',
+        correlationId: 'factory-triage-unknown',
+      }),
+    ])
+    expect(infos).toContainEqual([
+      '[factory] ignored GitHub issue answer from a bot',
+      expect.objectContaining({
+        issue: expect.objectContaining({ key: '61' }),
+        commentId: '9105',
+        correlationId: expect.stringMatching(/^factory-triage-/u),
+      }),
+    ])
 
-    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9104, {
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9107, {
       body: `${prefix} The reporter-authorized clarification.`,
       author: { login: 'reporter' },
     })
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-61-impl-pear', 'ar-61-review']))
   })
 
-  it('persists and rearms a GitHub triage watcher, replaying a correlated reply synced while stopped', async () => {
-    const path = githubIssuePath('AgentWorkforce', 'pear', 62)
-    const issue = githubIssueFile(62, { labels: ['factory'], author: 'reporter' })
+  it('serializes out-of-order GitHub comments without losing a lower-id correlated reply', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 65)
+    const issue = githubIssueFile(65, { labels: ['factory'], author: 'reporter' })
     const mount = new FakeMountClient({ [path]: issue })
-    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const fleet = new FakeFleetClient()
     const githubWriteback = new RecordingGithubWriteback()
-    const firstFactory = createFactory(config({ issueSource: 'github' }), {
+    const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
-      fleet: new FakeFleetClient(),
-      stateStore,
+      fleet,
       triage: new GithubClarifiedTriage(),
       githubWriteback,
     })
 
-    await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
     const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
-    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toHaveLength(1)
-    await firstFactory.stop()
 
-    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 62, 9201, {
-      body: `${prefix} This reply arrived while factory was stopped.`,
+    // Subscription callbacks are fire-and-forget. Deliver the higher unrelated
+    // ID first to prove it cannot move a scalar cursor past the valid reply.
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 65, 9602, {
+      body: 'Unrelated discussion with the higher comment id.',
+      author: { login: 'reporter' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 65, 9601, {
+      body: `${prefix} The lower-id correlated reply must still dispatch.`,
       author: { login: 'reporter' },
     })
 
-    const restartFleet = new FakeFleetClient()
-    const restartedFactory = createFactory(config({ issueSource: 'github' }), {
-      mount,
-      fleet: restartFleet,
-      stateStore,
-      triage: new GithubClarifiedTriage(),
-      githubWriteback,
-    })
-    await restartedFactory.start({
-      mode: 'live',
-      liveSubscription: { transport: 'subscribe' },
-    })
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review']))
+    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+  })
 
-    await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review']))
-    expect(restartedFactory.status().counters.githubIssueCommentWatchersRearmed).toBe(1)
-    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
-    await restartedFactory.stop()
+  it('persists a pre-side-effect claim and suppresses the same reply after a crash restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-claim-'))
+    try {
+      const watchStatePath = join(root, 'github-watches.json')
+      const path = githubIssuePath('AgentWorkforce', 'pear', 66)
+      const issue = githubIssueFile(66, { labels: ['factory'], author: 'reporter' })
+      const mount = new FakeMountClient({ [path]: issue })
+      const firstStateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+      const githubWriteback = new RecordingGithubWriteback()
+      const crashingFleet = new SpawnFailingFleetClient()
+      const firstFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: crashingFleet,
+        stateStore: firstStateStore,
+        triage: new GithubClarifiedTriage(),
+        githubWriteback,
+        logger: { error: () => undefined },
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
+      const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 66, 9701, {
+        body: `${prefix} This reply is claimed before the simulated crash.`,
+        author: { login: 'reporter' },
+      })
+
+      await vi.waitFor(async () => {
+        const watches = await firstStateStore.listGithubIssueCommentWatches('factory-test')
+        expect(watches[0]?.[1].pending[0]?.claimedByCommentId).toBe('9701')
+      })
+      expect(crashingFleet.spawns).toHaveLength(1)
+      await firstFactory.stop()
+
+      const restartedStateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+      const restartedFleet = new FakeFleetClient()
+      const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: restartedStateStore,
+        triage: new GithubClarifiedTriage(),
+        githubWriteback,
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      await vi.waitFor(async () => {
+        expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+      })
+      expect(restartedFleet.spawns).toEqual([])
+      expect(restartedFactory.status().counters.githubAnswersClaimedReplaySuppressed).toBe(1)
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('persists and rearms a GitHub triage watcher, replaying a correlated reply synced while stopped', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-watch-'))
+    try {
+      const watchStatePath = join(root, 'github-watches.json')
+      const path = githubIssuePath('AgentWorkforce', 'pear', 62)
+      const issue = githubIssueFile(62, { labels: ['factory'], author: 'reporter' })
+      const mount = new FakeMountClient({ [path]: issue })
+      const firstStateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+      const githubWriteback = new RecordingGithubWriteback()
+      const firstFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: firstStateStore,
+        triage: new GithubClarifiedTriage(),
+        githubWriteback,
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
+      const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
+      expect(await firstStateStore.listGithubIssueCommentWatches('factory-test')).toHaveLength(1)
+      await firstFactory.stop()
+
+      // Legacy flat leaves remain replayable alongside canonical
+      // comments/<id>/meta.json entries from adapter-github 0.5.0.
+      mount.files.set('/github/repos/AgentWorkforce/pear/issues/62/comments/9201.json', {
+        content: {
+          id: 9201,
+          body: `${prefix} This flat-leaf reply arrived while factory was stopped.`,
+          author: { login: 'reporter' },
+        },
+      })
+
+      const restartedStateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toHaveLength(1)
+      const restartFleet = new FakeFleetClient()
+      const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: restartFleet,
+        stateStore: restartedStateStore,
+        triage: new GithubClarifiedTriage(),
+        githubWriteback,
+      })
+      await restartedFactory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe' },
+      })
+
+      await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review']))
+      expect(restartedFactory.status().counters.githubIssueCommentWatchersRearmed).toBe(1)
+      expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('dispatches a matched agent to read a Slack triage answer even when factory still finds the issue thin', async () => {

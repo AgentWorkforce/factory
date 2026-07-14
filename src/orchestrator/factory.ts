@@ -226,6 +226,7 @@ export class FactoryLoop implements Factory {
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
+  readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
@@ -502,6 +503,7 @@ export class FactoryLoop implements Factory {
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
       this.#githubIssueCommentWatchStates.clear()
+      this.#githubIssueCommentQueues.clear()
       await this.#state.clearSlackThreads(this.#workspaceId)
       this.#slackWatcherStarts.clear()
       this.#offAgentExit?.()
@@ -2824,11 +2826,14 @@ export class FactoryLoop implements Factory {
       watch = persisted.find(([persistedKey]) => persistedKey === key)?.[1]
     }
     if (!watch) {
+      const sinceCommentId = await this.#latestGithubIssueCommentId(source)
       watch = {
         issue,
         source,
         pending: [],
-        lastSeenCommentId: await this.#latestGithubIssueCommentId(source),
+        sinceCommentId,
+        lastSeenCommentId: sinceCommentId,
+        processedCommentIds: [],
       }
     }
     const added = !watch.pending.some((candidate) => candidate.correlationId === pending.correlationId)
@@ -2840,6 +2845,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #watchGithubIssueComments(watch: GithubIssueCommentWatchState): Promise<boolean> {
+    watch = normalizeGithubIssueCommentWatch(watch)
     const key = githubIssueSourceKey(watch.source)
     this.#githubIssueCommentWatchStates.set(key, watch)
     await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
@@ -2866,7 +2872,7 @@ export class FactoryLoop implements Factory {
       }
 
       try {
-        await this.#handleGithubIssueComment(key, path)
+        await this.#enqueueGithubIssueComment(key, path)
       } catch (error) {
         this.#logger.error?.('[factory] failed to handle GitHub issue comment reply', {
           issue: watch.issue,
@@ -2962,16 +2968,33 @@ export class FactoryLoop implements Factory {
     const watch = this.#githubIssueCommentWatchStates.get(key)
     if (!watch) return
     const comments: Array<{ path: string; id: number }> = []
+    const sinceCommentId = githubCommentNumericId(watch.sinceCommentId ?? watch.lastSeenCommentId)
+    const processedCommentIds = new Set(watch.processedCommentIds ?? [])
     for (const path of await this.#githubIssueCommentPaths(watch.source)) {
       const parts = githubIssueCommentPathParts(path)
       const id = parts ? githubCommentNumericId(parts.commentId) : undefined
-      if (id !== undefined && id > githubCommentNumericId(watch.lastSeenCommentId)) {
+      if (id !== undefined && id > sinceCommentId && !processedCommentIds.has(String(id))) {
         comments.push({ path, id })
       }
     }
     comments.sort((a, b) => a.id - b.id)
     for (const comment of comments) {
-      await this.#handleGithubIssueComment(key, comment.path)
+      await this.#enqueueGithubIssueComment(key, comment.path)
+    }
+  }
+
+  async #enqueueGithubIssueComment(key: string, path: string): Promise<void> {
+    const previous = this.#githubIssueCommentQueues.get(key) ?? Promise.resolve()
+    const current = previous.catch(() => undefined).then(async () => {
+      await this.#handleGithubIssueComment(key, path)
+    })
+    this.#githubIssueCommentQueues.set(key, current)
+    try {
+      await current
+    } finally {
+      if (this.#githubIssueCommentQueues.get(key) === current) {
+        this.#githubIssueCommentQueues.delete(key)
+      }
     }
   }
 
@@ -3027,7 +3050,13 @@ export class FactoryLoop implements Factory {
     const comment = await this.#readGithubIssueComment(path)
     if (!comment) return
     const commentId = githubCommentNumericId(comment.commentId)
-    if (commentId <= githubCommentNumericId(watch.lastSeenCommentId)) {
+    const normalizedCommentId = String(commentId)
+    const processedCommentIds = new Set(watch.processedCommentIds ?? [])
+    if (
+      commentId === 0 ||
+      commentId <= githubCommentNumericId(watch.sinceCommentId) ||
+      processedCommentIds.has(normalizedCommentId)
+    ) {
       this.#increment('githubIssueCommentDuplicatesSuppressed')
       return
     }
@@ -3037,22 +3066,48 @@ export class FactoryLoop implements Factory {
       ? watch.pending.find((candidate) => candidate.correlationId === reply.correlationId)
       : undefined
     let resolved = false
-    if (pending && !comment.isBot && comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()) {
+    let discardClaimedPending = false
+    if (pending?.claimedByCommentId === normalizedCommentId) {
+      this.#increment('githubAnswersClaimedReplaySuppressed')
+      discardClaimedPending = true
+    } else if (pending && comment.isBot) {
+      this.#increment('githubAnswersIgnoredBot')
+      this.#logger.info?.('[factory] ignored GitHub issue answer from a bot', {
+        issue: watch.issue,
+        commentId: normalizedCommentId,
+        correlationId: pending.correlationId,
+      })
+    } else if (pending && comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()) {
+      pending.claimedByCommentId = normalizedCommentId
+      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
       resolved = await this.#routeGithubAnswerToImplementers(watch, pending, comment, reply!.text)
-    } else if (pending && comment.author?.toLowerCase() !== pending.authorizedAuthor.toLowerCase()) {
+      if (!resolved) {
+        delete pending.claimedByCommentId
+      }
+    } else if (pending) {
       this.#increment('githubAnswersIgnoredUnauthorizedAuthor')
       this.#logger.info?.('[factory] ignored GitHub issue answer from unauthorized author', {
         issue: watch.issue,
+        commentId: normalizedCommentId,
         correlationId: pending.correlationId,
         author: comment.author,
         authorizedAuthor: pending.authorizedAuthor,
+      })
+    } else if (reply) {
+      this.#increment('githubAnswersIgnoredUnknownCorrelation')
+      this.#logger.info?.('[factory] ignored GitHub issue answer with unknown correlation', {
+        issue: watch.issue,
+        commentId: normalizedCommentId,
+        correlationId: reply.correlationId,
       })
     } else if (!reply && comment.body.includes('[factory-reply:')) {
       this.#increment('githubAnswersIgnoredMissingCorrelationPrefix')
     }
 
-    watch.lastSeenCommentId = String(commentId)
-    if (resolved && pending) {
+    processedCommentIds.add(normalizedCommentId)
+    watch.processedCommentIds = [...processedCommentIds]
+    watch.lastSeenCommentId = String(Math.max(commentId, githubCommentNumericId(watch.lastSeenCommentId)))
+    if ((resolved || discardClaimedPending) && pending) {
       watch.pending = watch.pending.filter((candidate) => candidate.correlationId !== pending.correlationId)
     }
     if (watch.pending.length === 0) {
@@ -5523,6 +5578,12 @@ const githubCommentNumericId = (value: string | undefined): number => {
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
 }
+
+const normalizeGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState => ({
+  ...watch,
+  sinceCommentId: watch.sinceCommentId ?? watch.lastSeenCommentId,
+  processedCommentIds: [...new Set(watch.processedCommentIds ?? [])],
+})
 
 const githubIssueReadCandidatePaths = (path: string): string[] => {
   if (path.endsWith('/')) {
