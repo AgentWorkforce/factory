@@ -351,6 +351,101 @@ describe('InternalFleetClient', () => {
     expect(harness.disconnectCalls).toBe(0)
   })
 
+  it('keeps an owned cold-start broker alive until all dispatched task-exit agents finish', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({
+      client: harness,
+      ownsBroker: true,
+      cwd: '/worktree',
+      ownedBrokerAgentExitTimeoutMs: 1_000,
+    })
+
+    await fleet.spawn({ name: 'ar-59-impl', capability: 'spawn:codex', task: 'Fix issue #59' })
+    await fleet.spawn({ name: 'ar-59-review', capability: 'spawn:claude', task: 'Review issue #59' })
+    const implInjected = fleet.waitForInjected({ to: 'ar-59-impl', text: 'Fix issue #59' })
+    const reviewInjected = fleet.waitForInjected({ to: 'ar-59-review', text: 'Review issue #59' })
+    await Promise.resolve()
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-59-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+    })
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-59-review',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+    await expect(implInjected).resolves.toEqual({ eventId: 'event-1', targets: ['ar-59-impl'] })
+    await expect(reviewInjected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-59-review'] })
+
+    const disposing = fleet.dispose()
+    await Promise.resolve()
+    expect(harness.shutdownCalls).toBe(0)
+
+    harness.emit({
+      kind: 'agent_exit',
+      name: 'ar-59-impl',
+      reason: 'task_exit',
+    } as BrokerEvent)
+    await Promise.resolve()
+    expect(harness.shutdownCalls).toBe(0)
+
+    harness.emit({
+      kind: 'agent_exited',
+      name: 'ar-59-review',
+      code: 0,
+      reason: 'task_exit',
+    } as BrokerEvent)
+    await disposing
+
+    expect(harness.shutdownCalls).toBe(1)
+    expect(harness.disconnectCalls).toBe(0)
+  })
+
+  it('times out a hung task-exit agent and force-shuts down its owned broker with a warning', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = new FakeHarnessDriverClient()
+      const warn = vi.fn()
+      const fleet = new InternalFleetClient({
+        client: harness,
+        ownsBroker: true,
+        ownedBrokerAgentExitTimeoutMs: 250,
+        logger: { warn },
+      })
+      await fleet.spawn({ name: 'ar-59-hung', capability: 'spawn:codex' })
+
+      const disposing = fleet.dispose()
+      await vi.advanceTimersByTimeAsync(249)
+      expect(harness.shutdownCalls).toBe(0)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await disposing
+
+      expect(harness.shutdownCalls).toBe(1)
+      expect(warn).toHaveBeenCalledWith(
+        '[factory-sdk] timed out waiting for task-exit agents; force-shutting down spawned relay broker',
+        { agents: ['ar-59-hung'], timeoutMs: 250 },
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not delay persistent factory shutdown after its live agents are released', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, ownsBroker: true })
+    await fleet.spawn({ name: 'ar-59-live', capability: 'spawn:codex' })
+
+    await fleet.release('ar-59-live', 'factory-stopped')
+    await fleet.dispose()
+
+    expect(harness.released).toEqual([{ name: 'ar-59-live', reason: 'factory-stopped' }])
+    expect(harness.shutdownCalls).toBe(1)
+  })
+
   it('only disconnects on dispose when reusing an existing broker (never shuts it down)', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
