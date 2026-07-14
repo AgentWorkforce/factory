@@ -75,12 +75,17 @@ export {
   RelayfileCloudMountClient,
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
+export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
 export type {
   ActiveWorkspaceResolver,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
   ResolvedFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
+export type {
+  GitCommandRunner,
+  RelayfileGithubConnectionWriteConfig,
+} from './mount/relayfile-github-connection-write'
 export {
   GhCliGithubMergeGate,
   GithubMergeGate,
@@ -216,6 +221,9 @@ export type {
   ChangeEvent,
   Clock,
   EventPage,
+  GithubConnectionWrite,
+  GithubPublishPullRequestInput,
+  GithubPublishPullRequestResult,
   MountClient,
   ProviderSyncStatus,
   SubscribeOptions,

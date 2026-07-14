@@ -45,10 +45,9 @@ export interface GithubPublishPullRequestResult {
 }
 
 /**
- * GitHub mutations that require the authenticated workspace connection rather
- * than a file-native Relayfile draft. The current Relayfile adapter does not
- * expose these operations yet, so mounts advertise the capability only when
- * their backing connection can execute it.
+ * GitHub mutations that require the authenticated workspace connection. The
+ * concrete mount translates these operations into file-native Relayfile
+ * writeback drafts interpreted by the server-side GitHub adapter.
  */
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
