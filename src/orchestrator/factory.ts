@@ -4902,6 +4902,7 @@ const githubIssueAsFactoryIssue = (issue: GithubIssueSource): LinearIssue => {
           number: issue.number,
           url: issue.url,
           path: issue.path,
+          ...(issue.author ? { author: issue.author, reporter: issue.author } : {}),
         },
       },
     },
@@ -4989,10 +4990,10 @@ const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefi
 const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
-  return (
-    githubAuthorLogin(payload) ??
-    githubAuthorLogin(source ?? {})
-  )?.trim() || undefined
+  if (stringValue(source?.provider)?.toLowerCase() === 'github') {
+    return githubAuthorLogin(source ?? {})?.trim() || undefined
+  }
+  return source ? undefined : githubAuthorLogin(payload)?.trim() || undefined
 }
 
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
@@ -5472,7 +5473,7 @@ const parseGithubIssueComment = (path: string, content: unknown): GithubIssueCom
   const payload = wrappedPayload(raw)
   const comment = asRecord(payload.comment) ?? payload
   const author = asRecord(comment.author) ?? asRecord(comment.user)
-  const authorLogin = stringValue(author?.login) ?? stringValue(author?.name)
+  const authorLogin = stringValue(author?.login)
   const authorType = stringValue(author?.type)?.toLowerCase()
   return {
     owner: parts.owner,
@@ -5932,8 +5933,7 @@ const githubAuthorLogin = (payload: Record<string, unknown>): string | undefined
   for (const value of [payload.author, payload.user, payload.reporter]) {
     const login = (
       stringValue(value) ??
-      stringValue(asRecord(value)?.login) ??
-      stringValue(asRecord(value)?.name)
+      stringValue(asRecord(value)?.login)
     )?.trim()
     if (login) return login
   }

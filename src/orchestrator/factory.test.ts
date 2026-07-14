@@ -7349,6 +7349,7 @@ describe('FactoryLoop', () => {
       ...mirrorDraft,
       id: 'uuid-64',
       identifier: 'AR-64',
+      author: { login: 'linear-creator' },
       url: 'https://linear.app/agent-relay/issue/AR-64/github-mirror',
       stateId: ready,
       state: { id: ready, name: 'Ready for Agent' },
@@ -7376,6 +7377,15 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.comments[0]?.body).toContain(`Reply with a comment that starts with \`${prefix}\`.`)
 
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', githubNumber, 9401, {
+      body: `${prefix} The Linear creator must not cross the GitHub trust boundary.`,
+      author: { login: 'linear-creator' },
+    })
+    await flush()
+    await flush()
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().counters.githubAnswersIgnoredUnauthorizedAuthor).toBe(1)
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', githubNumber, 9402, {
       body: `${prefix} Use bounded retries and cover the timeout case.`,
       author: { login: 'github-reporter' },
     })
