@@ -105,7 +105,7 @@ describe('FileStateStore', () => {
       const watchStatePath = join(root, 'github-watches.json')
       const lockPath = `${watchStatePath}.lock`
       await mkdir(lockPath)
-      const expired = new Date(Date.now() - 30_000)
+      const expired = new Date(Date.now() - 90_000)
       await utimes(lockPath, expired, expired)
 
       const store = new FileStateStore({ batchSize: 2, watchStatePath })
@@ -113,6 +113,36 @@ describe('FileStateStore', () => {
         .setGithubIssueCommentWatch('workspace-1', 'agentworkforce/factory#62', githubWatch(62))
         .then(() => 'written')
       expect(await Promise.race([write, delay(1_000, 'timed-out')])).toBe('written')
+      expect(await store.listGithubIssueCommentWatches('workspace-1')).toEqual([
+        ['agentworkforce/factory#62', githubWatch(62)],
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not reclaim a paused writer lock at the old ten-second threshold', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-paused-lock-'))
+    try {
+      const watchStatePath = join(root, 'github-watches.json')
+      const lockPath = `${watchStatePath}.lock`
+      await mkdir(lockPath)
+      const pausedAt = new Date(Date.now() - 30_000)
+      await utimes(lockPath, pausedAt, pausedAt)
+
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      let settled = false
+      const write = store
+        .setGithubIssueCommentWatch('workspace-1', 'agentworkforce/factory#62', githubWatch(62))
+        .finally(() => { settled = true })
+
+      // A 30-second process pause exceeded the old lease but remains inside
+      // the widened safety window, so another writer must not reclaim it.
+      await delay(50)
+      expect(settled).toBe(false)
+      await rm(lockPath, { recursive: true })
+      await write
+
       expect(await store.listGithubIssueCommentWatches('workspace-1')).toEqual([
         ['agentworkforce/factory#62', githubWatch(62)],
       ])

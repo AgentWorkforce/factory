@@ -20,8 +20,11 @@ export const githubWatchStatePath = (registryPath: string): string =>
   join(dirname(registryPath), 'github-issue-comment-watches.json')
 
 // proper-lockfile refreshes a live writer's lease at half this interval. If a
-// process crashes, the next writer can reclaim its lock after this TTL.
-const WATCH_STATE_LOCK_STALE_MS = 10_000
+// process crashes, the next writer can reclaim its lock after this TTL. The
+// longer interval trades rare crash-recovery latency for enough headroom that
+// serialization, fsync, GC, disk stalls, or a briefly paused process do not
+// let a second writer reclaim a lock that is still actively owned.
+const WATCH_STATE_LOCK_STALE_MS = 60_000
 
 /**
  * Keeps the factory's general runtime bookkeeping in memory while persisting
@@ -100,6 +103,7 @@ export class FileStateStore extends InMemoryStateStore {
       }
 
       await rename(temporaryPath, this.#watchStatePath)
+      await syncParentDirectory(this.#watchStatePath)
     } finally {
       await rm(temporaryPath, { force: true })
     }
@@ -142,6 +146,15 @@ const parseDocument = (value: unknown): WatchStateDocument => {
 
 const cloneWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState =>
   structuredClone(watch)
+
+const syncParentDirectory = async (filePath: string): Promise<void> => {
+  const handle = await open(dirname(filePath), 'r')
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
