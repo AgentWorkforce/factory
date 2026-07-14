@@ -173,6 +173,8 @@ export function evaluateGithubMergeGate(
 }
 
 export const defaultGhRunner: GhRunner = async (args) => {
+  // TODO(issue-52): retire this compatibility runner when merge-gate reads and
+  // guarded merges are fully represented by the mounted GitHub connection.
   const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
   return { stdout, stderr }
 }

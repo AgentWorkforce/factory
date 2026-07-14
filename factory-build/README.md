@@ -79,7 +79,8 @@ cloud-placed spawns on their own machine.
 - PRs are opened **draft** with a `[factory]` title and the **`no-agent-relay-review`** label,
   which disables the autonomous pr-reviewer bot that otherwise pushes unreviewed commits to
   held draft PRs.
-- PR creation uses local `gh` (the broker runs on the user's machine where `gh` is authed).
+- This archived factory-build workflow still uses local `gh`; the shipped
+  Factory CLI publishes PRs through the connected workspace instead.
   For cloud execution, swap the `open-pr` step in the lib for `createGitHubStep({action:'createPR'})`
   (imported from `@relayflows/core/integrations/github`).
 - **Repair-not-skip:** the workflow is `.repairable({ repairRetries: 12 })`. Any failing

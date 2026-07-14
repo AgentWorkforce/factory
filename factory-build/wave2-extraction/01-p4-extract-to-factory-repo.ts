@@ -43,6 +43,8 @@ async function main() {
       'set -e',
       'git rev-parse --show-toplevel >/dev/null',
       'git filter-repo --version >/dev/null 2>&1 || { echo "MISSING_TOOL: git-filter-repo (install: brew install git-filter-repo)"; exit 1; }',
+      // TODO(issue-52): archived extraction workflow; migrate its compatibility
+      // preflight if this one-off factory-build path is reactivated.
       'gh auth status >/dev/null 2>&1 || { echo "MISSING_ENV_VAR: gh auth"; exit 1; }',
       // p1-p3 must be landed: the package must be publishable as @agent-relay/factory, non-private.
       'node -e "const p=require(\'./packages/factory-sdk/package.json\'); if(p.name!==\'@agent-relay/factory\'){console.error(\'p3 not landed: package name is \'+p.name);process.exit(1)} if(p.private){console.error(\'p3 not landed: still private\');process.exit(1)}"',
