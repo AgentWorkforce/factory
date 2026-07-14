@@ -15,3 +15,11 @@ export interface SlackWriteback {
 export interface GithubRead {
   getPr(repo: string, number: number): Promise<PrSummary>
 }
+
+export type GithubIssueStatus = 'in-progress' | 'human-review'
+
+export interface GithubWriteback {
+  postComment(issue: LinearIssue, body: string): Promise<void>
+  setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
+  closeIssue(issue: LinearIssue, body: string): Promise<void>
+}

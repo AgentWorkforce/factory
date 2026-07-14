@@ -1,6 +1,6 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
-import type { AgentSpec, FleetClient, GithubRead, LinearWriteback, MountClient, SlackWriteback } from './ports'
+import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
@@ -20,6 +20,7 @@ export interface FactoryPorts {
   linear?: LinearWriteback
   slack?: SlackWriteback
   github?: GithubRead
+  githubWriteback?: GithubWriteback
   mergeGate?: GithubMergeGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver

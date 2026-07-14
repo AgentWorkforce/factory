@@ -11,6 +11,7 @@ import {
   closeProbePr,
   createFactory,
   createRelayflowPolicyRegistry,
+  isDispatchableIssue,
   isInFactoryScope,
   parseLinearIssue,
   readFactoryInFlightRegistry,
@@ -22,7 +23,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { ChangeEvent, EventPage, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { ChangeEvent, EventPage, GithubIssueStatus, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -208,6 +209,24 @@ class StaticTriage implements TriageEngine {
       confidence: 'high',
       rationale: 'static test decision',
     }
+  }
+}
+
+class RecordingGithubWriteback implements GithubWriteback {
+  readonly comments: Array<{ key: string; body: string }> = []
+  readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
+  readonly closes: Array<{ key: string; body: string }> = []
+
+  async postComment(issue: LinearIssue, body: string): Promise<void> {
+    this.comments.push({ key: issue.key, body })
+  }
+
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
+    this.statuses.push({ key: issue.key, status })
+  }
+
+  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+    this.closes.push({ key: issue.key, body })
   }
 }
 
@@ -925,6 +944,38 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('accepts stable GitHub issue sources at the dispatchability gate without weakening Linear validation', () => {
+    const githubIssue: LinearIssue = {
+      uuid: 'github-2174',
+      key: '2174',
+      title: 'GitHub-native factory work',
+      description: 'Dispatch directly from GitHub.',
+      stateId: '',
+      labels: ['factory'],
+      path: githubIssuePath('AgentWorkforce', 'cloud', 2174),
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-2174',
+            owner: 'AgentWorkforce',
+            repo: 'cloud',
+            number: 2174,
+            url: 'https://github.com/AgentWorkforce/cloud/issues/2174',
+          },
+        },
+      },
+    }
+
+    expect(isDispatchableIssue(githubIssue)).toBe(true)
+    expect(isDispatchableIssue({
+      ...githubIssue,
+      raw: { payload: { source: { provider: 'github', number: 2174 } } },
+    })).toBe(false)
+    expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174, ready, { url: undefined })))).toBe(false)
+    expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174)))).toBe(true)
+  })
+
   it('does not infer a state id from state_name alone (no hardcoded name->id map)', () => {
     // State names/ids are workspace-dynamic, so parseLinearIssue no longer maps a
     // bare state_name to a UUID. The record parses with an empty stateId and is
@@ -1037,6 +1088,220 @@ describe('FactoryLoop', () => {
       expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, path)).toBe(true)
     }
     expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, '/linear/issues/AR-173.json')).toBe(false)
+  })
+
+  it('dispatches a labeled GitHub issue without Linear and writes in-progress then human-review to GitHub', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 48)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(48, { labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const mergeGate = new ScriptedGithubMergeGate([readyMergeVerdict()])
+    const factory = createFactory(config({
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+      mergeGate,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#48', key: '48', path }])
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['48'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-48-impl-pear', 'ar-48-review'])
+    expect(githubWriteback.statuses).toEqual([{ key: '48', status: 'in-progress' }])
+    expect(githubWriteback.comments[0]?.body).toContain('Factory dispatch for 48')
+    expect(mount.writes.filter((write) => write.path.startsWith('/linear/'))).toEqual([])
+    expect(factory.status().counters.githubIssueMirrorsCreated).toBeUndefined()
+
+    fleet.emitAgentExit('ar-48-impl-pear', 'issue-done')
+    await flush()
+    await flush()
+
+    expect(githubWriteback.statuses).toEqual([
+      { key: '48', status: 'in-progress' },
+      { key: '48', status: 'human-review' },
+    ])
+    expect(githubWriteback.comments.at(-1)?.body).toContain('awaiting human review')
+    expect(githubWriteback.closes).toEqual([])
+    expect(mergeGate.checks).toEqual([])
+    expect(mergeGate.merges).toEqual([])
+  })
+
+  it('requires the configured readiness label before dispatching a GitHub-native issue', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 49)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(49, { labels: ['triaged'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([{
+      issue: { uuid: 'AgentWorkforce/pear#49', key: '49', path },
+      reason: 'live state is not ready-for-agent',
+    }])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it.each(['factory:in-progress', 'factory:human-review'] as const)(
+    'does not redispatch a GitHub-native issue labeled %s after restart',
+    async (lifecycleLabel) => {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 52)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(52, { labels: ['factory', 'pear', lifecycleLabel] }),
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+      })
+
+      const report = await restartedFactory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(report.skipped).toEqual([{
+        issue: { uuid: 'AgentWorkforce/pear#52', key: '52', path },
+        reason: 'live state is not ready-for-agent',
+      }])
+      expect(fleet.spawns).toEqual([])
+      expect(githubWriteback.comments).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(mount.writes).toEqual([])
+    },
+  )
+
+  it('keeps a Linear-backed GitHub mirror on the byte-compatible Linear writeback path', async () => {
+    const sourcePath = githubIssuePath('AgentWorkforce', 'pear', 51)
+    const mirrorPath = issuePath(51)
+    const mount = new FakeMountClient({
+      [mirrorPath]: realIssueFile(51, ready, {
+        title: '[factory] Existing Linear mirror',
+        labels: [{ name: 'pear' }],
+        source: {
+          provider: 'github',
+          owner: 'AgentWorkforce',
+          repo: 'pear',
+          number: 51,
+          url: 'https://github.com/AgentWorkforce/pear/issues/51',
+          path: sourcePath,
+        },
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-51'])
+    expect(mount.writes.some((write) => write.path === mirrorPath &&
+      (write.content as { stateId?: string }).stateId === implementing)).toBe(true)
+    expect(githubWriteback.comments).toEqual([])
+    expect(githubWriteback.statuses).toEqual([])
+  })
+
+  it('does not treat an accepted merge command as proof that a GitHub-native PR merged', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 50)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(50, { labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const mergeGate = new ScriptedGithubMergeGate([readyMergeVerdict('github-head')])
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'on-green-with-review',
+      terminalState: 'done',
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+      mergeGate,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50 }),
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-50-impl-pear', 'issue-done')
+    await flush()
+    await flush()
+
+    expect(mergeGate.checks).toEqual([{ repo: 'AgentWorkforce/pear', number: 50 }])
+    expect(mergeGate.merges).toEqual([{ repo: 'AgentWorkforce/pear', number: 50, expectedHeadSha: 'github-head' }])
+    expect(githubWriteback.closes).toEqual([])
+    expect(githubWriteback.statuses).toEqual([
+      { key: '50', status: 'in-progress' },
+      { key: '50', status: 'human-review' },
+    ])
+  })
+
+  it('closes a GitHub-native issue only after receiving a merged PR event', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 51)
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/51/metadata.json'
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(51, { labels: ['factory', 'pear'] }),
+      [prPath]: prFile(51, {
+        title: 'Fix GitHub issue #51',
+        head_ref: 'github-issue-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'done',
+      slack: slackConfig(),
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.runOnce()
+      expect(githubWriteback.closes).toEqual([])
+
+      mount.emit(changeEvent(prPath, 'github-pr-51-merged'))
+
+      await vi.waitFor(() => expect(githubWriteback.closes).toHaveLength(1))
+      expect(githubWriteback.closes[0]?.body).toContain('linked pull request merge')
+      const completionTexts = mount.writes
+        .map((write) => (write.content as { text?: string }).text)
+        .filter((text): text is string => Boolean(text?.startsWith('51:')))
+      expect(completionTexts).toContain('51: PR merged; GitHub status set to Done.')
+      expect(completionTexts).toContain('51: GitHub status set to Done.')
+    } finally {
+      await factory.stop()
+    }
   })
 
   it('runOnce caps active issues, skips stale state, and pulls queued work after completion', async () => {
@@ -4312,6 +4577,26 @@ describe('FactoryLoop', () => {
       ['ar-720-review', '/work/cloud'],
     ])
     expect(comments[0]).toContain('Implementers: ar-720-impl-cloud, ar-720-impl-relayfile')
+  })
+
+  it('routes a Linear issue whose repo label matches a GitHub lifecycle label', async () => {
+    const routedIssue = realIssueFile(729, ready, {
+      labels: [{ name: 'factory:in-progress' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(729)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { 'factory:in-progress': 'AgentWorkforce/pear' },
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+      },
+    }), { mount, fleet, triage: new StaticTriage(), linear: stateOnlyLinear(mount) })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(729), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.role)).toEqual(['implementer', 'reviewer'])
+    expect(fleet.spawns.map((spawn) => spawn.cwd)).toEqual(['/work/pear', '/work/pear'])
+    expect(result.comments[0]).toContain('ar-729-impl-factory-in-progress')
   })
 
   it('filters non-repo labels when repo labels are present', async () => {
@@ -8091,6 +8376,41 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(prPath, 'pr-410-merged-replay'))
       await flush()
       expect(mount.writes.filter((write) => write.path === issuePath(410) && (write.content as { stateId?: string }).stateId === done)).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('skips an already-closed GitHub issue during a merged PR scan', async () => {
+    const issuePath = githubIssuePath('AgentWorkforce', 'pear', 414)
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/414/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePath]: githubIssueFile(414, {
+        state: 'closed',
+        labels: ['factory', 'factory:human-review'],
+      }),
+      [prPath]: prFile(414, {
+        head_ref: 'issue-414-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(prPath, 'pr-414-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrAdvanceNoIssue).toBe(1))
+      expect(githubWriteback.closes).toEqual([])
+      expect(githubWriteback.comments).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
     } finally {
       await factory.stop()
     }

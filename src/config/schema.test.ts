@@ -109,6 +109,17 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.stateIds.humanReview).toBe('state-human-review')
   })
 
+  it('supports an explicit GitHub issue source while leaving source auto-detection enabled by default', () => {
+    const auto = FactoryConfigSchema.parse({ repos: { default: 'AgentWorkforce/factory' } })
+    const github = FactoryConfigSchema.parse({
+      issueSource: 'github',
+      repos: { default: 'AgentWorkforce/factory' },
+    })
+
+    expect(auto.issueSource).toBeUndefined()
+    expect(github.issueSource).toBe('github')
+  })
+
   it('parses dynamic per-team Linear state name mappings', () => {
     const parsed = FactoryConfigSchema.parse({
       repos: { byLabel: { pear: 'AgentWorkforce/pear' } },

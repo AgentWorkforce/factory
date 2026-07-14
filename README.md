@@ -69,9 +69,16 @@ From a source checkout instead of an npm install, run
    }
    ```
 
-   `workspaceId` is your relay workspace; `repos.byLabel` maps a Linear label to a
+   `workspaceId` is your relay workspace; `repos.byLabel` maps an issue label to a
    repo; `clonePaths` tells the agent where that repo lives locally so it has
    somewhere to make changes.
+
+   For a GitHub-only workspace, add `"issueSource": "github"` (or omit it and
+   Factory will select GitHub automatically when `/linear/issues` is not
+   connected). An open issue carrying the configured `safety.requireLabel`
+   label—`factory` by default—is then dispatched directly, with lifecycle
+   updates written back as GitHub comments and `factory:in-progress` /
+   `factory:human-review` labels. No Linear mirror is created.
 
 2. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
    but writes nothing and spawns no agents:
@@ -136,18 +143,18 @@ relayfile Slack mount.
 
 ## Tell it what to work on
 
-Two ways to hand the factory an issue — both are just labeling/titling, nothing
-to install:
+How an issue enters the factory depends on `issueSource`:
 
 | Source | What you do | Result |
 |---|---|---|
-| **Linear** | Title it `[factory] <task>`, set the team + a repo label, move it to **Ready for Agent** | dispatched directly |
-| **GitHub** | Add the **`factory`** label to the issue | mirrored into a `[factory]` Linear issue, then dispatched |
+| **Linear** (`issueSource: "linear"`) | Title it `[factory] <task>`, set the configured team + a repo label, move it to **Ready for Agent** | dispatched directly from Linear |
+| **GitHub native** (`issueSource: "github"`) | Add the configured readiness label (`factory` by default) and a repo route label | dispatched directly from GitHub; lifecycle comments and labels stay on the GitHub issue |
+| **GitHub mirror** (`issueSource: "linear"`) | Add the **`factory`** label to the GitHub issue | mirrored into a `[factory]` Linear issue, then dispatched through the Linear flow |
 
-The **safety gate** is what keeps this opt-in: by default the factory only
-dispatches an issue whose **title starts with your configured prefix** *and* whose
-**team matches** your configured team. Everything else is ignored. Loosen it
-deliberately — it's the main guardrail.
+The **safety gate** keeps both flows opt-in. Linear dispatch uses the configured
+title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
+open issue. Everything else is ignored. Loosen these checks deliberately —
+they're the main guardrail.
 
 > Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
 > auto-close). For real work you want to keep, use the `[factory]` prefix.

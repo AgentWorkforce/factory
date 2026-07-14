@@ -145,6 +145,10 @@ const WorkspaceConfigObjectSchema = z.object({
   batchSize: z.number().int().min(1).max(5).default(5),
   models: modelsSchema,
   slack: slackSchema,
+  // Linear remains the default whenever its issue sub-root is connected. When
+  // omitted, the orchestrator probes that sub-root once and falls back to
+  // GitHub-native issue lifecycle handling only when Linear is absent.
+  issueSource: z.enum(['linear', 'github']).optional(),
   mergePolicy: z.enum(['never', 'on-green-with-review']).default('never'),
   // Opt-in PR babysitter. When enabled, a sonnet agent is spawned once the
   // implementer's PR opens (webhook-driven, see the orchestrator) and shepherds

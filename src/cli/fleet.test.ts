@@ -46,6 +46,21 @@ const issueFile = {
   },
 }
 
+const githubIssueFile = (repo: string, number = 48) => ({
+  provider: 'github',
+  objectType: 'issue',
+  objectId: `${repo}-${number}`,
+  payload: {
+    number,
+    title: `GitHub-only ${repo} issue`,
+    body: 'Dispatch the repository-qualified GitHub issue.',
+    state: 'open',
+    labels: [{ name: 'factory' }, { name: repo }],
+    url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
+    repository: { name: repo, owner: { login: 'AgentWorkforce' } },
+  },
+})
+
 describe('fleet CLI parsing', () => {
   it('parses spawn flags into a FleetClient spawn input shape', () => {
     expect(parseFleetCommand([
@@ -323,6 +338,173 @@ describe('fleet CLI runtime', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('auto-detects GitHub-only workspaces without resolving Linear states', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-only-'))
+    try {
+      const configPath = await writeConfig(root)
+      const githubPath = '/github/repos/AgentWorkforce/pear/issues/by-id/48.json'
+      const mount = new FakeMountClient({
+        [githubPath]: {
+          provider: 'github',
+          objectType: 'issue',
+          objectId: '48',
+          payload: {
+            number: 48,
+            title: 'GitHub-only quickstart issue',
+            body: 'Dispatch without a Linear connection.',
+            state: 'open',
+            labels: [{ name: 'factory' }],
+            url: 'https://github.com/AgentWorkforce/pear/issues/48',
+            repository: { name: 'pear', owner: { login: 'AgentWorkforce' } },
+          },
+        },
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'run-once',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount,
+        resolveStates: async () => {
+          throw new Error('Linear state resolution must not run')
+        },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        pulled: [{ key: '48', path: githubPath }],
+        dispatched: [{ issue: { key: '48' }, dryRun: true }],
+      })
+      expect(mount.writes.filter((write) => write.path.startsWith('/linear/'))).toEqual([])
+
+      const dispatchOutput = buffer()
+      const dispatchCode = await runFleetCli([
+        'dispatch',
+        '48',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount,
+        resolveStates: async () => {
+          throw new Error('Linear state resolution must not run')
+        },
+        stdout: dispatchOutput,
+        stderr: buffer(),
+      })
+
+      expect(dispatchCode).toBe(0)
+      expect(JSON.parse(dispatchOutput.text())).toMatchObject({
+        issue: { key: '48', path: githubPath },
+        dryRun: true,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an ambiguous bare GitHub issue number across configured repositories', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-ambiguous-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear', cloud: 'AgentWorkforce/cloud' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear', 'AgentWorkforce/cloud': '/work/cloud' },
+        },
+      })
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
+        '/github/repos/AgentWorkforce/cloud/issues/by-id/48.json': githubIssueFile('cloud'),
+      })
+      const errors = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('matches multiple repositories (AgentWorkforce/cloud, AgentWorkforce/pear)')
+      expect(errors.text()).toContain('set repos.default or pass a repo-qualified argument')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses repos.default to disambiguate a bare GitHub issue number', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-default-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear', cloud: 'AgentWorkforce/cloud' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear', 'AgentWorkforce/cloud': '/work/cloud' },
+          default: 'AgentWorkforce/cloud',
+        },
+      })
+      const cloudPath = '/github/repos/AgentWorkforce/cloud/issues/by-id/48.json'
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
+        [cloudPath]: githubIssueFile('cloud'),
+      })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48', path: cloudPath } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('deduplicates alternate mounted paths for the same GitHub repository', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-dedupe-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        },
+      })
+      const preferredPath = '/github/repos/AgentWorkforce/pear/issues/48/meta.json'
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
+        [preferredPath]: githubIssueFile('pear'),
+      })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48', path: preferredPath } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('routes factory progress logs to stderr so run-once stdout stays JSON', async () => {
