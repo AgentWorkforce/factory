@@ -1158,6 +1158,37 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it.each(['factory:in-progress', 'factory:human-review'] as const)(
+    'does not redispatch a GitHub-native issue labeled %s after restart',
+    async (lifecycleLabel) => {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 52)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(52, { labels: ['factory', 'pear', lifecycleLabel] }),
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+      })
+
+      const report = await restartedFactory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(report.skipped).toEqual([{
+        issue: { uuid: 'AgentWorkforce/pear#52', key: '52', path },
+        reason: 'live state is not ready-for-agent',
+      }])
+      expect(fleet.spawns).toEqual([])
+      expect(githubWriteback.comments).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(mount.writes).toEqual([])
+    },
+  )
+
   it('keeps a Linear-backed GitHub mirror on the byte-compatible Linear writeback path', async () => {
     const sourcePath = githubIssuePath('AgentWorkforce', 'pear', 51)
     const mirrorPath = issuePath(51)

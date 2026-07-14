@@ -157,6 +157,7 @@ const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
 const GITHUB_FACTORY_LABEL = 'factory'
+const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
@@ -1652,6 +1653,9 @@ export class FactoryLoop implements Factory {
     }
     const githubState = (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase()
     if (githubState === 'closed') {
+      return false
+    }
+    if (issue.labels.some((label) => GITHUB_LIFECYCLE_LABELS.has(label.trim().toLowerCase()))) {
       return false
     }
     const required = this.#config.safety.requireLabel.trim().toLowerCase()
@@ -4646,7 +4650,9 @@ function labelRoutesForIssue(
 } {
   const githubReadinessLabel = isGithubIssue(issue) ? config.safety.requireLabel.trim().toLowerCase() : undefined
   const labels = uniqueNormalizedLabels(issue.labels).filter((label) =>
-    !isShapeLabel(label) && label.toLowerCase() !== githubReadinessLabel,
+    !isShapeLabel(label) &&
+    label.toLowerCase() !== githubReadinessLabel &&
+    !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase()),
   )
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []
