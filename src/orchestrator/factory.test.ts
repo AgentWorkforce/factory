@@ -5193,7 +5193,10 @@ describe('FactoryLoop', () => {
       },
       closePullRequest: async () => undefined,
     }
-    const mount = new FakeMountClient({ [issuePath(52)]: issueFile(52) }, githubWrite)
+    const mount = new FakeMountClient({
+      [issuePath(52)]: issueFile(52),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), {
       mount,
@@ -5215,6 +5218,50 @@ describe('FactoryLoop', () => {
       body: expect.stringContaining('Factory issue AR-52'),
     }])
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+  })
+
+  it('uses the configured repo owner and mounted default branch for PR publication', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 54,
+          url: 'https://github.com/acme/pear/pull/54',
+          headRef: 'fix/ar-54',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(54)]: issueFile(54),
+      '/github/repos/acme/pear/meta.json': { payload: { defaultBranch: 'trunk' } },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        org: 'acme',
+        byLabel: { pear: 'pear' },
+        clonePaths: { pear: '/work/pear' },
+        default: 'pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(54), issueFile(54))))
+    fleet.emitAgentExit('ar-54-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]).toMatchObject({
+      repo: 'acme/pear',
+      baseRef: 'trunk',
+      clonePath: '/work/pear',
+    })
   })
 
   it('surfaces a clear error when a cloud mount lacks the GitHub write path', async () => {
@@ -5435,7 +5482,7 @@ describe('FactoryLoop', () => {
     expect(fleet.messages[0]!.text).toContain('Create a branch for this issue before editing.')
     expect(fleet.messages[0]!.text).toContain('Commit the implementation and tests.')
     expect(fleet.messages[0]!.text).toContain('Push the branch to origin.')
-    expect(fleet.messages[0]!.text).toContain('Factory will open the PR targeting `main` through the connected GitHub workspace.')
+    expect(fleet.messages[0]!.text).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(fleet.messages[0]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(fleet.messages[0]!.text).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
     expect(fleet.messages[0]!.text).toContain('DM `broker` when fully done.')
@@ -5528,7 +5575,7 @@ describe('FactoryLoop', () => {
       data: { issue: { key: 'AR-63' } },
     })
     expect(fleet.messages[2]!.text).toContain('Linear issue: AR-63 - [factory-e2e] Fix factory issue 63')
-    expect(fleet.messages[2]!.text).toContain('Factory will open the PR targeting `main` through the connected GitHub workspace.')
+    expect(fleet.messages[2]!.text).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(fleet.messages[2]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(fleet.messages[2]!.text).toContain('Factory will hand the opened PR to reviewer `ar-63-review`.')
     expect(fleet.inputs).toEqual([

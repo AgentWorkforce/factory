@@ -31,7 +31,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Create a branch for this issue before editing.')
     expect(task).toContain('Commit the implementation and tests.')
     expect(task).toContain('Push the branch to origin.')
-    expect(task).toContain('Factory will open the PR targeting `main` through the connected GitHub workspace.')
+    expect(task).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(task).toContain('Factory will hand the opened PR to reviewer `ar-123-review`.')
     expect(task).toContain('write to the .integrations mount path so the factory can relay it to the issue thread.')

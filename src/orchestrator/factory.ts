@@ -2629,11 +2629,18 @@ export class FactoryLoop implements Factory {
       throw new Error(`Unable to publish GitHub PR: issue ${record.issue.key} is no longer readable`)
     }
 
-    const repo = normalizeGithubRepo(implementer.spec.repo)
+    const sourceRepo = githubMirrorRepoForIssue(issue)
+    const sourceRepoParts = sourceRepo ? githubRepoParts(sourceRepo) : undefined
+    const bareRepoName = implementer.spec.repo.includes('/') ? undefined : implementer.spec.repo
+    const sourceOwner = bareRepoName && sourceRepoParts?.repo === bareRepoName
+      ? sourceRepoParts.owner
+      : undefined
+    const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+    const baseRef = await this.#githubDefaultBranch(repo)
     const result = await githubWrite.publishPullRequest({
       repo,
       clonePath: implementer.spec.clonePath,
-      baseRef: 'main',
+      baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue),
     })
@@ -2646,6 +2653,31 @@ export class FactoryLoop implements Factory {
       url: result.url,
     })
     return result
+  }
+
+  async #githubDefaultBranch(repo: string): Promise<string> {
+    const parts = githubRepoParts(repo)
+    if (!parts) {
+      throw new Error(`GitHub repo must be owner/repo before resolving its default branch: ${repo}`)
+    }
+    const path = `/github/repos/${encodeURIComponent(parts.owner)}/${encodeURIComponent(parts.repo)}/meta.json`
+    let payload: Record<string, unknown>
+    try {
+      payload = wrappedPayload((await this.#mount.readFile(path)).content)
+    } catch (error) {
+      throw new Error(`Unable to resolve the default branch for ${repo} from ${path}: ${describeError(error).errorMessage}`)
+    }
+    const repository = asRecord(payload.repository)
+    const defaultBranch = (
+      stringValue(payload.defaultBranch) ??
+      stringValue(payload.default_branch) ??
+      stringValue(repository?.defaultBranch) ??
+      stringValue(repository?.default_branch)
+    )?.trim()
+    if (!defaultBranch) {
+      throw new Error(`GitHub repository metadata for ${repo} does not include a default branch`)
+    }
+    return defaultBranch
   }
 
   // An implementer that exited, was resumed once, and STILL produced no PR is
@@ -6293,7 +6325,14 @@ const labelName = (value: unknown): string | undefined => {
 const isCompletionReason = (reason?: string): boolean =>
   reason === 'issue-done' || reason === 'done' || reason === 'completed'
 
-const normalizeGithubRepo = (repo: string): string => repo.includes('/') ? repo : `AgentWorkforce/${repo}`
+const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
+  if (repo.includes('/')) return repo
+  const owner = defaultOwner?.trim()
+  if (!owner) {
+    throw new Error(`GitHub repository owner is required for bare repo route: ${repo}; set repos.org or use owner/repo`)
+  }
+  return `${owner}/${repo}`
+}
 
 const githubPullRequestBody = (issue: LinearIssue): string => [
   issue.description,
