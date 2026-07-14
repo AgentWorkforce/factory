@@ -774,11 +774,21 @@ describe('GhCliGithubWriteback', () => {
     },
   }
 
-  it('writes dispatch and lifecycle transitions with GitHub comments and status labels', async () => {
+  it('sets the first lifecycle status without removing an absent label, then transitions statuses', async () => {
     const calls: string[][] = []
+    const labels = new Set<string>()
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          const added = args[args.indexOf('--add-label') + 1]
+          const removed = args[args.indexOf('--remove-label') + 1]
+          if (args.includes('--add-label') && added) labels.add(added)
+          if (args.includes('--remove-label') && removed) labels.delete(removed)
+        }
         return { stdout: '' }
       },
     })
@@ -790,8 +800,10 @@ describe('GhCliGithubWriteback', () => {
     expect(calls).toEqual([
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
       ['label', 'create', 'factory:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Factory agents are working on this issue.', '--force'],
-      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress', '--remove-label', 'factory:human-review'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress'],
       ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
     ])
   })
@@ -819,6 +831,26 @@ describe('GhCliGithubWriteback', () => {
       ...githubIssue,
       raw: { payload: { source: { provider: 'github', number: 48 } } },
     }, 'unsafe')).rejects.toThrow(/stable GitHub issue source/)
+  })
+
+  it('rejects a source URL whose issue number only shares a numeric prefix', async () => {
+    const github = new GhCliGithubWriteback({ runner: async () => ({ stdout: '' }) })
+    await expect(github.postComment({
+      ...githubIssue,
+      key: '4',
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-4',
+            owner: 'AgentWorkforce',
+            repo: 'factory',
+            number: 4,
+            url: 'https://github.com/AgentWorkforce/factory/issues/45',
+          },
+        },
+      },
+    }, 'unsafe')).rejects.toThrow(/source URL does not match AgentWorkforce\/factory#4/)
   })
 })
 

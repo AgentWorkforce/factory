@@ -3030,7 +3030,9 @@ export class FactoryLoop implements Factory {
         continue
       }
       const issue = await this.#readIssue(path)
-      if (!issue || (!githubSource && !isUpstreamState(issue.stateId))) {
+      if (!issue || (githubSource
+        ? issue.state?.name?.trim().toLowerCase() === 'closed'
+        : !isUpstreamState(issue.stateId))) {
         continue
       }
       if (!isDispatchableIssue(issue) || !isInFactoryScope(issue, this.#config.safety)) {
@@ -3215,6 +3217,29 @@ export class FactoryLoop implements Factory {
     return found
   }
 
+  async #githubPrObservedMerged(record: InFlightIssue, issue: LinearIssue): Promise<boolean> {
+    const babysatSnapshot = await this.#readBabysatPrSnapshot(record)
+    if (babysatSnapshot && prMetaShowsMerged(babysatSnapshot)) {
+      return true
+    }
+
+    const pr = this.#babysitterPr.get(record.issue.key) ?? await this.#completionPrForIssue(issue)
+    if (!pr) {
+      return false
+    }
+    for (const path of await this.#pullMetaPathsFor(pr.repo, pr.prNumber)) {
+      try {
+        const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, pr.prNumber)
+        if (snapshot && prMetaShowsMerged(snapshot)) {
+          return true
+        }
+      } catch {
+        // A concurrent mount refresh may remove an alternate path; keep scanning.
+      }
+    }
+    return false
+  }
+
   async #completeIssue(
     record: InFlightIssue,
     opts: { targetState?: 'configured' | 'done'; runMergeGate?: boolean; completionReason?: 'agents-completed' | 'pr-merged' } = {},
@@ -3237,8 +3262,16 @@ export class FactoryLoop implements Factory {
         this.#config.terminalState === 'human-review' &&
         (githubIssue || this.#states.hasHumanReview(issueTeam))
       let githubMerged = githubIssue && opts.completionReason === 'pr-merged'
-      if (issue && githubIssue && !configuredHumanReview && !githubMerged && opts.runMergeGate !== false) {
-        githubMerged = await this.#runCompletionMergeGate(issue)
+      if (issue && githubIssue && !configuredHumanReview && !githubMerged) {
+        githubMerged = await this.#githubPrObservedMerged(record, issue)
+        if (!githubMerged && opts.runMergeGate !== false) {
+          const mergeCommandAccepted = await this.#runCompletionMergeGate(issue)
+          // A successful merge command can mean queued/auto-merge rather than
+          // merged. Only mounted PR state or a merged webhook may prove merge.
+          if (mergeCommandAccepted) {
+            githubMerged = await this.#githubPrObservedMerged(record, issue)
+          }
+        }
       }
       // A GitHub issue only closes after its PR merges. If a configured done
       // path cannot merge (including mergePolicy: never), park it for a human
@@ -3279,7 +3312,7 @@ export class FactoryLoop implements Factory {
               ? `${record.issue.key}: PR merged; ${systemOfRecord} set to ${statusLabel}.`
               : `${record.issue.key}: factory agents completed${humanReview ? '; awaiting human review' : ''}.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`
             const stateText = merged
-              ? `${record.issue.key}: PR merged; ${systemOfRecord} set to ${statusLabel}.`
+              ? `${record.issue.key}: ${systemOfRecord} set to ${statusLabel}.`
               : humanReview
                 ? `${record.issue.key}: awaiting human review; ${systemOfRecord} set to ${statusLabel}.`
                 : `${record.issue.key}: ${systemOfRecord} set to ${statusLabel}.`
@@ -4652,7 +4685,7 @@ function labelRoutesForIssue(
   const labels = uniqueNormalizedLabels(issue.labels).filter((label) =>
     !isShapeLabel(label) &&
     label.toLowerCase() !== githubReadinessLabel &&
-    !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase()),
+    (!isGithubIssue(issue) || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
   )
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []

@@ -591,6 +591,7 @@ async function resolveStatesForIssueSource(
       config.issueSource = 'github'
       return stateResolutionFromIds(config.stateIds, config.linear.states)
     }
+    config.issueSource = 'linear'
   }
   return (resolveStates ?? defaultResolveStates)(mount, config)
 }
@@ -682,7 +683,22 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
     if (matches.length === 0) {
       throw new Error(`Unable to resolve GitHub issue ${key}: found 0 matches`)
     }
-    return matches[0]!
+    const matchesByRepo = new Map<string, { repo: string; path: string }>()
+    for (const path of matches) {
+      const parts = githubIssuePathParts(path)!
+      const repo = `${parts.owner}/${parts.repo}`
+      if (!matchesByRepo.has(repo.toLowerCase())) {
+        matchesByRepo.set(repo.toLowerCase(), { repo, path })
+      }
+    }
+    if (!defaultRepo && matchesByRepo.size > 1) {
+      const repos = [...matchesByRepo.values()].map((match) => match.repo).sort((left, right) => left.localeCompare(right))
+      throw new Error(
+        `Unable to resolve GitHub issue ${key}: matches multiple repositories (${repos.join(', ')}); ` +
+        'set repos.default or pass a repo-qualified argument',
+      )
+    }
+    return matchesByRepo.values().next().value!.path
   }
   const matches = (await mount.listTree('/linear/issues/'))
     .filter((path) => path.startsWith(`/linear/issues/${key}__`) || path === `/linear/issues/${key}.json`)

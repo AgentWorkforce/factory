@@ -98,17 +98,44 @@ export class GhCliGithubWriteback implements GithubWriteback {
       target.description,
       '--force',
     ])
-    await this.#run([
+    const labels = await this.#issueLabels(ref)
+    const editArgs = [
       'issue',
       'edit',
       String(ref.number),
       '--repo',
       ref.repo,
-      '--add-label',
-      target.name,
-      '--remove-label',
-      previous.name,
+    ]
+    if (!labels.has(target.name.toLowerCase())) {
+      editArgs.push('--add-label', target.name)
+    }
+    if (labels.has(previous.name.toLowerCase())) {
+      editArgs.push('--remove-label', previous.name)
+    }
+    if (editArgs.length > 5) {
+      await this.#run(editArgs)
+    }
+  }
+
+  async #issueLabels(ref: { repo: string; number: number }): Promise<Set<string>> {
+    const result = await this.#run([
+      'issue',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'labels',
     ])
+    if (!result.stdout.trim()) {
+      return new Set()
+    }
+    const parsed = JSON.parse(result.stdout) as { labels?: Array<{ name?: unknown }> }
+    return new Set(
+      (parsed.labels ?? [])
+        .map((label) => stringValue(label.name)?.toLowerCase())
+        .filter((label): label is string => Boolean(label)),
+    )
   }
 
   async closeIssue(issue: LinearIssue, body: string): Promise<void> {
@@ -143,10 +170,16 @@ const githubIssueRef = (issue: LinearIssue): { repo: string; number: number; url
     `https://github.com/${repo}/issues/${number}`,
     `https://api.github.com/repos/${repo}/issues/${number}`,
   ].map((candidate) => candidate.toLowerCase())
-  if (!expectedUrlPrefixes.some((prefix) => normalizedUrl.startsWith(prefix))) {
+  if (!expectedUrlPrefixes.some((prefix) => matchesBoundary(normalizedUrl, prefix))) {
     throw new Error(`GitHub writeback source URL does not match ${repo}#${number}`)
   }
   return { repo, number: number!, url }
+}
+
+const matchesBoundary = (value: string, prefix: string): boolean => {
+  if (!value.startsWith(prefix)) return false
+  const next = value[prefix.length]
+  return next === undefined || next === '/' || next === '?' || next === '#'
 }
 
 const stringValue = (value: unknown): string | undefined =>
