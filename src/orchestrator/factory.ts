@@ -6107,7 +6107,7 @@ const isAllowedFactoryDraft = async (
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/factory-[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/u.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/refs%2Fheads%2F[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,

@@ -38,10 +38,11 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const headSha = await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
     const draftName = githubDraftName(headRef, headSha)
     const repoRoot = `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
-    const refPath = `${repoRoot}/refs/${draftName}.json`
+    const fullHeadRef = `refs/heads/${headRef}`
+    const refPath = `${repoRoot}/refs/${encodeURIComponent(fullHeadRef)}.json`
 
     await this.#writeAndConfirm(refPath, {
-      ref: `refs/heads/${headRef}`,
+      ref: fullHeadRef,
       sha: headSha,
     })
 
