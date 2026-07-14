@@ -12,12 +12,15 @@ import {
   createFleet,
   ensureRelayBroker,
   defaultGhRunner,
+  githubIssuePathParts,
   isInFactoryScope,
+  parseGithubFactoryIssue,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
   resolveFactoryStates,
+  stateResolutionFromIds,
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
@@ -166,10 +169,10 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         const mount = await buildMount(loaded, deps)
-        // Resolve the factory's Linear states (role <-> UUID, per team) from
-        // /linear/states by name, with config.stateIds as an explicit-UUID
-        // fallback. Nothing about state names/ids is hardcoded.
-        const stateResolution = await (deps.resolveStates ?? defaultResolveStates)(mount, loaded.config)
+        // Resolve Linear workflow states only when Linear is the issue source.
+        // A GitHub-only workspace has no /linear/states catalog and uses labels
+        // for lifecycle state, so it must not depend on that provider at startup.
+        const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
         const logger = streamLogger(err)
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
@@ -367,7 +370,7 @@ async function runFactoryCommand(
     return result.ok ? 0 : 1
   }
 
-  const issue = await readIssueArg(mount, command.issue)
+  const issue = await readIssueArg(mount, command.issue, config)
   const decision = await factory.triageIssue(issue)
   if (command.kind === 'factory-triage') {
     writeJson(out, decision)
@@ -574,6 +577,24 @@ async function defaultResolveStates(mount: MountClient, config: FactoryConfig): 
   })
 }
 
+async function resolveStatesForIssueSource(
+  mount: MountClient,
+  config: FactoryConfig,
+  resolveStates: FleetCliDeps['resolveStates'],
+): Promise<FactoryStateResolution> {
+  if (config.issueSource === 'github') {
+    return stateResolutionFromIds(config.stateIds, config.linear.states)
+  }
+  if (!config.issueSource) {
+    const linearReady = await mount.ensureSubRoot('/linear/issues', { timeoutMs: 90_000 })
+    if (linearReady !== 'ready') {
+      config.issueSource = 'github'
+      return stateResolutionFromIds(config.stateIds, config.linear.states)
+    }
+  }
+  return (resolveStates ?? defaultResolveStates)(mount, config)
+}
+
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
   if (deps.mount) return deps.mount
   if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
@@ -635,12 +656,34 @@ const scopeIssueFromDraftContent = (content: unknown) => ({
   raw: asRecord(content),
 })
 
-async function readIssueArg(mount: MountClient, issueArg: string) {
-  const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg)
+async function readIssueArg(mount: MountClient, issueArg: string, config: FactoryConfig) {
+  const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg, config)
+  if (githubIssuePathParts(path)) {
+    return parseGithubFactoryIssue(path, (await mount.readFile(path)).content)
+  }
   return readLinearIssueWithCanonicalFallback(mount, path)
 }
 
-async function findIssuePath(mount: MountClient, key: string): Promise<string> {
+async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string> {
+  if (config.issueSource === 'github') {
+    const number = Number(key.replace(/^#/, ''))
+    if (!Number.isInteger(number) || number <= 0) {
+      throw new Error(`Unable to resolve GitHub issue ${key}: expected a positive issue number`)
+    }
+    const defaultRepo = config.repos.default?.toLowerCase()
+    const matches = (await mount.listTree('/github/repos'))
+      .filter((path) => path.endsWith('.json'))
+      .filter((path) => {
+        const parts = githubIssuePathParts(path)
+        if (!parts || parts.number !== number) return false
+        return !defaultRepo || `${parts.owner}/${parts.repo}`.toLowerCase() === defaultRepo
+      })
+      .sort((left, right) => githubIssuePathPreference(left) - githubIssuePathPreference(right) || left.localeCompare(right))
+    if (matches.length === 0) {
+      throw new Error(`Unable to resolve GitHub issue ${key}: found 0 matches`)
+    }
+    return matches[0]!
+  }
   const matches = (await mount.listTree('/linear/issues/'))
     .filter((path) => path.startsWith(`/linear/issues/${key}__`) || path === `/linear/issues/${key}.json`)
   if (matches.length !== 1) {
@@ -648,6 +691,9 @@ async function findIssuePath(mount: MountClient, key: string): Promise<string> {
   }
   return matches[0]
 }
+
+const githubIssuePathPreference = (path: string): number =>
+  path.endsWith('/meta.json') ? 0 : path.includes('/by-id/') ? 1 : 2
 
 function parseFlags(args: string[]): Record<string, string | undefined> {
   const flags: Record<string, string | undefined> = {}

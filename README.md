@@ -69,9 +69,16 @@ From a source checkout instead of an npm install, run
    }
    ```
 
-   `workspaceId` is your relay workspace; `repos.byLabel` maps a Linear label to a
+   `workspaceId` is your relay workspace; `repos.byLabel` maps an issue label to a
    repo; `clonePaths` tells the agent where that repo lives locally so it has
    somewhere to make changes.
+
+   For a GitHub-only workspace, add `"issueSource": "github"` (or omit it and
+   Factory will select GitHub automatically when `/linear/issues` is not
+   connected). An open issue carrying the configured `safety.requireLabel`
+   label—`factory` by default—is then dispatched directly, with lifecycle
+   updates written back as GitHub comments and `factory:in-progress` /
+   `factory:human-review` labels. No Linear mirror is created.
 
 2. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
    but writes nothing and spawns no agents:

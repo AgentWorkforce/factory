@@ -17,5 +17,9 @@ export type {
   MountSlackWritebackConfig,
 } from './slack'
 export {
+  GhCliGithubWriteback,
   MountGithubRead,
+} from './github'
+export type {
+  GhCliGithubWritebackConfig,
 } from './github'

@@ -325,6 +325,79 @@ describe('fleet CLI runtime', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('auto-detects GitHub-only workspaces without resolving Linear states', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-only-'))
+    try {
+      const configPath = await writeConfig(root)
+      const githubPath = '/github/repos/AgentWorkforce/pear/issues/by-id/48.json'
+      const mount = new FakeMountClient({
+        [githubPath]: {
+          provider: 'github',
+          objectType: 'issue',
+          objectId: '48',
+          payload: {
+            number: 48,
+            title: 'GitHub-only quickstart issue',
+            body: 'Dispatch without a Linear connection.',
+            state: 'open',
+            labels: [{ name: 'factory' }],
+            url: 'https://github.com/AgentWorkforce/pear/issues/48',
+            repository: { name: 'pear', owner: { login: 'AgentWorkforce' } },
+          },
+        },
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'run-once',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount,
+        resolveStates: async () => {
+          throw new Error('Linear state resolution must not run')
+        },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        pulled: [{ key: '48', path: githubPath }],
+        dispatched: [{ issue: { key: '48' }, dryRun: true }],
+      })
+      expect(mount.writes.filter((write) => write.path.startsWith('/linear/'))).toEqual([])
+
+      const dispatchOutput = buffer()
+      const dispatchCode = await runFleetCli([
+        'dispatch',
+        '48',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount,
+        resolveStates: async () => {
+          throw new Error('Linear state resolution must not run')
+        },
+        stdout: dispatchOutput,
+        stderr: buffer(),
+      })
+
+      expect(dispatchCode).toBe(0)
+      expect(JSON.parse(dispatchOutput.text())).toMatchObject({
+        issue: { key: '48', path: githubPath },
+        dryRun: true,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('routes factory progress logs to stderr so run-once stdout stays JSON', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-logs-'))
     try {

@@ -11,6 +11,7 @@ import type {
   AgentSpec,
   ChangeEvent,
   FleetClient,
+  GithubWriteback,
   LinearWriteback,
   MountClient,
   ProviderSyncStatus,
@@ -54,7 +55,7 @@ import type {
   TriageDecision,
   TriageEngine,
 } from '../types'
-import { MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
+import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
@@ -67,6 +68,7 @@ type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
 type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
+type IssueSource = 'linear' | 'github'
 type SlackReply = {
   channelDir: string
   threadTs: string
@@ -175,6 +177,7 @@ export class FactoryLoop implements Factory {
   readonly #fleet: FleetClient
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
+  readonly #githubWriteback: GithubWriteback
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
   readonly #probeCloser: ProbeCloser
@@ -258,6 +261,7 @@ export class FactoryLoop implements Factory {
   // undefined = readiness not yet probed; resolved lazily so the standalone
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
+  #resolvedIssueSource?: IssueSource
   #integrationInstructions?: string
   #integrationInstructionsRefresh?: Promise<string | undefined>
   #starting?: Promise<void>
@@ -278,6 +282,7 @@ export class FactoryLoop implements Factory {
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
       safety: config.safety,
     })
+    this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     void (ports.github ?? MountGithubRead(ports.mount))
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
@@ -392,12 +397,19 @@ export class FactoryLoop implements Factory {
 
   async #start(opts: FactoryStartOptions): Promise<void> {
     this.#stopping = false
-    const ready = await this.#mount.ensureSubRoot(ISSUE_ROOT, { timeoutMs: 90_000 })
-    if (ready !== 'ready') {
-      this.#error(new Error(`${ISSUE_ROOT} sub-root is not mounted`))
+    const issueSource = await this.#issueSource()
+    if (issueSource === 'linear') {
+      const ready = await this.#mount.ensureSubRoot(ISSUE_ROOT, { timeoutMs: 90_000 })
+      if (ready !== 'ready') {
+        this.#error(new Error(`${ISSUE_ROOT} sub-root is not mounted`))
+        return
+      }
+    }
+    const githubReady = await this.#ensureGithubIngestionReady()
+    if (issueSource === 'github' && !githubReady) {
+      this.#error(new Error(`${GITHUB_ISSUE_ROOT} sub-root is not mounted`))
       return
     }
-    await this.#ensureGithubIngestionReady()
 
     this.#wireFleetEvents()
 
@@ -1072,7 +1084,12 @@ export class FactoryLoop implements Factory {
     this.#logger.info?.('[factory] run-once started', { dryRun })
     let report: IterationReport | undefined
     try {
-      await this.#ingestGithubIssues({ dryRun })
+      const issueSource = await this.#issueSource()
+      if (issueSource === 'linear') {
+        await this.#ingestGithubIssues({ dryRun })
+      } else {
+        await this.#ensureGithubIngestionReady()
+      }
       const paths = await this.#readyIssuePaths()
       const pulled: IssueRef[] = []
       const triaged: TriageDecision[] = []
@@ -1090,7 +1107,7 @@ export class FactoryLoop implements Factory {
           lastReadyReadProgressAtMs,
           { read: readyIssueReads, total: paths.length, path },
         )
-        if (issue) {
+        if (issue && issueSource === 'linear') {
           await this.#recordCanonicalIssueState(issue)
         }
         if (!issue) {
@@ -1110,7 +1127,7 @@ export class FactoryLoop implements Factory {
           continue
         }
 
-        if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
+        if (!this.#isIssueReady(issue)) {
           skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
           continue
         }
@@ -1120,7 +1137,7 @@ export class FactoryLoop implements Factory {
           continue
         }
 
-        if (!isRealLinearIssue(issue)) {
+        if (!isDispatchableIssue(issue)) {
           skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
           continue
         }
@@ -1378,7 +1395,7 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    if (!isRealLinearIssue(liveIssue)) {
+    if (!isDispatchableIssue(liveIssue)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not reconciled real Linear issue`)
       this.#error(error, decision.issue)
       throw error
@@ -1406,7 +1423,7 @@ export class FactoryLoop implements Factory {
         const signature = labelDispatchFailureSignature(labelDispatch)
         if (this.#labelDispatchFailures.get(decision.issue.key) !== signature) {
           try {
-            await this.#linear.postComment(liveIssue, comment)
+            await this.#postIssueComment(liveIssue, comment)
             // Record only after a successful post so a failed writeback retries
             // next cycle rather than being suppressed as already-notified.
             this.#labelDispatchFailures.set(decision.issue.key, signature)
@@ -1458,16 +1475,20 @@ export class FactoryLoop implements Factory {
       let implementingStateId: string | undefined
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
-        if (!issue || !this.#states.isRole(issue.stateId, 'readyForAgent')) {
+        if (!issue || !this.#isIssueReady(issue)) {
           throw new Error(`Live state changed before writeback for ${dispatchDecision.issue.key}`)
         }
-        implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
         try {
-          await this.#linear.postComment(issue, comment)
+          await this.#postIssueComment(issue, comment)
         } catch (error) {
           this.#logger.warn?.('[factory] comment writeback skipped', error)
         }
-        await this.#linear.setState(issue, implementingStateId)
+        if (isGithubIssue(issue)) {
+          await this.#githubWriteback.setStatus(issue, 'in-progress')
+        } else {
+          implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
+          await this.#linear.setState(issue, implementingStateId)
+        }
         this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
@@ -1554,20 +1575,20 @@ export class FactoryLoop implements Factory {
   }
 
   async #handleChange(path: string, opts: { requireRealIssue?: boolean } = {}): Promise<void> {
-    if (!isIssueFilePath(path)) {
+    if (!isIssueFilePath(path) && !isGithubIssueFilePath(path)) {
       return
     }
 
     try {
       const issue = await this.#readIssue(path)
-      if (issue) {
+      if (issue && !isGithubIssue(issue)) {
         await this.#recordCanonicalIssueState(issue)
       }
-      if (!issue || !this.#states.isRole(issue.stateId, 'readyForAgent')) {
+      if (!issue || !this.#isIssueReady(issue)) {
         return
       }
 
-      if (opts.requireRealIssue && !isRealLinearIssue(issue)) {
+      if (opts.requireRealIssue && !isDispatchableIssue(issue)) {
         return
       }
 
@@ -1575,7 +1596,7 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (!isRealLinearIssue(issue)) {
+      if (!isDispatchableIssue(issue)) {
         return
       }
 
@@ -1606,6 +1627,43 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#logger.error?.('[factory] failed to handle issue change', error)
     }
+  }
+
+  async #issueSource(): Promise<IssueSource> {
+    if (this.#resolvedIssueSource) {
+      return this.#resolvedIssueSource
+    }
+    if (this.#config.issueSource) {
+      this.#resolvedIssueSource = this.#config.issueSource
+      return this.#resolvedIssueSource
+    }
+
+    const linearReady = await this.#mount.ensureSubRoot(ISSUE_ROOT, { timeoutMs: 90_000 })
+    this.#resolvedIssueSource = linearReady === 'ready' ? 'linear' : 'github'
+    if (this.#resolvedIssueSource === 'github') {
+      this.#logger.info?.('[factory] Linear issue source is not connected; using GitHub issues')
+    }
+    return this.#resolvedIssueSource
+  }
+
+  #isIssueReady(issue: LinearIssue): boolean {
+    if (!isGithubIssue(issue)) {
+      return this.#states.isRole(issue.stateId, 'readyForAgent')
+    }
+    const githubState = (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase()
+    if (githubState === 'closed') {
+      return false
+    }
+    const required = this.#config.safety.requireLabel.trim().toLowerCase()
+    return Boolean(required) && issue.labels.some((label) => label.trim().toLowerCase() === required)
+  }
+
+  async #postIssueComment(issue: LinearIssue, body: string): Promise<void> {
+    if (isGithubIssue(issue)) {
+      await this.#githubWriteback.postComment(issue, body)
+      return
+    }
+    await this.#linear.postComment(issue, body)
   }
 
   // Probes the GitHub issue sub-root at most once and caches the verdict so
@@ -1743,6 +1801,13 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      if (await this.#issueSource() === 'github') {
+        if (!githubIssueIsClosed(ghIssue) && githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
+          await this.#handleChange(ghIssue.path)
+        }
+        return
+      }
+
       if (githubIssueIsClosed(ghIssue)) {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
         if (mirror && !this.#states.isRole(mirror.stateId, 'done')) {
@@ -1759,7 +1824,7 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (!githubIssueHasFactoryLabel(ghIssue)) {
+      if (!githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
         return
       }
 
@@ -2060,6 +2125,9 @@ export class FactoryLoop implements Factory {
   }
 
   async #readyIssuePaths(): Promise<string[]> {
+    if (await this.#issueSource() === 'github') {
+      return this.#githubIssuePaths()
+    }
     const pathsByKey = new Map<string, string>()
     const canonicalPathsByKey = new Map<string, string>()
     for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery')) {
@@ -2088,6 +2156,10 @@ export class FactoryLoop implements Factory {
 
   async #readIssue(path: string): Promise<LinearIssue | undefined> {
     try {
+      if (isGithubIssueFilePath(path)) {
+        const githubIssue = await this.#readGithubIssue(path)
+        return githubIssue ? githubIssueAsFactoryIssue(githubIssue) : undefined
+      }
       // Newly-synced issues land as a change-event STUB at the primary
       // /linear/issues/<key>__<uuid>.json path (no state/url/team); the full
       // record lands at the by-id / by-uuid aliases. Read the canonical sibling
@@ -2892,9 +2964,17 @@ export class FactoryLoop implements Factory {
     this.#postMergeDoneAdvances.add(advanceKey)
 
     try {
-      const doneStateId = this.#states.idFor(issue.team, 'done')
-      await this.#linear.setState(issue, doneStateId)
-      await this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
+      const githubIssue = isGithubIssue(issue)
+      if (githubIssue) {
+        await this.#githubWriteback.closeIssue(
+          issue,
+          `Factory observed pull request #${snapshot.number} merge and completed this issue.`,
+        )
+      } else {
+        const doneStateId = this.#states.idFor(issue.team, 'done')
+        await this.#linear.setState(issue, doneStateId)
+        await this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
+      }
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
       this.#increment('mergedPrAdvancedDone')
       this.#increment('done')
@@ -2908,11 +2988,12 @@ export class FactoryLoop implements Factory {
         try {
           const channel = await this.#slackChannelDir()
           if (channel) {
+            const systemOfRecord = githubIssue ? 'GitHub issue closed' : 'Linear state set to Done'
             const root = await this.#slack.postThread({
               channel,
-              text: `${issue.key}: PR merged; Linear state set to Done.`,
+              text: `${issue.key}: PR merged; ${systemOfRecord}.`,
             })
-            await this.#slack.reply(root.threadId, `${issue.key}: Linear state set to Done.`)
+            await this.#slack.reply(root.threadId, `${issue.key}: ${systemOfRecord}.`)
             this.#recordSlackWritebackSuccess('merge-done-thread')
           }
         } catch (error) {
@@ -2938,15 +3019,17 @@ export class FactoryLoop implements Factory {
     // This no-record path runs after agents are released, so there is no
     // tracked PR identity left. Keep the scan simple and prefer branch identity
     // over title/body references to avoid "related to AR-N" body false positives.
-    for (const path of await this.#mount.listTree(ISSUE_ROOT)) {
-      if (!isIssueFilePath(path)) {
+    const githubSource = await this.#issueSource() === 'github'
+    const paths = githubSource ? await this.#githubIssuePaths() : await this.#mount.listTree(ISSUE_ROOT)
+    for (const path of paths) {
+      if (githubSource ? !isGithubIssueFilePath(path) : !isIssueFilePath(path)) {
         continue
       }
       const issue = await this.#readIssue(path)
-      if (!issue || !isUpstreamState(issue.stateId)) {
+      if (!issue || (!githubSource && !isUpstreamState(issue.stateId))) {
         continue
       }
-      if (!isRealLinearIssue(issue) || !isInFactoryScope(issue, this.#config.safety)) {
+      if (!isDispatchableIssue(issue) || !isInFactoryScope(issue, this.#config.safety)) {
         continue
       }
       const score = prSnapshotIssueMatchScore(snapshot, issue.key)
@@ -2954,7 +3037,7 @@ export class FactoryLoop implements Factory {
         best = { issue, score }
       }
     }
-    this.#logger.debug?.('[factory] scanned Linear issues for merged PR advance', {
+    this.#logger.debug?.(`[factory] scanned ${githubSource ? 'GitHub' : 'Linear'} issues for merged PR advance`, {
       prNumber: snapshot.number,
       durationMs: this.#clock.now() - scanStartedAtMs,
       matchedIssue: best?.issue.key,
@@ -3145,16 +3228,40 @@ export class FactoryLoop implements Factory {
       // (the legacy terminal) so the issue never gets stuck on an unconfigured
       // state.
       const issueTeam = issue?.team
-      const humanReview = opts.targetState !== 'done' &&
+      const githubIssue = issue ? isGithubIssue(issue) : false
+      const configuredHumanReview = opts.targetState !== 'done' &&
         this.#config.terminalState === 'human-review' &&
-        this.#states.hasHumanReview(issueTeam)
-      const targetState = humanReview
-        ? this.#states.idFor(issueTeam, 'humanReview')
-        : this.#states.idFor(issueTeam, 'done')
+        (githubIssue || this.#states.hasHumanReview(issueTeam))
+      let githubMerged = githubIssue && opts.completionReason === 'pr-merged'
+      if (issue && githubIssue && !configuredHumanReview && !githubMerged && opts.runMergeGate !== false) {
+        githubMerged = await this.#runCompletionMergeGate(issue)
+      }
+      // A GitHub issue only closes after its PR merges. If a configured done
+      // path cannot merge (including mergePolicy: never), park it for a human
+      // instead of closing the issue while its PR remains open.
+      const humanReview = configuredHumanReview || (githubIssue && !githubMerged)
       const statusLabel = humanReview ? 'In Human Review' : 'Done'
       if (issue) {
-        await this.#linear.setState(issue, targetState)
-        await this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
+        if (githubIssue) {
+          if (humanReview) {
+            await this.#githubWriteback.setStatus(issue, 'human-review')
+            await this.#githubWriteback.postComment(
+              issue,
+              `Factory agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
+            )
+          } else {
+            await this.#githubWriteback.closeIssue(
+              issue,
+              'Factory observed the linked pull request merge and completed this issue.',
+            )
+          }
+        } else {
+          const targetState = humanReview
+            ? this.#states.idFor(issueTeam, 'humanReview')
+            : this.#states.idFor(issueTeam, 'done')
+          await this.#linear.setState(issue, targetState)
+          await this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
+        }
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
       }
 
@@ -3163,14 +3270,15 @@ export class FactoryLoop implements Factory {
           const channel = await this.#slackChannelDir()
           if (channel) {
             const merged = opts.completionReason === 'pr-merged'
+            const systemOfRecord = githubIssue ? 'GitHub status' : 'Linear state'
             const completionText = merged
-              ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
+              ? `${record.issue.key}: PR merged; ${systemOfRecord} set to ${statusLabel}.`
               : `${record.issue.key}: factory agents completed${humanReview ? '; awaiting human review' : ''}.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`
             const stateText = merged
-              ? `${record.issue.key}: PR merged; Linear state set to ${statusLabel}.`
+              ? `${record.issue.key}: PR merged; ${systemOfRecord} set to ${statusLabel}.`
               : humanReview
-                ? `${record.issue.key}: awaiting human review; Linear state set to ${statusLabel}.`
-                : `${record.issue.key}: Linear state set to ${statusLabel}.`
+                ? `${record.issue.key}: awaiting human review; ${systemOfRecord} set to ${statusLabel}.`
+                : `${record.issue.key}: ${systemOfRecord} set to ${statusLabel}.`
             const root = await this.#slack.postThread({
               channel,
               text: completionText,
@@ -3185,7 +3293,7 @@ export class FactoryLoop implements Factory {
       // Only auto-merge on the `done` terminal path. Human Review parks the PR
       // for an operator — the merge gate (which requires an APPROVED review)
       // would refuse anyway, and we must not merge before the human has looked.
-      if (issue && !humanReview && opts.runMergeGate !== false) {
+      if (issue && !githubIssue && !humanReview && opts.runMergeGate !== false) {
         await this.#runCompletionMergeGate(issue)
       }
 
@@ -3809,11 +3917,11 @@ export class FactoryLoop implements Factory {
 
   async #handleTriageEscalationSlackAnswer(record: InFlightIssue, text: string): Promise<DispatchResult | undefined> {
     const issue = await this.#readIssue(record.issue.path)
-    if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isRealLinearIssue(issue)) {
+    if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isDispatchableIssue(issue)) {
       this.#increment('slackTriageAnswersIgnoredIssueUnavailable')
       return
     }
-    if (!this.#states.isRole(issue.stateId, 'readyForAgent')) {
+    if (!this.#isIssueReady(issue)) {
       this.#increment('slackTriageAnswersIgnoredIssueNotReady')
       return
     }
@@ -3997,34 +4105,34 @@ export class FactoryLoop implements Factory {
       : undefined
   }
 
-  async #runCompletionMergeGate(issue: LinearIssue): Promise<void> {
+  async #runCompletionMergeGate(issue: LinearIssue): Promise<boolean> {
     if (this.#isSyntheticProbeIssue(issue)) {
       await this.#closeSyntheticProbeIfPresent(issue)
-      return
+      return false
     }
 
-    if (!isRealLinearIssue(issue)) {
+    if (!isDispatchableIssue(issue)) {
       this.#logger.warn?.('[factory] merge gate skipped non-real Linear issue', { issue: issue.key })
       this.#increment('mergeGateSkippedNonReal')
-      return
+      return false
     }
 
     if (this.#config.mergePolicy !== 'on-green-with-review') {
-      return
+      return false
     }
 
     const pr = await this.#probePrResolver(issue)
     if (!pr) {
       this.#logger.warn?.('[factory] merge gate found no PR for real issue', { issue: issue.key })
       this.#increment('mergeGateMissingPr')
-      return
+      return false
     }
 
     const ready = await this.#waitForMergeReady(pr)
     const headSha = ready?.live.headRefOid
     if (!ready || !headSha) {
       this.#increment('mergeGateNotMerged')
-      return
+      return false
     }
 
     const result = await this.#mergeGate.merge({
@@ -4041,7 +4149,7 @@ export class FactoryLoop implements Factory {
         reason: result.reason,
       })
       this.#increment('mergeGateMergeAborted')
-      return
+      return false
     }
 
     this.#logger.info?.('[factory] merge gate merged PR', {
@@ -4051,6 +4159,7 @@ export class FactoryLoop implements Factory {
       headSha,
     })
     this.#increment('mergeGateMerged')
+    return true
   }
 
   async #closeSyntheticProbeIfPresent(issue: LinearIssue): Promise<void> {
@@ -4208,6 +4317,50 @@ export function parseGithubIssue(path: string, content: unknown): GithubIssueSou
   }
 }
 
+export function parseGithubFactoryIssue(path: string, content: unknown): LinearIssue {
+  return githubIssueAsFactoryIssue(parseGithubIssue(path, content))
+}
+
+const githubIssueAsFactoryIssue = (issue: GithubIssueSource): LinearIssue => {
+  const wrapper = asRecord(issue.raw) ?? {}
+  const payload = wrappedPayload(wrapper)
+  const objectId = stringValue(wrapper.objectId)
+  const stableId = `${issue.repo}#${objectId ?? issue.number}`
+  return {
+    uuid: stableId,
+    key: String(issue.number),
+    title: issue.title,
+    description: issue.body,
+    stateId: '',
+    state: issue.state ? { name: issue.state } : undefined,
+    labels: issue.labels,
+    path: issue.path,
+    raw: {
+      ...wrapper,
+      provider: 'github',
+      objectType: 'issue',
+      objectId: stableId,
+      payload: {
+        ...payload,
+        id: stableId,
+        number: issue.number,
+        title: issue.title,
+        description: issue.body,
+        url: issue.url,
+        source: {
+          provider: 'github',
+          id: stableId,
+          owner: issue.owner,
+          repo: issue.repoName,
+          number: issue.number,
+          url: issue.url,
+          path: issue.path,
+        },
+      },
+    },
+  }
+}
+
 export async function readFactoryLoopHeartbeat(
   path = DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
 ): Promise<FactoryLoopHeartbeat | undefined> {
@@ -4246,6 +4399,29 @@ export function isRealLinearIssue(issue: LinearIssue): boolean {
     /^[A-Z]+-\d+$/u.test(identifier) &&
     typeof payload.url === 'string' &&
     payload.url.length > 0
+}
+
+export function isDispatchableIssue(issue: LinearIssue): boolean {
+  if (isRealLinearIssue(issue)) {
+    return true
+  }
+  if (!isGithubIssue(issue)) {
+    return false
+  }
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  const sourceId = stringValue(source?.id)
+  const number = numberValue(source?.number) ?? numberValue(payload.number)
+  const url = stringValue(source?.url) ?? stringValue(payload.url)
+  const hasStableIdentity = Boolean(sourceId?.trim()) || (Number.isInteger(number) && (number ?? 0) > 0)
+  return Boolean(issue.uuid.trim() && issue.key.trim() && hasStableIdentity && url?.trim())
+}
+
+const isGithubIssue = (issue: LinearIssue): boolean => {
+  const wrapper = asRecord(issue.raw)
+  const source = asRecord(wrappedPayload(issue.raw).source)
+  return stringValue(source?.provider)?.toLowerCase() === 'github' &&
+    (stringValue(wrapper?.provider)?.toLowerCase() === 'github' || isGithubIssueFilePath(issue.path))
 }
 
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
@@ -4468,7 +4644,10 @@ function labelRoutesForIssue(
   offendingLabels: string[]
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
-  const labels = uniqueNormalizedLabels(issue.labels).filter((label) => !isShapeLabel(label))
+  const githubReadinessLabel = isGithubIssue(issue) ? config.safety.requireLabel.trim().toLowerCase() : undefined
+  const labels = uniqueNormalizedLabels(issue.labels).filter((label) =>
+    !isShapeLabel(label) && label.toLowerCase() !== githubReadinessLabel,
+  )
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []
   const seenRepos = new Set<string>()
@@ -4736,8 +4915,8 @@ const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: str
   }
 }
 
-const githubIssueHasFactoryLabel = (issue: GithubIssueSource): boolean =>
-  issue.labels.some((label) => label.toLowerCase() === GITHUB_FACTORY_LABEL)
+const githubIssueHasFactoryLabel = (issue: GithubIssueSource, requiredLabel = GITHUB_FACTORY_LABEL): boolean =>
+  issue.labels.some((label) => label.trim().toLowerCase() === requiredLabel.trim().toLowerCase())
 
 const githubIssueIsClosed = (issue: GithubIssueSource): boolean =>
   issue.state === 'closed'

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { createFactory, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import { createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
 import type { MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
@@ -747,6 +747,78 @@ describe('MountGithubRead', () => {
       author: 'factory-bot',
       filesChanged: ['src/writeback/github.ts'],
     })
+  })
+})
+
+describe('GhCliGithubWriteback', () => {
+  const githubIssue: LinearIssue = {
+    ...issue,
+    uuid: 'github-48',
+    key: '48',
+    title: 'GitHub-native factory work',
+    description: 'Implement the GitHub issue directly.',
+    stateId: '',
+    labels: ['factory'],
+    path: '/github/repos/AgentWorkforce/factory/issues/by-id/48.json',
+    raw: {
+      payload: {
+        source: {
+          provider: 'github',
+          id: 'github-48',
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          number: 48,
+          url: 'https://github.com/AgentWorkforce/factory/issues/48',
+        },
+      },
+    },
+  }
+
+  it('writes dispatch and lifecycle transitions with GitHub comments and status labels', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: '' }
+      },
+    })
+
+    await github.postComment(githubIssue, 'Factory dispatch for 48')
+    await github.setStatus(githubIssue, 'in-progress')
+    await github.setStatus(githubIssue, 'human-review')
+
+    expect(calls).toEqual([
+      ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
+      ['label', 'create', 'factory:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Factory agents are working on this issue.', '--force'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress', '--remove-label', 'factory:human-review'],
+      ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
+    ])
+  })
+
+  it('comments and closes the GitHub issue after merge', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: '' }
+      },
+    })
+
+    await github.closeIssue(githubIssue, 'Factory observed the linked pull request merge.')
+
+    expect(calls).toEqual([
+      ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory observed the linked pull request merge.'],
+      ['issue', 'close', '48', '--repo', 'AgentWorkforce/factory', '--reason', 'completed'],
+    ])
+  })
+
+  it('refuses writeback when GitHub source identity is incomplete', async () => {
+    const github = new GhCliGithubWriteback({ runner: async () => ({ stdout: '' }) })
+    await expect(github.postComment({
+      ...githubIssue,
+      raw: { payload: { source: { provider: 'github', number: 48 } } },
+    }, 'unsafe')).rejects.toThrow(/stable GitHub issue source/)
   })
 })
 

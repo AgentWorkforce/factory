@@ -101,7 +101,10 @@ export {
   createFactory,
   FactoryLoop,
   issueKey,
+  isDispatchableIssue,
   isRealLinearIssue,
+  githubIssuePathParts,
+  parseGithubFactoryIssue,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
@@ -120,12 +123,14 @@ export type {
   LlmTriageOptions,
 } from './triage'
 export {
+  GhCliGithubWriteback,
   linearCommentName,
   MountGithubRead,
   MountLinearWriteback,
   MountSlackWriteback,
 } from './writeback'
 export type {
+  GhCliGithubWritebackConfig,
   LinearCommentPayload,
   LinearCreateIssuePayload,
   LinearStateIds,
@@ -216,6 +221,8 @@ export type {
   SpawnInput,
   SpawnResult,
   GithubRead,
+  GithubIssueStatus,
+  GithubWriteback,
   LinearWriteback,
   Logger,
   SlackWriteback,
