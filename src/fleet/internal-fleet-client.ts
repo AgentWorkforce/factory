@@ -40,6 +40,9 @@ export interface InternalFleetClientOptions {
   // True when the injected client owns a broker we spawned, so dispose() shuts it
   // down instead of merely disconnecting (which would leave it running).
   ownsBroker?: boolean
+  // Maximum time dispose() waits for task-exit agents before force-shutting
+  // down a broker owned by this client.
+  ownedBrokerAgentExitTimeoutMs?: number
   cwd?: string
   connectionPath?: string
   workspaceKey?: string
@@ -79,10 +82,12 @@ const selfNode: RosterEntry['nodes'][number] = {
 const PID_RESOLVE_ATTEMPTS = 3
 const PID_RESOLVE_BACKOFF_MS = 75
 const READY_RESEND_DELAY_MS = 1_000
+const DEFAULT_OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 30 * 60_000
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
   readonly #ownsBroker: boolean
+  readonly #ownedBrokerAgentExitTimeoutMs: number
   readonly #cwd?: string
   readonly #connectionPath?: string
   readonly #workspaceKey?: string
@@ -103,6 +108,8 @@ export class InternalFleetClient implements FleetClient {
   readonly #failedDeliveryIds: string[] = []
   readonly #exitedAgentNames = new Set<string>()
   readonly #readyAgentNames = new Set<string>()
+  readonly #taskExitAgentNames = new Set<string>()
+  readonly #taskExitWaiters = new Set<() => void>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
@@ -118,6 +125,7 @@ export class InternalFleetClient implements FleetClient {
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
     this.#ownsBroker = options.ownsBroker ?? false
+    this.#ownedBrokerAgentExitTimeoutMs = options.ownedBrokerAgentExitTimeoutMs ?? DEFAULT_OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -127,6 +135,8 @@ export class InternalFleetClient implements FleetClient {
     // fallback MCP registration races the first confirmed task injection.
     this.#ensureEventSubscription()
     this.#readyAgentNames.delete(input.name)
+    this.#clearAgentExitLatch(input.name)
+    this.#taskExitAgentNames.add(input.name)
 
     const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name,
@@ -140,9 +150,18 @@ export class InternalFleetClient implements FleetClient {
       spawnMode: 'task_exit',
       exitAfterTask: true,
     })
-    const handle = await this.#client.spawnPty(spawnInput)
-
-    this.#clearAgentExitLatch(handle.name)
+    let handle: SpawnedHandleLike
+    try {
+      handle = await this.#client.spawnPty(spawnInput)
+    } catch (error) {
+      this.#markTaskExitAgentComplete(input.name)
+      throw error
+    }
+    if (handle.name !== input.name) {
+      this.#markTaskExitAgentComplete(input.name)
+      this.#clearAgentExitLatch(handle.name)
+      this.#taskExitAgentNames.add(handle.name)
+    }
     // A fresh broker's event stream can miss the first worker_ready edge while
     // it is still connecting. The successful spawn response is the broker's
     // authoritative registration signal, so feed it through the same bounded
@@ -194,6 +213,7 @@ export class InternalFleetClient implements FleetClient {
   async release(name: string, reason?: string): Promise<void> {
     try {
       await this.#client.release(name, reason)
+      this.#markTaskExitAgentComplete(name)
     } finally {
       this.#readyAgentNames.delete(name)
     }
@@ -355,6 +375,10 @@ export class InternalFleetClient implements FleetClient {
     }
     this.#disposed = true
 
+    if (this.#ownsBroker) {
+      await this.#waitForTaskExitAgents()
+    }
+
     const pending = [...this.#activeInjectedWaits]
     this.#activeInjectedWaits.clear()
     this.#pendingInjected.clear()
@@ -374,6 +398,7 @@ export class InternalFleetClient implements FleetClient {
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
     this.#readyAgentNames.clear()
+    this.#taskExitAgentNames.clear()
     // If we started the broker, shut it down so the process can exit cleanly
     // (a spawned broker's owner-lease renewal otherwise keeps the event loop
     // alive). A reused broker is only disconnected — never shut down — so we
@@ -403,6 +428,7 @@ export class InternalFleetClient implements FleetClient {
     if (offDeliveryUpdate) this.#eventUnsubscribers.push(offDeliveryUpdate)
     const offAgentExited = this.#client.addListener?.('agentExited', (agent) => {
       this.#readyAgentNames.delete(agent.name)
+      this.#markTaskExitAgentComplete(agent.name)
       this.#emitAgentExit(agent.name, 'exited', {
         key: `agentExited:${JSON.stringify(agent)}`,
         hasStableId: false,
@@ -464,14 +490,57 @@ export class InternalFleetClient implements FleetClient {
 
     if (event.kind === 'agent_exit') {
       this.#readyAgentNames.delete(event.name)
+      this.#markTaskExitAgentComplete(event.name)
       this.#emitAgentExit(event.name, event.reason, eventIdentity(event))
       return
     }
 
     if (event.kind === 'agent_exited') {
       this.#readyAgentNames.delete(event.name)
+      this.#markTaskExitAgentComplete(event.name)
       this.#emitAgentExit(event.name, event.reason ?? exitReason(event), eventIdentity(event))
     }
+  }
+
+  async #waitForTaskExitAgents(): Promise<void> {
+    if (this.#taskExitAgentNames.size === 0) {
+      return
+    }
+
+    const timeoutMs = this.#ownedBrokerAgentExitTimeoutMs
+    this.#logger?.info?.('[factory-sdk] waiting for task-exit agents before shutting down spawned relay broker', {
+      agents: [...this.#taskExitAgentNames].sort(),
+      timeoutMs,
+    })
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const completed = new Promise<'completed'>((resolve) => {
+      this.#taskExitWaiters.add(() => resolve('completed'))
+    })
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs)
+    })
+    const result = await Promise.race([completed, timedOut])
+    if (timer) clearTimeout(timer)
+    this.#taskExitWaiters.clear()
+
+    if (result === 'timeout') {
+      this.#logger?.warn?.('[factory-sdk] timed out waiting for task-exit agents; force-shutting down spawned relay broker', {
+        agents: [...this.#taskExitAgentNames].sort(),
+        timeoutMs,
+      })
+    }
+  }
+
+  #markTaskExitAgentComplete(name: string): void {
+    if (!this.#taskExitAgentNames.delete(name) || this.#taskExitAgentNames.size > 0) {
+      return
+    }
+
+    for (const resolve of this.#taskExitWaiters) {
+      resolve()
+    }
+    this.#taskExitWaiters.clear()
   }
 
   #markAgentReady(name: string): void {
