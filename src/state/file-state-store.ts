@@ -1,5 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+
+import lockfile from 'proper-lockfile'
 
 import type { GithubIssueCommentWatchState } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
@@ -16,13 +19,21 @@ export type FileStateStoreOptions = InMemoryStateStoreOptions & {
 export const githubWatchStatePath = (registryPath: string): string =>
   join(dirname(registryPath), 'github-issue-comment-watches.json')
 
+// proper-lockfile refreshes a live writer's lease at half this interval. If a
+// process crashes, the next writer can reclaim its lock after this TTL. The
+// longer interval trades rare crash-recovery latency for enough headroom that
+// serialization, fsync, GC, disk stalls, or a briefly paused process do not
+// let a second writer reclaim a lock that is still actively owned.
+const WATCH_STATE_LOCK_STALE_MS = 60_000
+
 /**
  * Keeps the factory's general runtime bookkeeping in memory while persisting
  * GitHub escalation watches atomically so they survive a CLI process restart.
+ * Mutations reload under an advisory lock so independent processes merge
+ * updates instead of publishing divergent cached documents.
  */
 export class FileStateStore extends InMemoryStateStore {
   readonly #watchStatePath: string
-  #document?: WatchStateDocument
   #operation: Promise<void> = Promise.resolve()
 
   constructor(options: FileStateStoreOptions) {
@@ -36,10 +47,12 @@ export class FileStateStore extends InMemoryStateStore {
     watch: GithubIssueCommentWatchState,
   ): Promise<void> {
     await this.#exclusive(async () => {
-      const document = await this.#load()
-      const workspace = document.workspaces[workspaceId] ??= {}
-      workspace[key] = cloneWatch(watch)
-      await this.#persist(document)
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId] ??= {}
+        workspace[key] = cloneWatch(watch)
+        await this.#persist(document)
+      })
     })
   }
 
@@ -47,7 +60,7 @@ export class FileStateStore extends InMemoryStateStore {
     workspaceId: string,
   ): Promise<Array<[string, GithubIssueCommentWatchState]>> {
     return await this.#exclusive(async () => {
-      const document = await this.#load()
+      const document = await this.#loadFromDisk()
       return Object.entries(document.workspaces[workspaceId] ?? {})
         .map(([key, watch]) => [key, cloneWatch(watch)])
     })
@@ -55,34 +68,66 @@ export class FileStateStore extends InMemoryStateStore {
 
   override async clearGithubIssueCommentWatch(workspaceId: string, key: string): Promise<void> {
     await this.#exclusive(async () => {
-      const document = await this.#load()
-      const workspace = document.workspaces[workspaceId]
-      if (!workspace || !(key in workspace)) return
-      delete workspace[key]
-      if (Object.keys(workspace).length === 0) {
-        delete document.workspaces[workspaceId]
-      }
-      await this.#persist(document)
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId]
+        if (!workspace || !(key in workspace)) return
+        delete workspace[key]
+        if (Object.keys(workspace).length === 0) {
+          delete document.workspaces[workspaceId]
+        }
+        await this.#persist(document)
+      })
     })
   }
 
-  async #load(): Promise<WatchStateDocument> {
-    if (this.#document) return this.#document
+  async #loadFromDisk(): Promise<WatchStateDocument> {
     try {
       const parsed = JSON.parse(await readFile(this.#watchStatePath, 'utf8')) as unknown
-      this.#document = parseDocument(parsed)
+      return parseDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
-      this.#document = { version: 1, workspaces: {} }
+      return { version: 1, workspaces: {} }
     }
-    return this.#document
   }
 
   async #persist(document: WatchStateDocument): Promise<void> {
+    const temporaryPath = `${this.#watchStatePath}.${process.pid}.${randomUUID()}.tmp`
+    try {
+      const handle = await open(temporaryPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(`${JSON.stringify(document, null, 2)}\n`)
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+
+      await rename(temporaryPath, this.#watchStatePath)
+      await syncParentDirectory(this.#watchStatePath)
+    } finally {
+      await rm(temporaryPath, { force: true })
+    }
+  }
+
+  async #withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
     await mkdir(dirname(this.#watchStatePath), { recursive: true })
-    const temporaryPath = `${this.#watchStatePath}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 })
-    await rename(temporaryPath, this.#watchStatePath)
+    const release = await lockfile.lock(this.#watchStatePath, {
+      realpath: false,
+      stale: WATCH_STATE_LOCK_STALE_MS,
+      update: WATCH_STATE_LOCK_STALE_MS / 2,
+      retries: {
+        forever: true,
+        factor: 1.2,
+        minTimeout: 10,
+        maxTimeout: 100,
+        randomize: true,
+      },
+    })
+    try {
+      return await operation()
+    } finally {
+      await release()
+    }
   }
 
   async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -101,6 +146,15 @@ const parseDocument = (value: unknown): WatchStateDocument => {
 
 const cloneWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState =>
   structuredClone(watch)
+
+const syncParentDirectory = async (filePath: string): Promise<void> => {
+  const handle = await open(dirname(filePath), 'r')
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
