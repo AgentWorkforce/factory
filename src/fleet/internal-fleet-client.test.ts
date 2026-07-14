@@ -455,6 +455,123 @@ describe('InternalFleetClient', () => {
     }
   })
 
+  it('retries a release rejected as retryable (broker http_500 / internal reply dropped) and succeeds', async () => {
+    // Regression for factory#65: on cold-start dispatch completion the broker
+    // occasionally drops the release reply and answers http_500 with
+    // retryable: true. The transient failure must not reach the orchestrator's
+    // final release-failed warning — a bounded retry recovers a graceful release.
+    vi.useFakeTimers()
+    try {
+      class TransientRetryableReleaseHarnessDriverClient extends FakeHarnessDriverClient {
+        attempts = 0
+        override async release(name: string, reason?: string): Promise<{ name: string }> {
+          this.attempts += 1
+          this.released.push({ name, reason })
+          if (this.attempts < 3) {
+            throw Object.assign(new Error('internal reply dropped'), {
+              name: 'HarnessDriverProtocolError',
+              code: 'http_500',
+              status: 500,
+              retryable: true,
+              data: { error: 'internal reply dropped', success: false },
+            })
+          }
+          return { name }
+        }
+      }
+      const harness = new TransientRetryableReleaseHarnessDriverClient()
+      const logger = { warn: vi.fn(), debug: vi.fn(), info: vi.fn() }
+      const fleet = new InternalFleetClient({ client: harness, logger })
+      await fleet.spawn({ name: 'ar-19-review', capability: 'spawn:codex' })
+
+      const released = fleet.release('ar-19-review', 'issue-done')
+      // Two failed attempts, so two backoff sleeps (250ms, then 500ms).
+      await vi.advanceTimersByTimeAsync(250 + 500)
+      await released
+
+      expect(harness.attempts).toBe(3)
+      expect(harness.released).toHaveLength(3)
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory-sdk] release rejected as retryable; retrying',
+        expect.objectContaining({ name: 'ar-19-review', attempt: 1, maxAttempts: 3 }),
+      )
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory-sdk] release rejected as retryable; retrying',
+        expect.objectContaining({ name: 'ar-19-review', attempt: 2, maxAttempts: 3 }),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('gives up after bounded retries when the broker keeps dropping the release reply', async () => {
+    vi.useFakeTimers()
+    try {
+      class AlwaysRetryableReleaseHarnessDriverClient extends FakeHarnessDriverClient {
+        attempts = 0
+        override async release(name: string, reason?: string): Promise<{ name: string }> {
+          this.attempts += 1
+          this.released.push({ name, reason })
+          throw Object.assign(new Error('internal reply dropped'), {
+            name: 'HarnessDriverProtocolError',
+            code: 'http_500',
+            status: 500,
+            retryable: true,
+            data: { error: 'internal reply dropped', success: false },
+          })
+        }
+      }
+      const harness = new AlwaysRetryableReleaseHarnessDriverClient()
+      const fleet = new InternalFleetClient({
+        client: harness,
+        ownsBroker: true,
+        ownedBrokerAgentExitTimeoutMs: 1_000,
+      })
+      await fleet.spawn({ name: 'ar-19-review', capability: 'spawn:codex' })
+
+      const released = fleet.release('ar-19-review', 'issue-done')
+      // Observe the rejection before advancing through the final attempt so
+      // Vitest never sees an intermediate unhandled rejection.
+      const releaseRejected = expect(released).rejects.toThrow('internal reply dropped')
+      // Two backoffs (250ms + 500ms) between three attempts.
+      await vi.advanceTimersByTimeAsync(250 + 500)
+      await releaseRejected
+      expect(harness.attempts).toBe(3)
+
+      // The failed release is still terminal for lifecycle bookkeeping — a
+      // subsequent dispose() of the owned broker must not wait on this agent.
+      const disposed = fleet.dispose()
+      await Promise.resolve()
+      expect(harness.shutdownCalls).toBe(1)
+      await disposed
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not retry release when the broker rejects with a non-retryable error', async () => {
+    class NonRetryableReleaseHarnessDriverClient extends FakeHarnessDriverClient {
+      attempts = 0
+      override async release(name: string, reason?: string): Promise<{ name: string }> {
+        this.attempts += 1
+        this.released.push({ name, reason })
+        throw Object.assign(new Error(`agent '${name}' already exists`), {
+          name: 'HarnessDriverProtocolError',
+          code: 'http_500',
+          status: 500,
+          retryable: false,
+          data: { error: `agent '${name}' already exists`, success: false },
+        })
+      }
+    }
+    const harness = new NonRetryableReleaseHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+    await fleet.spawn({ name: 'ar-19-review', capability: 'spawn:codex' })
+
+    await expect(fleet.release('ar-19-review', 'issue-done')).rejects.toThrow("agent 'ar-19-review' already exists")
+    expect(harness.attempts).toBe(1)
+  })
+
   it('times out waiting for a hung dispatched agent before shutting down an owned broker', async () => {
     vi.useFakeTimers()
     try {
