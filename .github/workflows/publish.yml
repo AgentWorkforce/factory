@@ -77,8 +77,10 @@ jobs:
           echo "@agent-relay/factory@$V: unpublished — OK"
 
       # npm >= 11.5.1 for the OIDC trusted-publisher (provenance) flow.
-      - name: Install latest npm
-        run: npm install -g npm@latest
+      - name: Update npm for OIDC support
+        # npm 12 requires Node >=22.22.2, while this workflow uses Node 22.14.0.
+        # npm 11 supports trusted publishing and remains compatible with Node 22.14.
+        run: npm install -g npm@11.18.0
 
       # No NPM_TOKEN: relies on npm OIDC trusted-publisher. Register this
       # repo/workflow as a trusted publisher for @agent-relay/factory on
