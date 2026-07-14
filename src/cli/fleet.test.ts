@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '../index'
+import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -902,6 +903,7 @@ describe('fleet CLI runtime', () => {
         acceptableWorkspaceIds: undefined,
       })
       expect(createFactory).toHaveBeenCalledTimes(1)
+      expect(createFactory.mock.calls[0]?.[1].stateStore).toBeInstanceOf(FileStateStore)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
       expect(factory.runLoop).not.toHaveBeenCalled()
       expect(waitForStopSignal).toHaveBeenCalledTimes(1)

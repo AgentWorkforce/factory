@@ -18,6 +18,28 @@ export type DispatchAttemptState = {
   backoffUntilMs: number
 }
 
+export type GithubIssueCommentWatchPending = {
+  correlationId: string
+  kind: 'triage' | 'agent-question'
+  authorizedAuthor: string
+  decision?: TriageDecision
+  claimedByCommentId?: string
+}
+
+export type GithubIssueCommentWatchState = {
+  issue: IssueRef
+  source: {
+    owner: string
+    repo: string
+    number: number
+    url: string
+  }
+  pending: GithubIssueCommentWatchPending[]
+  sinceCommentId?: string
+  lastSeenCommentId?: string
+  processedCommentIds?: string[]
+}
+
 export interface BatchSnapshot {
   readonly size: number
   readonly inFlight: InFlightIssue[]
@@ -57,6 +79,10 @@ export interface StateStore {
   getSlackThread(workspaceId: string, issueKey: string): Promise<string | undefined>
   clearSlackThread(workspaceId: string, issueKey: string): Promise<void>
   clearSlackThreads(workspaceId: string): Promise<void>
+
+  setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
+  listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>
+  clearGithubIssueCommentWatch(workspaceId: string, key: string): Promise<void>
 
   seenAgentQuestion(workspaceId: string, key: string): Promise<boolean>
   markAgentQuestion(workspaceId: string, key: string): Promise<void>
