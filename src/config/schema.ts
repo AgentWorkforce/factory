@@ -250,6 +250,7 @@ function normalizeFactoryConfig(cfg: z.infer<typeof FactoryConfigObjectSchema>) 
       registryPath,
     },
     repos: {
+      ...(cfg.repos.org !== undefined ? { org: cfg.repos.org } : {}),
       byLabel: resolved.byLabel,
       byProject: resolved.byProject,
       keywordRules: resolved.keywordRules,

@@ -1,6 +1,9 @@
 export type {
   ChangeEvent,
   EventPage,
+  GithubConnectionWrite,
+  GithubPublishPullRequestInput,
+  GithubPublishPullRequestResult,
   MountClient,
   ProviderSyncStatus,
   SubscribeOptions,

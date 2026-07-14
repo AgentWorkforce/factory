@@ -1,10 +1,7 @@
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-
 import { containsIssueKey } from '../issue-key-match'
-import type { GhRunner } from './merge-gate'
+import type { GithubConnectionWrite } from '../ports'
+import { defaultGhRunner, type GhRunner } from './merge-gate'
 
-const execFileAsync = promisify(execFile)
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 
 export interface CloseProbePrInput {
@@ -12,6 +9,7 @@ export interface CloseProbePrInput {
   prNumber: number
   expectedIssueKey: string
   requireTitleMarker?: boolean
+  githubWrite?: GithubConnectionWrite
   runner?: GhRunner
 }
 
@@ -22,6 +20,10 @@ export interface CloseProbePrResult {
 }
 
 export async function closeProbePr(input: CloseProbePrInput): Promise<CloseProbePrResult> {
+  const githubWrite = input.githubWrite
+  if (!githubWrite) {
+    throw new Error('GitHub write path not available on this mount — connect GitHub to your workspace')
+  }
   const run = input.runner ?? defaultGhRunner
   const before = await viewPr(run, input)
   const beforeState = assertClosableProbe(before, input)
@@ -29,7 +31,7 @@ export async function closeProbePr(input: CloseProbePrInput): Promise<CloseProbe
     return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
   }
 
-  await run(['pr', 'close', String(input.prNumber), '--repo', input.repo])
+  await githubWrite.closePullRequest({ repo: input.repo, number: input.prNumber })
 
   const after = await viewPr(run, input)
   const afterState = stringValue(after.state)
@@ -41,6 +43,8 @@ export async function closeProbePr(input: CloseProbePrInput): Promise<CloseProbe
 }
 
 const viewPr = async (run: GhRunner, input: CloseProbePrInput): Promise<Record<string, unknown>> => {
+  // TODO(issue-52): replace this transitional gh read with the mounted PR meta
+  // once every supported adapter shape exposes the probe guard fields.
   const result = await run([
     'pr',
     'view',
@@ -88,9 +92,4 @@ const parseGhJson = (stdout: string): Record<string, unknown> => {
   return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
     ? parsed as Record<string, unknown>
     : {}
-}
-
-const defaultGhRunner: GhRunner = async (args) => {
-  const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
-  return { stdout, stderr }
 }

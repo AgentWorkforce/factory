@@ -2,6 +2,7 @@ import type {
   ChangeEvent,
   EventPage,
   FleetClient,
+  GithubConnectionWrite,
   AgentMessage,
   MountClient,
   RosterEntry,
@@ -19,6 +20,7 @@ type AgentMessageListener = (message: AgentMessage) => void
 
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
+  githubWrite?: GithubConnectionWrite
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []
@@ -31,7 +33,8 @@ export class FakeMountClient implements MountClient {
   #absentSubRoots = new Set<string>()
   #confirmations = new Map<string, 'acked' | 'pending' | 'failed' | 'timeout'>()
 
-  constructor(initialFiles: Record<string, unknown> = {}) {
+  constructor(initialFiles: Record<string, unknown> = {}, githubWrite?: GithubConnectionWrite) {
+    this.githubWrite = githubWrite
     for (const [path, content] of Object.entries(initialFiles)) {
       this.files.set(path, { content })
     }

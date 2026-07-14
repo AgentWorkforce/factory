@@ -162,6 +162,7 @@ describe('FactoryConfigSchema', () => {
     // subscription.labels defaults to the repo names
     expect(parsed.subscription.labels).toEqual(['pear', 'cloud', 'agentswarm'])
     expect(parsed.repos.default).toBe('pear')
+    expect(parsed.repos.org).toBe('AgentWorkforce')
   })
 
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {

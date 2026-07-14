@@ -28,8 +28,35 @@ export interface ProviderSyncStatus {
   lagSeconds?: number
 }
 
+export interface GithubPublishPullRequestInput {
+  repo: string
+  clonePath: string
+  baseRef: string
+  title: string
+  body: string
+}
+
+export interface GithubPublishPullRequestResult {
+  repo: string
+  number: number
+  url: string
+  headRef: string
+  headSha?: string
+}
+
+/**
+ * GitHub mutations that require the authenticated workspace connection. The
+ * concrete mount translates these operations into file-native Relayfile
+ * writeback drafts interpreted by the server-side GitHub adapter.
+ */
+export interface GithubConnectionWrite {
+  publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
+  closePullRequest(input: { repo: string; number: number }): Promise<void>
+}
+
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
+  readonly githubWrite?: GithubConnectionWrite
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>

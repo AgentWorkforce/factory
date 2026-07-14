@@ -55,7 +55,12 @@ From a source checkout instead of an npm install, run
 
 ## Quick start
 
-1. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
+1. **Connect GitHub to your relay workspace** with push access for the target
+   repositories. Factory uses that workspace connection to publish branches and
+   open pull requests; a local `gh` installation or `gh auth login` is not a
+   prerequisite.
+
+2. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
    repo route are required:
 
    ```json
@@ -80,14 +85,14 @@ From a source checkout instead of an npm install, run
    updates written back as GitHub comments and `factory:in-progress` /
    `factory:human-review` labels. No Linear mirror is created.
 
-2. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
+3. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
    but writes nothing and spawns no agents:
 
    ```bash
    factory run-once --config ./factory.config.json --dry-run
    ```
 
-3. **Let it work for real:**
+4. **Let it work for real:**
 
    ```bash
    # One discovery→dispatch cycle, then exit.
@@ -201,4 +206,4 @@ worked example (including offline fixture mode).
 - The published `dist/` is plain ESM, runnable directly by Node (`node bin/factory.mjs`)
   and importable by ESM consumers.
 - For production operation (the live-daemon + reaper backstop model, heartbeats,
-  and `gh`-auth preconditions), see the operations notes alongside the config schema.
+  and connected-workspace prerequisites), see the operations notes alongside the config schema.

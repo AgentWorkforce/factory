@@ -58,6 +58,8 @@ export interface GhCliGithubWritebackConfig {
 
 /**
  * GitHub issue lifecycle writeback using authenticated `gh` primitives.
+ * TODO(issue-52): migrate issue labels/comments to the mounted GitHub
+ * connection after the PR publication path has proven stable.
  *
  * Labels are created idempotently before use so a newly-onboarded repository
  * does not need factory status labels to be provisioned by hand.

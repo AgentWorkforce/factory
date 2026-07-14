@@ -22,13 +22,14 @@ import {
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
 
-import type { EventPage, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
+import type { EventPage, GithubConnectionWrite, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
 import {
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
   type TokenProvider,
   type WorkspaceEventClientSource,
 } from '../subscriptions'
+import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
@@ -37,6 +38,7 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/states/**',
   'relayfile:fs:write:/linear/issues/**',
   'relayfile:fs:read:/github/repos/**',
+  'relayfile:fs:write:/github/repos/**',
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
@@ -133,6 +135,7 @@ export type RelayFileClientLike =
 export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
+  readonly githubWrite: GithubConnectionWrite
 
   readonly #client: RelayFileClientLike
   readonly #tokenProvider: TokenProvider
@@ -154,6 +157,7 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#eventClient = config.eventClient
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
+    this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
   }
 
   setDefaultAllowedDraftPredicate(
@@ -531,10 +535,11 @@ const arrayRecords = (value: unknown): Array<Record<string, unknown>> =>
 const isProviderWritebackPath = (path: string): boolean =>
   path.startsWith('/linear/issues/') ||
   path.startsWith('/linear/comments/') ||
+  path.startsWith('/github/repos/') ||
   /^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)
 
 const isProviderPath = (path: string): boolean =>
-  path.startsWith('/linear/') || path.startsWith('/slack/')
+  path.startsWith('/linear/') || path.startsWith('/github/') || path.startsWith('/slack/')
 
 const providerContentLooksLinked = (content: unknown): boolean => {
   const record = content !== null && typeof content === 'object' && !Array.isArray(content)

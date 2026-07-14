@@ -156,6 +156,8 @@ function addSetup(wf: Wf, o: FactoryWorkflowOptions): void {
       'set -e',
       // Already in the isolated worktree on this branch (setupWorktree did the checkout).
       `git rev-parse --abbrev-ref HEAD | grep -qx "${o.branch}" || { echo "not on ${o.branch}"; exit 1; }`,
+      // TODO(issue-52): this archived factory-build workflow still uses its
+      // local gh transport; it is not part of the shipped Factory CLI path.
       'gh auth status >/dev/null 2>&1 || { echo "MISSING_ENV_VAR: gh auth (run: gh auth login)"; exit 1; }',
       `mkdir -p ${dir}`,
       'echo PREFLIGHT_OK',
@@ -323,7 +325,7 @@ function addShip(wf: Wf, o: FactoryWorkflowOptions): void {
     failOnError: true,
     command: `git push -u origin ${o.branch} 2>&1 | tail -20`,
   });
-  // Local transport uses gh (broker runs on the user's machine; gh is authed in
+  // TODO(issue-52): Local transport uses gh (broker runs on the user's machine; gh is authed in
   // preflight). For cloud execution, swap this for createGitHubStep({action:'createPR'}).
   // `no-agent-relay-review` label disables the autonomous pr-reviewer bot that
   // otherwise pushes unreviewed commits to held draft PRs.
