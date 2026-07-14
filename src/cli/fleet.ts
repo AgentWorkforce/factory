@@ -108,12 +108,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         ? undefined
         : (deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
             workspaceId: (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId,
+            isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
           })).githubWrite
       const result = await (deps.probeCloser ?? closeProbePr)({
         repo: command.repo,
         prNumber: command.prNumber,
         expectedIssueKey: command.issue,
         ...(githubWrite ? { githubWrite } : {}),
+        ...(deps.probePrGhRunner ? { runner: deps.probePrGhRunner } : {}),
       })
       writeJson(out, result)
       return 0
@@ -685,7 +687,7 @@ async function isAllowedFactoryDraft(
     return true
   }
 
-  if (isFactoryGithubWritebackPath(path)) {
+  if (isAllowedFactoryGithubDraft(path, opts)) {
     return true
   }
 
@@ -694,6 +696,11 @@ async function isAllowedFactoryDraft(
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/refs%2Fheads%2F[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+
+const isAllowedFactoryGithubDraft = (
+  path: string,
+  opts: { guarded?: boolean } | undefined,
+): boolean => opts?.guarded === true && isFactoryGithubWritebackPath(path)
 
 const scopeIssueFromDraftContent = (content: unknown) => ({
   title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',

@@ -1,11 +1,7 @@
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-
 import { containsIssueKey } from '../issue-key-match'
 import type { GithubConnectionWrite } from '../ports'
-import type { GhRunner } from './merge-gate'
+import { defaultGhRunner, type GhRunner } from './merge-gate'
 
-const execFileAsync = promisify(execFile)
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 
 export interface CloseProbePrInput {
@@ -96,9 +92,4 @@ const parseGhJson = (stdout: string): Record<string, unknown> => {
   return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
     ? parsed as Record<string, unknown>
     : {}
-}
-
-const defaultGhRunner: GhRunner = async (args) => {
-  const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
-  return { stdout, stderr }
 }

@@ -719,6 +719,55 @@ describe('fleet CLI runtime', () => {
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
   })
 
+  it('configures guarded GitHub writeback when close-probe creates a cloud mount', async () => {
+    const output = buffer()
+    const closes: Array<{ repo: string; number: number }> = []
+    const cloudMountFromConfig = vi.fn(async (opts) => {
+      const mount = new FakeMountClient()
+      mount.githubWrite = {
+        publishPullRequest: async () => { throw new Error('unexpected publish') },
+        closePullRequest: async (input) => {
+          const path = `/github/repos/${input.repo}/pulls/${input.number}/close.json`
+          const allowed = await opts?.isAllowedDraft?.(path, {}, { guarded: true })
+          if (!allowed) throw new Error('GitHub close draft rejected by mount predicate')
+          closes.push(input)
+        },
+      }
+      return mount
+    })
+    let readCount = 0
+
+    const code = await runFleetCli([
+      'close-probe',
+      '42',
+      '--repo',
+      'AgentWorkforce/pear',
+      '--issue',
+      'AR-77',
+    ], {
+      stdout: output,
+      stderr: buffer(),
+      resolveWorkspace: async () => ({ workspaceId: 'rw_test' }),
+      cloudMountFromConfig,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          state: readCount++ === 0 ? 'OPEN' : 'CLOSED',
+          headRefName: 'factory-e2e/ar-77-probe',
+          title: '[factory-e2e] AR-77 probe',
+          body: 'Closes AR-77',
+        }),
+      }),
+    })
+
+    expect(code).toBe(0)
+    expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'rw_test',
+      isAllowedDraft: expect.any(Function),
+    }))
+    expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 42 }])
+    expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
+  })
+
   it('runs factory loop through the bounded runner and emits a heartbeat-backed status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-loop-'))
     try {
