@@ -82,7 +82,9 @@ const selfNode: RosterEntry['nodes'][number] = {
 const PID_RESOLVE_ATTEMPTS = 3
 const PID_RESOLVE_BACKOFF_MS = 75
 const READY_RESEND_DELAY_MS = 1_000
-const OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 60 * 60 * 1_000
+// One-shot commands normally finish well inside this guard. Keep it bounded so
+// a hung task_exit worker cannot hold a cold-started broker open indefinitely.
+const OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 30 * 60 * 1_000
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
@@ -107,12 +109,14 @@ export class InternalFleetClient implements FleetClient {
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
   readonly #exitedAgentNames = new Set<string>()
+  readonly #agentExitSequences = new Map<string, number>()
   readonly #readyAgentNames = new Set<string>()
   readonly #activeSpawnedAgentNames = new Set<string>()
   readonly #activeAgentsDrainedListeners = new Set<() => void>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
+  #agentExitSequence = 0
   #subscribed = false
   #disposed = false
 
@@ -148,7 +152,7 @@ export class InternalFleetClient implements FleetClient {
       spawnMode: 'task_exit',
       exitAfterTask: true,
     })
-    this.#trackAgentStart(input.name)
+    const exitSequenceAtSpawnStart = this.#trackAgentStart(input.name)
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -156,7 +160,7 @@ export class InternalFleetClient implements FleetClient {
       this.#trackAgentExit(input.name)
       throw error
     }
-    this.#reconcileTrackedAgentName(input.name, handle.name)
+    this.#reconcileTrackedAgentName(input.name, handle.name, exitSequenceAtSpawnStart)
     // A fresh broker's event stream can miss the first worker_ready edge while
     // it is still connecting. The successful spawn response is the broker's
     // authoritative registration signal, so feed it through the same bounded
@@ -179,7 +183,7 @@ export class InternalFleetClient implements FleetClient {
       continueFrom: input.sessionRef,
     })
     const requestedName = input.name ?? input.sessionRef
-    this.#trackAgentStart(requestedName)
+    const exitSequenceAtSpawnStart = this.#trackAgentStart(requestedName)
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -187,7 +191,7 @@ export class InternalFleetClient implements FleetClient {
       this.#trackAgentExit(requestedName)
       throw error
     }
-    this.#reconcileTrackedAgentName(requestedName, handle.name)
+    this.#reconcileTrackedAgentName(requestedName, handle.name, exitSequenceAtSpawnStart)
 
     return { ...spawnResultFrom(handle), sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
   }
@@ -215,9 +219,12 @@ export class InternalFleetClient implements FleetClient {
   async release(name: string, reason?: string): Promise<void> {
     try {
       await this.#client.release(name, reason)
-      this.#trackAgentExit(name)
     } finally {
       this.#readyAgentNames.delete(name)
+      // An explicit release attempt is terminal for this client's lifecycle
+      // bookkeeping even if the broker reports an error. Factory.stop() catches
+      // that error and dispose() must not then wait for the full agent timeout.
+      this.#trackAgentExit(name)
     }
   }
 
@@ -640,8 +647,6 @@ export class InternalFleetClient implements FleetClient {
   }
 
   #emitAgentExit(name: string, reason: string | undefined, identity: EventIdentity): void {
-    this.#trackAgentExit(name)
-
     if (this.#rememberEvent(identity)) {
       return
     }
@@ -649,6 +654,11 @@ export class InternalFleetClient implements FleetClient {
     if (this.#rememberAgentExit(name)) {
       return
     }
+
+    // Deduplicate before draining the tracked lifetime. In particular, an
+    // exact replay of an old exit must not finish a newly resumed same-name
+    // agent after #trackAgentStart() clears the per-name exit latch.
+    this.#trackAgentExit(name)
 
     for (const listener of this.#agentExitListeners) {
       listener(name, reason)
@@ -668,6 +678,8 @@ export class InternalFleetClient implements FleetClient {
     }
 
     this.#exitedAgentNames.add(name)
+    this.#agentExitSequence += 1
+    this.#agentExitSequences.set(name, this.#agentExitSequence)
     return false
   }
 
@@ -675,16 +687,23 @@ export class InternalFleetClient implements FleetClient {
     this.#exitedAgentNames.delete(name)
   }
 
-  #trackAgentStart(name: string): void {
+  #trackAgentStart(name: string): number {
+    const exitSequenceAtStart = this.#agentExitSequence
     this.#clearAgentExitLatch(name)
     this.#activeSpawnedAgentNames.add(name)
+    return exitSequenceAtStart
   }
 
-  #reconcileTrackedAgentName(requestedName: string, actualName: string): void {
+  #reconcileTrackedAgentName(requestedName: string, actualName: string, exitSequenceAtSpawnStart: number): void {
     if (requestedName === actualName) return
 
     this.#activeSpawnedAgentNames.delete(requestedName)
-    if (!this.#exitedAgentNames.has(actualName)) {
+    const actualExitSequence = this.#agentExitSequences.get(actualName) ?? 0
+    const exitedDuringSpawn = this.#exitedAgentNames.has(actualName) && actualExitSequence > exitSequenceAtSpawnStart
+    if (!exitedDuringSpawn) {
+      // An exit stamp at or before the spawn boundary belongs to an older
+      // lifetime of the broker-returned name and must not suppress tracking.
+      this.#clearAgentExitLatch(actualName)
       this.#activeSpawnedAgentNames.add(actualName)
     }
     this.#notifyIfActiveAgentsDrained()
@@ -704,6 +723,15 @@ export class InternalFleetClient implements FleetClient {
 
   async #waitForSpawnedAgentsToExit(): Promise<void> {
     if (this.#activeSpawnedAgentNames.size === 0) return
+
+    this.#logger?.info?.(
+      '[factory-sdk] waiting for spawned agents to exit before shutting down the owned relay broker',
+      {
+        agents: [...this.#activeSpawnedAgentNames].sort(),
+        timeoutMs: this.#ownedBrokerAgentExitTimeoutMs,
+        remainingCount: this.#activeSpawnedAgentNames.size,
+      },
+    )
 
     const timedOut = await new Promise<boolean>((resolve) => {
       let settled = false
