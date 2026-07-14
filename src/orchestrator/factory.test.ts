@@ -65,6 +65,8 @@ const githubIssuePath = (owner: string, repo: string, number: number) => `/githu
 const githubIssueCompactPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}__${repo}/issues/by-id/${number}.json`
 const githubIssueNestedMetaPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}/${repo}/issues/${number}/meta.json`
 const githubIssueCompactNestedMetaPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}__${repo}/issues/${number}/meta.json`
+const githubIssueCommentPath = (owner: string, repo: string, number: number, commentId: number) =>
+  `/github/repos/${owner}/${repo}/issues/${number}/comments/${commentId}/meta.json`
 const capturedReadyCanaryPath = '/linear/issues/AR-133__dac27fce-e8de-4910-bbf6-98ad436df3dd.json'
 const capturedStaleDoneCanonicalPath = '/linear/issues/AR-173__40c7e780-59ad-47ee-8809-3a9b8434d8fb.json'
 const capturedStaleReadyAliasPath = '/linear/issues/by-state/ready-for-agent/AR-173.json'
@@ -136,6 +138,15 @@ const githubIssueFile = (
     },
   }
 }
+
+const githubIssueCommentFile = (id: number, body: string, author = 'human') => ({
+  id,
+  body,
+  author: { login: author },
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  reactions: { total_count: 0 },
+})
 
 const prFile = (
   number: number,
@@ -278,6 +289,15 @@ class SlackStillEscalatingTriage extends EscalatingTriage {
       })
     }
     return super.triage(issue)
+  }
+}
+
+class GithubClarifyingTriage extends EscalatingTriage {
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    const decision = await super.triage(issue)
+    return issue.description.includes('Human clarification from GitHub:')
+      ? { ...decision, thin: false, confidence: 'high' }
+      : decision
   }
 }
 
@@ -7221,6 +7241,91 @@ describe('FactoryLoop', () => {
     )).toHaveLength(1)
   })
 
+  it('posts GitHub-native triage escalation to the source issue and dispatches after a human comment', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 90)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(90, { labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new GithubClarifyingTriage({ rationale: 'GitHub issue needs acceptance details.' }),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]).toEqual({
+      key: '90',
+      body: expect.stringContaining('<!-- factory-escalation:triage -->'),
+    })
+    expect(githubWriteback.comments[0]?.body).toContain('Reply to this issue with the missing details.')
+    expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
+
+    const commentPath = githubIssueCommentPath('AgentWorkforce', 'pear', 90, 7001)
+    await mount.writeFile(commentPath, githubIssueCommentFile(
+      7001,
+      'Use the existing retry helper, preserve idempotency, and cover duplicate delivery with a regression test.',
+    ))
+    mount.emit(changeEvent(commentPath, 'github-human-clarification-90'))
+
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-90-impl-pear', 'ar-90-review'])
+    expect(fleet.inputs).toContainEqual({
+      name: 'ar-90-impl-pear',
+      data: '<integration-event source="github" issue="90">\nHuman reply on the source GitHub issue:\nUse the existing retry helper, preserve idempotency, and cover duplicate delivery with a regression test.\n</integration-event>\r',
+    })
+    expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBe(1)
+    await factory.stop()
+  })
+
+  it('keeps Slack as the triage escalation target when configured', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(89)]: issueFile(89) })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    expect(githubWriteback.comments).toEqual([])
+    expect(factory.status().counters.triageEscalationsPostedToGithub).toBeUndefined()
+  })
+
+  it('logs an error when triage escalation has neither Slack nor a GitHub source write path', async () => {
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount: new CloudWritebackFakeMountClient({ [issuePath(88)]: issueFile(88) }),
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      logger: {
+        error: (...args: unknown[]) => errors.push(args),
+        warn: () => undefined,
+      },
+    })
+
+    await factory.runOnce()
+
+    expect(errors).toContainEqual([
+      '[factory] triage escalation has no configured write path',
+      expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-88' }),
+        slackConfigured: false,
+        githubSource: false,
+      }),
+    ])
+    expect(factory.status().counters.triageEscalationsUnavailable).toBe(1)
+  })
+
   it('posts low-confidence and thin triage escalation to Slack with reason and question', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(20)]: issueFile(20) })
     const fleet = new FakeFleetClient()
@@ -7493,13 +7598,59 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.agentQuestionsPostedToSlack).toBeUndefined()
   })
 
-  it('treats agent questions as no-ops when Slack is unconfigured without regressing dispatch', async () => {
+  it('mirrors a GitHub-sourced agent clarification to the issue and routes the human reply back', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 91)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(91, { labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    fleet.emitAgentMessage({
+      from: 'ar-91-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input]\nIssue: 91\nQuestion: Which retry helper should the babysitter path use?',
+      eventId: 'github-agent-question-91',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionsPostedToGithub).toBe(1))
+
+    const questionComment = githubWriteback.comments.find((comment) =>
+      comment.body.includes('<!-- factory-escalation:agent-question -->'),
+    )
+    expect(questionComment?.body).toContain('Question: Which retry helper should the babysitter path use?')
+
+    const commentPath = githubIssueCommentPath('AgentWorkforce', 'pear', 91, 7002)
+    await mount.writeFile(commentPath, githubIssueCommentFile(7002, 'Use the shared helper in factory.ts.'))
+    mount.emit(changeEvent(commentPath, 'github-human-answer-91'))
+
+    await vi.waitFor(() => expect(factory.status().counters.githubAnswersInjected).toBe(1))
+    expect(fleet.inputs).toContainEqual({
+      name: 'ar-91-impl-pear',
+      data: '<integration-event source="github" issue="91">\nHuman reply on the source GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
+    })
+    await factory.stop()
+  })
+
+  it('logs loudly when an agent question has no Slack or GitHub write path without regressing dispatch', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(38)]: issueFile(38) })
     const fleet = new FakeFleetClient()
+    const errors: unknown[][] = []
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
+      logger: {
+        error: (...args: unknown[]) => errors.push(args),
+        warn: () => undefined,
+      },
     })
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(38), issueFile(38))))
@@ -7515,7 +7666,11 @@ describe('FactoryLoop', () => {
     expect(result.agents.map((agent) => agent.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
     expect(slackReplyWrites(mount)).toEqual([])
-    expect(factory.status().counters.agentQuestionsSkippedNoSlack).toBe(1)
+    expect(factory.status().counters.agentQuestionsUnavailable).toBe(1)
+    expect(errors).toContainEqual([
+      '[factory] agent question has no configured escalation write path',
+      expect.objectContaining({ issue: expect.objectContaining({ key: 'AR-38' }) }),
+    ])
   })
 
   it('treats agent questions as no-ops while Slack sync is degraded without regressing dispatch', async () => {
