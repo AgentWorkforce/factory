@@ -13,6 +13,7 @@ import {
   createRelayflowPolicyRegistry,
   isDispatchableIssue,
   isInFactoryScope,
+  parseGithubFactoryIssue,
   parseLinearIssue,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
@@ -230,6 +231,12 @@ class RecordingGithubWriteback implements GithubWriteback {
   }
 }
 
+class FailingGithubCommentWriteback extends RecordingGithubWriteback {
+  override async postComment(): Promise<void> {
+    throw new Error('GitHub comment writeback unavailable')
+  }
+}
+
 class CountingTriage extends StaticTriage {
   count = 0
 
@@ -278,6 +285,21 @@ class SlackStillEscalatingTriage extends EscalatingTriage {
       })
     }
     return super.triage(issue)
+  }
+}
+
+class GithubClarifiedTriage extends EscalatingTriage {
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    const decision = await super.triage(issue)
+    if (issue.description.includes('Human clarification from GitHub:')) {
+      return {
+        ...decision,
+        thin: false,
+        confidence: 'high',
+        rationale: 'Human clarified the GitHub issue.',
+      }
+    }
+    return decision
   }
 }
 
@@ -7247,6 +7269,105 @@ describe('FactoryLoop', () => {
     expect(slack.roots).toEqual([])
   })
 
+  it('posts low-confidence and thin GitHub triage escalation to the source issue when Slack is unconfigured', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 55)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(55, { labels: ['factory'] }) })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage({ rationale: 'Issue lacks acceptance criteria.' }),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification before dispatching 55.')
+    expect(githubWriteback.comments[0]?.body).toContain('Reason: low-confidence triage and thin issue context: Issue lacks acceptance criteria.')
+    expect(githubWriteback.comments[0]?.body).toContain('Question: Factory matched AgentWorkforce/pear.')
+    expect(githubWriteback.comments[0]?.body).toMatch(/<!-- factory-escalation:factory-triage-/u)
+    expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
+    expect(factory.status().counters.errors).toBeUndefined()
+  })
+
+  it('prefers Slack over a GitHub issue comment for triage escalation when Slack is configured', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 56)
+    const mount = new CloudWritebackFakeMountClient({ [path]: githubIssueFile(56, { labels: ['factory'] }) })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    expect(githubWriteback.comments).toEqual([])
+    expect(factory.status().counters.triageEscalationsPostedToGithub).toBeUndefined()
+  })
+
+  it('logs and emits an observable error when GitHub triage escalation has no usable write path', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 57)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(57, { labels: ['factory'] }) })
+    const errors: unknown[][] = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      githubWriteback: new FailingGithubCommentWriteback(),
+      logger: {
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    await factory.runOnce()
+
+    expect(errors).toContainEqual([
+      '[factory] escalation delivery failed',
+      expect.objectContaining({
+        kind: 'triage',
+        correlationId: expect.stringMatching(/^factory-triage-/u),
+        reason: 'GitHub issue comment writeback failed',
+      }),
+    ])
+    expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
+    expect(factory.status().counters.errors).toBe(1)
+  })
+
+  it('dispatches a thin GitHub issue after a human replies to the clarification comment', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 58)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(58, { labels: ['factory'] }) })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new GithubClarifiedTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, githubIssueFile(58, { labels: ['factory'] }))))
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification')
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 58, 9001, {
+      body: 'Use the shared retry helper and add regression coverage.',
+      author: { login: 'human-maintainer' },
+    })
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-58-impl-pear', 'ar-58-review']))
+    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
+      name: 'ar-58-impl-pear',
+      data: '<integration-event source="github" issue="58">\nHuman reply on the GitHub issue:\nUse the shared retry helper and add regression coverage.\n</integration-event>\r',
+    }))
+    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBe(1)
+  })
+
   it('dispatches a matched agent to read a Slack triage answer even when factory still finds the issue thin', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(23)]: issueFile(23) })
     const fleet = new FakeFleetClient()
@@ -7470,6 +7591,81 @@ describe('FactoryLoop', () => {
     expect(fleet.messages).toHaveLength(2)
   })
 
+  it('posts a mid-task agent question to the source GitHub issue when Slack is unconfigured', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const issue = githubIssueFile(59, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    fleet.emitAgentMessage({
+      from: 'ar-59-impl-pear',
+      target: 'factory',
+      body: 'FACTORY_NEEDS_INPUT\nIssue: 59\nQuestion: Which retry helper should I use?',
+      eventId: 'github-agent-question-59',
+    })
+    await flush()
+    await flush()
+
+    expect(githubWriteback.comments.at(-1)?.body).toContain('59: ar-59-impl-pear needs input.')
+    expect(githubWriteback.comments.at(-1)?.body).toContain('Question: Which retry helper should I use?')
+    expect(githubWriteback.comments.at(-1)?.body).toMatch(/<!-- factory-escalation:factory-agent-question-/u)
+    expect(factory.status().counters.agentQuestionsPostedToGithub).toBe(1)
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9002, {
+      body: 'Use the shared helper in factory.ts.',
+      author: { login: 'maintainer' },
+    })
+    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
+      name: 'ar-59-impl-pear',
+      data: '<integration-event source="github" issue="59">\nHuman reply from @maintainer on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
+    }))
+    expect(factory.status().counters.githubAnswersInjected).toBe(1)
+  })
+
+  it('logs and emits an observable error when a GitHub agent question comment cannot be written', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 60)
+    const issue = githubIssueFile(60, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const errors: unknown[][] = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new FailingGithubCommentWriteback(),
+      logger: { error: (...args: unknown[]) => errors.push(args) },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    fleet.emitAgentMessage({
+      from: 'ar-60-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Should retries be bounded?',
+      eventId: 'github-agent-question-60',
+    })
+    await flush()
+    await flush()
+
+    expect(errors).toContainEqual([
+      '[factory] escalation delivery failed',
+      expect.objectContaining({
+        kind: 'agent-question',
+        correlationId: expect.stringMatching(/^factory-agent-question-/u),
+        reason: 'GitHub issue comment writeback failed',
+      }),
+    ])
+    expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
+    expect(factory.status().counters.errors).toBe(1)
+  })
+
   it('ignores marked agent questions that are not addressed to the factory', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(37)]: issueFile(37) })
     const fleet = new FakeFleetClient()
@@ -7493,13 +7689,15 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.agentQuestionsPostedToSlack).toBeUndefined()
   })
 
-  it('treats agent questions as no-ops when Slack is unconfigured without regressing dispatch', async () => {
+  it('logs loudly when an agent question has neither Slack nor a GitHub write path', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(38)]: issueFile(38) })
     const fleet = new FakeFleetClient()
+    const errors: unknown[][] = []
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
+      logger: { error: (...args: unknown[]) => errors.push(args) },
     })
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(38), issueFile(38))))
@@ -7515,7 +7713,15 @@ describe('FactoryLoop', () => {
     expect(result.agents.map((agent) => agent.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-38-impl-pear', 'ar-38-review'])
     expect(slackReplyWrites(mount)).toEqual([])
-    expect(factory.status().counters.agentQuestionsSkippedNoSlack).toBe(1)
+    expect(errors).toContainEqual([
+      '[factory] escalation delivery failed',
+      expect.objectContaining({
+        kind: 'agent-question',
+        correlationId: expect.stringMatching(/^factory-agent-question-/u),
+        reason: 'no Slack channel or stable GitHub issue write path is available',
+      }),
+    ])
+    expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
   })
 
   it('treats agent questions as no-ops while Slack sync is degraded without regressing dispatch', async () => {
@@ -8539,6 +8745,24 @@ const emitSlackReply = (
     },
   })
   mount.emit(changeEvent(path, id))
+}
+
+const emitGithubIssueComment = (
+  mount: FakeMountClient,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  commentId: number,
+  payload: Record<string, unknown>,
+): void => {
+  const path = `/github/repos/${owner}/${repo}/issues/${issueNumber}/comments/${commentId}/meta.json`
+  mount.files.set(path, {
+    content: {
+      id: commentId,
+      ...payload,
+    },
+  })
+  mount.emit(changeEvent(path, `github-comment-${commentId}`))
 }
 
 const isSlackRootWritePath = (path: string): boolean =>
