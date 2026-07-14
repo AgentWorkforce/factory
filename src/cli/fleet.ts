@@ -18,6 +18,7 @@ import {
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
   resolveFactoryStates,
+  stateResolutionFromIds,
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
@@ -166,10 +167,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         const mount = await buildMount(loaded, deps)
-        // Resolve the factory's Linear states (role <-> UUID, per team) from
-        // /linear/states by name, with config.stateIds as an explicit-UUID
-        // fallback. Nothing about state names/ids is hardcoded.
-        const stateResolution = await (deps.resolveStates ?? defaultResolveStates)(mount, loaded.config)
+        const issueSource = loaded.config.issueSource ??
+          (await mount.ensureSubRoot('/linear/issues', { timeoutMs: 90_000 }) === 'ready' ? 'linear' : 'github')
+        loaded.config.issueSource = issueSource
+        // GitHub lifecycle state is represented by labels, so a GitHub-only
+        // workspace must not attempt to resolve a nonexistent Linear catalog.
+        const stateResolution = issueSource === 'github'
+          ? stateResolutionFromIds({})
+          : await (deps.resolveStates ?? defaultResolveStates)(mount, loaded.config)
         const logger = streamLogger(err)
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
@@ -596,6 +601,18 @@ async function isAllowedFactoryDraft(
   config: FactoryConfig,
 ): Promise<boolean> {
   if (!opts?.guarded) return false
+
+  if (config.issueSource === 'github') {
+    if (/^\/github\/repos\/[^/]+\/[^/]+\/issues\/\d+\/comments\/factory-[^/]+\.json$/u.test(path)) {
+      return true
+    }
+    if (/^\/github\/repos\/[^/]+\/[^/]+\/issues\/\d+\.json$/u.test(path)) {
+      const labels = asRecord(content)?.labels
+      return Array.isArray(labels) && labels.some((label) =>
+        (typeof label === 'string' ? label : typeof asRecord(label)?.name === 'string' ? asRecord(label)?.name as string : undefined)
+          ?.toLowerCase() === config.safety.requireLabel.toLowerCase())
+    }
+  }
 
   // Comment writeback nested under its issue: /linear/issues/<ref>/comments/<draft>.json.
   // Scope-check the owning issue (the draft content is a comment, not an issue).

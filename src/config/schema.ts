@@ -146,6 +146,10 @@ const WorkspaceConfigObjectSchema = z.object({
   models: modelsSchema,
   slack: slackSchema,
   mergePolicy: z.enum(['never', 'on-green-with-review']).default('never'),
+  // The provider whose issues are the dispatch system-of-record. When omitted,
+  // the runtime keeps the historical Linear-first behavior when /linear/issues
+  // is mounted and falls back to GitHub only when Linear is unavailable.
+  issueSource: z.enum(['linear', 'github']).optional(),
   // Opt-in PR babysitter. When enabled, a sonnet agent is spawned once the
   // implementer's PR opens (webhook-driven, see the orchestrator) and shepherds
   // it — addressing review comments, resolving conflicts, and fixing CI — until

@@ -6,6 +6,7 @@ export {
   checkFactoryLoopLiveness,
   createFactory,
   FactoryLoop,
+  isDispatchableIssue,
   isRealLinearIssue,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,

@@ -39,6 +39,7 @@ describe('FactoryConfigSchema', () => {
       staleAfterMs: 10 * 60_000,
     })
     expect(parsed.mergePolicy).toBe('never')
+    expect(parsed.issueSource).toBeUndefined()
     // No hardcoded state defaults: omitted stateIds resolve to {} and are filled
     // at runtime from linear.states (by name) or explicit stateIds.
     expect(parsed.stateIds).toEqual({})
@@ -61,6 +62,15 @@ describe('FactoryConfigSchema', () => {
       requireTeamKey: 'AR',
     })
     expect(parsed.dryRun).toBe(false)
+  })
+
+  it('accepts an explicit GitHub issue source', () => {
+    const parsed = FactoryConfigSchema.parse({
+      issueSource: 'github',
+      repos: { default: 'AgentWorkforce/factory' },
+    })
+
+    expect(parsed.issueSource).toBe('github')
   })
 
   it('preserves explicit model overrides', () => {

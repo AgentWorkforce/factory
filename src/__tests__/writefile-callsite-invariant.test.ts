@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 const SDK_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const ALLOWED_WRITEBACK_CALLSITES = new Set([
+  'writeback/github.ts',
   'writeback/linear.ts',
   'writeback/slack.ts',
 ])

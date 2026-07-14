@@ -101,6 +101,7 @@ export {
   createFactory,
   FactoryLoop,
   issueKey,
+  isDispatchableIssue,
   isRealLinearIssue,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
@@ -120,12 +121,18 @@ export type {
   LlmTriageOptions,
 } from './triage'
 export {
+  GITHUB_HUMAN_REVIEW_LABEL,
+  GITHUB_IN_PROGRESS_LABEL,
+  githubCommentName,
   linearCommentName,
   MountGithubRead,
+  MountGithubWriteback,
   MountLinearWriteback,
   MountSlackWriteback,
 } from './writeback'
 export type {
+  GithubIssueWritebackState,
+  GithubWriteback,
   LinearCommentPayload,
   LinearCreateIssuePayload,
   LinearStateIds,

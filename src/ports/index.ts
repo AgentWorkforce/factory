@@ -20,6 +20,8 @@ export type {
 } from './fleet'
 export type {
   GithubRead,
+  GithubWriteback,
+  GithubIssueWritebackState,
   LinearWriteback,
   SlackWriteback,
 } from './writeback'

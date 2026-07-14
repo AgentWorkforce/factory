@@ -3,7 +3,16 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { createFactory, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import {
+  createFactory,
+  GITHUB_HUMAN_REVIEW_LABEL,
+  GITHUB_IN_PROGRESS_LABEL,
+  linearCommentName,
+  MountGithubRead,
+  MountGithubWriteback,
+  MountLinearWriteback,
+  MountSlackWriteback,
+} from '../index'
 import type { MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
@@ -747,6 +756,50 @@ describe('MountGithubRead', () => {
       author: 'factory-bot',
       filesChanged: ['src/writeback/github.ts'],
     })
+  })
+})
+
+describe('MountGithubWriteback', () => {
+  const githubIssue = (): LinearIssue => ({
+    uuid: 'github:agentworkforce/factory#48',
+    key: 'GH-48',
+    title: 'GitHub-native dispatch',
+    description: 'No Linear mirror.',
+    stateId: 'github:ready',
+    labels: ['factory', 'bug'],
+    path: '/github/repos/AgentWorkforce/factory/issues/48/meta.json',
+    raw: {
+      provider: 'github',
+      objectType: 'issue',
+      payload: {
+        number: 48,
+        url: 'https://github.com/AgentWorkforce/factory/issues/48',
+        repository: { name: 'factory', owner: { login: 'AgentWorkforce' } },
+      },
+    },
+  })
+
+  it('writes lifecycle labels and idempotent comments to canonical GitHub paths', async () => {
+    const mount = new FakeMountClient()
+    const github = MountGithubWriteback(mount)
+    const issue = githubIssue()
+
+    await github.postComment(issue, 'Factory dispatched GH-48')
+    await github.setState(issue, 'in-progress')
+    expect(mount.writes[0]?.path).toMatch(/^\/github\/repos\/AgentWorkforce\/factory\/issues\/48\/comments\/factory-[^/]+\.json$/u)
+    expect(mount.writes[1]).toEqual({
+      path: '/github/repos/AgentWorkforce/factory/issues/48.json',
+      content: { labels: ['factory', 'bug', GITHUB_IN_PROGRESS_LABEL], state: 'open' },
+    })
+
+    await github.setState(issue, 'human-review')
+    expect(mount.writes[2]?.content).toEqual({
+      labels: ['factory', 'bug', GITHUB_HUMAN_REVIEW_LABEL],
+      state: 'open',
+    })
+
+    await github.setState(issue, 'done')
+    expect(mount.writes[3]?.content).toEqual({ labels: ['factory', 'bug'], state: 'closed' })
   })
 })
 

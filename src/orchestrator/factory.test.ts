@@ -8252,3 +8252,66 @@ describe('changeEventPath (resource-less event tolerance)', () => {
     expect(changeEventPath({ resource: { path: 123 } } as unknown as ChangeEvent)).toBeUndefined()
   })
 })
+
+describe('FactoryLoop GitHub issue system-of-record', () => {
+  it('dispatches without Linear, writes GitHub lifecycle, and parks an open PR for human review', async () => {
+    const sourcePath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 48)
+    const mount = new FakeMountClient({
+      [sourcePath]: githubIssueFile(48, {
+        title: 'Ship GitHub-native issue dispatch',
+        labels: [{ name: 'factory' }],
+      }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/48.json': prFile(48, {
+        title: 'GH-48: GitHub-native issue dispatch',
+        head_ref: 'gh-48-github-native-dispatch',
+        state: 'open',
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    mount.setSubRoot('/github/repos', 'ready')
+    const fleet = new FakeFleetClient()
+    const linearCalls: string[] = []
+    const linear: LinearWriteback = {
+      async setState() { linearCalls.push('setState') },
+      async postComment() { linearCalls.push('postComment') },
+      async createIssue() { linearCalls.push('createIssue'); throw new Error('GitHub mode must not create Linear issues') },
+      async verify() { linearCalls.push('verify'); return false },
+    }
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict()])
+    const factory = createFactory(config({
+      terminalState: 'human-review',
+      mergePolicy: 'never',
+    }), {
+      mount,
+      fleet,
+      linear,
+      triage: new StaticTriage(),
+      mergeGate: gate,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toHaveLength(1)
+    expect(report.dispatched[0]?.issue).toMatchObject({ key: 'GH-48', path: sourcePath })
+    expect(linearCalls).toEqual([])
+    expect(mount.writes.some((write) => write.path.startsWith('/linear/'))).toBe(false)
+    expect(mount.writes).toContainEqual({
+      path: '/github/repos/AgentWorkforce/pear/issues/48.json',
+      content: { labels: ['factory', 'factory:in-progress'], state: 'open' },
+    })
+    expect(mount.writes.some((write) =>
+      /^\/github\/repos\/AgentWorkforce\/pear\/issues\/48\/comments\/factory-[^/]+\.json$/u.test(write.path) &&
+      String(record(write.content).body).includes('Factory dispatch for GH-48'))).toBe(true)
+
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(mount.writes).toContainEqual({
+      path: '/github/repos/AgentWorkforce/pear/issues/48.json',
+      content: { labels: ['factory', 'factory:human-review'], state: 'open' },
+    })
+    expect(gate.checks).toEqual([])
+    expect(gate.merges).toEqual([])
+    expect(factory.status().counters.humanReview).toBe(1)
+    expect(linearCalls).toEqual([])
+  })
+})
