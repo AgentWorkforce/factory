@@ -84,6 +84,15 @@ type AgentQuestion = {
   question: string
   eventId?: string
 }
+type GithubIssueComment = {
+  owner: string
+  repo: string
+  number: number
+  commentId: string
+  text: string
+  author?: string
+  raw: Record<string, unknown>
+}
 type GithubIssueSource = {
   owner: string
   repoName: string
@@ -138,6 +147,8 @@ const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 const AGENT_QUESTION_DEDUPE_LIMIT = 500
 const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
 const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
+const GITHUB_TRIAGE_ESCALATION_MARKER = '<!-- factory-escalation:triage -->'
+const GITHUB_AGENT_QUESTION_MARKER = '<!-- factory-escalation:agent-question -->'
 // The babysitter DMs `factory` with this marker once it believes the PR is
 // green; the orchestrator confirms readiness with one authoritative gh read
 // before transitioning the issue to Human Review.
@@ -214,6 +225,10 @@ export class FactoryLoop implements Factory {
   // same notice every cycle. Cleared once the issue dispatches successfully.
   readonly #labelDispatchFailures = new Map<string, string>()
   readonly #pendingSlackClarifications = new Map<string, string>()
+  readonly #pendingGithubClarifications = new Map<string, string>()
+  readonly #pendingGithubTriageEscalations = new Map<string, TriageDecision>()
+  readonly #pendingGithubAgentQuestions = new Set<string>()
+  readonly #seenGithubIssueComments = new Set<string>()
   readonly #postMergeDoneAdvances = new Set<string>()
   #slackDegraded = false
   #slackDegradedReason: string | undefined
@@ -440,6 +455,10 @@ export class FactoryLoop implements Factory {
       }
       if (isGithubPullFilePath(path)) {
         void this.#handlePrChange(path)
+        return
+      }
+      if (isGithubIssueCommentFilePath(path)) {
+        void this.#handleGithubIssueCommentChange(path)
         return
       }
       if (isGithubIssueFilePath(path)) {
@@ -798,7 +817,8 @@ export class FactoryLoop implements Factory {
       return { dispatchRelayflow: false }
     }
     const isPullPath = isGithubPullFilePath(path)
-    const isFactoryPath = isIssueFilePath(path) || isGithubIssueFilePath(path) || isPullPath
+    const isGithubCommentPath = isGithubIssueCommentFilePath(path)
+    const isFactoryPath = isIssueFilePath(path) || isGithubIssueFilePath(path) || isGithubCommentPath || isPullPath
     if (!isFactoryPath && !this.#relayflows) {
       return { dispatchRelayflow: false }
     }
@@ -845,6 +865,11 @@ export class FactoryLoop implements Factory {
 
     if (!isFactoryPath) {
       return { dispatchRelayflow: true }
+    }
+
+    if (isGithubCommentPath) {
+      this.#recordArrivalLatency(event)
+      return { path, dispatchRelayflow: true }
     }
 
     if (isGithubIssueFilePath(path)) {
@@ -939,6 +964,10 @@ export class FactoryLoop implements Factory {
     }
     if (isGithubIssueFilePath(path)) {
       await this.#handleGithubIssueChange(path, { dryRun: this.#config.dryRun })
+      return
+    }
+    if (isGithubIssueCommentFilePath(path)) {
+      await this.#handleGithubIssueCommentChange(path)
       return
     }
     await this.#handleChange(path, { requireRealIssue: true })
@@ -1404,7 +1433,7 @@ export class FactoryLoop implements Factory {
 
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
-      const replayedResult = await this.#escalateTriageToSlack(decision, escalationReason, dryRun)
+      const replayedResult = await this.#escalateTriage(decision, escalationReason, dryRun)
       this.#recordTriageEscalation(decision, escalationReason)
       return replayedResult ?? { issue: decision.issue, agents: [], dryRun }
     }
@@ -1508,6 +1537,7 @@ export class FactoryLoop implements Factory {
         await this.#sendImplementerTask(record)
         await this.#sendCriticalReviewerMessage(record)
         await this.#injectPendingSlackClarification(record)
+        await this.#injectPendingGithubClarification(record)
       }
       return result
     } catch (error) {
@@ -1613,7 +1643,7 @@ export class FactoryLoop implements Factory {
       const decision = await this.triageIssue(issue)
       const escalationReason = triageEscalationReason(decision)
       if (escalationReason) {
-        await this.#escalateTriageToSlack(decision, escalationReason, this.#config.dryRun)
+        await this.#escalateTriage(decision, escalationReason, this.#config.dryRun)
         this.#recordTriageEscalation(decision, escalationReason)
         return
       }
@@ -1860,6 +1890,163 @@ export class FactoryLoop implements Factory {
       this.#increment('githubIssueMirrorsCreated')
     } catch (error) {
       this.#logger.error?.('[factory] failed to ingest GitHub issue', error)
+    }
+  }
+
+  async #handleGithubIssueCommentChange(path: string): Promise<void> {
+    const parts = githubIssueCommentPathParts(path)
+    if (!parts) {
+      return
+    }
+
+    try {
+      const comment = await this.#readGithubIssueComment(path)
+      if (!comment || !comment.text.trim() || isFactoryGithubEscalationComment(comment.text)) {
+        return
+      }
+
+      const commentKey = `${parts.owner}/${parts.repo}#${parts.number}:${comment.commentId}:${stableHash(comment.text)}`
+      if (this.#seenGithubIssueComments.has(commentKey)) {
+        this.#increment('githubIssueCommentDuplicatesSuppressed')
+        return
+      }
+      rememberGithubIssueComment(this.#seenGithubIssueComments, commentKey)
+
+      const issueIdentity = githubIssueIdentityFromParts(parts)
+      const pendingTriage = this.#pendingGithubTriageEscalations.get(issueIdentity)
+      if (pendingTriage) {
+        // Remove the pending marker before dispatch writebacks begin. Their own
+        // GitHub comment webhooks can arrive concurrently and must never be
+        // mistaken for a second human clarification.
+        this.#pendingGithubTriageEscalations.delete(issueIdentity)
+        let resolved = false
+        try {
+          resolved = await this.#handleTriageEscalationGithubAnswer(
+            escalationWatchRecord(pendingTriage),
+            comment.text.trim(),
+          )
+        } finally {
+          if (!resolved) {
+            this.#pendingGithubTriageEscalations.set(issueIdentity, pendingTriage)
+          }
+        }
+        return
+      }
+
+      if (!this.#pendingGithubAgentQuestions.has(issueIdentity)) {
+        return
+      }
+      const record = (await this.#batch()).inFlight.find((candidate) =>
+        githubIssueIdentityFromRef(candidate.issue) === issueIdentity,
+      )
+      if (!record) {
+        this.#increment('githubAnswersIgnoredNoInFlight')
+        return
+      }
+      if (await this.#routeGithubAnswerToImplementers(record, comment.text.trim())) {
+        this.#pendingGithubAgentQuestions.delete(issueIdentity)
+      }
+    } catch (error) {
+      this.#logger.error?.('[factory] failed to handle GitHub issue comment escalation reply', { path, error })
+    }
+  }
+
+  async #readGithubIssueComment(path: string): Promise<GithubIssueComment | undefined> {
+    const parts = githubIssueCommentPathParts(path)
+    if (!parts) {
+      return
+    }
+    try {
+      const { content } = await this.#readRelayfileFile(path, 'GitHub issue comment escalation reply')
+      return parseGithubIssueComment(path, content)
+    } catch (error) {
+      this.#logger.warn?.('[factory] unable to read GitHub issue comment escalation reply', { path, error })
+      return
+    }
+  }
+
+  async #routeGithubAnswerToImplementers(record: InFlightIssue, text: string): Promise<boolean> {
+    if (!this.#fleet.sendInput) {
+      this.#logger.error?.('[factory] GitHub clarification reply cannot be delivered because agent input is unavailable', {
+        issue: record.issue,
+      })
+      return false
+    }
+
+    const recipients = [...record.agents.values()]
+      .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
+      .map((agent) => agent.result?.name ?? agent.spec.name)
+      .filter((name): name is string => Boolean(name))
+    if (recipients.length === 0) {
+      this.#increment('githubAnswersIgnoredNoImplementer')
+      return false
+    }
+
+    for (const recipient of new Set(recipients)) {
+      await this.#injectGithubReplyEvent(recipient, record.issue, text)
+      this.#increment('githubAnswersInjected')
+    }
+    return true
+  }
+
+  async #handleTriageEscalationGithubAnswer(record: InFlightIssue, text: string): Promise<boolean> {
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isDispatchableIssue(issue)) {
+      this.#increment('githubTriageAnswersIgnoredIssueUnavailable')
+      return false
+    }
+    if (!this.#isIssueReady(issue)) {
+      this.#increment('githubTriageAnswersIgnoredIssueNotReady')
+      return false
+    }
+
+    const batch = await this.#batch()
+    if (batch.isInFlight(record.issue) || batch.isQueued(record.issue)) {
+      this.#increment('githubTriageAnswersIgnoredAlreadyActive')
+      return true
+    }
+    if (await this.#dispatchBlockReason(record.issue)) {
+      this.#increment('githubTriageAnswersIgnoredBlocked')
+      return false
+    }
+
+    const clarifiedIssue = issueWithGithubClarification(issue, text)
+    const decision = await this.#triage.triage(clarifiedIssue, {
+      config: this.#config,
+      repoMap: repoMapFromConfig(this.#config),
+    })
+    const escalationReason = triageEscalationReason(decision)
+    if (escalationReason) {
+      if (hasDispatchableRoute(decision)) {
+        this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
+        await this.#startOrQueueGithubClarifiedDecision(dispatchAfterGithubClarification(decision, escalationReason))
+        this.#increment('githubTriageAnswersDispatchedWithRemainingEscalation')
+        return true
+      }
+      this.#increment('githubTriageAnswersStillEscalated')
+      this.#logger.warn?.('[factory] GitHub triage answer still leaves issue escalated', {
+        issue: record.issue,
+        reason: escalationReason,
+      })
+      return false
+    }
+
+    this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
+    await this.#startOrQueueGithubClarifiedDecision(decision)
+    this.#increment('githubTriageAnswersDispatched')
+    return true
+  }
+
+  async #startOrQueueGithubClarifiedDecision(decision: TriageDecision): Promise<void> {
+    const batch = await this.#batch()
+    if (batch.canStart()) {
+      await this.dispatch(decision, { dryRun: this.#config.dryRun })
+      return
+    }
+
+    if (batch.queue(decision, this.#config.dryRun)) {
+      this.#increment('githubTriageAnswersQueued')
+      this.#emit('issue-queued', { issue: decision.issue })
     }
   }
 
@@ -2699,16 +2886,12 @@ export class FactoryLoop implements Factory {
       })
     }
 
-    await this.#postAgentQuestionToSlack(record, question)
+    await this.#postAgentQuestion(record, question)
   }
 
-  async #postAgentQuestionToSlack(record: InFlightIssue, question: AgentQuestion): Promise<void> {
+  async #postAgentQuestion(record: InFlightIssue, question: AgentQuestion): Promise<void> {
     if (!this.#slack || !this.#config.slack) {
-      this.#increment('agentQuestionsSkippedNoSlack')
-      this.#logger.warn?.('[factory] agent question has no Slack channel configured', {
-        issue: record.issue,
-        from: question.agentName,
-      })
+      await this.#postAgentQuestionToGithub(record, question)
       return
     }
 
@@ -2741,6 +2924,43 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#markSlackWritebackFailure('agent-question', error)
       this.#logger.warn?.(`[factory] failed to post agent question for ${record.issue.key}`, error)
+    }
+  }
+
+  async #postAgentQuestionToGithub(record: InFlightIssue, question: AgentQuestion): Promise<void> {
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue || !isGithubIssue(issue)) {
+      this.#increment('agentQuestionsUnavailable')
+      this.#logger.error?.('[factory] agent question has no configured escalation write path', {
+        issue: record.issue,
+        from: question.agentName,
+        slackConfigured: Boolean(this.#config.slack),
+        githubSource: false,
+      })
+      return
+    }
+
+    const key = githubIssueIdentityFromRef(issue)
+    if (!key) {
+      this.#increment('agentQuestionsUnavailable')
+      this.#logger.error?.('[factory] GitHub agent question source identity is unavailable', {
+        issue: record.issue,
+        from: question.agentName,
+      })
+      return
+    }
+    this.#pendingGithubAgentQuestions.add(key)
+    try {
+      await this.#githubWriteback.postComment(issue, githubAgentQuestionComment(record.issue, question))
+      this.#increment('agentQuestionsPostedToGithub')
+    } catch (error) {
+      this.#pendingGithubAgentQuestions.delete(key)
+      this.#increment('agentQuestionsUnavailable')
+      this.#logger.error?.('[factory] agent question could not be delivered to GitHub and no Slack channel is configured', {
+        issue: record.issue,
+        from: question.agentName,
+        error,
+      })
     }
   }
 
@@ -3609,17 +3829,13 @@ export class FactoryLoop implements Factory {
     this.#recordSlackWritebackSuccess('dispatch-thread')
   }
 
-  async #escalateTriageToSlack(decision: TriageDecision, reason: string, dryRun: boolean): Promise<DispatchResult | undefined> {
+  async #escalateTriage(decision: TriageDecision, reason: string, dryRun: boolean): Promise<DispatchResult | undefined> {
     if (dryRun) {
       return
     }
 
     if (!this.#slack || !this.#config.slack) {
-      this.#logger.warn?.('[factory] triage escalation has no Slack channel configured', {
-        issue: decision.issue,
-        reason,
-      })
-      return
+      return await this.#escalateTriageToGithub(decision, reason)
     }
 
     if (await this.#shouldSkipSlackWriteback('triage-escalation')) {
@@ -3655,6 +3871,47 @@ export class FactoryLoop implements Factory {
       this.#logger.warn?.(`[factory] failed to establish Slack escalation thread for ${decision.issue.key}`, error)
     } finally {
       this.#slackWatcherStarts.delete(key)
+    }
+  }
+
+  async #escalateTriageToGithub(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
+    const issue = await this.#readIssue(decision.issue.path)
+    if (!issue || !isGithubIssue(issue)) {
+      this.#increment('triageEscalationsUnavailable')
+      this.#logger.error?.('[factory] triage escalation has no configured write path', {
+        issue: decision.issue,
+        reason,
+        slackConfigured: Boolean(this.#config.slack),
+        githubSource: false,
+      })
+      return
+    }
+
+    const key = githubIssueIdentityFromRef(issue)
+    if (!key) {
+      this.#increment('triageEscalationsUnavailable')
+      this.#logger.error?.('[factory] GitHub triage escalation source identity is unavailable', {
+        issue: decision.issue,
+        reason,
+      })
+      return
+    }
+    if (this.#pendingGithubTriageEscalations.has(key)) {
+      return
+    }
+
+    this.#pendingGithubTriageEscalations.set(key, decision)
+    try {
+      await this.#githubWriteback.postComment(issue, githubTriageEscalationComment(issue, decision, reason))
+      this.#increment('triageEscalationsPostedToGithub')
+    } catch (error) {
+      this.#pendingGithubTriageEscalations.delete(key)
+      this.#increment('triageEscalationsUnavailable')
+      this.#logger.error?.('[factory] triage escalation could not be delivered to GitHub and no Slack channel is configured', {
+        issue: decision.issue,
+        reason,
+        error,
+      })
     }
   }
 
@@ -4042,6 +4299,36 @@ export class FactoryLoop implements Factory {
     this.#pendingSlackClarifications.delete(key)
   }
 
+  async #injectPendingGithubClarification(record: InFlightIssue): Promise<void> {
+    const key = issueKey(record.issue)
+    const text = this.#pendingGithubClarifications.get(key)
+    if (!text || !this.#fleet.sendInput) {
+      return
+    }
+
+    const recipients = [...record.agents.values()]
+      .filter((agent) =>
+        agent.spec.role === 'implementer' ||
+        agent.spec.role === 'workflow' ||
+        agent.spec.role === 'babysitter')
+      .map((agent) => agent.result?.name ?? agent.spec.name)
+      .filter((name): name is string => Boolean(name))
+
+    for (const recipient of new Set(recipients)) {
+      try {
+        await this.#injectGithubReplyEvent(recipient, record.issue, text)
+        this.#increment('githubTriageAnswersInjectedToAgents')
+      } catch (error) {
+        this.#logger.warn?.('[factory] failed to inject GitHub triage clarification into agent', {
+          issue: record.issue.key,
+          recipient,
+          error,
+        })
+      }
+    }
+    this.#pendingGithubClarifications.delete(key)
+  }
+
   // Inject the human's Slack reply into the agent framed as the
   // <integration-event> the spawn prompt tells it to expect (not an ambiguous
   // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
@@ -4049,6 +4336,10 @@ export class FactoryLoop implements Factory {
   // robustness follow-up.)
   async #injectSlackReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
     await this.#fleet.sendInput?.(recipient, slackReplyEvent(issue, text))
+  }
+
+  async #injectGithubReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
+    await this.#fleet.sendInput?.(recipient, githubReplyEvent(issue, text))
   }
 
   // Absolute path to the local .integrations mount the daemon manages. The mount
@@ -4915,6 +5206,53 @@ export const githubIssuePathParts = (path: string): { owner: string; repo: strin
   }
 }
 
+const githubIssueCommentPathParts = (path: string): {
+  owner: string
+  repo: string
+  number: number
+  commentId: string
+} | undefined => {
+  const match = path.match(
+    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(\d+)(?:__[^/]*)?\/comments\/([^/]+?)(?:\.json|\/(?:meta|metadata)\.json)$/u,
+  )
+  if (!match) {
+    return undefined
+  }
+  const owner = match[1] ?? match[3]
+  const repo = match[2] ?? match[4]
+  const commentId = match[6]
+  if (!owner || !repo || !commentId) {
+    return undefined
+  }
+  return { owner, repo, number: Number(match[5]), commentId }
+}
+
+const parseGithubIssueComment = (path: string, content: unknown): GithubIssueComment => {
+  const parts = githubIssueCommentPathParts(path)
+  if (!parts) {
+    throw new Error(`Unsupported GitHub issue comment path: ${path}`)
+  }
+  const raw = asRecord(parseJsonContent(content)) ?? {}
+  const payload = wrappedPayload(raw)
+  const author = asRecord(payload.author)
+  const user = asRecord(payload.user)
+  return {
+    ...parts,
+    commentId: stringValue(payload.id) ?? String(numberValue(payload.id) ?? parts.commentId),
+    text: stringValue(payload.body) ?? '',
+    author: stringValue(author?.login) ?? stringValue(user?.login) ?? stringValue(payload.author),
+    raw,
+  }
+}
+
+const githubIssueIdentityFromParts = (parts: { owner: string; repo: string; number: number }): string =>
+  `${parts.owner.toLowerCase()}/${parts.repo.toLowerCase()}#${parts.number}`
+
+const githubIssueIdentityFromRef = (issue: IssueRef): string | undefined => {
+  const parts = githubIssuePathParts(issue.path) ?? githubIssueDirectoryPathParts(issue.path)
+  return parts ? githubIssueIdentityFromParts(parts) : undefined
+}
+
 const githubIssueReadCandidatePaths = (path: string): string[] => {
   if (path.endsWith('/')) {
     return [`${path}meta.json`, `${path}metadata.json`]
@@ -5219,6 +5557,9 @@ const isLinearIssueMirrorCandidatePath = (path: string): boolean =>
 
 const isGithubIssueFilePath = (path: string): boolean =>
   githubIssuePathParts(path) !== undefined || githubIssueDirectoryPathParts(path) !== undefined
+
+const isGithubIssueCommentFilePath = (path: string): boolean =>
+  githubIssueCommentPathParts(path) !== undefined
 
 const isGithubIssueTreePath = (path: string): boolean =>
   /^\/github\/repos\/(?:[^/]+\/[^/]+|[^/]+__[^/]+)\/issues\/.+/u.test(path)
@@ -5728,6 +6069,41 @@ const triageEscalationQuestion = (decision: TriageDecision): string => {
   ].join(' ')
 }
 
+const githubTriageEscalationComment = (
+  issue: LinearIssue,
+  decision: TriageDecision,
+  reason: string,
+): string => [
+  GITHUB_TRIAGE_ESCALATION_MARKER,
+  `Factory needs human clarification before dispatching ${issue.key}.`,
+  '',
+  `Reason: ${reason}`,
+  `Question: ${triageEscalationQuestion(decision)}`,
+  '',
+  'Reply to this issue with the missing details. Factory will use the next human comment to resume triage.',
+].join('\n')
+
+const githubAgentQuestionComment = (issue: IssueRef, question: AgentQuestion): string => [
+  GITHUB_AGENT_QUESTION_MARKER,
+  `${issue.key}: ${question.agentName} needs input.`,
+  '',
+  `Question: ${question.question}`,
+  '',
+  'Reply to this issue and Factory will deliver the answer to the active agent.',
+].join('\n')
+
+const isFactoryGithubEscalationComment = (text: string): boolean =>
+  text.includes(GITHUB_TRIAGE_ESCALATION_MARKER) || text.includes(GITHUB_AGENT_QUESTION_MARKER)
+
+const rememberGithubIssueComment = (seen: Set<string>, key: string): void => {
+  seen.add(key)
+  while (seen.size > AGENT_QUESTION_DEDUPE_LIMIT) {
+    const oldest = seen.values().next().value as string | undefined
+    if (!oldest) break
+    seen.delete(oldest)
+  }
+}
+
 const isTriageEscalationWatchRecord = (record: InFlightIssue): boolean =>
   record.agents.size === 0 && record.invocationIds.size === 0 && triageEscalationReason(record.decision) !== undefined
 
@@ -5744,12 +6120,32 @@ const dispatchAfterSlackClarification = (decision: TriageDecision, escalationRea
   ].filter(Boolean).join(' '),
 })
 
+const dispatchAfterGithubClarification = (decision: TriageDecision, escalationReason: string): TriageDecision => ({
+  ...decision,
+  thin: false,
+  confidence: 'high',
+  rationale: [
+    decision.rationale,
+    `Human answered the GitHub triage escalation (${escalationReason}); dispatching to the matched agent so it can acknowledge the answer and ask follow-up questions if needed.`,
+  ].filter(Boolean).join(' '),
+})
+
 const issueWithSlackClarification = (issue: LinearIssue, text: string): LinearIssue => ({
   ...issue,
   description: [
     issue.description,
     '',
     'Human clarification from Slack:',
+    text,
+  ].join('\n'),
+})
+
+const issueWithGithubClarification = (issue: LinearIssue, text: string): LinearIssue => ({
+  ...issue,
+  description: [
+    issue.description,
+    '',
+    'Human clarification from GitHub:',
     text,
   ].join('\n'),
 })
@@ -5762,6 +6158,9 @@ const slackAnswerInput = (issue: IssueRef, text: string): string =>
 // keystroke. Trailing CR submits it to the agent's PTY.
 const slackReplyEvent = (issue: IssueRef, text: string): string =>
   `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
+
+const githubReplyEvent = (issue: IssueRef, text: string): string =>
+  `<integration-event source="github" issue="${issue.key}">\nHuman reply on the source GitHub issue:\n${text}\n</integration-event>\r`
 
 const isFactoryQuestionTarget = (target: string): boolean => {
   const normalized = target.trim().replace(/^@/u, '').toLowerCase()
