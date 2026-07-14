@@ -3,6 +3,7 @@ import type {
   BatchSnapshot,
   CriticalRecord,
   DispatchAttemptState,
+  GithubIssueCommentWatchState,
   RegistryHandoffAgent,
   StateStore,
 } from '../ports/state'
@@ -12,6 +13,7 @@ type WorkspaceState = {
   criticalMessages: Map<string, CriticalRecord>
   resumedExitKeys: Set<string>
   slackThreadIds: Map<string, string>
+  githubIssueCommentWatches: Map<string, GithubIssueCommentWatchState>
   seenAgentQuestionKeys: Set<string>
   seenAgentQuestionOrder: string[]
   dispatchAttempts: Map<string, DispatchAttemptState>
@@ -90,6 +92,19 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).slackThreadIds.clear()
   }
 
+  async setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void> {
+    this.#workspace(workspaceId).githubIssueCommentWatches.set(key, cloneGithubIssueCommentWatch(watch))
+  }
+
+  async listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>> {
+    return [...this.#workspace(workspaceId).githubIssueCommentWatches]
+      .map(([key, watch]) => [key, cloneGithubIssueCommentWatch(watch)])
+  }
+
+  async clearGithubIssueCommentWatch(workspaceId: string, key: string): Promise<void> {
+    this.#workspace(workspaceId).githubIssueCommentWatches.delete(key)
+  }
+
   async seenAgentQuestion(workspaceId: string, key: string): Promise<boolean> {
     return this.#workspace(workspaceId).seenAgentQuestionKeys.has(key)
   }
@@ -150,6 +165,7 @@ export class InMemoryStateStore implements StateStore {
         criticalMessages: new Map(),
         resumedExitKeys: new Set(),
         slackThreadIds: new Map(),
+        githubIssueCommentWatches: new Map(),
         seenAgentQuestionKeys: new Set(),
         seenAgentQuestionOrder: [],
         dispatchAttempts: new Map(),
@@ -161,3 +177,22 @@ export class InMemoryStateStore implements StateStore {
     return state
   }
 }
+
+const cloneGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState => ({
+  ...watch,
+  issue: { ...watch.issue },
+  source: { ...watch.source },
+  pending: watch.pending.map((pending) => ({
+    ...pending,
+    ...(pending.decision ? {
+      decision: {
+        ...pending.decision,
+        issue: { ...pending.decision.issue },
+        routes: pending.decision.routes.map((route) => ({ ...route })),
+        implementers: pending.decision.implementers.map((agent) => ({ ...agent })),
+        reviewer: { ...pending.decision.reviewer },
+        ...(pending.decision.workflow ? { workflow: { ...pending.decision.workflow } } : {}),
+      },
+    } : {}),
+  })),
+})
