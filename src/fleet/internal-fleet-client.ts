@@ -52,10 +52,17 @@ type AgentExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
 type PendingInjectedWait = {
+  input: SendInput
+  eventIds: Set<string>
+  currentEventId: string
   targets: string[]
   timeout: ReturnType<typeof setTimeout>
   resolve: (result: { eventId: string; targets: string[] }) => void
   reject: (error: Error) => void
+  resendTimer?: ReturnType<typeof setTimeout>
+  resendInFlight: boolean
+  resendTriggered: boolean
+  settled: boolean
 }
 
 export const capabilityCli: Record<Capability, string> = {
@@ -71,6 +78,7 @@ const selfNode: RosterEntry['nodes'][number] = {
 }
 const PID_RESOLVE_ATTEMPTS = 3
 const PID_RESOLVE_BACKOFF_MS = 75
+const READY_RESEND_DELAY_MS = 1_000
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
@@ -88,11 +96,13 @@ export class InternalFleetClient implements FleetClient {
   readonly #seenEvents: string[] = []
   readonly #seenEventKeys = new Set<string>()
   readonly #pendingInjected = new Map<string, PendingInjectedWait>()
+  readonly #activeInjectedWaits = new Set<PendingInjectedWait>()
   readonly #injectedEventIds: string[] = []
   readonly #injectedEventIdSet = new Set<string>()
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
   readonly #exitedAgentNames = new Set<string>()
+  readonly #readyAgentNames = new Set<string>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
   #missingIdentityEvents = 0
@@ -112,6 +122,11 @@ export class InternalFleetClient implements FleetClient {
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
     assertSelfNode(input.node)
+    // The broker has no delivery-target registration event. Subscribe before
+    // spawn so worker_ready can act as a bounded re-send trigger if the child's
+    // fallback MCP registration races the first confirmed task injection.
+    this.#ensureEventSubscription()
+    this.#readyAgentNames.delete(input.name)
 
     const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name,
@@ -134,6 +149,8 @@ export class InternalFleetClient implements FleetClient {
 
   async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     assertSelfNode(input.node)
+    this.#ensureEventSubscription()
+    this.#readyAgentNames.delete(input.name ?? input.sessionRef)
 
     const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name ?? input.sessionRef,
@@ -170,7 +187,11 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async release(name: string, reason?: string): Promise<void> {
-    await this.#client.release(name, reason)
+    try {
+      await this.#client.release(name, reason)
+    } finally {
+      this.#readyAgentNames.delete(name)
+    }
   }
 
   async roster(): Promise<RosterEntry> {
@@ -233,6 +254,7 @@ export class InternalFleetClient implements FleetClient {
 
   async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }> {
     this.#ensureEventSubscription()
+    const targetWasReady = this.#readyAgentNames.has(input.to)
     const result = await this.#client.sendMessage(messageInputFrom(input))
     const eventId = result.event_id
     const targets = result.targets ?? []
@@ -241,24 +263,56 @@ export class InternalFleetClient implements FleetClient {
       return { eventId, targets }
     }
 
-    const priorFailure = this.#failedDeliveries.get(eventId)
-    if (priorFailure) {
-      throw priorFailure
-    }
-
     return await new Promise((resolve, reject) => {
       const timeoutMs = opts?.timeoutMs ?? 30_000
       const timeout = setTimeout(() => {
-        this.#pendingInjected.delete(eventId)
-        reject(new Error(`Timed out waiting for delivery_injected for ${eventId}`))
+        this.#rejectPendingInjected(
+          pending,
+          new Error(`Timed out waiting for delivery_injected for ${pending.currentEventId}`),
+        )
       }, timeoutMs)
 
-      this.#pendingInjected.set(eventId, {
+      const pending: PendingInjectedWait = {
+        input,
+        eventIds: new Set([eventId]),
+        currentEventId: eventId,
         targets,
         timeout,
         resolve,
         reject,
-      })
+        resendInFlight: false,
+        resendTriggered: false,
+        settled: false,
+      }
+      this.#pendingInjected.set(eventId, pending)
+      this.#activeInjectedWaits.add(pending)
+
+      // worker_ready may arrive while sendMessage is in flight, before the
+      // pending waiter is installed. Re-check after installation to close that
+      // gap, while preserving the one-send path for workers already ready.
+      if (!targetWasReady && this.#readyAgentNames.has(input.to)) {
+        this.#triggerReadyResend(pending)
+      } else if (targetWasReady) {
+        pending.resendTimer = setTimeout(() => this.#triggerReadyResend(pending), READY_RESEND_DELAY_MS)
+      }
+
+      // delivery_injected can likewise race the sendMessage response and the
+      // pending-map write. Resolve from the recent-event latch when it does.
+      if (this.#injectedEventIdSet.has(eventId)) {
+        this.#resolvePendingInjected(pending, eventId)
+        return
+      }
+
+      // delivery_failed can also arrive before sendMessage resolves. Defer its
+      // handling until the logical waiter exists so captured readiness can keep
+      // the recovery re-send alive while the failed event id is retired.
+      const priorFailure = this.#failedDeliveries.get(eventId)
+      if (priorFailure) {
+        if (targetWasReady || this.#readyAgentNames.has(input.to)) {
+          this.#triggerReadyResend(pending)
+        }
+        this.#failPendingInjectedEvent(pending, eventId, priorFailure)
+      }
     })
   }
 
@@ -296,10 +350,13 @@ export class InternalFleetClient implements FleetClient {
     }
     this.#disposed = true
 
-    const pending = [...this.#pendingInjected.values()]
+    const pending = [...this.#activeInjectedWaits]
+    this.#activeInjectedWaits.clear()
     this.#pendingInjected.clear()
     for (const entry of pending) {
       clearTimeout(entry.timeout)
+      if (entry.resendTimer) clearTimeout(entry.resendTimer)
+      entry.settled = true
       entry.reject(new Error('InternalFleetClient disposed before delivery was confirmed'))
     }
 
@@ -311,6 +368,7 @@ export class InternalFleetClient implements FleetClient {
     this.#agentMessageListeners.clear()
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
+    this.#readyAgentNames.clear()
     // If we started the broker, shut it down so the process can exit cleanly
     // (a spawned broker's owner-lease renewal otherwise keeps the event loop
     // alive). A reused broker is only disconnected — never shut down — so we
@@ -338,17 +396,28 @@ export class InternalFleetClient implements FleetClient {
     if (offEvent) this.#eventUnsubscribers.push(offEvent)
     const offDeliveryUpdate = this.#client.addListener?.('deliveryUpdate', (event) => this.#handleBrokerEvent(event))
     if (offDeliveryUpdate) this.#eventUnsubscribers.push(offDeliveryUpdate)
-    const offAgentExited = this.#client.addListener?.('agentExited', (agent) =>
+    const offAgentExited = this.#client.addListener?.('agentExited', (agent) => {
+      this.#readyAgentNames.delete(agent.name)
       this.#emitAgentExit(agent.name, 'exited', {
         key: `agentExited:${JSON.stringify(agent)}`,
         hasStableId: false,
-      }),
-    )
+      })
+    })
     if (offAgentExited) this.#eventUnsubscribers.push(offAgentExited)
     this.#client.connectEvents?.()
   }
 
   #handleBrokerEvent(event: BrokerEvent): void {
+    if (event.kind === 'worker_ready') {
+      this.#readyAgentNames.add(event.name)
+      for (const pending of new Set(this.#pendingInjected.values())) {
+        if (pending.input.to === event.name) {
+          this.#triggerReadyResend(pending)
+        }
+      }
+      return
+    }
+
     if (event.kind === 'delivery_injected') {
       this.#resolveInjected(event.event_id)
       return
@@ -394,11 +463,13 @@ export class InternalFleetClient implements FleetClient {
     }
 
     if (event.kind === 'agent_exit') {
+      this.#readyAgentNames.delete(event.name)
       this.#emitAgentExit(event.name, event.reason, eventIdentity(event))
       return
     }
 
     if (event.kind === 'agent_exited') {
+      this.#readyAgentNames.delete(event.name)
       this.#emitAgentExit(event.name, event.reason ?? exitReason(event), eventIdentity(event))
     }
   }
@@ -411,9 +482,72 @@ export class InternalFleetClient implements FleetClient {
       return
     }
 
+    this.#resolvePendingInjected(pending, eventId)
+  }
+
+  #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
+    if (pending.settled) return
+    pending.settled = true
+    this.#activeInjectedWaits.delete(pending)
     clearTimeout(pending.timeout)
-    this.#pendingInjected.delete(eventId)
+    if (pending.resendTimer) clearTimeout(pending.resendTimer)
+    for (const pendingEventId of pending.eventIds) {
+      this.#pendingInjected.delete(pendingEventId)
+    }
     pending.resolve({ eventId, targets: pending.targets })
+  }
+
+  #rejectPendingInjected(pending: PendingInjectedWait, error: Error): void {
+    if (pending.settled) return
+    pending.settled = true
+    this.#activeInjectedWaits.delete(pending)
+    clearTimeout(pending.timeout)
+    if (pending.resendTimer) clearTimeout(pending.resendTimer)
+    for (const pendingEventId of pending.eventIds) {
+      this.#pendingInjected.delete(pendingEventId)
+    }
+    pending.reject(error)
+  }
+
+  #triggerReadyResend(pending: PendingInjectedWait): void {
+    if (pending.settled || pending.resendTriggered) return
+    if (pending.resendTimer) clearTimeout(pending.resendTimer)
+    pending.resendTriggered = true
+    pending.resendInFlight = true
+    void this.#resendPendingInjected(pending)
+  }
+
+  async #resendPendingInjected(pending: PendingInjectedWait): Promise<void> {
+    try {
+      const result = await this.#client.sendMessage(messageInputFrom(pending.input))
+      pending.resendInFlight = false
+      if (pending.settled) return
+
+      const eventId = result.event_id
+      pending.currentEventId = eventId
+      pending.targets = result.targets ?? []
+      pending.eventIds.add(eventId)
+      this.#pendingInjected.set(eventId, pending)
+
+      if (this.#injectedEventIdSet.has(eventId)) {
+        this.#resolvePendingInjected(pending, eventId)
+        return
+      }
+      const priorFailure = this.#failedDeliveries.get(eventId)
+      if (priorFailure) {
+        this.#failPendingInjectedEvent(pending, eventId, priorFailure)
+      }
+    } catch (error) {
+      pending.resendInFlight = false
+      if (pending.eventIds.size === 0) {
+        this.#rejectPendingInjected(pending, error instanceof Error ? error : new Error(String(error)))
+      } else {
+        this.#logger?.warn?.(
+          '[factory-sdk] readiness-triggered resend failed, but original event is still active',
+          error,
+        )
+      }
+    }
   }
 
   #rejectInjected(eventId: string, reason?: string): void {
@@ -432,9 +566,18 @@ export class InternalFleetClient implements FleetClient {
       return
     }
 
-    clearTimeout(pending.timeout)
+    this.#failPendingInjectedEvent(pending, eventId, error)
+  }
+
+  #failPendingInjectedEvent(pending: PendingInjectedWait, eventId: string, error: Error): void {
     this.#pendingInjected.delete(eventId)
-    pending.reject(error)
+    pending.eventIds.delete(eventId)
+    // A readiness-triggered re-send aliases the old and new broker event ids
+    // into one logical waiter. A late failure for the superseded id must not
+    // reject a newer send that can still be acknowledged.
+    if (pending.eventIds.size === 0 && !pending.resendInFlight) {
+      this.#rejectPendingInjected(pending, error)
+    }
   }
 
   #emitDeliveryFailed(info: { to: string; msgId?: string; reason?: string }, identity: EventIdentity): void {
