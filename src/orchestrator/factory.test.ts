@@ -24,7 +24,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { ChangeEvent, EventPage, GithubIssueStatus, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -5178,6 +5178,64 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl-pear', 'ar-6-review'])
   })
 
+  it('publishes an implementer PR through the mount connection on successful completion', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 52,
+          url: 'https://github.com/AgentWorkforce/pear/pull/52',
+          headRef: 'fix/ar-52',
+          headSha: 'sha-52',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({ [issuePath(52)]: issueFile(52) }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => { throw new Error('gh must not be invoked for PR publication') },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
+      baseRef: 'main',
+      title: 'AR-52: [factory-e2e] Fix factory issue 52',
+      body: expect.stringContaining('Factory issue AR-52'),
+    }])
+    expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+  })
+
+  it('surfaces a clear error when a cloud mount lacks the GitHub write path', async () => {
+    const mount = new FakeMountClient({ [issuePath(53)]: issueFile(53) })
+    Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
+    const fleet = new FakeFleetClient()
+    const errors: Error[] = []
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    factory.on('error', (payload) => {
+      if (payload.error instanceof Error) errors.push(payload.error)
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(53), issueFile(53))))
+    fleet.emitAgentExit('ar-53-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(errors).toHaveLength(1))
+
+    expect(errors[0]?.message).toBe('GitHub write path not available on this mount — connect GitHub to your workspace')
+    expect(factory.status().counters.githubPullRequestPublishFailures).toBe(1)
+    expect(fleet.releases).toEqual([])
+  })
+
   it('completes an implementer exit without resuming when a PR already exists', async () => {
     const issue = realIssueFile(254, ready, { title: 'Real implementer PR exit terminal' })
     const mount = new FakeMountClient({ [issuePath(254)]: issue })
@@ -5377,9 +5435,9 @@ describe('FactoryLoop', () => {
     expect(fleet.messages[0]!.text).toContain('Create a branch for this issue before editing.')
     expect(fleet.messages[0]!.text).toContain('Commit the implementation and tests.')
     expect(fleet.messages[0]!.text).toContain('Push the branch to origin.')
-    expect(fleet.messages[0]!.text).toContain('Open a PR targeting `main` when done.')
-    expect(fleet.messages[0]!.text).toContain('Use `gh pr create --base main` and report the PR URL.')
-    expect(fleet.messages[0]!.text).toContain('DM the reviewer `ar-62-review` when the PR is ready.')
+    expect(fleet.messages[0]!.text).toContain('Factory will open the PR targeting `main` through the connected GitHub workspace.')
+    expect(fleet.messages[0]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
+    expect(fleet.messages[0]!.text).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
     expect(fleet.messages[0]!.text).toContain('DM `broker` when fully done.')
     expect(fleet.messages[0]!.text).toContain('Merge policy: never - open the PR for human review and approval; never merge it yourself.')
     expect(fleet.messages[1]).toMatchObject({
@@ -5470,9 +5528,9 @@ describe('FactoryLoop', () => {
       data: { issue: { key: 'AR-63' } },
     })
     expect(fleet.messages[2]!.text).toContain('Linear issue: AR-63 - [factory-e2e] Fix factory issue 63')
-    expect(fleet.messages[2]!.text).toContain('Open a PR targeting `main` when done.')
-    expect(fleet.messages[2]!.text).toContain('Use `gh pr create --base main` and report the PR URL.')
-    expect(fleet.messages[2]!.text).toContain('DM the reviewer `ar-63-review` when the PR is ready.')
+    expect(fleet.messages[2]!.text).toContain('Factory will open the PR targeting `main` through the connected GitHub workspace.')
+    expect(fleet.messages[2]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
+    expect(fleet.messages[2]!.text).toContain('Factory will hand the opened PR to reviewer `ar-63-review`.')
     expect(fleet.inputs).toEqual([
       { name: 'ar-63-impl-pear', data: '\r' },
       { name: 'ar-63-review', data: '\r' },
@@ -6339,6 +6397,10 @@ describe('FactoryLoop', () => {
       }),
       probeCloser: (input) => closeProbePr({
         ...input,
+        githubWrite: {
+          publishPullRequest: async () => { throw new Error('unexpected publish') },
+          closePullRequest: async () => { throw new Error('already-closed PR must not be closed again') },
+        },
         runner: async (args) => {
           closeViewCalls.push(args)
           return {

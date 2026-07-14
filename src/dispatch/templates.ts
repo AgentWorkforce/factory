@@ -75,7 +75,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'Push the branch to origin.',
     'When implementation is complete, finish your session normally; Factory will open the PR targeting `main` through the connected GitHub workspace.',
     'Do not run `gh pr create` or require local GitHub CLI authentication.',
-    `DM the reviewer \`${input.reviewerName}\` when the PR is ready.`,
+    `Factory will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
     'If blocked and you need human input, write to the .integrations mount path so the factory can relay it to the issue thread.',
     'DM `broker` when fully done.',
     'Do NOT auto-merge.',
