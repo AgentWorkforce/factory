@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { ensureLocalMount } from '../mount/local-mount-preflight'
 import {
   FactoryConfigSchema,
+  FileStateStore,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
   closeProbePr,
@@ -13,6 +14,7 @@ import {
   ensureRelayBroker,
   defaultGhRunner,
   githubIssuePathParts,
+  githubWatchStatePath,
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
@@ -174,9 +176,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
         const logger = streamLogger(err)
+        const stateStore = new FileStateStore({
+          batchSize: loaded.config.batchSize,
+          watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
+        })
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
+          stateStore,
           stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
           logger,
