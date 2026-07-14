@@ -115,6 +115,7 @@ const githubIssueFile = (
     state?: string
     labels?: Array<string | { name: string }>
     url?: string
+    author?: string
   } = {},
 ) => {
   const owner = payload.owner ?? 'AgentWorkforce'
@@ -130,6 +131,7 @@ const githubIssueFile = (
       state: payload.state ?? 'open',
       labels: payload.labels ?? [{ name: 'factory' }],
       url: payload.url ?? `https://github.com/${owner}/${repo}/issues/${number}`,
+      author: { login: payload.author ?? 'issue-author' },
       repository: {
         name: repo,
         owner: { login: owner },
@@ -7371,9 +7373,10 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
     expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification')
 
+    const triageReplyPrefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 58, 9001, {
-      body: 'Use the shared retry helper and add regression coverage.',
-      author: { login: 'human-maintainer' },
+      body: `${triageReplyPrefix} Use the shared retry helper and add regression coverage.`,
+      author: { login: 'issue-author' },
     })
 
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-58-impl-pear', 'ar-58-review']))
@@ -7383,6 +7386,91 @@ describe('FactoryLoop', () => {
     }))
     expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
     expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBe(1)
+  })
+
+  it('requires a start-of-body correlation token from the issue reporter before resolving GitHub triage', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 61)
+    const issue = githubIssueFile(61, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new GithubClarifiedTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9101, {
+      body: 'Unrelated issue discussion without the correlation token.',
+      author: { login: 'reporter' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9102, {
+      body: `> ${prefix} quoted escalation text should not resolve`,
+      author: { login: 'reporter' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9103, {
+      body: `${prefix} An unauthorized user must not dispatch agents.`,
+      author: { login: 'drive-by-user' },
+    })
+    await flush()
+    await flush()
+
+    expect(fleet.spawns).toEqual([])
+    expect(factory.status().counters.githubAnswersIgnoredMissingCorrelationPrefix).toBe(1)
+    expect(factory.status().counters.githubAnswersIgnoredUnauthorizedAuthor).toBe(1)
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 61, 9104, {
+      body: `${prefix} The reporter-authorized clarification.`,
+      author: { login: 'reporter' },
+    })
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-61-impl-pear', 'ar-61-review']))
+  })
+
+  it('persists and rearms a GitHub triage watcher, replaying a correlated reply synced while stopped', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 62)
+    const issue = githubIssueFile(62, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const firstFactory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new GithubClarifiedTriage(),
+      githubWriteback,
+    })
+
+    await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
+    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toHaveLength(1)
+    await firstFactory.stop()
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 62, 9201, {
+      body: `${prefix} This reply arrived while factory was stopped.`,
+      author: { login: 'reporter' },
+    })
+
+    const restartFleet = new FakeFleetClient()
+    const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: restartFleet,
+      stateStore,
+      triage: new GithubClarifiedTriage(),
+      githubWriteback,
+    })
+    await restartedFactory.start({
+      mode: 'live',
+      liveSubscription: { transport: 'subscribe' },
+    })
+
+    await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review']))
+    expect(restartedFactory.status().counters.githubIssueCommentWatchersRearmed).toBe(1)
+    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+    await restartedFactory.stop()
   })
 
   it('dispatches a matched agent to read a Slack triage answer even when factory still finds the issue thin', async () => {
@@ -7636,15 +7724,65 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.comments.at(-1)?.body).toMatch(/<!-- factory-escalation:factory-agent-question-/u)
     expect(factory.status().counters.agentQuestionsPostedToGithub).toBe(1)
 
+    const agentReplyPrefix = githubReplyPrefixFromComment(githubWriteback.comments.at(-1)?.body)
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9002, {
-      body: 'Use the shared helper in factory.ts.',
-      author: { login: 'maintainer' },
+      body: `${agentReplyPrefix} Use the shared helper in factory.ts.`,
+      author: { login: 'issue-author' },
     })
     await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
       name: 'ar-59-impl-pear',
-      data: '<integration-event source="github" issue="59">\nHuman reply from @maintainer on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
+      data: '<integration-event source="github" issue="59">\nHuman reply from @issue-author on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
     }))
     expect(factory.status().counters.githubAnswersInjected).toBe(1)
+  })
+
+  it('rearms a persisted mid-task GitHub question and replays a reply received while stopped', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 63)
+    const issue = githubIssueFile(63, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const firstFleet = new FakeFleetClient()
+    const firstFactory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: firstFleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    firstFleet.emitAgentMessage({
+      from: 'ar-63-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Which retry helper?',
+      eventId: 'github-agent-question-63',
+    })
+    await vi.waitFor(() => expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1))
+    const prefix = githubReplyPrefixFromComment(factoryGithubQuestionComments(githubWriteback)[0]?.body)
+    await firstFactory.stop()
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 63, 9301, {
+      body: `${prefix} Use the shared helper.`,
+      author: { login: 'reporter' },
+    })
+
+    const restartFleet = new FakeFleetClient()
+    const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: restartFleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+    await vi.waitFor(() => expect(restartFleet.inputs).toContainEqual({
+      name: 'ar-63-impl-pear',
+      data: '<integration-event source="github" issue="63">\nHuman reply from @reporter on the GitHub issue:\nUse the shared helper.\n</integration-event>\r',
+    }))
+    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+    await restartedFactory.stop()
   })
 
   it('logs and emits an observable error when a GitHub agent question comment cannot be written', async () => {
@@ -7735,7 +7873,7 @@ describe('FactoryLoop', () => {
       expect.objectContaining({
         kind: 'agent-question',
         correlationId: expect.stringMatching(/^factory-agent-question-/u),
-        reason: 'no Slack channel or stable GitHub issue write path is available',
+        reason: 'no Slack channel or GitHub issue write path with an identifiable issue reporter is available',
       }),
     ])
     expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
@@ -8781,6 +8919,15 @@ const emitGithubIssueComment = (
   })
   mount.emit(changeEvent(path, `github-comment-${commentId}`))
 }
+
+const githubReplyPrefixFromComment = (body: string | undefined): string => {
+  const correlationId = body?.match(/<!-- factory-escalation:(factory-(?:triage|agent-question)-[a-z0-9]+) -->/u)?.[1]
+  if (!correlationId) throw new Error('Factory GitHub escalation comment is missing a correlation id')
+  return `[factory-reply:${correlationId}]`
+}
+
+const factoryGithubQuestionComments = (writeback: RecordingGithubWriteback): Array<{ key: string; body: string }> =>
+  writeback.comments.filter((comment) => comment.body.includes(' needs input.'))
 
 const isSlackRootWritePath = (path: string): boolean =>
   /^\/slack\/channels\/[^/]+\/messages\/[^/]+\.json$/u.test(path)

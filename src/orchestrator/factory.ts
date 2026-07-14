@@ -20,6 +20,8 @@ import type {
 } from '../ports'
 import type {
   BatchSnapshot,
+  GithubIssueCommentWatchPending,
+  GithubIssueCommentWatchState,
   RegistryHandoffAgent,
   StateStore,
 } from '../ports/state'
@@ -222,7 +224,7 @@ export class FactoryLoop implements Factory {
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
-  readonly #githubIssueCommentWatchRecords = new Map<string, InFlightIssue>()
+  readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
@@ -440,6 +442,7 @@ export class FactoryLoop implements Factory {
       try {
         await this.#startLiveSubscription(opts.liveSubscription)
         await this.#rearmSlackReplyWatchers()
+        await this.#rearmGithubIssueCommentWatchers()
         this.#scheduleCompletionSweep(0)
         return
       } catch (error) {
@@ -471,6 +474,7 @@ export class FactoryLoop implements Factory {
     })
     this.#started = true
     await this.#rearmSlackReplyWatchers()
+    await this.#rearmGithubIssueCommentWatchers()
     this.#scheduleCompletionSweep(0)
   }
 
@@ -496,7 +500,7 @@ export class FactoryLoop implements Factory {
       this.#slackWatchers.clear()
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
-      this.#githubIssueCommentWatchRecords.clear()
+      this.#githubIssueCommentWatchStates.clear()
       await this.#state.clearSlackThreads(this.#workspaceId)
       this.#slackWatcherStarts.clear()
       this.#offAgentExit?.()
@@ -2769,29 +2773,34 @@ export class FactoryLoop implements Factory {
     const correlationId = githubEscalationCorrelationId('agent-question', record.issue, question.question)
     const issue = await this.#readIssue(record.issue.path)
     const source = issue ? githubIssueSourceRef(issue) : undefined
-    if (!issue || !source) {
+    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    if (!issue || !source || !authorizedAuthor) {
       this.#surfaceEscalationDeliveryFailure(
         'agent-question',
         record.issue,
         correlationId,
-        'no Slack channel or stable GitHub issue write path is available',
+        'no Slack channel or GitHub issue write path with an identifiable issue reporter is available',
       )
       return
     }
 
-    const watcherCreated = this.#watchGithubIssueComments(source, record)
+    await this.#addGithubIssueCommentWatch(record.issue, source, {
+      correlationId,
+      kind: 'agent-question',
+      authorizedAuthor,
+    })
     try {
       await this.#githubWriteback.postComment(issue, [
         `${record.issue.key}: ${question.agentName} needs input.`,
         `Question: ${question.question}`,
+        `Authorized responder: @${authorizedAuthor} (the issue reporter).`,
+        `Reply with a comment that starts with \`${githubReplyPrefix(correlationId)}\`.`,
         '',
         githubEscalationMarker(correlationId),
       ].join('\n'))
       this.#increment('agentQuestionsPostedToGithub')
     } catch (error) {
-      if (watcherCreated) {
-        await this.#stopGithubIssueCommentWatcher(source)
-      }
+      await this.#removeGithubIssueCommentPending(source, correlationId)
       this.#surfaceEscalationDeliveryFailure(
         'agent-question',
         record.issue,
@@ -2802,14 +2811,44 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  #watchGithubIssueComments(source: GithubIssueSourceRef, record: InFlightIssue): boolean {
+  async #addGithubIssueCommentWatch(
+    issue: IssueRef,
+    source: GithubIssueSourceRef,
+    pending: GithubIssueCommentWatchPending,
+  ): Promise<boolean> {
     const key = githubIssueSourceKey(source)
-    this.#githubIssueCommentWatchRecords.set(key, record)
+    let watch = this.#githubIssueCommentWatchStates.get(key)
+    if (!watch) {
+      const persisted = await this.#state.listGithubIssueCommentWatches(this.#workspaceId)
+      watch = persisted.find(([persistedKey]) => persistedKey === key)?.[1]
+    }
+    if (!watch) {
+      watch = {
+        issue,
+        source,
+        pending: [],
+        lastSeenCommentId: await this.#latestGithubIssueCommentId(source),
+      }
+    }
+    const added = !watch.pending.some((candidate) => candidate.correlationId === pending.correlationId)
+    if (added) {
+      watch.pending.push(pending)
+    }
+    await this.#watchGithubIssueComments(watch)
+    return added
+  }
+
+  async #watchGithubIssueComments(watch: GithubIssueCommentWatchState): Promise<boolean> {
+    const key = githubIssueSourceKey(watch.source)
+    this.#githubIssueCommentWatchStates.set(key, watch)
+    await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
     if (this.#githubIssueCommentWatchers.has(key)) {
+      await this.#replayGithubIssueComments(key)
       return false
     }
 
-    const seenComments = new Set<string>()
+    const source = watch.source
+
     let stopped = false
     const handle = async (event: ChangeEvent): Promise<void> => {
       const path = changeEventPath(event)
@@ -2826,24 +2865,10 @@ export class FactoryLoop implements Factory {
       }
 
       try {
-        const comment = await this.#readGithubIssueComment(path)
-        if (!comment || comment.isBot || !comment.body.trim() || comment.body.includes(`<!-- ${GITHUB_ESCALATION_MARKER_PREFIX}`)) {
-          return
-        }
-        const commentKey = `${comment.commentId}:${stableHash(JSON.stringify(comment.raw))}`
-        if (seenComments.has(commentKey)) {
-          this.#increment('githubIssueCommentDuplicatesSuppressed')
-          return
-        }
-        seenComments.add(commentKey)
-
-        const currentRecord = this.#githubIssueCommentWatchRecords.get(key)
-        if (currentRecord) {
-          await this.#routeGithubAnswerToImplementers(currentRecord, comment)
-        }
+        await this.#handleGithubIssueComment(key, path)
       } catch (error) {
         this.#logger.error?.('[factory] failed to handle GitHub issue comment reply', {
-          issue: record.issue,
+          issue: watch.issue,
           path,
           error,
         })
@@ -2857,11 +2882,11 @@ export class FactoryLoop implements Factory {
         void handle(event)
       })
     } catch (error) {
-      this.#githubIssueCommentWatchRecords.delete(key)
+      this.#githubIssueCommentWatchStates.delete(key)
       this.#surfaceEscalationDeliveryFailure(
         'github-reply-watcher',
-        record.issue,
-        githubEscalationCorrelationId('reply-watcher', record.issue, key),
+        watch.issue,
+        githubEscalationCorrelationId('reply-watcher', watch.issue, key),
         'GitHub issue comment reply subscription failed',
         error,
       )
@@ -2874,30 +2899,115 @@ export class FactoryLoop implements Factory {
         await this.#boundedStopTeardown('GitHub issue comment subscription unsubscribe', () => subscription.unsubscribe())
       },
     })
+    await this.#replayGithubIssueComments(key)
     return true
   }
 
-  async #stopGithubIssueCommentWatcher(source: GithubIssueSourceRef): Promise<void> {
+  async #stopGithubIssueCommentWatcher(source: GithubIssueSourceRef, clearPersisted = true): Promise<void> {
     const key = githubIssueSourceKey(source)
     const watcher = this.#githubIssueCommentWatchers.get(key)
     this.#githubIssueCommentWatchers.delete(key)
-    this.#githubIssueCommentWatchRecords.delete(key)
+    this.#githubIssueCommentWatchStates.delete(key)
+    if (clearPersisted) {
+      await this.#state.clearGithubIssueCommentWatch(this.#workspaceId, key)
+    }
     await watcher?.stop()
   }
 
   async #stopGithubIssueCommentWatcherForIssue(issue: IssueRef): Promise<void> {
     const keysToStop: string[] = []
-    for (const [key, record] of this.#githubIssueCommentWatchRecords) {
-      if (record.issue.uuid === issue.uuid || record.issue.path === issue.path) {
+    for (const [key, watch] of this.#githubIssueCommentWatchStates) {
+      if (watch.issue.uuid === issue.uuid || watch.issue.path === issue.path) {
         keysToStop.push(key)
       }
     }
     for (const key of keysToStop) {
       const watcher = this.#githubIssueCommentWatchers.get(key)
       this.#githubIssueCommentWatchers.delete(key)
-      this.#githubIssueCommentWatchRecords.delete(key)
+      this.#githubIssueCommentWatchStates.delete(key)
+      await this.#state.clearGithubIssueCommentWatch(this.#workspaceId, key)
       await watcher?.stop()
     }
+  }
+
+  async #removeGithubIssueCommentPending(source: GithubIssueSourceRef, correlationId: string): Promise<void> {
+    const key = githubIssueSourceKey(source)
+    const watch = this.#githubIssueCommentWatchStates.get(key)
+    if (!watch) return
+    watch.pending = watch.pending.filter((pending) => pending.correlationId !== correlationId)
+    if (watch.pending.length === 0) {
+      await this.#stopGithubIssueCommentWatcher(source)
+      return
+    }
+    await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+  }
+
+  async #rearmGithubIssueCommentWatchers(): Promise<void> {
+    for (const [, watch] of await this.#state.listGithubIssueCommentWatches(this.#workspaceId)) {
+      if (watch.pending.length === 0) continue
+      try {
+        await this.#watchGithubIssueComments(watch)
+        this.#increment('githubIssueCommentWatchersRearmed')
+      } catch (error) {
+        this.#logger.warn?.('[factory] failed to re-arm GitHub issue comment watcher', {
+          issue: watch.issue,
+          error,
+        })
+      }
+    }
+  }
+
+  async #replayGithubIssueComments(key: string): Promise<void> {
+    const watch = this.#githubIssueCommentWatchStates.get(key)
+    if (!watch) return
+    const comments: Array<{ path: string; id: number }> = []
+    for (const path of await this.#githubIssueCommentPaths(watch.source)) {
+      const parts = githubIssueCommentPathParts(path)
+      const id = parts ? githubCommentNumericId(parts.commentId) : undefined
+      if (id !== undefined && id > githubCommentNumericId(watch.lastSeenCommentId)) {
+        comments.push({ path, id })
+      }
+    }
+    comments.sort((a, b) => a.id - b.id)
+    for (const comment of comments) {
+      await this.#handleGithubIssueComment(key, comment.path)
+    }
+  }
+
+  async #githubIssueCommentPaths(source: GithubIssueSourceRef): Promise<string[]> {
+    const paths = new Set<string>()
+    const owner = encodeURIComponent(source.owner)
+    const repo = encodeURIComponent(source.repo)
+    for (const prefix of [
+      `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+      `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+    ]) {
+      try {
+        for (const path of await this.#mount.listTree(prefix)) {
+          const parts = githubIssueCommentPathParts(path)
+          if (
+            parts &&
+            parts.owner.toLowerCase() === source.owner.toLowerCase() &&
+            parts.repo.toLowerCase() === source.repo.toLowerCase() &&
+            parts.number === source.number
+          ) {
+            paths.add(path)
+          }
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] unable to list GitHub issue comments for replay', { prefix, error })
+      }
+    }
+    return [...paths]
+  }
+
+  async #latestGithubIssueCommentId(source: GithubIssueSourceRef): Promise<string | undefined> {
+    let latest = 0
+    for (const path of await this.#githubIssueCommentPaths(source)) {
+      const id = githubCommentNumericId(githubIssueCommentPathParts(path)?.commentId)
+      if (id > latest) latest = id
+    }
+    return latest > 0 ? String(latest) : undefined
   }
 
   async #readGithubIssueComment(path: string): Promise<GithubIssueComment | undefined> {
@@ -2910,20 +3020,63 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #routeGithubAnswerToImplementers(record: InFlightIssue, comment: GithubIssueComment): Promise<DispatchResult | undefined> {
-    const text = comment.body.trim()
-    const liveRecord = (await this.#batch()).getIssue(record.issue)
-    if (!liveRecord || liveRecord.dryRun) {
-      if (isTriageEscalationWatchRecord(record)) {
-        return await this.#handleTriageEscalationGithubAnswer(record, text)
-      }
-      this.#increment('githubAnswersIgnoredNoInFlight')
+  async #handleGithubIssueComment(key: string, path: string): Promise<void> {
+    const watch = this.#githubIssueCommentWatchStates.get(key)
+    if (!watch) return
+    const comment = await this.#readGithubIssueComment(path)
+    if (!comment) return
+    const commentId = githubCommentNumericId(comment.commentId)
+    if (commentId <= githubCommentNumericId(watch.lastSeenCommentId)) {
+      this.#increment('githubIssueCommentDuplicatesSuppressed')
       return
     }
 
-    if (!this.#fleet.sendInput) {
-      return
+    const reply = githubCorrelatedReply(comment.body)
+    const pending = reply
+      ? watch.pending.find((candidate) => candidate.correlationId === reply.correlationId)
+      : undefined
+    let resolved = false
+    if (pending && !comment.isBot && comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()) {
+      resolved = await this.#routeGithubAnswerToImplementers(watch, pending, comment, reply!.text)
+    } else if (pending && comment.author?.toLowerCase() !== pending.authorizedAuthor.toLowerCase()) {
+      this.#increment('githubAnswersIgnoredUnauthorizedAuthor')
+      this.#logger.info?.('[factory] ignored GitHub issue answer from unauthorized author', {
+        issue: watch.issue,
+        correlationId: pending.correlationId,
+        author: comment.author,
+        authorizedAuthor: pending.authorizedAuthor,
+      })
+    } else if (!reply && comment.body.includes('[factory-reply:')) {
+      this.#increment('githubAnswersIgnoredMissingCorrelationPrefix')
     }
+
+    watch.lastSeenCommentId = String(commentId)
+    if (resolved && pending) {
+      watch.pending = watch.pending.filter((candidate) => candidate.correlationId !== pending.correlationId)
+    }
+    if (watch.pending.length === 0) {
+      await this.#stopGithubIssueCommentWatcher(watch.source)
+    } else {
+      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+    }
+  }
+
+  async #routeGithubAnswerToImplementers(
+    watch: GithubIssueCommentWatchState,
+    pending: GithubIssueCommentWatchPending,
+    comment: GithubIssueComment,
+    text: string,
+  ): Promise<boolean> {
+    if (pending.kind === 'triage' && pending.decision) {
+      return await this.#handleTriageEscalationGithubAnswer(escalationWatchRecord(pending.decision), text)
+    }
+
+    const liveRecord = (await this.#batch()).getIssue(watch.issue)
+    if (!liveRecord || liveRecord.dryRun) {
+      this.#increment('githubAnswersIgnoredNoInFlight')
+      return false
+    }
+    if (!this.#fleet.sendInput) return false
 
     const recipients = [...liveRecord.agents.values()]
       .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
@@ -2931,34 +3084,35 @@ export class FactoryLoop implements Factory {
       .filter((name): name is string => Boolean(name))
     if (recipients.length === 0) {
       this.#increment('githubAnswersIgnoredNoImplementer')
-      return
+      return false
     }
 
     for (const recipient of new Set(recipients)) {
       await this.#fleet.sendInput(recipient, githubReplyEvent(liveRecord.issue, text, comment.author))
       this.#increment('githubAnswersInjected')
     }
+    return true
   }
 
-  async #handleTriageEscalationGithubAnswer(record: InFlightIssue, text: string): Promise<DispatchResult | undefined> {
+  async #handleTriageEscalationGithubAnswer(record: InFlightIssue, text: string): Promise<boolean> {
     const issue = await this.#readIssue(record.issue.path)
     if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isDispatchableIssue(issue)) {
       this.#increment('githubTriageAnswersIgnoredIssueUnavailable')
-      return
+      return false
     }
     if (!this.#isIssueReady(issue)) {
       this.#increment('githubTriageAnswersIgnoredIssueNotReady')
-      return
+      return false
     }
 
     const batch = await this.#batch()
     if (batch.isInFlight(record.issue) || batch.isQueued(record.issue)) {
       this.#increment('githubTriageAnswersIgnoredAlreadyActive')
-      return
+      return false
     }
     if (await this.#dispatchBlockReason(record.issue)) {
       this.#increment('githubTriageAnswersIgnoredBlocked')
-      return
+      return false
     }
 
     const clarifiedIssue = issueWithGithubClarification(issue, text)
@@ -2972,20 +3126,20 @@ export class FactoryLoop implements Factory {
         this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
         const result = await this.#startOrQueueGithubClarifiedDecision(dispatchAfterGithubClarification(decision, escalationReason))
         this.#increment('githubTriageAnswersDispatchedWithRemainingEscalation')
-        return result
+        return Boolean(result) || (await this.#batch()).isQueued(decision.issue)
       }
       this.#increment('githubTriageAnswersStillEscalated')
       this.#logger.warn?.('[factory] GitHub triage answer still leaves issue escalated', {
         issue: record.issue,
         reason: escalationReason,
       })
-      return
+      return false
     }
 
     this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
     const result = await this.#startOrQueueGithubClarifiedDecision(decision)
     this.#increment('githubTriageAnswersDispatched')
-    return result
+    return Boolean(result) || (await this.#batch()).isQueued(decision.issue)
   }
 
   async #startOrQueueGithubClarifiedDecision(decision: TriageDecision): Promise<DispatchResult | undefined> {
@@ -3938,18 +4092,24 @@ export class FactoryLoop implements Factory {
     const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const issue = await this.#readIssue(decision.issue.path)
     const source = issue ? githubIssueSourceRef(issue) : undefined
-    if (!issue || !source) {
+    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    if (!issue || !source || !authorizedAuthor) {
       this.#surfaceEscalationDeliveryFailure(
         'triage',
         decision.issue,
         correlationId,
-        'no Slack channel or stable GitHub issue write path is available',
+        'no Slack channel or GitHub issue write path with an identifiable issue reporter is available',
       )
       return
     }
 
-    const watcherCreated = this.#watchGithubIssueComments(source, escalationWatchRecord(decision))
-    if (!watcherCreated) {
+    const pendingAdded = await this.#addGithubIssueCommentWatch(decision.issue, source, {
+      correlationId,
+      kind: 'triage',
+      authorizedAuthor,
+      decision,
+    })
+    if (!pendingAdded) {
       return
     }
 
@@ -3958,12 +4118,14 @@ export class FactoryLoop implements Factory {
         `Factory needs clarification before dispatching ${decision.issue.key}.`,
         `Reason: ${reason}`,
         `Question: ${question}`,
+        `Authorized responder: @${authorizedAuthor} (the issue reporter).`,
+        `Reply with a comment that starts with \`${githubReplyPrefix(correlationId)}\`.`,
         '',
         githubEscalationMarker(correlationId),
       ].join('\n'))
       this.#increment('triageEscalationsPostedToGithub')
     } catch (error) {
-      await this.#stopGithubIssueCommentWatcher(source)
+      await this.#removeGithubIssueCommentPending(source, correlationId)
       this.#surfaceEscalationDeliveryFailure(
         'triage',
         decision.issue,
@@ -4822,6 +4984,17 @@ const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefi
   return { owner, repo, number: number!, url }
 }
 
+const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  const author = asRecord(payload.author) ?? asRecord(payload.user)
+  return (
+    stringValue(author?.login) ??
+    stringValue(author?.name) ??
+    stringValue(source?.author)
+  )?.trim() || undefined
+}
+
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
 
 const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefined): number[] => {
@@ -5331,6 +5504,24 @@ const githubEscalationCorrelationId = (kind: string, issue: IssueRef, text: stri
 
 const githubEscalationMarker = (correlationId: string): string =>
   `<!-- ${GITHUB_ESCALATION_MARKER_PREFIX}${correlationId} -->`
+
+const githubReplyPrefix = (correlationId: string): string =>
+  `[factory-reply:${correlationId}]`
+
+const githubCorrelatedReply = (body: string): { correlationId: string; text: string } | undefined => {
+  if (!body.startsWith('[factory-reply:')) return undefined
+  const markerEnd = body.indexOf(']')
+  if (markerEnd < 0) return undefined
+  const correlationId = body.slice('[factory-reply:'.length, markerEnd)
+  if (!/^factory-(?:triage|agent-question)-[a-z0-9]+$/u.test(correlationId)) return undefined
+  const text = body.slice(markerEnd + 1).replace(/^\s*:?\s*/u, '').trim()
+  return text ? { correlationId, text } : undefined
+}
+
+const githubCommentNumericId = (value: string | undefined): number => {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+}
 
 const githubIssueReadCandidatePaths = (path: string): string[] => {
   if (path.endsWith('/')) {
