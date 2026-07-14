@@ -37,6 +37,7 @@ describe('createFleet', () => {
   it('forwards the owned-broker agent exit timeout to the internal client', async () => {
     vi.useFakeTimers()
     try {
+      vi.stubEnv('FACTORY_AGENT_EXIT_TIMEOUT_MS', '60')
       const shutdown = vi.fn()
       const harness = { ...fakeHarness, shutdown }
       const fleet = createFleet(
@@ -47,6 +48,30 @@ describe('createFleet', () => {
 
       const disposed = fleet.dispose()
       await vi.advanceTimersByTimeAsync(24)
+      expect(shutdown).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+      await disposed
+      expect(shutdown).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('uses the agent exit timeout environment override for direct createFleet callers', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubEnv('FACTORY_AGENT_EXIT_TIMEOUT_MS', '60000')
+      const shutdown = vi.fn()
+      const harness = { ...fakeHarness, shutdown }
+      const fleet = createFleet(
+        { backend: 'internal' },
+        { harnessClient: harness, ownsBroker: true },
+      )
+      await fleet.spawn({ name: 'ar-59-env-timeout', capability: 'spawn:codex' })
+
+      const disposed = fleet.dispose()
+      await vi.advanceTimersByTimeAsync(59_999)
       expect(shutdown).not.toHaveBeenCalled()
 
       await vi.advanceTimersByTimeAsync(1)

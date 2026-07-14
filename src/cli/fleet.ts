@@ -16,6 +16,7 @@ import {
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
+  parseOwnedBrokerAgentExitTimeoutMs,
   readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
@@ -252,10 +253,7 @@ function parseFleetSubcommand(args: string[]): ParsedCommand {
 
 export function parseGlobalOptions(argv: string[]): { globals: GlobalOptions; args: string[] } {
   const args: string[] = []
-  const envAgentExitTimeoutMs = parseAgentExitTimeout(
-    process.env.FACTORY_AGENT_EXIT_TIMEOUT_MS,
-    'FACTORY_AGENT_EXIT_TIMEOUT_MS',
-  )
+  const envAgentExitTimeoutMs = parseOwnedBrokerAgentExitTimeoutMs(process.env.FACTORY_AGENT_EXIT_TIMEOUT_MS)
   const globals: GlobalOptions = {
     backend: 'internal',
     dryRun: false,
@@ -270,10 +268,12 @@ export function parseGlobalOptions(argv: string[]): { globals: GlobalOptions; ar
     } else if (arg === '--config') {
       globals.config = requireValue(argv, ++index, '--config')
     } else if (arg === '--agent-exit-timeout') {
-      globals.agentExitTimeoutMs = parseAgentExitTimeout(
-        requireValue(argv, ++index, '--agent-exit-timeout'),
-        '--agent-exit-timeout',
-      )
+      const value = requireValue(argv, ++index, '--agent-exit-timeout')
+      const timeoutMs = parseOwnedBrokerAgentExitTimeoutMs(value)
+      if (timeoutMs === undefined) {
+        throw new Error('--agent-exit-timeout must be a positive integer number of milliseconds')
+      }
+      globals.agentExitTimeoutMs = timeoutMs
     } else if (arg === '--dry-run') {
       globals.dryRun = true
     } else {
@@ -752,15 +752,6 @@ function requireValue(args: string[], index: number, flag: string): string {
   const value = args[index]
   if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`)
   return value
-}
-
-function parseAgentExitTimeout(value: string | undefined, source: string): number | undefined {
-  if (value === undefined || value === '') return undefined
-  const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error(`${source} must be a positive integer number of milliseconds`)
-  }
-  return parsed
 }
 
 function writeJson(out: Pick<NodeJS.WriteStream, 'write'>, value: unknown): void {

@@ -50,7 +50,12 @@ export type {
   TriggerInputMapper,
   TriggerMapperContext,
 } from './dispatch/relayflow-registry'
-export { createFleet } from './fleet/create-fleet'
+export {
+  FACTORY_AGENT_EXIT_TIMEOUT_ENV,
+  createFleet,
+  parseOwnedBrokerAgentExitTimeoutMs,
+  resolveOwnedBrokerAgentExitTimeoutMs,
+} from './fleet/create-fleet'
 export type {
   CreateFleetDeps,
   CreateFleetOptions,

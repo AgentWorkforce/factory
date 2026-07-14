@@ -115,6 +115,12 @@ describe('fleet CLI parsing', () => {
         args: ['roster'],
       })
       expect(parseGlobalOptions(['roster', '--agent-exit-timeout', '45000']).globals.agentExitTimeoutMs).toBe(45_000)
+
+      vi.stubEnv('FACTORY_AGENT_EXIT_TIMEOUT_MS', 'invalid')
+      expect(parseGlobalOptions(['roster'])).toEqual({
+        globals: { backend: 'internal', dryRun: false },
+        args: ['roster'],
+      })
     } finally {
       vi.unstubAllEnvs()
     }
