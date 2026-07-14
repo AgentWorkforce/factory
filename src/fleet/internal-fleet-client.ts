@@ -149,6 +149,8 @@ export class InternalFleetClient implements FleetClient {
 
   async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
     assertSelfNode(input.node)
+    this.#ensureEventSubscription()
+    this.#readyAgentNames.delete(input.name ?? input.sessionRef)
 
     const spawnInput = this.#withAgentRelayMcpHarness({
       name: input.name ?? input.sessionRef,
@@ -185,8 +187,11 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async release(name: string, reason?: string): Promise<void> {
-    await this.#client.release(name, reason)
-    this.#readyAgentNames.delete(name)
+    try {
+      await this.#client.release(name, reason)
+    } finally {
+      this.#readyAgentNames.delete(name)
+    }
   }
 
   async roster(): Promise<RosterEntry> {
@@ -258,11 +263,6 @@ export class InternalFleetClient implements FleetClient {
       return { eventId, targets }
     }
 
-    const priorFailure = this.#failedDeliveries.get(eventId)
-    if (priorFailure) {
-      throw priorFailure
-    }
-
     return await new Promise((resolve, reject) => {
       const timeoutMs = opts?.timeoutMs ?? 30_000
       const timeout = setTimeout(() => {
@@ -300,6 +300,18 @@ export class InternalFleetClient implements FleetClient {
       // pending-map write. Resolve from the recent-event latch when it does.
       if (this.#injectedEventIdSet.has(eventId)) {
         this.#resolvePendingInjected(pending, eventId)
+        return
+      }
+
+      // delivery_failed can also arrive before sendMessage resolves. Defer its
+      // handling until the logical waiter exists so captured readiness can keep
+      // the recovery re-send alive while the failed event id is retired.
+      const priorFailure = this.#failedDeliveries.get(eventId)
+      if (priorFailure) {
+        if (targetWasReady || this.#readyAgentNames.has(input.to)) {
+          this.#triggerReadyResend(pending)
+        }
+        this.#failPendingInjectedEvent(pending, eventId, priorFailure)
       }
     })
   }
@@ -529,6 +541,11 @@ export class InternalFleetClient implements FleetClient {
       pending.resendInFlight = false
       if (pending.eventIds.size === 0) {
         this.#rejectPendingInjected(pending, error instanceof Error ? error : new Error(String(error)))
+      } else {
+        this.#logger?.warn?.(
+          '[factory-sdk] readiness-triggered resend failed, but original event is still active',
+          error,
+        )
       }
     }
   }
