@@ -143,6 +143,11 @@ export class InternalFleetClient implements FleetClient {
     const handle = await this.#client.spawnPty(spawnInput)
 
     this.#clearAgentExitLatch(handle.name)
+    // A fresh broker's event stream can miss the first worker_ready edge while
+    // it is still connecting. The successful spawn response is the broker's
+    // authoritative registration signal, so feed it through the same bounded
+    // re-send path.
+    this.#markAgentReady(handle.name)
 
     return spawnResultFrom(handle)
   }
@@ -409,12 +414,7 @@ export class InternalFleetClient implements FleetClient {
 
   #handleBrokerEvent(event: BrokerEvent): void {
     if (event.kind === 'worker_ready') {
-      this.#readyAgentNames.add(event.name)
-      for (const pending of new Set(this.#pendingInjected.values())) {
-        if (pending.input.to === event.name) {
-          this.#triggerReadyResend(pending)
-        }
-      }
+      this.#markAgentReady(event.name)
       return
     }
 
@@ -471,6 +471,15 @@ export class InternalFleetClient implements FleetClient {
     if (event.kind === 'agent_exited') {
       this.#readyAgentNames.delete(event.name)
       this.#emitAgentExit(event.name, event.reason ?? exitReason(event), eventIdentity(event))
+    }
+  }
+
+  #markAgentReady(name: string): void {
+    this.#readyAgentNames.add(name)
+    for (const pending of new Set(this.#pendingInjected.values())) {
+      if (pending.input.to === name) {
+        this.#triggerReadyResend(pending)
+      }
     }
   }
 
