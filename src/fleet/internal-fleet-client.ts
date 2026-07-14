@@ -236,13 +236,11 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async #releaseWithRetry(name: string, reason?: string): Promise<void> {
-    let lastError: unknown
     for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
         await this.#client.release(name, reason)
         return
       } catch (error) {
-        lastError = error
         if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS || !isRetryableReleaseError(error)) {
           throw error
         }
@@ -255,9 +253,6 @@ export class InternalFleetClient implements FleetClient {
         await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
       }
     }
-    // Loop only exits via return or throw; this line is unreachable but keeps
-    // the type checker satisfied.
-    throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
   async roster(): Promise<RosterEntry> {

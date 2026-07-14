@@ -458,8 +458,8 @@ describe('InternalFleetClient', () => {
   it('retries a release rejected as retryable (broker http_500 / internal reply dropped) and succeeds', async () => {
     // Regression for factory#65: on cold-start dispatch completion the broker
     // occasionally drops the release reply and answers http_500 with
-    // retryable: true. The transient failure must not surface as a warning —
-    // a bounded retry recovers a graceful release.
+    // retryable: true. The transient failure must not reach the orchestrator's
+    // final release-failed warning — a bounded retry recovers a graceful release.
     vi.useFakeTimers()
     try {
       class TransientRetryableReleaseHarnessDriverClient extends FakeHarnessDriverClient {
@@ -530,9 +530,12 @@ describe('InternalFleetClient', () => {
       await fleet.spawn({ name: 'ar-19-review', capability: 'spawn:codex' })
 
       const released = fleet.release('ar-19-review', 'issue-done')
+      // Observe the rejection before advancing through the final attempt so
+      // Vitest never sees an intermediate unhandled rejection.
+      const releaseRejected = expect(released).rejects.toThrow('internal reply dropped')
       // Two backoffs (250ms + 500ms) between three attempts.
       await vi.advanceTimersByTimeAsync(250 + 500)
-      await expect(released).rejects.toThrow('internal reply dropped')
+      await releaseRejected
       expect(harness.attempts).toBe(3)
 
       // The failed release is still terminal for lifecycle bookkeeping — a
