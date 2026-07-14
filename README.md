@@ -114,8 +114,10 @@ From a source checkout instead of an npm install, run
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
-`--backend <internal|relay>`. The internal backend reuses a relay broker that's
-already running for your workspace, and starts one if none is.
+`--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
+backend reuses a relay broker that's already running for your workspace, and
+starts one if none is. For self-started brokers, the agent-exit timeout defaults
+to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
