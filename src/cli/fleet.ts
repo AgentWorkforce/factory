@@ -104,10 +104,16 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'factory-close-probe') {
       // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
+      const githubWrite = deps.probeCloser
+        ? undefined
+        : (deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
+            workspaceId: (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId,
+          })).githubWrite
       const result = await (deps.probeCloser ?? closeProbePr)({
         repo: command.repo,
         prNumber: command.prNumber,
         expectedIssueKey: command.issue,
+        ...(githubWrite ? { githubWrite } : {}),
       })
       writeJson(out, result)
       return 0

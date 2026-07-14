@@ -11,6 +11,7 @@ import type {
   AgentSpec,
   ChangeEvent,
   FleetClient,
+  GithubPublishPullRequestResult,
   GithubWriteback,
   LinearWriteback,
   MountClient,
@@ -275,6 +276,7 @@ export class FactoryLoop implements Factory {
   // Issue key -> the open PR the babysitter is shepherding, including the
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, { repo: string; prNumber: number; path?: string }>()
+  readonly #publishedPullRequests = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
@@ -2492,6 +2494,20 @@ export class FactoryLoop implements Factory {
     const exiting = record.agents.get(name)
 
     if (isCompletionReason(reason)) {
+      let publishedPr: GithubPublishPullRequestResult | undefined
+      if (
+        exiting?.spec.role === 'implementer' &&
+        !record.dryRun &&
+        (this.#mount.githubWrite || this.#mount.writebackTransport === 'relayfile-cloud')
+      ) {
+        try {
+          publishedPr = await this.#publishImplementerPullRequest(record, exiting)
+        } catch (error) {
+          this.#increment('githubPullRequestPublishFailures')
+          this.#error(error, record.issue)
+          return
+        }
+      }
       if (this.#config.babysitter.enabled && !record.dryRun) {
         // Babysitter path: an implementer/reviewer finishing does NOT mark the
         // issue done — it hands the open PR to the babysitter. The babysitter
@@ -2499,6 +2515,12 @@ export class FactoryLoop implements Factory {
         // advance to Human Review.
         if (exiting?.spec.role === 'babysitter') {
           await this.#maybeAdvanceToHumanReview(record)
+        } else if (publishedPr) {
+          await this.#ensureBabysitter(record, {
+            repo: publishedPr.repo,
+            prNumber: publishedPr.number,
+            url: publishedPr.url,
+          })
         } else {
           await this.#ensureBabysitterForIssue(record)
         }
@@ -2586,6 +2608,44 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#error(error, record.issue)
     }
+  }
+
+  async #publishImplementerPullRequest(
+    record: InFlightIssue,
+    implementer: TrackedAgent,
+  ): Promise<GithubPublishPullRequestResult | undefined> {
+    const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
+    if (this.#publishedPullRequests.has(key)) return undefined
+
+    const githubWrite = this.#mount.githubWrite
+    if (!githubWrite) {
+      throw new Error('GitHub write path not available on this mount — connect GitHub to your workspace')
+    }
+    if (!implementer.spec.clonePath) {
+      throw new Error(`GitHub PR publication requires a configured clone path for ${implementer.spec.repo}`)
+    }
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue) {
+      throw new Error(`Unable to publish GitHub PR: issue ${record.issue.key} is no longer readable`)
+    }
+
+    const repo = normalizeGithubRepo(implementer.spec.repo)
+    const result = await githubWrite.publishPullRequest({
+      repo,
+      clonePath: implementer.spec.clonePath,
+      baseRef: 'main',
+      title: `${issue.key}: ${issue.title}`,
+      body: githubPullRequestBody(issue),
+    })
+    this.#publishedPullRequests.add(key)
+    this.#increment('githubPullRequestsPublished')
+    this.#logger.info?.('[factory] published PR through workspace GitHub connection', {
+      issue: issue.key,
+      repo: result.repo,
+      prNumber: result.number,
+      url: result.url,
+    })
+    return result
   }
 
   // An implementer that exited, was resumed once, and STILL produced no PR is
@@ -3819,6 +3879,9 @@ export class FactoryLoop implements Factory {
       this.#probePrResolvedCache.delete(completionKey)
       this.#babysitterSpawned.delete(record.issue.key)
       this.#babysitterPr.delete(record.issue.key)
+      for (const publishedKey of this.#publishedPullRequests) {
+        if (publishedKey.startsWith(`${record.issue.key}:`)) this.#publishedPullRequests.delete(publishedKey)
+      }
     }
   }
 
@@ -4778,6 +4841,7 @@ export class FactoryLoop implements Factory {
       prNumber: probe.prNumber,
       expectedIssueKey: issue.key,
       requireTitleMarker: false,
+      ...(this.#mount.githubWrite ? { githubWrite: this.#mount.githubWrite } : {}),
     })
     this.#increment('mergeGateSyntheticClosed')
   }
@@ -6228,6 +6292,16 @@ const labelName = (value: unknown): string | undefined => {
 
 const isCompletionReason = (reason?: string): boolean =>
   reason === 'issue-done' || reason === 'done' || reason === 'completed'
+
+const normalizeGithubRepo = (repo: string): string => repo.includes('/') ? repo : `AgentWorkforce/${repo}`
+
+const githubPullRequestBody = (issue: LinearIssue): string => [
+  issue.description,
+  '',
+  isGithubIssue(issue) && /^\d+$/u.test(issue.key)
+    ? `Fixes #${issue.key}`
+    : `Factory issue ${issue.key}`,
+].join('\n').trim()
 
 // The broker rejects re-registering a name it never released on exit
 // (relay#1116-family) with a 500 "agent '<name>' already exists". Detect it from
