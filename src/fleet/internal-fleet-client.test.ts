@@ -553,6 +553,25 @@ describe('InternalFleetClient', () => {
     ])
   })
 
+  it('re-sends a pending injection when its target registers through a fresh spawn', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:codex' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
   it('re-sends an unconfirmed injection when the matching worker becomes ready', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness })
