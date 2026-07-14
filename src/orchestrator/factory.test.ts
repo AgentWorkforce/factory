@@ -7271,7 +7271,7 @@ describe('FactoryLoop', () => {
 
   it('posts low-confidence and thin GitHub triage escalation to the source issue when Slack is unconfigured', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 55)
-    const mount = new FakeMountClient({ [path]: githubIssueFile(55, { labels: ['factory'] }) })
+    const mount = new CountingEventsMount({ [path]: githubIssueFile(55, { labels: ['factory'] }) })
     const githubWriteback = new RecordingGithubWriteback()
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
@@ -7290,6 +7290,23 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.comments[0]?.body).toMatch(/<!-- factory-escalation:factory-triage-/u)
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.errors).toBeUndefined()
+    const watcherGlobs = mount.subscribeGlobs.at(-1) ?? []
+    expect(watcherGlobs).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues/55*/comments/**',
+      '/github/repos/AgentWorkforce__pear/issues/55*/comments/**',
+    ])
+    expect(watcherGlobs.some((glob) => globMatchesPath(
+      glob,
+      '/github/repos/AgentWorkforce/pear/issues/55__github-escalation/comments/9001/meta.json',
+    ))).toBe(true)
+    expect(watcherGlobs.some((glob) => globMatchesPath(
+      glob,
+      '/github/repos/AgentWorkforce/pear/issues/56/comments/9002/meta.json',
+    ))).toBe(false)
+    expect(watcherGlobs.some((glob) => globMatchesPath(
+      glob,
+      '/github/repos/OtherOrg/pear/issues/55/comments/9003/meta.json',
+    ))).toBe(false)
   })
 
   it('prefers Slack over a GitHub issue comment for triage escalation when Slack is configured', async () => {

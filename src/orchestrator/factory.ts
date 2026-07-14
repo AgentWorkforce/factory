@@ -2853,7 +2853,7 @@ export class FactoryLoop implements Factory {
 
     let subscription: Subscription
     try {
-      subscription = this.#mount.subscribe([LIVE_GITHUB_ISSUE_GLOB], (event) => {
+      subscription = this.#mount.subscribe(githubIssueCommentGlobs(source), (event) => {
         void handle(event)
       })
     } catch (error) {
@@ -2886,10 +2886,13 @@ export class FactoryLoop implements Factory {
   }
 
   async #stopGithubIssueCommentWatcherForIssue(issue: IssueRef): Promise<void> {
+    const keysToStop: string[] = []
     for (const [key, record] of this.#githubIssueCommentWatchRecords) {
-      if (record.issue.uuid !== issue.uuid && record.issue.path !== issue.path) {
-        continue
+      if (record.issue.uuid === issue.uuid || record.issue.path === issue.path) {
+        keysToStop.push(key)
       }
+    }
+    for (const key of keysToStop) {
       const watcher = this.#githubIssueCommentWatchers.get(key)
       this.#githubIssueCommentWatchers.delete(key)
       this.#githubIssueCommentWatchRecords.delete(key)
@@ -5312,6 +5315,16 @@ const parseGithubIssueComment = (path: string, content: unknown): GithubIssueCom
 
 const githubIssueSourceKey = (source: GithubIssueSourceRef): string =>
   `${source.owner.toLowerCase()}/${source.repo.toLowerCase()}#${source.number}`
+
+const githubIssueCommentGlobs = (source: GithubIssueSourceRef): string[] => {
+  const owner = encodeURIComponent(source.owner)
+  const repo = encodeURIComponent(source.repo)
+  const issueSegment = `${source.number}*`
+  return [
+    `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues/${issueSegment}/comments/**`,
+    `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/${issueSegment}/comments/**`,
+  ]
+}
 
 const githubEscalationCorrelationId = (kind: string, issue: IssueRef, text: string): string =>
   `factory-${kind}-${stableHash(`${issue.uuid}:${issue.path}:${text}`)}`
