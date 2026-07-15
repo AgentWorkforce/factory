@@ -334,6 +334,35 @@ class ResumeNameCollisionFleetClient extends FakeFleetClient {
   }
 }
 
+// Mimics the broker's own restartPolicy re-registering an exited agent's name
+// before the orchestrator's no-sessionRef RESPAWN runs, so the respawn collides
+// with http 500 "already exists" (the real relay#1116 path exercised in the
+// factory-e2e run for #67 — the first spawn of a name succeeds, a later respawn
+// of the same name collides).
+class RespawnNameCollisionFleetClient extends FakeFleetClient {
+  readonly terminalAgents: Array<{ name: string; reason?: string }> = []
+  readonly #spawnCounts = new Map<string, number>()
+
+  markAgentTerminal(name: string, reason?: string): void {
+    this.terminalAgents.push({ name, reason })
+  }
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const count = (this.#spawnCounts.get(input.name) ?? 0) + 1
+    this.#spawnCounts.set(input.name, count)
+    if (count > 1) {
+      this.spawns.push(input)
+      throw Object.assign(new Error(`agent '${input.name}' already exists`), {
+        code: 'http_500',
+        status: 500,
+        retryable: true,
+        data: { error: `agent '${input.name}' already exists`, name: input.name, success: false },
+      })
+    }
+    return await super.spawn(input)
+  }
+}
+
 class ManualClock {
   value = 0
 
@@ -5367,8 +5396,12 @@ describe('FactoryLoop', () => {
     await flush()
 
     expect(fleet.resumes).toHaveLength(1) // resumed once, collided, then short-circuited
+    // The implementer is marked terminal by the collision branch; the reviewer
+    // is then marked terminal by the conclude path (#67) as it is torn down so
+    // it cannot hang the dispatch waiting on a DM that will never arrive.
     expect(fleet.terminalAgents).toEqual([
       { name: 'ar-80-impl-pear', reason: 'resume-already-exists' },
+      { name: 'ar-80-review', reason: 'implementer-terminal:resume-already-exists' },
     ])
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
@@ -5411,6 +5444,155 @@ describe('FactoryLoop', () => {
       '[factory-sdk] timed out waiting for spawned agents to exit; shutting down the owned relay broker',
       expect.anything(),
     )
+  })
+
+  // #67: the reviewer's prompt is "Wait for a DM from the implementer(s)". When
+  // the implementer's resume collides on a leaked broker name it is terminal and
+  // never sends that DM, so the reviewer used to stay live forever and stall the
+  // owned-broker dispose-wait. The orchestrator must now signal and tear down the
+  // reviewer so the dispatch resolves.
+  it('signals and releases a waiting reviewer when an implementer resume collides and no PR exists (#67)', async () => {
+    const mount = new FakeMountClient({ [issuePath(82)]: issueFile(82) })
+    const fleet = new ResumeNameCollisionFleetClient()
+    fleet.setSessionRef('ar-82-impl-pear', 'session-impl-82')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(82), issueFile(82)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-82-impl-pear', 'crash')
+    await flush()
+
+    // The reviewer is signaled that the implementer terminated (a synthetic DM
+    // "from" the implementer it was blocked on) ...
+    const reviewerSignal = fleet.messages.find(
+      (message) => message.to === 'ar-82-review' && message.from === 'ar-82-impl-pear',
+    )
+    expect(reviewerSignal).toBeDefined()
+    expect(reviewerSignal?.text).toMatch(/terminated/i)
+    // ... and then torn down so the dispatch does not hang.
+    expect(fleet.releases.map((release) => release.name)).toContain('ar-82-review')
+    expect(factory.status().counters.resumeNameCollisions).toBe(1)
+    expect(factory.status().counters.issuesStalledNoPr).toBe(1)
+    expect(factory.status().counters.errors ?? 0).toBe(0)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  // If the PR the implementer opened becomes visible only after the collision
+  // (mount lag at exit time is why we fell through to resume), re-probing lets
+  // the dispatch complete cleanly and release the reviewer instead of abandoning.
+  it('completes and releases the reviewer when a PR is visible after an implementer resume collision (#67)', async () => {
+    const issue = realIssueFile(83, ready, { title: 'Real implementer PR after collision' })
+    const mount = new FakeMountClient({ [issuePath(83)]: issue })
+    const fleet = new ResumeNameCollisionFleetClient()
+    fleet.setSessionRef('ar-83-impl-pear', 'session-impl-83')
+    let probeCalls = 0
+    const factory = createFactory(config({ safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      // No PR on the first (pre-resume) probe; it becomes visible by the
+      // post-collision probe inside the conclude path.
+      probePrResolver: async () => (probeCalls++ === 0 ? undefined : { repo: 'AgentWorkforce/pear', prNumber: 83 }),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(83), issue))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-83-impl-pear', 'crash')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    expect(fleet.resumes).toHaveLength(1) // collided once, then recovered via the PR probe
+    expect(fleet.releases.map((release) => release.name)).toEqual(
+      expect.arrayContaining(['ar-83-impl-pear', 'ar-83-review']),
+    )
+    expect(factory.status().counters.issuesStalledNoPr ?? 0).toBe(0)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  // End-to-end at the real InternalFleetClient level: unlike the defense-in-depth
+  // test above (which manually releases the reviewer), the orchestrator now tears
+  // the reviewer down itself, so the owned-broker dispose-wait drains promptly.
+  it('drains owned dispose without a manual reviewer release after an implementer collision (#67)', async () => {
+    const mount = new FakeMountClient({ [issuePath(85)]: issueFile(85) })
+    const harness = new ResumeCollisionHarnessClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const fleet = new InternalFleetClient({
+      client: harness,
+      ownsBroker: true,
+      ownedBrokerAgentExitTimeoutMs: 25,
+      logger,
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger,
+      processFinder: async () => ({ status: 'missing' }),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(85), issueFile(85))))
+    harness.emit({
+      kind: 'agent_exit',
+      name: 'ar-85-impl-pear',
+      reason: 'crash',
+      event_id: 'ar-85-impl-exit',
+    } as BrokerEvent)
+
+    // The orchestrator releases the stuck reviewer on its own — no manual release.
+    await vi.waitFor(() => expect(harness.releases.map((release) => release.name)).toContain('ar-85-review'))
+    await fleet.dispose()
+
+    expect(harness.shutdownCalls).toBe(1)
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      '[factory-sdk] timed out waiting for spawned agents to exit; shutting down the owned relay broker',
+      expect.anything(),
+    )
+  })
+
+  // The collision the factory-e2e run for #67 actually hit: a fresh implementer
+  // has no sessionRef, so its exit takes the RESPAWN branch (#fleet.spawn), and
+  // the broker's own restartPolicy has already re-registered the name — the
+  // respawn collides. Before the fix this surfaced as a hard `[factory] error`
+  // and left the reviewer live to stall dispose; now it is treated as terminal
+  // and the reviewer is signaled + torn down.
+  it('handles a no-sessionRef respawn collision without a hard error and releases the reviewer (#67)', async () => {
+    const mount = new FakeMountClient({ [issuePath(86)]: issueFile(86) })
+    const fleet = new RespawnNameCollisionFleetClient()
+    // No setSessionRef for the implementer -> tracked.sessionRef is undefined ->
+    // the exit takes the respawn branch, not resume.
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(86), issueFile(86)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-86-impl-pear', 'crash')
+    await flush()
+
+    // The collision is treated as terminal, not surfaced as a hard error ...
+    expect(factory.status().counters.errors ?? 0).toBe(0)
+    expect(factory.status().counters.resumeNameCollisions).toBe(1)
+    expect(fleet.resumes).toEqual([]) // respawn path, never resume
+    expect(fleet.terminalAgents).toEqual([
+      { name: 'ar-86-impl-pear', reason: 'respawn-already-exists' },
+      { name: 'ar-86-review', reason: 'implementer-terminal:respawn-already-exists' },
+    ])
+    // ... and the reviewer is signaled then released so dispatch does not hang.
+    const reviewerSignal = fleet.messages.find(
+      (message) => message.to === 'ar-86-review' && message.from === 'ar-86-impl-pear',
+    )
+    expect(reviewerSignal).toBeDefined()
+    expect(fleet.releases.map((release) => release.name)).toContain('ar-86-review')
+    expect(factory.status().counters.issuesStalledNoPr).toBe(1)
+    expect(factory.status().inFlight).toEqual([])
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {

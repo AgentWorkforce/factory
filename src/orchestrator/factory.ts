@@ -2549,10 +2549,12 @@ export class FactoryLoop implements Factory {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
           // Already resumed once and STILL exiting with no completion PR — the
-          // agent isn't making progress. Escalate so a human notices, instead of
-          // leaving the issue silently in-flight forever.
+          // agent isn't making progress. Conclude the dispatch so a human
+          // notices AND the reviewer waiting on the implementer's DM is torn
+          // down, instead of leaving the issue silently in-flight forever with
+          // a live reviewer stalling the owned-broker dispose-wait (#67).
           if (tracked.spec.role === 'implementer') {
-            await this.#escalateStalledIssue(record, name)
+            await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
           }
           return
         }
@@ -2584,6 +2586,13 @@ export class FactoryLoop implements Factory {
               issue: record.issue.key,
               name,
             })
+            // The implementer is now terminal but never sent the completion DM
+            // the reviewer is blocked on ("Wait for a DM from the
+            // implementer(s)"). Resolve the dispatch so the reviewer does not
+            // stay live forever and stall the owned-broker dispose-wait (#67).
+            if (tracked.spec.role === 'implementer') {
+              await this.#concludeTerminalImplementer(record, name, 'resume-already-exists')
+            }
           } else {
             throw error
           }
@@ -2592,19 +2601,40 @@ export class FactoryLoop implements Factory {
         }
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
-        const result = await this.#fleet.spawn({
-          name: tracked.spec.name,
-          capability: tracked.spec.capability,
-          node: tracked.spec.node ?? 'self',
-          task: tracked.spec.task,
-          model: tracked.spec.model,
-          cwd: tracked.spec.clonePath,
-          sessionRef: tracked.spec.sessionRef,
-          invocationId,
-          restartPolicy: defaultRestartPolicy(tracked.spec),
-          channel: tracked.spec.channel,
-        })
-        batch.recordSpawn(record, tracked.spec, invocationId, result)
+        try {
+          const result = await this.#fleet.spawn({
+            name: tracked.spec.name,
+            capability: tracked.spec.capability,
+            node: tracked.spec.node ?? 'self',
+            task: tracked.spec.task,
+            model: tracked.spec.model,
+            cwd: tracked.spec.clonePath,
+            sessionRef: tracked.spec.sessionRef,
+            invocationId,
+            restartPolicy: defaultRestartPolicy(tracked.spec),
+            channel: tracked.spec.channel,
+          })
+          batch.recordSpawn(record, tracked.spec, invocationId, result)
+        } catch (error) {
+          if (!isAgentAlreadyExistsError(error)) {
+            throw error
+          }
+          // Same leaked-broker-name collision as the resume path, but on a
+          // no-sessionRef respawn: the broker's own restartPolicy already
+          // re-registered the name (relay#1116-family), so our respawn collides.
+          // Retrying just re-collides forever. Treat it as terminal for this
+          // name and resolve the dispatch so a reviewer blocked on the
+          // implementer's DM does not hang the owned-broker dispose-wait (#67).
+          this.#fleet.markAgentTerminal?.(name, 'respawn-already-exists')
+          this.#increment('resumeNameCollisions')
+          this.#logger.warn?.('[factory] respawn skipped: broker still holds agent name (relay#1116); not retrying', {
+            issue: record.issue.key,
+            name,
+          })
+          if (tracked.spec.role === 'implementer') {
+            await this.#concludeTerminalImplementer(record, name, 'respawn-already-exists')
+          }
+        }
       }
     } catch (error) {
       this.#error(error, record.issue)
@@ -2702,6 +2732,79 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to post stalled-issue escalation to Slack', error)
+    }
+  }
+
+  // An implementer that collided on its leaked broker name, or that exited a
+  // second time with no PR, is terminal: it will never send the completion DM
+  // the reviewer is blocked on (its prompt is literally "Wait for a DM from the
+  // implementer(s)"). Left alone, the reviewer stays live forever and the
+  // owned-broker dispose-wait stalls until FACTORY_AGENT_EXIT_TIMEOUT_MS
+  // (default 30 min), so the issue never reaches human-review (#67). Signal any
+  // waiting reviewer(s) so they can proceed, then resolve the dispatch
+  // deterministically: complete to the terminal state when a PR is now visible
+  // (mount lag at exit time is why we fell through to resume in the first
+  // place), otherwise escalate and tear down the stuck agents so dispose drains.
+  async #concludeTerminalImplementer(record: InFlightIssue, implementerName: string, reason: string): Promise<void> {
+    await this.#signalReviewersImplementerDone(record, implementerName, reason)
+    if (await this.#issueHasCompletionPr(record)) {
+      await this.#completeIssue(record)
+      return
+    }
+    await this.#escalateStalledIssue(record, implementerName)
+    await this.#abandonStuckDispatch(record, reason)
+  }
+
+  // Deliver a synthetic "implementer done" DM so a reviewer blocked on the
+  // implementer's message unblocks and proceeds (review the PR if one is open,
+  // otherwise conclude). Best-effort: the deterministic teardown below is the
+  // backstop when the reviewer cannot act on it.
+  async #signalReviewersImplementerDone(record: InFlightIssue, implementerName: string, reason: string): Promise<void> {
+    const reviewers = new Set(
+      [...record.agents.values()]
+        .filter((agent) => agent.spec.role === 'reviewer')
+        .map((agent) => agent.result?.name ?? agent.spec.name)
+        .filter((name): name is string => Boolean(name)),
+    )
+    for (const reviewer of reviewers) {
+      try {
+        await this.#fleet.sendMessage({
+          to: reviewer,
+          from: implementerName,
+          text: `[factory] implementer ${implementerName} has terminated (${reason}) and will send no further messages. If a pull request is open for this issue, review it now; otherwise conclude your review and DM \`broker\` that you are done.`,
+        })
+        this.#increment('reviewerImplementerTerminatedSignals')
+      } catch (error) {
+        this.#logger.warn?.('[factory] failed to signal reviewer of implementer termination', {
+          issue: record.issue.key,
+          reviewer,
+          error,
+        })
+      }
+    }
+  }
+
+  // Tear down agents still live after a terminal implementer produced no PR —
+  // chiefly the reviewer, blocked on a DM that will never arrive — and free the
+  // batch slot, so the owned-broker dispose-wait drains instead of stalling for
+  // the full agent-exit timeout. Marking each agent terminal first suppresses
+  // the release-driven exit event so it cannot re-trigger a resume before the
+  // record leaves the batch.
+  async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
+    const remaining = [...record.agents].filter(([, tracked]) => tracked.spec.role !== 'implementer')
+    for (const [agentName] of remaining) {
+      this.#fleet.markAgentTerminal?.(agentName, `implementer-terminal:${reason}`)
+    }
+    if (remaining.length > 0) {
+      await this.#releaseAndTerminateAgents(remaining, 'issue-abandoned', 'completion')
+    }
+    await this.#recordDispatchTerminal(record.issue)
+    const next = (await this.#batch()).complete(record.issue)
+    await this.#stopSlackWatcher(record.issue)
+    await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
+    await this.#writeInFlightRegistry()
+    if (next) {
+      await this.dispatch(next.decision, { dryRun: next.dryRun })
     }
   }
 
