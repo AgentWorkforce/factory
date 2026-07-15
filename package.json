@@ -55,14 +55,15 @@
     "factory-build": "factory-build/run-factory-build.sh"
   },
   "dependencies": {
-    "@agent-relay/cloud": "^9.0.2",
-    "@agent-relay/fleet": "^9.0.2",
-    "@agent-relay/harness-driver": "^9.0.2",
-    "@agent-relay/integration-prompts": "^9.0.2",
+    "@agent-relay/cloud": "^10.2.0",
+    "@agent-relay/fleet": "^10.2.0",
+    "@agent-relay/harness-driver": "^10.2.0",
+    "@agent-relay/integration-prompts": "^10.2.0",
+    "@agent-relay/sdk": "^10.2.0",
     "@relayfile/relay-helpers": "^0.4.2",
     "@relayfile/sdk": "^0.10.9",
     "@relayflows/core": "^1.0.3",
-    "agent-relay": "^9.0.1",
+    "agent-relay": "^10.2.0",
     "proper-lockfile": "^4.1.2",
     "zod": "^3.25.76"
   },
