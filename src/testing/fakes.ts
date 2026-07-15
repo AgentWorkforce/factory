@@ -180,8 +180,11 @@ export class FakeFleetClient implements FleetClient {
     | { kind: 'injected'; to: string; eventId: string }
     | { kind: 'input'; name: string; data: string }
   > = []
+  readonly hydrated: Array<{ name: string; invocationId?: string; node?: string }> = []
+  reconciles = 0
 
   #agents = new Set<string>()
+  #tracked = new Map<string, { invocationId?: string; node?: string }>()
   #exitListeners = new Set<ExitListener>()
   #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   #agentMessageListeners = new Set<AgentMessageListener>()
@@ -190,6 +193,10 @@ export class FakeFleetClient implements FleetClient {
   async spawn(input: SpawnInput): Promise<SpawnResult> {
     this.spawns.push(input)
     this.#agents.add(input.name)
+    this.#tracked.set(input.name, {
+      invocationId: input.invocationId,
+      ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+    })
     return { name: input.name, sessionRef: this.#sessionRefs.get(input.name) ?? input.sessionRef }
   }
 
@@ -203,6 +210,23 @@ export class FakeFleetClient implements FleetClient {
   async release(name: string, reason?: string): Promise<void> {
     this.releases.push({ name, reason })
     this.#agents.delete(name)
+    this.#tracked.delete(name)
+  }
+
+  trackedAgents(): ReadonlyMap<string, { invocationId?: string; node?: string }> {
+    return this.#tracked
+  }
+
+  hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
+    for (const agent of agents) {
+      this.hydrated.push(agent)
+      this.#tracked.set(agent.name, { invocationId: agent.invocationId, node: agent.node })
+      this.#agents.add(agent.name)
+    }
+  }
+
+  async reconcileTrackedAgents(): Promise<void> {
+    this.reconciles += 1
   }
 
   async listAgents(): Promise<Array<{ name: string }>> {
@@ -264,6 +288,7 @@ export class FakeFleetClient implements FleetClient {
 
   emitAgentExit(name: string, reason?: string): void {
     this.#agents.delete(name)
+    this.#tracked.delete(name)
     for (const listener of this.#exitListeners) {
       listener(name, reason)
     }

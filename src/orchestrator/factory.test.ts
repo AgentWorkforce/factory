@@ -2524,6 +2524,44 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('start re-adopts remote in-flight registry agents into the fleet and reconciles once', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-adopt-inflight-'))
+    const registryPath = join(root, 'registry.json')
+    try {
+      await writeFile(registryPath, JSON.stringify({
+        pid: 12345,
+        updatedAt: new Date(0).toISOString(),
+        updatedAtMs: 0,
+        agents: [
+          { name: 'ar-1-impl', pids: [], invocationId: 'inv-1', node: 'mac-mini' },
+          { name: 'ar-1-review', pids: [], node: 'mac-mini' },
+          // Local-only agents (pids, no placement facts) are not fleet-tracked.
+          { name: 'ar-2-impl', pids: [4242] },
+        ],
+      }))
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({
+        loop: { maxIterations: 1, heartbeatPath: join(root, 'heartbeat.json'), registryPath, heartbeatStaleMs: 1_000 },
+      }), {
+        mount: new FakeMountClient(),
+        fleet,
+        triage: new StaticTriage(),
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(fleet.hydrated).toEqual([
+        { name: 'ar-1-impl', invocationId: 'inv-1', node: 'mac-mini' },
+        { name: 'ar-1-review', invocationId: undefined, node: 'mac-mini' },
+      ])
+      expect(fleet.reconciles).toBe(1)
+
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('start live writes and refreshes a running loop heartbeat, then marks stopping on stop', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-'))
     const heartbeatPath = join(root, 'heartbeat.json')

@@ -40,6 +40,7 @@ export type AgentPidResolution =
 
 export type SendInput = { to: string; text: string; from?: string; data?: Record<string, unknown> }
 export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
+export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
 export interface FleetClient {
   spawn(input: SpawnInput): Promise<SpawnResult>
@@ -55,6 +56,11 @@ export interface FleetClient {
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
+  // Remote backends track spawned-and-not-exited agents so the orchestrator can
+  // persist them for crash recovery and re-adopt them after a restart.
+  trackedAgents?(): ReadonlyMap<string, FleetTrackedAgent>
+  hydrateTracked?(agents: Array<{ name: string; invocationId?: string; node?: string }>): void
+  reconcileTrackedAgents?(): Promise<void>
   dispose(): Promise<void>
 }
 

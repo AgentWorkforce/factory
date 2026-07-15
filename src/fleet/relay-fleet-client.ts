@@ -20,6 +20,7 @@ export interface TrackedAgent {
   invocationId?: string
   node?: string
   spawnedAtMs: number
+  nodeOfflineSinceMs?: number
 }
 
 export interface RelayClientLike {
@@ -52,6 +53,13 @@ export interface RelayFleetClientOptions {
    * given env is consulted, never the on-disk cloud workspace store.
    */
   env?: NodeJS.ProcessEnv
+  /** Cadence of the roster-reconciliation exit watcher. */
+  exitWatchIntervalMs?: number
+  /** How long a tracked agent's node must be dead before synthesizing an exit. */
+  nodeOfflineGraceMs?: number
+  /** How long a freshly spawned agent may be absent from the roster before it counts as exited. */
+  registrationGraceMs?: number
+  now?: () => number
   sleep?: (ms: number) => Promise<void>
   log?: (message: string) => void
 }
@@ -62,13 +70,22 @@ const terminalStatuses = new Set(['completed', 'failed', 'denied'])
 const DEFAULT_AGENT_NAME = 'factory'
 const DEFAULT_SPAWN_ACK_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
+const DEFAULT_EXIT_WATCH_INTERVAL_MS = 15_000
+// 2× the engine's 45s node-liveness TTL so one missed heartbeat sweep cannot
+// synthesize a false exit.
+const DEFAULT_NODE_OFFLINE_GRACE_MS = 90_000
+const DEFAULT_REGISTRATION_GRACE_MS = 60_000
 
 export class RelayFleetClient implements FleetClient {
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
   readonly #spawnAckTimeoutMs: number
   readonly #pollIntervalMs: number
+  readonly #exitWatchIntervalMs: number
+  readonly #nodeOfflineGraceMs: number
+  readonly #registrationGraceMs: number
   readonly #createRelay: (options: RelayClientFactoryOptions) => RelayClientLike
+  readonly #now: () => number
   readonly #sleep: (ms: number) => Promise<void>
   readonly #log: (message: string) => void
   readonly #agentExitListeners = new Set<AgentExitListener>()
@@ -83,13 +100,19 @@ export class RelayFleetClient implements FleetClient {
   #messagingReady: Promise<RelayMessaging> | undefined
   #eventsStarted = false
   #disposed = false
+  #watchTimer: ReturnType<typeof setInterval> | undefined
+  #reconciling: Promise<void> | undefined
 
   constructor(options: RelayFleetClientOptions = {}) {
     this.#options = options
     this.#agentName = options.agentName ?? DEFAULT_AGENT_NAME
     this.#spawnAckTimeoutMs = options.spawnAckTimeoutMs ?? DEFAULT_SPAWN_ACK_TIMEOUT_MS
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+    this.#exitWatchIntervalMs = options.exitWatchIntervalMs ?? DEFAULT_EXIT_WATCH_INTERVAL_MS
+    this.#nodeOfflineGraceMs = options.nodeOfflineGraceMs ?? DEFAULT_NODE_OFFLINE_GRACE_MS
+    this.#registrationGraceMs = options.registrationGraceMs ?? DEFAULT_REGISTRATION_GRACE_MS
     this.#createRelay = options.createRelay ?? ((relayOptions) => new AgentRelay(relayOptions))
+    this.#now = options.now ?? Date.now
     this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
     this.#log = options.log ?? (() => {})
     this.#messaging = options.messaging
@@ -104,12 +127,28 @@ export class RelayFleetClient implements FleetClient {
   hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
     for (const agent of agents) {
       if (this.#tracked.has(agent.name)) continue
+      // spawnedAtMs of 0 skips the registration grace: a hydrated agent was
+      // registered long ago, so absence from the roster is a real exit.
       this.#tracked.set(agent.name, {
         invocationId: agent.invocationId,
         node: agent.node,
-        spawnedAtMs: Date.now(),
+        spawnedAtMs: 0,
       })
     }
+    this.#syncExitWatcher()
+  }
+
+  /**
+   * Reconcile tracked agents against the engine roster, synthesizing exits for
+   * agents that went offline (or whose node died) without a push signal. The
+   * exit watcher runs this on an interval; callers may invoke it directly for
+   * a deterministic sweep (startup recovery, tests).
+   */
+  reconcileTrackedAgents(): Promise<void> {
+    this.#reconciling ??= this.#reconcileTracked().finally(() => {
+      this.#reconciling = undefined
+    })
+    return this.#reconciling
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -151,6 +190,7 @@ export class RelayFleetClient implements FleetClient {
       await this.#awaitInvocation(ack.actionName || 'release', ack)
     } finally {
       this.#tracked.delete(name)
+      this.#syncExitWatcher()
     }
   }
 
@@ -203,14 +243,20 @@ export class RelayFleetClient implements FleetClient {
   onAgentExit(listener: AgentExitListener): () => void {
     this.#ensureEventSubscription()
     this.#agentExitListeners.add(listener)
+    this.#syncExitWatcher()
     return () => {
       this.#agentExitListeners.delete(listener)
+      this.#syncExitWatcher()
     }
   }
 
   async dispose(): Promise<void> {
     if (this.#disposed) return
     this.#disposed = true
+    if (this.#watchTimer) {
+      clearInterval(this.#watchTimer)
+      this.#watchTimer = undefined
+    }
     for (const unsubscribe of this.#eventUnsubscribers.splice(0)) {
       unsubscribe()
     }
@@ -320,8 +366,64 @@ export class RelayFleetClient implements FleetClient {
     this.#tracked.set(name, {
       invocationId: ack.invocationId,
       node: ack.placement?.node ?? ack.dispatchedNodeId ?? undefined,
-      spawnedAtMs: Date.now(),
+      spawnedAtMs: this.#now(),
     })
+    this.#syncExitWatcher()
+  }
+
+  #syncExitWatcher(): void {
+    const shouldRun = !this.#disposed && this.#tracked.size > 0 && this.#agentExitListeners.size > 0
+    if (shouldRun && !this.#watchTimer) {
+      this.#watchTimer = setInterval(() => {
+        void this.reconcileTrackedAgents().catch((error) => {
+          this.#log(`relay fleet exit reconciliation failed: ${errorMessage(error)}`)
+        })
+      }, this.#exitWatchIntervalMs)
+      this.#watchTimer.unref?.()
+    } else if (!shouldRun && this.#watchTimer) {
+      clearInterval(this.#watchTimer)
+      this.#watchTimer = undefined
+    }
+  }
+
+  async #reconcileTracked(): Promise<void> {
+    if (this.#tracked.size === 0) return
+    const messaging = await this.#ensureMessaging()
+    const [agents, nodes] = await Promise.all([
+      messaging.agents.list({ status: 'all' }),
+      messaging.nodes.list(),
+    ])
+    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
+    const nodeLive = new Map(nodes.map((node) => [node.name, node.live ?? node.status === 'online']))
+    const nowMs = this.#now()
+
+    for (const [name, entry] of [...this.#tracked]) {
+      const row = agentsByName.get(name)
+      if (!row || row.status === 'offline') {
+        // A just-spawned agent may not have registered with the engine yet;
+        // absence only counts as an exit once the grace window has passed.
+        if (nowMs - entry.spawnedAtMs < this.#registrationGraceMs) continue
+        this.#emitExit(name, 'exited')
+        continue
+      }
+      if (!entry.node) continue
+      if (nodeLive.get(entry.node) === false || !nodeLive.has(entry.node)) {
+        entry.nodeOfflineSinceMs ??= nowMs
+        if (nowMs - entry.nodeOfflineSinceMs >= this.#nodeOfflineGraceMs) {
+          this.#emitExit(name, 'node-offline')
+        }
+      } else {
+        entry.nodeOfflineSinceMs = undefined
+      }
+    }
+  }
+
+  #emitExit(name: string, reason: string): void {
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
+    for (const listener of this.#agentExitListeners) {
+      listener(name, reason)
+    }
   }
 
   #ensureEventSubscription(): void {
@@ -384,10 +486,7 @@ export class RelayFleetClient implements FleetClient {
   // The roster reconciliation watcher remains the authoritative exit detector.
   #handleAgentOffline(name: string): void {
     if (!this.#tracked.has(name)) return
-    this.#tracked.delete(name)
-    for (const listener of this.#agentExitListeners) {
-      listener(name, 'offline')
-    }
+    this.#emitExit(name, 'offline')
   }
 }
 

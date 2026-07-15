@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 
@@ -354,6 +354,102 @@ describe('RelayFleetClient', () => {
     fleet.hydrateTracked([{ name: 'ar-9-impl', invocationId: 'inv-9', node: 'mac-mini' }])
 
     expect(fleet.trackedAgents().get('ar-9-impl')).toMatchObject({ invocationId: 'inv-9', node: 'mac-mini' })
+  })
+
+  it('synthesizes exits for tracked agents that left the roster after the registration grace', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-2-review', status: 'online' }]
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'online', capabilities: [] }]
+    let nowMs = 1_000_000
+    const fleet = createClient(messaging, { now: () => nowMs })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:claude' })
+    fleet.hydrateTracked([{ name: 'ar-2-review', node: 'mac-mini' }])
+
+    // Inside the registration grace a missing spawned agent is not an exit.
+    await fleet.reconcileTrackedAgents()
+    expect(exits).toEqual([])
+
+    nowMs += 120_000
+    await fleet.reconcileTrackedAgents()
+
+    expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'exited' }])
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+    expect(fleet.trackedAgents().has('ar-2-review')).toBe(true)
+  })
+
+  it('synthesizes exits for offline roster rows and dead nodes after their grace windows', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [
+      { name: 'ar-1-impl', status: 'offline' },
+      { name: 'ar-2-review', status: 'online' },
+    ]
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'offline', live: false, capabilities: [] }]
+    let nowMs = 1_000_000
+    const fleet = createClient(messaging, { now: () => nowMs })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+    fleet.hydrateTracked([
+      { name: 'ar-1-impl', node: 'mac-mini' },
+      { name: 'ar-2-review', node: 'mac-mini' },
+    ])
+
+    // Hydrated agents carry no registration grace: offline is an exit now. The
+    // dead node only starts its grace clock on this sweep.
+    await fleet.reconcileTrackedAgents()
+    expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'exited' }])
+
+    nowMs += 90_000
+    await fleet.reconcileTrackedAgents()
+
+    expect(exits).toEqual([
+      { name: 'ar-1-impl', reason: 'exited' },
+      { name: 'ar-2-review', reason: 'node-offline' },
+    ])
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
+  it('clears the node-offline clock when the node comes back', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'offline', live: false, capabilities: [] }]
+    let nowMs = 1_000_000
+    const fleet = createClient(messaging, { now: () => nowMs })
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([{ name: 'ar-1-impl', node: 'mac-mini' }])
+
+    await fleet.reconcileTrackedAgents()
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'online', live: true, capabilities: [] }]
+    nowMs += 60_000
+    await fleet.reconcileTrackedAgents()
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'offline', live: false, capabilities: [] }]
+    nowMs += 60_000
+    await fleet.reconcileTrackedAgents()
+
+    // The first offline stretch never reached the grace; the clock restarted.
+    expect(exits).toEqual([])
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(true)
+  })
+
+  it('runs the exit watcher on an interval while agents are tracked', async () => {
+    vi.useFakeTimers()
+    try {
+      const messaging = new FakeMessaging()
+      messaging.agentRows = []
+      messaging.nodeRows = []
+      const fleet = createClient(messaging, { exitWatchIntervalMs: 1_000, now: () => Date.now() })
+      const exits: string[] = []
+      fleet.onAgentExit((name) => exits.push(name))
+      fleet.hydrateTracked([{ name: 'ar-1-impl' }])
+
+      await vi.advanceTimersByTimeAsync(1_100)
+
+      expect(exits).toEqual(['ar-1-impl'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('registers the factory agent identity from a workspace key on first use', async () => {

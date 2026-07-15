@@ -94,6 +94,9 @@ export interface FactoryInFlightRegistryAgent {
   sessionRef?: string
   pids: number[]
   processes?: FactoryInFlightRegistryProcess[]
+  // Remote (relay-backend) placement facts; pids are meaningless off-machine.
+  invocationId?: string
+  node?: string
 }
 
 export interface FactoryInFlightRegistryProcess {
