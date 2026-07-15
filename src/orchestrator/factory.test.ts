@@ -363,6 +363,7 @@ class RespawnNameCollisionFleetClient extends FakeFleetClient {
   }
 }
 
+
 class ManualClock {
   value = 0
 
@@ -5593,6 +5594,51 @@ describe('FactoryLoop', () => {
     expect(fleet.releases.map((release) => release.name)).toContain('ar-86-review')
     expect(factory.status().counters.issuesStalledNoPr).toBe(1)
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  // The real reason the demo never reached human-review even after #67: the
+  // implementer commits its work to a feature branch but exits (turn-end/idle)
+  // without running `gh pr create`. Factory finalizes the branch into a PR
+  // itself on the (non-completion) exit, then advances to completion.
+  it('publishes the implementer PR from its clone when it exits without opening one (#67 follow-up)', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 92,
+          url: 'https://github.com/AgentWorkforce/pear/pull/92',
+          headRef: 'ar-92-impl-pear',
+          headSha: 'sha-92',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(92)]: issueFile(92),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined, // no PR of record yet
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(92), issueFile(92))))
+    // Non-completion, turn-end exit: the agent committed a branch but never ran gh pr create.
+    fleet.emitAgentExit('ar-92-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(factory.status().counters.implementerPrsPublishedOnExit).toBe(1)
+    expect(fleet.resumes).toEqual([]) // published instead of respawning
+    // Published PR -> completed -> both agents released, issue no longer in flight.
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+    expect(fleet.releases.map((release) => release.name)).toEqual(
+      expect.arrayContaining(['ar-92-impl-pear', 'ar-92-review']),
+    )
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {

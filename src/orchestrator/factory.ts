@@ -2545,6 +2545,30 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      // The implementer's turn ended without a PR of record. Agents reliably
+      // COMMIT their work to a feature branch but often exit (turn-end / idle)
+      // before running `gh pr create` — the root reason a dispatch never reached
+      // human-review even after the #67 fixes. Rather than respawn a done agent
+      // and hope, factory finalizes the branch into a PR itself (the same
+      // publish path the completion flow uses), then advances to the babysitter
+      // / human-review path. Best-effort: with no publishable branch (no commits
+      // ahead of base, clone gone) it returns undefined and we fall through.
+      if (tracked.spec.role === 'implementer') {
+        const publishedPr = await this.#tryPublishImplementerPr(record, tracked)
+        if (publishedPr) {
+          if (this.#config.babysitter.enabled) {
+            await this.#ensureBabysitter(record, {
+              repo: publishedPr.repo,
+              prNumber: publishedPr.number,
+              url: publishedPr.url,
+            })
+          } else {
+            await this.#completeIssue(record)
+          }
+          return
+        }
+      }
+
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
@@ -2574,11 +2598,10 @@ export class FactoryLoop implements Factory {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
             // (relay#1116-family), so re-registering collides with the stuck
-            // name. The error is marked retryable but isn't — retrying just
-            // re-collides forever. Treat it as terminal for this name: record
-            // the resume key so subsequent exit events short-circuit, count it,
-            // and warn once instead of spamming a 500 stack trace. The external
-            // reaper / a broker restart reclaims the leaked name.
+            // name. Retrying just re-collides forever. Treat it as terminal for
+            // this name: record the resume key so subsequent exit events
+            // short-circuit, count it, and warn once. The external reaper / a
+            // broker restart reclaims the leaked name.
             this.#fleet.markAgentTerminal?.(name, 'resume-already-exists')
             await this.#state.markResumed(this.#workspaceId, resumeKey)
             this.#increment('resumeNameCollisions')
@@ -2619,12 +2642,12 @@ export class FactoryLoop implements Factory {
           if (!isAgentAlreadyExistsError(error)) {
             throw error
           }
-          // Same leaked-broker-name collision as the resume path, but on a
+          // Same leaked-broker-name collision as the resume path, on a
           // no-sessionRef respawn: the broker's own restartPolicy already
           // re-registered the name (relay#1116-family), so our respawn collides.
-          // Retrying just re-collides forever. Treat it as terminal for this
-          // name and resolve the dispatch so a reviewer blocked on the
-          // implementer's DM does not hang the owned-broker dispose-wait (#67).
+          // Retrying just re-collides forever. Treat it as terminal and resolve
+          // the dispatch so a reviewer blocked on the implementer's DM does not
+          // hang the owned-broker dispose-wait (#67).
           this.#fleet.markAgentTerminal?.(name, 'respawn-already-exists')
           this.#increment('resumeNameCollisions')
           this.#logger.warn?.('[factory] respawn skipped: broker still holds agent name (relay#1116); not retrying', {
@@ -2638,6 +2661,40 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#error(error, record.issue)
+    }
+  }
+
+  // Publish a PR from the implementer's committed branch when it exited without
+  // opening one. Best-effort and idempotent: returns undefined when there is no
+  // GitHub write path, no clone, or nothing publishable (no branch / no commits
+  // ahead of base — `#publishImplementerPullRequest` refuses head==base), so the
+  // caller falls back to its normal restart/conclude handling.
+  async #tryPublishImplementerPr(
+    record: InFlightIssue,
+    implementer: TrackedAgent,
+  ): Promise<GithubPublishPullRequestResult | undefined> {
+    if (record.dryRun || !implementer.spec.clonePath || !this.#mount.githubWrite) {
+      return undefined
+    }
+    try {
+      const published = await this.#publishImplementerPullRequest(record, implementer)
+      if (published) {
+        this.#increment('implementerPrsPublishedOnExit')
+        this.#logger.info?.('[factory] published PR from implementer clone after it exited without opening one', {
+          issue: record.issue.key,
+          repo: published.repo,
+          prNumber: published.number,
+        })
+      }
+      return published
+    } catch (error) {
+      this.#increment('exitPrPublishSkipped')
+      this.#logger.warn?.('[factory] could not publish implementer PR on exit; falling back', {
+        issue: record.issue.key,
+        name: implementer.result?.name ?? implementer.spec.name,
+        error: describeError(error).errorMessage,
+      })
+      return undefined
     }
   }
 
