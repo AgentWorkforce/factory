@@ -20,6 +20,19 @@ export function relayWorkspaceKeyFromApiKey(value: string | undefined): string |
   return trimmed?.startsWith('rk_live_') ? trimmed : undefined
 }
 
+export interface ResolveRelayAgentTokenOptions {
+  agentToken?: string
+  env?: NodeJS.ProcessEnv
+}
+
+// Only at_live_ tokens are agent identities; node (nt_live_) and observer
+// (ot_live_) tokens must never be treated as one.
+export function resolveRelayAgentToken(options: ResolveRelayAgentTokenOptions = {}): string | undefined {
+  const env = options.env ?? process.env
+  const candidate = nonEmpty(options.agentToken) ?? nonEmpty(env.RELAY_AGENT_TOKEN)
+  return candidate?.startsWith('at_live_') ? candidate : undefined
+}
+
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
   return trimmed || undefined

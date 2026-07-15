@@ -43,6 +43,8 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 
 interface FleetCliDeps {
   fleet?: FleetClient
+  /** Hermetic credential environment for the relay backend (tests). */
+  env?: NodeJS.ProcessEnv
   mount?: MountClient
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
@@ -570,7 +572,7 @@ async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefin
     )
   }
 
-  return createFleet({ backend: globals.backend, cwd, connectionPath })
+  return createFleet({ backend: globals.backend, cwd, connectionPath }, { env: deps.env })
 }
 
 function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {

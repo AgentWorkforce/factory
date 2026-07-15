@@ -1,84 +1,152 @@
 import { describe, expect, it } from 'vitest'
 
-import { RelayFleetClient, type RelayActionAck, type RelayActionInvocation, type RelayFleetEvent, type RelayFleetTransport } from './relay-fleet-client'
+import { RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 
-import type { SendInput } from '../ports'
+import type {
+  RelayActionInvocation,
+  RelayActionInvocationAck,
+  RelayMessage,
+  RelayMessaging,
+  RelayNode,
+  RelaySpawnPlacementInput,
+} from '@agent-relay/sdk'
 
-class FakeRelayFleetTransport implements RelayFleetTransport {
-  readonly invokes: Array<{ actionName: string; input: Record<string, unknown>; invocationId: string }> = []
-  readonly sent: SendInput[] = []
-  readonly eventListeners = new Set<(event: RelayFleetEvent) => void>()
-  agents: Array<{ name: string }> = []
-  nodes: Array<{ name: string; status?: string; live?: boolean; capabilities?: Array<string | { name?: string }> }> = []
-  completions = new Map<string, RelayActionInvocation[]>()
+type EventHandler = (...args: unknown[]) => void
 
-  async invokeAction(actionName: string, input: Record<string, unknown>, opts: { invocationId: string }): Promise<RelayActionAck> {
-    this.invokes.push({ actionName, input, invocationId: opts.invocationId })
-    const first = this.completions.get(opts.invocationId)?.[0]
-    return {
-      invocationId: opts.invocationId,
-      actionName,
-      status: first?.status ?? 'pending',
-      dispatchedNodeId: first?.dispatchedNodeId,
-      input,
+function relayMessage(overrides: Partial<RelayMessage> & { text: string }): RelayMessage {
+  return {
+    id: overrides.id ?? 'msg-1',
+    messageId: overrides.id ?? 'msg-1',
+    from: overrides.from ?? { name: 'ar-1-impl' },
+    ...overrides,
+  } as RelayMessage
+}
+
+class FakeMessaging {
+  readonly placements: RelaySpawnPlacementInput[] = []
+  readonly invokes: Array<{ name: string; input?: Record<string, unknown> }> = []
+  readonly directs: Array<{ to: string; text: string }> = []
+  readonly channelSends: Array<{ channel: string; text: string }> = []
+  readonly handlers = new Map<string, Set<EventHandler>>()
+  invocations = new Map<string, RelayActionInvocation[]>()
+  placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
+  agentRows: Array<{ name: string; status?: string }> = []
+  nodeRows: Array<Partial<RelayNode> & { name: string }> = []
+  directError: Error | undefined
+  connected = 0
+  disconnected = 0
+  nextInvocationId = 0
+
+  readonly agents = {
+    list: async () => this.agentRows as never[],
+  }
+
+  readonly nodes = {
+    list: async () => this.nodeRows as RelayNode[],
+  }
+
+  readonly messages = {
+    send: async (input: { channel: string; text: string }) => {
+      this.channelSends.push(input)
+      return relayMessage({ id: `sent-${this.channelSends.length}`, text: input.text, from: { name: 'factory' } })
+    },
+    direct: async (input: { to: string; text: string }) => {
+      if (this.directError) throw this.directError
+      this.directs.push(input)
+      return relayMessage({ id: `dm-${this.directs.length}`, text: input.text, from: { name: 'factory' } })
+    },
+  }
+
+  readonly commands = {
+    invoke: async (name: string, input?: Record<string, unknown>): Promise<RelayActionInvocationAck> => {
+      this.invokes.push({ name, input })
+      const invocationId = `inv-${++this.nextInvocationId}`
+      return { invocationId, actionName: name, status: this.invocations.has(invocationId) ? 'pending' : 'completed' }
+    },
+    getInvocation: async (name: string, invocationId: string): Promise<RelayActionInvocation> => {
+      const queue = this.invocations.get(invocationId)
+      const next = queue?.shift()
+      return next ?? { invocationId, actionName: name, status: 'completed', output: {} }
+    },
+  }
+
+  readonly placement = {
+    spawn: async (input: RelaySpawnPlacementInput) => {
+      this.placements.push(input)
+      const invocationId = this.placementAck.invocationId ?? `inv-${++this.nextInvocationId}`
+      return {
+        invocationId,
+        actionName: 'spawn',
+        status: this.placementAck.status ?? (this.invocations.has(invocationId) ? 'pending' : 'completed'),
+        dispatchedNodeId: this.placementAck.dispatchedNodeId,
+        node: { name: this.placementAck.placement?.node ?? 'node-a' } as RelayNode,
+        placement: {
+          capability: input.capability,
+          node: this.placementAck.placement?.node ?? 'node-a',
+          attempts: 1,
+          queued: false,
+        },
+      }
+    },
+  }
+
+  readonly events = {
+    connect: () => {
+      this.connected += 1
+    },
+    disconnect: async () => {
+      this.disconnected += 1
+    },
+    subscribe: () => {},
+    unsubscribe: () => {},
+    on: (event: string, handler: EventHandler) => {
+      const handlers = this.handlers.get(event) ?? new Set()
+      handlers.add(handler)
+      this.handlers.set(event, handlers)
+      return () => handlers.delete(handler)
+    },
+  }
+
+  emit(event: string, payload: unknown): void {
+    for (const handler of this.handlers.get(event) ?? []) {
+      handler(payload)
     }
   }
 
-  async getInvocation(actionName: string, invocationId: string): Promise<RelayActionInvocation> {
-    const queue = this.completions.get(invocationId)
-    const next = queue?.shift()
-    return next ?? {
-      invocationId,
-      actionName,
-      status: 'completed',
-      output: { name: 'fallback-agent' },
-    }
-  }
-
-  async listAgents(): Promise<Array<{ name: string }>> {
-    return this.agents
-  }
-
-  async listNodes(): Promise<Array<{ name: string; status?: string; live?: boolean; capabilities?: Array<string | { name?: string }> }>> {
-    return this.nodes
-  }
-
-  async sendMessage(input: SendInput): Promise<{ eventId?: string; targets?: string[] }> {
-    this.sent.push(input)
-    return { eventId: `event-${this.sent.length}`, targets: [input.to] }
-  }
-
-  onEvent(listener: (event: RelayFleetEvent) => void): () => void {
-    this.eventListeners.add(listener)
-    return () => {
-      this.eventListeners.delete(listener)
-    }
-  }
-
-  emit(event: RelayFleetEvent): void {
-    for (const listener of this.eventListeners) {
-      listener(event)
-    }
+  asMessaging(): RelayMessaging {
+    return this as unknown as RelayMessaging
   }
 }
 
 const immediateSleep = async () => {}
 
+function createClient(messaging: FakeMessaging, overrides: Record<string, unknown> = {}) {
+  return new RelayFleetClient({
+    messaging: messaging.asMessaging(),
+    sleep: immediateSleep,
+    pollIntervalMs: 0,
+    ...overrides,
+  })
+}
+
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 describe('RelayFleetClient', () => {
-  it('invokes fleet spawn with a caller-supplied invocation id and no factory placement target', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('inv-1', [
-      { invocationId: 'inv-1', actionName: 'spawn', status: 'pending' },
-      { invocationId: 'inv-1', actionName: 'spawn', status: 'dispatched', dispatchedNodeId: 'node-a' },
+  it('dispatches spawn through placement with task-exit lifecycle and no self target', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'inv-1', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('inv-1', [
+      { invocationId: 'inv-1', actionName: 'spawn', status: 'dispatched' },
       {
         invocationId: 'inv-1',
         actionName: 'spawn',
         status: 'completed',
-        dispatchedNodeId: 'node-a',
         output: { agent_name: 'ar-1-impl', session_ref: 'session-1', pid: 123 },
       },
     ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
+    const fleet = createClient(messaging)
 
     await expect(fleet.spawn({
       name: 'ar-1-impl',
@@ -89,196 +157,114 @@ describe('RelayFleetClient', () => {
       task: 'do work',
       model: 'opus',
       cwd: '/checkout',
-      invocationId: 'inv-1',
+      invocationId: 'factory-inv-1',
       channel: 'wf-factory',
     })).resolves.toEqual({ name: 'ar-1-impl', sessionRef: 'session-1', pid: 123 })
 
-    expect(transport.invokes).toEqual([
-      {
-        actionName: 'spawn',
-        invocationId: 'inv-1',
-        input: {
-          capability: 'spawn:claude',
-          name: 'ar-1-impl',
-          agent: 'ar-1-impl',
-          repo: 'AgentWorkforce/factory',
-          clone_path: '/checkout',
-          clonePath: '/checkout',
-          invocationId: 'inv-1',
-          task: 'do work',
-          model: 'opus',
-          cwd: '/checkout',
-          channels: ['wf-factory'],
-        },
-      },
-    ])
+    expect(messaging.placements).toHaveLength(1)
+    const placement = messaging.placements[0]!
+    expect(placement.capability).toBe('spawn:claude')
+    expect(placement.repo).toBe('AgentWorkforce/factory')
+    expect(placement).not.toHaveProperty('node')
+    expect(placement.input).toEqual({
+      name: 'ar-1-impl',
+      agent: 'ar-1-impl',
+      clone_path: '/checkout',
+      clonePath: '/checkout',
+      invocationId: 'factory-inv-1',
+      task: 'do work',
+      model: 'opus',
+      cwd: '/checkout',
+      channels: ['wf-factory'],
+      spawn_mode: 'task_exit',
+      exit_after_task: true,
+    })
+    expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({ invocationId: 'inv-1', node: 'mac-mini' })
   })
 
-  it('passes explicit node targets while leaving ordinary cloud placement to the fleet', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('inv-2', [
-      { invocationId: 'inv-2', actionName: 'spawn', status: 'completed', output: { name: 'ar-2-impl' } },
-    ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
+  it('passes explicit node targets through to placement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
 
-    await fleet.spawn({
-      name: 'ar-2-impl',
-      capability: 'spawn:codex',
-      node: 'mac-mini',
-      invocationId: 'inv-2',
-    })
+    await fleet.spawn({ name: 'ar-2-impl', capability: 'spawn:codex', node: 'mac-mini' })
 
-    expect(transport.invokes[0]?.input.node).toBe('mac-mini')
+    expect(messaging.placements[0]?.node).toBe('mac-mini')
   })
 
-  it('maps resume to an origin-targeted spawn with session_ref', async () => {
-    const transport = new FakeRelayFleetTransport()
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
+  it('maps resume onto a placement spawn with session_ref', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
 
-    await expect(fleet.resume({
-      name: 'ar-3-impl',
-      sessionRef: 'session-3',
-      node: 'origin-node',
-      capability: 'spawn:claude',
-    })).resolves.toEqual({ name: 'fallback-agent', sessionRef: 'session-3' })
+    await fleet.resume({ name: 'ar-3-impl', sessionRef: 'session-3', node: 'origin-node', capability: 'spawn:claude' })
 
-    expect(transport.invokes).toHaveLength(1)
-    expect(transport.invokes[0]).toMatchObject({
-      actionName: 'spawn',
-      input: {
-        capability: 'spawn:claude',
-        name: 'ar-3-impl',
-        agent: 'ar-3-impl',
-        node: 'origin-node',
-        session_ref: 'session-3',
-      },
-    })
-  })
-
-  it('omits the local self sentinel from relay resume payloads', async () => {
-    const transport = new FakeRelayFleetTransport()
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
-
-    await fleet.resume({
-      name: 'ar-3-impl',
-      sessionRef: 'session-3',
-      node: 'self',
-      capability: 'spawn:codex',
-    })
-
-    expect(transport.invokes).toHaveLength(1)
-    expect(transport.invokes[0]?.input).toMatchObject({
-      capability: 'spawn:codex',
+    expect(messaging.placements[0]).toMatchObject({ capability: 'spawn:claude', node: 'origin-node' })
+    expect(messaging.placements[0]?.input).toMatchObject({
       name: 'ar-3-impl',
       agent: 'ar-3-impl',
       session_ref: 'session-3',
-    })
-    expect(transport.invokes[0]?.input).not.toHaveProperty('node')
-  })
-
-  it('invokes release through the fleet protocol', async () => {
-    const transport = new FakeRelayFleetTransport()
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
-
-    await fleet.release('ar-4-impl', 'issue-done')
-
-    expect(transport.invokes).toHaveLength(1)
-    expect(transport.invokes[0]).toMatchObject({
-      actionName: 'release',
-      input: { name: 'ar-4-impl', agent: 'ar-4-impl', reason: 'issue-done' },
+      spawn_mode: 'task_exit',
+      exit_after_task: true,
     })
   })
 
-  it('maps workflow:run input into the spawn action contract', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('wf-inv', [
-      { invocationId: 'wf-inv', actionName: 'spawn', status: 'completed', output: { name: 'ar-5-workflow' } },
-    ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
+  it('does not request task-exit lifecycle for workflow capabilities', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
 
     await fleet.spawn({
       name: 'ar-5-workflow',
       capability: 'workflow:run',
       workflow: 'workflows/factory/linear-issue.ts',
       inputs: { issue: 'AR-5' },
-      invocationId: 'wf-inv',
     })
 
-    expect(transport.invokes[0]?.input).toMatchObject({
-      capability: 'workflow:run',
+    expect(messaging.placements[0]?.input).toMatchObject({
       workflow: 'workflows/factory/linear-issue.ts',
       inputs: { issue: 'AR-5' },
     })
+    expect(messaging.placements[0]?.input).not.toHaveProperty('spawn_mode')
+    expect(messaging.placements[0]?.input).not.toHaveProperty('exit_after_task')
   })
 
-  it('observes node-loss reschedule on the same invocation id without reinvoking', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('stable-invocation', [
-      { invocationId: 'stable-invocation', actionName: 'spawn', status: 'dispatched', dispatchedNodeId: 'alpha' },
-      { invocationId: 'stable-invocation', actionName: 'spawn', status: 'pending', dispatchedNodeId: 'beta' },
-      { invocationId: 'stable-invocation', actionName: 'spawn', status: 'dispatched', dispatchedNodeId: 'beta' },
-      {
-        invocationId: 'stable-invocation',
-        actionName: 'spawn',
-        status: 'completed',
-        dispatchedNodeId: 'beta',
-        output: { name: 'ar-6-impl' },
-      },
+  it('releases through commands.invoke and stops tracking the agent', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    await fleet.spawn({ name: 'ar-4-impl', capability: 'spawn:codex' })
+    expect(fleet.trackedAgents().has('ar-4-impl')).toBe(true)
+
+    await fleet.release('ar-4-impl', 'issue-done')
+
+    expect(messaging.invokes).toEqual([
+      { name: 'release', input: { name: 'ar-4-impl', agent: 'ar-4-impl', reason: 'issue-done' } },
     ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
-
-    await fleet.spawn({ name: 'ar-6-impl', capability: 'spawn:claude', invocationId: 'stable-invocation' })
-
-    expect(transport.invokes.map((invoke) => invoke.invocationId)).toEqual(['stable-invocation'])
+    expect(fleet.trackedAgents().has('ar-4-impl')).toBe(false)
   })
 
-  it('fails cleanly when the fleet denies a spawn for a capability mismatch', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('inv-denied', [
-      { invocationId: 'inv-denied', actionName: 'spawn', status: 'dispatched', dispatchedNodeId: 'node-a' },
-      {
-        invocationId: 'inv-denied',
-        actionName: 'spawn',
-        status: 'denied',
-        error: 'node cannot spawn:codex',
-      },
+  it('fails cleanly when the fleet denies or fails an invocation', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'inv-denied', status: 'pending' }
+    messaging.invocations.set('inv-denied', [
+      { invocationId: 'inv-denied', actionName: 'spawn', status: 'denied', error: 'node cannot spawn:codex' },
     ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
+    const fleet = createClient(messaging)
 
-    await expect(fleet.spawn({
-      name: 'ar-7-impl',
-      capability: 'spawn:codex',
-      invocationId: 'inv-denied',
-    })).rejects.toThrow(/spawn invocation inv-denied denied: node cannot spawn:codex/)
-  })
-
-  it('fails cleanly when the fleet marks an invocation failed', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.completions.set('inv-failed', [
-      {
-        invocationId: 'inv-failed',
-        actionName: 'spawn',
-        status: 'failed',
-        error: 'node crashed during spawn',
-      },
-    ])
-    const fleet = new RelayFleetClient({ transport, sleep: immediateSleep, pollIntervalMs: 0 })
-
-    await expect(fleet.spawn({
-      name: 'ar-8-impl',
-      capability: 'spawn:claude',
-      invocationId: 'inv-failed',
-    })).rejects.toThrow(/spawn invocation inv-failed failed: node crashed during spawn/)
+    await expect(fleet.spawn({ name: 'ar-7-impl', capability: 'spawn:codex' }))
+      .rejects.toThrow(/spawn invocation inv-denied denied: node cannot spawn:codex/)
+    expect(fleet.trackedAgents().size).toBe(0)
   })
 
   it('returns the relay agent and node roster', async () => {
-    const transport = new FakeRelayFleetTransport()
-    transport.agents = [{ name: 'ar-1-impl' }]
-    transport.nodes = [
-      { name: 'alpha', status: 'online', capabilities: ['spawn:claude', { name: 'workflow:run' }, 'unknown:cap'] },
-      { name: 'beta', status: 'offline', capabilities: ['spawn:codex'] },
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    messaging.nodeRows = [
+      {
+        name: 'alpha',
+        status: 'online',
+        capabilities: [{ name: 'spawn:claude' }, { name: 'workflow:run' }, { name: 'unknown:cap' }],
+      },
+      { name: 'beta', status: 'offline', live: false, capabilities: [{ name: 'spawn:codex' }] },
     ]
-    const fleet = new RelayFleetClient({ transport })
+    const fleet = createClient(messaging)
 
     await expect(fleet.roster()).resolves.toEqual({
       agents: [{ name: 'ar-1-impl' }],
@@ -289,36 +275,161 @@ describe('RelayFleetClient', () => {
     })
   })
 
-  it('maps relay delivery, message, and exit events to the FleetClient callbacks', () => {
-    const transport = new FakeRelayFleetTransport()
-    const fleet = new RelayFleetClient({ transport })
-    const deliveries: Array<{ to: string; msgId?: string; reason?: string }> = []
-    const messages: Array<{ from: string; target: string; body: string; threadId?: string; eventId?: string }> = []
+  it('sends DMs and channel messages through the agent-scoped surface', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+
+    await fleet.sendMessage({ to: 'ar-1-impl', text: 'hello' })
+    await fleet.sendMessage({ to: '#wf-factory', text: 'update' })
+
+    expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello' }])
+    expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update' }])
+  })
+
+  it('confirms injected tasks with the sent message id', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+
+    await expect(fleet.waitForInjected({ to: 'ar-1-impl', text: 'task' })).resolves.toEqual({
+      eventId: 'dm-1',
+      targets: ['ar-1-impl'],
+    })
+  })
+
+  it('maps unknown-recipient send errors to the retryable registration-lag shape', async () => {
+    const messaging = new FakeMessaging()
+    messaging.directError = new Error('Agent not found: ar-1-impl')
+    const fleet = createClient(messaging)
+
+    await expect(fleet.waitForInjected({ to: 'ar-1-impl', text: 'task' }))
+      .rejects.toThrow(/recipient unavailable: Agent not found: ar-1-impl/)
+  })
+
+  it('maps messaging events onto FleetClient callbacks', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const messages: Array<{ from: string; target: string; body: string; eventId?: string }> = []
     const exits: Array<{ name: string; reason?: string }> = []
-
-    fleet.onDeliveryFailed((event) => deliveries.push(event))
-    fleet.onAgentMessage((event) => messages.push(event))
+    fleet.onAgentMessage((message) => messages.push(message))
     fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:claude' })
+    await flush()
 
-    transport.emit({ type: 'delivery.failed', to: 'ar-1-impl', message_id: 'msg-1', reason: 'expired' })
-    transport.emit({
-      type: 'dm.received',
-      message: {
+    messaging.emit('any', {
+      type: 'dmReceived',
+      message: relayMessage({
         id: 'msg-2',
         text: 'FACTORY_NEEDS_INPUT ar-1-impl',
         from: { name: 'ar-1-impl' },
-        target: { agentName: 'factory' },
+        target: { kind: 'agent', agentName: 'factory' },
+      }),
+    })
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({ id: 'msg-3', text: 'progress', from: { name: 'ar-1-impl' } }),
+    })
+    // Self-authored messages must not loop back into the orchestrator.
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({ id: 'msg-4', text: 'from us', from: { name: 'factory' } }),
+    })
+    messaging.emit('any', { type: 'agentOffline', agent: { name: 'ar-1-impl' } })
+    messaging.emit('any', { type: 'agentOffline', agent: { name: 'untracked-agent' } })
+
+    expect(messages).toEqual([
+      { from: 'ar-1-impl', target: 'factory', body: 'FACTORY_NEEDS_INPUT ar-1-impl', eventId: 'msg-2' },
+      { from: 'ar-1-impl', target: 'wf-factory', body: 'progress', eventId: 'msg-3' },
+    ])
+    expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'offline' }])
+    expect(messaging.connected).toBe(1)
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  it('hydrates tracked agents for restart recovery', () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+
+    fleet.hydrateTracked([{ name: 'ar-9-impl', invocationId: 'inv-9', node: 'mac-mini' }])
+
+    expect(fleet.trackedAgents().get('ar-9-impl')).toMatchObject({ invocationId: 'inv-9', node: 'mac-mini' })
+  })
+
+  it('registers the factory agent identity from a workspace key on first use', async () => {
+    const messaging = new FakeMessaging()
+    const created: RelayClientFactoryOptions[] = []
+    const registered: Array<{ name: string }> = []
+    const bootstrap: RelayClientLike = {
+      messaging: {
+        agents: {
+          registerOrRotate: async (input: { name: string }) => {
+            registered.push(input)
+            return { id: 'agent-1', name: input.name, token: 'at_live_rotated', status: 'online' }
+          },
+        },
+      } as unknown as RelayMessaging,
+    }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => {
+        created.push(options)
+        return options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap
       },
     })
-    transport.emit({ type: 'agent.status.offline', agentName: 'ar-1-impl', reason: 'completed' })
 
-    expect(deliveries).toEqual([{ to: 'ar-1-impl', msgId: 'msg-1', reason: 'expired' }])
-    expect(messages).toEqual([{
-      from: 'ar-1-impl',
-      target: 'factory',
-      body: 'FACTORY_NEEDS_INPUT ar-1-impl',
-      eventId: 'msg-2',
-    }])
-    expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'completed' }])
+    await fleet.roster()
+
+    expect(registered).toEqual([{ name: 'factory' }])
+    expect(created).toEqual([
+      { workspaceKey: 'rk_live_test' },
+      { workspaceKey: 'rk_live_test', agentToken: 'at_live_rotated' },
+    ])
+  })
+
+  it('uses a configured at_live_ token without registering', async () => {
+    const messaging = new FakeMessaging()
+    const created: RelayClientFactoryOptions[] = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      agentToken: 'at_live_configured',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => {
+        created.push(options)
+        return { messaging: messaging.asMessaging() }
+      },
+    })
+
+    await fleet.roster()
+
+    expect(created).toEqual([{ workspaceKey: 'rk_live_test', agentToken: 'at_live_configured' }])
+  })
+
+  it('constructs without credentials and fails lazily with a helpful error', async () => {
+    const fleet = new RelayFleetClient({
+      env: {},
+      createRelay: () => {
+        throw new Error('should not be called')
+      },
+    })
+
+    await expect(fleet.roster()).rejects.toThrow(/requires a workspace key \(rk_live_…\) or agent token \(at_live_…\)/)
+  })
+
+  it('dispose is idempotent and disconnects the event stream', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    await fleet.dispose()
+    await fleet.dispose()
+
+    expect(messaging.disconnected).toBe(1)
   })
 })
