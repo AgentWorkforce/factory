@@ -54,6 +54,10 @@ const spawnCapabilityInputSchema = z.object({
   restart_policy: restartPolicySchema.optional(),
   restartPolicy: restartPolicySchema.optional(),
   skip_relay_prompt: z.boolean().optional(),
+  spawn_mode: z.string().min(1).optional(),
+  spawnMode: z.string().min(1).optional(),
+  exit_after_task: z.boolean().optional(),
+  exitAfterTask: z.boolean().optional(),
 }).passthrough().transform((input) => ({
   ...input,
   name: input.name ?? input.agent,
@@ -62,6 +66,8 @@ const spawnCapabilityInputSchema = z.object({
   invocationId: input.invocationId ?? input.invocation_id,
   channels: input.channels ?? (input.channel ? [input.channel] : undefined),
   restartPolicy: input.restartPolicy ?? input.restart_policy,
+  spawnMode: input.spawnMode ?? input.spawn_mode,
+  exitAfterTask: input.exitAfterTask ?? input.exit_after_task,
 }))
 
 const workflowCapabilityInputSchema = z.object({
@@ -239,7 +245,10 @@ async function runSpawnCapability(
     restartPolicy: input.restartPolicy,
   }
   const harnessConfig = command ? buildRelayMcpHarnessConfig(spawnInput, command) : undefined
-  const agent: AgentSpec = {
+  // spawn_mode/exit_after_task ride the agent spec verbatim onto the broker's
+  // spawn input; brokers that honor task-exit on engine-dispatched spawns end
+  // the agent when its task completes, older brokers ignore the fields.
+  const agent: AgentSpec & { spawn_mode?: string; exit_after_task?: boolean } = {
     name: input.name,
     runtime: 'pty',
     cli,
@@ -250,6 +259,8 @@ async function runSpawnCapability(
     ...(input.sessionRef ? { session_id: input.sessionRef } : {}),
     ...(input.restartPolicy ? { restart_policy: input.restartPolicy } : {}),
     ...(harnessConfig ? { harness_config: harnessConfig } : {}),
+    ...(input.spawnMode ? { spawn_mode: input.spawnMode } : {}),
+    ...(input.exitAfterTask !== undefined ? { exit_after_task: input.exitAfterTask } : {}),
   }
 
   const output = await ctx.spawnAgent({
@@ -263,6 +274,7 @@ async function runSpawnCapability(
     name: input.name,
     capability,
     cwd,
+    node: ctx.node.name,
     invocationId: input.invocationId ?? ctx.invocationId,
     agent: output,
   }
