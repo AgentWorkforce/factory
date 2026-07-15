@@ -2577,6 +2577,7 @@ export class FactoryLoop implements Factory {
             // the resume key so subsequent exit events short-circuit, count it,
             // and warn once instead of spamming a 500 stack trace. The external
             // reaper / a broker restart reclaims the leaked name.
+            this.#fleet.markAgentTerminal?.(name, 'resume-already-exists')
             await this.#state.markResumed(this.#workspaceId, resumeKey)
             this.#increment('resumeNameCollisions')
             this.#logger.warn?.('[factory] resume skipped: broker still holds agent name (relay#1116); not retrying', {

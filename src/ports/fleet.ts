@@ -51,6 +51,7 @@ export interface FleetClient {
   sendMessage(input: SendInput): Promise<void>
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
   sendInput?(name: string, data: string): Promise<void>
+  markAgentTerminal?(name: string, reason?: string): void
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void

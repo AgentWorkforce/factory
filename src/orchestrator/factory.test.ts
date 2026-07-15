@@ -316,6 +316,12 @@ class SpawnFailingFleetClient extends FakeFleetClient {
 // Mimics the broker rejecting a resume because it never released the agent's
 // name on exit (relay#1116-family): http 500 "agent '<name>' already exists".
 class ResumeNameCollisionFleetClient extends FakeFleetClient {
+  readonly terminalAgents: Array<{ name: string; reason?: string }> = []
+
+  markAgentTerminal(name: string, reason?: string): void {
+    this.terminalAgents.push({ name, reason })
+  }
+
   override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
     this.resumes.push(input)
     const name = input.name ?? input.sessionRef
@@ -576,6 +582,28 @@ class RosterPidHarnessClient implements HarnessDriverClientLike {
     for (const listener of this.eventListeners) {
       listener(event)
     }
+  }
+}
+
+class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
+  resumeAttempts = 0
+  shutdownCalls = 0
+
+  override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
+    if (input.continueFrom) {
+      this.resumeAttempts += 1
+      throw Object.assign(new Error(`agent '${input.name}' already exists`), {
+        code: 'http_500',
+        status: 500,
+        retryable: true,
+        data: { error: `agent '${input.name}' already exists`, name: input.name, success: false },
+      })
+    }
+    return await super.spawnPty(input)
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownCalls += 1
   }
 }
 
@@ -5283,11 +5311,15 @@ describe('FactoryLoop', () => {
     expect(fleet.releases).toEqual([])
   })
 
-  it('completes an implementer exit without resuming when a PR already exists', async () => {
-    const issue = realIssueFile(254, ready, { title: 'Real implementer PR exit terminal' })
-    const mount = new FakeMountClient({ [issuePath(254)]: issue })
+  it.each([
+    ['without a reason', undefined],
+    ['with an abnormal reason', 'worker_exited'],
+  ])('completes an implementer exit %s without resuming when a PR already exists', async (_label, reason) => {
+    const issueNumber = reason ? 254 : 253
+    const issue = realIssueFile(issueNumber, ready, { title: 'Real implementer PR exit terminal' })
+    const mount = new FakeMountClient({ [issuePath(issueNumber)]: issue })
     const fleet = new FakeFleetClient()
-    fleet.setSessionRef('ar-254-impl-pear', 'session-impl-254')
+    fleet.setSessionRef(`ar-${issueNumber}-impl-pear`, `session-impl-${issueNumber}`)
     const probedIssues: string[] = []
     const factory = createFactory(config({
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -5297,22 +5329,25 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       probePrResolver: async (issue) => {
         probedIssues.push(issue.key)
-        return { repo: 'AgentWorkforce/pear', prNumber: 254 }
+        return { repo: 'AgentWorkforce/pear', prNumber: issueNumber }
       },
     })
-    const decision = await factory.triageIssue(parseLinearIssue(issuePath(254), issue))
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(issueNumber), issue))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-254-impl-pear', 'worker_exited')
+    fleet.emitAgentExit(`ar-${issueNumber}-impl-pear`, reason)
 
     await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
 
-    expect(probedIssues).toEqual(['AR-254'])
+    expect(probedIssues).toEqual([`AR-${issueNumber}`])
     expect(fleet.resumes).toEqual([])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-254-impl-pear', 'ar-254-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      `ar-${issueNumber}-impl-pear`,
+      `ar-${issueNumber}-review`,
+    ])
     expect(fleet.releases).toEqual([
-      { name: 'ar-254-impl-pear', reason: 'issue-done' },
-      { name: 'ar-254-review', reason: 'issue-done' },
+      { name: `ar-${issueNumber}-impl-pear`, reason: 'issue-done' },
+      { name: `ar-${issueNumber}-review`, reason: 'issue-done' },
     ])
     expect(factory.status().inFlight).toEqual([])
   })
@@ -5320,20 +5355,62 @@ describe('FactoryLoop', () => {
   it('does not loop when resume hits a leaked broker name ("already exists")', async () => {
     const mount = new FakeMountClient({ [issuePath(80)]: issueFile(80) })
     const fleet = new ResumeNameCollisionFleetClient()
-    fleet.setSessionRef('ar-80-review', 'session-review-80')
+    fleet.setSessionRef('ar-80-impl-pear', 'session-impl-80')
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(80), issueFile(80)))
 
     await factory.dispatch(decision)
-    fleet.emitAgentExit('ar-80-review', 'crash')
+    fleet.emitAgentExit('ar-80-impl-pear', 'crash')
     await flush()
     // A second exit event must NOT trigger another resume attempt.
-    fleet.emitAgentExit('ar-80-review', 'crash')
+    fleet.emitAgentExit('ar-80-impl-pear', 'crash')
     await flush()
 
     expect(fleet.resumes).toHaveLength(1) // resumed once, collided, then short-circuited
+    expect(fleet.terminalAgents).toEqual([
+      { name: 'ar-80-impl-pear', reason: 'resume-already-exists' },
+    ])
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
+  })
+
+  it('drains the real internal fleet after an implementer resume collides with a leaked name', async () => {
+    const mount = new FakeMountClient({ [issuePath(81)]: issueFile(81) })
+    const harness = new ResumeCollisionHarnessClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const fleet = new InternalFleetClient({
+      client: harness,
+      ownsBroker: true,
+      ownedBrokerAgentExitTimeoutMs: 25,
+      logger,
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger,
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(81), issueFile(81))))
+    harness.emit({
+      kind: 'agent_exit',
+      name: 'ar-81-impl-pear',
+      reason: 'crash',
+      event_id: 'ar-81-impl-exit',
+    } as BrokerEvent)
+    await vi.waitFor(() => expect(harness.resumeAttempts).toBe(1))
+
+    // The reviewer is still legitimately live; remove it so dispose isolates
+    // the implementer's failed same-name resume lifetime.
+    await fleet.release('ar-81-review', 'test-complete')
+    await fleet.dispose()
+
+    expect(harness.shutdownCalls).toBe(1)
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      '[factory-sdk] timed out waiting for spawned agents to exit; shutting down the owned relay broker',
+      expect.anything(),
+    )
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {

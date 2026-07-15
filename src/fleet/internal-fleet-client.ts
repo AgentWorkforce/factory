@@ -235,6 +235,13 @@ export class InternalFleetClient implements FleetClient {
     }
   }
 
+  markAgentTerminal(name: string, reason?: string): void {
+    this.#readyAgentNames.delete(name)
+    this.#rememberAgentExit(name)
+    this.#trackAgentExit(name)
+    this.#logger?.debug?.('[factory-sdk] marked spawned agent terminal', { name, reason })
+  }
+
   async #releaseWithRetry(name: string, reason?: string): Promise<void> {
     for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
