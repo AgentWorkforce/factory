@@ -436,7 +436,9 @@ const mapOperationStatus = (
     const providerResult = response.providerResult
     if (
       providerResult &&
-      providerResult.status === 200 &&
+      typeof providerResult.status === 'number' &&
+      providerResult.status >= 200 &&
+      providerResult.status < 300 &&
       typeof providerResult.externalId === 'string' &&
       providerResult.externalId.length > 0
     ) {

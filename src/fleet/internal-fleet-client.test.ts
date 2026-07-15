@@ -432,6 +432,51 @@ describe('InternalFleetClient', () => {
     expect(harness.shutdownCalls).toBe(1)
   })
 
+  it('does not delay owned broker shutdown after a resumed agent is marked terminal', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const logger = { info: vi.fn(), warn: vi.fn() }
+    const fleet = new InternalFleetClient({
+      client: harness,
+      ownsBroker: true,
+      ownedBrokerAgentExitTimeoutMs: 25,
+      logger,
+    })
+    await fleet.resume({ name: 'ar-59-resumed', sessionRef: 'session-original' })
+
+    const disposed = fleet.dispose()
+    await Promise.resolve()
+    expect(logger.info).toHaveBeenCalledWith(
+      '[factory-sdk] waiting for spawned agents to exit before shutting down the owned relay broker',
+      expect.objectContaining({ agents: ['ar-59-resumed'], remainingCount: 1 }),
+    )
+
+    fleet.markAgentTerminal('ar-59-resumed', 'resume-already-exists')
+    await disposed
+
+    expect(harness.shutdownCalls).toBe(1)
+    expect(logger.warn).not.toHaveBeenCalled()
+  })
+
+  it('marks terminal idempotently and suppresses a late real exit', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+    const listener = vi.fn()
+    fleet.onAgentExit(listener)
+    await fleet.spawn({ name: 'ar-59-terminal', capability: 'spawn:codex' })
+
+    fleet.markAgentTerminal('ar-59-terminal', 'resume-already-exists')
+    fleet.markAgentTerminal('ar-59-terminal', 'resume-already-exists')
+    harness.emit({
+      kind: 'agent_exit',
+      name: 'ar-59-terminal',
+      reason: 'task_exit',
+      event_id: 'late-terminal-exit',
+    } as BrokerEvent)
+
+    expect(listener).not.toHaveBeenCalled()
+    await fleet.dispose()
+  })
+
   it('treats a failed explicit release as terminal so owned dispose does not wait', async () => {
     vi.useFakeTimers()
     try {
