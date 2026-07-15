@@ -483,6 +483,28 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
   })
 
+  it('confirms a succeeded draft op with providerResult 201 and externalId', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: {
+        status: 201,
+        externalId: '52',
+      },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/github/pull-requests/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/github/pull-requests/new.json', { timeoutMs: 5 })).resolves.toBe('acked')
+  })
+
   it('fails closed on unpollable write confirmations for legacy clients and restarted instances', async () => {
     const fake = new FakeRelayFileClient()
     const clientWithoutGetOp: RelayFileClientLike = {
@@ -805,13 +827,36 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.deleteFileCalls).toEqual([])
   })
 
-  it('does not confirm a succeeded draft op without providerResult 200 and externalId', async () => {
+  it('does not confirm a succeeded draft op without a providerResult externalId', async () => {
     const fake = new FakeRelayFileClient()
     fake.ops.set('op-1', {
       opId: 'op-1',
       status: 'succeeded',
       attemptCount: 1,
       providerResult: { status: 200 },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 }))
+      .rejects.toThrow(/provider result incomplete/)
+  })
+
+  it('does not confirm a succeeded draft op with a non-2xx providerResult status', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: {
+        status: 500,
+        externalId: 'linear-id',
+      },
     })
     const mount = new RelayfileCloudMountClient({
       workspaceId: 'rw_test',
