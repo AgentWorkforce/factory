@@ -4819,10 +4819,10 @@ describe('FactoryLoop', () => {
       'ar-720-impl-relayfile',
       'ar-720-review',
     ])
-    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd])).toEqual([
-      ['ar-720-impl-cloud', '/work/cloud'],
-      ['ar-720-impl-relayfile', '/work/relayfile'],
-      ['ar-720-review', '/work/cloud'],
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.repo, spawn.cwd])).toEqual([
+      ['ar-720-impl-cloud', 'AgentWorkforce/cloud', '/work/cloud'],
+      ['ar-720-impl-relayfile', 'AgentWorkforce/relayfile', '/work/relayfile'],
+      ['ar-720-review', 'AgentWorkforce/cloud', '/work/cloud'],
     ])
     expect(comments[0]).toContain('Implementers: ar-720-impl-cloud, ar-720-impl-relayfile')
   })
@@ -5906,7 +5906,10 @@ describe('FactoryLoop', () => {
 
     expect(fleet.resumes).toEqual([])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-7-impl-pear', 'ar-7-review', 'ar-7-impl-pear'])
-    expect(fleet.spawns.at(-1)?.invocationId).toContain(':restart:')
+    expect(fleet.spawns.at(-1)).toMatchObject({
+      repo: 'AgentWorkforce/pear',
+      invocationId: expect.stringContaining(':restart:'),
+    })
   })
 
   it('emits an escalation on delivery_failed for an in-flight agent', async () => {
@@ -6111,6 +6114,11 @@ describe('FactoryLoop', () => {
     await expect(factory.dispatch(decision)).rejects.toThrow(
       'Dispatch spawn failed for AR-36/ar-36-impl-pear (spawn:codex) cwd=/work/pear: spawnPty failed',
     )
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-36-impl-pear',
+      repo: 'AgentWorkforce/pear',
+    })
+    expect(fleet.spawns).toHaveLength(1)
     expect(errors).toHaveLength(1)
     expect(JSON.parse(JSON.stringify(errors[0]))).toMatchObject({
       issue: { key: 'AR-36' },
@@ -9143,6 +9151,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([])
     expect(fleet.spawns).toHaveLength(4)
     for (const spawn of fleet.spawns.slice(2)) {
+      expect(spawn.repo).toBe('AgentWorkforce/pear')
       expect(spawn.task).toContain('Factory released this team while waiting for human input')
       expect(spawn.task).toContain('Which retry helper should I use?')
       expect(spawn.task).toContain('Use retryOnTimeout from factory.ts.')
