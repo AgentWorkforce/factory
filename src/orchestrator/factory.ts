@@ -31,7 +31,7 @@ import type {
 import type { Clock, Logger } from '../ports/system'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
-import { normalizeLogger, normalizeLogValue, stringifyLogValue } from '../logging'
+import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
 import {
@@ -7493,11 +7493,10 @@ const contextualError = (context: string, error: unknown): Error => {
   const wrapped = new Error(`${context}: ${details.errorMessage}`)
   if (details.errorStack) {
     const wrappedDetails = describeError(wrapped)
-    Object.defineProperty(wrapped, 'stack', {
-      configurable: true,
-      writable: true,
-      value: `${wrappedDetails.errorStack ?? wrapped.message}\nCaused by: ${details.errorStack}`,
-    })
+    setSafeErrorStack(
+      wrapped,
+      `${wrappedDetails.errorStack ?? wrapped.message}\nCaused by: ${details.errorStack}`,
+    )
   }
   const withCause = wrapped as Error & { cause?: unknown }
   withCause.cause = error

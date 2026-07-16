@@ -108,7 +108,11 @@ describe('log metadata normalization', () => {
     })
 
     expect(normalizeLogValue(error)).toEqual({ name: 'Error', message: 'Error' })
-    expect(normalizeLogValue(stackError)).toEqual({ name: 'Error', message: 'safe message' })
+    expect(normalizeLogValue(stackError)).toEqual({
+      name: 'Error',
+      message: 'safe message',
+      stack: 'Error: safe message',
+    })
     expect(normalizeLogValue(array)).toEqual(['[Getter]'])
     expect(errorGets).toBe(0)
     expect(arrayGets).toBe(0)
@@ -166,7 +170,7 @@ describe('log metadata normalization', () => {
   })
 
   it('does not materialize a lazy stack through a custom Error.prepareStackTrace hook', () => {
-    const error = new Error('hooked stack')
+    const errorCreatedBeforeHook = new Error('before hook')
     const original = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace')
     let calls = 0
     Object.defineProperty(Error, 'prepareStackTrace', {
@@ -177,10 +181,16 @@ describe('log metadata normalization', () => {
       },
     })
     try {
-      expect(normalizeLogValue(error)).toEqual({
+      const errorCreatedAfterHook = new Error('after hook')
+      expect(normalizeLogValue(errorCreatedBeforeHook)).toEqual({
         name: 'Error',
-        message: 'hooked stack',
-        stack: 'Error: hooked stack',
+        message: 'before hook',
+        stack: 'Error: before hook',
+      })
+      expect(normalizeLogValue(errorCreatedAfterHook)).toEqual({
+        name: 'Error',
+        message: 'after hook',
+        stack: 'Error: after hook',
       })
       expect(calls).toBe(0)
     } finally {

@@ -7,7 +7,7 @@ const MAX_DEPTH = 6
 const MAX_FIELDS = 100
 const MAX_ARRAY_ITEMS = 100
 const MAX_STRING_LENGTH = 32_000
-const NATIVE_ERROR_STACK_GETTER = Object.getOwnPropertyDescriptor(new Error(), 'stack')?.get
+const SAFE_ERROR_STACKS = new WeakMap<Error, string>()
 const NATIVE_REGEXP_SOURCE_GETTER = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')?.get
 const NATIVE_REGEXP_FLAG_GETTERS = [
   ['d', Object.getOwnPropertyDescriptor(RegExp.prototype, 'hasIndices')?.get],
@@ -78,6 +78,16 @@ export function stringifyLogValue(value: unknown): string {
   }
 }
 
+/** Attach a stack assembled from already-normalized diagnostics. */
+export function setSafeErrorStack(error: Error, stack: string): void {
+  Object.defineProperty(error, 'stack', {
+    configurable: true,
+    writable: true,
+    value: stack,
+  })
+  SAFE_ERROR_STACKS.set(error, stack)
+}
+
 function normalizeValue(value: unknown, depth: number, state: NormalizationState): unknown {
   if (typeof value === 'string') return boundedString(value)
   if (value === null || typeof value === 'boolean') return value
@@ -123,31 +133,79 @@ function normalizeError(error: Error, depth: number, state: NormalizationState):
   const result: Record<string, unknown> = {}
   let descriptors: PropertyDescriptorMap
   try {
-    descriptors = Object.getOwnPropertyDescriptors(error)
+    descriptors = getOwnErrorDescriptors(error)
   } catch {
     return { name: 'Error', message: 'Error' }
   }
   const name = safeDataField(error, descriptors, 'name')
   const message = safeDataField(error, descriptors, 'message')
   const displayFieldHasAccessor = hasAccessorField(error, descriptors, 'name') || hasAccessorField(error, descriptors, 'message')
-  const stack = displayFieldHasAccessor
-    ? undefined
-    : safeDataField(error, descriptors, 'stack')
+  const markedSafeStack = SAFE_ERROR_STACKS.get(error)
+  const stack = markedSafeStack ?? (
+    displayFieldHasAccessor || hasCustomPrepareStackTrace()
+      ? undefined
+      : safeStackField(error)
+  )
   const code = safeDataField(error, descriptors, 'code')
 
   result.name = typeof name === 'string' && name ? boundedString(name) : 'Error'
   result.message = typeof message === 'string' && message ? boundedString(message) : result.name
   if (typeof stack === 'string' && stack) result.stack = boundedString(stack)
-  else if (!displayFieldHasAccessor && isNativeLazyStack(error, descriptors)) {
-    // A custom Error.prepareStackTrace makes lazy materialization unsafe. Keep
-    // the diagnostic header without executing that hook or losing the stack
-    // field entirely.
+  else if (!displayFieldHasAccessor) {
+    // Stack descriptors are runtime-specific: inspecting one can materialize
+    // V8's lazy stack and execute Error.prepareStackTrace on Node 20. Keep a
+    // safe diagnostic header whenever the full stack cannot be read without
+    // invoking user code.
     result.stack = `${result.name}: ${result.message}`
   }
   if (isSafeErrorCode(code)) result.code = code
 
   appendEnumerableProperties(result, descriptors, depth, state, new Set(['name', 'message', 'stack', 'code', 'cause']))
   return result
+}
+
+function getOwnErrorDescriptors(error: Error): PropertyDescriptorMap {
+  const descriptors: PropertyDescriptorMap = {}
+  for (const key of Reflect.ownKeys(error)) {
+    if (typeof key !== 'string' || key === 'stack') continue
+    const descriptor = Object.getOwnPropertyDescriptor(error, key)
+    if (descriptor) descriptors[key] = descriptor
+  }
+  return descriptors
+}
+
+function safeStackField(error: Error): unknown {
+  let descriptor: PropertyDescriptor | undefined
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(error, 'stack')
+  } catch {
+    return undefined
+  }
+  if (!descriptor) return undefined
+  if ('value' in descriptor) return descriptor.value
+
+  const nativeGetter = getNativeErrorStackGetter()
+  if (!nativeGetter || descriptor.get !== nativeGetter) return undefined
+  try {
+    return nativeGetter.call(error)
+  } catch {
+    return undefined
+  }
+}
+
+let nativeErrorStackGetter: (() => string) | undefined
+let nativeErrorStackGetterResolved = false
+
+function getNativeErrorStackGetter(): (() => string) | undefined {
+  if (hasCustomPrepareStackTrace()) return undefined
+  if (nativeErrorStackGetterResolved) return nativeErrorStackGetter
+  nativeErrorStackGetterResolved = true
+  try {
+    nativeErrorStackGetter = Object.getOwnPropertyDescriptor(new Error(), 'stack')?.get
+  } catch {
+    nativeErrorStackGetter = undefined
+  }
+  return nativeErrorStackGetter
 }
 
 function normalizeArray(value: unknown[], depth: number, state: NormalizationState): unknown[] | string {
@@ -228,18 +286,6 @@ function safeDataField(error: Error, ownDescriptors: PropertyDescriptorMap, key:
   const descriptor = findPropertyDescriptor(error, ownDescriptors, key)
   if (!descriptor) return undefined
   if ('value' in descriptor) return descriptor.value
-  if (
-    key === 'stack' &&
-    descriptor.get &&
-    descriptor.get === NATIVE_ERROR_STACK_GETTER &&
-    !hasCustomPrepareStackTrace()
-  ) {
-    try {
-      return NATIVE_ERROR_STACK_GETTER.call(error)
-    } catch {
-      return undefined
-    }
-  }
   return undefined
 }
 
@@ -260,11 +306,6 @@ function hasCustomPrepareStackTrace(): boolean {
 function hasAccessorField(error: Error, ownDescriptors: PropertyDescriptorMap, key: string): boolean {
   const descriptor = findPropertyDescriptor(error, ownDescriptors, key)
   return Boolean(descriptor && !('value' in descriptor))
-}
-
-function isNativeLazyStack(error: Error, ownDescriptors: PropertyDescriptorMap): boolean {
-  const descriptor = findPropertyDescriptor(error, ownDescriptors, 'stack')
-  return Boolean(descriptor && !('value' in descriptor) && descriptor.get === NATIVE_ERROR_STACK_GETTER)
 }
 
 function findPropertyDescriptor(
