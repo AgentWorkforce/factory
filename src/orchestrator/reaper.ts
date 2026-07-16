@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 
 import { parseJsonContent } from '../writeback/shared'
 import type { Clock, FleetClient, Logger } from '../ports'
+import { normalizeLogger } from '../logging'
 import type { FactoryInFlightRegistry, FactoryInFlightRegistryAgent, FactoryInFlightRegistryProcess } from '../types'
 import { checkFactoryLoopLiveness, readFactoryLoopHeartbeat } from './factory'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder, type ProcessIdentity } from './process-identity'
@@ -175,6 +176,7 @@ const parsePidList = (stdout: string | Buffer | undefined): number[] => {
 }
 
 export async function reapFactoryOrphansOnce(opts: FactoryReaperOptions): Promise<FactoryReaperReport> {
+  const logger = opts.logger ? normalizeLogger(opts.logger) : undefined
   const heartbeat = await readFactoryLoopHeartbeat(opts.heartbeatPath)
   const liveness = checkFactoryLoopLiveness(heartbeat, { nowMs: opts.nowMs ?? opts.clock?.now(), staleMs: opts.staleMs })
   if (!liveness.stale) {
@@ -190,7 +192,7 @@ export async function reapFactoryOrphansOnce(opts: FactoryReaperOptions): Promis
   const reaped: FactoryReaperReport['reaped'] = []
   const skipped: FactoryReaperReport['skipped'] = []
   const kill = opts.kill ?? process.kill
-  const protectedPids = await reaperProtectedPids(opts)
+  const protectedPids = await reaperProtectedPids(opts, logger)
   const processes = await registryProcesses(registry, opts, skipped, protectedPids)
 
   for (const processInfo of processes) {
@@ -215,7 +217,7 @@ export async function reapFactoryOrphansOnce(opts: FactoryReaperOptions): Promis
     })
     for (const entry of report.terminated) {
       reaped.push(entry)
-      opts.logger?.warn?.('[factory-reaper] reaped orphaned factory pid', { pid: entry.pid, signals: entry.signals })
+      logger?.warn?.('[factory-reaper] reaped orphaned factory pid', { pid: entry.pid, signals: entry.signals })
     }
     for (const entry of report.skipped) {
       skipped.push(entry)
@@ -267,11 +269,11 @@ export class FactoryReaper {
   }
 }
 
-async function reaperProtectedPids(opts: FactoryReaperOptions): Promise<number[]> {
+async function reaperProtectedPids(opts: FactoryReaperOptions, logger?: Logger): Promise<number[]> {
   try {
     return await opts.fleet?.protectedPids?.() ?? []
   } catch (error) {
-    opts.logger?.warn?.('[factory-reaper] failed to resolve protected fleet pids', error)
+    logger?.warn?.('[factory-reaper] failed to resolve protected fleet pids', error)
     return []
   }
 }

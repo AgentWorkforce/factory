@@ -6083,7 +6083,13 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({ [issuePath(9)]: issueFile(9) })
     mount.setConfirmWrite(issuePath(9), 'failed')
     const fleet = new FakeFleetClient()
-    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const loggedErrors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: { error: (...args: unknown[]) => loggedErrors.push(args) },
+    })
     const errors: unknown[] = []
     factory.on('error', (payload) => errors.push(payload))
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(9), issueFile(9)))
@@ -6098,6 +6104,74 @@ describe('FactoryLoop', () => {
       errorMessage: expect.stringContaining('Writeback not acked'),
       errorStack: expect.stringContaining('Error: Writeback not acked'),
     })
+    expect(loggedErrors).toContainEqual([
+      '[factory] error',
+      expect.objectContaining({
+        name: 'Error',
+        message: expect.stringContaining('Writeback not acked'),
+        stack: expect.stringContaining('Error: Writeback not acked'),
+        errorMessage: expect.stringContaining('Writeback not acked'),
+        errorStack: expect.stringContaining('Error: Writeback not acked'),
+        issue: 'AR-9',
+      }),
+    ])
+    expect(factory.status().counters.errors).toBe(1)
+  })
+
+  it('preserves structured custom error fields in #error logs without leaking sensitive metadata', async () => {
+    const mount = new FakeMountClient({ [issuePath(83)]: issueFile(83) })
+    const fleet = new FakeFleetClient()
+    const loggedErrors: unknown[][] = []
+    const emittedErrors: unknown[] = []
+    const protocolError = Object.assign(new Error('internal reply dropped'), {
+      name: 'HarnessDriverProtocolError',
+      code: 'http_500',
+      status: 500,
+      retryable: true,
+      data: { error: 'internal reply dropped', authorization: 'Bearer do-not-log' },
+    })
+    const linear: LinearWriteback = {
+      async postComment() {},
+      async setState() {
+        throw protocolError
+      },
+      async createIssue() {
+        throw new Error('not used')
+      },
+      async verify() {
+        return true
+      },
+    }
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear,
+      logger: { error: (...args: unknown[]) => loggedErrors.push(args) },
+    })
+    factory.on('error', (payload) => emittedErrors.push(payload))
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(83), issueFile(83)))
+
+    await expect(factory.dispatch(decision)).rejects.toBe(protocolError)
+
+    expect(loggedErrors).toContainEqual([
+      '[factory] error',
+      expect.objectContaining({
+        name: 'HarnessDriverProtocolError',
+        message: 'internal reply dropped',
+        stack: expect.stringContaining('HarnessDriverProtocolError: internal reply dropped'),
+        errorMessage: 'internal reply dropped',
+        errorStack: expect.stringContaining('HarnessDriverProtocolError: internal reply dropped'),
+        code: 'http_500',
+        status: 500,
+        retryable: true,
+        data: { error: 'internal reply dropped', authorization: '[Redacted]' },
+        issue: 'AR-83',
+      }),
+    ])
+    expect(emittedErrors).toHaveLength(1)
+    expect(emittedErrors[0]).toMatchObject({ error: protocolError, issue: { key: 'AR-83' } })
+    expect(factory.status().counters.errors).toBe(1)
   })
 
   it('classifies fleet spawn failures with issue, agent, capability, and cwd context', async () => {
@@ -6155,7 +6229,11 @@ describe('FactoryLoop', () => {
     })
     expect(warnings[0]).toEqual([
       '[factory] comment writeback skipped',
-      expect.objectContaining({ message: 'unsupported Linear writeback path' }),
+      expect.objectContaining({
+        name: 'Error',
+        message: 'unsupported Linear writeback path',
+        stack: expect.stringContaining('Error: unsupported Linear writeback path'),
+      }),
     ])
     expect(mount.writes).toContainEqual({ path: issuePath(25), content: { stateId: implementing } })
   })
@@ -9061,7 +9139,14 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.clarificationWakeLeaseLosses).toBeUndefined()
       expect(warnings).toContainEqual([
         '[factory] transient error renewing clarification wake lease; retrying',
-        expect.objectContaining({ issue: 'AR-52', error: expect.any(Error) }),
+        expect.objectContaining({
+          issue: 'AR-52',
+          error: expect.objectContaining({
+            name: 'Error',
+            message: 'transient state store outage',
+            stack: expect.stringContaining('Error: transient state store outage'),
+          }),
+        }),
       ])
     } finally {
       vi.useRealTimers()
