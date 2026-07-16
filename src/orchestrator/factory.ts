@@ -62,7 +62,7 @@ import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlack
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
-import { terminatePids } from './reaper'
+import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -440,6 +440,7 @@ export class FactoryLoop implements Factory {
     }
 
     this.#wireFleetEvents()
+    await this.#adoptInFlightAgents()
 
     if ((opts.mode ?? 'live') === 'live') {
       this.#started = true
@@ -1594,6 +1595,27 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  // Remote backends survive orchestrator restarts: re-adopt the agents recorded
+  // in the in-flight registry, then reconcile once so exits that happened while
+  // this process was down are handled before any new dispatch.
+  async #adoptInFlightAgents(): Promise<void> {
+    if (!this.#fleet.hydrateTracked) return
+    try {
+      const registry = await readFactoryInFlightRegistry(this.#config.loop.registryPath)
+      const agents = (registry?.agents ?? []).filter((agent) => agent.invocationId || agent.node)
+      if (agents.length > 0) {
+        this.#fleet.hydrateTracked(agents.map((agent) => ({
+          name: agent.name,
+          invocationId: agent.invocationId,
+          node: agent.node,
+        })))
+      }
+      await this.#fleet.reconcileTrackedAgents?.()
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to re-adopt in-flight agents from the registry', { error })
+    }
+  }
+
   async #backfillReadyIssues(): Promise<void> {
     const page = await this.#mount.getEvents({ limit: READY_EVENTS_LIMIT })
     const allPaths = page.events.map((event) => changeEventPath(event)).filter((p): p is string => Boolean(p))
@@ -2393,6 +2415,7 @@ export class FactoryLoop implements Factory {
           processes.push({ ...identity, agentName })
         }
       }
+      const fleetTracked = this.#fleet.trackedAgents?.().get(agentName)
       agents.push({
         name: agentName,
         role: tracked.spec.role,
@@ -2400,6 +2423,8 @@ export class FactoryLoop implements Factory {
         sessionRef: tracked.sessionRef,
         pids,
         processes,
+        ...(fleetTracked?.invocationId ? { invocationId: fleetTracked.invocationId } : {}),
+        ...(fleetTracked?.node ? { node: fleetTracked.node } : {}),
       })
     }
 
