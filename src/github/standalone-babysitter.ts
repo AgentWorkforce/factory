@@ -53,19 +53,15 @@ export function parseStandaloneBabysitTarget(value: string | undefined): Standal
     url.port ||
     url.search ||
     url.hash ||
-    !match
+    !match ||
+    match[1]?.includes('%') ||
+    match[2]?.includes('%')
   ) {
     throw new Error('factory babysit requires a positive PR number or canonical https://github.com/<owner>/<repo>/pull/<number> URL')
   }
 
-  let owner: string
-  let repoName: string
-  try {
-    owner = decodeURIComponent(match[1]!)
-    repoName = decodeURIComponent(match[2]!)
-  } catch {
-    throw new Error('factory babysit requires a positive PR number or canonical https://github.com/<owner>/<repo>/pull/<number> URL')
-  }
+  const owner = match[1]!
+  const repoName = match[2]!
   const prNumber = Number(match[3])
   if (!isGithubOwner(owner) || !isGithubRepo(repoName) || !Number.isSafeInteger(prNumber)) {
     throw new Error('factory babysit requires a positive PR number or canonical https://github.com/<owner>/<repo>/pull/<number> URL')
@@ -123,8 +119,13 @@ export function standaloneBabysitterAgentName(repo: string, prNumber: number): s
 }
 
 export function explicitLinkedIssueKey(body: string): string | undefined {
-  const matches = [...body.matchAll(/(?:^|\n)\s*(?:linear|issue|closes|fixes|resolves)\b[^\n]*?\b([A-Z][A-Z0-9]*-\d+)\b/giu)]
-  const keys = new Set(matches.map((match) => match[1]!.toUpperCase()))
+  const linkedLines = body.split('\n').filter((line) => /^\s*(?:linear|issue|closes|fixes|resolves)\b/iu.test(line))
+  const keys = new Set<string>()
+  for (const line of linkedLines) {
+    for (const match of line.matchAll(/\b([A-Z][A-Z0-9]*-\d+)\b/giu)) {
+      keys.add(match[1]!.toUpperCase())
+    }
+  }
   return keys.size === 1 ? [...keys][0] : undefined
 }
 
@@ -236,7 +237,7 @@ function mergePullMetadata(
     repo: live.repo,
     number: live.number,
     title: live.title || mounted.title,
-    body: live.body,
+    body: live.body || mounted.body,
     state: live.state ?? mounted.state,
     draft: live.draft ?? mounted.draft,
     merged: live.merged ?? mounted.merged,

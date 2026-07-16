@@ -95,7 +95,7 @@ const RELEASE_RETRY_BACKOFF_MS = 250
 
 export class InternalFleetClient implements FleetClient {
   readonly #client: HarnessDriverClientLike
-  readonly #ownsBroker: boolean
+  #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number
   readonly #cwd?: string
   readonly #connectionPath?: string
@@ -410,6 +410,10 @@ export class InternalFleetClient implements FleetClient {
     return () => {
       this.#agentExitListeners.delete(listener)
     }
+  }
+
+  preserveInfrastructureOnDispose(): void {
+    this.#ownsBroker = false
   }
 
   async dispose(): Promise<void> {

@@ -131,12 +131,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     }
 
     const loaded = command.kind.startsWith('factory') ? await loadConfig(globals.config) : undefined
-    fleet = await buildFleet(
-      globals,
-      loaded,
-      deps,
-      command.kind === 'factory-babysit' && !globals.dryRun,
-    )
+    fleet = await buildFleet(globals, loaded, deps)
 
     switch (command.kind) {
       case 'spawn': {
@@ -453,9 +448,9 @@ async function runStandaloneBabysitCommand(
   const clonePath = standaloneBabysitClonePath(repo, config)
   const mountFn = deps.ensureLocalMount ?? ensureLocalMount
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
-  await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts)
+  await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts, deps.stderr)
   if (clonePath && resolve(clonePath) !== resolve(process.cwd())) {
-    await ensureStandaloneBabysitMount(mountFn, workspaceId, clonePath, mountOpts)
+    await ensureStandaloneBabysitMount(mountFn, workspaceId, clonePath, mountOpts, deps.stderr)
   }
 
   const pr = await readStandalonePullRequest(
@@ -553,6 +548,7 @@ async function runStandaloneBabysitCommand(
     cwd: clonePath,
     invocationId: `factory-babysit:${repo}#${pr.number}`,
   })
+  fleet.preserveInfrastructureOnDispose?.()
   writeJson(out, { status: 'spawned', ...receiptBase, agent: spawned.name })
   return 0
 }
@@ -562,12 +558,13 @@ async function ensureStandaloneBabysitMount(
   workspaceId: string,
   startDir: string,
   options: { acceptableWorkspaceIds?: readonly string[] },
+  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
 ): Promise<void> {
   try {
     await mountFn(workspaceId, startDir, options)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    process.stderr.write(
+    stderr.write(
       `[factory] warning: could not start relayfile mount for standalone babysitter at ${resolve(startDir)}; ` +
       `the agent will use the GitHub CLI fallback: ${message}\n`,
     )
@@ -597,8 +594,8 @@ function resolveStandaloneBabysitRepo(repo: string | undefined, config: FactoryC
 }
 
 function standaloneBabysitClonePath(repo: string, config: FactoryConfig): string | undefined {
-  const configured = Object.entries(config.clonePaths).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
-    ?? Object.entries(config.repos.clonePaths).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
+  const configured = Object.entries(config.clonePaths ?? {}).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
+    ?? Object.entries(config.repos.clonePaths ?? {}).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
   if (configured && existsSync(configured)) return configured
   return undefined
 }
@@ -735,7 +732,6 @@ async function buildFleet(
   globals: GlobalOptions,
   loaded: LoadedConfig | undefined,
   deps: FleetCliDeps,
-  preserveStartedBroker = false,
 ): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
@@ -764,10 +760,7 @@ async function buildFleet(
       { backend: 'internal', cwd, connectionPath },
       {
         harnessClient: client,
-        // A standalone babysitter is intentionally fire-and-forget. If this
-        // command had to start the broker, leave it running so a long CI/review
-        // cycle is not killed by InternalFleetClient's owned-broker timeout.
-        ownsBroker: started && !preserveStartedBroker,
+        ownsBroker: started,
         ownedBrokerAgentExitTimeoutMs: globals.agentExitTimeoutMs,
         workspaceKey,
         logger,

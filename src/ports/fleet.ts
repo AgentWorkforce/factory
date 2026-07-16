@@ -61,6 +61,10 @@ export interface FleetClient {
   trackedAgents?(): ReadonlyMap<string, FleetTrackedAgent>
   hydrateTracked?(agents: Array<{ name: string; invocationId?: string; node?: string }>): void
   reconcileTrackedAgents?(): Promise<void>
+  // A successfully spawned fire-and-forget worker may need infrastructure this
+  // client cold-started to outlive the invoking CLI process. Backends that own
+  // such infrastructure can relinquish cleanup responsibility after spawn.
+  preserveInfrastructureOnDispose?(): void
   dispose(): Promise<void>
 }
 

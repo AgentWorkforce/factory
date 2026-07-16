@@ -757,19 +757,25 @@ describe('fleet CLI runtime', () => {
       })
       const fleet = new FakeFleetClient()
       const output = buffer()
+      const errors = buffer()
       const mountCalls: string[] = []
       const code = await runFleetCli(['babysit', '10', '--config', configPath], {
         fleet,
         mount,
-        ensureLocalMount: async (_workspaceId, startDir) => { mountCalls.push(startDir) },
+        ensureLocalMount: async (_workspaceId, startDir) => {
+          mountCalls.push(startDir)
+          if (startDir === clonePath) throw new Error('mount unavailable')
+        },
         babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: output,
-        stderr: buffer(),
+        stderr: errors,
       })
 
       expect(code).toBe(0)
       expect(mountCalls).toEqual([process.cwd(), clonePath])
+      expect(errors.text()).toContain(`warning: could not start relayfile mount for standalone babysitter at ${clonePath}`)
       expect(fleet.spawns).toHaveLength(1)
+      expect(fleet.preservedInfrastructure).toBe(1)
       expect(fleet.spawns[0]).toMatchObject({
         capability: 'spawn:claude',
         repo: 'AgentWorkforce/hoopsheet',
@@ -830,6 +836,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(1)
       expect(errors.text()).toContain(message)
       expect(fleet.spawns).toEqual([])
+      expect(fleet.preservedInfrastructure).toBe(0)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

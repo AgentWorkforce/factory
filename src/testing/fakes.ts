@@ -182,6 +182,7 @@ export class FakeFleetClient implements FleetClient {
   > = []
   readonly hydrated: Array<{ name: string; invocationId?: string; node?: string }> = []
   reconciles = 0
+  preservedInfrastructure = 0
 
   #agents = new Set<string>()
   #tracked = new Map<string, { invocationId?: string; node?: string }>()
@@ -278,6 +279,10 @@ export class FakeFleetClient implements FleetClient {
     return () => {
       this.#agentMessageListeners.delete(listener)
     }
+  }
+
+  preserveInfrastructureOnDispose(): void {
+    this.preservedInfrastructure += 1
   }
 
   async dispose(): Promise<void> {}

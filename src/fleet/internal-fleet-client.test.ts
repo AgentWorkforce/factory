@@ -357,6 +357,17 @@ describe('InternalFleetClient', () => {
     expect(harness.disconnectCalls).toBe(0)
   })
 
+  it('preserves a cold-started broker only after infrastructure ownership is relinquished', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness, ownsBroker: true, cwd: '/worktree' })
+
+    fleet.preserveInfrastructureOnDispose()
+    await fleet.dispose()
+
+    expect(harness.shutdownCalls).toBe(0)
+    expect(harness.disconnectCalls).toBe(1)
+  })
+
   it('keeps an owned broker alive until all dispatched agents exit across both broker event shapes', async () => {
     const harness = new FakeHarnessDriverClient()
     const logger = { info: vi.fn() }

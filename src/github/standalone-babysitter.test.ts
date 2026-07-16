@@ -26,6 +26,7 @@ describe('standalone PR babysitter helpers', () => {
       'https://user@github.com/AgentWorkforce/hoopsheet/pull/10',
       'https://github.com/AgentWorkforce/hoopsheet/pull/10?diff=split',
       'https://github.com/AgentWorkforce%2Fother/hoopsheet/pull/10',
+      'https://github.com/AgentWorkforce/%68oopsheet/pull/10',
     ]) {
       expect(() => parseStandaloneBabysitTarget(target)).toThrow(/factory babysit requires/u)
     }
@@ -131,9 +132,45 @@ describe('standalone PR babysitter helpers', () => {
     })
   })
 
+  it('preserves the mounted PR body when live metadata has an empty body', async () => {
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
+        payload: {
+          number: 10,
+          title: 'Mounted title',
+          body: 'Mounted definition of done',
+          state: 'open',
+          draft: false,
+          head: { ref: 'feature', sha: 'mounted-sha', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
+          base: { ref: 'main' },
+        },
+      },
+    })
+    const pr = await readStandalonePullRequest(
+      mount,
+      { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
+      async () => ({
+        stdout: JSON.stringify({
+          number: 10,
+          title: 'Live title',
+          body: '',
+          state: 'OPEN',
+          isDraft: false,
+          headRefName: 'feature',
+          headRefOid: 'live-sha',
+          baseRefName: 'main',
+          headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
+        }),
+      }),
+    )
+
+    expect(pr.body).toBe('Mounted definition of done')
+  })
+
   it('only selects an unambiguous explicit linked issue', () => {
     expect(explicitLinkedIssueKey('Closes AR-123')).toBe('AR-123')
     expect(explicitLinkedIssueKey('Closes AR-123\nFixes AR-456')).toBeUndefined()
+    expect(explicitLinkedIssueKey('Closes AR-123, Closes AR-456')).toBeUndefined()
     expect(explicitLinkedIssueKey('AR-123 appears incidentally')).toBeUndefined()
   })
 
