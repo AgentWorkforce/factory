@@ -8149,7 +8149,7 @@ describe('FactoryLoop', () => {
     })
 
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review']))
-    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
   })
 
   it('persists a pre-side-effect claim and suppresses the same reply after a crash restart', async () => {
