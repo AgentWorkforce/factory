@@ -1,0 +1,1806 @@
+version: '1.0'
+updated: '2026-07-17'
+catalog:
+  category_count: 19
+  feature_count: 238
+  tier_counts:
+    1: 22
+    2: 104
+    3: 10
+    4: 41
+    5: 47
+    6: 14
+
+# Every user-facing feature in @agent-relay/factory, categorized and scored.
+#
+# criticality:
+#   critical - product cannot function without this; verify on every change
+#   hot      - commonly used or safety-sensitive path; verify for related changes
+#   standard - useful supporting or programmatic feature; verify periodically
+#
+# verify_tier (what is required to run verification):
+#   1 - nothing beyond the installed package/source checkout
+#   2 - a valid factory.config.json (fixture-backed is acceptable)
+#   3 - reachable ticket provider credentials (Linear or GitHub)
+#   4 - a fleet backend (internal broker or hosted Relay fleet) is available
+#   5 - cloud auth and a writable Relayfile mount are available
+#   6 - manual verification with a live issue or pull request
+
+categories:
+  cli-operations:
+    name: Factory CLI Operations
+    description: Published factory commands and global execution controls
+    criticality: critical
+    features:
+      - id: cli-help
+        name: CLI Help
+        cli: factory --help
+        description: Print the complete factory command and global option surface without loading config
+        location: src/cli/fleet.ts
+        verify_tier: 1
+
+      - id: cli-run-once
+        name: Single Factory Cycle
+        cli: factory run-once
+        api: Factory.runOnce()
+        description: Run one discover, triage, and dispatch cycle and emit an IterationReport as JSON
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-start-live
+        name: Live Factory Daemon
+        cli: factory start --mode live
+        api: "Factory.start({ mode: 'live' })"
+        description: Start the long-lived event-driven factory daemon until SIGINT or SIGTERM
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: cli-status
+        name: Factory Status
+        cli: factory status
+        api: Factory.status()
+        description: Print in-flight issues, queued issues, counters, and Slack degradation state as JSON
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-loop
+        name: Bounded Factory Loop
+        cli: factory loop
+        api: Factory.runLoop()
+        description: Run a bounded multi-iteration factory loop with heartbeat and circuit-breaker handling
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-loop-status
+        name: Loop Liveness Status
+        cli: factory loop-status
+        api: checkFactoryLoopLiveness()
+        description: Read the loop heartbeat and report whether the owning process is live or stale
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-kill-loop
+        name: Stop Loop by Heartbeat PID
+        cli: factory kill-loop
+        description: Send SIGTERM to the process recorded in the configured factory heartbeat
+        location: src/cli/fleet.ts
+        verify_tier: 6
+
+      - id: cli-reap-orphans
+        name: Reap Orphaned Factory Agents
+        cli: factory reap-orphans
+        api: reapFactoryOrphansOnce()
+        description: Reconcile stale heartbeat and registry state and terminate factory-owned orphan processes
+        location: src/cli/fleet.ts, src/orchestrator/reaper.ts
+        verify_tier: 4
+
+      - id: cli-canary
+        name: Sync-Fidelity Canary
+        cli: factory canary <KEY|path>
+        description: Exercise the real dry-run discovery and triage path and fail if a known issue is not dispatch-ready
+        location: src/cli/fleet.ts
+        verify_tier: 3
+
+      - id: cli-triage
+        name: Triage One Issue
+        cli: factory triage <KEY|path>
+        api: Factory.triageIssue()
+        description: Read one Linear or GitHub issue, route it, and print the normalized triage decision
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: cli-dispatch
+        name: Dispatch One Issue
+        cli: factory dispatch <KEY|path>
+        api: Factory.dispatch()
+        description: Triage one issue and dispatch its implementation team through the selected fleet backend
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: cli-github-numeric-issue
+        name: GitHub Numeric Issue Resolution
+        cli: factory <canary|triage|dispatch> <issue-number>
+        description: Resolve a positive GitHub issue number within configured repositories without requiring a repo-qualified path
+        location: src/cli/fleet.ts
+        verify_tier: 3
+
+      - id: cli-babysit
+        name: Standalone Pull Request Babysitter
+        cli: factory babysit <PR-number|GitHub-PR-URL>
+        description: Spawn a one-shot task-exit babysitter for an existing open non-draft same-repository PR
+        location: src/cli/fleet.ts, src/github/standalone-babysitter.ts
+        verify_tier: 6
+
+      - id: cli-close-probe
+        name: Close Synthetic Probe PR
+        cli: factory close-probe <PR> --repo <owner/repo> --issue <KEY>
+        api: closeProbePr()
+        description: Guard and close a synthetic probe pull request through the connected GitHub write path
+        location: src/cli/fleet.ts, src/github/probe-closer.ts
+        verify_tier: 6
+
+      - id: cli-config-option
+        name: Alternate Config File
+        cli: factory <command> --config <path>
+        description: Load factory configuration from a caller-selected JSON path instead of ./factory.config.json
+        location: src/cli/fleet.ts
+        verify_tier: 1
+
+      - id: cli-dry-run-option
+        name: Dry-Run Execution
+        cli: factory <run-once|loop|dispatch|babysit> --dry-run
+        description: Discover and triage without provider writes, agent spawns, or destructive lifecycle changes
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-backend-option
+        name: Fleet Backend Selection
+        cli: factory <command> --backend <internal|relay>
+        api: 'createFleet({ backend })'
+        description: Select an internal relay broker or the hosted Relay fleet for agent placement
+        location: src/cli/fleet.ts, src/fleet/create-fleet.ts
+        verify_tier: 4
+
+      - id: cli-agent-exit-timeout-option
+        name: Owned Broker Agent Exit Timeout
+        cli: factory <command> --agent-exit-timeout <ms>
+        api: FACTORY_AGENT_EXIT_TIMEOUT_MS
+        description: Bound how long a factory-owned internal broker waits for task-exit agents during disposal
+        location: src/cli/fleet.ts, src/fleet/create-fleet.ts, src/fleet/internal-fleet-client.ts
+        verify_tier: 4
+
+  fleet-cli:
+    name: Low-Level Fleet CLI
+    description: Direct spawn, inventory, resume, and release controls under factory fleet
+    criticality: hot
+    features:
+      - id: fleet-spawn-codex
+        name: Spawn Codex Worker
+        cli: factory fleet spawn spawn:codex
+        api: "FleetClient.spawn({ capability: 'spawn:codex' })"
+        description: Launch a Codex harness worker with optional name, node, task, model, and checkout inputs
+        location: src/cli/fleet.ts, src/fleet/internal-fleet-client.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-spawn-claude
+        name: Spawn Claude Worker
+        cli: factory fleet spawn spawn:claude
+        api: "FleetClient.spawn({ capability: 'spawn:claude' })"
+        description: Launch a Claude harness worker with optional name, node, task, model, and checkout inputs
+        location: src/cli/fleet.ts, src/fleet/internal-fleet-client.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-spawn-workflow
+        name: Spawn Relayflows Workflow
+        cli: factory fleet spawn workflow:run
+        api: "FleetClient.spawn({ capability: 'workflow:run' })"
+        description: Place a workflow run on a capable fleet node
+        location: src/cli/fleet.ts, src/node/factory-node.ts
+        verify_tier: 4
+
+      - id: fleet-resume
+        name: Resume Agent Session
+        cli: factory fleet spawn <capability> --resume <session-ref>
+        api: FleetClient.resume()
+        description: Resume an existing harness session instead of creating a fresh worker
+        location: src/cli/fleet.ts, src/fleet/internal-fleet-client.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-target-node
+        name: Target Fleet Node
+        cli: factory fleet spawn <capability> --node <self|node-name>
+        description: Constrain a spawn or resume request to the local node or a named hosted node
+        location: src/cli/fleet.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-spawn-inputs
+        name: Spawn Task Inputs
+        cli: factory fleet spawn <capability> [--name N] [--task T] [--model M] [--cwd P]
+        description: Customize worker identity, initial task, model, and working directory
+        location: src/cli/fleet.ts
+        verify_tier: 4
+
+      - id: fleet-roster
+        name: Fleet Roster
+        cli: factory fleet roster
+        api: FleetClient.roster()
+        description: List active agents and fleet nodes with capability and liveness information
+        location: src/cli/fleet.ts, src/ports/fleet.ts
+        verify_tier: 4
+
+      - id: fleet-release
+        name: Release Fleet Agent
+        cli: factory fleet release <name> [--reason <text>]
+        api: FleetClient.release()
+        description: Gracefully release an agent and optionally record the operator-supplied reason
+        location: src/cli/fleet.ts, src/ports/fleet.ts
+        verify_tier: 4
+
+  discovery-events:
+    name: Issue Discovery and Event Ingestion
+    description: Pull and live-event paths that find work without missing or double-processing it
+    criticality: critical
+    features:
+      - id: discovery-linear-ready
+        name: Linear Ready Issue Discovery
+        api: Factory.runOnce()
+        description: Discover canonical Linear issues in the Ready for Agent state, including ready-state aliases
+        location: src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: discovery-github-native
+        name: GitHub-Native Issue Discovery
+        api: Factory.runOnce()
+        description: Discover open GitHub issues carrying the configured readiness label without requiring Linear
+        location: src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: discovery-github-path-shapes
+        name: Canonical GitHub Issue Path Compatibility
+        api: findIssuePath()
+        description: Resolve owner__repo and owner/repo mounts across meta.json, by-id, and flat issue records, with scoped fallback scans and ambiguity rejection
+        location: src/cli/fleet.ts
+        verify_tier: 3
+
+      - id: discovery-github-linear-mirror
+        name: GitHub-to-Linear Issue Mirroring
+        api: Factory.runOnce()
+        description: Mirror factory-labeled GitHub issues into scoped Linear issues and deduplicate repeated ingestion
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-github-mirror-close
+        name: GitHub Mirror Closure Propagation
+        api: Factory.runOnce()
+        description: Advance a mirrored Linear issue to Done when its source GitHub issue closes
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-source-auto-select
+        name: Automatic Issue Source Selection
+        api: Factory.start()
+        description: Infer GitHub-native intake from repository-only config, preserve legacy Linear-oriented configs, and report the selected source in resolution failures
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-canonical-fallback
+        name: Sparse Linear Record Reconciliation
+        api: readLinearIssueWithCanonicalFallback()
+        description: Replace sparse primary event stubs with canonical by-id or by-uuid issue records before triage
+        location: src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: discovery-state-name-backfill
+        name: Linear State Name Backfill
+        api: FactoryStateResolution.idForName()
+        description: Recover missing workflow-state UUIDs from configured state names on sparse synced records
+        location: src/orchestrator/factory.ts, src/linear/state-resolver.ts
+        verify_tier: 3
+
+      - id: discovery-startup-backfill
+        name: Startup Ready-Issue Backfill
+        api: "Factory.start({ mode: 'backfill-and-subscribe' })"
+        description: Process recent events and the current ready tree before relying on subsequent live changes
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-live-subscribe
+        name: Live Subscription Transport
+        api: "Factory.start({ mode: 'live' })"
+        description: Subscribe to issue and PR changes from the current high-water mark
+        location: src/orchestrator/factory.ts, src/subscriptions/event-client.ts
+        verify_tier: 5
+
+      - id: discovery-live-poll
+        name: Live Polling Transport
+        api: "Factory.start({ liveSubscription: { transport: 'poll' } })"
+        description: Drain paginated workspace events on an interval when polling is selected
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-live-hybrid
+        name: Subscribe-and-Poll Recovery
+        api: liveSubscription.transport = 'subscribe-and-poll'
+        description: Use the Relayfile stream with SDK-managed polling fallback and recovery
+        location: src/config/schema.ts, src/subscriptions/event-client.ts
+        verify_tier: 5
+
+      - id: discovery-replay-suppression
+        name: Replay Cutoff and High-Water Suppression
+        api: Factory.start()
+        description: Reject stale and already-observed live events by timestamp, high-water mark, and stable event identity
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-duplicate-suppression
+        name: Issue Event Deduplication
+        api: Factory.start()
+        description: Suppress duplicate issue and PR events within a drain and against queued or in-flight work
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-high-water-fallback
+        name: High-Water Route Fallback
+        api: Factory.start()
+        description: Run a safe startup full pull when the event high-water route is unavailable, then drain buffered changes
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-relayflow-events
+        name: Integration Event Relayflow Dispatch
+        api: dispatchRelayflowForChangeEvent()
+        description: Normalize provider change events, resolve registered trigger policies, and run the selected Relayflow
+        location: src/dispatch/relayflow-registry.ts, src/orchestrator/factory.ts
+        verify_tier: 5
+
+  triage-routing:
+    name: Triage and Repository Routing
+    description: Deterministic and optional LLM-assisted decisions that shape each factory team
+    criticality: critical
+    features:
+      - id: triage-label-routing
+        name: Label-Based Repository Routing
+        api: HeuristicTriage.triage()
+        description: Route issue labels through repos.byLabel with case-insensitive matching and highest precedence
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-project-routing
+        name: Project-Based Repository Routing
+        api: HeuristicTriage.triage()
+        description: Route an issue through repos.byProject when no repository label matches
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-keyword-routing
+        name: Keyword Repository Routing
+        api: HeuristicTriage.triage()
+        description: Apply configured case-insensitive regex rules to issue title and description after label and project routing
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-default-routing
+        name: Default Repository Routing
+        api: HeuristicTriage.triage()
+        description: Use repos.default when no label, project, or keyword route matches
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-unroutable-escalation
+        name: Unroutable Issue Escalation
+        api: HeuristicTriage.triage()
+        description: Produce a low-confidence decision for human routing instead of guessing a repository
+        location: src/triage/heuristic.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: triage-single-scope
+        name: Single-Agent Execution Shape
+        api: TriageDecision.scope = 'single'
+        description: Assign one implementer plus a reviewer for work constrained to one implementation surface
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-team-scope
+        name: Multi-Agent Team Execution Shape
+        api: TriageDecision.scope = 'team'
+        description: Assign bounded implementers across multiple routes or inferred surfaces plus a reviewer
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-workflow-scope
+        name: Relayflow Execution Shape
+        api: TriageDecision.scope = 'workflow'
+        description: Dispatch a workflow:run specification instead of direct implementers
+        location: src/triage/heuristic.ts, src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: triage-shape-labels
+        name: Explicit Shape Labels
+        api: scopeFromLabels()
+        description: Honor agent:single, agent:team, and agent:workflow labels ahead of shape inference
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-surface-inference
+        name: Surface-Bucket Shape Inference
+        api: detectSurfaceBuckets()
+        description: Infer team scope from UI, main, Slack, Linear, GitHub, cloud, and docs signals
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-thin-issue-detection
+        name: Thin Issue Detection
+        api: isThinIssue()
+        description: Mark descriptions below the length threshold or without acceptance signals for clarification
+        location: src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: triage-llm-fallback
+        name: LLM Triage Fallback
+        api: LlmTriage.triage()
+        description: Ask an injected LLM for schema-validated routing only when deterministic triage is thin or low confidence
+        location: src/triage/llm.ts, src/triage/schema.ts
+        verify_tier: 2
+
+      - id: triage-tiered-fail-safe
+        name: Tiered Triage Fail-Safe
+        api: TieredTriage.triage()
+        description: Fall back to a low-confidence heuristic decision when optional LLM triage times out or fails validation
+        location: src/triage/tiered.ts
+        verify_tier: 2
+
+      - id: triage-decision-normalization
+        name: Triage Decision Normalization
+        api: TriageDecisionSchema
+        description: Validate agent specs and rebuild routes, names, clone paths, scope, and implementer limits deterministically
+        location: src/triage/schema.ts, src/triage/heuristic.ts, src/triage/tiered.ts
+        verify_tier: 2
+
+      - id: triage-repo-qualified-agent-identities
+        name: Repository-Qualified GitHub Agent Identities
+        api: agentNameForRole()
+        description: Add the GitHub source repository slug to implementer, reviewer, workflow, and babysitter names while preserving byte-compatible Linear identities
+        location: src/triage/agent-names.ts, src/triage/heuristic.ts, src/triage/llm.ts
+        verify_tier: 2
+
+  dispatch-orchestration:
+    name: Team Dispatch and Agent Lifecycle
+    description: Batch admission, agent spawning, messaging, persistence, recovery, and completion coordination
+    criticality: critical
+    features:
+      - id: dispatch-batch-admission
+        name: Bounded Batch Admission
+        api: BatchTracker.start()
+        description: Start work only while batch capacity is available and queue excess triage decisions
+        location: src/orchestrator/batch-tracker.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: dispatch-queue-promotion
+        name: Queued Issue Promotion
+        api: BatchTracker.complete()
+        description: Promote the next queued issue immediately when an in-flight record completes
+        location: src/orchestrator/batch-tracker.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-duplicate-suppression
+        name: Duplicate Dispatch Suppression
+        api: Factory.dispatch()
+        description: Return the existing result or in-flight promise for repeated dispatch attempts on the same issue and phase
+        location: src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: dispatch-composite-issue-identity
+        name: Composite GitHub Issue State Identity
+        api: issueKey()
+        description: Key GitHub dispatch, registry, PR cache, publication guard, retry, and babysitter state by normalized repository plus issue number so equal-number issues remain isolated
+        location: src/orchestrator/factory.ts, src/orchestrator/batch-tracker.ts
+        verify_tier: 2
+
+      - id: dispatch-retry-backoff
+        name: Dispatch Failure Backoff
+        api: dispatch.errorCooldownMs
+        description: Back off a failed dispatch before it becomes eligible for another attempt
+        location: src/orchestrator/factory.ts, src/config/schema.ts
+        verify_tier: 2
+
+      - id: dispatch-retry-limit
+        name: Dispatch Attempt Limit
+        api: dispatch.maxAttempts
+        description: Mark repeatedly failing dispatches terminal after the configured bounded retry count
+        location: src/orchestrator/factory.ts, src/config/schema.ts
+        verify_tier: 2
+
+      - id: dispatch-label-authority
+        name: Authoritative Label Dispatch Identity
+        api: Factory.dispatch()
+        description: Rebuild dispatch identity from valid repository labels and block ambiguous or invalid label sets with a deduplicated issue comment
+        location: src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: dispatch-implementers
+        name: Implementer Agent Dispatch
+        api: FleetClient.spawn()
+        description: Spawn one or more Codex implementers with stable issue-derived names and idempotent invocation IDs
+        location: src/triage/heuristic.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-reviewer
+        name: Reviewer Agent Dispatch
+        api: FleetClient.spawn()
+        description: Spawn a Claude reviewer alongside the implementation team and coordinate it by direct messages
+        location: src/triage/heuristic.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-workflow-agent
+        name: Workflow Dispatch
+        api: "FleetClient.spawn({ capability: 'workflow:run' })"
+        description: Dispatch configured Relayflow templates with normalized issue and route inputs
+        location: src/triage/heuristic.ts, src/orchestrator/factory.ts, src/node/factory-node.ts
+        verify_tier: 4
+
+      - id: dispatch-agent-task-rendering
+        name: Agent Task Rendering
+        api: renderAgentTask()
+        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, and integration instructions
+        location: src/dispatch/templates.ts
+        verify_tier: 2
+
+      - id: dispatch-confirmed-task-injection
+        name: Confirmed Critical Task Injection
+        api: FleetClient.waitForInjected()
+        description: Wait for broker delivery confirmation before submitting task input to a harness
+        location: src/orchestrator/factory.ts, src/fleet/internal-fleet-client.ts
+        verify_tier: 4
+
+      - id: dispatch-critical-delivery-retry
+        name: Critical Delivery Retry
+        api: FleetClient.onDeliveryFailed()
+        description: Persist critical messages by event ID and retry them when broker delivery fails
+        location: src/orchestrator/factory.ts, src/state/in-memory-state-store.ts
+        verify_tier: 4
+
+      - id: dispatch-agent-resume
+        name: Agent Exit Resume
+        api: FleetClient.resume()
+        description: Resume an interrupted session once, then fail safely when the same worker remains stalled
+        location: src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-exit-pr-publication
+        name: Implementer Branch PR Publication
+        api: GithubConnectionWrite.publishPullRequest()
+        description: Publish a committed implementer branch through the workspace GitHub connection when the agent exits without opening a PR
+        location: src/orchestrator/factory.ts, src/mount/relayfile-github-connection-write.ts
+        verify_tier: 5
+
+      - id: dispatch-state-writeback
+        name: Dispatch Lifecycle Writeback
+        api: LinearWriteback.setState() / GithubWriteback.setStatus()
+        description: Post the dispatch summary and advance the source issue to Agent Implementing or factory:in-progress
+        location: src/orchestrator/factory.ts, src/writeback/linear.ts, src/writeback/github.ts
+        verify_tier: 5
+
+      - id: dispatch-inflight-registry
+        name: In-Flight Registry Persistence
+        api: FileStateStore
+        description: Persist issue, agent, session, PID, invocation, and node ownership for crash recovery and reaping
+        location: src/orchestrator/factory.ts, src/state/file-state-store.ts
+        verify_tier: 2
+
+      - id: dispatch-remote-re-adoption
+        name: Remote Agent Re-Adoption
+        api: FleetClient.hydrateTracked() / reconcileTrackedAgents()
+        description: Restore hosted fleet tracking from the registry after an orchestrator restart and reconcile missed exits
+        location: src/orchestrator/factory.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: dispatch-durable-relay-lifecycle
+        name: Durable Relay Dispatch Lifecycle
+        api: DispatchLifecycle / StateStore.claimDispatchLifecycle()
+        description: Persist placement intents, agents, publication receipts, release checkpoints, and waiting phases so relay dispatch survives owner crashes through terminal writeback
+        location: src/ports/state.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-same-host-owner-fencing
+        name: Same-Host Dispatch Owner Fencing
+        api: StateStore.claimDispatchLifecycle() / renewDispatchLifecycle()
+        description: Fence lifecycle ownership and global batch capacity by lease epoch across processes sharing one FileStateStore; cross-host active/active control planes remain unsupported without shared compare-and-set state
+        location: README.md, src/ports/state.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-remote-publication-recovery
+        name: Remote PR Publication and Release Recovery
+        api: GithubConnectionWrite.publishPullRequest() / DispatchLifecycle
+        description: Publish from a remote pushed head, verify the exact mounted PR is open and non-draft, reuse provider receipts, and autonomously retry publication or release cleanup after lease loss or restart
+        location: src/orchestrator/factory.ts, src/mount/relayfile-github-connection-write.ts, src/ports/state.ts
+        verify_tier: 5
+
+  human-loop:
+    name: Human Clarification Loop
+    description: Slack and GitHub conversations that unblock triage and running agents
+    criticality: hot
+    features:
+      - id: human-slack-dispatch-thread
+        name: Slack Dispatch Thread
+        api: SlackWriteback.postThread()
+        description: Post and persist a per-issue Slack status thread after dispatch
+        location: src/orchestrator/factory.ts, src/writeback/slack.ts
+        verify_tier: 5
+
+      - id: human-triage-escalation
+        name: Triage Clarification Escalation
+        api: Factory.dispatch()
+        description: Ask a targeted routing or specification question when triage is thin or low confidence
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: human-agent-questions
+        name: Running Agent Questions
+        api: FleetClient.onAgentMessage()
+        description: Recognize factory-needs-input messages from tracked agents and surface them to a human
+        location: src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: human-team-release-for-clarification
+        name: Clarification Team Release and Parking
+        api: DispatchLifecycle.phase = 'parking' / 'waiting-for-human'
+        description: Durably reserve the first agent question, release the full team after fleet absence is confirmed, and keep batch capacity occupied until parking is committed
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
+        verify_tier: 4
+
+      - id: human-github-question-fallback
+        name: GitHub Issue Question Fallback
+        api: GithubWriteback.postComment()
+        description: Post correlated questions to the source GitHub issue when no Slack channel is configured
+        location: src/orchestrator/factory.ts, src/writeback/github.ts
+        verify_tier: 5
+
+      - id: human-authorized-github-replies
+        name: Authorized GitHub Replies
+        api: Factory.start()
+        description: Accept correlated non-bot answers only from the original GitHub issue reporter
+        location: src/orchestrator/factory.ts
+        verify_tier: 6
+
+      - id: human-slack-reply-watch
+        name: Slack Reply Watch and Replay
+        api: Factory.start()
+        description: Subscribe and poll for new thread replies, deduplicate them, and re-arm persisted watchers after restart
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: human-durable-clarification-wake
+        name: Durable Clarification Wake
+        api: StateStore.claimClarificationWake()
+        description: Lease one wake per reply, resume saved sessions or cold-start from persisted issue/question/answer context, and restore interrupted wakes after restart
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
+        verify_tier: 4
+
+      - id: human-clarification-escalation-retry
+        name: Durable Clarification Escalation Retry
+        api: Factory.start()
+        description: Cancel stale out-of-scope wakes and durably retry unanswered seven-day stakeholder escalations without consuming failed attempts
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
+        verify_tier: 5
+
+      - id: human-answer-injection
+        name: Human Answer Injection
+        api: FleetClient.sendInput()
+        description: Inject Slack or GitHub answers into implementer and babysitter sessions as integration events
+        location: src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: human-clarified-redispatch
+        name: Clarified Issue Re-Triage
+        api: TieredTriage.triage()
+        description: Re-triage an issue with the human answer, then start or queue the clarified decision
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: human-slack-degraded-mode
+        name: Slack Degraded Mode
+        api: Factory.status()
+        description: Detect stale or failed Slack sync/writeback, suppress unsafe writes during backoff, and keep core factory work running
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+  pr-lifecycle:
+    name: Pull Request and Completion Lifecycle
+    description: PR discovery, babysitting, merge gating, terminal transitions, and probe cleanup
+    criticality: critical
+    features:
+      - id: pr-completion-detection
+        name: Completion PR Detection
+        api: Factory.start() / Factory.runLoop()
+        description: Resolve an issue's PR from mounted GitHub records with guarded gh fallback and bounded polling sweeps
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-draft-block
+        name: Draft PR Completion Guard
+        api: Factory.start()
+        description: Keep an issue in flight while its matching pull request remains a draft
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-babysitter-opt-in
+        name: Event-Driven PR Babysitter
+        api: babysitter.enabled
+        description: Spawn a Claude babysitter when a non-draft PR opens and let it address CI, conflicts, and review feedback
+        location: src/orchestrator/factory.ts, src/triage/heuristic.ts, src/dispatch/templates.ts
+        verify_tier: 6
+
+      - id: pr-standalone-babysitter-validation
+        name: Standalone Babysitter PR Validation
+        api: readStandalonePullRequest()
+        description: Combine mount and gh metadata while rejecting closed, merged, draft, incomplete, or cross-repository PRs
+        location: src/cli/fleet.ts, src/github/standalone-babysitter.ts
+        verify_tier: 6
+
+      - id: pr-babysitter-ready-signal
+        name: Babysitter Readiness Signal
+        api: FleetClient.onAgentMessage()
+        description: Accept a matching factory-pr-ready signal from the tracked babysitter and guard it against current mounted PR state
+        location: src/orchestrator/factory.ts
+        verify_tier: 6
+
+      - id: pr-canonical-event-routing
+        name: Canonical Owned PR Event Routing
+        api: Factory.start()
+        description: Route validated review, review-comment, issue-comment, failed-check, conflict, and base-divergence records only to the babysitter owning the exact normalized repo and PR
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-durable-babysitter-sessions
+        name: Durable Babysitter Session Ownership
+        api: BabysitterSessionState / StateStore.setBabysitterSession()
+        description: Persist exact issue, repo, PR, agent, session, critical fence, and pending wake categories and restore them without replaying the original implementation team
+        location: src/ports/state.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: pr-babysitter-wake-coalescing
+        name: Confirmed Babysitter Wake Coalescing and Retry
+        api: FleetClient.waitForInjected() / StateStore.setBabysitterSession()
+        description: Coalesce metadata-only PR activity, require confirmed delivery, retain events arriving in flight, and retry failed delivery or persistence without loss or multiplication
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
+        verify_tier: 4
+
+      - id: pr-babysitter-critical-ack-fence
+        name: Critical Babysitter ACK Fence
+        api: parseBabysitterCriticalSignal()
+        description: Persist the no-submit destructive-work fence before acknowledging entry, recheck it after delivery ACK, and defer PTY submission until the matching critical section exits
+        location: src/orchestrator/factory.ts, src/dispatch/templates.ts, src/ports/state.ts
+        verify_tier: 4
+
+      - id: pr-polling-readback-backstop
+        name: PR Polling and Readback Backstop
+        api: Factory.start()
+        description: Feed paginated poll events through the same exact-PR router and re-read mounted PR state before wake delivery or cancellation so missed or stale events fail closed
+        location: src/orchestrator/factory.ts, src/ports/mount.ts
+        verify_tier: 5
+
+      - id: pr-human-review-terminal
+        name: Human Review Terminal State
+        api: terminalState = 'human-review'
+        description: Park completed work in Linear Human Review or GitHub factory:human-review while leaving the PR open
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-done-terminal
+        name: Done Terminal State
+        api: terminalState = 'done'
+        description: Advance completed Linear work to Done or close a GitHub issue only after its PR is observed merged
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-merge-gate-check
+        name: Merge Gate Readiness Check
+        api: GithubMergeGate.check()
+        description: Require MERGEABLE, CLEAN, APPROVED, a stable head SHA, and at least one non-blocking check result
+        location: src/github/merge-gate.ts, src/orchestrator/factory.ts
+        verify_tier: 6
+
+      - id: pr-guarded-merge
+        name: Head-Guarded Squash Merge
+        api: GithubMergeGate.merge()
+        description: Squash merge and delete the branch only when the live head still matches the approved SHA
+        location: src/github/merge-gate.ts
+        verify_tier: 6
+
+      - id: pr-never-auto-merge
+        name: Never Auto-Merge Policy
+        api: mergePolicy = 'never'
+        description: Leave all pull requests open for a human unless guarded auto-merge is explicitly enabled
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: pr-on-green-merge-policy
+        name: On-Green-With-Review Policy
+        api: mergePolicy = 'on-green-with-review'
+        description: Poll the merge gate and attempt a guarded merge only after checks and review approval are green
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 6
+
+      - id: pr-post-merge-advance
+        name: Post-Merge Done Advancement
+        api: Factory.start()
+        description: Match merged PR events back to in-flight or persisted issues and advance them to the true Done state
+        location: src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: pr-synthetic-probe-cleanup
+        name: Synthetic Probe Cleanup
+        api: closeProbePr()
+        description: Detect factory-e2e issues and close their guarded PRs instead of merging synthetic work
+        location: src/orchestrator/factory.ts, src/github/probe-closer.ts
+        verify_tier: 6
+
+  safety:
+    name: Opt-In Safety and Mutation Guards
+    description: Fail-closed checks that constrain issue scope, provider writes, PR actions, and node paths
+    criticality: critical
+    features:
+      - id: safety-title-prefix
+        name: Linear Title Prefix Gate
+        api: isInFactoryScope()
+        description: Admit Linear work only when its title starts at the configured marker boundary or an accepted label is present
+        location: src/safety/factory-scope.ts
+        verify_tier: 2
+
+      - id: safety-label-gate
+        name: Factory Label Gate
+        api: isInFactoryScope()
+        description: Treat the configured factory label as an explicit opt-in across supported label payload shapes
+        location: src/safety/factory-scope.ts
+        verify_tier: 2
+
+      - id: safety-team-gate
+        name: Linear Team Gate
+        api: isInFactoryScope()
+        description: Refuse dispatch and writeback when an issue belongs to a different configured team
+        location: src/safety/factory-scope.ts, src/writeback/linear.ts
+        verify_tier: 2
+
+      - id: safety-github-open-label
+        name: GitHub Native Scope Gate
+        api: Factory.runOnce()
+        description: Admit only open GitHub issues carrying safety.requireLabel
+        location: src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: safety-guarded-linear-drafts
+        name: Guarded Linear Draft Writes
+        api: 'MountClient.writeFile(..., { guarded: true })'
+        description: Allow issue and nested comment drafts only after the owning issue passes factory scope checks
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts, src/writeback/linear.ts
+        verify_tier: 5
+
+      - id: safety-guarded-github-drafts
+        name: Guarded GitHub Draft Writes
+        api: 'MountClient.writeFile(..., { guarded: true })'
+        description: Restrict GitHub provider writes to factory PR creation, branch refs, and explicit PR-close command paths
+        location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: safety-probe-close-identity
+        name: Probe Close Identity Guard
+        api: closeProbePr()
+        description: Require the expected issue key and, by default, the factory-e2e title marker before closing a PR
+        location: src/github/probe-closer.ts
+        verify_tier: 6
+
+      - id: safety-babysit-pr-identity
+        name: Standalone PR Identity Guard
+        api: parseStandaloneBabysitTarget()
+        description: Accept only positive PR numbers or canonical GitHub PR URLs and refuse draft or cross-repository work
+        location: src/github/standalone-babysitter.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+      - id: safety-node-checkout-containment
+        name: Advertised Checkout Containment
+        api: createFactoryNodeDefinition()
+        description: Refuse cloud-supplied working directories outside configured clone paths or clone root
+        location: src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: safety-relay-token-types
+        name: Relay Credential Type Separation
+        api: resolveRelayWorkspaceKey() / resolveRelayAgentToken()
+        description: Accept only rk_live workspace keys and at_live agent tokens for their respective identities
+        location: src/fleet/relay-workspace-key.ts
+        verify_tier: 1
+
+      - id: safety-merge-head-sha
+        name: Merge Head SHA Guard
+        api: evaluateGithubMergeGate()
+        description: Refuse merge if the live PR head moved after readiness was checked
+        location: src/github/merge-gate.ts
+        verify_tier: 1
+
+      - id: safety-delete-fail-closed
+        name: Provider Delete Guard
+        api: RelayfileCloudMountClient.deleteFile()
+        description: Permit provider deletion only for failed unreconciled creates accepted by an explicit delete predicate
+        location: src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 5
+
+  mount-writeback:
+    name: Relayfile Mount and Provider Writeback
+    description: Cloud workspace access, local mount health, and confirmed provider mutations
+    criticality: critical
+    features:
+      - id: mount-active-workspace
+        name: Active Workspace Resolution
+        api: resolveFactoryWorkspace()
+        description: Resolve the active cloud workspace handle and its UUID alias, with an offline default fallback
+        location: src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 5
+
+      - id: mount-cloud-session
+        name: Non-Interactive Cloud Session
+        api: RelayfileCloudMountClient.fromConfig()
+        description: Refresh cloud authentication, join the workspace with least-privilege scopes, and explain when browser login is required
+        location: src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 5
+
+      - id: mount-cloud-filesystem
+        name: Cloud Filesystem Operations
+        api: RelayfileCloudMountClient
+        description: Read, list, subscribe, and query events and provider sync status for the selected workspace
+        location: src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 5
+
+      - id: mount-write-confirmation
+        name: Provider Write Confirmation
+        api: MountClient.confirmWrite()
+        description: Wait for a provider operation to produce an acknowledged external object and fail on incomplete or dead-lettered results
+        location: src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 5
+
+      - id: mount-local-auto-start
+        name: Local Integration Mount Auto-Start
+        api: ensureLocalMount()
+        description: Start a background relayfile mount when .integrations state is missing or invalid
+        location: src/mount/local-mount-preflight.ts, src/mount/relayfile-binary.ts
+        verify_tier: 5
+
+      - id: mount-stale-self-heal
+        name: Stale Mount Self-Healing
+        api: ensureLocalMount()
+        description: Detect workspace mismatch, stale reconciliation, or a dead mount process and refresh the mount in place
+        location: src/mount/local-mount-preflight.ts, src/mount/relayfile-binary.ts
+        verify_tier: 5
+
+      - id: mount-clone-paths
+        name: Per-Checkout Integration Mounts
+        cli: factory <start|run-once|loop> --config <path>
+        description: Ensure each configured repository checkout can reach an absolute .integrations mount for agent writeback
+        location: src/cli/fleet.ts
+        verify_tier: 5
+
+      - id: writeback-linear-state
+        name: Linear State Writeback
+        api: MountLinearWriteback().setState()
+        description: Update a scoped Linear issue state and confirm provider acknowledgement
+        location: src/writeback/linear.ts
+        verify_tier: 5
+
+      - id: writeback-linear-comment
+        name: Linear Comment Writeback
+        api: MountLinearWriteback().postComment()
+        description: Post stable, deduplicated comments under a scoped Linear issue and confirm delivery
+        location: src/writeback/linear.ts
+        verify_tier: 5
+
+      - id: writeback-linear-create
+        name: Linear Issue Creation
+        api: MountLinearWriteback().createIssue()
+        description: Create scoped Linear mirror issues through guarded file-native drafts
+        location: src/writeback/linear.ts
+        verify_tier: 5
+
+      - id: writeback-linear-verify
+        name: Linear Writeback Verification
+        api: MountLinearWriteback().verify()
+        description: Re-read issue state and comment records to verify expected mutations are visible
+        location: src/writeback/linear.ts
+        verify_tier: 5
+
+      - id: writeback-github-lifecycle
+        name: GitHub Issue Lifecycle Writeback
+        api: GhCliGithubWriteback
+        description: Post comments, apply in-progress or human-review labels, and close GitHub-native issues
+        location: src/writeback/github.ts
+        verify_tier: 5
+
+      - id: writeback-github-pr-publication
+        name: Workspace GitHub PR Publication
+        api: RelayfileGithubConnectionWrite.publishPullRequest()
+        description: Push the current branch ref, create a PR draft command, confirm both writes, and read the resulting receipt
+        location: src/mount/relayfile-github-connection-write.ts
+        verify_tier: 6
+
+      - id: writeback-github-pr-close
+        name: Workspace GitHub PR Close
+        api: RelayfileGithubConnectionWrite.closePullRequest()
+        description: Close a validated PR through the connected workspace without relying on local gh authentication
+        location: src/mount/relayfile-github-connection-write.ts
+        verify_tier: 6
+
+      - id: writeback-slack-thread
+        name: Slack Thread and Reply Writeback
+        api: MountSlackWriteback
+        description: Create issue threads and bounded replies using guarded Slack mount paths and confirmed writes
+        location: src/writeback/slack.ts
+        verify_tier: 5
+
+  fleet-node:
+    name: Fleet Backends and Factory Node
+    description: Local broker execution, hosted placement, node capabilities, and workflow running
+    criticality: hot
+    features:
+      - id: fleet-internal-backend
+        name: Internal Broker Fleet
+        api: InternalFleetClient
+        description: Spawn, resume, message, list, and release PTY agents through a local harness-driver broker
+        location: src/fleet/internal-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-broker-reuse
+        name: Existing Broker Reuse
+        api: ensureRelayBroker()
+        description: Connect to an existing workspace broker without taking ownership or stopping it on dispose
+        location: src/fleet/ensure-relay-broker.ts
+        verify_tier: 4
+
+      - id: fleet-broker-autostart
+        name: Internal Broker Auto-Start
+        api: ensureRelayBroker()
+        description: Start and own a broker when none is reachable, joining the existing workspace when a key is available
+        location: src/fleet/ensure-relay-broker.ts
+        verify_tier: 4
+
+      - id: fleet-owned-broker-drain
+        name: Owned Broker Drain
+        api: InternalFleetClient.dispose()
+        description: Wait a bounded time for factory-spawned task-exit agents before stopping owned infrastructure
+        location: src/fleet/internal-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-relay-backend
+        name: Hosted Relay Fleet
+        api: RelayFleetClient
+        description: Invoke hosted spawn and release actions, place by capability or node, and expose a unified roster
+        location: src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-relay-repo-placement
+        name: Repository-Aware Relay Placement
+        api: AgentSpec.repo / FleetClient.spawn()
+        description: Forward the source repository on initial and no-session restart spawns so hosted placement selects a node advertising the required checkout and preserves node/repo locality on resume
+        location: src/ports/fleet.ts, src/fleet/relay-fleet-client.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: fleet-relay-reconciliation
+        name: Hosted Agent Reconciliation
+        api: RelayFleetClient.reconcileTrackedAgents()
+        description: Reconcile tracked invocation IDs against hosted action status and roster state to recover missed exits
+        location: src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-message-events
+        name: Fleet Messaging Events
+        api: FleetClient.sendMessage() / onAgentMessage()
+        description: Send coordination messages and surface delivery failures, direct agent messages, and agent exits
+        location: src/ports/fleet.ts, src/fleet/internal-fleet-client.ts, src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: node-definition
+        name: Factory Fleet Node Definition
+        api: createFactoryNodeDefinition()
+        description: Export a deployable node with configured capabilities, tags, clone metadata, and concurrency
+        location: src/node/factory-node.ts, src/node/factory.node.ts
+        verify_tier: 2
+
+      - id: node-spawn-capabilities
+        name: Node Claude and Codex Capabilities
+        api: spawn:claude / spawn:codex
+        description: Validate action input and spawn PTY harnesses with task, model, channels, session, restart, and lifecycle controls
+        location: src/node/factory-node.ts
+        verify_tier: 4
+
+      - id: node-workflow-capability
+        name: Node Workflow Capability
+        api: workflow:run
+        description: Run YAML, TypeScript, TSX, or Python Relayflows in an authorized checkout with structured inputs
+        location: src/node/factory-node.ts
+        verify_tier: 4
+
+      - id: node-inventory-sync
+        name: Node Inventory Reconciliation Payload
+        api: factoryNodeInventorySync()
+        description: Report workspace, advertised clone paths, and live agent session identities after reconnect
+        location: src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: node-relay-mcp-harness
+        name: Agent Relay MCP Harness Injection
+        api: buildRelayMcpHarnessConfig()
+        description: Attach the Agent Relay MCP server configuration to spawned Claude and Codex harnesses when available
+        location: src/fleet/internal-fleet-client.ts, src/node/factory-node.ts
+        verify_tier: 4
+
+  webhook-subscriptions:
+    name: Webhooks and Subscription Utilities
+    description: Programmatic event intake, filtering, coalescing, and delivery target derivation
+    criticality: standard
+    features:
+      - id: webhook-hmac-validation
+        name: Webhook HMAC Validation
+        api: WebhookHandler.handle()
+        description: Verify Relay timestamp-body signatures with timing-safe comparison before event processing
+        location: src/webhook/handler.ts
+        verify_tier: 1
+
+      - id: webhook-event-routing
+        name: Provider Webhook Routing
+        api: WebhookHandler.handle()
+        description: Route Linear, Slack, and GitHub path events to provider-specific handlers with correct HTTP status semantics
+        location: src/webhook/handler.ts
+        verify_tier: 1
+
+      - id: webhook-event-deduplication
+        name: Webhook Event Deduplication
+        api: WebhookHandler.handle()
+        description: Return success without reprocessing an already-seen event ID
+        location: src/webhook/handler.ts
+        verify_tier: 1
+
+      - id: webhook-registration
+        name: Idempotent Webhook Registration
+        api: WebhookRegistrar.register()
+        description: Reuse an existing URL and glob-equivalent subscription or register the default provider paths
+        location: src/webhook/registrar.ts
+        verify_tier: 5
+
+      - id: webhook-unregistration
+        name: Webhook Unregistration
+        api: WebhookRegistrar.unregister()
+        description: Delete the active workspace webhook subscription and clear local registration state
+        location: src/webhook/registrar.ts
+        verify_tier: 5
+
+      - id: subscription-canonical-paths
+        name: Canonical Integration Paths
+        api: canonicalMountPaths() / eventPathGlobsForIntegration()
+        description: Normalize provider mount paths, Slack aliases, direct-message roots, and SDK-compatible globs
+        location: src/subscriptions/specs.ts, src/subscriptions/globs.ts
+        verify_tier: 1
+
+      - id: subscription-delivery-targets
+        name: Integration Delivery Targets
+        api: deliveryTargetsFor()
+        description: Normalize and deduplicate agent and channel listeners from integration scope
+        location: src/subscriptions/specs.ts
+        verify_tier: 1
+
+      - id: subscription-linear-predicates
+        name: Linear Scope Predicate Filtering
+        api: filterLinearPredicateSpecs()
+        description: Filter issue events by configured team, project, label, and assignee predicates
+        location: src/subscriptions/linear-filter.ts
+        verify_tier: 1
+
+      - id: subscription-stream-recovery
+        name: Workspace Stream Coalescing and Recovery
+        api: createWorkspaceScopedEventClient()
+        description: Coalesce changes by path, reject mismatched workspace JWTs, fall back to polling, and allow SDK stream self-healing
+        location: src/subscriptions/event-client.ts
+        verify_tier: 5
+
+  programmatic-api:
+    name: Public TypeScript API
+    description: Stable package exports for embedding factory behavior in other applications
+    criticality: standard
+    features:
+      - id: api-factory-lifecycle
+        name: Factory Lifecycle API
+        api: createFactory() / FactoryLoop
+        description: Construct, start, stop, dispose, run, triage, dispatch, inspect, and subscribe to a factory instance
+        location: src/index.ts, src/types.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: api-factory-events
+        name: Factory Event API
+        api: Factory.on()
+        description: Subscribe to issue-queued, dispatched, issue-done, writeback-verified, and error events
+        location: src/types.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: api-config-schemas
+        name: Config Schema API
+        api: FactoryConfigSchema / WorkspaceConfigSchema / NodeConfigSchema
+        description: Parse normalized combined or split workspace, node, and factory configuration with Zod
+        location: src/config/schema.ts
+        verify_tier: 1
+
+      - id: api-linear-state-resolution
+        name: Linear State Resolution API
+        api: resolveFactoryStates() / stateResolutionFromIds()
+        description: Resolve global and per-team role names to IDs with ambiguity checks and issue-record fallback
+        location: src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: api-triage-engines
+        name: Pluggable Triage Engines
+        api: HeuristicTriage / LlmTriage / TieredTriage
+        description: Embed deterministic, LLM, or tiered triage behind the TriageEngine contract
+        location: src/triage/
+        verify_tier: 1
+
+      - id: api-fleet-ports
+        name: Fleet Client API
+        api: FleetClient / InternalFleetClient / RelayFleetClient
+        description: Implement or consume a common fleet contract for spawn, resume, release, messaging, roster, and lifecycle events
+        location: src/ports/fleet.ts, src/fleet/
+        verify_tier: 1
+
+      - id: api-mount-ports
+        name: Mount Client API
+        api: MountClient / RelayfileCloudMountClient
+        description: Implement or consume the file, event, subscription, write-confirmation, and provider-readiness contract
+        location: src/ports/mount.ts, src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 1
+
+      - id: api-writeback-ports
+        name: Provider Writeback API
+        api: LinearWriteback / GithubWriteback / SlackWriteback
+        description: Inject or consume provider mutation ports independently from orchestration
+        location: src/ports/writeback.ts, src/writeback/
+        verify_tier: 1
+
+      - id: api-state-stores
+        name: State Store API
+        api: InMemoryStateStore / FileStateStore
+        description: Persist batch, retry, critical delivery, human-loop, handoff, and canonical-state records
+        location: src/ports/state.ts, src/state/
+        verify_tier: 1
+
+      - id: api-reaper
+        name: Reaper API
+        api: FactoryReaper / terminatePids() / reapFactoryOrphansOnce()
+        description: Embed heartbeat-aware, identity-checked process cleanup with protected-PID handling
+        location: src/orchestrator/reaper.ts
+        verify_tier: 1
+
+      - id: api-relayflow-policy
+        name: Relayflow Policy Registry API
+        api: RelayflowPolicyRegistry
+        description: Register provider-resource-action triggers with input mappers and workflow templates
+        location: src/dispatch/relayflow-registry.ts
+        verify_tier: 1
+
+      - id: api-testing
+        name: Testing Fakes Export
+        api: '@agent-relay/factory/testing'
+        description: Provide fake mount and fleet clients for hermetic consumer tests
+        location: src/testing/index.ts, package.json
+        verify_tier: 1
+
+      - id: api-safe-log-serialization
+        name: Safe Bounded Log Serialization
+        api: normalizeLogValue() / normalizeLogger() / stringifyLogValue()
+        description: Preserve Error diagnostics and structured context as bounded redacted JSON-safe metadata without invoking getters, toJSON hooks, custom stack hooks, or failing on cycles and BigInt
+        location: src/logging.ts
+        verify_tier: 1
+
+  config-intake:
+    name: Workspace Intake Configuration
+    description: Factory source, capacity, subscription, and retry controls in factory.config.json
+    criticality: critical
+    features:
+      - id: config-workspace-id
+        name: Workspace ID
+        api: factory.config.json#workspaceId
+        description: Pin a Relayfile workspace handle; when omitted the CLI derives the active cloud workspace
+        location: src/config/schema.ts, src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 2
+
+      - id: config-issue-source
+        name: Issue Source
+        api: factory.config.json#issueSource
+        description: Select linear or github lifecycle explicitly, or omit it for sub-root-based auto-detection
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-batch-size
+        name: Batch Size
+        api: factory.config.json#batchSize
+        description: Limit concurrent issue records to an integer from one through five
+        location: src/config/schema.ts, src/orchestrator/batch-tracker.ts
+        verify_tier: 2
+
+      - id: config-subscription-teams
+        name: Subscribed Linear Teams
+        api: factory.config.json#subscription.teams
+        description: Scope issue intake and upfront state resolution to selected team identifiers
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-subscription-projects
+        name: Subscribed Linear Projects
+        api: factory.config.json#subscription.projects
+        description: Scope integration subscription predicates to selected projects
+        location: src/config/schema.ts, src/subscriptions/linear-filter.ts
+        verify_tier: 2
+
+      - id: config-subscription-labels
+        name: Subscribed Issue Labels
+        api: factory.config.json#subscription.labels
+        description: Scope intake to selected labels; defaults to repos.names when the explicit list is empty
+        location: src/config/schema.ts, src/subscriptions/linear-filter.ts
+        verify_tier: 2
+
+      - id: config-subscription-assignees
+        name: Subscribed Assignees
+        api: factory.config.json#subscription.assignees
+        description: Scope integration subscription predicates to selected assignee identities
+        location: src/config/schema.ts, src/subscriptions/linear-filter.ts
+        verify_tier: 2
+
+      - id: config-live-transport
+        name: Live Subscription Transport
+        api: factory.config.json#liveSubscription.transport
+        description: Choose subscribe-and-poll, subscribe, or poll for live workspace events
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-live-poll-interval
+        name: Live Poll Interval
+        api: factory.config.json#liveSubscription.pollIntervalMs
+        description: Set the minimum 50 ms delay between live polling passes
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-live-event-limit
+        name: Live Event Page Limit
+        api: factory.config.json#liveSubscription.eventLimit
+        description: Bound each event page from one through one thousand records
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-live-replay-skew
+        name: Live Replay Skew Margin
+        api: factory.config.json#liveSubscription.replaySkewMarginMs
+        description: Allow bounded clock skew while rejecting events older than the live connection cutoff
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-dispatch-cooldown
+        name: Dispatch Error Cooldown
+        api: factory.config.json#dispatch.errorCooldownMs
+        description: Set the non-negative retry backoff after a dispatch failure
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-dispatch-attempts
+        name: Dispatch Maximum Attempts
+        api: factory.config.json#dispatch.maxAttempts
+        description: Limit dispatch attempts to one through five before marking work terminal
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-triage-implementers
+        name: Maximum Implementers
+        api: factory.config.json#triage.maxImplementers
+        description: Bound a team-shaped issue to one through six implementer assignments
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+  config-repositories:
+    name: Repository Routing Configuration
+    description: Compact and explicit repository routing plus checkout derivation
+    criticality: critical
+    features:
+      - id: config-repos-org
+        name: Repository Organization
+        api: factory.config.json#repos.org
+        description: Supply the owner used to expand compact repo names and bare repository routes
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-repos-names
+        name: Compact Repository Names
+        api: factory.config.json#repos.names
+        description: Derive label routes, default subscription labels, and clone paths from a repository name list
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-repos-overrides
+        name: Compact Route Overrides
+        api: factory.config.json#repos.overrides
+        description: Override the owner/repo expansion for individual compact repository names
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-repos-by-label
+        name: Label Route Map
+        api: factory.config.json#repos.byLabel
+        description: Map issue labels to repositories; explicit entries override derived compact routes
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-repos-by-project
+        name: Project Route Map
+        api: factory.config.json#repos.byProject
+        description: Map Linear project names to repositories after label routing
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-repos-keyword-rules
+        name: Keyword Route Rules
+        api: factory.config.json#repos.keywordRules
+        description: Provide ordered regex-to-repository routes used after label and project routes
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-repos-default
+        name: Default Repository
+        api: factory.config.json#repos.default
+        description: Set the final routing fallback and the repo used for numeric standalone babysit targets
+        location: src/config/schema.ts, src/triage/heuristic.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+      - id: config-repos-clone-root
+        name: Legacy Repository Clone Root
+        api: factory.config.json#repos.cloneRoot
+        description: Accept the legacy nested clone root and promote it into normalized node and factory config
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-repos-clone-paths
+        name: Legacy Repository Clone Paths
+        api: factory.config.json#repos.clonePaths
+        description: Accept legacy nested repo checkout paths, with top-level explicit entries taking precedence
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-clone-root
+        name: Node Clone Root
+        api: factory.config.json#cloneRoot
+        description: Derive repository checkout paths and authorize node-local child paths beneath one root
+        location: src/config/schema.ts, src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: config-clone-paths
+        name: Explicit Clone Paths
+        api: factory.config.json#clonePaths
+        description: Map owner/repo keys to local checkouts; explicit values override all derived and legacy paths
+        location: src/config/schema.ts, src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: config-home-clone-expansion
+        name: Clone Path Home Expansion
+        api: factory.config.json#cloneRoot / clonePaths
+        description: Expand exact tilde and leading tilde-slash values across legacy, combined, and split clone configuration while rejecting unsupported user-home forms
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-cwd-clone-inference
+        name: Single-Repository Checkout Inference
+        api: resolveLocalFactoryConfig()
+        description: Infer a local checkout root from cwd only for one unambiguous repository whose parsed GitHub remote matches the resolved route
+        location: src/config/local-clone-paths.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+      - id: config-local-checkout-preflight
+        name: Local Dispatch Checkout Preflight
+        api: 'resolveLocalFactoryConfig({ validateConfiguredCheckouts: true })'
+        description: Fail local internal dispatch before spawning when a configured clone path is missing, non-git, or not the checkout root while accepting linked worktree roots and leaving relay or maintenance paths environment-independent
+        location: src/config/local-clone-paths.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+  config-loop:
+    name: Loop and Recovery Configuration
+    description: Bounded iteration, heartbeat, and registry controls for production operation
+    criticality: hot
+    features:
+      - id: config-loop-max-iterations
+        name: Loop Maximum Iterations
+        api: factory.config.json#loop.maxIterations
+        description: Bound a factory loop invocation to one through five iterations
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-loop-failure-limit
+        name: Loop Consecutive Failure Limit
+        api: factory.config.json#loop.maxConsecutiveFailures
+        description: Open the loop circuit after one through five consecutive failed iterations
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-loop-heartbeat-path
+        name: Loop Heartbeat Path
+        api: factory.config.json#loop.heartbeatPath
+        description: Select the JSON file used for process liveness, progress, and stopping state
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-loop-registry-path
+        name: In-Flight Registry Path
+        api: factory.config.json#loop.registryPath
+        description: Select the JSON file used for tracked agent and process recovery metadata
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-loop-heartbeat-stale
+        name: Heartbeat Staleness Threshold
+        api: factory.config.json#loop.heartbeatStaleMs
+        description: Set the minimum one-second threshold used by liveness checks and orphan reaping
+        location: src/config/schema.ts, src/orchestrator/factory.ts, src/orchestrator/reaper.ts
+        verify_tier: 2
+
+      - id: config-loop-heartbeat-alias
+        name: Node Heartbeat Path Alias
+        api: factory.config.json#factoryLoopHeartbeatPath
+        description: Override loop.heartbeatPath through the node-oriented compatibility field
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-loop-registry-alias
+        name: Node Registry Path Alias
+        api: factory.config.json#factoryLoopRegistryPath
+        description: Override loop.registryPath through the node-oriented compatibility field
+        location: src/config/schema.ts
+        verify_tier: 2
+
+  config-models-and-human:
+    name: Agent, Merge, and Human-Loop Configuration
+    description: Per-role model selection, babysitting, terminal policy, and Slack behavior
+    criticality: hot
+    features:
+      - id: config-model-implementer
+        name: Implementer Model
+        api: factory.config.json#models.implementer
+        description: Override the model passed to implementer spawns
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-model-reviewer
+        name: Reviewer Model
+        api: factory.config.json#models.reviewer
+        description: Override the model passed to reviewer spawns
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-model-triage
+        name: Triage Model
+        api: factory.config.json#models.triage
+        description: Reserve a workspace-level model selection for consumers that inject an LLM triage engine
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-model-babysitter
+        name: Babysitter Model
+        api: factory.config.json#models.babysitter
+        description: Override the babysitter model; defaults to sonnet
+        location: src/config/schema.ts, src/triage/heuristic.ts
+        verify_tier: 2
+
+      - id: config-babysitter-enabled
+        name: Automatic Babysitter Enablement
+        api: factory.config.json#babysitter.enabled
+        description: Opt into event-driven PR babysitting after issue-driven dispatch
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-merge-policy
+        name: Merge Policy
+        api: factory.config.json#mergePolicy
+        description: Choose never or on-green-with-review for guarded automatic merge behavior
+        location: src/config/schema.ts, src/github/merge-gate.ts
+        verify_tier: 2
+
+      - id: config-terminal-state
+        name: Terminal State
+        api: factory.config.json#terminalState
+        description: Choose done or human-review, with safe fallback when a Linear team lacks Human Review
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-slack-channel
+        name: Slack Channel
+        api: factory.config.json#slack.channel
+        description: Select a Slack name, ID, or mounted directory for dispatch and completion threads
+        location: src/config/schema.ts, src/writeback/slack.ts
+        verify_tier: 2
+
+      - id: config-slack-style
+        name: Slack Thread Style
+        api: factory.config.json#slack.style
+        description: Validate the threaded-summarized writeback style contract
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-slack-bot-user
+        name: Slack Bot User ID
+        api: factory.config.json#slack.botUserId
+        description: Identify and ignore the factory's own bot replies in thread watchers
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-slack-staleness
+        name: Slack Staleness Threshold
+        api: factory.config.json#slack.staleAfterMs
+        description: Set the provider-sync freshness threshold that activates Slack degraded mode
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+  config-linear-states:
+    name: Linear State Configuration
+    description: Global, per-team, and pinned UUID mappings for every factory lifecycle role
+    criticality: critical
+    features:
+      - id: config-linear-ready-name
+        name: Ready for Agent State Name
+        api: factory.config.json#linear.states.readyForAgent
+        description: Map the factory readyForAgent role to the workspace-wide Linear state name
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-implementing-name
+        name: Agent Implementing State Name
+        api: factory.config.json#linear.states.agentImplementing
+        description: Map the factory agentImplementing role to the workspace-wide Linear state name
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-planning-name
+        name: In Planning State Name
+        api: factory.config.json#linear.states.inPlanning
+        description: Map the factory inPlanning role to the workspace-wide Linear state name
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-done-name
+        name: Done State Name
+        api: factory.config.json#linear.states.done
+        description: Map the factory done role to the workspace-wide Linear state name
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-human-review-name
+        name: Human Review State Name
+        api: factory.config.json#linear.states.humanReview
+        description: Map the optional humanReview role to the workspace-wide Linear state name
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-states-by-team
+        name: Per-Team State Names
+        api: factory.config.json#linear.statesByTeam
+        description: Override any lifecycle role name for teams whose workflows use different names
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-linear-team-ids
+        name: Linear Team ID Map
+        api: factory.config.json#linear.teamIds
+        description: Preserve configured team-key to team-ID metadata for workspace consumers
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-state-id-ready
+        name: Ready for Agent State UUID
+        api: factory.config.json#stateIds.readyForAgent
+        description: Pin a fallback UUID for the readyForAgent role when name resolution is unavailable
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-state-id-implementing
+        name: Agent Implementing State UUID
+        api: factory.config.json#stateIds.agentImplementing
+        description: Pin a fallback UUID for the agentImplementing role when name resolution is unavailable
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-state-id-planning
+        name: In Planning State UUID
+        api: factory.config.json#stateIds.inPlanning
+        description: Pin a fallback UUID for the inPlanning role when name resolution is unavailable
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-state-id-done
+        name: Done State UUID
+        api: factory.config.json#stateIds.done
+        description: Pin a fallback UUID for the done role when name resolution is unavailable
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+      - id: config-state-id-human-review
+        name: Human Review State UUID
+        api: factory.config.json#stateIds.humanReview
+        description: Pin a fallback UUID for the optional humanReview role when name resolution is unavailable
+        location: src/config/schema.ts, src/linear/state-resolver.ts
+        verify_tier: 2
+
+  config-safety:
+    name: Safety Configuration
+    description: Explicit factory opt-in boundaries for titles, labels, and teams
+    criticality: critical
+    features:
+      - id: config-safety-title-prefix
+        name: Required Title Prefix
+        api: factory.config.json#safety.requireTitlePrefix
+        description: Configure the exact boundary-aware title marker accepted for Linear work
+        location: src/config/schema.ts, src/safety/factory-scope.ts
+        verify_tier: 2
+
+      - id: config-safety-label
+        name: Required Factory Label
+        api: factory.config.json#safety.requireLabel
+        description: Configure the case-insensitive opt-in label used for Linear and GitHub issue intake
+        location: src/config/schema.ts, src/safety/factory-scope.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-safety-team
+        name: Required Team Key
+        api: factory.config.json#safety.requireTeamKey
+        description: Configure the Linear team boundary enforced before dispatch and writeback
+        location: src/config/schema.ts, src/safety/factory-scope.ts
+        verify_tier: 2
+
+  config-node-and-loading:
+    name: Node and Config Loading
+    description: Node advertisement, local defaults, split config envelopes, and hermetic fixture mode
+    criticality: hot
+    features:
+      - id: config-node-capabilities
+        name: Node Capabilities
+        api: factory.node.json#capabilities
+        description: Advertise any supported subset of spawn:claude, spawn:codex, and workflow:run; reject empty or unknown-only sets
+        location: src/config/schema.ts, src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: config-node-dry-run
+        name: Node Dry-Run Metadata
+        api: factory.node.json#dryRun
+        description: Advertise node dry-run intent in factory capability metadata
+        location: src/config/schema.ts, src/node/factory-node.ts
+        verify_tier: 2
+
+      - id: config-node-path-env
+        name: Node Config Path Environment
+        api: AGENT_RELAY_FACTORY_NODE_CONFIG / FACTORY_NODE_CONFIG / FACTORY_CONFIG
+        description: Resolve factory.node.json through ordered environment overrides before the default path
+        location: src/node/factory-node.ts
+        verify_tier: 1
+
+      - id: config-node-name-env
+        name: Node Name Environment
+        api: AGENT_RELAY_NODE_NAME / FACTORY_NODE_NAME
+        description: Override the default hostname-derived factory node name
+        location: src/node/factory-node.ts
+        verify_tier: 1
+
+      - id: config-combined-envelope
+        name: Combined Factory Config Envelope
+        api: factory.config.json#factoryConfig
+        description: Accept a factoryConfig wrapper around the combined workspace and node schema
+        location: src/config/schema.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+      - id: config-split-envelope
+        name: Split Workspace and Node Config
+        api: factory.config.json#workspaceConfig + nodeConfig
+        description: Combine required workspaceConfig and nodeConfig objects while rejecting mismatched workspace IDs
+        location: src/config/schema.ts
+        verify_tier: 2
+
+      - id: config-fixture-files
+        name: Hermetic Fixture Files
+        api: factory.config.json#fixtureFiles
+        description: Replace cloud mount and internal fleet construction with fakes for deterministic CLI verification
+        location: src/cli/fleet.ts, src/testing/fakes.ts
+        verify_tier: 2
