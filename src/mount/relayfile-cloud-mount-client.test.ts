@@ -52,6 +52,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
   getSyncStatus?: RelayFileClientLike['getSyncStatus']
+  treePageSize?: number
 
   files = new Map<string, { revision: string; content: string; contentType: string }>()
   ops = new Map<string, OperationStatusResponse>()
@@ -119,10 +120,17 @@ class FakeRelayFileClient implements RelayFileClientLike {
 
   async listTree(workspaceId: string, options?: { path?: string; depth?: number; cursor?: string }) {
     this.listTreeCalls.push({ workspaceId, options })
+    const paths = [...this.files.keys()]
+      .filter((path) => path.startsWith(options?.path ?? '/'))
+      .sort()
+    const start = Number(options?.cursor ?? 0)
+    const pageSize = this.treePageSize ?? paths.length
+    const page = paths.slice(start, start + pageSize)
+    const next = start + page.length
     return {
       path: options?.path ?? '/',
-      entries: [...this.files.keys()].map((path) => ({ path, type: 'file' as const, revision: '1' })),
-      nextCursor: null,
+      entries: page.map((path) => ({ path, type: 'file' as const, revision: '1' })),
+      nextCursor: next < paths.length ? String(next) : null,
     }
   }
 
@@ -349,6 +357,31 @@ describe('RelayfileCloudMountClient', () => {
       options: { path: '/linear/issues', cursor: undefined },
     })
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
+  })
+
+  it('paginates listTree to exhaustion', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.treePageSize = 2
+    for (const number of [1, 2, 3, 4, 5]) {
+      fake.files.set(`/github/repos/AgentWorkforce__factory/issues/by-id/${number}.json`, {
+        revision: '1',
+        content: '{}',
+        contentType: 'application/json',
+      })
+    }
+    fake.files.set('/linear/issues/AR-1.json', {
+      revision: '1',
+      content: '{}',
+      contentType: 'application/json',
+    })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.listTree('/github/repos/AgentWorkforce__factory/issues')).resolves.toEqual(
+      [1, 2, 3, 4, 5].map((number) =>
+        `/github/repos/AgentWorkforce__factory/issues/by-id/${number}.json`,
+      ),
+    )
+    expect(fake.listTreeCalls.map((call) => call.options?.cursor)).toEqual([undefined, '2', '4'])
   })
 
   it('uses recent change-log events for provider-filtered getEvents tail reads', async () => {

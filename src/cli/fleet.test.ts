@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '../index'
+import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
@@ -552,9 +553,24 @@ describe('fleet CLI runtime', () => {
   it('auto-detects GitHub-only workspaces without resolving Linear states', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-only-'))
     try {
-      const configPath = await writeConfig(root)
+      const configPath = await writeConfig(root, {
+        stateIds: undefined,
+        repos: {
+          org: 'AgentWorkforce',
+          names: ['pear'],
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
       const githubPath = '/github/repos/AgentWorkforce/pear/issues/by-id/48.json'
-      const mount = new FakeMountClient({
+      const mount = new (class extends FakeMountClient {
+        override async ensureSubRoot(prefix: string): Promise<'ready' | 'absent'> {
+          if (prefix === '/linear/issues') {
+            throw new Error('Linear sub-root probe must not run for a GitHub-oriented config')
+          }
+          return super.ensureSubRoot(prefix)
+        }
+      })({
         [githubPath]: {
           provider: 'github',
           objectType: 'issue',
@@ -570,8 +586,8 @@ describe('fleet CLI runtime', () => {
           },
         },
       })
-      mount.setSubRoot('/linear/issues', 'absent')
       const output = buffer()
+      const errors = buffer()
 
       const code = await runFleetCli([
         'run-once',
@@ -585,10 +601,10 @@ describe('fleet CLI runtime', () => {
           throw new Error('Linear state resolution must not run')
         },
         stdout: output,
-        stderr: buffer(),
+        stderr: errors,
       })
 
-      expect(code).toBe(0)
+      expect(code, errors.text()).toBe(0)
       expect(JSON.parse(output.text())).toMatchObject({
         pulled: [{ key: '48', path: githubPath }],
         dispatched: [{ issue: { key: '48' }, dryRun: true }],
@@ -617,6 +633,77 @@ describe('fleet CLI runtime', () => {
         issue: { key: '48', path: githubPath },
         dryRun: true,
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps legacy Linear configs with repository routing on the Linear source', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-linear-with-repos-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: {
+          org: 'AgentWorkforce',
+          names: ['pear'],
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/77.json'
+      const mount = new FakeMountClient({
+        [issuePath]: issueFile,
+        [githubPath]: githubIssueFile('pear', 77),
+      })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', 'AR-77', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: 'AR-77', path: issuePath } })
+      expect(mount.reads).not.toContain(githubPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('honors an explicit Linear source for an otherwise GitHub-oriented config', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-explicit-linear-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'linear',
+        stateIds: undefined,
+        repos: {
+          org: 'AgentWorkforce',
+          names: ['pear'],
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const mount = new (class extends FakeMountClient {
+        override async ensureSubRoot(): Promise<'ready' | 'absent'> {
+          throw new Error('explicit issueSource must not probe providers')
+        }
+      })({
+        [issuePath]: issueFile,
+        '/github/repos/AgentWorkforce__pear/issues/by-id/77.json': githubIssueFile('pear', 77),
+      })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', 'AR-77', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        resolveStates: async () => stateResolutionFromIds(TEST_STATE_IDS),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: 'AR-77', path: issuePath } })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -653,6 +740,28 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('rejects non-positive GitHub issue numbers with source context', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-invalid-number-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const errors = buffer()
+
+      const code = await runFleetCli(['dispatch', '0', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain(
+        'Unable to resolve GitHub issue 0 (issueSource=github): expected a positive issue number',
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('uses repos.default to disambiguate a bare GitHub issue number', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-default-'))
     try {
@@ -665,7 +774,11 @@ describe('fleet CLI runtime', () => {
         },
       })
       const cloudPath = '/github/repos/AgentWorkforce/cloud/issues/by-id/48.json'
-      const mount = new FakeMountClient({
+      const mount = new (class extends FakeMountClient {
+        override async listTree(): Promise<string[]> {
+          throw new Error('direct GitHub issue resolution must not list the mount')
+        }
+      })({
         '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
         [cloudPath]: githubIssueFile('cloud'),
       })
@@ -680,6 +793,141 @@ describe('fleet CLI runtime', () => {
 
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48', path: cloudPath } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves a case-insensitive bare repos.default through repos.byLabel without listing the mount', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-bare-default-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'PEAR',
+        },
+      })
+      const compactPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      const mount = new (class extends FakeMountClient {
+        override async listTree(): Promise<string[]> {
+          throw new Error('direct GitHub issue resolution must not list the mount')
+        }
+      })({ [compactPath]: githubIssueFile('pear') })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48', path: compactPath } })
+      expect(mount.reads).toContain(compactPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    '/github/repos/AgentWorkforce__pear/issues/48__scoped-fallback/meta.json',
+    '/github/repos/AgentWorkforce/pear/issues/48__scoped-fallback/meta.json',
+  ])('falls back to compact and nested repo-scoped issue roots for %s', async (issuePath) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-scoped-fallback-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const listed: string[] = []
+      const mount = new (class extends FakeMountClient {
+        override async listTree(prefix: string): Promise<string[]> {
+          listed.push(prefix)
+          if (prefix === '/github/repos') throw new Error('global GitHub tree scan is forbidden')
+          return super.listTree(prefix)
+        }
+      })({ [issuePath]: githubIssueFile('pear') })
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48', path: issuePath } })
+      expect(listed.sort()).toEqual([
+        '/github/repos/AgentWorkforce/pear/issues',
+        '/github/repos/AgentWorkforce__pear/issues',
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not hide a provider failure behind GitHub direct-read fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-provider-error-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const mount = new (class extends FakeMountClient {
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path.endsWith('/48/meta.json')) {
+            throw Object.assign(new Error('GitHub connection unauthorized'), { status: 401 })
+          }
+          return super.readFile(path)
+        }
+      })()
+      const errors = buffer()
+
+      const code = await runFleetCli(['dispatch', '48', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('Unable to read GitHub issue candidate')
+      expect(errors.text()).toContain('GitHub connection unauthorized')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('names an auto-detected Linear source and suggests the GitHub override on resolution failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-linear-source-error-'))
+    try {
+      const configPath = await writeConfig(root)
+      const errors = buffer()
+
+      const code = await runFleetCli(['dispatch', '37', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain(
+        'Unable to resolve issue 37 in Linear (issueSource=linear, auto-detected): found 0 matches',
+      )
+      expect(errors.text()).toContain("set issueSource: 'github' if these are GitHub issues")
     } finally {
       await rm(root, { recursive: true, force: true })
     }
