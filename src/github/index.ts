@@ -7,6 +7,12 @@ export {
 export {
   closeProbePr,
 } from './probe-closer'
+export {
+  explicitLinkedIssueKey,
+  parseStandaloneBabysitTarget,
+  readStandalonePullRequest,
+  standaloneBabysitterAgentName,
+} from './standalone-babysitter'
 export type {
   GhRunner,
   GhRunResult,
@@ -20,3 +26,7 @@ export type {
   CloseProbePrInput,
   CloseProbePrResult,
 } from './probe-closer'
+export type {
+  StandaloneBabysitTarget,
+  StandalonePullRequest,
+} from './standalone-babysitter'

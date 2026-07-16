@@ -197,7 +197,10 @@ export class RelayFleetClient implements FleetClient {
   async roster(): Promise<RosterEntry> {
     const messaging = await this.#ensureMessaging()
     const [agents, nodes] = await Promise.all([
-      messaging.agents.list({ status: 'all' }),
+      // Roster means agents that can currently collide with a spawn. Including
+      // offline task-exit rows makes deterministic one-shot names permanently
+      // sticky and prevents a later review round from spawning a fresh worker.
+      messaging.agents.list({ status: 'online' }),
       messaging.nodes.list(),
     ])
     return {
