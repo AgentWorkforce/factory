@@ -19,6 +19,8 @@ export interface CreateFleetDeps {
   ownedBrokerAgentExitTimeoutMs?: number
   workspaceKey?: string
   logger?: Logger
+  /** Hermetic credential environment for the relay backend (tests). */
+  env?: NodeJS.ProcessEnv
 }
 
 export function parseOwnedBrokerAgentExitTimeoutMs(value: unknown): number | undefined {
@@ -47,7 +49,11 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
   const backend = options.backend ?? 'internal'
 
   if (backend === 'relay') {
-    return new RelayFleetClient()
+    return new RelayFleetClient({
+      workspaceKey: deps.workspaceKey,
+      env: deps.env,
+      log: deps.logger ? (message) => deps.logger?.info?.(message) : undefined,
+    })
   }
 
   return new InternalFleetClient({
