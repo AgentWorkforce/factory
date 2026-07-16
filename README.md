@@ -166,24 +166,50 @@ they're the main guardrail.
 > Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
 > auto-close). For real work you want to keep, use the `[factory]` prefix.
 
-## Run it as a fleet node (optional)
+## Run it as a fleet node
 
-The package also ships a fleet **node definition** so a machine can advertise
-`spawn:claude` / `spawn:codex` / `workflow:run` to the cloud and run agents in the
-checkouts it owns:
+The package ships a fleet **node definition** so a machine can advertise
+`spawn:claude` / `spawn:codex` / `workflow:run` to the engine and run agents in the
+checkouts it owns. Bringing a worker machine online is two steps:
 
 ```bash
-agent-relay fleet serve @agent-relay/factory/node
+# once per machine: redeem an enrollment token for durable node credentials
+agent-relay cloud enroll --token ocl_node_enr_…
+
+# each boot: start the node with the factory definition
+agent-relay node up --config agent-relay.ts
 ```
 
-It reads its node config from `./factory.node.json` (or `$FACTORY_NODE_CONFIG`).
-Prefer to build the definition yourself?
+`agent-relay.ts` is a re-export in the node's working directory (`node up`
+auto-discovers it there, making `--config` optional). It must **default-export**
+the definition:
 
 ```ts
-import { createFactoryNodeDefinition, readFactoryNodeConfigSync } from '@agent-relay/factory'
-
-export default createFactoryNodeDefinition({ config: readFactoryNodeConfigSync() })
+export { default } from '@agent-relay/factory/node'
 ```
+
+The definition reads its node config from `./factory.node.json` (or
+`$FACTORY_NODE_CONFIG`): `workspaceId`, `capabilities`, and the
+`clonePaths`/`cloneRoot` map naming the checkouts this node services. Each
+mapped repo is advertised as a `repo:<label>` tag so placement can route
+repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
+
+### Dispatching to nodes (`--backend relay`)
+
+With `--backend relay`, the factory orchestrator dispatches work through the
+hosted engine instead of a local broker: placement picks a live node with the
+required capability (a named `node` target passes through), the node runs the
+agent in its mapped checkout, and the orchestrator detects exits by reconciling
+its tracked agents against the engine roster.
+
+Tokens involved — set only the first one on the orchestrator host:
+
+| Token | Prefix | Who holds it |
+|---|---|---|
+| Workspace key | `rk_live_` | the orchestrator (`RELAY_WORKSPACE_KEY`); used to mint the factory's own agent identity on first use |
+| Agent token | `at_live_` | optional `RELAY_AGENT_TOKEN` to pin the orchestrator's agent identity; spawned agents get their own automatically |
+| Node token | `nt_live_` | each worker node, minted by `cloud enroll` |
+| Observer token | `ot_live_` | read-only dashboards/streams only — never dispatch |
 
 ## Configuration
 

@@ -122,10 +122,13 @@ describe('factory node definition', () => {
       channel: 'wf-factory-p13',
       session_ref: 'resume-me',
       restart_policy: { max_restarts: 2 },
+      spawn_mode: 'task_exit',
+      exit_after_task: true,
     }, ctx)).resolves.toMatchObject({
       name: 'ar-13-impl',
       capability: 'spawn:codex',
       cwd: '/work/factory',
+      node: 'factory-node',
       invocationId: 'spawn-inv',
     })
 
@@ -143,6 +146,8 @@ describe('factory node definition', () => {
         channels: ['wf-factory-p13'],
         session_id: 'resume-me',
         restart_policy: { max_restarts: 2 },
+        spawn_mode: 'task_exit',
+        exit_after_task: true,
         harness_config: {
           runtime: 'pty',
           command: 'codex',

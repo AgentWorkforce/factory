@@ -3,7 +3,7 @@ import { hostname } from 'node:os'
 import { basename, extname, join, resolve, sep } from 'node:path'
 
 import { action, defineNode, type FleetActionContext, type FleetCapabilityValue, type FleetNodeDefinition } from '@agent-relay/fleet'
-import type { AgentSpec, JsonValue, RestartPolicy } from '@agent-relay/harness-driver/protocol'
+import type { AgentSpec, JsonValue, RestartPolicy, SpawnMode } from '@agent-relay/harness-driver/protocol'
 import type { SpawnPtyInput } from '@agent-relay/harness-driver'
 import { runScriptWorkflow, runWorkflow } from '@relayflows/core'
 import type { WorkflowRunRow } from '@relayflows/core'
@@ -35,6 +35,10 @@ const restartPolicySchema: z.ZodType<RestartPolicy> = z.object({
   max_consecutive_failures: z.number().int().min(0).optional(),
 }).passthrough()
 
+// Mirrors the broker's accepted lifecycle modes; z.ZodType<SpawnMode> keeps the
+// enum from drifting ahead of the harness-driver union.
+const spawnModeSchema: z.ZodType<SpawnMode> = z.enum(['interactive', 'task_exit', 'task-exit', 'single_shot', 'single-shot'])
+
 const spawnCapabilityInputSchema = z.object({
   name: z.string().min(1).optional(),
   agent: z.string().min(1).optional(),
@@ -54,6 +58,10 @@ const spawnCapabilityInputSchema = z.object({
   restart_policy: restartPolicySchema.optional(),
   restartPolicy: restartPolicySchema.optional(),
   skip_relay_prompt: z.boolean().optional(),
+  spawn_mode: spawnModeSchema.optional(),
+  spawnMode: spawnModeSchema.optional(),
+  exit_after_task: z.boolean().optional(),
+  exitAfterTask: z.boolean().optional(),
 }).passthrough().transform((input) => ({
   ...input,
   name: input.name ?? input.agent,
@@ -62,6 +70,8 @@ const spawnCapabilityInputSchema = z.object({
   invocationId: input.invocationId ?? input.invocation_id,
   channels: input.channels ?? (input.channel ? [input.channel] : undefined),
   restartPolicy: input.restartPolicy ?? input.restart_policy,
+  spawnMode: input.spawnMode ?? input.spawn_mode,
+  exitAfterTask: input.exitAfterTask ?? input.exit_after_task,
 }))
 
 const workflowCapabilityInputSchema = z.object({
@@ -239,6 +249,8 @@ async function runSpawnCapability(
     restartPolicy: input.restartPolicy,
   }
   const harnessConfig = command ? buildRelayMcpHarnessConfig(spawnInput, command) : undefined
+  // spawn_mode/exit_after_task ride the agent spec onto the broker's spawn
+  // input; the broker ends the agent when its task completes.
   const agent: AgentSpec = {
     name: input.name,
     runtime: 'pty',
@@ -250,6 +262,8 @@ async function runSpawnCapability(
     ...(input.sessionRef ? { session_id: input.sessionRef } : {}),
     ...(input.restartPolicy ? { restart_policy: input.restartPolicy } : {}),
     ...(harnessConfig ? { harness_config: harnessConfig } : {}),
+    ...(input.spawnMode ? { spawn_mode: input.spawnMode } : {}),
+    ...(input.exitAfterTask !== undefined ? { exit_after_task: input.exitAfterTask } : {}),
   }
 
   const output = await ctx.spawnAgent({
@@ -263,6 +277,7 @@ async function runSpawnCapability(
     name: input.name,
     capability,
     cwd,
+    node: ctx.node.name,
     invocationId: input.invocationId ?? ctx.invocationId,
     agent: output,
   }
