@@ -235,6 +235,31 @@ an invalid config fails fast with a field-level error. See
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
 
+`cloneRoot` and every `clonePaths` value accept `~` or a leading `~/`, expanded
+against the current user's home directory. Named-user forms such as `~alice`
+are rejected because Node cannot expand them portably.
+
+For a local, single-repository run, the checkout mapping can be omitted:
+
+```json
+{
+  "repos": {
+    "org": "your-org",
+    "names": ["your-repo"],
+    "default": "your-org/your-repo"
+  }
+}
+```
+
+Run Factory from that repository (or one of its subdirectories). When exactly
+one `repos.names` entry is configured and no `cloneRoot` or `clonePaths` field is
+supplied, Factory resolves the checkout's git top-level and uses it only if a
+GitHub remote matches the resolved `org/name`. The inference is logged. Missing,
+unparseable, or mismatched remotes fail with a config-oriented error instead of
+silently dispatching in the wrong directory. Explicit local clone paths are also
+preflighted before commands that can dispatch through the internal backend;
+relay-backend paths are left for their worker nodes to validate.
+
 ## Notes
 
 - The daemon is headless by design; tools like Pear can consume this package and

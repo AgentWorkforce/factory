@@ -3,8 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 import { ensureLocalMount } from '../mount/local-mount-preflight'
+import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import {
-  FactoryConfigSchema,
   FileStateStore,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
@@ -72,6 +72,8 @@ interface FleetCliDeps {
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
   daemonExit?: (code: number) => void
   flushDaemonOutput?: () => Promise<void>
+  /** Hermetic local-checkout probes for CLI integration tests. */
+  localClonePathOptions?: LocalClonePathOptions
 }
 
 interface GlobalOptions {
@@ -130,7 +132,17 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       return 0
     }
 
-    const loaded = command.kind.startsWith('factory') ? await loadConfig(globals.config) : undefined
+    const resolvesLocalClonePaths = globals.backend === 'internal' && commandUsesLocalCheckout(command)
+    const loaded = command.kind.startsWith('factory')
+      ? await loadConfig(globals.config, {
+          ...deps.localClonePathOptions,
+          inferFromCwd: resolvesLocalClonePaths,
+          logger: streamLogger(err),
+          validateConfiguredCheckouts: resolvesLocalClonePaths && (
+            deps.localClonePathOptions?.validateConfiguredCheckouts ?? !hasInjectedFactoryRuntime(deps)
+          ),
+        })
+      : undefined
     fleet = await buildFleet(globals, loaded, deps)
 
     switch (command.kind) {
@@ -718,14 +730,37 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live'
   return { mode }
 }
 
-async function loadConfig(path?: string): Promise<LoadedConfig> {
+async function loadConfig(path?: string, options: LocalClonePathOptions = {}): Promise<LoadedConfig> {
   const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
   const raw = JSON.parse(await readFile(configPath, 'utf8')) as unknown
   const record = asRecord(raw)
   return {
-    config: FactoryConfigSchema.parse(record.factoryConfig ?? record),
+    config: await resolveLocalFactoryConfig(raw, {
+      ...options,
+      // fixtureFiles describe a hermetic in-memory run; their checkout paths
+      // are intentionally synthetic and must not be preflighted on the host.
+      validateConfiguredCheckouts: options.validateConfiguredCheckouts && !record.fixtureFiles,
+    }),
     fixtureFiles: record.fixtureFiles ? asRecord(record.fixtureFiles) : undefined,
   }
+}
+
+function commandUsesLocalCheckout(command: ParsedCommand): boolean {
+  switch (command.kind) {
+    case 'factory':
+      return command.action === 'run-once' || command.action === 'loop' || command.action === 'start'
+    case 'factory-canary':
+    case 'factory-triage':
+    case 'factory-dispatch':
+    case 'factory-babysit':
+      return true
+    default:
+      return false
+  }
+}
+
+function hasInjectedFactoryRuntime(deps: FleetCliDeps): boolean {
+  return Boolean(deps.fleet || deps.mount || deps.createFactory || deps.createFleet || deps.cloudMountFromConfig)
 }
 
 async function buildFleet(

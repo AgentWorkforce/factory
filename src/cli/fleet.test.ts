@@ -399,6 +399,156 @@ describe('fleet CLI runtime', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('infers clonePath from cwd for internal dispatch and logs the checkout root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-infer-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: {
+          org: 'AgentWorkforce',
+          names: ['pear'],
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const git = vi.fn(async (_cwd: string, args: string[]) => {
+        if (args[0] === 'rev-parse') return '/checkout/pear\n'
+        if (args[0] === 'remote' && args.length === 1) return 'origin\n'
+        if (args[0] === 'remote' && args[1] === 'get-url') return 'git@github.com:AgentWorkforce/pear.git\n'
+        throw new Error(`unexpected git args: ${args.join(' ')}`)
+      })
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient({ [issuePath]: issueFile }),
+        localClonePathOptions: { cwd: '/checkout/pear/src', git },
+        stdout: output,
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issue: { key: 'AR-77' },
+        dryRun: true,
+      })
+      expect(errors.text()).toContain('[factory] clonePath inferred from cwd: /checkout/pear')
+      expect(git).toHaveBeenCalledWith('/checkout/pear/src', ['rev-parse', '--show-toplevel'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails fast for an invalid explicit clonePath before internal dispatch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-invalid-clone-'))
+    try {
+      const missing = join(root, 'missing-checkout')
+      const configPath = await writeConfig(root, {
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': missing },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient({ [issuePath]: issueFile }),
+        localClonePathOptions: { validateConfiguredCheckouts: true },
+        stdout: output,
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain(`[factory] clonePath for AgentWorkforce/pear does not exist: ${missing}`)
+      expect(output.text()).toBe('')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not inspect orchestrator-local checkouts for relay dispatch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-relay-clone-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': join(root, 'worker-only-checkout') },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const git = vi.fn(async () => {
+        throw new Error('relay dispatch must not inspect local git state')
+      })
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--dry-run',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient({ [issuePath]: issueFile }),
+        localClonePathOptions: { git, validateConfiguredCheckouts: true },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(git).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not infer or preflight clone paths for a maintenance command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-maintenance-clone-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: { org: 'AgentWorkforce', names: ['pear'] },
+      })
+      const git = vi.fn(async () => {
+        throw new Error('status must not inspect local git state')
+      })
+      const factoryStatus = { inFlight: [], queued: [], counters: { pulled: 0 } }
+      const factory = {
+        status: vi.fn(() => factoryStatus),
+      } as unknown as Factory
+      const output = buffer()
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        localClonePathOptions: { cwd: '/not/a/checkout', git, validateConfiguredCheckouts: true },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+      expect(git).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('auto-detects GitHub-only workspaces without resolving Linear states', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-only-'))
     try {
@@ -705,6 +855,9 @@ describe('fleet CLI runtime', () => {
   it('runs manual close-probe through the injectable probe closer', async () => {
     const output = buffer()
     const calls: unknown[] = []
+    const git = vi.fn(async () => {
+      throw new Error('close-probe must not inspect local git state')
+    })
     const code = await runFleetCli([
       'close-probe',
       '42',
@@ -715,6 +868,7 @@ describe('fleet CLI runtime', () => {
     ], {
       stdout: output,
       stderr: buffer(),
+      localClonePathOptions: { git, validateConfiguredCheckouts: true },
       probeCloser: async (input: Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey'>) => {
         calls.push(input)
         return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
@@ -722,6 +876,7 @@ describe('fleet CLI runtime', () => {
     })
 
     expect(code).toBe(0)
+    expect(git).not.toHaveBeenCalled()
     expect(calls).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 42, expectedIssueKey: 'AR-77' }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
   })

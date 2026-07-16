@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
-import { FactoryConfigSchema } from './schema'
+import { FactoryConfigSchema, NodeConfigSchema, loadFactoryConfig } from './schema'
 
 describe('FactoryConfigSchema', () => {
   it('parses a valid config and applies defaults', () => {
@@ -184,6 +186,111 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.clonePaths['Other/cloud-fork']).toBe('/work/cloud-fork')
     // explicit subscription.labels is preserved (not overwritten by names)
     expect(parsed.subscription.labels).toEqual(['pear'])
+  })
+
+  it('expands exact ~ and ~/ in cloneRoot and explicit clonePaths while preserving precedence', () => {
+    const parsed = FactoryConfigSchema.parse({
+      cloneRoot: '~/top-level',
+      clonePaths: { 'AgentWorkforce/pear': '~/top-level-explicit' },
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['pear', 'cloud'],
+        cloneRoot: '~/legacy-root',
+        clonePaths: {
+          'AgentWorkforce/pear': '~/legacy-explicit',
+          'AgentWorkforce/cloud': '~',
+        },
+      },
+    })
+
+    expect(parsed.cloneRoot).toBe(join(homedir(), 'top-level'))
+    expect(parsed.clonePaths).toEqual({
+      'AgentWorkforce/pear': join(homedir(), 'top-level-explicit'),
+      'AgentWorkforce/cloud': homedir(),
+    })
+    expect(parsed.repos.clonePaths).toEqual(parsed.clonePaths)
+  })
+
+  it('derives clone paths from an exact ~ legacy cloneRoot', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['factory'],
+        cloneRoot: '~',
+      },
+    })
+
+    expect(parsed.cloneRoot).toBe(homedir())
+    expect(parsed.clonePaths).toEqual({
+      'AgentWorkforce/factory': join(homedir(), 'factory'),
+    })
+  })
+
+  it('expands node-only and split clone paths consistently', () => {
+    expect(NodeConfigSchema.parse({
+      cloneRoot: '~',
+      clonePaths: { 'AgentWorkforce/factory': '~/Projects/factory' },
+    })).toMatchObject({
+      cloneRoot: homedir(),
+      clonePaths: { 'AgentWorkforce/factory': join(homedir(), 'Projects/factory') },
+    })
+
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { org: 'AgentWorkforce', names: ['factory'] },
+      },
+      nodeConfig: {
+        cloneRoot: '~/Projects/AgentWorkforce',
+        clonePaths: { 'AgentWorkforce/factory': '~' },
+      },
+    })
+    expect(loaded.factoryConfig.cloneRoot).toBe(join(homedir(), 'Projects/AgentWorkforce'))
+    expect(loaded.factoryConfig.clonePaths).toEqual({ 'AgentWorkforce/factory': homedir() })
+    expect(loaded.factoryConfig.repos.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
+    expect(loaded.nodeConfig.cloneRoot).toBe(join(homedir(), 'Projects/AgentWorkforce'))
+    expect(loaded.nodeConfig.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
+  })
+
+  it('does not rewrite embedded tildes', () => {
+    const parsed = FactoryConfigSchema.parse({
+      cloneRoot: '/work/~shared',
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        clonePaths: { 'AgentWorkforce/pear': '/work/~shared/pear' },
+      },
+    })
+
+    expect(parsed.cloneRoot).toBe('/work/~shared')
+    expect(parsed.clonePaths['AgentWorkforce/pear']).toBe('/work/~shared/pear')
+  })
+
+  it.each([
+    { input: { cloneRoot: '~other', repos: {} }, field: 'cloneRoot' },
+    { input: { repos: { cloneRoot: '~other/projects' } }, field: 'cloneRoot' },
+    {
+      input: { repos: { clonePaths: { 'AgentWorkforce/pear': '~other/pear' } } },
+      field: 'repos.clonePaths["AgentWorkforce/pear"]',
+    },
+  ])('rejects unsupported ~user syntax in $field', ({ input, field }) => {
+    expect(() => FactoryConfigSchema.parse(input)).toThrow(`${field} does not support ~user expansion`)
+  })
+
+  it('rejects ~user syntax even when a higher-precedence value overrides it', () => {
+    expect(() => FactoryConfigSchema.parse({
+      cloneRoot: '/top-level',
+      clonePaths: { 'AgentWorkforce/pear': '/top-level/pear' },
+      repos: {
+        cloneRoot: '~other/legacy',
+        clonePaths: { 'AgentWorkforce/pear': '~other/pear' },
+      },
+    })).toThrow('repos.cloneRoot does not support ~user expansion')
+
+    expect(() => loadFactoryConfig({
+      workspaceConfig: {
+        repos: { cloneRoot: '~other/legacy' },
+      },
+      nodeConfig: { cloneRoot: '/node-root' },
+    })).toThrow('workspaceConfig.repos.cloneRoot does not support ~user expansion')
   })
 
   it('still accepts the legacy explicit-only repos form', () => {

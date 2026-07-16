@@ -1,3 +1,6 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 import { z } from 'zod'
 
 // The five workflow-state roles the factory drives an issue through. Each is
@@ -223,18 +226,30 @@ function normalizeWorkspaceConfig(cfg: z.infer<typeof WorkspaceConfigObjectSchem
 }
 
 function normalizeNodeConfig(cfg: z.infer<typeof NodeConfigObjectSchema>) {
+  const cloneRoot = cfg.cloneRoot === undefined
+    ? undefined
+    : expandLeadingTilde(cfg.cloneRoot, 'cloneRoot')
+
   return {
     ...cfg,
+    cloneRoot,
+    clonePaths: expandClonePaths(cfg.clonePaths),
     factoryLoopHeartbeatPath: cfg.factoryLoopHeartbeatPath,
     factoryLoopRegistryPath: cfg.factoryLoopRegistryPath,
   }
 }
 
 function normalizeFactoryConfig(cfg: z.infer<typeof FactoryConfigObjectSchema>) {
-  const cloneRoot = cfg.cloneRoot ?? cfg.repos.cloneRoot
+  const topLevelCloneRoot = cfg.cloneRoot === undefined
+    ? undefined
+    : expandLeadingTilde(cfg.cloneRoot, 'cloneRoot')
+  const legacyCloneRoot = cfg.repos.cloneRoot === undefined
+    ? undefined
+    : expandLeadingTilde(cfg.repos.cloneRoot, 'repos.cloneRoot')
+  const cloneRoot = topLevelCloneRoot ?? legacyCloneRoot
   const explicitClonePaths = {
-    ...cfg.repos.clonePaths,
-    ...cfg.clonePaths,
+    ...expandClonePaths(cfg.repos.clonePaths, 'repos.clonePaths'),
+    ...expandClonePaths(cfg.clonePaths),
   }
   const resolved = resolveRepos(cfg.repos, cloneRoot, explicitClonePaths)
   const labels = resolveSubscriptionLabels(cfg.subscription.labels, cfg.repos.names ?? [])
@@ -285,13 +300,16 @@ function resolveRepos(
   // Explicit clonePaths entries win.
   const derivedClonePaths: Record<string, string> = {}
   if (cloneRoot) {
-    const root = cloneRoot.replace(/\/+$/u, '')
+    const root = expandLeadingTilde(cloneRoot, 'cloneRoot').replace(/\/+$/u, '')
     for (const repo of Object.values(resolvedByLabel)) {
       const repoName = repo.includes('/') ? repo.slice(repo.lastIndexOf('/') + 1) : repo
       derivedClonePaths[repo] = `${root}/${repoName}`
     }
   }
-  const resolvedClonePaths = { ...derivedClonePaths, ...explicitClonePaths }
+  const resolvedClonePaths = {
+    ...derivedClonePaths,
+    ...expandClonePaths(explicitClonePaths),
+  }
 
   return {
     byLabel: resolvedByLabel,
@@ -300,6 +318,26 @@ function resolveRepos(
     clonePaths: resolvedClonePaths,
     defaultRepo,
   }
+}
+
+function expandClonePaths(
+  clonePaths: Record<string, string>,
+  field = 'clonePaths',
+): Record<string, string> {
+  return Object.fromEntries(Object.entries(clonePaths).map(([repo, clonePath]) => [
+    repo,
+    expandLeadingTilde(clonePath, `${field}[${JSON.stringify(repo)}]`),
+  ]))
+}
+
+/** Expand the shell-like home shorthand that Node's filesystem APIs do not. */
+export function expandLeadingTilde(value: string, field = 'path'): string {
+  if (value === '~') return homedir()
+  if (value.startsWith('~/')) return join(homedir(), value.slice(2))
+  if (value.startsWith('~')) {
+    throw new Error(`${field} does not support ~user expansion; use ~ or ~/ instead`)
+  }
+  return value
 }
 
 function resolveSubscriptionLabels(labels: string[], repoNames: string[]): string[] {
@@ -352,6 +390,11 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   const workspaceRepos = asOptionalConfigRecord(workspace.repos)
   assertCompatibleWorkspaceIds(workspace.workspaceId, node.workspaceId)
 
+  // Validate tilde syntax in both split halves before node-local values take
+  // precedence, so an overridden ~user path is never silently accepted.
+  validateClonePathSyntax(workspaceRepos, 'workspaceConfig.repos')
+  validateClonePathSyntax(node, 'nodeConfig')
+
   return {
     ...workspace,
     ...node,
@@ -360,6 +403,16 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
       cloneRoot: node.cloneRoot ?? workspaceRepos.cloneRoot,
       clonePaths: node.clonePaths ?? workspaceRepos.clonePaths,
     },
+  }
+}
+
+function validateClonePathSyntax(input: Record<string, unknown>, field: string): void {
+  if (typeof input.cloneRoot === 'string') expandLeadingTilde(input.cloneRoot, `${field}.cloneRoot`)
+  const clonePaths = asOptionalConfigRecord(input.clonePaths)
+  for (const [repo, clonePath] of Object.entries(clonePaths)) {
+    if (typeof clonePath === 'string') {
+      expandLeadingTilde(clonePath, `${field}.clonePaths[${JSON.stringify(repo)}]`)
+    }
   }
 }
 
