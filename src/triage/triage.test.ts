@@ -3,7 +3,7 @@ import { ZodError } from 'zod'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import type { LinearIssue, TriageContext, TriageDecision, TriageEngine } from '../types'
-import { HeuristicTriage } from './heuristic'
+import { HeuristicTriage, babysitterSpec } from './heuristic'
 import { LlmTriage } from './llm'
 import { TieredTriage } from './tiered'
 
@@ -235,6 +235,30 @@ describe('HeuristicTriage thin and scope detection', () => {
       clonePath: '/work/pear',
       node: 'self',
     })
+  })
+
+  it('repo-qualifies every collision-prone GitHub-native role while preserving its source repo identity', async () => {
+    const githubIssue = issue({
+      uuid: 'AgentWorkforce/hoopsheet#26',
+      key: '26',
+      path: '/github/repos/AgentWorkforce/hoopsheet/issues/by-id/26.json',
+      raw: {
+        provider: 'github',
+        payload: {
+          source: { provider: 'github', owner: 'AgentWorkforce', repo: 'hoopsheet', number: 26 },
+        },
+      },
+    })
+    const decision = await new HeuristicTriage().triage(githubIssue, ctx)
+    const workflow = await new HeuristicTriage().triage({
+      ...githubIssue,
+      labels: ['pear', 'agent:workflow'],
+    }, ctx)
+
+    expect(decision.implementers.map((agent) => agent.name)).toEqual(['ar-26-impl-hoopsheet'])
+    expect(decision.reviewer.name).toBe('ar-26-review-hoopsheet')
+    expect(babysitterSpec(githubIssue, baseConfig, decision.routes[0]).name).toBe('ar-26-babysit-hoopsheet')
+    expect(workflow.workflow?.name).toBe('ar-26-workflow-hoopsheet')
   })
 })
 
