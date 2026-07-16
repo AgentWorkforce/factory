@@ -79,6 +79,9 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Fix failing CI')
     expect(task).toContain('Resolve any merge conflicts')
     expect(task).toContain('Address every review comment for real')
+    expect(task).toContain('reply directly in its original review thread')
+    expect(task).toContain('name the fixing commit')
+    expect(task).toContain('checks on the newly pushed head commit')
     // Team coordination + readiness signal + guardrail.
     expect(task).toContain('ar-123-impl')
     expect(task).toContain('ar-123-review')
@@ -125,6 +128,8 @@ describe('renderAgentTask', () => {
     expect(task).toContain('refs/pull/10/head')
     expect(task).toContain('isolated clone/worktree')
     expect(task).toContain('Address every review comment for real')
+    expect(task).toContain('reply directly in its original review thread')
+    expect(task).toContain('checks on the newly pushed head commit')
     expect(task).toContain('Fix failing CI')
     expect(task).toContain('never merge it yourself')
     expect(task).toContain('Never search for, read, or substitute credentials or tokens')
