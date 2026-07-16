@@ -6,6 +6,8 @@ import type {
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
   StateStore,
+  WaitingClarification,
+  ClarificationReply,
 } from '../ports/state'
 
 type WorkspaceState = {
@@ -16,6 +18,7 @@ type WorkspaceState = {
   githubIssueCommentWatches: Map<string, GithubIssueCommentWatchState>
   seenAgentQuestionKeys: Set<string>
   seenAgentQuestionOrder: string[]
+  waitingClarifications: Map<string, WaitingClarification>
   dispatchAttempts: Map<string, DispatchAttemptState>
   canonicalIssueStates: Map<string, string>
   dispatchFailureReaperHandoffs: Map<string, RegistryHandoffAgent>
@@ -122,6 +125,189 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async reserveWaitingClarification(workspaceId: string, issueKey: string, record: WaitingClarification): Promise<boolean> {
+    const waiting = this.#workspace(workspaceId).waitingClarifications
+    if (waiting.has(issueKey)) return false
+    waiting.set(issueKey, cloneWaitingClarification(record))
+    return true
+  }
+
+  async getWaitingClarification(workspaceId: string, issueKey: string): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    return record ? cloneWaitingClarification(record) : undefined
+  }
+
+  async listWaitingClarifications(workspaceId: string): Promise<Array<[string, WaitingClarification]>> {
+    return [...this.#workspace(workspaceId).waitingClarifications]
+      .map(([key, record]) => [key, cloneWaitingClarification(record)])
+  }
+
+  async claimClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record || record.questionPostedAtMs !== undefined || (
+      record.questionDelivery?.owner &&
+      nowMs - record.questionDelivery.claimedAtMs < leaseMs
+    )) return undefined
+    record.questionDelivery = {
+      owner,
+      claimedAtMs: nowMs,
+      attempts: (record.questionDelivery?.attempts ?? 0) + 1,
+    }
+    return cloneWaitingClarification(record)
+  }
+
+  async completeClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    postedAtMs: number,
+  ): Promise<boolean> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (record?.questionDelivery?.owner !== owner) return false
+    record.questionPostedAtMs = postedAtMs
+    delete record.questionDelivery
+    return true
+  }
+
+  async releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    const delivery = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.questionDelivery
+    if (delivery?.owner !== owner) return
+    delivery.owner = ''
+    delivery.claimedAtMs = Number.MIN_SAFE_INTEGER
+  }
+
+  async claimClarificationReply(
+    workspaceId: string,
+    issueKey: string,
+    reply: ClarificationReply,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record || (record.questionPostedAtMs === undefined && !record.questionDelivery?.owner) || record.reply) {
+      return undefined
+    }
+    record.reply = { ...reply }
+    return cloneWaitingClarification(record)
+  }
+
+  async markClarificationAgentReleased(
+    workspaceId: string,
+    issueKey: string,
+    agentName: string,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record) return undefined
+    record.releasedAgents ??= []
+    if (!record.releasedAgents.includes(agentName)) record.releasedAgents.push(agentName)
+    return cloneWaitingClarification(record)
+  }
+
+  async claimClarificationWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record?.reply || record.questionPostedAtMs === undefined || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
+      return undefined
+    }
+    record.wake = {
+      owner,
+      claimedAtMs: nowMs,
+      attempts: (record.wake?.attempts ?? 0) + 1,
+      injectedAgents: [...(record.wake?.injectedAgents ?? [])],
+    }
+    return cloneWaitingClarification(record)
+  }
+
+  async markClarificationParked(workspaceId: string, issueKey: string, parkedAtMs: number): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record) return undefined
+    const released = new Set(record.releasedAgents ?? [])
+    if (record.agents.some(({ name }) => !released.has(name))) return undefined
+    record.parkedAtMs ??= parkedAtMs
+    return cloneWaitingClarification(record)
+  }
+
+  async claimClarificationEscalation(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record || record.reply || record.escalatedAtMs || (
+      record.escalation && record.escalation.owner !== owner && nowMs - record.escalation.claimedAtMs < leaseMs
+    )) return undefined
+    record.escalation = {
+      owner,
+      claimedAtMs: nowMs,
+      attempts: (record.escalation?.attempts ?? 0) + 1,
+    }
+    return cloneWaitingClarification(record)
+  }
+
+  async completeClarificationEscalation(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    escalatedAtMs: number,
+  ): Promise<boolean> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (record?.escalation?.owner !== owner) return false
+    record.escalatedAtMs = escalatedAtMs
+    delete record.escalation
+    return true
+  }
+
+  async releaseClarificationEscalation(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    const escalation = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.escalation
+    if (escalation?.owner !== owner) return
+    escalation.owner = ''
+    escalation.claimedAtMs = Number.MIN_SAFE_INTEGER
+  }
+
+  async renewClarificationWake(workspaceId: string, issueKey: string, owner: string, nowMs: number): Promise<boolean> {
+    const wake = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.wake
+    if (wake?.owner !== owner) return false
+    wake.claimedAtMs = nowMs
+    return true
+  }
+
+  async markClarificationAgentInjected(workspaceId: string, issueKey: string, owner: string, agentName: string): Promise<boolean> {
+    const wake = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.wake
+    if (wake?.owner !== owner) return false
+    if (!wake.injectedAgents.includes(agentName)) wake.injectedAgents.push(agentName)
+    return true
+  }
+
+  async completeClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<boolean> {
+    const state = this.#workspace(workspaceId)
+    if (state.waitingClarifications.get(issueKey)?.wake?.owner !== owner) return false
+    state.waitingClarifications.delete(issueKey)
+    return true
+  }
+
+  async releaseClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (record?.wake?.owner === owner) {
+      record.wake.owner = ''
+      record.wake.claimedAtMs = Number.MIN_SAFE_INTEGER
+    }
+  }
+
+  async clearWaitingClarification(workspaceId: string, issueKey: string): Promise<void> {
+    this.#workspace(workspaceId).waitingClarifications.delete(issueKey)
+  }
+
   #rememberAgentQuestion(state: WorkspaceState, key: string): void {
     state.seenAgentQuestionKeys.add(key)
     state.seenAgentQuestionOrder.push(key)
@@ -168,6 +354,7 @@ export class InMemoryStateStore implements StateStore {
         githubIssueCommentWatches: new Map(),
         seenAgentQuestionKeys: new Set(),
         seenAgentQuestionOrder: [],
+        waitingClarifications: new Map(),
         dispatchAttempts: new Map(),
         canonicalIssueStates: new Map(),
         dispatchFailureReaperHandoffs: new Map(),
@@ -177,6 +364,9 @@ export class InMemoryStateStore implements StateStore {
     return state
   }
 }
+
+const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>
+  structuredClone(record)
 
 const cloneGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState => ({
   ...watch,

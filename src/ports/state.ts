@@ -4,6 +4,49 @@ import type { IssueRef, TriageDecision } from '../types'
 
 export type CriticalRecord = { issue: IssueRef; input: SendInput }
 
+export type ClarificationReply = {
+  id: string
+  text: string
+  receivedAtMs: number
+}
+
+export type WaitingClarificationAgent = {
+  name: string
+  tracked: TrackedAgent
+}
+
+export type WaitingClarification = {
+  issue: IssueRef
+  decision: TriageDecision
+  dryRun: boolean
+  threadId: string
+  askerName: string
+  question: string
+  askedAtMs: number
+  agents: WaitingClarificationAgent[]
+  questionPostedAtMs?: number
+  questionDelivery?: {
+    owner: string
+    claimedAtMs: number
+    attempts: number
+  }
+  releasedAgents?: string[]
+  parkedAtMs?: number
+  escalatedAtMs?: number
+  escalation?: {
+    owner: string
+    claimedAtMs: number
+    attempts: number
+  }
+  reply?: ClarificationReply
+  wake?: {
+    owner: string
+    claimedAtMs: number
+    attempts: number
+    injectedAgents: string[]
+  }
+}
+
 export type RegistryHandoffAgent = {
   issue: IssueRef
   name: string
@@ -87,6 +130,25 @@ export interface StateStore {
   seenAgentQuestion(workspaceId: string, key: string): Promise<boolean>
   markAgentQuestion(workspaceId: string, key: string): Promise<void>
   claimAgentQuestion(workspaceId: string, key: string): Promise<boolean>
+
+  reserveWaitingClarification(workspaceId: string, issueKey: string, record: WaitingClarification): Promise<boolean>
+  getWaitingClarification(workspaceId: string, issueKey: string): Promise<WaitingClarification | undefined>
+  listWaitingClarifications(workspaceId: string): Promise<Array<[string, WaitingClarification]>>
+  claimClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, nowMs: number, leaseMs: number): Promise<WaitingClarification | undefined>
+  completeClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, postedAtMs: number): Promise<boolean>
+  releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void>
+  claimClarificationReply(workspaceId: string, issueKey: string, reply: ClarificationReply): Promise<WaitingClarification | undefined>
+  markClarificationAgentReleased(workspaceId: string, issueKey: string, agentName: string): Promise<WaitingClarification | undefined>
+  markClarificationParked(workspaceId: string, issueKey: string, parkedAtMs: number): Promise<WaitingClarification | undefined>
+  claimClarificationEscalation(workspaceId: string, issueKey: string, owner: string, nowMs: number, leaseMs: number): Promise<WaitingClarification | undefined>
+  completeClarificationEscalation(workspaceId: string, issueKey: string, owner: string, escalatedAtMs: number): Promise<boolean>
+  releaseClarificationEscalation(workspaceId: string, issueKey: string, owner: string): Promise<void>
+  claimClarificationWake(workspaceId: string, issueKey: string, owner: string, nowMs: number, leaseMs: number): Promise<WaitingClarification | undefined>
+  renewClarificationWake(workspaceId: string, issueKey: string, owner: string, nowMs: number): Promise<boolean>
+  markClarificationAgentInjected(workspaceId: string, issueKey: string, owner: string, agentName: string): Promise<boolean>
+  completeClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<boolean>
+  releaseClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<void>
+  clearWaitingClarification(workspaceId: string, issueKey: string): Promise<void>
 
   recordFailureHandoff(workspaceId: string, key: string, handoff: RegistryHandoffAgent): Promise<void>
   getFailureHandoff(workspaceId: string, key: string): Promise<RegistryHandoffAgent | undefined>

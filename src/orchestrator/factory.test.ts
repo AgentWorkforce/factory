@@ -175,6 +175,7 @@ const slackConfig = (channel = 'C0FACTORY__factory-e2e') => ({
   channel,
   style: 'threaded-summarized' as const,
   botUserId: 'U0B2596R7EZ',
+  stakeholderUserIds: [] as string[],
   staleAfterMs: 10 * 60_000,
 })
 
@@ -258,6 +259,57 @@ class FailingSlackAnswerFleetClient extends FakeFleetClient {
       throw new Error('sendInput failed')
     }
     await super.sendInput(name, data)
+  }
+}
+
+class BlockingFirstClarificationResumeFleetClient extends FakeFleetClient {
+  readonly resumeStarted: Promise<void>
+  #signalResumeStarted!: () => void
+  #releaseResume!: () => void
+  readonly #resumeReleased: Promise<void>
+  #blocked = false
+  disposeCalls = 0
+
+  constructor() {
+    super()
+    this.resumeStarted = new Promise((resolve) => { this.#signalResumeStarted = resolve })
+    this.#resumeReleased = new Promise((resolve) => { this.#releaseResume = resolve })
+  }
+
+  releaseResume(): void {
+    this.#releaseResume()
+  }
+
+  override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
+    if (!this.#blocked) {
+      this.#blocked = true
+      this.#signalResumeStarted()
+      await this.#resumeReleased
+    }
+    return super.resume(input)
+  }
+
+  override async dispose(): Promise<void> {
+    this.disposeCalls += 1
+  }
+}
+
+class TransientClarificationRenewalStateStore extends InMemoryStateStore {
+  failNextRenewal = false
+  renewalFailures = 0
+
+  override async renewClarificationWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    if (this.failNextRenewal) {
+      this.failNextRenewal = false
+      this.renewalFailures += 1
+      throw new Error('transient state store outage')
+    }
+    return super.renewClarificationWake(workspaceId, issueKey, owner, nowMs)
   }
 }
 
@@ -407,6 +459,33 @@ class ReleaseFailingFleetClient extends FakeFleetClient {
       throw new Error(`release failed for ${name}`)
     }
     await super.release(name, reason)
+  }
+}
+
+class DoubleReleaseFailingUnresolvedFleetClient extends FakeFleetClient {
+  readonly releaseAttempts: Array<{ name: string; reason?: string }> = []
+  failReleases = true
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.releaseAttempts.push({ name, reason })
+    if (this.failReleases) throw new Error(`control plane unavailable for ${name}`)
+    await super.release(name, reason)
+  }
+
+  async resolveAgentPid(_name: string): Promise<{ status: 'unresolved' }> {
+    return { status: 'unresolved' }
+  }
+}
+
+class RefuseFirstClarificationParkStateStore extends InMemoryStateStore {
+  refusalsRemaining = 1
+
+  override async markClarificationParked(workspaceId: string, issueKey: string, parkedAtMs: number) {
+    if (this.refusalsRemaining > 0) {
+      this.refusalsRemaining -= 1
+      return undefined
+    }
+    return super.markClarificationParked(workspaceId, issueKey, parkedAtMs)
   }
 }
 
@@ -939,6 +1018,21 @@ class CloudWritebackFakeMountClient extends FakeMountClient {
   }
 }
 
+class HumanReplyDuringQuestionMountClient extends CloudWritebackFakeMountClient {
+  override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+    await super.writeFile(path, content, opts)
+    const text = typeof content === 'object' && content !== null && 'text' in content
+      ? String((content as { text?: unknown }).text ?? '')
+      : ''
+    if (!text.includes('needs input')) return
+    emitSlackReply(this, slackReplyFixturePath('C0FACTORY__factory-e2e', this.threadTs, 'human-immediate'), 'human-immediate', {
+      text: 'The immediate answer must survive the post-to-park transition.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+  }
+}
+
 class ConfirmRecordingSlackMountClient extends CloudWritebackFakeMountClient {
   readonly confirmedPaths: string[] = []
 
@@ -948,12 +1042,41 @@ class ConfirmRecordingSlackMountClient extends CloudWritebackFakeMountClient {
   }
 }
 
-class FailFirstSlackReplyMountClient extends CloudWritebackFakeMountClient {
-  failedReply = false
+class BlockingSlackQuestionMountClient extends ConfirmRecordingSlackMountClient {
+  readonly questionWriteStarted: Promise<void>
+  #signalQuestionWriteStarted!: () => void
+  #releaseQuestionWrite!: () => void
+  readonly #questionWriteReleased: Promise<void>
+  #blocked = false
+
+  constructor(initialFiles: Record<string, unknown> = {}) {
+    super(initialFiles)
+    this.questionWriteStarted = new Promise((resolve) => { this.#signalQuestionWriteStarted = resolve })
+    this.#questionWriteReleased = new Promise((resolve) => { this.#releaseQuestionWrite = resolve })
+  }
+
+  releaseQuestionWrite(): void {
+    this.#releaseQuestionWrite()
+  }
 
   override async confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
-    if (!this.failedReply && path.includes('/replies/')) {
-      this.failedReply = true
+    if (!this.#blocked && path.includes('/replies/')) {
+      this.#blocked = true
+      this.#signalQuestionWriteStarted()
+      await this.#questionWriteReleased
+    }
+    return super.confirmWrite(path, opts)
+  }
+}
+
+class FailNextSlackReplyMountClient extends CloudWritebackFakeMountClient {
+  failNextReply = false
+  failedReplies = 0
+
+  override async confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+    if (this.failNextReply && path.includes('/replies/')) {
+      this.failNextReply = false
+      this.failedReplies += 1
       return 'failed'
     }
     return super.confirmWrite(path, opts)
@@ -8026,7 +8149,7 @@ describe('FactoryLoop', () => {
     })
 
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review']))
-    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
   })
 
   it('persists a pre-side-effect claim and suppresses the same reply after a crash restart', async () => {
@@ -8313,6 +8436,8 @@ describe('FactoryLoop', () => {
   it('routes a mid-task agent question to the Slack dispatch thread and returns the human answer via sendInput', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(36)]: issueFile(36) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-36-impl-pear', 'session-ar-36-impl-pear')
+    fleet.setSessionRef('ar-36-review', 'session-ar-36-review')
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
       fleet,
@@ -8320,14 +8445,14 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(36), issueFile(36))))
+    mount.files.set(issuePath(36), { content: issueFile(36, implementing) })
     fleet.emitAgentMessage({
       from: 'ar-36-impl-pear',
       target: 'broker',
       body: 'FACTORY_NEEDS_INPUT\nIssue: AR-36\nQuestion: Which retry helper should I use?',
       eventId: 'agent-question-36',
     })
-    await flush()
-    await flush()
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
 
     expect(slackReplyWrites(mount)).toEqual([
       expect.objectContaining({
@@ -8338,6 +8463,11 @@ describe('FactoryLoop', () => {
       }),
     ])
     expect(factory.status().counters.agentQuestionsPostedToSlack).toBe(1)
+    expect(fleet.releases).toEqual([
+      { name: 'ar-36-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-36-review', reason: 'waiting-for-human' },
+    ])
+    expect(factory.status().inFlight).toEqual([])
     expect(slackAnswerInputs(fleet)).toEqual([])
 
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'bot-question-echo'), 'bot-question-echo', {
@@ -8354,13 +8484,465 @@ describe('FactoryLoop', () => {
       user: 'U123',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
 
     expect(slackAnswerInputs(fleet)).toEqual([
       { name: 'ar-36-impl-pear', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
+      { name: 'ar-36-review', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
     ])
+    expect(fleet.resumes).toEqual([
+      { name: 'ar-36-impl-pear', sessionRef: 'session-ar-36-impl-pear', node: 'self', capability: 'spawn:codex' },
+      { name: 'ar-36-review', sessionRef: 'session-ar-36-review', node: 'self', capability: 'spawn:claude' },
+    ])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-36'])
     expect(fleet.messages).toHaveLength(2)
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-noise-36'), 'human-noise-36', {
+      text: 'One more thought that must not trigger a second wake.',
+      user: 'U456',
+      user_is_bot: false,
+    })
+    await flush()
+    await flush()
+    expect(fleet.resumes).toHaveLength(2)
+  })
+
+  it('parks an immediately exiting team and retries a failed durable question delivery after restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-question-delivery-retry-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const mount = new FailNextSlackReplyMountClient({ [issuePath(54)]: issueFile(54) })
+      const firstFleet = new FakeFleetClient()
+      const firstState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const factoryConfig = config({ slack: slackConfig() })
+      const firstFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: firstState,
+        triage: new StaticTriage(),
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseLinearIssue(issuePath(54), issueFile(54))))
+      mount.files.set(issuePath(54), { content: issueFile(54, implementing) })
+      mount.failNextReply = true
+      firstFleet.emitAgentMessage({
+        from: 'ar-54-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Preserve and retry this question.',
+        eventId: 'agent-question-54',
+      })
+      // The prompt tells the asker to exit immediately. This callback is
+      // intentionally emitted in the same turn as the marker so it races the
+      // first durable state await.
+      firstFleet.emitAgentExit('ar-54-impl-pear', 'completed')
+
+      await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionDeliveryFailures).toBe(1))
+      const pending = (await firstState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(pending).toMatchObject({
+        question: 'Preserve and retry this question.',
+        releasedAgents: ['ar-54-impl-pear', 'ar-54-review'],
+        questionDelivery: { owner: '', attempts: 1 },
+      })
+      expect(pending?.questionPostedAtMs).toBeUndefined()
+      expect(pending?.parkedAtMs).toBeTypeOf('number')
+      expect(firstFactory.status().counters.clarificationIntentExitsSuppressed).toBe(1)
+      expect(firstFactory.status().counters.clarificationQuestionDeliveryFailures).toBe(1)
+      expect(firstFleet.spawns).toHaveLength(2)
+      expect(firstFleet.releases).toEqual([
+        { name: 'ar-54-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-54-review', reason: 'waiting-for-human' },
+      ])
+      expect(firstFactory.status().inFlight).toEqual([])
+      await firstFactory.stop()
+
+      const restartedState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const restartedFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: restartedState,
+        triage: new StaticTriage(),
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(restartedFactory.status().counters.clarificationQuestionsDelivered).toBe(1))
+
+      const delivered = (await restartedState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(delivered?.questionPostedAtMs).toBeTypeOf('number')
+      expect(delivered?.questionDelivery).toBeUndefined()
+      expect(slackReplyWrites(mount).filter((write) =>
+        write.content.text.includes('Preserve and retry this question.'))).toHaveLength(2)
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('releases the whole team before waiting for slow Slack question confirmation', async () => {
+    const mount = new BlockingSlackQuestionMountClient({ [issuePath(57)]: issueFile(57) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-57-impl-pear', 'session-ar-57-impl-pear')
+    fleet.setSessionRef('ar-57-review', 'session-ar-57-review')
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(57), issueFile(57))))
+    mount.files.set(issuePath(57), { content: issueFile(57, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-57-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Do not hold slots while Slack is slow.',
+      eventId: 'agent-question-57',
+    })
+    await mount.questionWriteStarted
+
+    expect(fleet.releases).toEqual([
+      { name: 'ar-57-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-57-review', reason: 'waiting-for-human' },
+    ])
+    expect(factory.status().inFlight).toEqual([])
+    const blocked = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(blocked?.parkedAtMs).toBeTypeOf('number')
+    expect(blocked?.questionPostedAtMs).toBeUndefined()
+    expect(blocked?.questionDelivery?.owner).toBeTruthy()
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-57'), 'human-answer-57', {
+      text: 'Persist this answer while confirmation is blocked.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await vi.waitFor(async () => {
+      const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(waiting?.reply?.text).toBe('Persist this answer while confirmation is blocked.')
+    })
+    expect(factory.status().counters.clarificationTeamsWoken).toBeUndefined()
+    expect(fleet.resumes).toEqual([])
+
+    mount.releaseQuestionWrite()
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(factory.status().counters.clarificationQuestionsDelivered).toBe(1)
+    expect(fleet.resumes).toHaveLength(2)
+    expect(slackAnswerInputs(fleet)).toHaveLength(2)
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    await factory.stop()
+  })
+
+  it('tags configured Slack stakeholders when an agent needs input', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(44)]: issueFile(44) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER', 'ULEAD'] },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(44), issueFile(44))))
+    fleet.emitAgentMessage({
+      from: 'ar-44-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Which owner should approve this?',
+      eventId: 'agent-question-44',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    expect(slackReplyWrites(mount).at(-1)?.content.text).toBe(
+      '<@UOWNER> <@ULEAD>\nAR-44: ar-44-impl-pear needs input.\nQuestion: Which owner should approve this?',
+    )
+  })
+
+  it('atomically keeps the first clarification when concurrent agent questions arrive', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(49)]: issueFile(49) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(49), issueFile(49))))
+    fleet.emitAgentMessage({
+      from: 'ar-49-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Preserve this original question.',
+      eventId: 'agent-question-49-first',
+    })
+    fleet.emitAgentMessage({
+      from: 'ar-49-review',
+      target: 'factory',
+      body: '[factory-needs-input] This concurrent question must not overwrite progress.',
+      eventId: 'agent-question-49-second',
+    })
+    fleet.emitAgentExit('ar-49-review', 'completed')
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionClarificationAlreadyReserved).toBe(1))
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    const saved = await stateStore.listWaitingClarifications('factory-test')
+    expect(saved).toHaveLength(1)
+    expect(saved[0]?.[1]).toMatchObject({
+      askerName: 'ar-49-impl-pear',
+      question: 'Preserve this original question.',
+      releasedAgents: ['ar-49-impl-pear', 'ar-49-review'],
+    })
+    expect(slackReplyWrites(mount)).toHaveLength(1)
+    expect(fleet.releases).toHaveLength(2)
+    expect(factory.status().counters.clarificationIntentExitsSuppressed).toBe(1)
+  })
+
+  it('retries a release-complete clarification when the durable parked transition is refused once', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(50)]: issueFile(50) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new RefuseFirstClarificationParkStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(50), issueFile(50))))
+    fleet.emitAgentMessage({
+      from: 'ar-50-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Retry the durable park.',
+      eventId: 'agent-question-50',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationParkReleasePending).toBe(1))
+
+    const pending = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(pending?.releasedAgents).toEqual(['ar-50-impl-pear', 'ar-50-review'])
+    expect(pending?.parkedAtMs).toBeUndefined()
+    expect(factory.status().counters.agentQuestionTeamsReleased).toBeUndefined()
+    expect(factory.status().inFlight).toEqual([])
+
+    mount.files.set(issuePath(50), { content: issueFile(50, implementing) })
+    await factory.runLoop({ maxIterations: 1 })
+
+    const recovered = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(recovered?.parkedAtMs).toBeTypeOf('number')
+    expect(factory.status().counters.clarificationParksRecovered).toBe(1)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('keeps a clarification release-pending when both release attempts fail and no pid can be resolved', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(45)]: issueFile(45) })
+    const fleet = new DoubleReleaseFailingUnresolvedFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(45), issueFile(45))))
+    fleet.emitAgentMessage({
+      from: 'ar-45-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Should this wait?',
+      eventId: 'agent-question-45',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationParkReleasePending).toBe(1))
+
+    const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(fleet.releaseAttempts.slice(0, 2)).toEqual([
+      { name: 'ar-45-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-45-impl-pear', reason: 'waiting-for-human' },
+    ])
+    expect(waiting?.releasedAgents).toBeUndefined()
+    expect(waiting?.parkedAtMs).toBeUndefined()
+    expect(factory.status().counters.agentQuestionTeamsReleased).toBeUndefined()
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-45'])
+
+    fleet.failReleases = false
+    mount.files.set(issuePath(45), { content: issueFile(45, implementing) })
+    await factory.runLoop({ maxIterations: 1 })
+    const retried = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(retried?.releasedAgents).toEqual(['ar-45-impl-pear', 'ar-45-review'])
+    expect(retried?.parkedAtMs).toBeTypeOf('number')
+    expect(factory.status().counters.clarificationParksRecovered).toBe(1)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it.each([
+    [46, planning],
+    [48, 'cancelled-state-id'],
+  ] as const)('cancels a clarification wake when Linear issue %s moves to %s', async (number, nextStateId) => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(number)]: issueFile(number) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    mount.files.set(issuePath(number), { content: issueFile(number, implementing) })
+    fleet.emitAgentMessage({
+      from: `ar-${number}-impl-pear`,
+      target: 'factory',
+      body: '[factory-needs-input] Should this wake later?',
+      eventId: `agent-question-${number}`,
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+    mount.files.set(issuePath(number), { content: issueFile(number, nextStateId) })
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, `human-answer-${number}`), `human-answer-${number}`, {
+      text: 'Do not resume after replanning.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationWakesCancelledStaleIssue).toBe(1))
+
+    expect(fleet.resumes).toEqual([])
+    expect(fleet.spawns).toHaveLength(2)
+  })
+
+  it('cancels a clarification wake when a GitHub issue loses factory scope', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 64)
+    const mount = new ConfirmRecordingSlackMountClient({
+      [path]: githubIssueFile(64, { labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, githubIssueFile(64, { labels: ['factory'] }))))
+    mount.files.set(path, { content: githubIssueFile(64, { labels: ['factory', 'factory:in-progress'] }) })
+    fleet.emitAgentMessage({
+      from: 'ar-64-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Is this still in scope?',
+      eventId: 'agent-question-64',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+    mount.files.set(path, { content: githubIssueFile(64, { labels: ['factory:in-progress'] }) })
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-64'), 'human-answer-64', {
+      text: 'This should not wake out of scope.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationWakesCancelledStaleIssue).toBe(1))
+
+    expect(fleet.resumes).toEqual([])
+    expect(fleet.spawns).toHaveLength(2)
+  })
+
+  it('periodically escalates a clarification that remains unanswered for seven days', async () => {
+    const clock = new ManualClock()
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(47)]: issueFile(47) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({
+      slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER'] },
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      clock,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(47), issueFile(47))))
+    mount.files.set(issuePath(47), { content: issueFile(47, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-47-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Which timeout policy applies?',
+      eventId: 'agent-question-47',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+    clock.advance(7 * 24 * 60 * 60_000)
+
+    await factory.runLoop({ maxIterations: 1 })
+
+    const clarificationMessages = slackReplyWrites(mount).map((write) => write.content.text)
+    expect(clarificationMessages).toContain(
+      '<@UOWNER>\nAR-47 has been parked for seven days without a reply.\n' +
+      'Question from ar-47-impl-pear: Which timeout policy applies? Reply in this thread to wake the saved agent team, or move the issue out of Agent Implementing to cancel the wake.',
+    )
+    expect(factory.status().counters.clarificationEscalationsPosted).toBe(1)
+    expect((await stateStore.listWaitingClarifications('factory-test'))[0]?.[1].escalatedAtMs).toBe(clock.now())
+  })
+
+  it('retries a failed seven-day escalation after restart instead of consuming it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-escalation-retry-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const clock = new ManualClock()
+      const mount = new FailNextSlackReplyMountClient({ [issuePath(51)]: issueFile(51) })
+      const firstFleet = new FakeFleetClient()
+      const factoryConfig = config({
+        slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER'] },
+      })
+      const firstFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        clock,
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseLinearIssue(issuePath(51), issueFile(51))))
+      mount.files.set(issuePath(51), { content: issueFile(51, implementing) })
+      firstFleet.emitAgentMessage({
+        from: 'ar-51-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Retry this escalation after restart.',
+        eventId: 'agent-question-51',
+      })
+      await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionsDelivered).toBe(1))
+      clock.advance(7 * 24 * 60 * 60_000)
+      await firstFactory.stop()
+
+      mount.failNextReply = true
+      const failingFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        clock,
+      })
+      await failingFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(failingFactory.status().counters.clarificationEscalationFailures).toBe(1))
+      const afterFailure = (await new FileStateStore({ batchSize: 2, watchStatePath })
+        .listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(afterFailure?.escalatedAtMs).toBeUndefined()
+      expect(afterFailure?.escalation).toMatchObject({ owner: '', attempts: 1 })
+      expect(mount.failedReplies).toBe(1)
+      await failingFactory.stop()
+
+      const restartedState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const restartedFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: restartedState,
+        triage: new StaticTriage(),
+        clock,
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(restartedFactory.status().counters.clarificationEscalationsPosted).toBe(1))
+      const delivered = (await restartedState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(delivered?.escalatedAtMs).toBe(clock.now())
+      expect(delivered?.escalation).toBeUndefined()
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('posts a mid-task agent question to the source GitHub issue when Slack is unconfigured', async () => {
@@ -8401,6 +8983,301 @@ describe('FactoryLoop', () => {
       data: '<integration-event source="github" issue="59">\nHuman reply from @issue-author on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
     }))
     expect(factory.status().counters.githubAnswersInjected).toBe(1)
+  })
+
+  it('does not lose a human reply that arrives while the question post is completing', async () => {
+    const mount = new HumanReplyDuringQuestionMountClient({ [issuePath(39)]: issueFile(39) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-39-impl-pear', 'session-ar-39-impl-pear')
+    fleet.setSessionRef('ar-39-review', 'session-ar-39-review')
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
+    mount.files.set(issuePath(39), { content: issueFile(39, implementing) })
+    await flush()
+    fleet.emitAgentMessage({
+      from: 'ar-39-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Issue: AR-39\nQuestion: Can a fast reply race parking?',
+      eventId: 'agent-question-39',
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(fleet.releases.map((release) => release.reason)).toEqual(['waiting-for-human', 'waiting-for-human'])
+    expect(fleet.resumes.map((resume) => resume.sessionRef)).toEqual([
+      'session-ar-39-impl-pear',
+      'session-ar-39-review',
+    ])
+    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
+      '<integration-event source="slack" issue="AR-39">\nHuman reply in the Slack thread:\nThe immediate answer must survive the post-to-park transition.\n</integration-event>\r',
+      '<integration-event source="slack" issue="AR-39">\nHuman reply in the Slack thread:\nThe immediate answer must survive the post-to-park transition.\n</integration-event>\r',
+    ])
+  })
+
+  it('retries a transient background wake-lease renewal error without abandoning ownership', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(52)]: issueFile(52) })
+    const fleet = new BlockingFirstClarificationResumeFleetClient()
+    fleet.setSessionRef('ar-52-impl-pear', 'session-ar-52-impl-pear')
+    fleet.setSessionRef('ar-52-review', 'session-ar-52-review')
+    const stateStore = new TransientClarificationRenewalStateStore({ batchSize: 2 })
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger: { warn: (...args: unknown[]) => warnings.push(args) },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    mount.files.set(issuePath(52), { content: issueFile(52, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-52-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Keep the wake lease through a transient outage.',
+      eventId: 'agent-question-52',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    vi.useFakeTimers()
+    try {
+      emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-52'), 'human-answer-52', {
+        text: 'Retry the lease heartbeat and continue.',
+        user: 'U123',
+        user_is_bot: false,
+      })
+      await fleet.resumeStarted
+
+      stateStore.failNextRenewal = true
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(stateStore.renewalFailures).toBe(1)
+
+      fleet.releaseResume()
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(factory.status().counters.clarificationWakeLeaseLosses).toBeUndefined()
+      expect(warnings).toContainEqual([
+        '[factory] transient error renewing clarification wake lease; retrying',
+        expect.objectContaining({ issue: 'AR-52', error: expect.any(Error) }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('awaits and cancels an in-flight clarification wake before disposing the fleet', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(56)]: issueFile(56) })
+    const fleet = new BlockingFirstClarificationResumeFleetClient()
+    fleet.setSessionRef('ar-56-impl-pear', 'session-ar-56-impl-pear')
+    fleet.setSessionRef('ar-56-review', 'session-ar-56-review')
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(56), issueFile(56))))
+    mount.files.set(issuePath(56), { content: issueFile(56, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-56-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Stop safely during my wake.',
+      eventId: 'agent-question-56',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-56'), 'human-answer-56', {
+      text: 'This wake will overlap shutdown.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await fleet.resumeStarted
+
+    let stopped = false
+    const stop = factory.stop().then(() => { stopped = true })
+    await flush()
+    expect(stopped).toBe(false)
+    expect(fleet.disposeCalls).toBe(0)
+
+    fleet.releaseResume()
+    await stop
+    expect(fleet.disposeCalls).toBe(1)
+    expect(slackAnswerInputs(fleet)).toEqual([])
+    const durable = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(durable?.reply?.text).toBe('This wake will overlap shutdown.')
+    expect(durable?.wake?.owner).toBe('')
+  })
+
+  it('cold-starts with durable issue, question, and reply context when session refs are unavailable', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(37)]: issueFile(37) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(37), issueFile(37))))
+    mount.files.set(issuePath(37), { content: issueFile(37, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-37-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Issue: AR-37\nQuestion: Which retry helper should I use?',
+      eventId: 'agent-question-37',
+    })
+    await flush()
+    await flush()
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-37'), 'human-answer-37', {
+      text: 'Use retryOnTimeout from factory.ts.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+
+    expect(fleet.resumes).toEqual([])
+    expect(fleet.spawns).toHaveLength(4)
+    for (const spawn of fleet.spawns.slice(2)) {
+      expect(spawn.task).toContain('Factory released this team while waiting for human input')
+      expect(spawn.task).toContain('Which retry helper should I use?')
+      expect(spawn.task).toContain('Use retryOnTimeout from factory.ts.')
+      expect(spawn.task).toContain('Re-hydrate from the issue, branch, worktree, and any open PR')
+    }
+    expect(factory.status().counters.clarificationResumeFallbacks).toBe(2)
+  })
+
+  it('rearms a durable clarification after restart and wakes from a reply received while stopped', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-restart-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const mount = new ConfirmRecordingSlackMountClient({ [issuePath(38)]: issueFile(38) })
+      const firstFleet = new FakeFleetClient()
+      firstFleet.setSessionRef('ar-38-impl-pear', 'session-ar-38-impl-pear')
+      firstFleet.setSessionRef('ar-38-review', 'session-ar-38-review')
+      const firstFactory = createFactory(config({ slack: slackConfig() }), {
+        mount,
+        fleet: firstFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseLinearIssue(issuePath(38), issueFile(38))))
+      mount.files.set(issuePath(38), { content: issueFile(38, implementing) })
+      firstFleet.emitAgentMessage({
+        from: 'ar-38-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Issue: AR-38\nQuestion: Which durable path?',
+        eventId: 'agent-question-38',
+      })
+      await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await firstFactory.stop()
+
+      emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-38'), 'human-answer-38', {
+        text: 'Resume through the stored session refs.',
+        user: 'U123',
+        user_is_bot: false,
+      })
+
+      const restartedFleet = new FakeFleetClient()
+      const restartedFactory = createFactory(config({ slack: slackConfig() }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      await vi.waitFor(() => expect(restartedFleet.resumes).toHaveLength(2))
+      expect(restartedFleet.resumes.map((resume) => resume.sessionRef)).toEqual([
+        'session-ar-38-impl-pear',
+        'session-ar-38-review',
+      ])
+      expect(slackAnswerInputs(restartedFleet)).toHaveLength(2)
+      expect(restartedFactory.status().counters.clarificationTeamsWoken).toBe(1)
+
+      restartedFleet.emitAgentMessage({
+        from: 'ar-38-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Issue: AR-38\nQuestion: A second question after restart?',
+        eventId: 'agent-question-38-second',
+      })
+      await vi.waitFor(() => expect(restartedFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      expect(restartedFleet.releases).toEqual([
+        { name: 'ar-38-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-38-review', reason: 'waiting-for-human' },
+      ])
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('startup drains a persisted clarification reply left before any wake lease was claimed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-persisted-reply-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const mount = new ConfirmRecordingSlackMountClient({ [issuePath(55)]: issueFile(55) })
+      const firstFleet = new FakeFleetClient()
+      firstFleet.setSessionRef('ar-55-impl-pear', 'session-ar-55-impl-pear')
+      firstFleet.setSessionRef('ar-55-review', 'session-ar-55-review')
+      const firstState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const factoryConfig = config({ slack: slackConfig() })
+      const firstFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: firstState,
+        triage: new StaticTriage(),
+      })
+
+      await firstFactory.dispatch(await firstFactory.triageIssue(parseLinearIssue(issuePath(55), issueFile(55))))
+      mount.files.set(issuePath(55), { content: issueFile(55, implementing) })
+      firstFleet.emitAgentMessage({
+        from: 'ar-55-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Prove startup drains my persisted answer.',
+        eventId: 'agent-question-55',
+      })
+      await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await firstFactory.stop()
+
+      const persisted = new FileStateStore({ batchSize: 2, watchStatePath })
+      const [key] = (await persisted.listWaitingClarifications('factory-test'))[0]!
+      const claimed = await persisted.claimClarificationReply('factory-test', key, {
+        id: 'persisted-answer-55',
+        text: 'Resume this directly from startup drain.',
+        receivedAtMs: 500,
+      })
+      expect(claimed?.reply?.id).toBe('persisted-answer-55')
+      expect(claimed?.wake).toBeUndefined()
+
+      const restartedFleet = new FakeFleetClient()
+      const restartedState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const restartedFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: restartedState,
+        triage: new StaticTriage(),
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      await vi.waitFor(() => expect(restartedFactory.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(restartedFleet.resumes.map((resume) => resume.sessionRef)).toEqual([
+        'session-ar-55-impl-pear',
+        'session-ar-55-review',
+      ])
+      expect(slackAnswerInputs(restartedFleet)).toHaveLength(2)
+      expect(await restartedState.listWaitingClarifications('factory-test')).toEqual([])
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('rearms a persisted mid-task GitHub question and replays a reply received while stopped', async () => {
@@ -8590,14 +9467,14 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(40), issueFile(40))))
     fleet.emitAgentMessage(question)
     fleet.emitAgentMessage(question)
-    await flush()
-    await flush()
-
-    expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
-      'AR-40: ar-40-impl-pear needs input.\nQuestion: Is this duplicate-safe?',
-    ])
-    expect(factory.status().counters.agentQuestionsPostedToSlack).toBe(1)
+    await vi.waitFor(() => {
+      expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
+        'AR-40: ar-40-impl-pear needs input.\nQuestion: Is this duplicate-safe?',
+      ])
+      expect(factory.status().counters.clarificationQuestionsDelivered).toBe(1)
+    })
     expect(factory.status().counters.agentQuestionDuplicatesSuppressed).toBe(1)
+    await factory.stop()
   })
 
   it('watches top-level inbound Slack thread replies keyed by real reply ts', async () => {

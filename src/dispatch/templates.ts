@@ -90,7 +90,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'When implementation is complete, finish your session normally; Factory will open the PR targeting the repository default branch through the connected GitHub workspace.',
     'Do not run `gh pr create` or require local GitHub CLI authentication.',
     `Factory will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
-    'If blocked and you need human input, write to the .integrations mount path so the factory can relay it to the issue thread.',
+    'If blocked and you need human input, DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question. Factory will relay it to the issue conversation.',
     'DM `broker` when fully done.',
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
@@ -98,13 +98,12 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   const questionInstructions = input.slackDispatchThread
     ? [
         '',
-        'If you are blocked or need a human answer mid-task, write your question to this issue\'s Slack dispatch thread via the .integrations mount.',
+        'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
         // Absolute path: the agent runs in its repo clone, not the daemon cwd
         // where .integrations lives, so a relative path would be unreachable.
-        `Write path: ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json`,
-        'Write a JSON object with a "text" field containing your question.',
-        'The human\'s reply will be delivered to you as an `<integration-event>` system message injected into your session — wait for it, do not poll.',
-        'Continue with safe reversible work while waiting for a reply.',
+        `Factory will durably post and, if necessary, retry the question to the Slack thread represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
+        'After sending the marker, stop work and finish your session normally. Do not wait or poll: Factory will release the whole team and resume it from session memory only after the first human reply.',
+        'If session resume is unavailable, Factory will cold-start the team with the issue, question, reply, branch, and PR context so work can be re-hydrated explicitly.',
       ]
     : []
 

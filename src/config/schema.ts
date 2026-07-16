@@ -91,6 +91,10 @@ const slackSchema = z.object({
   channel: z.string(),
   style: z.literal('threaded-summarized').default('threaded-summarized'),
   botUserId: z.string().default('U0B2596R7EZ'),
+  // Slack user IDs to mention when an agent needs a human decision. Keeping
+  // this explicit avoids guessing that a Linear assignee name is also a Slack
+  // identity, while still making parked questions immediately actionable.
+  stakeholderUserIds: z.array(z.string().min(1)).default([]),
   staleAfterMs: z.number().int().min(1_000).default(10 * 60_000),
 }).optional()
 
