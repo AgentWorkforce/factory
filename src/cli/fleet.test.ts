@@ -166,6 +166,20 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses standalone babysit number and URL commands', () => {
+    expect(parseFleetCommand(['babysit', '10'])).toEqual({
+      kind: 'factory-babysit',
+      prNumber: 10,
+    })
+    expect(parseFleetCommand(['babysit', 'https://github.com/AgentWorkforce/hoopsheet/pull/10'])).toEqual({
+      kind: 'factory-babysit',
+      repo: 'AgentWorkforce/hoopsheet',
+      prNumber: 10,
+      url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
+    })
+    expect(() => parseFleetCommand(['babysit', 'not-a-pr'])).toThrow(/canonical/u)
+  })
+
   it('parses the factory orphan reaper command', () => {
     expect(parseFleetCommand(['reap-orphans'])).toEqual({
       kind: 'factory',
@@ -710,6 +724,233 @@ describe('fleet CLI runtime', () => {
     expect(code).toBe(0)
     expect(calls).toEqual([{ repo: 'AgentWorkforce/pear', prNumber: 42, expectedIssueKey: 'AR-77' }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
+  })
+
+  it('spawns a standalone babysitter for a mounted open PR even when config automation is disabled', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-babysit-'))
+    try {
+      const clonePath = join(root, 'hoopsheet')
+      await mkdir(clonePath)
+      const configPath = await writeConfig(root, {
+        repos: {
+          org: 'AgentWorkforce',
+          byLabel: { hoopsheet: 'AgentWorkforce/hoopsheet' },
+          clonePaths: { 'AgentWorkforce/hoopsheet': clonePath },
+          default: 'hoopsheet',
+        },
+        babysitter: { enabled: false },
+        models: { babysitter: 'claude-sonnet-4-6' },
+      })
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Add league subdomain routing',
+            body: 'Full PR definition of done',
+            state: 'open',
+            draft: false,
+            html_url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
+            head: { ref: 'codex/league-public-sites', sha: 'abc123', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+      const fleet = new FakeFleetClient()
+      const output = buffer()
+      const errors = buffer()
+      const mountCalls: string[] = []
+      const code = await runFleetCli(['babysit', '10', '--config', configPath], {
+        fleet,
+        mount,
+        ensureLocalMount: async (_workspaceId, startDir) => {
+          mountCalls.push(startDir)
+          if (startDir === clonePath) throw new Error('mount unavailable')
+        },
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: output,
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(mountCalls).toEqual([process.cwd(), clonePath])
+      expect(errors.text()).toContain(`warning: could not start relayfile mount for standalone babysitter at ${clonePath}`)
+      expect(fleet.spawns).toHaveLength(1)
+      expect(fleet.preservedInfrastructure).toBe(1)
+      expect(fleet.spawns[0]).toMatchObject({
+        capability: 'spawn:claude',
+        repo: 'AgentWorkforce/hoopsheet',
+        clonePath,
+        cwd: clonePath,
+        model: 'claude-sonnet-4-6',
+        invocationId: 'factory-babysit:AgentWorkforce/hoopsheet#10',
+      })
+      expect(fleet.spawns[0]?.task).toContain('standalone PR babysitter')
+      expect(fleet.spawns[0]?.task).toContain('Full PR definition of done')
+      expect(fleet.spawns[0]?.task).not.toContain('[factory-pr-ready]')
+      expect(JSON.parse(output.text())).toMatchObject({
+        status: 'spawned',
+        repo: 'AgentWorkforce/hoopsheet',
+        prNumber: 10,
+        source: 'mount',
+        specSource: 'pull-request',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    { state: 'closed', draft: false, message: 'state is CLOSED' },
+    { state: 'open', draft: true, message: 'is a draft' },
+    { state: 'unknown', draft: false, message: 'state is UNKNOWN' },
+  ])('rejects an ineligible standalone PR before spawn: $message', async ({ state, draft, message }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-babysit-guard-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: { byLabel: { pear: 'AgentWorkforce/pear' }, default: 'AgentWorkforce/pear' },
+      })
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Guarded PR',
+            body: 'Do not spawn when ineligible.',
+            state,
+            draft,
+            head: { ref: 'guarded-pr', sha: 'guard-sha', repo: { full_name: 'AgentWorkforce/pear' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+      const fleet = new FakeFleetClient()
+      const errors = buffer()
+      const code = await runFleetCli(['babysit', '10', '--config', configPath], {
+        fleet,
+        mount,
+        ensureLocalMount: async () => undefined,
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain(message)
+      expect(fleet.spawns).toEqual([])
+      expect(fleet.preservedInfrastructure).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a cross-repository standalone PR before spawn', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-babysit-fork-'))
+    try {
+      const configPath = await writeConfig(root)
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Fork PR',
+            body: 'Untrusted fork',
+            state: 'open',
+            draft: false,
+            head: { ref: 'fork-pr', sha: 'fork-sha', repo: { full_name: 'outside/pear' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+      const fleet = new FakeFleetClient()
+      const errors = buffer()
+      const code = await runFleetCli(['babysit', '10', '--config', configPath], {
+        fleet,
+        mount,
+        ensureLocalMount: async () => undefined,
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('refuses cross-repository PRs')
+      expect(fleet.spawns).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('honors an explicit default route override for numeric babysit dry-runs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-babysit-override-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: {
+          org: 'Acme',
+          byLabel: { app: 'customer-fork/app' },
+          default: 'app',
+        },
+      })
+      const mount = new FakeMountClient({
+        '/github/repos/customer-fork__app/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Override PR',
+            body: 'Use the explicit route.',
+            state: 'open',
+            draft: false,
+            head: { ref: 'override-pr', sha: 'override-sha', repo: { full_name: 'customer-fork/app' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+      const output = buffer()
+      const fleet = new FakeFleetClient()
+      const code = await runFleetCli(['babysit', '10', '--dry-run', '--config', configPath], {
+        fleet,
+        mount,
+        ensureLocalMount: async () => undefined,
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(fleet.spawns).toEqual([])
+      expect(JSON.parse(output.text())).toMatchObject({
+        status: 'dry-run',
+        repo: 'customer-fork/app',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an ambiguous repo-name default for numeric babysit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-babysit-ambiguous-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: {
+          byLabel: {
+            appProd: 'org-a/app',
+            appFork: 'org-b/app',
+          },
+          default: 'app',
+        },
+      })
+      const fleet = new FakeFleetClient()
+      const errors = buffer()
+      const code = await runFleetCli(['babysit', '10', '--dry-run', '--config', configPath], {
+        fleet,
+        mount: new FakeMountClient(),
+        ensureLocalMount: async () => undefined,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('matches multiple configured repos (org-a/app, org-b/app)')
+      expect(fleet.spawns).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('configures guarded GitHub writeback when close-probe creates a cloud mount', async () => {

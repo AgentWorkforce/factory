@@ -13,17 +13,22 @@ import {
   createFleet,
   ensureRelayBroker,
   defaultGhRunner,
+  explicitLinkedIssueKey,
   githubIssuePathParts,
   githubWatchStatePath,
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
   parseOwnedBrokerAgentExitTimeoutMs,
+  parseStandaloneBabysitTarget,
+  readStandalonePullRequest,
   readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
   readFactoryLoopHeartbeat,
   resolveFactoryStates,
   stateResolutionFromIds,
+  standaloneBabysitterAgentName,
+  renderAgentTask,
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
@@ -62,6 +67,7 @@ interface FleetCliDeps {
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
   probePrGhRunner?: GhRunner
+  babysitPrGhRunner?: GhRunner
   now?: () => number
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
   daemonExit?: (code: number) => void
@@ -89,6 +95,7 @@ type ParsedCommand =
   | { kind: 'factory-canary'; issue: string }
   | { kind: 'factory-triage'; issue: string }
   | { kind: 'factory-dispatch'; issue: string }
+  | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
@@ -159,7 +166,8 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       case 'factory':
       case 'factory-canary':
       case 'factory-triage':
-      case 'factory-dispatch': {
+      case 'factory-dispatch':
+      case 'factory-babysit': {
         if (!loaded) throw new Error('factory command requires config')
         if (command.kind === 'factory' && command.action === 'reap-orphans') {
           writeJson(out, await reapFactoryOrphansOnce({
@@ -183,6 +191,19 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         const mount = await buildMount(loaded, deps)
+        if (command.kind === 'factory-babysit') {
+          return await runStandaloneBabysitCommand(
+            command,
+            mount,
+            fleet,
+            loaded.config,
+            globals,
+            out,
+            deps,
+            workspaceId,
+            acceptableMountIds,
+          )
+        }
         // Resolve Linear workflow states only when Linear is the issue source.
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
@@ -412,6 +433,173 @@ async function runFactoryCommand(
   return 0
 }
 
+async function runStandaloneBabysitCommand(
+  command: Extract<ParsedCommand, { kind: 'factory-babysit' }>,
+  mount: MountClient,
+  fleet: FleetClient,
+  config: FactoryConfig,
+  globals: GlobalOptions,
+  out: Pick<NodeJS.WriteStream, 'write'>,
+  deps: FleetCliDeps,
+  workspaceId: string,
+  acceptableMountIds?: readonly string[],
+): Promise<number> {
+  const repo = resolveStandaloneBabysitRepo(command.repo, config)
+  const clonePath = standaloneBabysitClonePath(repo, config)
+  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
+  const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
+  await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts, deps.stderr)
+  if (clonePath && resolve(clonePath) !== resolve(process.cwd())) {
+    await ensureStandaloneBabysitMount(mountFn, workspaceId, clonePath, mountOpts, deps.stderr)
+  }
+
+  const pr = await readStandalonePullRequest(
+    mount,
+    { repo, prNumber: command.prNumber, url: command.url },
+    deps.babysitPrGhRunner ?? defaultGhRunner,
+  )
+  const state = pr.state?.trim().toUpperCase()
+  if (pr.merged || state === 'MERGED') {
+    throw new Error(`factory babysit requires an open PR; ${repo} PR #${pr.number} is merged`)
+  }
+  if (state !== 'OPEN') {
+    throw new Error(`factory babysit requires an open PR; ${repo} PR #${pr.number} state is ${state ?? 'UNKNOWN'}`)
+  }
+  if (pr.draft) {
+    throw new Error(`factory babysit skips draft PRs; ${repo} PR #${pr.number} is a draft`)
+  }
+  if (pr.crossRepository) {
+    throw new Error(
+      `factory babysit refuses cross-repository PRs by default; ${repo} PR #${pr.number} head is ${pr.headRepo ?? 'unknown'}`,
+    )
+  }
+
+  const linkedIssueKey = explicitLinkedIssueKey(pr.body)
+  let issue = {
+    key: `${repo}#${pr.number}`,
+    title: pr.title,
+    description: pr.body || '(No PR description was provided.)',
+  }
+  let specSource: 'pull-request' | 'linked-issue' = 'pull-request'
+  if (linkedIssueKey) {
+    try {
+      const linked = await readIssueArg(mount, linkedIssueKey, config)
+      issue = {
+        key: linked.key,
+        title: linked.title,
+        description: linked.description,
+      }
+      specSource = 'linked-issue'
+    } catch {
+      // The PR remains independently babysittable when its referenced issue is
+      // not connected to this workspace. Its own title/body become the spec.
+    }
+  }
+
+  const agentName = standaloneBabysitterAgentName(repo, pr.number)
+  const task = renderAgentTask({
+    issue,
+    route: { repo, clonePath },
+    role: 'babysitter',
+    config: { mergePolicy: config.mergePolicy, terminalState: config.terminalState },
+    reviewerName: '',
+    pr: {
+      number: pr.number,
+      url: pr.url,
+      headRef: pr.headRef,
+      headSha: pr.headSha,
+      baseRef: pr.baseRef,
+      headRepo: pr.headRepo,
+      crossRepository: pr.crossRepository,
+      maintainerCanModify: pr.maintainerCanModify,
+    },
+    standaloneBabysitter: { specSource },
+    integrationsMountRoot: resolve(process.cwd(), '.integrations'),
+  })
+  const receiptBase = {
+    agent: agentName,
+    repo,
+    prNumber: pr.number,
+    url: pr.url,
+    source: pr.source,
+    specSource,
+    ...(specSource === 'linked-issue' ? { linkedIssue: issue.key } : {}),
+  }
+
+  if (globals.dryRun) {
+    writeJson(out, { status: 'dry-run', ...receiptBase })
+    return 0
+  }
+
+  const roster = await fleet.roster()
+  if (roster.agents.some((agent) => agent.name === agentName)) {
+    writeJson(out, { status: 'already-running', ...receiptBase })
+    return 0
+  }
+
+  const spawned = await fleet.spawn({
+    name: agentName,
+    capability: 'spawn:claude',
+    node: 'self',
+    repo,
+    clonePath,
+    task,
+    model: config.models.babysitter,
+    cwd: clonePath,
+    invocationId: `factory-babysit:${repo}#${pr.number}`,
+  })
+  fleet.preserveInfrastructureOnDispose?.()
+  writeJson(out, { status: 'spawned', ...receiptBase, agent: spawned.name })
+  return 0
+}
+
+async function ensureStandaloneBabysitMount(
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
+  workspaceId: string,
+  startDir: string,
+  options: { acceptableWorkspaceIds?: readonly string[] },
+  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
+): Promise<void> {
+  try {
+    await mountFn(workspaceId, startDir, options)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(
+      `[factory] warning: could not start relayfile mount for standalone babysitter at ${resolve(startDir)}; ` +
+      `the agent will use the GitHub CLI fallback: ${message}\n`,
+    )
+  }
+}
+
+function resolveStandaloneBabysitRepo(repo: string | undefined, config: FactoryConfig): string {
+  const configured = repo ?? config.repos.default
+  if (!configured) {
+    throw new Error('factory babysit <PR-number> requires repos.default; pass a full GitHub PR URL instead')
+  }
+  if (configured.includes('/')) return configured
+  const exactRoute = config.repos.byLabel[configured]
+  if (exactRoute) return exactRoute
+  const routed = [...new Set(Object.values(config.repos.byLabel).filter((candidate) =>
+    candidate === configured || candidate.endsWith(`/${configured}`),
+  ))]
+  if (routed.length === 1) return routed[0]!
+  if (routed.length > 1) {
+    throw new Error(
+      `Unable to resolve repository ${configured}: matches multiple configured repos (${routed.sort().join(', ')}); ` +
+      'set repos.default to owner/repo or pass a full GitHub PR URL instead',
+    )
+  }
+  if (config.repos.org) return `${config.repos.org}/${configured}`
+  throw new Error(`Unable to resolve repository ${configured} to owner/repo; pass a full GitHub PR URL instead`)
+}
+
+function standaloneBabysitClonePath(repo: string, config: FactoryConfig): string | undefined {
+  const configured = Object.entries(config.clonePaths ?? {}).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
+    ?? Object.entries(config.repos.clonePaths ?? {}).find(([candidate]) => candidate.toLowerCase() === repo.toLowerCase())?.[1]
+  if (configured && existsSync(configured)) return configured
+  return undefined
+}
+
 /**
  * Ensures the relayfile mount is running at each configured clone path so
  * spawned agents can resolve `.integrations` relative to their working
@@ -460,6 +648,10 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
   if (action === 'dispatch') {
     if (!issueOrPr) throw new Error('factory dispatch requires an issue key or path')
     return { kind: 'factory-dispatch', issue: issueOrPr }
+  }
+  if (action === 'babysit') {
+    if (flags.length > 0) throw new Error(`Unexpected argument ${flags[0]}`)
+    return { kind: 'factory-babysit', ...parseStandaloneBabysitTarget(issueOrPr) }
   }
   if (action === 'close-probe') {
     const prNumber = Number(issueOrPr)
@@ -536,7 +728,11 @@ async function loadConfig(path?: string): Promise<LoadedConfig> {
   }
 }
 
-async function buildFleet(globals: GlobalOptions, loaded: LoadedConfig | undefined, deps: FleetCliDeps): Promise<FleetClient> {
+async function buildFleet(
+  globals: GlobalOptions,
+  loaded: LoadedConfig | undefined,
+  deps: FleetCliDeps,
+): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
 
@@ -819,6 +1015,7 @@ function isFactoryAction(value: string): boolean {
     value === 'canary' ||
     value === 'triage' ||
     value === 'dispatch' ||
+    value === 'babysit' ||
     value === 'close-probe'
 }
 
@@ -894,6 +1091,7 @@ Commands:
   canary <KEY|path>     Check that a known issue is dispatch-ready
   triage <KEY|path>     Triage one issue and print the decision
   dispatch <KEY|path>   Triage and dispatch one issue
+  babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
   fleet <command>       Low-level fleet commands: spawn, roster, release
 

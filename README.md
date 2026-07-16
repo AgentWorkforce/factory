@@ -116,6 +116,7 @@ From a source checkout instead of an npm install, run
 | `factory status` | Print current factory status as JSON. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
+| `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
@@ -126,6 +127,15 @@ to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+`factory babysit 10` uses `repos.default`; a full URL such as
+`factory babysit https://github.com/org/repo/pull/10` supplies the repository
+directly. The explicit command is opt-in on its own and does not require
+`babysitter.enabled`. It rejects closed, merged, and draft PRs, uses a linked
+issue spec when one can be resolved (otherwise the PR title/body), fixes the
+existing PR branch, and always leaves the final review and merge to a human.
+The command prints a spawn receipt and returns; the PR-keyed task-exit worker
+continues on the relay broker and reports completion or access blockers there.
 
 ### Scheduled sync-fidelity canary
 

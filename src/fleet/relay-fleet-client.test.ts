@@ -36,9 +36,13 @@ class FakeMessaging {
   connected = 0
   disconnected = 0
   nextInvocationId = 0
+  readonly agentListFilters: unknown[] = []
 
   readonly agents = {
-    list: async () => this.agentRows as never[],
+    list: async (filter: unknown) => {
+      this.agentListFilters.push(filter)
+      return this.agentRows as never[]
+    },
   }
 
   readonly nodes = {
@@ -273,6 +277,7 @@ describe('RelayFleetClient', () => {
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
       ],
     })
+    expect(messaging.agentListFilters).toEqual([{ status: 'online' }])
   })
 
   it('sends DMs and channel messages through the agent-scoped surface', async () => {

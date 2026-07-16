@@ -92,6 +92,10 @@ export {
   closeProbePr,
   defaultGhRunner,
   evaluateGithubMergeGate,
+  explicitLinkedIssueKey,
+  parseStandaloneBabysitTarget,
+  readStandalonePullRequest,
+  standaloneBabysitterAgentName,
 } from './github'
 export type {
   CloseProbePrInput,
@@ -103,6 +107,8 @@ export type {
   GithubMergeGatePort,
   GithubMergeResult,
   GithubMergeGateVerdict,
+  StandaloneBabysitTarget,
+  StandalonePullRequest,
 } from './github'
 export {
   BatchTracker,
