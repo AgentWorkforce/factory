@@ -121,6 +121,7 @@ type GithubIssueSource = {
   raw: Record<string, unknown>
 }
 class ClarificationWakeLeaseLostError extends Error {}
+class ClarificationWakeStoppedError extends Error {}
 type SlackSyncStatusSeverity = 'soft' | 'hard'
 type SlackSyncStatusCheck = { known: boolean; degraded: boolean; reason?: string; severity?: SlackSyncStatusSeverity }
 type SlackEventWatermark = { known: boolean; lastEventAtMs?: number }
@@ -175,6 +176,8 @@ const INJECTION_MAX_ATTEMPTS = 6
 const CLARIFICATION_WAKE_LEASE_MS = 60_000
 const CLARIFICATION_WAKE_RETRY_MS = 1_000
 const CLARIFICATION_PARK_RETRY_MS = 5_000
+const CLARIFICATION_QUESTION_DELIVERY_LEASE_MS = 2 * 60_000
+const CLARIFICATION_QUESTION_DELIVERY_RETRY_MS = 5_000
 const CLARIFICATION_ESCALATION_LEASE_MS = 2 * 60_000
 const CLARIFICATION_ESCALATION_RETRY_MS = 5_000
 const CLARIFICATION_STALE_WARN_MS = 7 * 24 * 60 * 60_000
@@ -249,6 +252,8 @@ export class FactoryLoop implements Factory {
   readonly #labelDispatchFailures = new Map<string, string>()
   readonly #pendingSlackClarifications = new Map<string, string>()
   readonly #pendingGithubClarifications = new Map<string, string>()
+  readonly #clarificationIntents = new Map<string, number>()
+  readonly #clarificationQuestionDeliveryInFlight = new Map<string, Promise<boolean>>()
   readonly #clarificationWakeInFlight = new Map<string, Promise<void>>()
   readonly #clarificationWakeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #clarificationWakeOwner = `${process.pid}:${randomUUID()}`
@@ -507,17 +512,25 @@ export class FactoryLoop implements Factory {
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
+      // Fence every source of new clarification work before touching the fleet.
+      // A wake already past the fence is allowed to unwind, and is awaited
+      // without a timeout so it can never race fleet disposal.
+      for (const timer of this.#clarificationWakeRetryTimers.values()) clearTimeout(timer)
+      this.#clarificationWakeRetryTimers.clear()
+      if (this.#clarificationSweepTimer) clearTimeout(this.#clarificationSweepTimer)
+      this.#clarificationSweepTimer = undefined
+      this.#clarificationSweepDueAtMs = undefined
+      await this.#clarificationSweepInFlight
+      await this.#drainClarificationQuestionDeliveriesForStop()
+      await this.#drainClarificationWakesForStop()
+      this.#clarificationIntents.clear()
+
       await this.#releaseInFlightAgents('factory-stopped')
       if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
       this.#livePollTimer = undefined
       this.#livePollInFlight = false
       this.#liveEventQueue.length = 0
       this.#completionInFlight.clear()
-      for (const timer of this.#clarificationWakeRetryTimers.values()) clearTimeout(timer)
-      this.#clarificationWakeRetryTimers.clear()
-      if (this.#clarificationSweepTimer) clearTimeout(this.#clarificationSweepTimer)
-      this.#clarificationSweepTimer = undefined
-      this.#clarificationSweepDueAtMs = undefined
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       const subscription = this.#subscription
@@ -540,6 +553,25 @@ export class FactoryLoop implements Factory {
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
+    }
+  }
+
+  async #drainClarificationWakesForStop(): Promise<void> {
+    // A wake may add its promise just as the sweep that discovered it settles.
+    // Re-snapshot until the map is empty rather than assuming one await is a
+    // stable drain.
+    while (this.#clarificationWakeInFlight.size > 0) {
+      await Promise.allSettled([...this.#clarificationWakeInFlight.values()])
+    }
+  }
+
+  async #drainClarificationQuestionDeliveriesForStop(): Promise<void> {
+    // Message handlers are fire-and-forget fleet callbacks. Track their Slack
+    // writes explicitly and re-snapshot until none remain, so shutdown cannot
+    // clear thread state (or let tests remove the state directory) underneath
+    // a late persistence step.
+    while (this.#clarificationQuestionDeliveryInFlight.size > 0) {
+      await Promise.allSettled([...this.#clarificationQuestionDeliveryInFlight.values()])
     }
   }
 
@@ -2536,6 +2568,16 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // Agent messages and exits are separate fleet callbacks. A needs-input DM
+    // can therefore be followed by the instructed session exit before the
+    // first durable state await completes. The message handler installs this
+    // synchronous fence before yielding; the durable park path removes it only
+    // after the batch can no longer interpret that exit as ordinary completion.
+    if (this.#clarificationIntents.has(name)) {
+      this.#increment('clarificationIntentExitsSuppressed')
+      return
+    }
+
     const batch = await this.#batch()
     const record = batch.getIssueByAgent(name)
     if (!record) {
@@ -3001,48 +3043,75 @@ export class FactoryLoop implements Factory {
     if (!question || !isFactoryQuestionTarget(message.target)) {
       return
     }
+    if (this.#stopping) return
 
-    const record = (await this.#batch()).getIssueByAgent(question.agentName)
-    if (!record || record.dryRun) {
-      this.#increment('agentQuestionsIgnoredNoInFlight')
-      return
-    }
+    this.#clarificationIntents.set(
+      question.agentName,
+      (this.#clarificationIntents.get(question.agentName) ?? 0) + 1,
+    )
+    let durableClarificationOwnsExit = false
 
-    if (question.issueKey && question.issueKey !== record.issue.key) {
-      this.#increment('agentQuestionsIgnoredIssueMismatch')
-      this.#logger.warn?.('[factory] ignored agent question for mismatched issue', {
-        from: question.agentName,
-        requestedIssue: question.issueKey,
-        activeIssue: record.issue.key,
-      })
-      return
-    }
+    try {
+      const record = (await this.#batch()).getIssueByAgent(question.agentName)
+      if (this.#stopping) return
+      if (!record || record.dryRun) {
+        this.#increment('agentQuestionsIgnoredNoInFlight')
+        return
+      }
 
-    const dedupeKey = agentQuestionDedupeKey(record.issue, question)
-    if (!await this.#state.claimAgentQuestion(this.#workspaceId, dedupeKey)) {
-      this.#increment('agentQuestionDuplicatesSuppressed')
-      this.#logger.debug?.('[factory] suppressed duplicate agent question', {
-        from: question.agentName,
-        issue: record.issue.key,
-      })
-      return
-    }
+      if (question.issueKey && question.issueKey !== record.issue.key) {
+        this.#increment('agentQuestionsIgnoredIssueMismatch')
+        this.#logger.warn?.('[factory] ignored agent question for mismatched issue', {
+          from: question.agentName,
+          requestedIssue: question.issueKey,
+          activeIssue: record.issue.key,
+        })
+        return
+      }
 
-    if (!question.eventId) {
-      this.#increment('agentQuestionsMissingIdentity')
-      this.#logger.warn?.('[factory] agent question event missing stable identity; falling back to sender/content dedupe', {
-        from: question.agentName,
-        issue: record.issue.key,
-      })
-    }
+      const dedupeKey = agentQuestionDedupeKey(record.issue, question)
+      if (!await this.#state.claimAgentQuestion(this.#workspaceId, dedupeKey)) {
+        this.#increment('agentQuestionDuplicatesSuppressed')
+        this.#logger.debug?.('[factory] suppressed duplicate agent question', {
+          from: question.agentName,
+          issue: record.issue.key,
+        })
+        return
+      }
 
-    const reserved = await this.#reserveHumanClarification(record, question)
-    if (reserved === false) return
-    const postedToSlack = await this.#postAgentQuestion(record, question)
-    if (postedToSlack && reserved) {
-      await this.#parkForHumanClarification(record, reserved)
-    } else if (reserved) {
-      await this.#state.clearWaitingClarification(this.#workspaceId, issueKey(record.issue))
+      if (!question.eventId) {
+        this.#increment('agentQuestionsMissingIdentity')
+        this.#logger.warn?.('[factory] agent question event missing stable identity; falling back to sender/content dedupe', {
+          from: question.agentName,
+          issue: record.issue.key,
+        })
+      }
+
+      if (this.#stopping) return
+      const reserved = await this.#reserveHumanClarification(record, question)
+      if (reserved === false) {
+        const existing = await this.#state.getWaitingClarification(this.#workspaceId, issueKey(record.issue))
+        durableClarificationOwnsExit = Boolean(
+          existing?.agents.some(({ name }) => name === question.agentName),
+        )
+        return
+      }
+      if (reserved) {
+        // The reservation, not Slack availability, owns the exit from here on.
+        // Always park immediately so a writeback outage cannot consume slots.
+        durableClarificationOwnsExit = true
+        await this.#parkForHumanClarification(record, reserved)
+        await this.#deliverClarificationQuestion(issueKey(record.issue), reserved)
+      } else {
+        if (this.#stopping) return
+        await this.#postAgentQuestion(record, question)
+      }
+    } finally {
+      if (!durableClarificationOwnsExit) {
+        const remaining = (this.#clarificationIntents.get(question.agentName) ?? 1) - 1
+        if (remaining > 0) this.#clarificationIntents.set(question.agentName, remaining)
+        else this.#clarificationIntents.delete(question.agentName)
+      }
     }
   }
 
@@ -3085,6 +3154,91 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#markSlackWritebackFailure('agent-question', error)
       this.#logger.warn?.(`[factory] failed to post agent question for ${record.issue.key}`, error)
+      return false
+    }
+  }
+
+  async #deliverClarificationQuestion(key: string, waiting: WaitingClarification): Promise<boolean> {
+    if (this.#stopping) return false
+    const existing = this.#clarificationQuestionDeliveryInFlight.get(key)
+    if (existing) return await existing
+
+    const delivery = this.#performClarificationQuestionDelivery(key, waiting)
+      .finally(() => {
+        if (this.#clarificationQuestionDeliveryInFlight.get(key) === delivery) {
+          this.#clarificationQuestionDeliveryInFlight.delete(key)
+        }
+      })
+    this.#clarificationQuestionDeliveryInFlight.set(key, delivery)
+    return await delivery
+  }
+
+  async #performClarificationQuestionDelivery(key: string, waiting: WaitingClarification): Promise<boolean> {
+    if (this.#stopping) return false
+    if (!this.#slack || !this.#config.slack || waiting.questionPostedAtMs !== undefined) {
+      return waiting.questionPostedAtMs !== undefined
+    }
+
+    const claimed = await this.#state.claimClarificationQuestionDelivery(
+      this.#workspaceId,
+      key,
+      this.#clarificationWakeOwner,
+      this.#clock.now(),
+      CLARIFICATION_QUESTION_DELIVERY_LEASE_MS,
+    )
+    if (!claimed) {
+      this.#increment('clarificationQuestionDeliveryClaimsSuppressed')
+      this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+      return false
+    }
+
+    if (this.#stopping || await this.#shouldSkipSlackWriteback('agent-question')) {
+      await this.#state.releaseClarificationQuestionDelivery(
+        this.#workspaceId,
+        key,
+        this.#clarificationWakeOwner,
+      )
+      if (!this.#stopping) this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+      return false
+    }
+
+    try {
+      await this.#slack.reply(
+        claimed.threadId,
+        agentQuestionSlackText(claimed.issue, {
+          agentName: claimed.askerName,
+          question: claimed.question,
+        }, this.#config.slack.stakeholderUserIds),
+      )
+      const completed = await this.#state.completeClarificationQuestionDelivery(
+        this.#workspaceId,
+        key,
+        this.#clarificationWakeOwner,
+        this.#clock.now(),
+      )
+      if (!completed) {
+        this.#increment('clarificationQuestionDeliveryOwnershipLost')
+        this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+        return false
+      }
+      this.#increment('agentQuestionsPostedToSlack')
+      this.#increment('clarificationQuestionsDelivered')
+      this.#recordSlackWritebackSuccess('agent-question')
+      // A very fast human can reply while the Slack write is being confirmed.
+      // The reply is durable but wake-ineligible until questionPostedAtMs is
+      // committed above, so drain it immediately after opening that gate.
+      await this.#drainReadyClarificationWake()
+      return true
+    } catch (error) {
+      await this.#state.releaseClarificationQuestionDelivery(
+        this.#workspaceId,
+        key,
+        this.#clarificationWakeOwner,
+      )
+      this.#markSlackWritebackFailure('agent-question', error)
+      this.#increment('clarificationQuestionDeliveryFailures')
+      this.#logger.warn?.(`[factory] failed to post agent question for ${claimed.issue.key}; keeping it durable for retry`, error)
+      this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
       return false
     }
   }
@@ -3138,6 +3292,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #parkForHumanClarification(record: InFlightIssue, waiting: WaitingClarification): Promise<void> {
+    if (this.#stopping) return
     try {
       await this.#finishClarificationPark(waiting, false)
     } catch (error) {
@@ -3172,6 +3327,7 @@ export class FactoryLoop implements Factory {
     }
     await this.#clearDispatchInFlight(waiting.issue)
     await this.#writeInFlightRegistry()
+    for (const { name } of waiting.agents) this.#clarificationIntents.delete(name)
     this.#increment(recovered ? 'clarificationParksRecovered' : 'agentQuestionTeamsReleased')
     this.#logger.info?.('[factory] released team while waiting for human clarification', {
       issue: waiting.issue.key,
@@ -4934,6 +5090,21 @@ export class FactoryLoop implements Factory {
         }
       }
 
+      if (waiting.questionPostedAtMs === undefined) {
+        await this.#deliverClarificationQuestion(key, waiting)
+        waiting = await this.#state.getWaitingClarification(this.#workspaceId, key) ?? waiting
+        if (waiting.questionPostedAtMs === undefined) {
+          nextDelayMs = Math.min(
+            nextDelayMs ?? CLARIFICATION_QUESTION_DELIVERY_RETRY_MS,
+            CLARIFICATION_QUESTION_DELIVERY_RETRY_MS,
+          )
+        }
+      }
+
+      // Do not accept arbitrary thread noise or escalate a question until its
+      // original Slack post is durably confirmed. Delivery retry is independent
+      // of parking so agents remain released throughout an outage.
+      if (waiting.questionPostedAtMs === undefined) continue
       if (waiting.reply || waiting.escalatedAtMs) continue
       const waitingAgeMs = this.#clock.now() - waiting.askedAtMs
       const untilEscalationMs = CLARIFICATION_STALE_WARN_MS - waitingAgeMs
@@ -5115,7 +5286,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
-    if (!waiting.reply) {
+    if (!waiting.reply || this.#stopping) {
       return
     }
     const claimed = await this.#state.claimClarificationWake(
@@ -5131,6 +5302,10 @@ export class FactoryLoop implements Factory {
       return
     }
     waiting = claimed
+    if (this.#stopping) {
+      await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
+      return
+    }
     const reply = waiting.reply
     if (!reply) {
       await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
@@ -5172,6 +5347,7 @@ export class FactoryLoop implements Factory {
 
     try {
       if (!await this.#clarificationIssueStillActive(waiting.issue)) {
+        this.#assertClarificationWakeRunning()
         await renewLease()
         const completed = await this.#state.completeClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
         if (!completed) {
@@ -5183,7 +5359,10 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      this.#assertClarificationWakeRunning()
+
       const batch = await this.#batch()
+      this.#assertClarificationWakeRunning()
       if (!batch.canStart()) {
         await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
         this.#increment('clarificationWakesQueuedForCapacity')
@@ -5201,7 +5380,9 @@ export class FactoryLoop implements Factory {
       try {
         await renewLease()
         const onlineNames = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+        this.#assertClarificationWakeRunning()
         for (const parked of waiting.agents) {
+          this.#assertClarificationWakeRunning()
           await renewLease()
           const tracked = structuredClone(parked.tracked)
           // A previous wake owner may have crashed after spawning but before
@@ -5210,16 +5391,18 @@ export class FactoryLoop implements Factory {
           const result = onlineNames.has(parked.name)
             ? { name: parked.name, sessionRef: tracked.sessionRef }
             : await this.#resumeOrColdStartClarificationAgent(parked.name, tracked, waiting)
-          await renewLease()
           const invocationId = batch.invocationIdFor(record.issue, tracked.spec)
           batch.recordSpawn(record, tracked.spec, invocationId, result)
           const live = record.agents.get(result.name)
           if (live) resumed.push([result.name, live])
+          this.#assertClarificationWakeRunning()
+          await renewLease()
         }
 
         const event = slackReplyEvent(waiting.issue, reply.text)
         for (const [name] of resumed) {
           if (waiting.wake?.injectedAgents.includes(name)) continue
+          this.#assertClarificationWakeRunning()
           await renewLease()
           if (this.#fleet.sendInput) {
             await this.#fleet.sendInput(name, event)
@@ -5230,6 +5413,7 @@ export class FactoryLoop implements Factory {
               text: event.replace(/\r$/u, ''),
             })
           }
+          this.#assertClarificationWakeRunning()
           const marked = await this.#state.markClarificationAgentInjected(
             this.#workspaceId,
             key,
@@ -5252,6 +5436,16 @@ export class FactoryLoop implements Factory {
           coldStarts: resumed.filter(([, tracked]) => !tracked.sessionRef).length,
         })
       } catch (error) {
+        if (error instanceof ClarificationWakeStoppedError) {
+          for (const [name] of resumed) {
+            this.#fleet.markAgentTerminal?.(name, 'factory-stopped')
+          }
+          await this.#releaseAndTerminateAgents(resumed, 'factory-stopped', 'clarification')
+          batch.complete(waiting.issue)
+          await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
+          await this.#writeInFlightRegistry()
+          return
+        }
         if (error instanceof ClarificationWakeLeaseLostError) {
           batch.complete(waiting.issue)
           await this.#writeInFlightRegistry()
@@ -5277,6 +5471,10 @@ export class FactoryLoop implements Factory {
         this.#scheduleClarificationWakeRetry(key)
       }
     } catch (error) {
+      if (error instanceof ClarificationWakeStoppedError) {
+        await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
+        return
+      }
       if (error instanceof ClarificationWakeLeaseLostError) {
         this.#increment('clarificationWakeLeaseLosses')
         this.#logger.warn?.('[factory] clarification wake ownership moved to another daemon', {
@@ -5295,6 +5493,10 @@ export class FactoryLoop implements Factory {
     } finally {
       clearInterval(heartbeat)
     }
+  }
+
+  #assertClarificationWakeRunning(): void {
+    if (this.#stopping) throw new ClarificationWakeStoppedError('factory is stopping')
   }
 
   async #clarificationIssueStillActive(issueRef: IssueRef): Promise<boolean> {
@@ -5348,6 +5550,7 @@ export class FactoryLoop implements Factory {
           capability: tracked.spec.capability,
         })
       } catch (error) {
+        this.#assertClarificationWakeRunning()
         this.#increment('clarificationResumeFallbacks')
         this.#logger.warn?.('[factory] session resume failed; cold-starting from durable issue/question context', {
           issue: waiting.issue.key,
@@ -5360,6 +5563,7 @@ export class FactoryLoop implements Factory {
       this.#increment('clarificationResumeFallbacks')
     }
 
+    this.#assertClarificationWakeRunning()
     const reply = waiting.reply?.text ?? ''
     return await this.#fleet.spawn({
       name,

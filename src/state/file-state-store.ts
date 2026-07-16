@@ -125,6 +125,59 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
+  override async claimClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record || record.questionPostedAtMs !== undefined || (
+          record.questionDelivery?.owner &&
+          nowMs - record.questionDelivery.claimedAtMs < leaseMs
+        )) return undefined
+        record.questionDelivery = {
+          owner,
+          claimedAtMs: nowMs,
+          attempts: (record.questionDelivery?.attempts ?? 0) + 1,
+        }
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async completeClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    postedAtMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (record?.questionDelivery?.owner !== owner) return false
+        record.questionPostedAtMs = postedAtMs
+        delete record.questionDelivery
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
+  override async releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    await this.#mutateClarification(workspaceId, issueKey, (record) => {
+      if (record.questionDelivery?.owner !== owner) return
+      record.questionDelivery.owner = ''
+      record.questionDelivery.claimedAtMs = Number.MIN_SAFE_INTEGER
+    })
+  }
+
   override async claimClarificationReply(
     workspaceId: string,
     issueKey: string,
@@ -134,7 +187,7 @@ export class FileStateStore extends InMemoryStateStore {
       return await this.#withMutationLock(async () => {
         const document = await this.#loadFromDisk()
         const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
-        if (!record || record.reply) {
+        if (!record || (record.questionPostedAtMs === undefined && !record.questionDelivery?.owner) || record.reply) {
           return undefined
         }
         record.reply = { ...reply }
@@ -166,7 +219,7 @@ export class FileStateStore extends InMemoryStateStore {
       return await this.#withMutationLock(async () => {
         const document = await this.#loadFromDisk()
         const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
-        if (!record?.reply || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
+        if (!record?.reply || record.questionPostedAtMs === undefined || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
           return undefined
         }
         record.wake = {

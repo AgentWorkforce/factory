@@ -223,6 +223,48 @@ describe('FileStateStore', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('leases delivery across daemons and persists fast replies without waking before confirmation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-question-delivery-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      const second = new FileStateStore({ batchSize: 2, watchStatePath })
+      const waiting = { ...waitingClarification(78), questionPostedAtMs: undefined }
+      const key = 'AR-78:uuid-78:path-78'
+      await first.reserveWaitingClarification('workspace-1', key, waiting)
+      expect(await first.claimClarificationReply('workspace-1', key, {
+        id: 'thread-noise', text: 'Not an answer to a delivered question.', receivedAtMs: 199,
+      })).toBeUndefined()
+      await first.markClarificationAgentReleased('workspace-1', key, 'ar-78-impl')
+      await first.markClarificationAgentReleased('workspace-1', key, 'ar-78-review')
+      await first.markClarificationParked('workspace-1', key, 199)
+
+      const [claimA, claimB] = await Promise.all([
+        first.claimClarificationQuestionDelivery('workspace-1', key, 'factory-a', 200, 60_000),
+        second.claimClarificationQuestionDelivery('workspace-1', key, 'factory-b', 200, 60_000),
+      ])
+      expect([claimA, claimB].filter(Boolean)).toHaveLength(1)
+      const owner = (claimA ?? claimB)?.questionDelivery?.owner
+      expect(owner).toMatch(/^factory-[ab]$/u)
+      expect(await first.claimClarificationQuestionDelivery('workspace-1', key, owner!, 201, 60_000))
+        .toBeUndefined()
+      expect(await second.claimClarificationReply('workspace-1', key, {
+        id: 'fast-answer', text: 'Visible in Slack before confirmation.', receivedAtMs: 202,
+      })).toMatchObject({ reply: { id: 'fast-answer' } })
+      expect(await first.claimClarificationWake('workspace-1', key, 'too-early', 202, 60_000))
+        .toBeUndefined()
+
+      await second.releaseClarificationQuestionDelivery('workspace-1', key, owner!)
+      const retry = await first.claimClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 203, 60_000)
+      expect(retry?.questionDelivery).toMatchObject({ owner: 'factory-retry', attempts: 2 })
+      expect(await second.completeClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 204)).toBe(true)
+      expect(await first.claimClarificationWake('workspace-1', key, 'factory-wake', 205, 60_000))
+        .toMatchObject({ reply: { id: 'fast-answer' }, wake: { owner: 'factory-wake' } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })
 
 const waitingClarification = (number: number): WaitingClarification => {
@@ -258,6 +300,7 @@ const waitingClarification = (number: number): WaitingClarification => {
     askerName: implementer.name,
     question: 'Which wake path should I use?',
     askedAtMs: 100,
+    questionPostedAtMs: 150,
     agents: [
       { name: implementer.name, tracked: { spec: implementer, sessionRef: 'session-impl' } },
       { name: reviewer.name, tracked: { spec: reviewer, sessionRef: 'session-review' } },

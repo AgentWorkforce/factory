@@ -101,7 +101,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
         // Absolute path: the agent runs in its repo clone, not the daemon cwd
         // where .integrations lives, so a relative path would be unreachable.
-        `Factory will post the question to the Slack thread represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
+        `Factory will durably post and, if necessary, retry the question to the Slack thread represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
         'After sending the marker, stop work and finish your session normally. Do not wait or poll: Factory will release the whole team and resume it from session memory only after the first human reply.',
         'If session resume is unavailable, Factory will cold-start the team with the issue, question, reply, branch, and PR context so work can be re-hydrated explicitly.',
       ]

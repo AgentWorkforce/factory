@@ -24,6 +24,12 @@ export type WaitingClarification = {
   question: string
   askedAtMs: number
   agents: WaitingClarificationAgent[]
+  questionPostedAtMs?: number
+  questionDelivery?: {
+    owner: string
+    claimedAtMs: number
+    attempts: number
+  }
   releasedAgents?: string[]
   parkedAtMs?: number
   escalatedAtMs?: number
@@ -128,6 +134,9 @@ export interface StateStore {
   reserveWaitingClarification(workspaceId: string, issueKey: string, record: WaitingClarification): Promise<boolean>
   getWaitingClarification(workspaceId: string, issueKey: string): Promise<WaitingClarification | undefined>
   listWaitingClarifications(workspaceId: string): Promise<Array<[string, WaitingClarification]>>
+  claimClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, nowMs: number, leaseMs: number): Promise<WaitingClarification | undefined>
+  completeClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, postedAtMs: number): Promise<boolean>
+  releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void>
   claimClarificationReply(workspaceId: string, issueKey: string, reply: ClarificationReply): Promise<WaitingClarification | undefined>
   markClarificationAgentReleased(workspaceId: string, issueKey: string, agentName: string): Promise<WaitingClarification | undefined>
   markClarificationParked(workspaceId: string, issueKey: string, parkedAtMs: number): Promise<WaitingClarification | undefined>

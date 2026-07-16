@@ -142,13 +142,53 @@ export class InMemoryStateStore implements StateStore {
       .map(([key, record]) => [key, cloneWaitingClarification(record)])
   }
 
+  async claimClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (!record || record.questionPostedAtMs !== undefined || (
+      record.questionDelivery?.owner &&
+      nowMs - record.questionDelivery.claimedAtMs < leaseMs
+    )) return undefined
+    record.questionDelivery = {
+      owner,
+      claimedAtMs: nowMs,
+      attempts: (record.questionDelivery?.attempts ?? 0) + 1,
+    }
+    return cloneWaitingClarification(record)
+  }
+
+  async completeClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    postedAtMs: number,
+  ): Promise<boolean> {
+    const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
+    if (record?.questionDelivery?.owner !== owner) return false
+    record.questionPostedAtMs = postedAtMs
+    delete record.questionDelivery
+    return true
+  }
+
+  async releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    const delivery = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.questionDelivery
+    if (delivery?.owner !== owner) return
+    delivery.owner = ''
+    delivery.claimedAtMs = Number.MIN_SAFE_INTEGER
+  }
+
   async claimClarificationReply(
     workspaceId: string,
     issueKey: string,
     reply: ClarificationReply,
   ): Promise<WaitingClarification | undefined> {
     const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
-    if (!record || record.reply) {
+    if (!record || (record.questionPostedAtMs === undefined && !record.questionDelivery?.owner) || record.reply) {
       return undefined
     }
     record.reply = { ...reply }
@@ -175,7 +215,7 @@ export class InMemoryStateStore implements StateStore {
     leaseMs: number,
   ): Promise<WaitingClarification | undefined> {
     const record = this.#workspace(workspaceId).waitingClarifications.get(issueKey)
-    if (!record?.reply || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
+    if (!record?.reply || record.questionPostedAtMs === undefined || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
       return undefined
     }
     record.wake = {
