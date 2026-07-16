@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import { invokeNodeHandler, nodeManifest, type FleetActionContext, type FleetSpawnAgentInput } from '@agent-relay/fleet'
+import { invokeNodeHandler, type FleetActionContext, type FleetSpawnAgentInput } from '@agent-relay/fleet'
 
 import {
   createFactoryNodeDefinition,
@@ -65,12 +65,13 @@ describe('factory node definition', () => {
       version: 'test-version',
     })
 
-    expect(nodeManifest(definition)).toEqual({
-      name: 'mac-mini',
-      max_agents: 4,
-      version: 'test-version',
-      tags: ['factory', 'workspace:workspace-1', 'repo:AgentWorkforce/factory', 'repo:relay'],
-      capabilities: [
+    expect(definition.name).toBe('mac-mini')
+    expect(definition.maxAgents).toBe(4)
+    expect(definition.version).toBe('test-version')
+    expect(definition.tags).toEqual(['factory', 'workspace:workspace-1', 'repo:AgentWorkforce/factory', 'repo:relay'])
+    expect(
+      Object.values(definition.capabilities).map(({ name, kind, metadata }) => ({ name, kind, metadata })),
+    ).toEqual([
         {
           name: 'spawn:codex',
           kind: 'action',
@@ -102,8 +103,7 @@ describe('factory node definition', () => {
             handler: 'relayflows',
           },
         },
-      ],
-    })
+    ])
   })
 
   it('spawns codex through the broker in the mapped checkout with MCP harness wiring', async () => {
@@ -343,9 +343,8 @@ describe('factory node definition', () => {
       name: 'published-node',
       version: 'test-version',
     })
-    const manifest = nodeManifest(definition)
-    expect(manifest.name).toBe('published-node')
-    expect(manifest.capabilities.map((cap) => cap.name)).toEqual(['spawn:claude', 'workflow:run'])
+    expect(definition.name).toBe('published-node')
+    expect(Object.values(definition.capabilities).map((cap) => cap.name)).toEqual(['spawn:claude', 'workflow:run'])
   })
 
   it('resolves a FleetNodeDefinition from the packaged default node export', async () => {
@@ -360,9 +359,9 @@ describe('factory node definition', () => {
     process.env[FACTORY_NODE_CONFIG_ENV] = configPath
     try {
       const mod = await import('./factory.node')
-      const manifest = nodeManifest(mod.default)
-      expect(manifest.capabilities.map((cap) => cap.name)).toEqual(['spawn:claude'])
-      expect(manifest.tags).toContain('workspace:workspace-published')
+      const definition = mod.default
+      expect(Object.values(definition.capabilities).map((cap) => cap.name)).toEqual(['spawn:claude'])
+      expect(definition.tags).toContain('workspace:workspace-published')
     } finally {
       if (previous === undefined) delete process.env[FACTORY_NODE_CONFIG_ENV]
       else process.env[FACTORY_NODE_CONFIG_ENV] = previous
