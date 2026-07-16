@@ -262,6 +262,52 @@ class FailingSlackAnswerFleetClient extends FakeFleetClient {
   }
 }
 
+class BlockingFirstClarificationResumeFleetClient extends FakeFleetClient {
+  readonly resumeStarted: Promise<void>
+  #signalResumeStarted!: () => void
+  #releaseResume!: () => void
+  readonly #resumeReleased: Promise<void>
+  #blocked = false
+
+  constructor() {
+    super()
+    this.resumeStarted = new Promise((resolve) => { this.#signalResumeStarted = resolve })
+    this.#resumeReleased = new Promise((resolve) => { this.#releaseResume = resolve })
+  }
+
+  releaseResume(): void {
+    this.#releaseResume()
+  }
+
+  override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
+    if (!this.#blocked) {
+      this.#blocked = true
+      this.#signalResumeStarted()
+      await this.#resumeReleased
+    }
+    return super.resume(input)
+  }
+}
+
+class TransientClarificationRenewalStateStore extends InMemoryStateStore {
+  failNextRenewal = false
+  renewalFailures = 0
+
+  override async renewClarificationWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    if (this.failNextRenewal) {
+      this.failNextRenewal = false
+      this.renewalFailures += 1
+      throw new Error('transient state store outage')
+    }
+    return super.renewClarificationWake(workspaceId, issueKey, owner, nowMs)
+  }
+}
+
 class EscalatingTriage extends StaticTriage {
   readonly overrides: Partial<Pick<TriageDecision, 'thin' | 'confidence' | 'rationale'>>
 
@@ -8843,6 +8889,56 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('retries a transient background wake-lease renewal error without abandoning ownership', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(52)]: issueFile(52) })
+    const fleet = new BlockingFirstClarificationResumeFleetClient()
+    fleet.setSessionRef('ar-52-impl-pear', 'session-ar-52-impl-pear')
+    fleet.setSessionRef('ar-52-review', 'session-ar-52-review')
+    const stateStore = new TransientClarificationRenewalStateStore({ batchSize: 2 })
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger: { warn: (...args: unknown[]) => warnings.push(args) },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    mount.files.set(issuePath(52), { content: issueFile(52, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-52-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Keep the wake lease through a transient outage.',
+      eventId: 'agent-question-52',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    vi.useFakeTimers()
+    try {
+      emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-52'), 'human-answer-52', {
+        text: 'Retry the lease heartbeat and continue.',
+        user: 'U123',
+        user_is_bot: false,
+      })
+      await fleet.resumeStarted
+
+      stateStore.failNextRenewal = true
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(stateStore.renewalFailures).toBe(1)
+
+      fleet.releaseResume()
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(factory.status().counters.clarificationWakeLeaseLosses).toBeUndefined()
+      expect(warnings).toContainEqual([
+        '[factory] transient error renewing clarification wake lease; retrying',
+        expect.objectContaining({ issue: 'AR-52', error: expect.any(Error) }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('cold-starts with durable issue, question, and reply context when session refs are unavailable', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(37)]: issueFile(37) })
     const fleet = new FakeFleetClient()
@@ -8868,8 +8964,7 @@ describe('FactoryLoop', () => {
       user: 'U123',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
 
     expect(fleet.resumes).toEqual([])
     expect(fleet.spawns).toHaveLength(4)
@@ -8880,7 +8975,6 @@ describe('FactoryLoop', () => {
       expect(spawn.task).toContain('Re-hydrate from the issue, branch, worktree, and any open PR')
     }
     expect(factory.status().counters.clarificationResumeFallbacks).toBe(2)
-    expect(factory.status().counters.clarificationTeamsWoken).toBe(1)
   })
 
   it('rearms a durable clarification after restart and wakes from a reply received while stopped', async () => {

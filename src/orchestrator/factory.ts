@@ -3187,9 +3187,9 @@ export class FactoryLoop implements Factory {
   async #releaseAgentsForClarification(key: string, agents: Array<[string, TrackedAgent]>): Promise<void> {
     let waiting = await this.#state.getWaitingClarification(this.#workspaceId, key)
     if (!waiting) return
+    let online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
     for (const [name, tracked] of agents) {
-      const onlineBefore = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
-      if (waiting.releasedAgents?.includes(name) && !onlineBefore.has(name)) continue
+      if (waiting.releasedAgents?.includes(name) && !online.has(name)) continue
       try {
         // Prefer broker release over process termination so the harness gets a
         // graceful shutdown boundary and can flush its latest resumable state.
@@ -3205,14 +3205,15 @@ export class FactoryLoop implements Factory {
       if (onlineAfter.has(name)) {
         throw new Error(`fleet still reports ${name} online after clarification release`)
       }
+      online = onlineAfter
       waiting = await this.#state.markClarificationAgentReleased(this.#workspaceId, key, name) ?? waiting
     }
 
     // Check the whole snapshot once more before opening the wake gate. This
     // catches server-side restart policies that re-register a name between its
     // individual release confirmation and the final parked transition.
-    const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
-    const stillOnline = agents.map(([name]) => name).filter((name) => online.has(name))
+    const finalOnline = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+    const stillOnline = agents.map(([name]) => name).filter((name) => finalOnline.has(name))
     if (stillOnline.length > 0) {
       throw new Error(`clarification agents still online: ${stillOnline.join(', ')}`)
     }
@@ -5155,7 +5156,16 @@ export class FactoryLoop implements Factory {
       if (renewalInFlight || leaseLost) return
       renewalInFlight = true
       void renewLease()
-        .catch(() => { leaseLost = true })
+        .catch((error: unknown) => {
+          if (error instanceof ClarificationWakeLeaseLostError) {
+            leaseLost = true
+            return
+          }
+          this.#logger.warn?.('[factory] transient error renewing clarification wake lease; retrying', {
+            issue: waiting.issue.key,
+            error,
+          })
+        })
         .finally(() => { renewalInFlight = false })
     }, Math.max(1_000, Math.floor(CLARIFICATION_WAKE_LEASE_MS / 3)))
     heartbeat.unref?.()
