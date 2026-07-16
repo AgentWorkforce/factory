@@ -4,12 +4,17 @@ import { dirname, join } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 
-import type { GithubIssueCommentWatchState } from '../ports/state'
+import type { ClarificationReply, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 
+type PersistedWorkspaceState = {
+  githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
+  waitingClarifications: Record<string, WaitingClarification>
+}
+
 type WatchStateDocument = {
-  version: 1
-  workspaces: Record<string, Record<string, GithubIssueCommentWatchState>>
+  version: 2
+  workspaces: Record<string, PersistedWorkspaceState>
 }
 
 export type FileStateStoreOptions = InMemoryStateStoreOptions & {
@@ -28,7 +33,8 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
 
 /**
  * Keeps the factory's general runtime bookkeeping in memory while persisting
- * GitHub escalation watches atomically so they survive a CLI process restart.
+ * GitHub escalation watches and parked clarification teams atomically so they
+ * survive a CLI process restart.
  * Mutations reload under an advisory lock so independent processes merge
  * updates instead of publishing divergent cached documents.
  */
@@ -49,8 +55,8 @@ export class FileStateStore extends InMemoryStateStore {
     await this.#exclusive(async () => {
       await this.#withMutationLock(async () => {
         const document = await this.#loadFromDisk()
-        const workspace = document.workspaces[workspaceId] ??= {}
-        workspace[key] = cloneWatch(watch)
+        const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+        workspace.githubIssueCommentWatches[key] = cloneWatch(watch)
         await this.#persist(document)
       })
     })
@@ -61,7 +67,7 @@ export class FileStateStore extends InMemoryStateStore {
   ): Promise<Array<[string, GithubIssueCommentWatchState]>> {
     return await this.#exclusive(async () => {
       const document = await this.#loadFromDisk()
-      return Object.entries(document.workspaces[workspaceId] ?? {})
+      return Object.entries(document.workspaces[workspaceId]?.githubIssueCommentWatches ?? {})
         .map(([key, watch]) => [key, cloneWatch(watch)])
     })
   }
@@ -71,9 +77,273 @@ export class FileStateStore extends InMemoryStateStore {
       await this.#withMutationLock(async () => {
         const document = await this.#loadFromDisk()
         const workspace = document.workspaces[workspaceId]
-        if (!workspace || !(key in workspace)) return
-        delete workspace[key]
-        if (Object.keys(workspace).length === 0) {
+        if (!workspace || !(key in workspace.githubIssueCommentWatches)) return
+        delete workspace.githubIssueCommentWatches[key]
+        if (workspaceIsEmpty(workspace)) {
+          delete document.workspaces[workspaceId]
+        }
+        await this.#persist(document)
+      })
+    })
+  }
+
+  override async reserveWaitingClarification(
+    workspaceId: string,
+    issueKey: string,
+    record: WaitingClarification,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+        if (workspace.waitingClarifications[issueKey]) return false
+        workspace.waitingClarifications[issueKey] = cloneClarification(record)
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
+  override async getWaitingClarification(
+    workspaceId: string,
+    issueKey: string,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      const document = await this.#loadFromDisk()
+      const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+      return record ? cloneClarification(record) : undefined
+    })
+  }
+
+  override async listWaitingClarifications(
+    workspaceId: string,
+  ): Promise<Array<[string, WaitingClarification]>> {
+    return await this.#exclusive(async () => {
+      const document = await this.#loadFromDisk()
+      return Object.entries(document.workspaces[workspaceId]?.waitingClarifications ?? {})
+        .map(([key, record]) => [key, cloneClarification(record)])
+    })
+  }
+
+  override async claimClarificationReply(
+    workspaceId: string,
+    issueKey: string,
+    reply: ClarificationReply,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record || record.reply) {
+          return undefined
+        }
+        record.reply = { ...reply }
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async markClarificationAgentReleased(
+    workspaceId: string,
+    issueKey: string,
+    agentName: string,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#mutateClarification(workspaceId, issueKey, (record) => {
+      record.releasedAgents ??= []
+      if (!record.releasedAgents.includes(agentName)) record.releasedAgents.push(agentName)
+    })
+  }
+
+  override async claimClarificationWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record?.reply || record.parkedAtMs === undefined || (record.wake && record.wake.owner !== owner && nowMs - record.wake.claimedAtMs < leaseMs)) {
+          return undefined
+        }
+        record.wake = {
+          owner,
+          claimedAtMs: nowMs,
+          attempts: (record.wake?.attempts ?? 0) + 1,
+          injectedAgents: [...(record.wake?.injectedAgents ?? [])],
+        }
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async markClarificationParked(
+    workspaceId: string,
+    issueKey: string,
+    parkedAtMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record) return undefined
+        const released = new Set(record.releasedAgents ?? [])
+        if (record.agents.some(({ name }) => !released.has(name))) return undefined
+        record.parkedAtMs ??= parkedAtMs
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async claimClarificationEscalation(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record || record.reply || record.escalatedAtMs || (
+          record.escalation && record.escalation.owner !== owner && nowMs - record.escalation.claimedAtMs < leaseMs
+        )) return undefined
+        record.escalation = {
+          owner,
+          claimedAtMs: nowMs,
+          attempts: (record.escalation?.attempts ?? 0) + 1,
+        }
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async completeClarificationEscalation(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    escalatedAtMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (record?.escalation?.owner !== owner) return false
+        record.escalatedAtMs = escalatedAtMs
+        delete record.escalation
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
+  override async releaseClarificationEscalation(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    await this.#mutateClarification(workspaceId, issueKey, (record) => {
+      if (record.escalation?.owner !== owner) return
+      record.escalation.owner = ''
+      record.escalation.claimedAtMs = Number.MIN_SAFE_INTEGER
+    })
+  }
+
+  override async renewClarificationWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    return await this.#mutateOwnedWake(workspaceId, issueKey, owner, (record) => {
+      record.wake!.claimedAtMs = nowMs
+    })
+  }
+
+  override async markClarificationAgentInjected(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    agentName: string,
+  ): Promise<boolean> {
+    return await this.#mutateOwnedWake(workspaceId, issueKey, owner, (record) => {
+      if (!record.wake!.injectedAgents.includes(agentName)) record.wake!.injectedAgents.push(agentName)
+    })
+  }
+
+  override async completeClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId]
+        if (workspace?.waitingClarifications[issueKey]?.wake?.owner !== owner) return false
+        delete workspace.waitingClarifications[issueKey]
+        if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
+  override async releaseClarificationWake(workspaceId: string, issueKey: string, owner: string): Promise<void> {
+    await this.#exclusive(async () => {
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (record?.wake?.owner !== owner) return
+        record.wake.owner = ''
+        record.wake.claimedAtMs = Number.MIN_SAFE_INTEGER
+        await this.#persist(document)
+      })
+    })
+  }
+
+  async #mutateOwnedWake(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    mutate: (record: WaitingClarification) => void,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (record?.wake?.owner !== owner) return false
+        mutate(record)
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
+  async #mutateClarification(
+    workspaceId: string,
+    issueKey: string,
+    mutate: (record: WaitingClarification) => void,
+  ): Promise<WaitingClarification | undefined> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const record = document.workspaces[workspaceId]?.waitingClarifications[issueKey]
+        if (!record) return undefined
+        mutate(record)
+        await this.#persist(document)
+        return cloneClarification(record)
+      })
+    })
+  }
+
+  override async clearWaitingClarification(workspaceId: string, issueKey: string): Promise<void> {
+    await this.#exclusive(async () => {
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId]
+        if (!workspace || !(issueKey in workspace.waitingClarifications)) return
+        delete workspace.waitingClarifications[issueKey]
+        if (workspaceIsEmpty(workspace)) {
           delete document.workspaces[workspaceId]
         }
         await this.#persist(document)
@@ -87,7 +357,7 @@ export class FileStateStore extends InMemoryStateStore {
       return parseDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
-      return { version: 1, workspaces: {} }
+      return { version: 2, workspaces: {} }
     }
   }
 
@@ -138,14 +408,42 @@ export class FileStateStore extends InMemoryStateStore {
 }
 
 const parseDocument = (value: unknown): WatchStateDocument => {
-  if (!isRecord(value) || value.version !== 1 || !isRecord(value.workspaces)) {
+  if (!isRecord(value) || !isRecord(value.workspaces)) {
     throw new Error('Factory GitHub watch state file is invalid')
   }
-  return value as WatchStateDocument
+  if (value.version === 2) {
+    return value as WatchStateDocument
+  }
+  if (value.version === 1) {
+    const workspaces: Record<string, PersistedWorkspaceState> = {}
+    for (const [workspaceId, watches] of Object.entries(value.workspaces)) {
+      if (!isRecord(watches)) {
+        throw new Error('Factory GitHub watch state file is invalid')
+      }
+      workspaces[workspaceId] = {
+        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
+        waitingClarifications: {},
+      }
+    }
+    return { version: 2, workspaces }
+  }
+  throw new Error('Factory GitHub watch state file is invalid')
 }
 
 const cloneWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState =>
   structuredClone(watch)
+
+const cloneClarification = (record: WaitingClarification): WaitingClarification =>
+  structuredClone(record)
+
+const emptyWorkspaceState = (): PersistedWorkspaceState => ({
+  githubIssueCommentWatches: {},
+  waitingClarifications: {},
+})
+
+const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
+  Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
+  Object.keys(workspace.waitingClarifications).length === 0
 
 const syncParentDirectory = async (filePath: string): Promise<void> => {
   const handle = await open(dirname(filePath), 'r')

@@ -34,7 +34,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(task).toContain('Factory will hand the opened PR to reviewer `ar-123-review`.')
-    expect(task).toContain('write to the .integrations mount path so the factory can relay it to the issue thread.')
+    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
     expect(task).toContain('DM `broker` when fully done.')
     expect(task).toContain('Do NOT auto-merge.')
     expect(task).toContain('Merge policy: never')
@@ -238,7 +238,7 @@ describe('renderAgentTask', () => {
     expect(task).not.toMatch(/\n\n(.integrations|Connected integrations)/m)
   })
 
-  it('directs agent questions to .integrations writeback instead of relay DM', () => {
+  it('makes the needs-input marker an explicit release boundary', () => {
     const task = renderAgentTask({
       issue,
       route: { repo: 'pear', clonePath: '/tmp/pear' },
@@ -248,14 +248,11 @@ describe('renderAgentTask', () => {
       slackDispatchThread: { channel: 'C123', threadId: '169.000', mountRoot: '/work/.integrations' },
     })
 
-    // The Slack-thread writeback replaces the old relay DM pattern.
-    expect(task).toContain('write your question to this issue\'s Slack dispatch thread via the .integrations mount')
-    expect(task).toContain('Write path: /work/.integrations/slack/channels/C123/messages/169_000/replies/question.json')
-    expect(task).toContain('Write a JSON object with a "text" field')
-    expect(task).toContain('Continue with safe reversible work while waiting for a reply.')
-    // No relay DM or legacy patterns.
+    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(task).toContain('/work/.integrations/slack/channels/C123/messages/169_000/replies/question.json')
+    expect(task).toContain('Do not wait or poll')
+    expect(task).toContain('release the whole team and resume it from session memory only after the first human reply')
+    expect(task).toContain('cold-start the team with the issue, question, reply, branch, and PR context')
     expect(task).not.toContain('FACTORY_NEEDS_INPUT')
-    expect(task).not.toContain('DM `broker` with')
-    expect(task).not.toContain('[factory-needs-input]')
   })
 })
