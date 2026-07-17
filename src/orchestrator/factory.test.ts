@@ -10518,6 +10518,7 @@ describe('FactoryLoop', () => {
       fleet,
       stateStore,
       triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
       logger: { error: () => undefined },
     })
     factory.on('error', (payload) => errors.push(payload))
