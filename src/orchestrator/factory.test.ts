@@ -12485,6 +12485,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
       mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'durable-pr-open'))
+      await flush()
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
       await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
 
