@@ -7257,6 +7257,37 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('delivers the implementer briefing and reviewer nudge via the spawn task when taskDelivery is spawn', async () => {
+    const mount = new FakeMountClient({ [issuePath(62)]: issueFile(62) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ dispatch: { taskDelivery: 'spawn' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(62), issueFile(62))))
+
+    // No post-spawn injection: the briefing rides in the spawn task instead.
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
+    expect(fleet.deliveryEvents).toEqual([])
+
+    // The implementer's full briefing is delivered as its spawn task.
+    const implSpawn = fleet.spawns.find((spawn) => spawn.name === 'ar-62-impl-pear')
+    expect(implSpawn).toBeDefined()
+    expect(implSpawn!.task).toContain('Create a branch for this issue before editing.')
+    expect(implSpawn!.task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
+    expect(implSpawn!.task).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
+    // The ask instruction is unconditional, so the agent can still escalate.
+    expect(implSpawn!.task).toContain('[factory-needs-input]')
+
+    // The reviewer's queued-review nudge is folded into its spawn task.
+    const reviewSpawn = fleet.spawns.find((spawn) => spawn.name === 'ar-62-review')
+    expect(reviewSpawn).toBeDefined()
+    expect(reviewSpawn!.task).toContain('Review is queued for AR-62. Watch implementer PR handoff and report readiness.')
+  })
+
   it('retries confirmed task injection when the spawned agent is not registered yet', async () => {
     const clock = new ManualClock()
     const mount = new FakeMountClient({ [issuePath(67)]: issueFile(67) })

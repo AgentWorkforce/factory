@@ -43,6 +43,16 @@ const liveSubscriptionSchema = z.object({
 const dispatchSchema = z.object({
   errorCooldownMs: z.number().int().min(0).default(60_000),
   maxAttempts: z.number().int().min(1).max(5).default(2),
+  // How the implementer/reviewer's initial briefing is delivered.
+  //   'inject' (default): rendered after spawn and injected into the agent's
+  //     session (the historical behavior).
+  //   'spawn': rendered into the spawn task itself, so the agent has its full
+  //     briefing at boot. Avoids the post-spawn injection race — a codex agent
+  //     spawned with a task starts working immediately and can miss an injected
+  //     briefing ('delivery_injected' never confirms), then runs un-briefed.
+  //     Opt-in while the injection path is hardened; composes with
+  //     agentCapabilities (e.g. a claude implementer + spawn delivery).
+  taskDelivery: z.enum(['inject', 'spawn']).default('inject'),
 }).default({})
 
 const loopSchema = z.object({

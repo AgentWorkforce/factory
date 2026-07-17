@@ -3190,6 +3190,16 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
+    // When taskDelivery is 'spawn', render the agent's full briefing into the
+    // spawn task itself instead of injecting it after spawn. This avoids the
+    // post-spawn injection race (a codex agent spawned with a task works
+    // immediately and can miss an injected briefing). Default 'inject' keeps the
+    // historical behavior. The human's later clarification reply is unaffected —
+    // it is delivered via release/resume, not this initial task.
+    const spawnTask = !dryRun && this.#config.dispatch.taskDelivery === 'spawn'
+      ? await this.#spawnTaskTextFor(record, spec)
+      : spec.task
+
     let result
     try {
       result = await this.#fleet.spawn({
@@ -3197,7 +3207,7 @@ export class FactoryLoop implements Factory {
         capability: spec.capability,
         node: spec.node ?? 'self',
         repo: spec.repo,
-        task: spec.task,
+        task: spawnTask,
         workflow: spec.workflow,
         inputs: spec.inputs,
         model: spec.model,
@@ -5013,6 +5023,11 @@ export class FactoryLoop implements Factory {
   }
 
   async #sendCriticalReviewerMessage(record: InFlightIssue): Promise<void> {
+    if (this.#config.dispatch.taskDelivery === 'spawn') {
+      // The reviewer's queued-review nudge is folded into its spawn task (see
+      // #reviewerSpawnTaskText), so there is no post-spawn injection to perform.
+      return
+    }
     if (!this.#fleet.waitForInjected) {
       return
     }
@@ -5032,7 +5047,59 @@ export class FactoryLoop implements Factory {
     await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
   }
 
+  // Render the initial task an agent should receive at spawn when
+  // dispatch.taskDelivery is 'spawn'. Non-impl/reviewer roles keep their
+  // configured spec.task unchanged.
+  async #spawnTaskTextFor(record: InFlightIssue, spec: AgentSpec): Promise<string> {
+    if (spec.role === 'implementer') {
+      return this.#implementerSpawnTaskText(record, spec)
+    }
+    if (spec.role === 'reviewer') {
+      return this.#reviewerSpawnTaskText(record, spec)
+    }
+    return spec.task
+  }
+
+  // The implementer's full briefing (base + PR flow + ask instructions), the same
+  // content #sendImplementerTask injects in 'inject' mode. `slackDispatchThread`
+  // is unset here (the thread is established right after spawn); the ask
+  // instruction is unconditional, so the agent can still ask — only the
+  // thread-specific reply-path hint is deferred.
+  async #implementerSpawnTaskText(record: InFlightIssue, spec: AgentSpec): Promise<string> {
+    const issue = await this.#readIssue(record.issue.path)
+    const integrationInstructions = await this.#resolveIntegrationInstructions()
+    const reviewerName = record.decision.reviewer?.name ?? 'reviewer'
+    const implementerNames = record.decision.implementers.map((implementer) => implementer.name)
+    return renderAgentTask({
+      issue: templateIssueFromRecord(record, issue),
+      route: routeForImplementer(record, spec),
+      role: 'implementer',
+      config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
+      reviewerName,
+      implementerNames,
+      slackDispatchThread: undefined,
+      integrationsMountRoot: this.#integrationsMountRoot(),
+      integrationInstructions,
+      branchName: spec.branch,
+    })
+  }
+
+  // The reviewer's spawn task = its configured review task plus the queued-review
+  // nudge #sendCriticalReviewerMessage injects in 'inject' mode.
+  #reviewerSpawnTaskText(record: InFlightIssue, spec: AgentSpec): string {
+    const nudge = `Review is queued for ${record.issue.key}. Watch implementer PR handoff and report readiness.`
+    return spec.task ? `${spec.task}\n\n${nudge}` : nudge
+  }
+
   async #sendImplementerTask(record: InFlightIssue): Promise<void> {
+    if (this.#config.dispatch.taskDelivery === 'spawn') {
+      // The implementer's full briefing is delivered as the spawn task (see
+      // #spawnAgent / #implementerSpawnTaskText), so there is no post-spawn
+      // injection to perform. Injecting the briefing on top of a freshly-spawned,
+      // already-working codex races its interactive hold and times out
+      // ('delivery_injected' never fires), leaving the agent un-briefed.
+      return
+    }
     if (!this.#fleet.waitForInjected) {
       return
     }
