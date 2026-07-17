@@ -15,6 +15,16 @@ export const AgentSpecSchema = z.object({
   sessionRef: z.string().optional(),
   invocationId: z.string().optional(),
   restartPolicy: z.unknown().optional(),
+  ownedPullRequest: z.object({
+    repo: z.string(),
+    number: z.number().int().positive(),
+    path: z.string().optional(),
+  }).optional(),
+  pendingPullRequestWake: z.object({
+    repo: z.string(),
+    number: z.number().int().positive(),
+    kinds: z.array(z.string()),
+  }).optional(),
 })
 
 export const TriageDecisionSchema = z.object({

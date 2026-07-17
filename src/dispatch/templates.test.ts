@@ -82,6 +82,13 @@ describe('renderAgentTask', () => {
     expect(task).toContain('reply directly in its original review thread')
     expect(task).toContain('name the fixing commit')
     expect(task).toContain('checks on the newly pushed head commit')
+    expect(task).toContain('metadata-only `<integration-event>`')
+    expect(task).toContain('The event stream is not a correctness boundary')
+    expect(task).toContain('on startup, after any resumed session')
+    expect(task).toContain('[factory-babysitter-critical] AR-123 begin')
+    expect(task).toContain('[factory-babysitter-critical-ack] AR-123 begin')
+    expect(task).toContain('send completion alone is not an acknowledgment')
+    expect(task).toContain('[factory-babysitter-critical] AR-123 end')
     // Team coordination + readiness signal + guardrail.
     expect(task).toContain('ar-123-impl')
     expect(task).toContain('ar-123-review')

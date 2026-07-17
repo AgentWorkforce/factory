@@ -1,6 +1,7 @@
 import { BatchTracker } from '../orchestrator/batch-tracker'
 import type {
   BatchSnapshot,
+  BabysitterSessionState,
   CriticalRecord,
   DispatchAttemptState,
   GithubIssueCommentWatchState,
@@ -22,6 +23,7 @@ type WorkspaceState = {
   dispatchAttempts: Map<string, DispatchAttemptState>
   canonicalIssueStates: Map<string, string>
   dispatchFailureReaperHandoffs: Map<string, RegistryHandoffAgent>
+  babysitterSessions: Map<string, BabysitterSessionState>
 }
 
 export type InMemoryStateStoreOptions = {
@@ -335,6 +337,23 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).dispatchFailureReaperHandoffs.delete(key)
   }
 
+  async setBabysitterSession(
+    workspaceId: string,
+    issueKey: string,
+    session: BabysitterSessionState,
+  ): Promise<void> {
+    this.#workspace(workspaceId).babysitterSessions.set(issueKey, structuredClone(session))
+  }
+
+  async listBabysitterSessions(workspaceId: string): Promise<Array<[string, BabysitterSessionState]>> {
+    return [...this.#workspace(workspaceId).babysitterSessions]
+      .map(([key, session]) => [key, structuredClone(session)])
+  }
+
+  async clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void> {
+    this.#workspace(workspaceId).babysitterSessions.delete(issueKey)
+  }
+
   async recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void> {
     this.#workspace(workspaceId).canonicalIssueStates.set(key, stateId)
   }
@@ -358,6 +377,7 @@ export class InMemoryStateStore implements StateStore {
         dispatchAttempts: new Map(),
         canonicalIssueStates: new Map(),
         dispatchFailureReaperHandoffs: new Map(),
+        babysitterSessions: new Map(),
       }
       this.#workspaces.set(workspaceId, state)
     }
