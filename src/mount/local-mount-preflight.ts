@@ -96,8 +96,13 @@ async function waitForStateFile(
     try {
       const raw = await readFile(stateFilePath, 'utf8')
       const state = JSON.parse(raw) as unknown
-      if (isValidMountState(state, workspaceId, acceptableWorkspaceIds)) return
-      lastInvalidReason = `state file is malformed or for another workspace: ${stateFilePath}`
+      if (isValidMountState(state, workspaceId, acceptableWorkspaceIds)) {
+        const staleness = checkMountStaleness(stateFilePath, workspaceId, acceptableWorkspaceIds)
+        if (!staleness.stale) return
+        lastInvalidReason = staleness.reason ?? 'mount state is stale'
+      } else {
+        lastInvalidReason = `state file is malformed or for another workspace: ${stateFilePath}`
+      }
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
         lastInvalidReason = 'state file was not created'

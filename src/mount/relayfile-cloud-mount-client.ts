@@ -98,6 +98,10 @@ export interface RelayfileWorkspaceHandleLike {
   getToken(): Promise<string> | string
 }
 
+export interface MountedWorkspaceHandleLike {
+  stop(): Promise<void>
+}
+
 export interface RelayfileSetupLike {
   joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
   ensureMountedWorkspace?(input: {
@@ -109,7 +113,7 @@ export interface RelayfileSetupLike {
     agentName?: string
     scopes?: string[]
     readyTimeoutMs?: number
-  }): Promise<unknown>
+  }): Promise<MountedWorkspaceHandleLike>
 }
 
 export type RelayfileSetupFactory = (options: {
@@ -174,6 +178,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #localMountPreflight: LocalMountPreflight
   readonly #localMountAgentName: string
   readonly #localMountScopes: string[]
+  readonly #localMounts = new Map<string, MountedWorkspaceHandleLike>()
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
@@ -242,10 +247,20 @@ export class RelayfileCloudMountClient implements MountClient {
     const ensureMountedWorkspace = setup.ensureMountedWorkspace.bind(setup)
 
     const localDir = join(resolve(startDir), '.integrations')
+    const acceptableWorkspaceIds = new Set(options.acceptableWorkspaceIds ?? [])
+    if (workspace.workspaceId && workspace.workspaceId !== this.workspaceId) {
+      acceptableWorkspaceIds.add(workspace.workspaceId)
+    }
     await this.#localMountPreflight(this.workspaceId, startDir, {
       ...options,
+      acceptableWorkspaceIds: [...acceptableWorkspaceIds],
       startMount: async () => {
-        await ensureMountedWorkspace({
+        const previous = this.#localMounts.get(localDir)
+        if (previous) {
+          this.#localMounts.delete(localDir)
+          await previous.stop()
+        }
+        const mounted = await ensureMountedWorkspace({
           workspace,
           localDir,
           remotePath: '/',
@@ -255,8 +270,15 @@ export class RelayfileCloudMountClient implements MountClient {
           scopes: [...this.#localMountScopes],
           ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
         })
+        this.#localMounts.set(localDir, mounted)
       },
     })
+  }
+
+  async dispose(): Promise<void> {
+    const mounted = [...this.#localMounts.values()]
+    this.#localMounts.clear()
+    await Promise.allSettled(mounted.map(async (handle) => handle.stop()))
   }
 
   async readFile(path: string): Promise<{ content: unknown; revision?: string }> {

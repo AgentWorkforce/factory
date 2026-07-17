@@ -195,7 +195,8 @@ describe('RelayfileCloudMountClient', () => {
       getToken: vi.fn(async () => 'delegated-relayfile-token'),
       info: { relayfileUrl: 'https://relayfile.example' },
     }
-    const ensureMountedWorkspace = vi.fn(async () => ({ ready: true }))
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
     const setup = {
       joinWorkspace: vi.fn(async () => handle),
       ensureMountedWorkspace,
@@ -214,7 +215,6 @@ describe('RelayfileCloudMountClient', () => {
     })
 
     await expect(mount.ensureLocalMount('/work/repo', {
-      acceptableWorkspaceIds: ['cloud-workspace-uuid'],
       stateWaitTimeoutMs: 3210,
     })).resolves.toBeUndefined()
 
@@ -233,6 +233,9 @@ describe('RelayfileCloudMountClient', () => {
       scopes: [...FACTORY_RELAYFILE_SCOPES],
       readyTimeoutMs: 3210,
     })
+
+    await mount.dispose()
+    expect(stop).toHaveBeenCalledTimes(1)
   })
 
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {

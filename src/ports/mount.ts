@@ -75,6 +75,8 @@ export interface MountClient {
   readonly githubWrite?: GithubConnectionWrite
   /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
   ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
+  /** Stop SDK-owned local mount processes created by this client. */
+  dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>

@@ -90,6 +90,26 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('does not report a stale state file as refreshed when the SDK start leaves it unchanged', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      })
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount: vi.fn(async () => {}),
+        stateWaitTimeoutMs: 5,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('auto-refresh failed'))
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount refreshed'))
+    })
+  })
+
   it('does not restart a healthy existing mount', async () => {
     await withTempDir(async (dir) => {
       await writeMountState(dir, {

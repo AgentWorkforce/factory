@@ -1626,10 +1626,13 @@ describe('fleet CLI runtime', () => {
     try {
       const configPath = await writeConfig(root)
       const ensureSdkMount = vi.fn(async () => {})
+      const disposeMount = vi.fn(async () => {})
       const mount = new FakeMountClient() as FakeMountClient & {
         ensureLocalMount: typeof ensureSdkMount
+        dispose: typeof disposeMount
       }
       mount.ensureLocalMount = ensureSdkMount
+      mount.dispose = disposeMount
       const factory = {
         start: vi.fn(async () => {}),
         stop: vi.fn(async () => {}),
@@ -1658,6 +1661,7 @@ describe('fleet CLI runtime', () => {
       expect(ensureSdkMount).toHaveBeenCalledWith('/work/pear', {
         acceptableWorkspaceIds: undefined,
       })
+      expect(disposeMount).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

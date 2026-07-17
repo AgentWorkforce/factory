@@ -107,6 +107,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   const out = deps.stdout ?? process.stdout
   const err = deps.stderr ?? process.stderr
   let fleet: FleetClient | undefined
+  let mount: MountClient | undefined
 
   try {
     if (argv.some(isHelpFlag)) {
@@ -205,7 +206,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         }
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
-        const mount = await buildMount(loaded, deps)
+        mount = await buildMount(loaded, deps)
         if (command.kind === 'factory-babysit') {
           return await runStandaloneBabysitCommand(
             command,
@@ -244,7 +245,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 1
   } finally {
-    await fleet?.dispose()
+    try {
+      await mount?.dispose?.()
+    } finally {
+      await fleet?.dispose()
+    }
   }
 }
 
