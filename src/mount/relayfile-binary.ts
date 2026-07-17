@@ -2,12 +2,11 @@ import { accessSync, constants, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// ESM has no __dirname; derive this module's directory for the default search
-// start (used when no caller-supplied deployment dir is available).
+// ESM has no __dirname; derive this module's directory so the resolver can find
+// dependencies installed with the factory package.
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 
 const STALE_RECONCILE_MS = 15 * 60 * 1000
-const NOT_FOUND_ERROR = '[factory] relayfile-mount binary not found. Install dependencies or run: npm run relayfile-mount:install'
 
 type MountState = {
   workspaceId?: unknown
@@ -77,35 +76,57 @@ function devRelayfileCandidates(pearRoot: string): string[] {
 // @relayfile/sdk carries relayfile-mount through per-platform optional
 // dependencies. Prefer that bundled binary so factory start does not depend on
 // a global relayfile install or a manually populated repo bin/ directory.
-function optionalPackageCandidates(pearRoot: string): string[] {
+function optionalPackageCandidates(packageRoot: string): string[] {
   const suffix = optionalPackageArchSuffix()
   return [
-    join(pearRoot, 'node_modules', '@relayfile', `mount-${suffix}`, 'bin', binaryName()),
-    join(pearRoot, 'node_modules', '@relayfile', 'sdk', 'node_modules', '@relayfile', `mount-${suffix}`, 'bin', binaryName()),
+    join(packageRoot, 'node_modules', '@relayfile', `mount-${suffix}`, 'bin', binaryName()),
+    join(packageRoot, 'node_modules', '@relayfile', 'sdk', 'node_modules', '@relayfile', `mount-${suffix}`, 'bin', binaryName()),
   ]
 }
 
-export function resolveRelayfileMountBinary(startDir = MODULE_DIR): string {
+// npm can place optional dependencies inside factory's own node_modules (a
+// global install), beside factory in a shared node_modules (npx/hoisting), or
+// below @relayfile/sdk (strict/nested installs). Walk upward from this module so
+// all of those layouts are found without depending on the target workspace.
+function installedOptionalPackageCandidates(installDir: string): string[] {
+  const candidates: string[] = []
+  let current = resolve(installDir)
+  for (;;) {
+    candidates.push(...optionalPackageCandidates(current))
+    const parent = dirname(current)
+    if (parent === current) return candidates
+    current = parent
+  }
+}
+
+function notFoundError(): string {
+  return `[factory] relayfile-mount binary not found (missing @relayfile/mount-${optionalPackageArchSuffix()}). Reinstall @agent-relay/factory without --omit=optional`
+}
+
+export function resolveRelayfileMountBinary(startDir = process.cwd(), installDir = MODULE_DIR): string {
   if (process.env.RELAYFILE_MOUNT_BIN) {
     const explicitBinary = resolve(process.env.RELAYFILE_MOUNT_BIN)
     if (canExecute(explicitBinary)) return explicitBinary
-    throw new Error(NOT_FOUND_ERROR)
+    throw new Error(notFoundError())
   }
 
   const pearRoot = findPearRoot(startDir)
-  const candidates = pearRoot
-    ? [
+  const candidates = [
+    ...installedOptionalPackageCandidates(installDir),
+    ...(pearRoot
+      ? [
         ...optionalPackageCandidates(pearRoot),
         join(pearRoot, 'bin', binaryName()),
         ...devRelayfileCandidates(pearRoot),
       ]
-    : []
+      : []),
+  ]
 
   for (const candidate of candidates) {
     if (canExecute(candidate)) return resolve(candidate)
   }
 
-  throw new Error(NOT_FOUND_ERROR)
+  throw new Error(notFoundError())
 }
 
 function cliName(): string {
