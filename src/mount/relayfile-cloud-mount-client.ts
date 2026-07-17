@@ -24,11 +24,13 @@ import {
 
 import type { EventPage, GithubConnectionWrite, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
 import {
+  createResourceSubscriptionsHttpClient,
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
   type TokenProvider,
   type WorkspaceEventClientSource,
 } from '../subscriptions'
+import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
@@ -113,6 +115,9 @@ export interface RelayfileCloudMountClientConfig {
   tokenProvider?: TokenProvider
   baseUrl?: string
   eventClient?: RelayfileEventClient
+  /** Override the standard Relayfile Cloud durable-subscription HTTP client. */
+  resourceSubscriptions?: ResourceSubscriptionsClient
+  resourceSubscriptionFetch?: typeof fetch
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
@@ -136,6 +141,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
   readonly githubWrite: GithubConnectionWrite
+  readonly resourceSubscriptions?: ResourceSubscriptionsClient
 
   readonly #client: RelayFileClientLike
   readonly #tokenProvider: TokenProvider
@@ -155,6 +161,13 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
+    this.resourceSubscriptions = config.resourceSubscriptions ?? (this.#baseUrl
+      ? createResourceSubscriptionsHttpClient({
+        baseUrl: this.#baseUrl,
+        tokenProvider: this.#tokenProvider,
+        fetch: config.resourceSubscriptionFetch,
+      })
+      : undefined)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })

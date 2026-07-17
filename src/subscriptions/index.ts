@@ -35,6 +35,20 @@ export {
   filesystemEventToChangeEvent,
   integrationRelayFileSyncOptions,
 } from './event-client'
+export {
+  createResourceSubscriptionsHttpClient,
+  isResourceSubscriptionsUnavailable,
+  ResourceSubscriptionsHttpError,
+  ResourceSubscriptionsUnavailableError,
+} from './resource-subscriptions'
+export type {
+  AcceptedResourceDelivery,
+  ResourceDeliveryClaim,
+  ResourceSubscription,
+  ResourceSubscriptionInput,
+  ResourceSubscriptionsClient,
+  ResourceSubscriptionsHttpClientOptions,
+} from './resource-subscriptions'
 export type {
   ChangeEvent,
   FilesystemEventLike,

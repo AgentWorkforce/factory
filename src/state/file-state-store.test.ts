@@ -64,6 +64,16 @@ describe('FileStateStore', () => {
         path: '/github/repos/AgentWorkforce/factory/pulls/87/metadata.json',
         critical: true,
         pendingKinds: ['checks-failed', 'review-comment'],
+        resourceSubscription: {
+          subscriptionId: 'sub-87',
+          provider: 'github',
+          resourceRef: '/github/repos/AgentWorkforce__factory/pulls/by-id/87.json',
+          subscriberId: 'factory-babysitter:uuid-87',
+          ownerId: 'factory-runtime',
+          expiresAt: '2026-12-31T00:00:00.000Z',
+          terminal: true,
+        },
+        pendingDeliveryClaims: [{ deliveryId: 'delivery-87-terminal', claimToken: 'claim-token-87' }],
       }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
       await first.setBabysitterSession('workspace-1', 'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json', session)

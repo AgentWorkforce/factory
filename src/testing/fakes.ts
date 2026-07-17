@@ -13,6 +13,7 @@ import type {
   Subscription,
   Capability,
 } from '../ports'
+import type { ResourceSubscriptionsClient } from '../subscriptions'
 
 type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
@@ -21,6 +22,7 @@ type AgentMessageListener = (message: AgentMessage) => void
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
   githubWrite?: GithubConnectionWrite
+  resourceSubscriptions?: ResourceSubscriptionsClient
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []

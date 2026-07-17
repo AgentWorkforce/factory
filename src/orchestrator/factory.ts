@@ -45,6 +45,7 @@ import {
 import { renderAgentTask } from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
+import { isResourceSubscriptionsUnavailable, type ResourceSubscription } from '../subscriptions'
 import type {
   DispatchResult,
   Factory,
@@ -91,7 +92,19 @@ type BabysitterWakeKind =
   | 'checks-failed'
   | 'merge-conflict'
   | 'base-diverged'
-type BabysitterPrRef = { repo: string; prNumber: number; path?: string; agentName: string }
+type BabysitterResourceSubscription = Pick<
+  ResourceSubscription,
+  'subscriptionId' | 'provider' | 'resourceRef' | 'subscriberId' | 'ownerId' | 'expiresAt'
+> & { terminal?: boolean }
+type BabysitterPendingDeliveryClaim = { deliveryId: string; claimToken: string }
+type BabysitterPrRef = {
+  repo: string
+  prNumber: number
+  path?: string
+  agentName: string
+  resourceSubscription?: BabysitterResourceSubscription
+  pendingDeliveryClaims?: BabysitterPendingDeliveryClaim[]
+}
 type BabysitterWakeState = {
   issue: IssueRef
   repo: string
@@ -214,6 +227,23 @@ const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const BABYSITTER_EVENT_COALESCE_MS = 750
 const BABYSITTER_EVENT_RETRY_MS = 1_000
+const BABYSITTER_SUBSCRIPTION_TTL_SECONDS = 60 * 60
+// Relayfile receives provider-native GitHub events, not the materialized file
+// changes that the legacy local router consumed. `closed` is separately
+// indexed as a terminal event below, so terminal delivery does not need a
+// broad normal-event subscription.
+const BABYSITTER_SUBSCRIPTION_EVENT_TYPES = [
+  'pull_request.opened',
+  'pull_request.reopened',
+  'pull_request.synchronize',
+  'pull_request.ready_for_review',
+  'pull_request_review.submitted',
+  'pull_request_review_comment.created',
+  'issue_comment.created',
+  'check_run.completed',
+]
+const BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES = ['pull_request.closed']
+const BABYSITTER_RESOURCE_DELIVERY_RETRY_MS = 5_000
 const CLARIFICATION_WAKE_LEASE_MS = 60_000
 const CLARIFICATION_WAKE_RETRY_MS = 1_000
 const CLARIFICATION_PARK_RETRY_MS = 5_000
@@ -349,6 +379,12 @@ export class FactoryLoop implements Factory {
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, BabysitterPrRef>()
   readonly #babysitterIssueRefs = new Map<string, IssueRef>()
+  // Relayfile matches subscription IDs server-side. This direct index means a
+  // delivery claim never requires the legacy local repo/PR scan to find an
+  // owning babysitter.
+  readonly #babysitterSubscriptionOwners = new Map<string, string>()
+  #babysitterResourceSubscriptionFault = false
+  #babysitterResourceDeliveryRetryTimer?: ReturnType<typeof setTimeout>
   readonly #babysitterWakeStates = new Map<string, BabysitterWakeState>()
   // A babysitter announces this fence before invoking destructive git tooling
   // and clears it afterward. Event text can be broker-delivered while a prompt
@@ -650,6 +686,8 @@ export class FactoryLoop implements Factory {
   async stop(): Promise<void> {
     this.#started = false
     this.#stopping = true
+    if (this.#babysitterResourceDeliveryRetryTimer) clearTimeout(this.#babysitterResourceDeliveryRetryTimer)
+    this.#babysitterResourceDeliveryRetryTimer = undefined
     if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
@@ -696,6 +734,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
+      this.#babysitterSubscriptionOwners.clear()
       this.#babysitterCriticalAgents.clear()
       const subscription = this.#subscription
       this.#subscription = undefined
@@ -5160,18 +5199,34 @@ export class FactoryLoop implements Factory {
         prNumber: session.prNumber,
         path: session.path,
         agentName: session.agentName,
+        resourceSubscription: session.resourceSubscription,
+        pendingDeliveryClaims: session.pendingDeliveryClaims,
       }
       this.#babysitterPr.set(persistedKey, ref)
+      if (ref.resourceSubscription) {
+        this.#babysitterSubscriptionOwners.set(ref.resourceSubscription.subscriptionId, persistedKey)
+      }
       this.#babysitterIssueRefs.set(persistedKey, { ...session.issue })
       this.#babysitterSpawned.add(persistedKey)
       if (session.critical) this.#babysitterCriticalAgents.add(session.agentName)
       this.#increment('babysitterOwnershipRestored')
       const pendingKinds = session.pendingKinds.filter(isBabysitterWakeKind)
       if (pendingKinds.length > 0) {
-        await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked)
+        // A terminal marker can coexist with the one wake persisted before
+        // acknowledgement. Rehydrate that durable hand-off once, while later
+        // raw events remain quarantined by #queueBabysitterWake.
+        await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked, { allowTerminal: true })
         this.#increment('babysitterPendingWakesRestored')
       }
+      await this.#ensureBabysitterResourceSubscription(session.issue, ref, tracked)
     }
+    // A crash after the local queue write but before (or just after) the
+    // remote acceptance leaves an ID in state. Accept is idempotent once the
+    // lease was accepted, so settle those durable hand-offs before claiming
+    // new work; lease expiry is retried below when a server has not released
+    // the original claim yet.
+    await this.#retryPendingBabysitterDeliveryAcceptances()
+    await this.#routeDurableBabysitterDeliveries()
   }
 
   async #drainBabysitterWakesForStop(): Promise<void> {
@@ -5194,6 +5249,7 @@ export class FactoryLoop implements Factory {
     const issue = this.#babysitterIssueRefs.get(issueIdentity)
     const mayClearDurable = this.#fleet.placementLocality !== 'remote'
       || Boolean(issue && await this.#assertIssueDispatchLifecycleOwner(issue))
+    const ref = this.#babysitterPr.get(issueIdentity)
     for (const [key, state] of this.#babysitterWakeStates) {
       if (issueKey(state.issue) !== issueIdentity) continue
       state.cancelled = true
@@ -5202,13 +5258,314 @@ export class FactoryLoop implements Factory {
       this.#babysitterWakeStates.delete(key)
       this.#babysitterCriticalAgents.delete(state.agentName)
     }
+    if (mayClearDurable && ref?.resourceSubscription) {
+      this.#babysitterSubscriptionOwners.delete(ref.resourceSubscription.subscriptionId)
+      const subscriptions = this.#mount.resourceSubscriptions
+      if (subscriptions) {
+        try {
+          await subscriptions.cancel(this.#workspaceId, {
+            subscriptionId: ref.resourceSubscription.subscriptionId,
+          })
+          this.#increment('babysitterResourceSubscriptionsCancelled')
+        } catch (error) {
+          // Cancellation is deliberately idempotent. A terminal acceptance may
+          // have retired this record already; an outage leaves the bounded TTL
+          // as the leak backstop and must not prevent local session cleanup.
+          this.#increment('babysitterResourceSubscriptionCancelFailures')
+          this.#logger.warn?.('[factory] could not cancel durable babysitter resource subscription', {
+            issue: issue?.key,
+            subscriptionId: ref.resourceSubscription.subscriptionId,
+            error: describeError(error).errorMessage,
+          })
+        }
+      }
+    }
     this.#babysitterPr.delete(issueIdentity)
     this.#babysitterIssueRefs.delete(issueIdentity)
     this.#babysitterSpawned.delete(issueIdentity)
     if (mayClearDurable) await this.#state.clearBabysitterSession(this.#workspaceId, issueIdentity)
   }
 
+  async #ensureBabysitterResourceSubscription(
+    issue: IssueRef,
+    ref: BabysitterPrRef,
+    tracked?: TrackedAgent,
+  ): Promise<void> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions || !ref.agentName || !await this.#assertIssueDispatchLifecycleOwner(issue)) return
+    // A terminal claim is persisted before Relayfile acceptance so a crash in
+    // that gap can never renew a retired record into a fresh generation.
+    if (ref.resourceSubscription?.terminal) return
+
+    const resourceRef = babysitterResourceRef(ref.repo, ref.prNumber)
+    const subscriberId = babysitterSubscriberId(issue)
+    try {
+      const subscription = await subscriptions.createOrRenew(this.#workspaceId, {
+        provider: 'github',
+        resourceRef,
+        eventTypes: [...BABYSITTER_SUBSCRIPTION_EVENT_TYPES],
+        terminalEventTypes: [...BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES],
+        subscriberId,
+        ttlSeconds: BABYSITTER_SUBSCRIPTION_TTL_SECONDS,
+      })
+      if (
+        !subscription.subscriptionId ||
+        subscription.provider !== 'github' ||
+        subscription.resourceRef !== resourceRef ||
+        subscription.subscriberId !== subscriberId ||
+        !subscription.ownerId ||
+        !subscription.expiresAt ||
+        !subscription.terminalEventTypes?.includes('pull_request.closed')
+      ) {
+        throw new Error('Relayfile returned an invalid durable resource subscription')
+      }
+      if (ref.resourceSubscription?.subscriptionId && ref.resourceSubscription.subscriptionId !== subscription.subscriptionId) {
+        this.#babysitterSubscriptionOwners.delete(ref.resourceSubscription.subscriptionId)
+      }
+      ref.resourceSubscription = {
+        subscriptionId: subscription.subscriptionId,
+        provider: subscription.provider,
+        resourceRef: subscription.resourceRef,
+        subscriberId: subscription.subscriberId,
+        ownerId: subscription.ownerId,
+        expiresAt: subscription.expiresAt,
+      }
+      this.#babysitterSubscriptionOwners.set(subscription.subscriptionId, issueKey(issue))
+      await this.#persistBabysitterSession(issue, ref, tracked)
+      this.#babysitterResourceSubscriptionFault = false
+      this.#increment('babysitterResourceSubscriptionsRenewed')
+    } catch (error) {
+      if (isResourceSubscriptionsUnavailable(error)) {
+        this.#babysitterResourceSubscriptionFault = false
+        this.#increment('babysitterResourceSubscriptionUnavailable')
+        return
+      }
+      this.#babysitterResourceSubscriptionFault = true
+      this.#scheduleDurableBabysitterDeliveryRetry()
+      this.#increment('babysitterResourceSubscriptionRenewFailures')
+      this.#logger.warn?.('[factory] could not create or renew durable babysitter resource subscription', {
+        issue: issue.key,
+        repo: ref.repo,
+        prNumber: ref.prNumber,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
+  async #routeDurableBabysitterDeliveries(): Promise<boolean> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions || !this.#config.babysitter.enabled || this.#stopping) return false
+    // Do not bypass the proven local router until every active babysitter has
+    // completed its own create/renew. This closes the rollout and transient
+    // provisioning gap without making a successful API response for some
+    // other subscription suppress an unregistered PR's wake.
+    if ([...this.#babysitterPr.values()].some((ref) => ref.agentName && !ref.resourceSubscription)) {
+      return this.#babysitterResourceSubscriptionFault
+    }
+
+    let claims: Awaited<ReturnType<typeof subscriptions.claimDeliveryClaims>>
+    try {
+      claims = await subscriptions.claimDeliveryClaims(this.#workspaceId)
+    } catch (error) {
+      if (isResourceSubscriptionsUnavailable(error)) {
+        this.#babysitterResourceSubscriptionFault = false
+        this.#increment('babysitterResourceSubscriptionUnavailable')
+      } else {
+        this.#babysitterResourceSubscriptionFault = true
+        this.#scheduleDurableBabysitterDeliveryRetry()
+        this.#increment('babysitterResourceDeliveryLookupFailures')
+        this.#logger.warn?.('[factory] durable babysitter delivery-claim lookup failed; retaining durable delivery retry', {
+          error: describeError(error).errorMessage,
+        })
+      }
+      return !isResourceSubscriptionsUnavailable(error)
+    }
+    this.#babysitterResourceSubscriptionFault = false
+
+    for (const claim of claims) {
+      const issueIdentity = this.#babysitterSubscriptionOwners.get(claim.subscriptionId)
+      const issue = issueIdentity ? this.#babysitterIssueRefs.get(issueIdentity) : undefined
+      const ref = issueIdentity ? this.#babysitterPr.get(issueIdentity) : undefined
+      const subscription = ref?.resourceSubscription
+      if (
+        !issue ||
+        !ref ||
+        !subscription ||
+        subscription.subscriptionId !== claim.subscriptionId ||
+        subscription.provider !== claim.provider ||
+        subscription.resourceRef !== claim.resourceRef ||
+        subscription.subscriberId !== claim.subscriberId ||
+        subscription.ownerId !== claim.ownerId
+      ) {
+        // The service is owner-isolated, but Factory may have just retired a
+        // local owner. Never route a stale or other-session claim by resource.
+        this.#increment('babysitterResourceDeliveriesIgnoredUnowned')
+        continue
+      }
+      if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
+        this.#increment('babysitterResourceDeliveriesIgnoredNonOwner')
+        continue
+      }
+
+      // A terminal delivery may be reclaimed after a process crash before its
+      // remote acceptance. Only that already-persisted delivery may finish;
+      // no later claim is allowed to wake or re-open the retired session.
+      if (subscription.terminal && !ref.pendingDeliveryClaims?.some((pending) => pending.deliveryId === claim.deliveryId)) {
+        this.#increment('babysitterResourceDeliveriesIgnoredTerminal')
+        continue
+      }
+
+      const batch = await this.#batch()
+      const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+        ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        ?? durableBabysitterTrackedAgent({
+          issue,
+          repo: ref.repo,
+          prNumber: ref.prNumber,
+          path: ref.path,
+          agentName: ref.agentName,
+          critical: false,
+          pendingKinds: [],
+          resourceSubscription: subscription,
+          pendingDeliveryClaims: ref.pendingDeliveryClaims,
+        })
+
+      const pendingClaim = ref.pendingDeliveryClaims?.find((pending) => pending.deliveryId === claim.deliveryId)
+      const alreadyQueued = Boolean(pendingClaim)
+      if (!alreadyQueued) {
+        const queued = await this.#queueBabysitterWake(issue, ref, ['pull-request-state'], tracked)
+        if (!queued) continue
+      }
+      if (!pendingClaim || pendingClaim.claimToken !== claim.claimToken) {
+        ref.pendingDeliveryClaims = [
+          ...(ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId),
+          { deliveryId: claim.deliveryId, claimToken: claim.claimToken },
+        ]
+        // The claim lease joins Factory's durable pending-wake state before
+        // the external acceptance. A crash after this point can retry the
+        // exact hand-off without delivering the same wake a second time.
+        await this.#persistBabysitterSession(issue, ref, tracked)
+      }
+
+      try {
+        if (claim.terminal && !subscription.terminal) {
+          subscription.terminal = true
+          await this.#persistBabysitterSession(issue, ref, tracked)
+        }
+        const accepted = await subscriptions.acceptDelivery(this.#workspaceId, {
+          deliveryId: claim.deliveryId,
+          claimToken: claim.claimToken,
+        })
+        if (accepted.deliveryId !== claim.deliveryId || accepted.subscriptionId !== claim.subscriptionId) {
+          throw new Error('Relayfile accepted a different durable delivery claim')
+        }
+        if (accepted.terminal || claim.terminal) {
+          // Keep the terminal marker and subscription identity locally until
+          // normal PR/session teardown. That quarantines the babysitter from
+          // both legacy fallback and a restart-time create-or-renew.
+          subscription.terminal = true
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+          this.#increment('babysitterResourceSubscriptionsRetiredTerminal')
+        } else {
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+        }
+        this.#increment('babysitterResourceDeliveriesAccepted')
+      } catch (error) {
+        this.#increment('babysitterResourceDeliveryAcceptFailures')
+        this.#logger.warn?.('[factory] durable babysitter delivery claim remains pending after wake queue', {
+          issue: issue.key,
+          subscriptionId: claim.subscriptionId,
+          deliveryId: claim.deliveryId,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+    if ([...this.#babysitterPr.values()].some((ref) => ref.pendingDeliveryClaims?.length)) {
+      this.#scheduleDurableBabysitterDeliveryRetry()
+    }
+    return true
+  }
+
+  async #retryPendingBabysitterDeliveryAcceptances(): Promise<void> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions) return
+
+    for (const [issueIdentity, ref] of this.#babysitterPr) {
+      const subscription = ref.resourceSubscription
+      const pendingDeliveryClaims = [...(ref.pendingDeliveryClaims ?? [])]
+      const issue = this.#babysitterIssueRefs.get(issueIdentity)
+      if (!subscription || !issue || pendingDeliveryClaims.length === 0) continue
+      const batch = await this.#batch()
+      const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+        ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        ?? durableBabysitterTrackedAgent({
+          issue,
+          repo: ref.repo,
+          prNumber: ref.prNumber,
+          path: ref.path,
+          agentName: ref.agentName,
+          critical: false,
+          pendingKinds: [],
+          resourceSubscription: subscription,
+          pendingDeliveryClaims,
+        })
+      for (const { deliveryId, claimToken } of pendingDeliveryClaims) {
+        try {
+          const accepted = await subscriptions.acceptDelivery(this.#workspaceId, { deliveryId, claimToken })
+          if (accepted.deliveryId !== deliveryId || accepted.subscriptionId !== subscription.subscriptionId) {
+            throw new Error('Relayfile accepted a different durable delivery claim')
+          }
+          if (accepted.terminal) subscription.terminal = true
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+          this.#increment('babysitterResourceDeliveriesAcceptedAfterRestore')
+        } catch (error) {
+          if (isResourceSubscriptionsUnavailable(error)) {
+            this.#babysitterResourceSubscriptionFault = false
+            this.#increment('babysitterResourceSubscriptionUnavailable')
+          } else {
+            this.#babysitterResourceSubscriptionFault = true
+            this.#increment('babysitterResourceDeliveryAcceptFailures')
+            this.#logger.warn?.('[factory] durable babysitter delivery acceptance remains pending after restore', {
+              issue: issue.key,
+              subscriptionId: subscription.subscriptionId,
+              deliveryId,
+              error: describeError(error).errorMessage,
+            })
+          }
+        }
+      }
+    }
+    if ([...this.#babysitterPr.values()].some((ref) => ref.pendingDeliveryClaims?.length)) {
+      this.#scheduleDurableBabysitterDeliveryRetry()
+    }
+  }
+
+  #scheduleDurableBabysitterDeliveryRetry(): void {
+    if (this.#babysitterResourceDeliveryRetryTimer || this.#stopping || !this.#mount.resourceSubscriptions) return
+    this.#babysitterResourceDeliveryRetryTimer = setTimeout(() => {
+      this.#babysitterResourceDeliveryRetryTimer = undefined
+      void (async () => {
+        await this.#retryPendingBabysitterDeliveryAcceptances()
+        await this.#routeDurableBabysitterDeliveries()
+      })().catch((error) => {
+        this.#logger.warn?.('[factory] durable babysitter delivery retry rejected', {
+          error: describeError(error).errorMessage,
+        })
+      })
+    }, BABYSITTER_RESOURCE_DELIVERY_RETRY_MS)
+    this.#babysitterResourceDeliveryRetryTimer.unref?.()
+  }
+
   async #routeBabysitterEvent(path: string, extraKinds: Iterable<BabysitterWakeKind> = []): Promise<void> {
+    // A successful Relayfile claim lookup is the new exact demux. Fall back to
+    // the legacy path router only while the capability is absent; transient
+    // failures retain and retry service claims so they cannot double-deliver,
+    // preserving rollout and degraded-service behaviour without teaching this
+    // runtime how to resolve canonical/renamed paths to their by-id anchors.
+    if (await this.#routeDurableBabysitterDeliveries()) return
     const event = githubBabysitterEventPathParts(path)
     if (!event || !this.#config.babysitter.enabled || this.#stopping) return
     let targets: Array<{ prNumber: number; kinds: BabysitterWakeKind[] }>
@@ -5303,10 +5660,15 @@ export class FactoryLoop implements Factory {
     ref: BabysitterPrRef,
     kinds: Iterable<BabysitterWakeKind>,
     tracked: TrackedAgent,
-  ): Promise<void> {
+    options: { allowTerminal?: boolean } = {},
+  ): Promise<boolean> {
+    if (ref.resourceSubscription?.terminal && !options.allowTerminal) {
+      this.#increment('babysitterEventsIgnoredTerminal')
+      return false
+    }
     if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
       this.#increment('babysitterEventsIgnoredNonOwner')
-      return
+      return false
     }
     // Owner lookup and queueing straddle async mount/state reads. Revalidate
     // the exact composite owner so a concurrent close/merge cancellation can
@@ -5318,7 +5680,7 @@ export class FactoryLoop implements Factory {
       githubPrIdentity(current.repo, current.prNumber) !== githubPrIdentity(ref.repo, ref.prNumber)
     ) {
       this.#increment('babysitterEventsIgnoredStaleOwner')
-      return
+      return false
     }
     const key = babysitterWakeKey(issue, ref)
     let state = this.#babysitterWakeStates.get(key)
@@ -5346,9 +5708,10 @@ export class FactoryLoop implements Factory {
 
     if (state.deferredSubmitTargets || state.inFlight || this.#babysitterCriticalAgents.has(state.agentName)) {
       this.#increment('babysitterEventWakesDeferred')
-      return
+      return true
     }
     this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+    return true
   }
 
   async #recordPendingBabysitterWake(state: BabysitterWakeState): Promise<void> {
@@ -5393,6 +5756,8 @@ export class FactoryLoop implements Factory {
       path: ref.path,
       critical: this.#babysitterCriticalAgents.has(ref.agentName),
       pendingKinds: pending?.kinds.filter(isBabysitterWakeKind).sort(compareBabysitterWakeKinds) ?? [],
+      ...(ref.resourceSubscription ? { resourceSubscription: { ...ref.resourceSubscription } } : {}),
+      ...(ref.pendingDeliveryClaims?.length ? { pendingDeliveryClaims: structuredClone(ref.pendingDeliveryClaims) } : {}),
     })
   }
 
@@ -5612,6 +5977,10 @@ export class FactoryLoop implements Factory {
         return
       }
       if (snapshot.draft) this.#increment('babysitterDraftPrSkipped')
+      // PR meta events are also the normal renewal heartbeat for the durable
+      // record. The store's identity makes this a create-or-renew, never a
+      // second subscription for the same babysitter.
+      await this.#ensureBabysitterResourceSubscription(owned.issue, owned.ref, owned.tracked)
       await this.#routeBabysitterEvent(path, babysitterWakeKindsFromSnapshot(snapshot))
       return
     }
@@ -5834,6 +6203,11 @@ export class FactoryLoop implements Factory {
       await this.#babysitterSpawnInFlight.get(babysitterKey)
       const settled = this.#babysitterPr.get(babysitterKey)
       if (settled && prRef.path) settled.path = prRef.path
+      if (settled) {
+        const tracked = record.agents.get(settled.agentName)
+          ?? [...record.agents.values()].find((agent) => agent.spec.role === 'babysitter')
+        await this.#ensureBabysitterResourceSubscription(record.issue, settled, tracked)
+      }
       return
     }
     const trackedBabysitter = [...record.agents.entries()].find(([, agent]) => agent.spec.role === 'babysitter')
@@ -5852,7 +6226,9 @@ export class FactoryLoop implements Factory {
         agentName: tracked.result?.name ?? trackedName,
       })
       this.#babysitterSpawned.add(babysitterKey)
-      await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      const ref = this.#babysitterPr.get(babysitterKey)!
+      await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       return
     }
     // Reserve up-front so concurrent PR events in a drain don't double-spawn.
@@ -5904,7 +6280,9 @@ export class FactoryLoop implements Factory {
         path: prRef.path,
         agentName: tracked?.result?.name ?? spawned.name,
       })
-      await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      const ref = this.#babysitterPr.get(babysitterKey)!
+      await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#writeInFlightRegistry()
       if (!await this.#saveDispatchLifecycle(record, 'running')) return
       this.#increment('babysittersSpawned')
@@ -9183,6 +9561,19 @@ const validPrNumber = (value: number): boolean => Number.isInteger(value) && val
 
 const githubPrIdentity = (repo: string, prNumber: number): string | undefined =>
   validGithubRepo(repo) && validPrNumber(prNumber) ? `${repo.toLowerCase()}#${prNumber}` : undefined
+
+// This is the public Relayfile stable identity for a GitHub pull request. It
+// deliberately comes from the PR's repo/number ownership record, never by
+// transforming an incoming canonical path (whose title slug can be renamed).
+const babysitterResourceRef = (repo: string, prNumber: number): string => {
+  if (!validGithubRepo(repo) || !validPrNumber(prNumber)) {
+    throw new Error('Cannot create a durable babysitter subscription for an invalid GitHub PR identity')
+  }
+  const [owner, name] = repo.split('/')
+  return `/github/repos/${owner}__${name}/pulls/by-id/${prNumber}.json`
+}
+
+const babysitterSubscriberId = (issue: IssueRef): string => `factory-babysitter:${issue.uuid}`
 
 const recordMatchesGithubRepo = (record: InFlightIssue, eventRepo: string, defaultOwner?: string): boolean => {
   if (!validGithubRepo(eventRepo)) return false

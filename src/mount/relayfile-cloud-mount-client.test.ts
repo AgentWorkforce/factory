@@ -268,6 +268,95 @@ describe('RelayfileCloudMountClient', () => {
     expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
   })
 
+  it('wires the durable resource-subscription API from the configured Relayfile URL and workspace bearer', async () => {
+    const fake = new FakeRelayFileClient()
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const resourceSubscriptionFetch: typeof fetch = async (input, init) => {
+      requests.push({ url: String(input), init })
+      if (String(input).endsWith('/subscriptions') && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          id: 'sub-1',
+          ownerId: 'configured-factory-agent',
+          subscriberId: 'factory-babysitter:uuid-1',
+          provider: 'github',
+          resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+          eventTypes: ['pull_request_review_comment.created'],
+          terminalEventTypes: ['pull_request.closed'],
+          intent: null,
+          status: 'active',
+          expiresAt: '2026-12-31T00:00:00.000Z',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (String(input).endsWith('/subscriptions/deliveries/claim') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ deliveries: [{
+          id: 'delivery-1',
+          claimToken: 'claim-token-1',
+          subscriptionId: 'sub-1',
+          ownerId: 'configured-factory-agent',
+          subscriberId: 'factory-babysitter:uuid-1',
+          provider: 'github',
+          resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+          event: { type: 'pull_request.closed' },
+          terminal: true,
+        }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (String(input).includes('/accept') && init?.method === 'POST') {
+        if (JSON.parse(String(init.body)).claimToken !== 'claim-token-1') {
+          return new Response(JSON.stringify({ error: 'delivery_claim_mismatch' }), { status: 409, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(JSON.stringify({ deliveryId: 'delivery-1', subscriptionId: 'sub-1', terminal: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(null, { status: 204 })
+    }
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      resourceSubscriptionFetch,
+    })
+
+    const client = mount.resourceSubscriptions!
+    await expect(client.createOrRenew('rw_test', {
+      provider: 'github',
+      resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+      eventTypes: ['pull_request_review_comment.created'],
+      terminalEventTypes: ['pull_request.closed'],
+      subscriberId: 'factory-babysitter:uuid-1',
+      ttlSeconds: 3600,
+    })).resolves.toMatchObject({ subscriptionId: 'sub-1', ownerId: 'configured-factory-agent' })
+    await expect(client.claimDeliveryClaims('rw_test')).resolves.toEqual([expect.objectContaining({
+      deliveryId: 'delivery-1',
+      claimToken: 'claim-token-1',
+      terminal: true,
+    })])
+    await expect(client.acceptDelivery('rw_test', { deliveryId: 'delivery-1', claimToken: 'wrong-token' }))
+      .rejects.toMatchObject({ status: 409 })
+    await expect(client.acceptDelivery('rw_test', { deliveryId: 'delivery-1', claimToken: 'claim-token-1' }))
+      .resolves.toEqual({ deliveryId: 'delivery-1', subscriptionId: 'sub-1', terminal: true })
+    await client.cancel('rw_test', { subscriptionId: 'sub-1' })
+
+    expect(requests.map(({ url, init }) => ({ url, method: init?.method }))).toEqual([
+      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions', method: 'POST' },
+      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/claim', method: 'POST' },
+      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/delivery-1/accept', method: 'POST' },
+      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/delivery-1/accept', method: 'POST' },
+      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/sub-1', method: 'DELETE' },
+    ])
+    expect(requests[0]?.init?.headers).toMatchObject({ authorization: 'Bearer relayfile-token' })
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      provider: 'github',
+      resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+      eventTypes: ['pull_request_review_comment.created'],
+      terminalEventTypes: ['pull_request.closed'],
+      subscriberId: 'factory-babysitter:uuid-1',
+      ttlSeconds: 3600,
+    })
+    expect(JSON.parse(String(requests[2]?.init?.body))).toEqual({ claimToken: 'wrong-token' })
+    expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({ claimToken: 'claim-token-1' })
+  })
+
   it('coalesces concurrent shared session resolutions for relayfile token refresh', async () => {
     const setup = {
       joinWorkspace: vi.fn(async () => ({
