@@ -205,13 +205,20 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
 
-    await fleet.resume({ name: 'ar-3-impl', sessionRef: 'session-3', node: 'origin-node', capability: 'spawn:claude' })
+    await fleet.resume({
+      name: 'ar-3-impl',
+      sessionRef: 'session-3',
+      node: 'origin-node',
+      capability: 'spawn:claude',
+      task: 'Continue with the durable human answer.',
+    })
 
     expect(messaging.placements[0]).toMatchObject({ capability: 'spawn:claude', node: 'origin-node' })
     expect(messaging.placements[0]?.input).toMatchObject({
       name: 'ar-3-impl',
       agent: 'ar-3-impl',
       session_ref: 'session-3',
+      task: 'Continue with the durable human answer.',
       spawn_mode: 'task_exit',
       exit_after_task: true,
     })

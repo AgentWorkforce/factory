@@ -1626,9 +1626,9 @@ describe('FactoryLoop', () => {
         'ar-26-impl-pear',
         'ar-26-review-pear',
       ].sort())
-      expect(fleet.messages.find((message) => message.to === 'ar-26-impl-pear')?.text)
+      expect(fleet.spawns.find((spawn) => spawn.name === 'ar-26-impl-pear')?.task)
         .toContain('reviewer `ar-26-review-pear`')
-      expect(fleet.messages.find((message) => message.to === 'ar-26-impl-hoopsheet')?.text)
+      expect(fleet.spawns.find((spawn) => spawn.name === 'ar-26-impl-hoopsheet')?.task)
         .toContain('reviewer `ar-26-review-hoopsheet`')
 
       const registry = await readFactoryInFlightRegistry(registryPath)
@@ -2425,7 +2425,7 @@ describe('FactoryLoop', () => {
     ])
     const branchInstructions = fleet.spawns
       .filter((spawn) => spawn.name === 'ar-364-impl-pear')
-      .map((spawn) => /Factory publication branch: ([^\s]+)/u.exec(spawn.task ?? '')?.[1])
+      .map((spawn) => /exact branch `([^`]+)`/u.exec(spawn.task ?? '')?.[1])
     expect(branchInstructions).toHaveLength(2)
     expect(branchInstructions[0]).not.toBe(branchInstructions[1])
     expect(fleet.spawns[0]?.invocationId).not.toBe(fleet.spawns[2]?.invocationId)
@@ -4396,7 +4396,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('runLoop catches spawned-then-inject failures, reaps the handoff, advances heartbeat, and continues', async () => {
+  it('runLoop carries initial tasks in spawn and does not depend on post-spawn injection', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-loop-registry-'))
     const heartbeatPath = join(root, 'heartbeat.json')
     const registryPath = join(root, 'registry.json')
@@ -4438,13 +4438,14 @@ describe('FactoryLoop', () => {
       const reports = await factory.runLoop()
 
       expect(reports).toHaveLength(2)
-      expect(reports[0]?.error?.message).toContain('recipient unavailable')
+      expect(reports[0]?.error).toBeUndefined()
       expect(reports[1]?.error).toBeUndefined()
-      expect(factory.status().inFlight).toEqual([])
-      expect(factory.status().counters.loopIterationFailures).toBe(1)
-      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
-      expect([...alive]).toEqual([])
-      expect(killed.map((entry) => entry.pid)).toEqual(expect.arrayContaining([7_602, 7_601, 7_604, 7_603]))
+      expect(fleet.injectionAttempts).toBe(0)
+      expect(fleet.messages).toEqual([])
+      expect(fleet.spawns.every((spawn) => spawn.task?.includes('AR-76'))).toBe(true)
+      expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-76'])
+      expect(factory.status().counters.loopIterationFailures).toBeUndefined()
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
       const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
       expect(heartbeat).toMatchObject({ status: 'idle', iteration: 2, maxIterations: 2, registryPath })
       const registry = await readFactoryInFlightRegistry(registryPath)
@@ -4454,7 +4455,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('runLoop catch reaps only failed handoffs and preserves healthy in-flight agents', async () => {
+  it('runLoop never enters dispatch-failure reaping when spawn tasks need no live injection', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-failure-no-overreap-'))
     const heartbeatPath = join(root, 'heartbeat.json')
     const registryPath = join(root, 'registry.json')
@@ -4512,14 +4513,11 @@ describe('FactoryLoop', () => {
       const reports = await factory.runLoop()
 
       expect(reports).toHaveLength(2)
-      expect(reports[0]?.error?.message).toContain('recipient unavailable')
-      expect(healthyAliveDuringFailedReap.length).toBeGreaterThan(0)
-      expect(healthyAliveDuringFailedReap.every(Boolean)).toBe(true)
-      const firstHealthyKill = killed.findIndex((entry) => healthyPids.has(entry.pid) && entry.signal !== 0)
-      const firstFailedKill = killed.findIndex((entry) => failedPids.has(entry.pid) && entry.signal !== 0)
-      expect(firstFailedKill).toBeGreaterThanOrEqual(0)
-      expect(firstHealthyKill).toBeGreaterThan(firstFailedKill)
-      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
+      expect(reports.every((report) => report.error === undefined)).toBe(true)
+      expect(fleet.messages).toEqual([])
+      expect(fleet.spawns).toHaveLength(4)
+      expect(fleet.spawns.every((spawn) => spawn.task?.includes('Factory will hand the opened PR'))).toBe(true)
+      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -7214,50 +7212,32 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it('confirms delivery of the implementer task and reviewer handoff after dispatch', async () => {
+  it('delivers the complete implementer and reviewer briefings in their spawn tasks', async () => {
     const mount = new FakeMountClient({ [issuePath(62)]: issueFile(62) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(62), issueFile(62))))
 
-    expect(fleet.messages).toHaveLength(2)
-    expect(fleet.messages[0]).toMatchObject({
-      to: 'ar-62-impl-pear',
-      from: 'factory',
-      data: { issue: { key: 'AR-62' } },
-    })
-    expect(fleet.messages[0]!.text).toContain('GitHub repo: AgentWorkforce/pear')
-    expect(fleet.messages[0]!.text).toContain('Repo path: /work/pear')
-    expect(fleet.messages[0]!.text).toContain('Linear issue: AR-62 - [factory-e2e] Fix factory issue 62')
-    expect(fleet.messages[0]!.text).toContain('Full Linear issue description:')
-    expect(fleet.messages[0]!.text).toContain('Implement the requested fix in src/orchestrator/factory.ts')
-    expect(fleet.messages[0]!.text).toContain('Create a branch for this issue before editing.')
-    expect(fleet.messages[0]!.text).toContain('Commit the implementation and tests.')
-    expect(fleet.messages[0]!.text).toContain('Push the branch to origin.')
-    expect(fleet.messages[0]!.text).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
-    expect(fleet.messages[0]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
-    expect(fleet.messages[0]!.text).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
-    expect(fleet.messages[0]!.text).toContain('DM `broker` when fully done.')
-    expect(fleet.messages[0]!.text).toContain('Merge policy: never - open the PR for human review and approval; never merge it yourself.')
-    expect(fleet.messages[1]).toMatchObject({
-      to: 'ar-62-review',
-      from: 'factory',
-      text: 'Review is queued for AR-62. Watch implementer PR handoff and report readiness.',
-    })
-    expect(fleet.inputs).toEqual([
-      { name: 'ar-62-impl-pear', data: '\r' },
-      { name: 'ar-62-review', data: '\r' },
-    ])
-    expect(fleet.deliveryEvents).toEqual([
-      { kind: 'injected', to: 'ar-62-impl-pear', eventId: 'fake-1' },
-      { kind: 'input', name: 'ar-62-impl-pear', data: '\r' },
-      { kind: 'injected', to: 'ar-62-review', eventId: 'fake-2' },
-      { kind: 'input', name: 'ar-62-review', data: '\r' },
-    ])
+    expect(fleet.spawns).toHaveLength(2)
+    const implementerTask = fleet.spawns.find((spawn) => spawn.name === 'ar-62-impl-pear')?.task
+    const reviewerTask = fleet.spawns.find((spawn) => spawn.name === 'ar-62-review')?.task
+    expect(implementerTask).toContain('GitHub repo: AgentWorkforce/pear')
+    expect(implementerTask).toContain('Repo path: /work/pear')
+    expect(implementerTask).toContain('Linear issue: AR-62 - [factory-e2e] Fix factory issue 62')
+    expect(implementerTask).toContain('Full Linear issue description:')
+    expect(implementerTask).toContain('Implement the requested fix in src/orchestrator/factory.ts')
+    expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
+    expect(implementerTask).toContain('### Factory human input request')
+    expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-62-impl-pear.')
+    expect(reviewerTask).toContain('Post review comments via the GitHub writeback path.')
+    expect(reviewerTask).toContain('### Factory human input request')
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
+    expect(fleet.deliveryEvents).toEqual([])
   })
 
-  it('retries confirmed task injection when the spawned agent is not registered yet', async () => {
+  it('does not depend on live task injection when registration lags', async () => {
     const clock = new ManualClock()
     const mount = new FakeMountClient({ [issuePath(67)]: issueFile(67) })
     const fleet = new LagThenInjectedFleetClient()
@@ -7265,20 +7245,17 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(67), issueFile(67))))
 
-    expect(fleet.injectionAttempts).toBe(3)
-    expect(factory.status().counters.injectionRegistrationLagRetries).toBe(1)
-    expect(fleet.messages.map((message) => message.to)).toEqual([
-      'ar-67-impl-pear',
-      'ar-67-impl-pear',
-      'ar-67-review',
+    expect(fleet.injectionAttempts).toBe(0)
+    expect(factory.status().counters.injectionRegistrationLagRetries).toBeUndefined()
+    expect(fleet.spawns.map((spawn) => spawn.task)).toEqual([
+      expect.stringContaining('Linear issue: AR-67'),
+      expect.stringContaining('Wait for a DM from the implementer(s): ar-67-impl-pear.'),
     ])
-    expect(fleet.inputs).toEqual([
-      { name: 'ar-67-impl-pear', data: '\r' },
-      { name: 'ar-67-review', data: '\r' },
-    ])
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
   })
 
-  it('falls back to the message recipient when the live injected ack omits targets', async () => {
+  it('does not consult live-injection acknowledgments during dispatch', async () => {
     class UndefinedTargetsFleetClient extends FakeFleetClient {
       override async waitForInjected(
         input: Parameters<FakeFleetClient['waitForInjected']>[0],
@@ -7298,19 +7275,12 @@ describe('FactoryLoop', () => {
       issue: { key: 'AR-65' },
     })
 
-    expect(fleet.inputs).toEqual([
-      { name: 'ar-65-impl-pear', data: '\r' },
-      { name: 'ar-65-review', data: '\r' },
-    ])
-    expect(fleet.deliveryEvents).toEqual([
-      { kind: 'injected', to: 'ar-65-impl-pear', eventId: 'fake-1' },
-      { kind: 'input', name: 'ar-65-impl-pear', data: '\r' },
-      { kind: 'injected', to: 'ar-65-review', eventId: 'fake-2' },
-      { kind: 'input', name: 'ar-65-review', data: '\r' },
-    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review'])
+    expect(fleet.inputs).toEqual([])
+    expect(fleet.deliveryEvents).toEqual([])
   })
 
-  it('reinjects the confirmed implementer task after delivery_failed', async () => {
+  it('does not retry an obsolete implementer task injection after delivery_failed', async () => {
     const mount = new FakeMountClient({ [issuePath(63)]: issueFile(63) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
@@ -7321,28 +7291,15 @@ describe('FactoryLoop', () => {
     fleet.emitDeliveryFailed({ to: 'ar-63-impl-pear', msgId: 'fake-1', reason: 'dropped' })
     await flush()
 
-    expect(fleet.messages).toHaveLength(3)
-    expect(fleet.messages[2]).toMatchObject({
-      to: 'ar-63-impl-pear',
-      from: 'factory',
-      data: { issue: { key: 'AR-63' } },
-    })
-    expect(fleet.messages[2]!.text).toContain('Linear issue: AR-63 - [factory-e2e] Fix factory issue 63')
-    expect(fleet.messages[2]!.text).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
-    expect(fleet.messages[2]!.text).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
-    expect(fleet.messages[2]!.text).toContain('Factory will hand the opened PR to reviewer `ar-63-review`.')
-    expect(fleet.inputs).toEqual([
-      { name: 'ar-63-impl-pear', data: '\r' },
-      { name: 'ar-63-review', data: '\r' },
-      { name: 'ar-63-impl-pear', data: '\r' },
-    ])
-    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-63-impl-pear', eventId: 'fake-3' })
-    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-63-impl-pear', data: '\r' })
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-63-impl-pear')?.task)
+      .toContain('Linear issue: AR-63')
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-63' } })
   })
 
-  it('reinjects the confirmed reviewer handoff after delivery_failed', async () => {
+  it('does not retry an obsolete reviewer handoff injection after delivery_failed', async () => {
     const mount = new FakeMountClient({ [issuePath(64)]: issueFile(64) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
@@ -7351,19 +7308,10 @@ describe('FactoryLoop', () => {
     fleet.emitDeliveryFailed({ to: 'ar-64-review', msgId: 'fake-2', reason: 'dropped' })
     await flush()
 
-    expect(fleet.messages).toHaveLength(3)
-    expect(fleet.messages[2]).toMatchObject({
-      to: 'ar-64-review',
-      from: 'factory',
-      text: 'Review is queued for AR-64. Watch implementer PR handoff and report readiness.',
-    })
-    expect(fleet.inputs).toEqual([
-      { name: 'ar-64-impl-pear', data: '\r' },
-      { name: 'ar-64-review', data: '\r' },
-      { name: 'ar-64-review', data: '\r' },
-    ])
-    expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-64-review', eventId: 'fake-3' })
-    expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-64-review', data: '\r' })
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-64-review')?.task)
+      .toContain('Wait for a DM from the implementer(s): ar-64-impl-pear.')
+    expect(fleet.messages).toEqual([])
+    expect(fleet.inputs).toEqual([])
   })
 
   it('emits error and rejects when writeback verification fails', async () => {
@@ -9492,12 +9440,11 @@ describe('FactoryLoop', () => {
     })
 
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-58-impl-pear', 'ar-58-review-pear']))
-    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
-      name: 'ar-58-impl-pear',
-      data: '<integration-event source="github" issue="58">\nHuman reply on the GitHub issue:\nUse the shared retry helper and add regression coverage.\n</integration-event>\r',
-    }))
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-58-impl-pear')?.task)
+      .toContain('Human clarification from GitHub:\nUse the shared retry helper and add regression coverage.')
+    expect(fleet.inputs).toEqual([])
     expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
-    expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBe(1)
+    expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBeUndefined()
   })
 
   it('requires a start-of-body correlation token from the issue reporter before resolving GitHub triage', async () => {
@@ -9650,7 +9597,9 @@ describe('FactoryLoop', () => {
       await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
       await vi.waitFor(async () => {
-        expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+        expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([
+          [expect.any(String), expect.objectContaining({ detectAgentQuestions: true, pending: [] })],
+        ])
       })
       expect(restartedFleet.spawns).toEqual([])
       expect(restartedFactory.status().counters.githubAnswersClaimedReplaySuppressed).toBe(1)
@@ -9709,7 +9658,9 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review-pear']))
       expect(restartedFactory.status().counters.githubIssueCommentWatchersRearmed).toBe(1)
-      expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+      expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([
+        [expect.any(String), expect.objectContaining({ detectAgentQuestions: true, pending: [] })],
+      ])
       await restartedFactory.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -9737,11 +9688,11 @@ describe('FactoryLoop', () => {
 
     await vi.waitFor(() => expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1))
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-23-impl-pear', 'ar-23-review'])
-    await vi.waitFor(() => expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-23-impl-pear', data: '<integration-event source="slack" issue="AR-23">\nHuman reply in the Slack thread:\nWhen deployed via ./workforce, one-click deploy in cloud should auto-join the configured Slack channel and ask there if blocked. Verify with tests.\n</integration-event>\r' },
-    ]))
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-23-impl-pear')?.task)
+      .toContain('Human clarification from Slack:\nWhen deployed via ./workforce, one-click deploy in cloud should auto-join the configured Slack channel and ask there if blocked. Verify with tests.')
+    expect(slackAnswerInputs(fleet)).toEqual([])
     expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1)
-    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBeUndefined()
     expect(factory.status().counters.slackTriageAnswersStillEscalated).toBeUndefined()
     expect(factory.status().counters.errors).toBeUndefined()
   })
@@ -9768,12 +9719,12 @@ describe('FactoryLoop', () => {
       { name: 'ar-32-review', role: 'reviewer' },
     ])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-32-impl-pear', data: '<integration-event source="slack" issue="AR-32">\nHuman reply in the Slack thread:\nThe cloud deploy path should auto-join the configured Slack channel before asking follow-up questions there.\n</integration-event>\r' },
-    ])
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-32-impl-pear')?.task)
+      .toContain('Human clarification from Slack:\nThe cloud deploy path should auto-join the configured Slack channel before asking follow-up questions there.')
+    expect(slackAnswerInputs(fleet)).toEqual([])
     expect(factory.status().counters.slackTriageAnswersReplayed).toBe(1)
     expect(factory.status().counters.slackTriageAnswersDispatchedWithRemainingEscalation).toBe(1)
-    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBe(1)
+    expect(factory.status().counters.slackTriageAnswersInjectedToAgents).toBeUndefined()
     expect(factory.status().counters.errors).toBeUndefined()
   })
 
@@ -9871,7 +9822,6 @@ describe('FactoryLoop', () => {
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect(slackRoots[0]?.path).toMatch(new RegExp(`^/slack/channels/${channelDir}/messages/`))
-    expect(fleet.messages[0]?.text).toContain(`/slack/channels/${channelDir}/messages/${mount.threadTs.replace(/\./g, '_')}/replies/question.json`)
 
     emitSlackReply(mount, slackReplyFixturePath(channelDir, mount.threadTs, 'human-answer-35'), 'human-answer-35', {
       text: 'Use the mounted channel directory.',
@@ -9939,16 +9889,17 @@ describe('FactoryLoop', () => {
     })
     await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
 
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-36-impl-pear', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
-      { name: 'ar-36-review', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
-    ])
+    expect(slackAnswerInputs(fleet)).toEqual([])
     expect(fleet.resumes).toEqual([
-      { name: 'ar-36-impl-pear', sessionRef: 'session-ar-36-impl-pear', node: 'self', capability: 'spawn:codex', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' },
-      { name: 'ar-36-review', sessionRef: 'session-ar-36-review', node: 'self', capability: 'spawn:claude', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' },
+      expect.objectContaining({ name: 'ar-36-impl-pear', sessionRef: 'session-ar-36-impl-pear', capability: 'spawn:codex' }),
+      expect.objectContaining({ name: 'ar-36-review', sessionRef: 'session-ar-36-review', capability: 'spawn:claude' }),
     ])
+    for (const resume of fleet.resumes) {
+      expect(resume.task).toContain('The blocked question was: Which retry helper should I use?')
+      expect(resume.task).toContain('The human answered: Use the shared retry helper in factory.ts.')
+    }
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-36'])
-    expect(fleet.messages).toHaveLength(2)
+    expect(fleet.messages).toEqual([])
 
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-noise-36'), 'human-noise-36', {
       text: 'One more thought that must not trigger a second wake.',
@@ -10083,7 +10034,8 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
     expect(factory.status().counters.clarificationQuestionsDelivered).toBe(1)
     expect(fleet.resumes).toHaveLength(2)
-    expect(slackAnswerInputs(fleet)).toHaveLength(2)
+    expect(slackAnswerInputs(fleet)).toEqual([])
+    expect(fleet.resumes.every((resume) => resume.task?.includes('Persist this answer while confirmation is blocked.'))).toBe(true)
     expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
     await factory.stop()
   })
@@ -10402,47 +10354,72 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('posts a mid-task agent question to the source GitHub issue when Slack is unconfigured', async () => {
+  it('detects a durable source-issue question and returns the answer only through fresh spawn tasks', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 59)
-    const issue = githubIssueFile(59, { labels: ['factory'] })
+    const issue = githubIssueFile(59, { labels: ['factory'], author: 'reporter' })
     const mount = new FakeMountClient({ [path]: issue })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-59-impl-pear', 'session-ar-59-impl-pear')
+    fleet.setSessionRef('ar-59-review-pear', 'session-ar-59-review-pear')
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const githubWriteback = new RecordingGithubWriteback()
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
+      stateStore,
       triage: new StaticTriage(),
       githubWriteback,
     })
 
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
-    fleet.emitAgentMessage({
-      from: 'ar-59-impl-pear',
-      target: 'factory',
-      body: 'FACTORY_NEEDS_INPUT\nIssue: 59\nQuestion: Which retry helper should I use?',
-      eventId: 'github-agent-question-59',
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-59-impl-pear')?.task)
+      .toContain('post one comment on AgentWorkforce/pear#59')
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-59-review-pear')?.task)
+      .toContain('Agent: ar-59-review-pear')
+    expect(fleet.messages).toEqual([])
+
+    mount.files.set(path, { content: githubIssueFile(59, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9001, {
+      body: [
+        '### Factory human input request',
+        'Agent: ar-59-impl-pear',
+        'Issue: 59',
+        'Question: Which retry helper should I use?',
+      ].join('\n'),
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
     })
-    await flush()
-    await flush()
+    fleet.emitAgentExit('ar-59-impl-pear', 'completed')
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    expect(factory.status().counters.githubQuestionExitsSuppressed).toBe(1)
+    expect(fleet.releases).toEqual([
+      { name: 'ar-59-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-59-review-pear', reason: 'waiting-for-human' },
+    ])
+    const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(waiting).toMatchObject({
+      askerName: 'ar-59-impl-pear',
+      question: 'Which retry helper should I use?',
+      questionSource: 'github',
+      questionPostedAtMs: expect.any(Number),
+      parkedAtMs: expect.any(Number),
+    })
+    expect(githubWriteback.comments.some((comment) => comment.body.includes(' needs input.'))).toBe(false)
 
-    expect(githubWriteback.comments.at(-1)?.body).toContain('59: ar-59-impl-pear needs input.')
-    expect(githubWriteback.comments.at(-1)?.body).toContain('Question: Which retry helper should I use?')
-    expect(githubWriteback.comments.at(-1)?.body).toMatch(/<!-- factory-escalation:factory-agent-question-/u)
-    expect(factory.status().counters.agentQuestionsPostedToGithub).toBe(1)
-
-    const agentReplyPrefix = githubReplyPrefixFromComment(githubWriteback.comments.at(-1)?.body)
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9002, {
-      body: `${agentReplyPrefix} Use the shared helper in factory.ts.`,
-      author: { login: 'issue-author' },
+      body: 'Use the shared helper in factory.ts.',
+      author: { login: 'reporter' },
     })
-    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
-      name: 'ar-59-impl-pear',
-      data: '<integration-event source="github" issue="59">\nHuman reply from @issue-author on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
-    }))
-    expect(factory.status().counters.githubAnswersInjected).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(fleet.inputs).toEqual([])
+    expect(fleet.resumes).toHaveLength(2)
+    for (const resume of fleet.resumes) {
+      expect(resume.task).toContain('The blocked question was: Which retry helper should I use?')
+      expect(resume.task).toContain('The human answered as @reporter: Use the shared helper in factory.ts.')
+    }
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
   })
 
-  it('falls back to the source GitHub issue when stale Slack prevented a dispatch thread', async () => {
+  it('parks and restarts from GitHub comments even when Slack is stale and has no dispatch thread', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 67)
     const issue = githubIssueFile(67, { labels: ['factory'], author: 'reporter' })
     const mount = new SlackStatusConfirmMountClient({ [path]: issue })
@@ -10458,32 +10435,28 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
     expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toEqual([])
-    fleet.emitAgentMessage({
-      from: 'ar-67-impl-pear',
-      target: 'factory',
-      body: '[factory-needs-input] Which fallback remains available?',
-      eventId: 'github-slack-fallback-question-67',
+    mount.files.set(path, { content: githubIssueFile(67, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 67, 9800, {
+      body: '### Factory human input request\nAgent: ar-67-impl-pear\nIssue: 67\nQuestion: Which durable path remains available?',
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
     })
 
-    await vi.waitFor(() => expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1))
-    const comment = factoryGithubQuestionComments(githubWriteback)[0]?.body
-    expect(comment).toContain('Slack fallback reason: Slack writeback is degraded: slack sync status is stale.')
-    expect(factory.status().counters.agentQuestionsRoutedToGithubFallback).toBe(1)
-    expect(fleet.releases).toEqual([])
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    expect(fleet.releases).toHaveLength(2)
+    expect(slackReplyWrites(mount)).toEqual([])
+    expect(factory.status().counters.agentQuestionSlackMirrorsSkippedDegraded).toBe(1)
 
-    const replyPrefix = githubReplyPrefixFromComment(comment)
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 67, 9801, {
-      body: `${replyPrefix} Use the GitHub fallback.`,
+      body: 'Use the GitHub issue record.',
       author: { login: 'reporter' },
     })
-    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
-      name: 'ar-67-impl-pear',
-      data: '<integration-event source="github" issue="67">\nHuman reply from @reporter on the GitHub issue:\nUse the GitHub fallback.\n</integration-event>\r',
-    }))
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(fleet.inputs).toEqual([])
+    expect(fleet.spawns.slice(2).every((spawn) => spawn.task?.includes('Use the GitHub issue record.'))).toBe(true)
     await factory.stop()
   })
 
-  it('preserves the durable park and wake lifecycle when a Slack thread falls back to GitHub', async () => {
+  it('mirrors a GitHub question to Slack without accepting Slack as the response record', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 68)
     const issue = githubIssueFile(68, { labels: ['factory'], author: 'reporter' })
     const mount = new SlackStatusConfirmMountClient({ [path]: issue })
@@ -10503,29 +10476,32 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
     expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
     mount.files.set(path, { content: githubIssueFile(68, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
-    mount.slackStatus = { provider: 'slack', status: 'stale' }
-    fleet.emitAgentMessage({
-      from: 'ar-68-impl-pear',
-      target: 'factory',
-      body: '[factory-needs-input] Keep the durable lifecycle through fallback.',
-      eventId: 'github-durable-fallback-question-68',
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 68, 9801, {
+      body: '### Factory human input request\nAgent: ar-68-impl-pear\nIssue: 68\nQuestion: Keep the issue record authoritative.',
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
     })
 
-    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
-    await vi.waitFor(() => expect(factory.status().counters.clarificationQuestionsDeliveredViaGithub).toBe(1))
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionsMirroredToSlack).toBe(1))
     expect(fleet.releases).toEqual([
       { name: 'ar-68-impl-pear', reason: 'waiting-for-human' },
       { name: 'ar-68-review-pear', reason: 'waiting-for-human' },
     ])
-    expect(slackReplyWrites(mount)).toEqual([])
+    expect(slackReplyWrites(mount).at(-1)?.content.text).toContain('Keep the issue record authoritative.')
     const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
     expect(waiting?.questionPostedAtMs).toBeTypeOf('number')
-    const comment = factoryGithubQuestionComments(githubWriteback)[0]?.body
-    expect(comment).toContain('Slack fallback reason: Slack writeback is degraded: slack sync status is stale.')
+    expect(waiting?.questionSource).toBe('github')
 
-    const replyPrefix = githubReplyPrefixFromComment(comment)
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'slack-answer-68'), 'slack-answer-68', {
+      text: 'This Slack reply is visibility-only.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await vi.waitFor(() => expect(factory.status().counters.slackClarificationRepliesIgnoredGithubRecord).toBe(1))
+    expect(fleet.resumes).toEqual([])
+
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 68, 9802, {
-      body: `${replyPrefix} Resume from the saved sessions.`,
+      body: 'Resume from the saved sessions.',
       author: { login: 'reporter' },
     })
 
@@ -10534,15 +10510,13 @@ describe('FactoryLoop', () => {
       'session-ar-68-impl-pear',
       'session-ar-68-review-pear',
     ])
-    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
-      '<integration-event source="github" issue="68">\nHuman reply from @reporter on the GitHub issue:\nResume from the saved sessions.\n</integration-event>\r',
-      '<integration-event source="github" issue="68">\nHuman reply from @reporter on the GitHub issue:\nResume from the saved sessions.\n</integration-event>\r',
-    ])
+    expect(slackAnswerInputs(fleet)).toEqual([])
+    expect(fleet.resumes.every((resume) => resume.task?.includes('Resume from the saved sessions.'))).toBe(true)
     expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
     await factory.stop()
   })
 
-  it('keeps the delivery lease through a confirmed Slack write failure and fast GitHub reply', async () => {
+  it('does not let an optional Slack mirror failure block a fast GitHub answer', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 69)
     const issue = githubIssueFile(69, { labels: ['factory'], author: 'reporter' })
     const mount = new FailNextSlackReplyMountClient({ [path]: issue })
@@ -10562,21 +10536,21 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
     mount.files.set(path, { content: githubIssueFile(69, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
     mount.failNextReply = true
-    fleet.emitAgentMessage({
-      from: 'ar-69-impl-pear',
-      target: 'factory',
-      body: '[factory-needs-input] Do not lose a reply during write failure fallback.',
-      eventId: 'github-write-failure-fallback-question-69',
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 69, 9810, {
+      body: '### Factory human input request\nAgent: ar-69-impl-pear\nIssue: 69\nQuestion: Do not lose the durable answer.',
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
+    })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 69, 9811, {
+      body: 'Preserve this fast issue reply.',
+      author: { login: 'reporter' },
     })
 
     await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
     expect(mount.failedReplies).toBe(1)
-    expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
-    expect(stateStore.completedQuestionPostedAtMs).toBeTypeOf('number')
+    expect(factoryGithubQuestionComments(githubWriteback)).toEqual([])
     expect(factory.status()).toMatchObject({
       counters: {
-        clarificationQuestionDeliveryFailures: 1,
-        clarificationQuestionsDeliveredViaGithub: 1,
+        agentQuestionSlackMirrorFailures: 1,
         githubClarificationRepliesClaimed: 1,
       },
     })
@@ -10584,10 +10558,8 @@ describe('FactoryLoop', () => {
       'session-ar-69-impl-pear',
       'session-ar-69-review-pear',
     ])
-    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
-      '<integration-event source="github" issue="69">\nHuman reply from @reporter on the GitHub issue:\nPreserve this fast fallback reply.\n</integration-event>\r',
-      '<integration-event source="github" issue="69">\nHuman reply from @reporter on the GitHub issue:\nPreserve this fast fallback reply.\n</integration-event>\r',
-    ])
+    expect(slackAnswerInputs(fleet)).toEqual([])
+    expect(fleet.resumes.every((resume) => resume.task?.includes('Preserve this fast issue reply.'))).toBe(true)
     expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
     await factory.stop()
   })
@@ -10770,11 +10742,9 @@ describe('FactoryLoop', () => {
         'session-ar-70-impl-pear',
         'session-ar-70-review-pear',
       ].sort())
-      expect([...slackAnswerInputs(restartedFleetA), ...slackAnswerInputs(restartedFleetB)]).toHaveLength(2)
-      expect([...slackAnswerInputs(restartedFleetA), ...slackAnswerInputs(restartedFleetB)].map((input) => input.data)).toEqual([
-        '<integration-event source="github" issue="70">\nHuman reply from @reporter on the GitHub issue:\nPreserve the reply through ambiguous recovery.\n</integration-event>\r',
-        '<integration-event source="github" issue="70">\nHuman reply from @reporter on the GitHub issue:\nPreserve the reply through ambiguous recovery.\n</integration-event>\r',
-      ])
+      expect([...slackAnswerInputs(restartedFleetA), ...slackAnswerInputs(restartedFleetB)]).toEqual([])
+      expect([...restartedFleetA.resumes, ...restartedFleetB.resumes]
+        .every((resume) => resume.task?.includes('Preserve the reply through ambiguous recovery.'))).toBe(true)
       expect(await restartedStateA.listWaitingClarifications('factory-test')).toEqual([])
       await Promise.all([restartedA.stop(), restartedB.stop()])
     } finally {
@@ -10809,10 +10779,8 @@ describe('FactoryLoop', () => {
       'session-ar-39-impl-pear',
       'session-ar-39-review',
     ])
-    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
-      '<integration-event source="slack" issue="AR-39">\nHuman reply in the Slack thread:\nThe immediate answer must survive the post-to-park transition.\n</integration-event>\r',
-      '<integration-event source="slack" issue="AR-39">\nHuman reply in the Slack thread:\nThe immediate answer must survive the post-to-park transition.\n</integration-event>\r',
-    ])
+    expect(slackAnswerInputs(fleet)).toEqual([])
+    expect(fleet.resumes.every((resume) => resume.task?.includes('The immediate answer must survive the post-to-park transition.'))).toBe(true)
   })
 
   it('retries a transient background wake-lease renewal error without abandoning ownership', async () => {
@@ -11003,7 +10971,8 @@ describe('FactoryLoop', () => {
         'session-ar-38-impl-pear',
         'session-ar-38-review',
       ])
-      expect(slackAnswerInputs(restartedFleet)).toHaveLength(2)
+      expect(slackAnswerInputs(restartedFleet)).toEqual([])
+      expect(restartedFleet.resumes.every((resume) => resume.task?.includes('Resume through the stored session refs.'))).toBe(true)
       expect(restartedFactory.status().counters.clarificationTeamsWoken).toBe(1)
 
       restartedFleet.emitAgentMessage({
@@ -11077,7 +11046,8 @@ describe('FactoryLoop', () => {
         'session-ar-55-impl-pear',
         'session-ar-55-review',
       ])
-      expect(slackAnswerInputs(restartedFleet)).toHaveLength(2)
+      expect(slackAnswerInputs(restartedFleet)).toEqual([])
+      expect(restartedFleet.resumes.every((resume) => resume.task?.includes('Resume this directly from startup drain.'))).toBe(true)
       expect(await restartedState.listWaitingClarifications('factory-test')).toEqual([])
       await restartedFactory.stop()
     } finally {
@@ -11242,18 +11212,20 @@ describe('FactoryLoop', () => {
     })
 
     await firstFactory.dispatch(await firstFactory.triageIssue(parseGithubFactoryIssue(path, issue)))
-    firstFleet.emitAgentMessage({
-      from: 'ar-63-impl-pear',
-      target: 'factory',
-      body: '[factory-needs-input] Which retry helper?',
-      eventId: 'github-agent-question-63',
+    mount.files.set(path, { content: githubIssueFile(63, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 63, 9300, {
+      body: '### Factory human input request\nAgent: ar-63-impl-pear\nIssue: 63\nQuestion: Which retry helper?',
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
     })
-    await vi.waitFor(() => expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1))
-    const prefix = githubReplyPrefixFromComment(factoryGithubQuestionComments(githubWriteback)[0]?.body)
+    await vi.waitFor(() => expect(firstFactory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    expect((await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]).toMatchObject({
+      questionSource: 'github',
+      question: 'Which retry helper?',
+    })
     await firstFactory.stop()
 
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 63, 9301, {
-      body: `${prefix} Use the shared helper.`,
+      body: 'Use the shared helper.',
       author: { login: 'reporter' },
     })
 
@@ -11267,11 +11239,17 @@ describe('FactoryLoop', () => {
     })
     await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
-    await vi.waitFor(() => expect(restartFleet.inputs).toContainEqual({
-      name: 'ar-63-impl-pear',
-      data: '<integration-event source="github" issue="63">\nHuman reply from @reporter on the GitHub issue:\nUse the shared helper.\n</integration-event>\r',
-    }))
-    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
+    await vi.waitFor(() => {
+      expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-63-impl-pear', 'ar-63-review-pear'])
+    })
+    expect(restartFleet.inputs).toEqual([])
+    expect(restartFleet.spawns.every((spawn) => (
+      spawn.task?.includes('Which retry helper?')
+      && spawn.task.includes('Use the shared helper.')
+    ))).toBe(true)
+    expect(await stateStore.listGithubIssueCommentWatches('factory-test')).toEqual([
+      [expect.any(String), expect.objectContaining({ detectAgentQuestions: true, pending: [] })],
+    ])
     await restartedFactory.stop()
   })
 
@@ -11387,12 +11365,11 @@ describe('FactoryLoop', () => {
     factory.on('error', (payload) => emittedErrors.push(payload))
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
-    expect(fleet.messages.find((message) => message.to === 'ar-39-impl-pear')?.text).toContain(
-      'DM `factory` with `[factory-needs-input]`',
-    )
-    expect(fleet.messages.find((message) => message.to === 'ar-39-impl-pear')?.text).toContain(
-      'operator-visible delivery error',
-    )
+    const implementerTask = fleet.spawns.find((spawn) => spawn.name === 'ar-39-impl-pear')?.task
+    expect(implementerTask).toContain('post one comment on the source GitHub issue')
+    expect(implementerTask).toContain('After the issue-comment writeback confirms, exit cleanly')
+    expect(implementerTask).toContain('Slack is optional and is not the request/response record')
+    expect(implementerTask).toContain('Do not DM `factory`, emit a needs-input marker')
     fleet.emitAgentMessage({
       from: 'ar-39-impl-pear',
       target: 'factory',

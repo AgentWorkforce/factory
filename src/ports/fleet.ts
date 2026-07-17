@@ -57,6 +57,8 @@ export interface FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    /** Fresh task delivered atomically with the resumed harness spawn. */
+    task?: string
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>

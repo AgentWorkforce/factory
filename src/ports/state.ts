@@ -21,7 +21,9 @@ export type WaitingClarification = {
   issue: IssueRef
   decision: TriageDecision
   dryRun: boolean
-  threadId: string
+  /** Optional Slack mirror thread. GitHub remains the durable request/response record. */
+  threadId?: string
+  questionSource?: 'github' | 'slack'
   askerName: string
   question: string
   askedAtMs: number
@@ -122,6 +124,8 @@ export type GithubIssueCommentWatchPending = {
   authorizedAuthor: string
   decision?: TriageDecision
   claimedByCommentId?: string
+  /** Accept the first later authorized issue comment without a correlation prefix. */
+  replyAfterCommentId?: string
 }
 
 export type GithubIssueCommentWatchState = {
@@ -133,6 +137,8 @@ export type GithubIssueCommentWatchState = {
     url: string
   }
   pending: GithubIssueCommentWatchPending[]
+  /** Keep watching this source issue for structured agent question comments. */
+  detectAgentQuestions?: boolean
   sinceCommentId?: string
   lastSeenCommentId?: string
   processedCommentIds?: string[]

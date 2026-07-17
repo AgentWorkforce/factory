@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
-import { renderAgentTask } from './templates'
+import {
+  parseGithubHumanInputRequest,
+  renderAgentTask,
+  renderGithubHumanInputRequest,
+} from './templates'
 
 const baseConfig = FactoryConfigSchema.parse({
   workspaceId: 'workspace',
@@ -12,6 +16,12 @@ const issue = {
   key: 'AR-123',
   title: 'Fix duplicate delivery',
   description: 'Full description with renderer reconnects, broker replay, and acceptance criteria.',
+  github: {
+    owner: 'AgentWorkforce',
+    repo: 'factory',
+    number: 123,
+    url: 'https://github.com/AgentWorkforce/factory/issues/123',
+  },
 }
 
 describe('renderAgentTask', () => {
@@ -22,6 +32,7 @@ describe('renderAgentTask', () => {
       role: 'implementer',
       config: baseConfig,
       reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl-pear',
     })
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
@@ -34,12 +45,15 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(task).toContain('Factory will hand the opened PR to reviewer `ar-123-review`.')
-    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
-    expect(task).toContain('source GitHub issue when available')
-    expect(task).toContain('operator-visible delivery error')
-    expect(task).toContain('No durable Slack dispatch thread was established')
-    expect(task).toContain('Keep the session available after asking')
-    expect(task).not.toContain('release the whole team and resume it from session memory')
+    expect(task).toContain('post one comment on AgentWorkforce/factory#123')
+    expect(task).toContain('/github/repos/AgentWorkforce/factory/issues/123')
+    expect(task).toContain('### Factory human input request')
+    expect(task).toContain('Agent: ar-123-impl-pear')
+    expect(task).toContain('Issue: AR-123')
+    expect(task).toContain('exit cleanly')
+    expect(task).toContain('Slack is optional')
+    expect(task).toContain('question and answer folded into each fresh spawn task')
+    expect(task).not.toContain('[factory-needs-input]')
     expect(task).toContain('DM `broker` when fully done.')
     expect(task).toContain('Do NOT auto-merge.')
     expect(task).toContain('Merge policy: never')
@@ -53,6 +67,7 @@ describe('renderAgentTask', () => {
       config: baseConfig,
       reviewerName: 'ar-123-review',
       implementerNames: ['ar-123-impl-ui', 'ar-123-impl-broker'],
+      agentName: 'ar-123-review',
     })
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
@@ -61,6 +76,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Post review comments via the GitHub writeback path.')
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
     expect(task).toContain('DM `broker` when the review cycle is complete.')
+    expect(task).toContain('Agent: ar-123-review')
   })
 
   it('renders an aggressive, spec-grounded babysitter task referencing the open PR', () => {
@@ -246,27 +262,53 @@ describe('renderAgentTask', () => {
       reviewerName: 'ar-123-review',
     })
 
-    // Should not add an extra trailing blank line + integration section.
-    expect(task).not.toMatch(/\n\n(.integrations|Connected integrations)/m)
+    expect(task).not.toContain('Connected integrations:')
   })
 
-  it('makes the needs-input marker an explicit release boundary', () => {
+  it('makes the source issue comment a durable release boundary', () => {
     const task = renderAgentTask({
       issue,
       route: { repo: 'pear', clonePath: '/tmp/pear' },
       role: 'implementer',
       config: baseConfig,
       reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl-pear',
       slackDispatchThread: { channel: 'C123', threadId: '169.000', mountRoot: '/work/.integrations' },
     })
 
-    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
-    expect(task).toContain('/work/.integrations/slack/channels/C123/messages/169_000/replies/question.json')
-    expect(task).toContain('source GitHub issue when available')
-    expect(task).toContain('operator-visible delivery error')
-    expect(task).toContain('Do not wait or poll')
-    expect(task).toContain('release the whole team and resume it from session memory only after the first human reply')
-    expect(task).toContain('cold-start the team with the issue, question, reply, branch, and PR context')
+    expect(task).toContain('post one comment on AgentWorkforce/factory#123')
+    expect(task).toContain('/github/repos/AgentWorkforce/factory/issues/123')
+    expect(task).toContain('Agent: ar-123-impl-pear')
+    expect(task).toContain('Question: <one concrete question>')
+    expect(task).toContain('Do not DM `factory`, emit a needs-input marker, wait, poll')
+    expect(task).toContain('records the team as awaiting a human answer, and releases the team')
+    expect(task).toContain('question and answer folded into each fresh spawn task')
+    expect(task).toContain('cold-start the team with the issue, question, answer, branch, and PR context')
+    expect(task).toContain('Slack is optional')
+    expect(task).not.toContain('[factory-needs-input]')
     expect(task).not.toContain('FACTORY_NEEDS_INPUT')
+  })
+})
+
+describe('GitHub human input request comments', () => {
+  it('round-trips the durable structured comment', () => {
+    const body = renderGithubHumanInputRequest(
+      'ar-123-review',
+      'AR-123',
+      'Should this retry preserve the original idempotency key?',
+    )
+
+    expect(parseGithubHumanInputRequest(body)).toEqual({
+      agentName: 'ar-123-review',
+      issueKey: 'AR-123',
+      question: 'Should this retry preserve the original idempotency key?',
+    })
+  })
+
+  it('ignores ordinary comments and incomplete request records', () => {
+    expect(parseGithubHumanInputRequest('Please use the shared retry helper.')).toBeUndefined()
+    expect(parseGithubHumanInputRequest(
+      '### Factory human input request\nAgent: ar-123-review\nIssue: AR-123',
+    )).toBeUndefined()
   })
 })

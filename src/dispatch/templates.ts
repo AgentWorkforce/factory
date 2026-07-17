@@ -5,6 +5,12 @@ export interface TemplateIssue {
   key: string
   title: string
   description: string
+  github?: {
+    owner: string
+    repo: string
+    number: number
+    url?: string
+  }
 }
 
 export interface TemplateRoute {
@@ -56,6 +62,8 @@ export interface RenderAgentTaskInput {
   integrationInstructions?: string
   /** Exact branch Factory will publish after the implementer pushes it. */
   branchName?: string
+  /** Registered relay identity used in durable human-input request comments. */
+  agentName?: string
   /**
    * Absolute path to the .integrations mount root. The agent runs in its repo
    * clonePath, not the daemon cwd where .integrations lives, so every
@@ -74,6 +82,14 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ? `Repo path: ${input.route.clonePath}`
     : `Clone/worktree: clone ${repo} and work in your own isolated git worktree before editing.`
   const implementers = input.implementerNames?.length ? input.implementerNames.join(', ') : 'the implementer(s)'
+  const questionAgentName = input.agentName ?? '<your registered relay agent name>'
+  const sourceGithubIssue = input.issue.github
+  const sourceGithubIssueLabel = sourceGithubIssue
+    ? `${sourceGithubIssue.owner}/${sourceGithubIssue.repo}#${sourceGithubIssue.number}`
+    : 'the source GitHub issue linked from this task'
+  const sourceGithubIssuePath = sourceGithubIssue
+    ? `${mountRoot}/github/repos/${sourceGithubIssue.owner}/${sourceGithubIssue.repo}/issues/${sourceGithubIssue.number}`
+    : `${mountRoot}/github/repos`
 
   const header = [
     `GitHub repo: ${repo}`,
@@ -100,19 +116,15 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   ]
   const questionInstructions = [
     '',
-    'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
-    'Factory will route the question through the issue Slack thread when available and healthy, otherwise through the source GitHub issue when available. If neither write path works, Factory will emit an operator-visible delivery error instead of silently discarding the question.',
-    ...(input.slackDispatchThread
-      ? [
-        // Absolute path: the agent runs in its repo clone, not the daemon cwd
-        // where .integrations lives, so a relative path would be unreachable.
-        `Factory will durably post and, if necessary, retry the question through that routing policy; the primary Slack thread is represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
-        'After sending the marker, stop work and finish your session normally. Do not wait or poll: Factory will release the whole team and resume it from session memory only after the first human reply.',
-        'If session resume is unavailable, Factory will cold-start the team with the issue, question, reply, branch, and PR context so work can be re-hydrated explicitly.',
-      ]
-      : [
-        'No durable Slack dispatch thread was established for this task. Keep the session available after asking so Factory can inject a GitHub reply if that fallback is available.',
-      ]),
+    `If you are blocked or need a human answer mid-task, finish any safe reversible work first, then post one comment on ${sourceGithubIssueLabel} through the connected GitHub issue-comment writeback under ${sourceGithubIssuePath}.`,
+    'The comment body must use this durable request format (replace only the question placeholder):',
+    '```markdown',
+    renderGithubHumanInputRequest(questionAgentName, input.issue.key, '<one concrete question>'),
+    '```',
+    'After the issue-comment writeback confirms, exit cleanly. Do not DM `factory`, emit a needs-input marker, wait, poll, or keep the session alive for an injected reply.',
+    'Factory reads the source issue comments, records the team as awaiting a human answer, and releases the team. A Slack copy may be posted for visibility, but Slack is optional and is not the request/response record.',
+    'After the first authorized human answer appears as a later comment on the same issue, Factory will start the released agents again with the question and answer folded into each fresh spawn task.',
+    'If session resume is unavailable, Factory will cold-start the team with the issue, question, answer, branch, and PR context so work can be re-hydrated explicitly.',
   ]
 
   if (input.role === 'babysitter') {
@@ -235,6 +247,39 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ...questionInstructions,
     ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
   ].join('\n')
+}
+
+export const GITHUB_HUMAN_INPUT_REQUEST_HEADING = '### Factory human input request'
+
+export type GithubHumanInputRequest = {
+  agentName: string
+  issueKey: string
+  question: string
+}
+
+export function renderGithubHumanInputRequest(
+  agentName: string,
+  issueKey: string,
+  question: string,
+): string {
+  return [
+    GITHUB_HUMAN_INPUT_REQUEST_HEADING,
+    `Agent: ${agentName}`,
+    `Issue: ${issueKey}`,
+    `Question: ${question}`,
+  ].join('\n')
+}
+
+export function parseGithubHumanInputRequest(body: string): GithubHumanInputRequest | undefined {
+  const normalized = body.trim().replace(/^```(?:markdown)?\s*\n|\n```$/gu, '')
+  const match = normalized.match(
+    /^### Factory human input request\s*\r?\nAgent:\s*`?([^`\r\n]+?)`?\s*\r?\nIssue:\s*`?([^`\r\n]+?)`?\s*\r?\nQuestion:\s*([\s\S]+)$/u,
+  )
+  const agentName = match?.[1]?.trim()
+  const issueKey = match?.[2]?.trim()
+  const question = match?.[3]?.trim()
+  if (!agentName || !issueKey || !question) return undefined
+  return { agentName, issueKey, question }
 }
 
 export function agentSpecWithRenderedTask(
