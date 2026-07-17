@@ -1,13 +1,72 @@
-import { mkdir, mkdtemp, readdir, rm, stat, utimes } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
 
-import type { GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import type { BabysitterSessionState, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
 import { FileStateStore } from './file-state-store'
 
 describe('FileStateStore', () => {
+  it('restores and clears babysitter ownership plus pending wake state in a fresh process-equivalent store', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-babysitter-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const session: BabysitterSessionState = {
+        issue: { uuid: 'uuid-87', key: 'AR-87', path: '/linear/issues/AR-87__uuid-87.json' },
+        repo: 'AgentWorkforce/factory',
+        prNumber: 87,
+        agentName: 'ar-87-babysit-factory',
+        path: '/github/repos/AgentWorkforce/factory/pulls/87/metadata.json',
+        critical: true,
+        pendingKinds: ['checks-failed', 'review-comment'],
+      }
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.setBabysitterSession('workspace-1', 'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json', session)
+
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restarted.listBabysitterSessions('workspace-1')).toEqual([
+        ['AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json', session],
+      ])
+
+      await restarted.clearBabysitterSession('workspace-1', 'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json')
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath }).listBabysitterSessions('workspace-1'))
+        .toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a persisted babysitter session that omits the critical fence state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-invalid-babysitter-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 2,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            babysitterSessions: {
+              'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json': {
+                issue: { uuid: 'uuid-87', key: 'AR-87', path: '/linear/issues/AR-87__uuid-87.json' },
+                repo: 'AgentWorkforce/factory',
+                prNumber: 87,
+                agentName: 'ar-87-babysit-factory',
+                pendingKinds: [],
+              },
+            },
+          },
+        },
+      }))
+
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      await expect(store.listBabysitterSessions('workspace-1')).rejects.toThrow('state file is invalid')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('restores GitHub escalation watches in a fresh store instance', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-'))
     try {

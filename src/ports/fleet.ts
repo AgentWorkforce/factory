@@ -83,4 +83,16 @@ export type AgentSpec = {
   sessionRef?: string
   invocationId?: string
   restartPolicy?: RestartPolicy
+  /** Durable, exact PR ownership for a lazily-spawned babysitter. */
+  ownedPullRequest?: {
+    repo: string
+    number: number
+    path?: string
+  }
+  /** Coalesced metadata-only wake retained until its safe PTY submit completes. */
+  pendingPullRequestWake?: {
+    repo: string
+    number: number
+    kinds: string[]
+  }
 }

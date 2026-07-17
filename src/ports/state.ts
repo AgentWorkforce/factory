@@ -54,6 +54,16 @@ export type RegistryHandoffAgent = {
   persistedAtMs: number
 }
 
+export type BabysitterSessionState = {
+  issue: IssueRef
+  repo: string
+  prNumber: number
+  agentName: string
+  path?: string
+  critical: boolean
+  pendingKinds: string[]
+}
+
 export type DispatchAttemptState = {
   attempts: number
   inFlight: boolean
@@ -154,6 +164,10 @@ export interface StateStore {
   getFailureHandoff(workspaceId: string, key: string): Promise<RegistryHandoffAgent | undefined>
   listFailureHandoffs(workspaceId: string): Promise<Array<[string, RegistryHandoffAgent]>>
   clearFailureHandoff(workspaceId: string, key: string): Promise<void>
+
+  setBabysitterSession(workspaceId: string, issueKey: string, session: BabysitterSessionState): Promise<void>
+  listBabysitterSessions(workspaceId: string): Promise<Array<[string, BabysitterSessionState]>>
+  clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void>
 
   recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
   getCanonicalState(workspaceId: string, key: string): Promise<string | undefined>

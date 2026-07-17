@@ -4,12 +4,13 @@ import { dirname, join } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 
-import type { ClarificationReply, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import type { BabysitterSessionState, ClarificationReply, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 
 type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   waitingClarifications: Record<string, WaitingClarification>
+  babysitterSessions: Record<string, BabysitterSessionState>
 }
 
 type WatchStateDocument = {
@@ -33,8 +34,8 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
 
 /**
  * Keeps the factory's general runtime bookkeeping in memory while persisting
- * GitHub escalation watches and parked clarification teams atomically so they
- * survive a CLI process restart.
+ * GitHub escalation watches, parked clarification teams, and exact babysitter
+ * PR ownership/pending wakes atomically so they survive a CLI process restart.
  * Mutations reload under an advisory lock so independent processes merge
  * updates instead of publishing divergent cached documents.
  */
@@ -404,6 +405,44 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
+  override async setBabysitterSession(
+    workspaceId: string,
+    issueKey: string,
+    session: BabysitterSessionState,
+  ): Promise<void> {
+    await this.#exclusive(async () => {
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+        workspace.babysitterSessions[issueKey] = cloneBabysitterSession(session)
+        await this.#persist(document)
+      })
+    })
+  }
+
+  override async listBabysitterSessions(
+    workspaceId: string,
+  ): Promise<Array<[string, BabysitterSessionState]>> {
+    return await this.#exclusive(async () => {
+      const document = await this.#loadFromDisk()
+      return Object.entries(document.workspaces[workspaceId]?.babysitterSessions ?? {})
+        .map(([key, session]) => [key, cloneBabysitterSession(session)])
+    })
+  }
+
+  override async clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void> {
+    await this.#exclusive(async () => {
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId]
+        if (!workspace || !(issueKey in workspace.babysitterSessions)) return
+        delete workspace.babysitterSessions[issueKey]
+        if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+        await this.#persist(document)
+      })
+    })
+  }
+
   async #loadFromDisk(): Promise<WatchStateDocument> {
     try {
       const parsed = JSON.parse(await readFile(this.#watchStatePath, 'utf8')) as unknown
@@ -465,7 +504,22 @@ const parseDocument = (value: unknown): WatchStateDocument => {
     throw new Error('Factory GitHub watch state file is invalid')
   }
   if (value.version === 2) {
-    return value as WatchStateDocument
+    const workspaces: Record<string, PersistedWorkspaceState> = {}
+    for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
+      if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
+      const watches = rawWorkspace.githubIssueCommentWatches
+      const clarifications = rawWorkspace.waitingClarifications
+      const babysitters = rawWorkspace.babysitterSessions
+      if (!isRecord(watches) || !isRecord(clarifications) || (babysitters !== undefined && !isRecord(babysitters))) {
+        throw new Error('Factory GitHub watch state file is invalid')
+      }
+      workspaces[workspaceId] = {
+        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
+        waitingClarifications: clarifications as Record<string, WaitingClarification>,
+        babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
+      }
+    }
+    return { version: 2, workspaces }
   }
   if (value.version === 1) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -476,6 +530,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
       workspaces[workspaceId] = {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: {},
+        babysitterSessions: {},
       }
     }
     return { version: 2, workspaces }
@@ -489,14 +544,54 @@ const cloneWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatc
 const cloneClarification = (record: WaitingClarification): WaitingClarification =>
   structuredClone(record)
 
+const cloneBabysitterSession = (session: BabysitterSessionState): BabysitterSessionState =>
+  structuredClone(session)
+
+const parseBabysitterSessions = (value: Record<string, unknown>): Record<string, BabysitterSessionState> => {
+  const sessions: Record<string, BabysitterSessionState> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (!isRecord(candidate) || !isRecord(candidate.issue)) {
+      throw new Error('Factory GitHub watch state file is invalid')
+    }
+    const issue = candidate.issue
+    if (
+      typeof issue.uuid !== 'string' ||
+      typeof issue.key !== 'string' ||
+      typeof issue.path !== 'string' ||
+      typeof candidate.repo !== 'string' ||
+      !Number.isSafeInteger(candidate.prNumber) ||
+      (candidate.prNumber as number) < 1 ||
+      typeof candidate.agentName !== 'string' ||
+      (candidate.path !== undefined && typeof candidate.path !== 'string') ||
+      typeof candidate.critical !== 'boolean' ||
+      !Array.isArray(candidate.pendingKinds) ||
+      !candidate.pendingKinds.every((kind) => typeof kind === 'string')
+    ) {
+      throw new Error('Factory GitHub watch state file is invalid')
+    }
+    sessions[key] = {
+      issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
+      repo: candidate.repo,
+      prNumber: candidate.prNumber as number,
+      agentName: candidate.agentName,
+      ...(candidate.path === undefined ? {} : { path: candidate.path }),
+      critical: candidate.critical,
+      pendingKinds: [...candidate.pendingKinds] as string[],
+    }
+  }
+  return sessions
+}
+
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
   waitingClarifications: {},
+  babysitterSessions: {},
 })
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
-  Object.keys(workspace.waitingClarifications).length === 0
+  Object.keys(workspace.waitingClarifications).length === 0 &&
+  Object.keys(workspace.babysitterSessions).length === 0
 
 const syncParentDirectory = async (filePath: string): Promise<void> => {
   const handle = await open(dirname(filePath), 'r')
