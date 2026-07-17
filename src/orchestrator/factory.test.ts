@@ -11393,6 +11393,144 @@ describe('FactoryLoop PR babysitter', () => {
     })
   }
 
+  it('recovers a remote babysitter across the spawn-ack crash gap without replaying the original team tasks', async () => {
+    class BabysitterAckGapFleet extends RemoteLifecycleFleetClient {
+      crashed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (input.name.includes('-babysit') && !this.crashed) {
+          this.crashed = true
+          throw new Error('owner crashed after remote babysitter spawn ack')
+        }
+        return result
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-remote-babysitter-ack-gap-'))
+    const watchStatePath = join(root, 'state.json')
+    const issue = realIssueFile(493, ready, { title: 'Real remote babysitter ack gap' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/493/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(493)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 493, { state: 'open', draft: false })
+    const fleet = new BabysitterAckGapFleet()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore: state(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(493), issue))
+      await first.dispatch(decision)
+      mount.emit(changeEvent(prPath, 'remote-pr-493-open'))
+      await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
+
+      const key = issueKey(decision.issue)
+      await vi.waitFor(async () => {
+        const lifecycle = await state().getDispatchLifecycle('factory-test', key)
+        expect(lifecycle?.phase).toBe('dispatching')
+        expect(lifecycle?.agents.find((agent) => agent.name === 'ar-493-babysit')?.tracked.result).toBeUndefined()
+      })
+      await first.stop()
+
+      const messagesBeforeRestart = fleet.messages.length
+      restarted = createFactory(babysitterConfig(), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        stateStore: state(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({
+        phase: 'running',
+        agents: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'ar-493-babysit',
+            tracked: expect.objectContaining({ result: expect.objectContaining({ node: 'sf-mini', locality: 'remote' }) }),
+          }),
+        ]),
+      }), { timeout: 4_000 })
+      await vi.waitFor(async () => expect(await state().listBabysitterSessions('factory-test')).toEqual([
+        [key, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
+      ]))
+
+      expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
+      expect(fleet.messages.slice(messagesBeforeRestart).filter((message) =>
+        message.to === 'ar-493-impl-pear' || message.to === 'ar-493-review')).toEqual([])
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a healthy remote lifecycle owner authoritative for restored babysitter wakes and critical state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-remote-babysitter-owner-'))
+    const watchStatePath = join(root, 'state.json')
+    const issue = realIssueFile(494, ready, { title: 'Real remote babysitter owner fence' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/494/metadata.json'
+    const reviewPath = '/github/repos/AgentWorkforce/pear/pulls/494/comments/9404.json'
+    const mount = new FakeMountClient({ [issuePath(494)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 494, { state: 'open', draft: false })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const ownerFleet = new RemoteLifecycleFleetClient()
+    const owner = createFactory(babysitterConfig(), {
+      mount,
+      fleet: ownerFleet,
+      triage: new StaticTriage(),
+      stateStore: state(),
+    })
+    const duplicateFleet = new RemoteLifecycleFleetClient()
+    const duplicate = createFactory(babysitterConfig(), {
+      mount,
+      fleet: duplicateFleet,
+      triage: new StaticTriage(),
+      stateStore: state(),
+    })
+    try {
+      await owner.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await owner.triageIssue(parseLinearIssue(issuePath(494), issue))
+      await owner.dispatch(decision)
+      mount.emit(changeEvent(prPath, 'remote-pr-494-open'))
+      await vi.waitFor(() => expect(ownerFleet.spawns.map((spawn) => spawn.name)).toContain('ar-494-babysit'))
+      ownerFleet.emitAgentMessage({
+        from: 'ar-494-babysit',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AR-494 begin',
+      })
+      await vi.waitFor(async () => expect((await state().listBabysitterSessions('factory-test'))[0]?.[1].critical).toBe(true))
+      mount.emit(changeEvent(reviewPath, 'remote-pr-494-review'))
+      await vi.waitFor(async () => expect((await state().listBabysitterSessions('factory-test'))[0]?.[1].pendingKinds)
+        .toContain('review-comment'))
+
+      await duplicate.start({ mode: 'dispatch-owner' })
+      expect(duplicate.status().counters.babysitterOwnershipRestored).toBeUndefined()
+      expect(duplicate.status().counters.babysitterOwnershipRestoreSkippedNonOwner).toBe(1)
+      duplicateFleet.emitAgentMessage({
+        from: 'ar-494-babysit',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AR-494 end',
+      })
+      await flush()
+
+      expect((await state().listBabysitterSessions('factory-test'))[0]?.[1]).toMatchObject({
+        critical: true,
+        pendingKinds: expect.arrayContaining(['review-comment']),
+      })
+      expect(duplicateFleet.messages).toEqual([])
+      expect(duplicateFleet.inputs).toEqual([])
+      expect(duplicate.status().counters.babysitterCriticalSignalsIgnored).toBe(1)
+    } finally {
+      await duplicate.stop()
+      await owner.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('keeps equal-number GitHub babysitters and reviewer prompts isolated across repos', async () => {
     const number = 26
     const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)

@@ -1759,7 +1759,6 @@ export class FactoryLoop implements Factory {
           })
         }
         agents.push({ name: spawned.name, role: spec.role })
-        await this.#saveDispatchLifecycle(record, 'dispatching')
       }
       await this.#writeInFlightRegistry()
 
@@ -2109,6 +2108,7 @@ export class FactoryLoop implements Factory {
     const durableRecord = inFlightRecordFromLifecycle(lifecycle)
     const record = lifecycle.phase === 'releasing' ? durableRecord : batch.restore(durableRecord)
     if (!await this.#assertDispatchLifecycleOwner(record)) return
+    if (acquiredNow && this.#config.babysitter.enabled) await this.#restoreBabysitterOwnership()
 
     if (acquiredNow && lifecycle.phase === 'running') {
       if (this.#fleet.hydrateTracked) {
@@ -2140,7 +2140,23 @@ export class FactoryLoop implements Factory {
       const published = await this.#publishImplementerPullRequest(record, implementer)
       if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request`)
       if (!await this.#saveDispatchLifecycle(record, 'published', published)) return
+      if (this.#config.babysitter.enabled) {
+        await this.#ensureBabysitter(record, {
+          repo: published.repo,
+          prNumber: published.number,
+          url: published.url,
+        })
+        return
+      }
       await this.#completeIssue(record)
+      return
+    }
+    if (lifecycle.phase === 'published' && this.#config.babysitter.enabled && lifecycle.pullRequest) {
+      await this.#ensureBabysitter(record, {
+        repo: lifecycle.pullRequest.repo,
+        prNumber: lifecycle.pullRequest.number,
+        url: lifecycle.pullRequest.url,
+      })
       return
     }
     if (lifecycle.phase === 'published' || lifecycle.phase === 'writeback-applied') {
@@ -2153,11 +2169,18 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
+    const hadResult = Boolean(record.result)
     const agents: DispatchResult['agents'] = []
-    for (const spec of dispatchSpecs(record.decision)) {
+    const specs = dispatchSpecs(record.decision)
+    const plannedNames = new Set(specs.map((spec) => spec.name))
+    for (const tracked of record.agents.values()) {
+      if (plannedNames.has(tracked.spec.name)) continue
+      plannedNames.add(tracked.spec.name)
+      specs.push(tracked.spec)
+    }
+    for (const spec of specs) {
       const spawned = await this.#spawnAgent(record, spec, record.dryRun)
       agents.push({ name: spawned.name, role: spec.role })
-      if (!await this.#saveDispatchLifecycle(record, 'dispatching')) return
     }
     await this.#writeInFlightRegistry()
     if (!record.dryRun) {
@@ -2177,8 +2200,19 @@ export class FactoryLoop implements Factory {
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
     if (!record.dryRun) {
-      await this.#sendImplementerTask(record)
-      await this.#sendCriticalReviewerMessage(record)
+      if (!hadResult) {
+        await this.#sendImplementerTask(record)
+        await this.#sendCriticalReviewerMessage(record)
+      }
+      for (const tracked of record.agents.values()) {
+        const owned = tracked.spec.ownedPullRequest
+        if (tracked.spec.role !== 'babysitter' || !owned) continue
+        await this.#ensureBabysitter(record, {
+          repo: owned.repo,
+          prNumber: owned.number,
+          path: owned.path,
+        })
+      }
     }
   }
 
@@ -2219,8 +2253,12 @@ export class FactoryLoop implements Factory {
   }
 
   async #assertDispatchLifecycleOwner(record: InFlightIssue): Promise<boolean> {
+    return await this.#assertIssueDispatchLifecycleOwner(record.issue)
+  }
+
+  async #assertIssueDispatchLifecycleOwner(issue: IssueRef): Promise<boolean> {
     if (this.#fleet.placementLocality !== 'remote') return true
-    const key = issueKey(record.issue)
+    const key = issueKey(issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) return false
     const renewed = await this.#state.renewDispatchLifecycle(
@@ -3133,7 +3171,9 @@ export class FactoryLoop implements Factory {
         node: existing?.result?.node ?? trackedPlacement?.node ?? rosterAgent.node,
         locality: existing?.result?.locality ?? this.#fleet.placementLocality,
       })
-      await this.#saveDispatchLifecycle(record, 'dispatching')
+      if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+        throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
+      }
       return { name: spec.name }
     }
 
@@ -3161,6 +3201,9 @@ export class FactoryLoop implements Factory {
       )
     }
     batch.recordSpawn(record, spec, invocationId, result)
+    if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+      throw new Error(`Dispatch lifecycle ownership lost after spawning ${spec.name}`)
+    }
     return { name: result.name }
   }
 
@@ -3767,6 +3810,11 @@ export class FactoryLoop implements Factory {
       )) {
         this.#babysitterCriticalAgents.delete(babysitterCritical.agentName)
         this.#increment('babysitterCriticalSignalsIgnored')
+        return
+      }
+      if (!await this.#assertIssueDispatchLifecycleOwner(durableIssue)) {
+        this.#babysitterCriticalAgents.delete(babysitterCritical.agentName)
+        this.#increment('babysitterCriticalSignalsIgnoredNonOwner')
         return
       }
       if (babysitterCritical.action === 'begin') {
@@ -4766,6 +4814,10 @@ export class FactoryLoop implements Factory {
         this.#increment('babysitterOwnershipRestoreInvalid')
         continue
       }
+      if (!await this.#assertIssueDispatchLifecycleOwner(session.issue)) {
+        this.#increment('babysitterOwnershipRestoreSkippedNonOwner')
+        continue
+      }
       const record = batch.getIssue(session.issue)
       const tracked = record?.agents.get(session.agentName)
         ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
@@ -4806,6 +4858,9 @@ export class FactoryLoop implements Factory {
   }
 
   async #cancelBabysitterWake(issueIdentity: string): Promise<void> {
+    const issue = this.#babysitterIssueRefs.get(issueIdentity)
+    const mayClearDurable = this.#fleet.placementLocality !== 'remote'
+      || Boolean(issue && await this.#assertIssueDispatchLifecycleOwner(issue))
     for (const [key, state] of this.#babysitterWakeStates) {
       if (issueKey(state.issue) !== issueIdentity) continue
       state.cancelled = true
@@ -4817,7 +4872,7 @@ export class FactoryLoop implements Factory {
     this.#babysitterPr.delete(issueIdentity)
     this.#babysitterIssueRefs.delete(issueIdentity)
     this.#babysitterSpawned.delete(issueIdentity)
-    await this.#state.clearBabysitterSession(this.#workspaceId, issueIdentity)
+    if (mayClearDurable) await this.#state.clearBabysitterSession(this.#workspaceId, issueIdentity)
   }
 
   async #routeBabysitterEvent(path: string, extraKinds: Iterable<BabysitterWakeKind> = []): Promise<void> {
@@ -4849,6 +4904,10 @@ export class FactoryLoop implements Factory {
       if (!owner) {
         this.#increment('babysitterEventsIgnoredUnownedPr')
         this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', { ...event, prNumber: target.prNumber })
+        continue
+      }
+      if (!await this.#assertIssueDispatchLifecycleOwner(owner.issue)) {
+        this.#increment('babysitterEventsIgnoredNonOwner')
         continue
       }
       const kinds = new Set<BabysitterWakeKind>([...target.kinds, ...extraKinds])
@@ -4912,6 +4971,10 @@ export class FactoryLoop implements Factory {
     kinds: Iterable<BabysitterWakeKind>,
     tracked: TrackedAgent,
   ): Promise<void> {
+    if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
+      this.#increment('babysitterEventsIgnoredNonOwner')
+      return
+    }
     // Owner lookup and queueing straddle async mount/state reads. Revalidate
     // the exact composite owner so a concurrent close/merge cancellation can
     // never recreate durable state from a stale child event.
@@ -4985,6 +5048,9 @@ export class FactoryLoop implements Factory {
     ref: BabysitterPrRef,
     tracked?: TrackedAgent,
   ): Promise<void> {
+    if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
+      throw new Error(`Babysitter lifecycle ownership lost for ${issue.key}`)
+    }
     const pending = tracked?.spec.pendingPullRequestWake
     await this.#state.setBabysitterSession(this.#workspaceId, issueKey(issue), {
       issue: { ...issue },
@@ -5023,6 +5089,16 @@ export class FactoryLoop implements Factory {
 
   async #flushBabysitterWake(state: BabysitterWakeState): Promise<void> {
     if (this.#stopping || state.cancelled || state.kinds.size === 0) return
+    if (!await this.#assertIssueDispatchLifecycleOwner(state.issue)) {
+      state.cancelled = true
+      this.#babysitterWakeStates.delete(babysitterWakeKey(state.issue, {
+        repo: state.repo,
+        prNumber: state.prNumber,
+        agentName: state.agentName,
+      }))
+      this.#increment('babysitterEventWakesCancelledNonOwner')
+      return
+    }
     if (this.#babysitterCriticalAgents.has(state.agentName)) {
       this.#increment('babysitterEventWakesDeferredCritical')
       return
@@ -5400,6 +5476,10 @@ export class FactoryLoop implements Factory {
 
   async #ensureBabysitter(record: InFlightIssue, prRef: { repo: string; prNumber: number; url?: string; path?: string }): Promise<void> {
     const babysitterKey = issueKey(record.issue)
+    if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+      this.#increment('babysitterLifecycleOwnershipRejected')
+      return
+    }
     this.#babysitterIssueRefs.set(babysitterKey, { ...record.issue })
     const existing = this.#babysitterPr.get(babysitterKey)
     if (existing && githubPrIdentity(existing.repo, existing.prNumber) !== githubPrIdentity(prRef.repo, prRef.prNumber)) {
@@ -5493,6 +5573,7 @@ export class FactoryLoop implements Factory {
       })
       await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
       await this.#writeInFlightRegistry()
+      if (!await this.#saveDispatchLifecycle(record, 'running')) return
       this.#increment('babysittersSpawned')
       this.#logger.info?.('[factory] babysitter spawned for open PR', {
         issue: record.issue.key,
@@ -5516,7 +5597,9 @@ export class FactoryLoop implements Factory {
       this.#babysitterSpawned.delete(babysitterKey)
       this.#babysitterPr.delete(babysitterKey)
       this.#babysitterIssueRefs.delete(babysitterKey)
-      await this.#state.clearBabysitterSession(this.#workspaceId, babysitterKey)
+      if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+        await this.#state.clearBabysitterSession(this.#workspaceId, babysitterKey)
+      }
       this.#increment('babysitterSpawnFailures')
       this.#error(error, record.issue)
     } finally {
