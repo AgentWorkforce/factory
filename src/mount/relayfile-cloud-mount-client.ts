@@ -501,6 +501,7 @@ const normalizeProviderSyncStatus = (value: unknown, provider: string): Provider
     lastEventAtMs: Number.isFinite(lastEventAtMs) ? lastEventAtMs : undefined,
     watermarkTs,
     lagSeconds: numberField(source, 'lagSeconds') ?? numberField(source, 'lag_seconds'),
+    webhookHealthy: booleanField(source, 'webhookHealthy') ?? booleanField(source, 'webhook_healthy'),
   }
 }
 
@@ -514,7 +515,9 @@ const hasProviderSyncFreshness = (candidate: Record<string, unknown>): boolean =
     numberField(candidate, 'lastEventAtMs') !== undefined ||
     numberField(candidate, 'last_event_at_ms') !== undefined ||
     numberField(candidate, 'lagSeconds') !== undefined ||
-    numberField(candidate, 'lag_seconds') !== undefined
+    numberField(candidate, 'lag_seconds') !== undefined ||
+    booleanField(candidate, 'webhookHealthy') !== undefined ||
+    booleanField(candidate, 'webhook_healthy') !== undefined
 )
 
 const stringField = (record: Record<string, unknown>, key: string): string | undefined =>
@@ -522,6 +525,9 @@ const stringField = (record: Record<string, unknown>, key: string): string | und
 
 const numberField = (record: Record<string, unknown>, key: string): number | undefined =>
   typeof record[key] === 'number' ? record[key] : undefined
+
+const booleanField = (record: Record<string, unknown>, key: string): boolean | undefined =>
+  typeof record[key] === 'boolean' ? record[key] : undefined
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined

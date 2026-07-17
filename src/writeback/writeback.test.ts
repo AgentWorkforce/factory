@@ -825,6 +825,28 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  it('looks up an escalation marker from all provider comment pages', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: 'ordinary comment\n<!-- factory-escalation:factory-agent-question-abc123 -->\n' }
+      },
+    })
+
+    await expect(github.hasCommentMarker(
+      githubIssue,
+      '<!-- factory-escalation:factory-agent-question-abc123 -->',
+    )).resolves.toBe(true)
+    expect(calls).toEqual([[
+      'api',
+      '--paginate',
+      'repos/AgentWorkforce/factory/issues/48/comments',
+      '--jq',
+      '.[].body',
+    ]])
+  })
+
   it('refuses writeback when GitHub source identity is incomplete', async () => {
     const github = new GhCliGithubWriteback({ runner: async () => ({ stdout: '' }) })
     await expect(github.postComment({

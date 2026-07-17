@@ -8,6 +8,8 @@ export type ClarificationReply = {
   id: string
   text: string
   receivedAtMs: number
+  source?: 'slack' | 'github'
+  author?: string
 }
 
 export type WaitingClarificationAgent = {
@@ -231,6 +233,7 @@ export interface StateStore {
   getWaitingClarification(workspaceId: string, issueKey: string): Promise<WaitingClarification | undefined>
   listWaitingClarifications(workspaceId: string): Promise<Array<[string, WaitingClarification]>>
   claimClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, nowMs: number, leaseMs: number): Promise<WaitingClarification | undefined>
+  renewClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, nowMs: number): Promise<boolean>
   completeClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string, postedAtMs: number): Promise<boolean>
   releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void>
   claimClarificationReply(workspaceId: string, issueKey: string, reply: ClarificationReply): Promise<WaitingClarification | undefined>

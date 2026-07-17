@@ -84,6 +84,18 @@ export class GhCliGithubWriteback implements GithubWriteback {
     ])
   }
 
+  async hasCommentMarker(issue: LinearIssue, marker: string): Promise<boolean> {
+    const ref = githubIssueRef(issue)
+    const result = await this.#run([
+      'api',
+      '--paginate',
+      `repos/${ref.repo}/issues/${ref.number}/comments`,
+      '--jq',
+      '.[].body',
+    ])
+    return result.stdout.includes(marker)
+  }
+
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
     const target = STATUS_LABELS[status]

@@ -328,6 +328,24 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
+  override async renewClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => {
+      return await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const delivery = document.workspaces[workspaceId]?.waitingClarifications[issueKey]?.questionDelivery
+        if (delivery?.owner !== owner) return false
+        delivery.claimedAtMs = nowMs
+        await this.#persist(document)
+        return true
+      })
+    })
+  }
+
   override async releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void> {
     await this.#mutateClarification(workspaceId, issueKey, (record) => {
       if (record.questionDelivery?.owner !== owner) return

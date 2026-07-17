@@ -290,6 +290,18 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async renewClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const delivery = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.questionDelivery
+    if (delivery?.owner !== owner) return false
+    delivery.claimedAtMs = nowMs
+    return true
+  }
+
   async releaseClarificationQuestionDelivery(workspaceId: string, issueKey: string, owner: string): Promise<void> {
     const delivery = this.#workspace(workspaceId).waitingClarifications.get(issueKey)?.questionDelivery
     if (delivery?.owner !== owner) return

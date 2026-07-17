@@ -19,6 +19,7 @@ import {
   readFactoryLoopHeartbeat,
   reapFactoryOrphansOnce,
   type FactoryConfig,
+  type FactoryEventPayload,
   type TriageDecision,
   type TriageEngine,
   type WorkflowRunnerInput,
@@ -258,6 +259,91 @@ class FailingGithubCommentWriteback extends RecordingGithubWriteback {
   }
 }
 
+class ImmediateGithubReplyWriteback extends RecordingGithubWriteback {
+  constructor(
+    private readonly mount: FakeMountClient,
+    private readonly issueNumber: number,
+    private readonly author: string,
+  ) {
+    super()
+  }
+
+  override async postComment(issue: LinearIssue, body: string): Promise<void> {
+    await super.postComment(issue, body)
+    if (!body.includes(' needs input.')) return
+    const prefix = githubReplyPrefixFromComment(body)
+    emitGithubIssueComment(this.mount, 'AgentWorkforce', 'pear', this.issueNumber, 9901, {
+      body: `${prefix} Preserve this fast fallback reply.`,
+      author: { login: this.author },
+    })
+    // Keep postComment unresolved long enough for the subscribed reply handler
+    // to claim the answer while the delivery lease is still held.
+    await flush()
+    await flush()
+  }
+}
+
+class MirroringGithubQuestionWriteback extends RecordingGithubWriteback {
+  constructor(
+    private readonly mount: FakeMountClient,
+    private readonly issueNumber: number,
+  ) {
+    super()
+  }
+
+  override async postComment(issue: LinearIssue, body: string): Promise<void> {
+    await super.postComment(issue, body)
+    if (!body.includes(' needs input.')) return
+    emitGithubIssueComment(this.mount, 'AgentWorkforce', 'pear', this.issueNumber, 9701, {
+      body,
+      author: { login: 'factory[bot]', type: 'Bot' },
+    })
+  }
+}
+
+class AmbiguousMirroringGithubQuestionWriteback extends MirroringGithubQuestionWriteback {
+  ambiguousQuestionPostsRemaining = 1
+
+  override async postComment(issue: LinearIssue, body: string): Promise<void> {
+    await super.postComment(issue, body)
+    if (body.includes(' needs input.') && this.ambiguousQuestionPostsRemaining > 0) {
+      this.ambiguousQuestionPostsRemaining -= 1
+      throw new Error('transport closed after GitHub accepted the comment')
+    }
+  }
+}
+
+class RecordingQuestionDeliveryRenewalFileStateStore extends FileStateStore {
+  questionDeliveryRenewals = 0
+  completedQuestionPostedAtMs?: number
+
+  override async renewClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    this.questionDeliveryRenewals += 1
+    return await super.renewClarificationQuestionDelivery(workspaceId, issueKey, owner, nowMs)
+  }
+
+  override async completeClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    postedAtMs: number,
+  ): Promise<boolean> {
+    const completed = await super.completeClarificationQuestionDelivery(
+      workspaceId,
+      issueKey,
+      owner,
+      postedAtMs,
+    )
+    if (completed) this.completedQuestionPostedAtMs = postedAtMs
+    return completed
+  }
+}
+
 class CountingTriage extends StaticTriage {
   count = 0
 
@@ -327,6 +413,28 @@ class TransientClarificationRenewalStateStore extends InMemoryStateStore {
       throw new Error('transient state store outage')
     }
     return super.renewClarificationWake(workspaceId, issueKey, owner, nowMs)
+  }
+}
+
+class RecordingQuestionDeliveryStateStore extends InMemoryStateStore {
+  completedQuestionPostedAtMs?: number
+
+  override async completeClarificationQuestionDelivery(
+    workspaceId: string,
+    issueKey: string,
+    owner: string,
+    postedAtMs: number,
+  ): Promise<boolean> {
+    const completed = await super.completeClarificationQuestionDelivery(
+      workspaceId,
+      issueKey,
+      owner,
+      postedAtMs,
+    )
+    this.completedQuestionPostedAtMs = (
+      await this.getWaitingClarification(workspaceId, issueKey)
+    )?.questionPostedAtMs
+    return completed
   }
 }
 
@@ -1145,6 +1253,20 @@ class ConfirmRecordingSlackMountClient extends CloudWritebackFakeMountClient {
   }
 }
 
+class SlackStatusConfirmMountClient extends ConfirmRecordingSlackMountClient {
+  slackStatus: ProviderSyncStatus | undefined
+  eventsReadCount = 0
+
+  async getSyncStatus(provider: string): Promise<ProviderSyncStatus | undefined> {
+    return provider === 'slack' ? this.slackStatus : undefined
+  }
+
+  override async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
+    this.eventsReadCount += 1
+    return await super.getEvents(opts)
+  }
+}
+
 class BlockingSlackQuestionMountClient extends ConfirmRecordingSlackMountClient {
   readonly questionWriteStarted: Promise<void>
   #signalQuestionWriteStarted!: () => void
@@ -1183,6 +1305,33 @@ class FailNextSlackReplyMountClient extends CloudWritebackFakeMountClient {
       return 'failed'
     }
     return super.confirmWrite(path, opts)
+  }
+}
+
+class FailingGithubCommentReconciliationMountClient extends FailNextSlackReplyMountClient {
+  failGithubCommentReconciliation: false | 'list' | 'read' | 'issue' = false
+
+  override async listTree(prefix: string): Promise<string[]> {
+    if (
+      this.failGithubCommentReconciliation === 'list' &&
+      (
+        prefix === '/github/repos/AgentWorkforce/pear/issues' ||
+        prefix === '/github/repos/AgentWorkforce__pear/issues'
+      )
+    ) {
+      throw new Error('GitHub comment mirror is unavailable')
+    }
+    return await super.listTree(prefix)
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    if (this.failGithubCommentReconciliation === 'issue' && path.endsWith('/issues/by-id/70.json')) {
+      throw new Error('GitHub source issue is temporarily unavailable')
+    }
+    if (this.failGithubCommentReconciliation === 'read' && path.includes('/comments/')) {
+      throw new Error('GitHub comment mirror read is unavailable')
+    }
+    return await super.readFile(path)
   }
 }
 
@@ -8599,12 +8748,95 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('uses independent webhook health to bootstrap Slack threads on cold start and restart', async () => {
+    const clock = new ManualClock()
+    const mount = new SlackStatusConfirmMountClient({
+      [issuePath(152)]: issueFile(152),
+      [issuePath(153)]: issueFile(153),
+    })
+    mount.slackStatus = {
+      provider: 'slack',
+      status: 'lagging',
+      lastEventAt: new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+      webhookHealthy: true,
+    }
+
+    const first = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      clock,
+    })
+    await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(152), issueFile(152))))
+    expect(first.status().counters.slackGateBypassedByWebhookHealth).toBe(1)
+    expect(first.status().counters.slackEventWatermarkRefreshes).toBeUndefined()
+    await first.stop()
+
+    const restarted = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      clock,
+    })
+    await restarted.dispatch(await restarted.triageIssue(parseLinearIssue(issuePath(153), issueFile(153))))
+
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(2)
+    expect(restarted.status()).toMatchObject({
+      slackDegraded: false,
+      counters: { slackGateBypassedByWebhookHealth: 1 },
+    })
+    expect(restarted.status().counters.slackEventWatermarkRefreshes).toBeUndefined()
+    await restarted.stop()
+  })
+
+  it('bypasses a false stale status from independently observed webhook arrival time', async () => {
+    const clock = new ManualClock()
+    const mount = new SlackStatusConfirmMountClient({
+      [issuePath(150)]: issueFile(150),
+      [issuePath(151)]: issueFile(151),
+    })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      clock,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(150), issueFile(150))))
+    mount.slackStatus = {
+      provider: 'slack',
+      status: 'lagging',
+      lastEventAt: new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+    }
+    const staleProviderTimestamp = changeEvent(
+      slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'observed-webhook-150'),
+      'observed-webhook-150',
+      new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+    )
+    mount.emit({
+      ...staleProviderTimestamp,
+      resource: { ...staleProviderTimestamp.resource, provider: 'slack' },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(151), issueFile(151))))
+
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(2)
+    expect(factory.status()).toMatchObject({
+      slackDegraded: false,
+      counters: {
+        slackWebhookEventsObserved: 1,
+        slackGateBypassedByObservedEvent: 1,
+      },
+    })
+    await factory.stop()
+  })
+
   it('keeps hard Slack sync failures blocking even when the Slack event watermark is fresh', async () => {
     for (const status of ['error', 'failed']) {
       const clock = new ManualClock()
       const issueNumber = status === 'error' ? 142 : 143
       const mount = new SlackSyncStatusMount({ [issuePath(issueNumber)]: issueFile(issueNumber) })
-      mount.slackStatus = { provider: 'slack', status }
+      mount.slackStatus = { provider: 'slack', status, webhookHealthy: true }
       const slackEvent = changeEvent(
         `/slack/channels/C0FACTORY__factory-e2e/messages/${status}/meta.json`,
         `slack-fresh-${status}`,
@@ -9759,6 +9991,10 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
       await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionDeliveryFailures).toBe(1))
+      await vi.waitFor(async () => {
+        const waiting = (await firstState.listWaitingClarifications('factory-test'))[0]?.[1]
+        expect(waiting?.questionDelivery?.owner).toBe('')
+      })
       const pending = (await firstState.listWaitingClarifications('factory-test'))[0]?.[1]
       expect(pending).toMatchObject({
         question: 'Preserve and retry this question.',
@@ -10204,6 +10440,346 @@ describe('FactoryLoop', () => {
       data: '<integration-event source="github" issue="59">\nHuman reply from @issue-author on the GitHub issue:\nUse the shared helper in factory.ts.\n</integration-event>\r',
     }))
     expect(factory.status().counters.githubAnswersInjected).toBe(1)
+  })
+
+  it('falls back to the source GitHub issue when stale Slack prevented a dispatch thread', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 67)
+    const issue = githubIssueFile(67, { labels: ['factory'], author: 'reporter' })
+    const mount = new SlackStatusConfirmMountClient({ [path]: issue })
+    mount.slackStatus = { provider: 'slack', status: 'stale' }
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toEqual([])
+    fleet.emitAgentMessage({
+      from: 'ar-67-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Which fallback remains available?',
+      eventId: 'github-slack-fallback-question-67',
+    })
+
+    await vi.waitFor(() => expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1))
+    const comment = factoryGithubQuestionComments(githubWriteback)[0]?.body
+    expect(comment).toContain('Slack fallback reason: Slack writeback is degraded: slack sync status is stale.')
+    expect(factory.status().counters.agentQuestionsRoutedToGithubFallback).toBe(1)
+    expect(fleet.releases).toEqual([])
+
+    const replyPrefix = githubReplyPrefixFromComment(comment)
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 67, 9801, {
+      body: `${replyPrefix} Use the GitHub fallback.`,
+      author: { login: 'reporter' },
+    })
+    await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
+      name: 'ar-67-impl-pear',
+      data: '<integration-event source="github" issue="67">\nHuman reply from @reporter on the GitHub issue:\nUse the GitHub fallback.\n</integration-event>\r',
+    }))
+    await factory.stop()
+  })
+
+  it('preserves the durable park and wake lifecycle when a Slack thread falls back to GitHub', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 68)
+    const issue = githubIssueFile(68, { labels: ['factory'], author: 'reporter' })
+    const mount = new SlackStatusConfirmMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-68-impl-pear', 'session-ar-68-impl-pear')
+    fleet.setSessionRef('ar-68-review-pear', 'session-ar-68-review-pear')
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    mount.files.set(path, { content: githubIssueFile(68, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    mount.slackStatus = { provider: 'slack', status: 'stale' }
+    fleet.emitAgentMessage({
+      from: 'ar-68-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Keep the durable lifecycle through fallback.',
+      eventId: 'github-durable-fallback-question-68',
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+    await vi.waitFor(() => expect(factory.status().counters.clarificationQuestionsDeliveredViaGithub).toBe(1))
+    expect(fleet.releases).toEqual([
+      { name: 'ar-68-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-68-review-pear', reason: 'waiting-for-human' },
+    ])
+    expect(slackReplyWrites(mount)).toEqual([])
+    const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(waiting?.questionPostedAtMs).toBeTypeOf('number')
+    const comment = factoryGithubQuestionComments(githubWriteback)[0]?.body
+    expect(comment).toContain('Slack fallback reason: Slack writeback is degraded: slack sync status is stale.')
+
+    const replyPrefix = githubReplyPrefixFromComment(comment)
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 68, 9802, {
+      body: `${replyPrefix} Resume from the saved sessions.`,
+      author: { login: 'reporter' },
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(fleet.resumes.map((resume) => resume.sessionRef)).toEqual([
+      'session-ar-68-impl-pear',
+      'session-ar-68-review-pear',
+    ])
+    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
+      '<integration-event source="github" issue="68">\nHuman reply from @reporter on the GitHub issue:\nResume from the saved sessions.\n</integration-event>\r',
+      '<integration-event source="github" issue="68">\nHuman reply from @reporter on the GitHub issue:\nResume from the saved sessions.\n</integration-event>\r',
+    ])
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    await factory.stop()
+  })
+
+  it('keeps the delivery lease through a confirmed Slack write failure and fast GitHub reply', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 69)
+    const issue = githubIssueFile(69, { labels: ['factory'], author: 'reporter' })
+    const mount = new FailNextSlackReplyMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-69-impl-pear', 'session-ar-69-impl-pear')
+    fleet.setSessionRef('ar-69-review-pear', 'session-ar-69-review-pear')
+    const stateStore = new RecordingQuestionDeliveryStateStore({ batchSize: 2 })
+    const githubWriteback = new ImmediateGithubReplyWriteback(mount, 69, 'reporter')
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    mount.files.set(path, { content: githubIssueFile(69, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    mount.failNextReply = true
+    fleet.emitAgentMessage({
+      from: 'ar-69-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Do not lose a reply during write failure fallback.',
+      eventId: 'github-write-failure-fallback-question-69',
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    expect(mount.failedReplies).toBe(1)
+    expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+    expect(stateStore.completedQuestionPostedAtMs).toBeTypeOf('number')
+    expect(factory.status()).toMatchObject({
+      counters: {
+        clarificationQuestionDeliveryFailures: 1,
+        clarificationQuestionsDeliveredViaGithub: 1,
+        githubClarificationRepliesClaimed: 1,
+      },
+    })
+    expect(fleet.resumes.map((resume) => resume.sessionRef)).toEqual([
+      'session-ar-69-impl-pear',
+      'session-ar-69-review-pear',
+    ])
+    expect(slackAnswerInputs(fleet).map((input) => input.data)).toEqual([
+      '<integration-event source="github" issue="69">\nHuman reply from @reporter on the GitHub issue:\nPreserve this fast fallback reply.\n</integration-event>\r',
+      '<integration-event source="github" issue="69">\nHuman reply from @reporter on the GitHub issue:\nPreserve this fast fallback reply.\n</integration-event>\r',
+    ])
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    await factory.stop()
+  })
+
+  it('reconciles an ambiguous accepted GitHub fallback through mirror failure and lease handoff', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-clarification-fallback-restart-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const path = githubIssuePath('AgentWorkforce', 'pear', 70)
+      const issue = githubIssueFile(70, { labels: ['factory'], author: 'reporter' })
+      const mount = new FailingGithubCommentReconciliationMountClient({ [path]: issue })
+      const githubWriteback = new AmbiguousMirroringGithubQuestionWriteback(mount, 70)
+      const factoryConfig = config({ issueSource: 'github', slack: slackConfig() })
+      const clock = new ManualClock()
+      const firstFleet = new FakeFleetClient()
+      firstFleet.setSessionRef('ar-70-impl-pear', 'session-ar-70-impl-pear')
+      firstFleet.setSessionRef('ar-70-review-pear', 'session-ar-70-review-pear')
+      const firstState = new RecordingQuestionDeliveryRenewalFileStateStore({ batchSize: 2, watchStatePath })
+      const first = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: firstState,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+
+      await first.dispatch(await first.triageIssue(parseGithubFactoryIssue(path, issue)))
+      mount.files.set(path, { content: githubIssueFile(70, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+      mount.failNextReply = true
+      firstFleet.emitAgentMessage({
+        from: 'ar-70-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Persist this fallback across restart.',
+        eventId: 'github-write-failure-fallback-question-70',
+      })
+      await vi.waitFor(() => expect(first.status().counters.agentQuestionGithubPostsAmbiguous).toBe(1))
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      const replyPrefix = githubReplyPrefixFromComment(factoryGithubQuestionComments(githubWriteback)[0]?.body)
+      let stranded = (await firstState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(stranded?.questionPostedAtMs).toBeUndefined()
+      expect(stranded?.questionDelivery).toMatchObject({ attempts: 1, owner: expect.any(String) })
+      expect(stranded?.questionDelivery?.owner).not.toBe('')
+      expect(firstState.questionDeliveryRenewals).toBeGreaterThanOrEqual(2)
+      expect((await firstState.listGithubIssueCommentWatches('factory-test'))[0]?.[1].pending).toHaveLength(1)
+
+      // The transport error is ambiguous: GitHub accepted the marker and the
+      // reporter can answer while durable completion is still stranded. The
+      // original pending watch must remain able to claim that answer.
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 70, 9902, {
+        body: `${replyPrefix} Preserve the reply through ambiguous recovery.`,
+        author: { login: 'reporter' },
+      })
+      await vi.waitFor(async () => {
+        stranded = (await firstState.listWaitingClarifications('factory-test'))[0]?.[1]
+        expect(stranded?.reply).toMatchObject({ id: 'github:AgentWorkforce/pear#70:9902', source: 'github' })
+      })
+      const slackQuestionWritesBeforeRestart = slackReplyWrites(mount).length
+      await first.stop()
+
+      // After the ambiguous owner's lease expires, an unavailable comment
+      // mirror must defer rather than treating the marker as absent and
+      // posting again. It also retains the watch, owner, and claimed reply.
+      clock.advance(3 * 60_000)
+      mount.failGithubCommentReconciliation = 'list'
+      const deferredFleet = new FakeFleetClient()
+      const deferredState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const deferred = createFactory(factoryConfig, {
+        mount,
+        fleet: deferredFleet,
+        stateStore: deferredState,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+      await deferred.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(deferred.status().counters.agentQuestionGithubReconciliationsDeferred).toBe(1))
+      const deferredWaiting = (await deferredState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(deferredWaiting?.questionPostedAtMs).toBeUndefined()
+      expect(deferredWaiting).toMatchObject({
+        questionDelivery: { attempts: 2, owner: expect.any(String) },
+        reply: { id: 'github:AgentWorkforce/pear#70:9902', source: 'github' },
+      })
+      expect(deferredWaiting?.questionDelivery?.owner).not.toBe('')
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      await deferred.stop()
+
+      // A subsequent owner also fails closed when the comment paths list but
+      // the marker-bearing comment itself cannot be read.
+      clock.advance(3 * 60_000)
+      mount.failGithubCommentReconciliation = 'read'
+      const readDeferredState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const readDeferred = createFactory(factoryConfig, {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: readDeferredState,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+      await readDeferred.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(readDeferred.status().counters.agentQuestionGithubReconciliationsDeferred).toBe(1))
+      const readDeferredWaiting = (await readDeferredState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(readDeferredWaiting?.questionPostedAtMs).toBeUndefined()
+      expect(readDeferredWaiting?.questionDelivery).toMatchObject({ attempts: 3, owner: expect.any(String) })
+      expect(readDeferredWaiting?.reply).toMatchObject({ source: 'github' })
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      await readDeferred.stop()
+
+      // Losing the source issue read must also defer before either provider is
+      // retried; the durable GitHub reply itself proves an external delivery
+      // may already exist even though its reply watch has been consumed.
+      clock.advance(3 * 60_000)
+      mount.failGithubCommentReconciliation = 'issue'
+      const issueDeferredState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const issueDeferred = createFactory(factoryConfig, {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: issueDeferredState,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+      await issueDeferred.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(issueDeferred.status().counters.agentQuestionGithubReconciliationsDeferred).toBe(1))
+      const issueDeferredWaiting = (await issueDeferredState.listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(issueDeferredWaiting?.questionPostedAtMs).toBeUndefined()
+      expect(issueDeferredWaiting?.questionDelivery).toMatchObject({ attempts: 4, owner: expect.any(String) })
+      expect(issueDeferredWaiting?.reply).toMatchObject({ source: 'github' })
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      expect(slackReplyWrites(mount)).toHaveLength(slackQuestionWritesBeforeRestart)
+      await issueDeferred.stop()
+
+      // Once authoritative reconciliation recovers and the retained lease
+      // expires, race two owners through cold-start recovery. Exactly one can
+      // commit the existing marker and drain the already-claimed reply.
+      clock.advance(3 * 60_000)
+      mount.failGithubCommentReconciliation = false
+      const restartedFleetA = new FakeFleetClient()
+      const restartedFleetB = new FakeFleetClient()
+      const restartedStateA = new RecordingQuestionDeliveryRenewalFileStateStore({ batchSize: 2, watchStatePath })
+      const restartedStateB = new RecordingQuestionDeliveryRenewalFileStateStore({ batchSize: 2, watchStatePath })
+      const restartedA = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleetA,
+        stateStore: restartedStateA,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+      const restartedB = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleetB,
+        stateStore: restartedStateB,
+        triage: new StaticTriage(),
+        githubWriteback,
+        clock,
+      })
+      await Promise.all([
+        restartedA.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } }),
+        restartedB.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } }),
+      ])
+      await vi.waitFor(() => expect([
+        restartedStateA.completedQuestionPostedAtMs,
+        restartedStateB.completedQuestionPostedAtMs,
+      ].filter((value) => typeof value === 'number')).toHaveLength(1))
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      expect(slackReplyWrites(mount)).toHaveLength(slackQuestionWritesBeforeRestart)
+      expect(
+        (restartedA.status().counters.agentQuestionGithubFallbacksReconciled ?? 0) +
+        (restartedB.status().counters.agentQuestionGithubFallbacksReconciled ?? 0),
+      ).toBe(1)
+
+      await vi.waitFor(() => expect(
+        (restartedA.status().counters.clarificationTeamsWoken ?? 0) +
+        (restartedB.status().counters.clarificationTeamsWoken ?? 0),
+      ).toBe(1))
+      expect(factoryGithubQuestionComments(githubWriteback)).toHaveLength(1)
+      expect([...restartedFleetA.resumes, ...restartedFleetB.resumes].map((resume) => resume.sessionRef).sort()).toEqual([
+        'session-ar-70-impl-pear',
+        'session-ar-70-review-pear',
+      ].sort())
+      expect([...slackAnswerInputs(restartedFleetA), ...slackAnswerInputs(restartedFleetB)]).toHaveLength(2)
+      expect([...slackAnswerInputs(restartedFleetA), ...slackAnswerInputs(restartedFleetB)].map((input) => input.data)).toEqual([
+        '<integration-event source="github" issue="70">\nHuman reply from @reporter on the GitHub issue:\nPreserve the reply through ambiguous recovery.\n</integration-event>\r',
+        '<integration-event source="github" issue="70">\nHuman reply from @reporter on the GitHub issue:\nPreserve the reply through ambiguous recovery.\n</integration-event>\r',
+      ])
+      expect(await restartedStateA.listWaitingClarifications('factory-test')).toEqual([])
+      await Promise.all([restartedA.stop(), restartedB.stop()])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('does not lose a human reply that arrives while the question post is completing', async () => {
@@ -10704,10 +11280,12 @@ describe('FactoryLoop', () => {
     const issue = githubIssueFile(60, { labels: ['factory'] })
     const mount = new FakeMountClient({ [path]: issue })
     const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const errors: unknown[][] = []
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
+      stateStore,
       triage: new StaticTriage(),
       githubWriteback: new FailingGithubCommentWriteback(),
       logger: { error: (...args: unknown[]) => errors.push(args) },
@@ -10728,11 +11306,12 @@ describe('FactoryLoop', () => {
       expect.objectContaining({
         kind: 'agent-question',
         correlationId: expect.stringMatching(/^factory-agent-question-/u),
-        reason: 'GitHub issue comment writeback failed',
+        reason: 'GitHub issue comment writeback returned an ambiguous result; the pending reply watch was retained for reconciliation',
       }),
     ])
     expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
     expect(factory.status().counters.errors).toBe(1)
+    expect((await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1].pending).toHaveLength(1)
   })
 
   it('ignores marked agent questions that are not addressed to the factory', async () => {
@@ -10793,30 +11372,53 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.escalationDeliveryFailures).toBe(1)
   })
 
-  it('treats agent questions as no-ops while Slack sync is degraded without regressing dispatch', async () => {
+  it('keeps ask instructions and surfaces an observable failure when degraded Slack has no fallback', async () => {
     const mount = new SlackSyncStatusMount({ [issuePath(39)]: issueFile(39) })
     mount.slackStatus = { provider: 'slack', status: 'stale' }
     const fleet = new FakeFleetClient()
+    const errors: unknown[][] = []
+    const emittedErrors: FactoryEventPayload[] = []
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
       fleet,
       triage: new StaticTriage(),
+      logger: { error: (...args: unknown[]) => errors.push(args) },
     })
+    factory.on('error', (payload) => emittedErrors.push(payload))
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
+    expect(fleet.messages.find((message) => message.to === 'ar-39-impl-pear')?.text).toContain(
+      'DM `factory` with `[factory-needs-input]`',
+    )
+    expect(fleet.messages.find((message) => message.to === 'ar-39-impl-pear')?.text).toContain(
+      'operator-visible delivery error',
+    )
     fleet.emitAgentMessage({
       from: 'ar-39-impl-pear',
       target: 'factory',
       body: '[factory-needs-input] Can anyone clarify the expected retry behavior?',
       eventId: 'agent-question-39',
     })
-    await flush()
-    await flush()
+    await vi.waitFor(() => expect(factory.status().counters.escalationDeliveryFailures).toBe(1))
 
     expect(result.agents.map((agent) => agent.name)).toEqual(['ar-39-impl-pear', 'ar-39-review'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-39-impl-pear', 'ar-39-review'])
     expect(mount.writes.filter((write) => isSlackRootWritePath(write.path) || write.path.includes('/replies/'))).toEqual([])
     expect(factory.status().counters.agentQuestionsSkippedSlackDegraded).toBe(1)
+    expect(errors).toContainEqual([
+      '[factory] escalation delivery failed',
+      expect.objectContaining({
+        kind: 'agent-question',
+        correlationId: expect.stringMatching(/^factory-agent-question-/u),
+        reason: 'Slack writeback is degraded: slack sync status is stale; no GitHub issue write path with an identifiable issue reporter is available',
+      }),
+    ])
+    expect(emittedErrors).toEqual([
+      expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-39' }),
+        errorMessage: expect.stringContaining('Slack writeback is degraded: slack sync status is stale'),
+      }),
+    ])
   })
 
   it('dedupes duplicate agent question events before posting to Slack', async () => {

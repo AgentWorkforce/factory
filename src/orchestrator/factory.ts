@@ -153,6 +153,11 @@ type GithubIssueSource = {
   raw: Record<string, unknown>
 }
 class ClarificationWakeLeaseLostError extends Error {}
+class ClarificationQuestionDeliveryLeaseLostError extends Error {}
+class GithubEscalationReconciliationUnavailableError extends Error {}
+class GithubEscalationPostAmbiguousError extends Error {}
+
+type GithubEscalationReconciliation = 'found' | 'absent' | 'unavailable'
 class ClarificationWakeStoppedError extends Error {}
 type SlackSyncStatusSeverity = 'soft' | 'hard'
 type SlackSyncStatusCheck = { known: boolean; degraded: boolean; reason?: string; severity?: SlackSyncStatusSeverity }
@@ -312,6 +317,7 @@ export class FactoryLoop implements Factory {
   #slackWritebackFailureBackoffUntilMs = 0
   #slackEventWatermarkCache?: { checkedAtMs: number; result: SlackEventWatermark }
   #slackEventWatermarkRefresh?: Promise<SlackEventWatermark>
+  #lastObservedSlackEventAtMs?: number
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
@@ -3969,13 +3975,16 @@ export class FactoryLoop implements Factory {
 
   async #postAgentQuestion(record: InFlightIssue, question: AgentQuestion): Promise<boolean> {
     if (!this.#slack || !this.#config.slack) {
-      await this.#postAgentQuestionToGithub(record, question)
-      return false
+      return await this.#postAgentQuestionToGithub(record, question)
     }
 
     if (await this.#shouldSkipSlackWriteback('agent-question')) {
       this.#increment('agentQuestionsSkippedSlackDegraded')
-      return false
+      return await this.#postAgentQuestionToGithub(
+        record,
+        question,
+        `Slack writeback is degraded${this.#slackDegradedReason ? `: ${this.#slackDegradedReason}` : ''}`,
+      )
     }
 
     const key = issueKey(record.issue)
@@ -3992,7 +4001,7 @@ export class FactoryLoop implements Factory {
         issue: record.issue,
         from: question.agentName,
       })
-      return false
+      return await this.#postAgentQuestionToGithub(record, question, 'no Slack dispatch thread exists')
     }
 
     try {
@@ -4006,7 +4015,7 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#markSlackWritebackFailure('agent-question', error)
       this.#logger.warn?.(`[factory] failed to post agent question for ${record.issue.key}`, error)
-      return false
+      return await this.#postAgentQuestionToGithub(record, question, 'Slack question writeback failed')
     }
   }
 
@@ -4044,14 +4053,103 @@ export class FactoryLoop implements Factory {
       return false
     }
 
-    if (this.#stopping || await this.#shouldSkipSlackWriteback('agent-question')) {
+    if (this.#stopping) {
       await this.#state.releaseClarificationQuestionDelivery(
         this.#workspaceId,
         key,
         this.#clarificationWakeOwner,
       )
-      if (!this.#stopping) this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
       return false
+    }
+
+    // A previous owner may have crashed after GitHub accepted the fallback
+    // but before questionPostedAtMs was committed. Reconcile that external
+    // fact before choosing a currently healthy Slack route, otherwise restart
+    // could duplicate the same durable question across providers.
+    const claimedIssue = await this.#readIssue(claimed.issue.path)
+    const claimedSource = claimedIssue ? githubIssueSourceRef(claimedIssue) : undefined
+    const claimedCorrelationId = githubEscalationCorrelationId(
+      'agent-question',
+      claimed.issue,
+      claimed.question,
+    )
+    let githubDeliveryMayHaveStarted: boolean
+    try {
+      githubDeliveryMayHaveStarted = claimed.reply?.source === 'github' ||
+        await this.#githubIssueCommentPending(claimedCorrelationId)
+    } catch (error) {
+      this.#increment('agentQuestionGithubReconciliationsDeferred')
+      this.#surfaceEscalationDeliveryFailure(
+        'agent-question',
+        claimed.issue,
+        claimedCorrelationId,
+        'GitHub reply-watch state is temporarily unreadable; the durable delivery lease was retained',
+        error,
+      )
+      this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+      return false
+    }
+    if (githubDeliveryMayHaveStarted && (!claimedIssue || !claimedSource)) {
+      this.#increment('agentQuestionGithubReconciliationsDeferred')
+      this.#surfaceEscalationDeliveryFailure(
+        'agent-question',
+        claimed.issue,
+        claimedCorrelationId,
+        'GitHub source issue is temporarily unreadable; the durable delivery lease and reply state were retained',
+      )
+      this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+      return false
+    }
+    if (githubDeliveryMayHaveStarted && claimedIssue && claimedSource) {
+      const reconciliation = await this.#reconcileGithubEscalationComment(
+        claimedIssue,
+        claimedSource,
+        claimedCorrelationId,
+      )
+      if (reconciliation === 'unavailable') {
+        // A persisted pending watch means a prior owner may have crossed the
+        // external-write boundary. Keep its lease/watch and fail closed until
+        // an authoritative lookup can distinguish absence from success.
+        this.#increment('agentQuestionGithubReconciliationsDeferred')
+        this.#logger.warn?.('[factory] deferring clarification delivery until GitHub marker reconciliation is available', {
+          issue: claimed.issue.key,
+          correlationId: claimedCorrelationId,
+        })
+        this.#surfaceEscalationDeliveryFailure(
+          'agent-question',
+          claimed.issue,
+          claimedCorrelationId,
+          'GitHub issue comment reconciliation is unavailable; the durable delivery lease and reply state were retained',
+        )
+        this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+        return false
+      }
+      if (reconciliation === 'found') {
+        const completed = await this.#state.completeClarificationQuestionDelivery(
+          this.#workspaceId,
+          key,
+          this.#clarificationWakeOwner,
+          this.#clock.now(),
+        )
+        if (!completed) {
+          this.#increment('clarificationQuestionDeliveryOwnershipLost')
+          this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+          return false
+        }
+        this.#increment('agentQuestionGithubFallbacksReconciled')
+        this.#increment('clarificationQuestionsDelivered')
+        this.#increment('clarificationQuestionsDeliveredViaGithub')
+        await this.#drainReadyClarificationWake()
+        return true
+      }
+    }
+
+    if (await this.#shouldSkipSlackWriteback('agent-question')) {
+      return await this.#deliverClarificationQuestionToGithub(
+        key,
+        claimed,
+        `Slack writeback is degraded${this.#slackDegradedReason ? `: ${this.#slackDegradedReason}` : ''}`,
+      )
     }
 
     try {
@@ -4082,16 +4180,119 @@ export class FactoryLoop implements Factory {
       await this.#drainReadyClarificationWake()
       return true
     } catch (error) {
+      this.#markSlackWritebackFailure('agent-question', error)
+      this.#increment('clarificationQuestionDeliveryFailures')
+      this.#logger.warn?.(`[factory] failed to post agent question for ${claimed.issue.key}; trying GitHub fallback`, error)
+      return await this.#deliverClarificationQuestionToGithub(key, claimed, 'Slack question writeback failed')
+    }
+  }
+
+  async #deliverClarificationQuestionToGithub(
+    key: string,
+    waiting: WaitingClarification,
+    fallbackReason: string,
+  ): Promise<boolean> {
+    let leaseLost = false
+    let renewalInFlight = false
+    const renewLease = async (): Promise<void> => {
+      if (leaseLost) {
+        throw new ClarificationQuestionDeliveryLeaseLostError('clarification question delivery lease lost')
+      }
+      const renewed = await this.#state.renewClarificationQuestionDelivery(
+        this.#workspaceId,
+        key,
+        this.#clarificationWakeOwner,
+        this.#clock.now(),
+      )
+      if (!renewed) {
+        leaseLost = true
+        throw new ClarificationQuestionDeliveryLeaseLostError('clarification question delivery lease lost')
+      }
+    }
+    const heartbeat = setInterval(() => {
+      if (renewalInFlight || leaseLost) return
+      renewalInFlight = true
+      void renewLease()
+        .catch((error: unknown) => {
+          if (error instanceof ClarificationQuestionDeliveryLeaseLostError) {
+            leaseLost = true
+            return
+          }
+          this.#logger.warn?.('[factory] transient error renewing clarification question delivery lease; retrying', {
+            issue: waiting.issue.key,
+            error,
+          })
+        })
+        .finally(() => { renewalInFlight = false })
+    }, Math.max(1_000, Math.floor(CLARIFICATION_QUESTION_DELIVERY_LEASE_MS / 3)))
+    heartbeat.unref?.()
+
+    try {
+      await renewLease()
+      const posted = await this.#postAgentQuestionToGithub(waitingRecord(waiting), {
+        agentName: waiting.askerName,
+        question: waiting.question,
+      }, fallbackReason, renewLease)
+      if (!posted) {
+        await this.#state.releaseClarificationQuestionDelivery(
+          this.#workspaceId,
+          key,
+          this.#clarificationWakeOwner,
+        )
+        this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+        return false
+      }
+
+      // Fence completion against a lease handoff that happened while the
+      // external GitHub write was in flight. A successor can reconcile the
+      // deterministic marker and complete without posting again.
+      await renewLease()
+      const completed = await this.#state.completeClarificationQuestionDelivery(
+        this.#workspaceId,
+        key,
+        this.#clarificationWakeOwner,
+        this.#clock.now(),
+      )
+      if (!completed) {
+        throw new ClarificationQuestionDeliveryLeaseLostError('clarification question delivery lease lost')
+      }
+      this.#increment('clarificationQuestionsDelivered')
+      this.#increment('clarificationQuestionsDeliveredViaGithub')
+      await this.#drainReadyClarificationWake()
+      return true
+    } catch (error) {
+      if (error instanceof ClarificationQuestionDeliveryLeaseLostError) {
+        this.#increment('clarificationQuestionDeliveryOwnershipLost')
+        this.#logger.warn?.('[factory] clarification question delivery ownership moved to another daemon', {
+          issue: waiting.issue.key,
+        })
+        this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+        return false
+      }
+      if (
+        error instanceof GithubEscalationReconciliationUnavailableError ||
+        error instanceof GithubEscalationPostAmbiguousError
+      ) {
+        this.#increment(error instanceof GithubEscalationPostAmbiguousError
+          ? 'agentQuestionGithubPostsAmbiguous'
+          : 'agentQuestionGithubReconciliationsDeferred')
+        this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
+        return false
+      }
       await this.#state.releaseClarificationQuestionDelivery(
         this.#workspaceId,
         key,
         this.#clarificationWakeOwner,
       )
-      this.#markSlackWritebackFailure('agent-question', error)
       this.#increment('clarificationQuestionDeliveryFailures')
-      this.#logger.warn?.(`[factory] failed to post agent question for ${claimed.issue.key}; keeping it durable for retry`, error)
+      this.#logger.error?.('[factory] GitHub clarification fallback preparation failed; delivery remains durable for retry', {
+        issue: waiting.issue.key,
+        error,
+      })
       this.#scheduleClarificationSweep(CLARIFICATION_QUESTION_DELIVERY_RETRY_MS)
       return false
+    } finally {
+      clearInterval(heartbeat)
     }
   }
 
@@ -4233,7 +4434,12 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #postAgentQuestionToGithub(record: InFlightIssue, question: AgentQuestion): Promise<void> {
+  async #postAgentQuestionToGithub(
+    record: InFlightIssue,
+    question: AgentQuestion,
+    fallbackReason?: string,
+    ensureDeliveryLease?: () => Promise<void>,
+  ): Promise<boolean> {
     const correlationId = githubEscalationCorrelationId('agent-question', record.issue, question.question)
     const issue = await this.#readIssue(record.issue.path)
     const source = issue ? githubIssueSourceRef(issue) : undefined
@@ -4243,9 +4449,11 @@ export class FactoryLoop implements Factory {
         'agent-question',
         record.issue,
         correlationId,
-        'no Slack channel or GitHub issue write path with an identifiable issue reporter is available',
+        fallbackReason
+          ? `${fallbackReason}; no GitHub issue write path with an identifiable issue reporter is available`
+          : 'no Slack channel or GitHub issue write path with an identifiable issue reporter is available',
       )
-      return
+      return false
     }
 
     await this.#addGithubIssueCommentWatch(record.issue, source, {
@@ -4253,26 +4461,125 @@ export class FactoryLoop implements Factory {
       kind: 'agent-question',
       authorizedAuthor,
     })
+    const reconciliation = await this.#reconcileGithubEscalationComment(issue, source, correlationId)
+    if (reconciliation === 'unavailable') {
+      this.#surfaceEscalationDeliveryFailure(
+        'agent-question',
+        record.issue,
+        correlationId,
+        'GitHub issue comment reconciliation is unavailable; delivery was deferred to avoid a duplicate',
+      )
+      if (ensureDeliveryLease) {
+        throw new GithubEscalationReconciliationUnavailableError('GitHub escalation reconciliation unavailable')
+      }
+      return false
+    }
+    if (reconciliation === 'found') {
+      this.#increment('agentQuestionGithubFallbacksReconciled')
+      return true
+    }
+    // Renew immediately before the irreversible external write. The caller
+    // also heartbeats long posts and fences durable completion afterward.
+    await ensureDeliveryLease?.()
     try {
       await this.#githubWriteback.postComment(issue, [
         `${record.issue.key}: ${question.agentName} needs input.`,
         `Question: ${question.question}`,
+        ...(fallbackReason ? [`Slack fallback reason: ${fallbackReason}.`] : []),
         `Authorized responder: @${authorizedAuthor} (the issue reporter).`,
         `Reply with a comment that starts with \`${githubReplyPrefix(correlationId)}\`.`,
         '',
         githubEscalationMarker(correlationId),
       ].join('\n'))
       this.#increment('agentQuestionsPostedToGithub')
+      if (fallbackReason) this.#increment('agentQuestionsRoutedToGithubFallback')
+      return true
     } catch (error) {
-      await this.#removeGithubIssueCommentPending(source, correlationId)
       this.#surfaceEscalationDeliveryFailure(
         'agent-question',
         record.issue,
         correlationId,
-        'GitHub issue comment writeback failed',
+        'GitHub issue comment writeback returned an ambiguous result; the pending reply watch was retained for reconciliation',
         error,
       )
+      if (ensureDeliveryLease) {
+        throw new GithubEscalationPostAmbiguousError('GitHub escalation post outcome is ambiguous', { cause: error })
+      }
+      return false
     }
+  }
+
+  async #reconcileGithubEscalationComment(
+    issue: LinearIssue,
+    source: GithubIssueSourceRef,
+    correlationId: string,
+  ): Promise<GithubEscalationReconciliation> {
+    const marker = githubEscalationMarker(correlationId)
+    if (this.#githubWriteback.hasCommentMarker) {
+      try {
+        return await this.#githubWriteback.hasCommentMarker(issue, marker) ? 'found' : 'absent'
+      } catch (error) {
+        this.#logger.warn?.('[factory] authoritative GitHub escalation marker lookup failed', {
+          issue: source.number,
+          correlationId,
+          error,
+        })
+        return 'unavailable'
+      }
+    }
+
+    const paths = new Set<string>()
+    const owner = encodeURIComponent(source.owner)
+    const repo = encodeURIComponent(source.repo)
+    for (const prefix of [
+      `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+      `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+    ]) {
+      try {
+        for (const path of await this.#mount.listTree(prefix)) {
+          const parts = githubIssueCommentPathParts(path)
+          if (
+            parts &&
+            parts.owner.toLowerCase() === source.owner.toLowerCase() &&
+            parts.repo.toLowerCase() === source.repo.toLowerCase() &&
+            parts.number === source.number
+          ) {
+            paths.add(path)
+          }
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] GitHub escalation marker listing failed', { prefix, correlationId, error })
+        return 'unavailable'
+      }
+    }
+
+    let unreadable = false
+    for (const path of paths) {
+      try {
+        const { content } = await this.#mount.readFile(path)
+        const comment = parseGithubIssueComment(path, content)
+        if (comment?.body.includes(marker)) return 'found'
+      } catch (error) {
+        unreadable = true
+        this.#logger.warn?.('[factory] GitHub escalation marker comment read failed', {
+          path,
+          correlationId,
+          error,
+        })
+      }
+    }
+    return unreadable ? 'unavailable' : 'absent'
+  }
+
+  async #githubIssueCommentPending(
+    correlationId: string,
+  ): Promise<boolean> {
+    if ([...this.#githubIssueCommentWatchStates.values()]
+      .some((watch) => watch.pending.some((pending) => pending.correlationId === correlationId))) {
+      return true
+    }
+    return (await this.#state.listGithubIssueCommentWatches(this.#workspaceId))
+      .some(([, watch]) => watch.pending.some((pending) => pending.correlationId === correlationId))
   }
 
   async #addGithubIssueCommentWatch(
@@ -4586,6 +4893,26 @@ export class FactoryLoop implements Factory {
   ): Promise<boolean> {
     if (pending.kind === 'triage' && pending.decision) {
       return await this.#handleTriageEscalationGithubAnswer(escalationWatchRecord(pending.decision), text)
+    }
+
+    const clarificationKey = issueKey(watch.issue)
+    const waiting = await this.#state.getWaitingClarification(this.#workspaceId, clarificationKey)
+    if (waiting) {
+      const claimed = await this.#state.claimClarificationReply(this.#workspaceId, clarificationKey, {
+        id: `github:${watch.source.owner}/${watch.source.repo}#${watch.source.number}:${comment.commentId}`,
+        text,
+        receivedAtMs: this.#clock.now(),
+        source: 'github',
+        author: comment.author,
+      })
+      if (!claimed) {
+        this.#increment('clarificationDuplicateWakesSuppressed')
+        return Boolean(waiting.reply)
+      }
+      this.#increment('clarificationRepliesClaimed')
+      this.#increment('githubClarificationRepliesClaimed')
+      await this.#wakeWaitingClarification(clarificationKey, claimed)
+      return true
     }
 
     const liveRecord = (await this.#batch()).getIssue(watch.issue)
@@ -5988,10 +6315,12 @@ export class FactoryLoop implements Factory {
   async #slackFreshness(): Promise<{ known: boolean; degraded: boolean; reason?: string; status?: ProviderSyncStatus }> {
     const staleAfterMs = this.#config.slack?.staleAfterMs ?? 10 * 60_000
     let sawSlackStatus = false
+    let slackStatus: ProviderSyncStatus | undefined
     let softStatusResult: SlackSyncStatusCheck | undefined
     let softStatus: ProviderSyncStatus | undefined
     try {
       const status = await this.#mount.getSyncStatus?.('slack')
+      slackStatus = status?.provider === 'slack' ? status : undefined
       sawSlackStatus = status?.provider === 'slack'
       const statusResult = slackSyncStatusResult(status, this.#clock.now(), staleAfterMs)
       if (statusResult.known) {
@@ -6003,6 +6332,33 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#logger.warn?.('[factory] Slack sync freshness check failed; proceeding without degradation', error)
+    }
+
+    if (slackStatus?.webhookHealthy === true) {
+      if (softStatusResult?.degraded) {
+        this.#increment('slackGateBypassedByWebhookHealth')
+        this.#logger.info?.('[factory] Slack sync soft-degraded but webhook delivery is healthy; continuing Slack writeback', {
+          reason: softStatusResult.reason,
+          status: slackStatus,
+        })
+      }
+      return { known: true, degraded: false }
+    }
+
+    const observedEventAgeMs = this.#lastObservedSlackEventAtMs === undefined
+      ? undefined
+      : this.#clock.now() - this.#lastObservedSlackEventAtMs
+    if (observedEventAgeMs !== undefined && observedEventAgeMs <= staleAfterMs) {
+      if (softStatusResult?.degraded) {
+        this.#increment('slackGateBypassedByObservedEvent')
+        this.#logger.info?.('[factory] Slack sync soft-degraded but a webhook event arrived recently; continuing Slack writeback', {
+          reason: softStatusResult.reason,
+          status: softStatus,
+          lastObservedSlackEventAtMs: this.#lastObservedSlackEventAtMs,
+          observedEventAgeMs,
+        })
+      }
+      return { known: true, degraded: false }
     }
 
     try {
@@ -6080,6 +6436,13 @@ export class FactoryLoop implements Factory {
       : { known: true, lastEventAtMs }
     this.#slackEventWatermarkCache = { checkedAtMs: this.#clock.now(), result }
     return result
+  }
+
+  #recordObservedSlackEvent(event: ChangeEvent): void {
+    const path = changeEventPath(event)
+    if (eventProvider(event) !== 'slack' && !path?.startsWith('/slack/')) return
+    this.#lastObservedSlackEventAtMs = this.#clock.now()
+    this.#increment('slackWebhookEventsObserved')
   }
 
   async #ensureSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
@@ -6349,6 +6712,10 @@ export class FactoryLoop implements Factory {
     let subscription: Subscription | undefined
     try {
       subscription = this.#mount.subscribe([`${messagesPrefix}**`], (event) => {
+        // Receipt time is independent of the provider-authored sync timestamp.
+        // A healthy webhook can therefore override a frozen advisory status
+        // without trusting the same field that declared the provider stale.
+        this.#recordObservedSlackEvent(event)
         void handle(event)
       })
     } catch (error) {
@@ -6669,6 +7036,7 @@ export class FactoryLoop implements Factory {
         id: `${reply.threadTs}:${reply.messageTs}`,
         text,
         receivedAtMs: this.#clock.now(),
+        source: 'slack',
       })
       if (!claimed) {
         this.#increment('clarificationDuplicateWakesSuppressed')
@@ -6884,7 +7252,9 @@ export class FactoryLoop implements Factory {
           await renewLease()
         }
 
-        const event = slackReplyEvent(waiting.issue, reply.text)
+        const event = reply.source === 'github'
+          ? githubReplyEvent(waiting.issue, reply.text, reply.author)
+          : slackReplyEvent(waiting.issue, reply.text)
         for (const [name] of resumed) {
           if (waiting.wake?.injectedAgents.includes(name)) continue
           this.#assertClarificationWakeRunning()
@@ -9333,6 +9703,14 @@ const escalationWatchRecord = (decision: TriageDecision): InFlightIssue => ({
   agents: new Map(),
   invocationIds: new Set(),
   dryRun: false,
+})
+
+const waitingRecord = (waiting: WaitingClarification): InFlightIssue => ({
+  issue: waiting.issue,
+  decision: waiting.decision,
+  agents: new Map(waiting.agents.map(({ name, tracked }) => [name, structuredClone(tracked)])),
+  invocationIds: new Set(),
+  dryRun: waiting.dryRun,
 })
 
 const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({

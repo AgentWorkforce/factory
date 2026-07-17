@@ -94,22 +94,26 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'When implementation is complete, finish your session normally; Factory will open the PR targeting the repository default branch through the connected GitHub workspace.',
     'Do not run `gh pr create` or require local GitHub CLI authentication.',
     `Factory will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
-    'If blocked and you need human input, DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question. Factory will relay it to the issue conversation.',
     'DM `broker` when fully done.',
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
   ]
-  const questionInstructions = input.slackDispatchThread
-    ? [
-        '',
-        'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
+  const questionInstructions = [
+    '',
+    'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
+    'Factory will route the question through the issue Slack thread when available and healthy, otherwise through the source GitHub issue when available. If neither write path works, Factory will emit an operator-visible delivery error instead of silently discarding the question.',
+    ...(input.slackDispatchThread
+      ? [
         // Absolute path: the agent runs in its repo clone, not the daemon cwd
         // where .integrations lives, so a relative path would be unreachable.
-        `Factory will durably post and, if necessary, retry the question to the Slack thread represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
+        `Factory will durably post and, if necessary, retry the question through that routing policy; the primary Slack thread is represented at ${input.slackDispatchThread.mountRoot}/slack/channels/${input.slackDispatchThread.channel}/messages/${input.slackDispatchThread.threadId.replaceAll('.', '_')}/replies/question.json.`,
         'After sending the marker, stop work and finish your session normally. Do not wait or poll: Factory will release the whole team and resume it from session memory only after the first human reply.',
         'If session resume is unavailable, Factory will cold-start the team with the issue, question, reply, branch, and PR context so work can be re-hydrated explicitly.',
       ]
-    : []
+      : [
+        'No durable Slack dispatch thread was established for this task. Keep the session available after asking so Factory can inject a GitHub reply if that fallback is available.',
+      ]),
+  ]
 
   if (input.role === 'babysitter') {
     const prRef = input.pr
