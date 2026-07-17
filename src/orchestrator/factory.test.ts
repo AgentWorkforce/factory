@@ -61,6 +61,23 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
   ...overrides,
 })
 
+const multiRepoGithubConfig = (overrides: FactoryConfigOverrides = {}): FactoryConfig => config({
+  issueSource: 'github',
+  batchSize: 4,
+  repos: {
+    byLabel: {
+      pear: 'AgentWorkforce/pear',
+      hoopsheet: 'AgentWorkforce/hoopsheet',
+    },
+    clonePaths: {
+      'AgentWorkforce/pear': '/work/pear',
+      'AgentWorkforce/hoopsheet': '/work/hoopsheet',
+    },
+    default: 'AgentWorkforce/pear',
+  },
+  ...overrides,
+})
+
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
 const readyAliasPath = (n: number) => `/linear/issues/by-state/ready-for-agent/AR-${n}.json`
 const githubIssuePath = (owner: string, repo: string, number: number) => `/github/repos/${owner}/${repo}/issues/by-id/${number}.json`
@@ -1320,7 +1337,7 @@ describe('FactoryLoop', () => {
 
     expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#48', key: '48', path }])
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['48'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-48-impl-pear', 'ar-48-review'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-48-impl-pear', 'ar-48-review-pear'])
     expect(githubWriteback.statuses).toEqual([{ key: '48', status: 'in-progress' }])
     expect(githubWriteback.comments[0]?.body).toContain('Factory dispatch for 48')
     expect(mount.writes.filter((write) => write.path.startsWith('/linear/'))).toEqual([])
@@ -1338,6 +1355,114 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.closes).toEqual([])
     expect(mergeGate.checks).toEqual([])
     expect(mergeGate.merges).toEqual([])
+  })
+
+  it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
+    const number = 26
+    const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const hoopsheetPath = githubIssuePath('AgentWorkforce', 'hoopsheet', number)
+    const pearFile = githubIssueFile(number, { repo: 'pear', labels: ['factory'] })
+    const hoopsheetFile = githubIssueFile(number, { repo: 'hoopsheet', labels: ['factory'] })
+    const mount = new FakeMountClient({
+      [pearPath]: pearFile,
+      [hoopsheetPath]: hoopsheetFile,
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-26-review-hoopsheet', 'session-review-hoopsheet-26')
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const temporaryDir = await mkdtemp(join(tmpdir(), 'factory-issue82-registry-'))
+    const registryPath = join(temporaryDir, 'registry.json')
+    const factory = createFactory(multiRepoGithubConfig({ loop: { registryPath } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.path).sort()).toEqual([hoopsheetPath, pearPath].sort())
+      expect(fleet.spawns.map((spawn) => spawn.name).sort()).toEqual([
+        'ar-26-impl-hoopsheet',
+        'ar-26-review-hoopsheet',
+        'ar-26-impl-pear',
+        'ar-26-review-pear',
+      ].sort())
+      expect(fleet.messages.find((message) => message.to === 'ar-26-impl-pear')?.text)
+        .toContain('reviewer `ar-26-review-pear`')
+      expect(fleet.messages.find((message) => message.to === 'ar-26-impl-hoopsheet')?.text)
+        .toContain('reviewer `ar-26-review-hoopsheet`')
+
+      const registry = await readFactoryInFlightRegistry(registryPath)
+      expect(registry?.agents.map((agent) => agent.name).sort()).toEqual([
+        'ar-26-impl-hoopsheet',
+        'ar-26-review-hoopsheet',
+        'ar-26-impl-pear',
+        'ar-26-review-pear',
+      ].sort())
+
+      fleet.emitAgentExit('ar-26-review-hoopsheet', 'crash')
+      await vi.waitFor(() => expect(fleet.resumes).toContainEqual({
+        name: 'ar-26-review-hoopsheet',
+        sessionRef: 'session-review-hoopsheet-26',
+        node: 'self',
+        capability: 'spawn:claude',
+      }))
+
+      fleet.emitAgentExit('ar-26-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(factory.status().inFlight.map((issue) => issue.path)).toEqual([hoopsheetPath]))
+
+      const pearIssue = parseGithubFactoryIssue(pearPath, pearFile)
+      const hoopsheetIssue = parseGithubFactoryIssue(hoopsheetPath, hoopsheetFile)
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(pearIssue))).resolves.toMatchObject({
+        inFlight: false,
+        terminal: true,
+      })
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(hoopsheetIssue))).resolves.toMatchObject({
+        inFlight: true,
+        terminal: false,
+      })
+      expect(fleet.releases.map((release) => release.name)).toEqual([
+        'ar-26-impl-pear',
+        'ar-26-review-pear',
+      ])
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
+        'ar-26-impl-hoopsheet',
+        'ar-26-review-hoopsheet',
+      ])
+    } finally {
+      await rm(temporaryDir, { recursive: true, force: true })
+    }
+  })
+
+  it('repo-qualifies equal-number GitHub workflow identities', async () => {
+    const number = 27
+    const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const hoopsheetPath = githubIssuePath('AgentWorkforce', 'hoopsheet', number)
+    const mount = new FakeMountClient({
+      [pearPath]: githubIssueFile(number, { repo: 'pear', labels: ['factory', 'pear', 'agent:workflow'] }),
+      [hoopsheetPath]: githubIssueFile(number, { repo: 'hoopsheet', labels: ['factory', 'hoopsheet', 'agent:workflow'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(multiRepoGithubConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toHaveLength(2)
+    expect(fleet.spawns.map((spawn) => spawn.name).sort()).toEqual([
+      'ar-27-workflow-hoopsheet',
+      'ar-27-workflow-pear',
+    ])
+    expect(report.dispatched.flatMap((result) => result.agents).every((agent) => agent.role === 'workflow')).toBe(true)
   })
 
   it('requires the configured readiness label before dispatching a GitHub-native issue', async () => {
@@ -8038,7 +8163,7 @@ describe('FactoryLoop', () => {
       author: { login: 'issue-author' },
     })
 
-    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-58-impl-pear', 'ar-58-review']))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-58-impl-pear', 'ar-58-review-pear']))
     await vi.waitFor(() => expect(fleet.inputs).toContainEqual({
       name: 'ar-58-impl-pear',
       data: '<integration-event source="github" issue="58">\nHuman reply on the GitHub issue:\nUse the shared retry helper and add regression coverage.\n</integration-event>\r',
@@ -8118,7 +8243,7 @@ describe('FactoryLoop', () => {
       body: `${prefix} The reporter-authorized clarification.`,
       author: { login: 'reporter' },
     })
-    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-61-impl-pear', 'ar-61-review']))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-61-impl-pear', 'ar-61-review-pear']))
   })
 
   it('serializes out-of-order GitHub comments without losing a lower-id correlated reply', async () => {
@@ -8148,7 +8273,7 @@ describe('FactoryLoop', () => {
       author: { login: 'reporter' },
     })
 
-    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review']))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-65-impl-pear', 'ar-65-review-pear']))
     await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
   })
 
@@ -8254,7 +8379,7 @@ describe('FactoryLoop', () => {
         liveSubscription: { transport: 'subscribe' },
       })
 
-      await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review']))
+      await vi.waitFor(() => expect(restartFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-62-impl-pear', 'ar-62-review-pear']))
       expect(restartedFactory.status().counters.githubIssueCommentWatchersRearmed).toBe(1)
       expect(await restartedStateStore.listGithubIssueCommentWatches('factory-test')).toEqual([])
       await restartedFactory.stop()
@@ -10026,6 +10151,125 @@ describe('FactoryLoop PR babysitter', () => {
       content: { number: n, head_ref: `ar-${n}-fix`, url: `https://github.com/${repo}/pull/${n}`, ...payload },
     })
   }
+
+  it('keeps equal-number GitHub babysitters and reviewer prompts isolated across repos', async () => {
+    const number = 26
+    const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const hoopsheetPath = githubIssuePath('AgentWorkforce', 'hoopsheet', number)
+    const mount = new FakeMountClient({
+      [pearPath]: githubIssueFile(number, { repo: 'pear', labels: ['factory'] }),
+      [hoopsheetPath]: githubIssueFile(number, { repo: 'hoopsheet', labels: ['factory'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    seedPrMeta(mount, 'AgentWorkforce/hoopsheet', number, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async (issue) => ({
+        repo: issue.path.includes('/hoopsheet/') ? 'AgentWorkforce/hoopsheet' : 'AgentWorkforce/pear',
+        prNumber: number,
+      }),
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-26-impl-pear', 'worker_exited')
+    fleet.emitAgentExit('ar-26-impl-hoopsheet', 'worker_exited')
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(expect.arrayContaining([
+      'ar-26-babysit-pear',
+      'ar-26-babysit-hoopsheet',
+    ])))
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-26-babysit-pear')?.task)
+      .toContain('reviewer `ar-26-review-pear`')
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-26-babysit-hoopsheet')?.task)
+      .toContain('reviewer `ar-26-review-hoopsheet`')
+
+    fleet.emitAgentExit('ar-26-impl-pear', 'worker_exited')
+    await flush()
+    expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-26-babysit-pear')).toHaveLength(1)
+    expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-26-babysit-hoopsheet')).toHaveLength(1)
+
+    fleet.emitAgentMessage({
+      from: 'ar-26-babysit-pear',
+      target: 'factory',
+      body: '[factory-pr-ready] 26',
+    })
+    await vi.waitFor(() => expect(factory.status().inFlight.map((issue) => issue.path)).toEqual([hoopsheetPath]))
+    expect(fleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-26-babysit-pear',
+      'ar-26-impl-pear',
+      'ar-26-review-pear',
+    ])
+  })
+
+  it('cleans only the completed repo publication guard for equal-number GitHub issues', async () => {
+    const number = 29
+    const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const hoopsheetPath = githubIssuePath('AgentWorkforce', 'hoopsheet', number)
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number,
+          url: `https://github.com/${input.repo}/pull/${number}`,
+          headRef: `ar-${number}-impl-${input.repo.split('/').at(-1)}`,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [pearPath]: githubIssueFile(number, { repo: 'pear', labels: ['factory'] }),
+      [hoopsheetPath]: githubIssueFile(number, { repo: 'hoopsheet', labels: ['factory'] }),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    seedPrMeta(mount, 'AgentWorkforce/hoopsheet', number, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-29-impl-pear', 'crash')
+    fleet.emitAgentExit('ar-29-impl-hoopsheet', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(expect.arrayContaining([
+      'ar-29-babysit-pear',
+      'ar-29-babysit-hoopsheet',
+    ])))
+
+    fleet.emitAgentMessage({
+      from: 'ar-29-babysit-pear',
+      target: 'factory',
+      body: '[factory-pr-ready] 29',
+    })
+    await vi.waitFor(() => expect(factory.status().inFlight.map((issue) => issue.path)).toEqual([hoopsheetPath]))
+
+    fleet.emitAgentExit('ar-29-impl-hoopsheet', 'crash-again')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(publishInputs.map((input) => input.repo).sort()).toEqual([
+      'AgentWorkforce/hoopsheet',
+      'AgentWorkforce/pear',
+    ])
+  })
 
   it('spawns a sonnet babysitter (not done) when an implementer exits with a ready PR', async () => {
     const issue = realIssueFile(401, ready, { title: 'Real babysitter spawn' })

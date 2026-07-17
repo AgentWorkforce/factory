@@ -1,6 +1,7 @@
 import type { FactoryConfig } from '../config/schema'
 import type { AgentSpec } from '../ports'
 import type { IssueRef, LinearIssue, RepoMapEntry, TriageContext, TriageDecision, TriageEngine } from '../types'
+import { agentNameForRole, repoSlugFromName } from './agent-names'
 
 type RouteSource = RepoMapEntry['source']
 type Route = TriageDecision['routes'][number]
@@ -63,7 +64,7 @@ export class HeuristicTriage implements TriageEngine {
         ? `${routed.rationale} Scope selected from Linear label agent:${explicitScope}.`
         : routed.rationale,
       scopeSlugs: routed.routes.length >= 2
-        ? routed.routes.map((route) => slugFromRepo(route.repo))
+        ? routed.routes.map((route) => repoSlugFromName(route.repo) ?? 'scope')
         : surfaces,
     })
   }
@@ -90,7 +91,7 @@ export function buildDecision(input: {
       : input.scope === 'workflow'
         ? 'workflow'
         : 'single'
-  const slugs = input.scopeSlugs ?? routes.map((route) => slugFromRepo(route.repo))
+  const slugs = input.scopeSlugs ?? routes.map((route) => repoSlugFromName(route.repo) ?? 'scope')
   const implementerAssignments = scope === 'workflow' || input.confidence === 'low' && routes.length === 0
     ? []
     : implementationAssignments(routes, scope, slugs, maxImplementers)
@@ -248,13 +249,13 @@ function implementationAssignments(
 ): Array<{ route: Route; slug: string }> {
   if (scope === 'single' || scope === 'workflow') {
     const route = routes[0]
-    return route ? [{ route, slug: slugFromRepo(route.repo) }] : []
+    return route ? [{ route, slug: repoSlugFromName(route.repo) ?? 'scope' }] : []
   }
 
   if (routes.length >= 2) {
     return routes.slice(0, maxImplementers).map((route, index) => ({
       route,
-      slug: slugs[index] ?? slugFromRepo(route.repo),
+      slug: slugs[index] ?? repoSlugFromName(route.repo) ?? 'scope',
     }))
   }
 
@@ -263,7 +264,7 @@ function implementationAssignments(
     return []
   }
 
-  const teamSlugs = slugs.length >= 2 ? slugs : [slugFromRepo(route.repo), 'scope']
+  const teamSlugs = slugs.length >= 2 ? slugs : [repoSlugFromName(route.repo) ?? 'scope', 'scope']
   return teamSlugs.slice(0, maxImplementers).map((slug) => ({ route, slug }))
 }
 
@@ -282,8 +283,10 @@ function implementerSpec(input: {
   scope: Scope
   slug: string
 }): AgentSpec {
-  const base = agentBaseName(input.issue)
-  const name = input.scope === 'team' ? `${base}-impl-${sanitizeSlug(input.slug)}` : `${base}-impl`
+  const name = agentNameForRole(input.issue, 'impl', {
+    repo: input.route.repo,
+    discriminator: input.scope === 'team' ? input.slug : undefined,
+  })
   return {
     name,
     role: 'implementer',
@@ -304,7 +307,7 @@ function workflowSpec(issue: LinearIssue, _config: FactoryConfig, routes: Route[
   // consumes this version, so the two can diverge without an observable bug.
   const repoLabels = issue.labels.filter((label) => !isShapeLabel(label))
   return {
-    name: `${agentBaseName(issue)}-workflow`,
+    name: agentNameForRole(issue, 'workflow', { repo: primaryRoute.repo }),
     role: 'workflow',
     capability: 'workflow:run',
     task: taskFor(issue, primaryRoute, 'workflow'),
@@ -326,7 +329,7 @@ function workflowSpec(issue: LinearIssue, _config: FactoryConfig, routes: Route[
 function reviewerSpec(issue: LinearIssue, config: FactoryConfig, route?: Route): AgentSpec {
   const repo = route?.repo ?? config.repos.default ?? 'unroutable'
   return {
-    name: `${agentBaseName(issue)}-review`,
+    name: agentNameForRole(issue, 'review', { repo }),
     role: 'reviewer',
     capability: 'spawn:claude',
     model: config.models.reviewer,
@@ -346,7 +349,7 @@ function reviewerSpec(issue: LinearIssue, config: FactoryConfig, route?: Route):
 export function babysitterSpec(issue: LinearIssue, config: FactoryConfig, route?: Route): AgentSpec {
   const repo = route?.repo ?? config.repos.default ?? 'unroutable'
   return {
-    name: `${agentBaseName(issue)}-babysit`,
+    name: agentNameForRole(issue, 'babysit', { repo }),
     role: 'babysitter',
     capability: 'spawn:claude',
     model: config.models.babysitter,
@@ -371,19 +374,6 @@ function taskFor(issue: LinearIssue, route: Route, role: AgentSpec['role']): str
     `Route rationale: ${route.rationale}`,
     issue.description,
   ].join('\n\n')
-}
-
-function agentBaseName(issue: LinearIssue): string {
-  const number = issue.key.match(/\d+/)?.[0] ?? sanitizeSlug(issue.key)
-  return `ar-${number}`
-}
-
-function slugFromRepo(repo: string): string {
-  return sanitizeSlug(repo.split('/').at(-1) ?? repo)
-}
-
-function sanitizeSlug(slug: string): string {
-  return slug.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'scope'
 }
 
 export function scopeFromLabels(labels: string[]): Scope | undefined {

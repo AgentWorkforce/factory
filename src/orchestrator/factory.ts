@@ -39,6 +39,7 @@ import {
 } from '@agent-relay/integration-prompts'
 import { renderAgentTask } from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
+import { agentNameForRole } from '../triage/agent-names'
 import type {
   DispatchResult,
   Factory,
@@ -290,10 +291,10 @@ export class FactoryLoop implements Factory {
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
-  // Issue keys for which a babysitter has already been spawned, so repeated PR
+  // Composite issue identities for which a babysitter has already been spawned, so repeated PR
   // webhooks / agent-exit safety nets don't respawn it.
   readonly #babysitterSpawned = new Set<string>()
-  // Issue key -> the open PR the babysitter is shepherding, including the
+  // Composite issue identity -> the open PR the babysitter is shepherding, including the
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, { repo: string; prNumber: number; path?: string }>()
   readonly #publishedPullRequests = new Set<string>()
@@ -1085,7 +1086,7 @@ export class FactoryLoop implements Factory {
             }
             if (pr.draft) {
               this.#increment('completionSweepDraftPr')
-              this.#probePrGhBackoffUntilMs.set(issue.key, this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
+              this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
               return undefined
             }
             return { record, pr }
@@ -1131,7 +1132,7 @@ export class FactoryLoop implements Factory {
     issue: LinearIssue,
     opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
   ): Promise<ResolvedIssuePr | undefined> {
-    const key = issue.key
+    const key = issueStateKey(issueRef(issue))
     const now = this.#clock.now()
     const cached = this.#probePrResolvedCache.get(key)
     if (cached && cached.expiresAtMs > now) {
@@ -1448,7 +1449,7 @@ export class FactoryLoop implements Factory {
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
-    const key = `${decision.issue.key}:${dryRun ? 'dry-run' : 'live'}:${phase}`
+    const key = `${issueStateKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
     const inFlight = this.#dispatchInFlight.get(key)
     if (inFlight) {
       this.#increment('dispatchDuplicateSuppressed')
@@ -1514,12 +1515,13 @@ export class FactoryLoop implements Factory {
       })
       if (!dryRun) {
         const signature = labelDispatchFailureSignature(labelDispatch)
-        if (this.#labelDispatchFailures.get(decision.issue.key) !== signature) {
+        const failureKey = issueStateKey(decision.issue)
+        if (this.#labelDispatchFailures.get(failureKey) !== signature) {
           try {
             await this.#postIssueComment(liveIssue, comment)
             // Record only after a successful post so a failed writeback retries
             // next cycle rather than being suppressed as already-notified.
-            this.#labelDispatchFailures.set(decision.issue.key, signature)
+            this.#labelDispatchFailures.set(failureKey, signature)
           } catch (error) {
             this.#logger.warn?.('[factory] label dispatch block comment writeback skipped', error)
           }
@@ -1531,7 +1533,7 @@ export class FactoryLoop implements Factory {
     const dispatchDecision = labelDispatch.decision
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
-    this.#labelDispatchFailures.delete(dispatchDecision.issue.key)
+    this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
     await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
@@ -2054,7 +2056,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
-    const key = issue.key
+    const key = issueStateKey(issue)
     const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
     if (!state) return undefined
     if (state.terminal) return 'dispatch already terminal'
@@ -2072,7 +2074,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #recordDispatchAttempt(issue: IssueRef): Promise<void> {
-    const key = issue.key
+    const key = issueStateKey(issue)
     const state = await this.#state.getDispatchAttempts(this.#workspaceId, key) ?? {
       attempts: 0,
       inFlight: false,
@@ -2086,27 +2088,29 @@ export class FactoryLoop implements Factory {
   }
 
   async #clearDispatchInFlight(issue: IssueRef): Promise<void> {
-    await this.#state.releaseInFlight(this.#workspaceId, issue.key)
+    await this.#state.releaseInFlight(this.#workspaceId, issueStateKey(issue))
   }
 
   async #recordDispatchFailure(issue: IssueRef): Promise<void> {
-    const state = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key)
+    const key = issueStateKey(issue)
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
     if (!state) return
     state.inFlight = false
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       state.terminal = true
       state.backoffUntilMs = 0
       this.#increment('dispatchTerminalFailures')
-      await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
+      await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
       return
     }
     state.backoffUntilMs = this.#clock.now() + this.#config.dispatch.errorCooldownMs
-    await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
+    await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
     this.#increment('dispatchBackoffs')
   }
 
   async #recordDispatchTerminal(issue: IssueRef): Promise<void> {
-    const state = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key) ?? {
+    const key = issueStateKey(issue)
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, key) ?? {
       attempts: 0,
       inFlight: false,
       terminal: false,
@@ -2115,25 +2119,26 @@ export class FactoryLoop implements Factory {
     state.inFlight = false
     state.terminal = true
     state.backoffUntilMs = 0
-    await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, state)
+    await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
-  async #recordCanonicalIssueState(issue: Pick<LinearIssue, 'key' | 'stateId'>): Promise<void> {
-    const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, issue.key)
+  async #recordCanonicalIssueState(issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'>): Promise<void> {
+    const key = issueStateKey(issue)
+    const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, key)
     const previousRole = this.#states.roleOf(previousStateId)
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && this.#states.isRole(issue.stateId, 'readyForAgent')) {
-      const dispatchState = await this.#state.getDispatchAttempts(this.#workspaceId, issue.key)
+      const dispatchState = await this.#state.getDispatchAttempts(this.#workspaceId, key)
       if (dispatchState?.terminal) {
         dispatchState.attempts = 0
         dispatchState.inFlight = false
         dispatchState.terminal = false
         dispatchState.backoffUntilMs = 0
-        await this.#state.recordDispatchAttempt(this.#workspaceId, issue.key, dispatchState)
+        await this.#state.recordDispatchAttempt(this.#workspaceId, key, dispatchState)
         this.#increment('dispatchTerminalReopened')
       }
     }
-    await this.#state.recordCanonicalState(this.#workspaceId, issue.key, issue.stateId)
+    await this.#state.recordCanonicalState(this.#workspaceId, key, issue.stateId)
   }
 
   async #writeLoopHeartbeat(
@@ -4028,7 +4033,7 @@ export class FactoryLoop implements Factory {
       this.#increment('mergedPrAdvanceNoIssue')
       return
     }
-    const advanceKey = `${issue.key}:${snapshot.number}`
+    const advanceKey = `${issueKey(issueRef(issue))}:${snapshot.number}`
     if (this.#postMergeDoneAdvances.has(advanceKey)) {
       this.#increment('mergedPrAdvanceDuplicatesSuppressed')
       return
@@ -4045,7 +4050,7 @@ export class FactoryLoop implements Factory {
       } else {
         const doneStateId = this.#states.idFor(issue.team, 'done')
         await this.#linear.setState(issue, doneStateId)
-        await this.#recordCanonicalIssueState({ key: issue.key, stateId: doneStateId })
+        await this.#recordCanonicalIssueState({ ...issueRef(issue), stateId: doneStateId })
       }
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
       this.#increment('mergedPrAdvancedDone')
@@ -4124,7 +4129,7 @@ export class FactoryLoop implements Factory {
   // probe resolver and spawn the babysitter. Triggered by an implementer exiting
   // after opening its PR (an event, not a poll).
   async #ensureBabysitterForIssue(record: InFlightIssue): Promise<void> {
-    if (this.#babysitterSpawned.has(record.issue.key)) {
+    if (this.#babysitterSpawned.has(issueKey(record.issue))) {
       return
     }
     const issue = await this.#readIssue(record.issue.path)
@@ -4139,21 +4144,22 @@ export class FactoryLoop implements Factory {
   }
 
   async #ensureBabysitter(record: InFlightIssue, prRef: { repo: string; prNumber: number; url?: string; path?: string }): Promise<void> {
-    this.#babysitterPr.set(record.issue.key, { repo: prRef.repo, prNumber: prRef.prNumber, path: prRef.path })
-    if (this.#babysitterSpawned.has(record.issue.key)) {
+    const babysitterKey = issueKey(record.issue)
+    this.#babysitterPr.set(babysitterKey, { repo: prRef.repo, prNumber: prRef.prNumber, path: prRef.path })
+    if (this.#babysitterSpawned.has(babysitterKey)) {
       return
     }
     if ([...record.agents.values()].some((agent) => agent.spec.role === 'babysitter')) {
-      this.#babysitterSpawned.add(record.issue.key)
+      this.#babysitterSpawned.add(babysitterKey)
       return
     }
     // Reserve up-front so concurrent PR events in a drain don't double-spawn.
-    this.#babysitterSpawned.add(record.issue.key)
+    this.#babysitterSpawned.add(babysitterKey)
 
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
-        this.#babysitterSpawned.delete(record.issue.key)
+        this.#babysitterSpawned.delete(babysitterKey)
         return
       }
 
@@ -4161,7 +4167,8 @@ export class FactoryLoop implements Factory {
         ?? record.decision.routes[0]
       const spec = babysitterSpec(issue, this.#config, route)
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
-      const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name ?? `${spec.name.replace(/-babysit$/, '')}-review`
+      const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name
+        ?? agentNameForRole(issue, 'review', { repo: route?.repo ?? prRef.repo })
       const implementerNames = [...record.agents.values()]
         .filter((agent) => agent.spec.role === 'implementer')
         .map((agent) => agent.result?.name ?? agent.spec.name)
@@ -4202,7 +4209,7 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       // Allow a later event to retry the spawn.
-      this.#babysitterSpawned.delete(record.issue.key)
+      this.#babysitterSpawned.delete(babysitterKey)
       this.#increment('babysitterSpawnFailures')
       this.#error(error, record.issue)
     }
@@ -4244,7 +4251,7 @@ export class FactoryLoop implements Factory {
   // exact path captured when the babysitter was spawned; otherwise scans the
   // repo's pulls subtree for the PR number across known layout shapes.
   async #readBabysatPrSnapshot(record: InFlightIssue): Promise<PullSnapshot | undefined> {
-    const ref = this.#babysitterPr.get(record.issue.key)
+    const ref = this.#babysitterPr.get(issueKey(record.issue))
     if (!ref) {
       return undefined
     }
@@ -4291,7 +4298,7 @@ export class FactoryLoop implements Factory {
       return true
     }
 
-    const pr = this.#babysitterPr.get(record.issue.key) ?? await this.#completionPrForIssue(issue)
+    const pr = this.#babysitterPr.get(issueKey(record.issue)) ?? await this.#completionPrForIssue(issue)
     if (!pr) {
       return false
     }
@@ -4365,7 +4372,7 @@ export class FactoryLoop implements Factory {
             ? this.#states.idFor(issueTeam, 'humanReview')
             : this.#states.idFor(issueTeam, 'done')
           await this.#linear.setState(issue, targetState)
-          await this.#recordCanonicalIssueState({ key: issue.key, stateId: targetState })
+          await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
       }
@@ -4419,12 +4426,13 @@ export class FactoryLoop implements Factory {
       this.#error(error, record.issue)
     } finally {
       this.#completionInFlight.delete(completionKey)
-      this.#probePrGhBackoffUntilMs.delete(completionKey)
-      this.#probePrResolvedCache.delete(completionKey)
-      this.#babysitterSpawned.delete(record.issue.key)
-      this.#babysitterPr.delete(record.issue.key)
+      const stateKey = issueStateKey(record.issue)
+      this.#probePrGhBackoffUntilMs.delete(stateKey)
+      this.#probePrResolvedCache.delete(stateKey)
+      this.#babysitterSpawned.delete(completionKey)
+      this.#babysitterPr.delete(completionKey)
       for (const publishedKey of this.#publishedPullRequests) {
-        if (publishedKey.startsWith(`${record.issue.key}:`)) this.#publishedPullRequests.delete(publishedKey)
+        if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
       }
     }
   }
@@ -6179,6 +6187,11 @@ const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
 
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
 
+// Preserve the historical Linear state namespace while keeping GitHub-native
+// issue numbers independent across repositories in the same workspace.
+const issueStateKey = (issue: IssueRef): string =>
+  githubIssuePathParts(issue.path) ? issueKey(issue) : issue.key
+
 const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefined): number[] => {
   const pids = new Set<number>()
   for (const pid of result?.pids ?? []) {
@@ -6440,7 +6453,7 @@ function routeImplementerSpec(
   route: TriageDecision['routes'][number],
 ): AgentSpec {
   return {
-    name: `${agentBaseName(issue)}-impl-${sanitizeAgentSlug(slug)}`,
+    name: agentNameForRole(issue, 'impl', { repo: route.repo, discriminator: slug }),
     role: 'implementer',
     capability: 'spawn:codex',
     model: config.models.implementer,
@@ -6459,7 +6472,7 @@ function routeReviewerSpec(
 ): AgentSpec {
   return {
     ...reviewer,
-    name: `${agentBaseName(issue)}-review`,
+    name: agentNameForRole(issue, 'review', { repo: route.repo }),
     role: 'reviewer',
     capability: reviewer.capability ?? 'spawn:claude',
     model: reviewer.model ?? config.models.reviewer,
@@ -6479,7 +6492,7 @@ function routeWorkflowSpec(
   const route = routesByLabel[0]!.route
   return {
     ...workflow,
-    name: workflow?.name ?? `${agentBaseName(issue)}-workflow`,
+    name: agentNameForRole(issue, 'workflow', { repo: route.repo }),
     role: 'workflow',
     capability: 'workflow:run',
     task: workflow?.task ?? taskForDispatch(issue, route, 'workflow'),
@@ -6561,15 +6574,6 @@ function taskForDispatch(issue: LinearIssue, route: TriageDecision['routes'][num
     `Route rationale: ${route.rationale}`,
     issue.description,
   ].join('\n\n')
-}
-
-function agentBaseName(issue: LinearIssue): string {
-  const number = issue.key.match(/\d+/)?.[0] ?? sanitizeAgentSlug(issue.key)
-  return `ar-${number}`
-}
-
-function sanitizeAgentSlug(slug: string): string {
-  return slug.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'scope'
 }
 
 const templateIssueFromRecord = (record: InFlightIssue, issue: LinearIssue | undefined) => ({
