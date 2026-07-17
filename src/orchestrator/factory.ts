@@ -3116,7 +3116,7 @@ export class FactoryLoop implements Factory {
       const tracked = record?.agents.get(babysitterCritical.agentName)
       const durableIssue = record?.issue ?? this.#babysitterIssueForAgent(babysitterCritical.agentName)
       if (!durableIssue || (record && tracked?.spec.role !== 'babysitter') || (
-        babysitterCritical.issueKey && babysitterCritical.issueKey !== durableIssue.key
+        babysitterCritical.issueKey && !babysitterCriticalIssueMatches(babysitterCritical.issueKey, durableIssue)
       )) {
         this.#babysitterCriticalAgents.delete(babysitterCritical.agentName)
         this.#increment('babysitterCriticalSignalsIgnored')
@@ -3126,7 +3126,16 @@ export class FactoryLoop implements Factory {
         // Durably install the fence before acknowledging it. A process crash
         // after the ACK can therefore restore both the exact owner and the
         // no-submit invariant until the babysitter sends its matching end.
-        await this.#persistBabysitterCriticalFence(babysitterCritical.agentName)
+        try {
+          await this.#persistBabysitterCriticalFence(babysitterCritical.agentName)
+        } catch (error) {
+          this.#increment('babysitterCriticalPersistenceFailures')
+          this.#logger.warn?.('[factory] could not persist babysitter critical fence; retaining it without ACK', {
+            babysitter: babysitterCritical.agentName,
+            error: describeError(error).errorMessage,
+          })
+          return
+        }
         this.#increment('babysitterCriticalSectionsEntered')
         try {
           await this.#waitForInjectedAndSubmit({
@@ -3147,8 +3156,16 @@ export class FactoryLoop implements Factory {
           })
         }
       } else {
-        await this.#finishBabysitterCriticalSection(babysitterCritical.agentName)
-        await this.#persistBabysitterCriticalFence(babysitterCritical.agentName)
+        try {
+          await this.#finishBabysitterCriticalSection(babysitterCritical.agentName)
+        } catch (error) {
+          this.#increment('babysitterCriticalPersistenceFailures')
+          this.#logger.warn?.('[factory] could not persist cleared babysitter critical fence; retaining the fence', {
+            babysitter: babysitterCritical.agentName,
+            error: describeError(error).errorMessage,
+          })
+          return
+        }
         this.#increment('babysitterCriticalSectionsExited')
       }
       return
@@ -4340,6 +4357,11 @@ export class FactoryLoop implements Factory {
           state.nextDelayMs = undefined
           this.#scheduleBabysitterWake(state, delayMs)
         }
+      }).catch((error) => {
+        this.#logger.warn?.('[factory] babysitter wake task rejected after recovery', {
+          babysitter: state.agentName,
+          error: describeError(error).errorMessage,
+        })
       })
     }, delayMs)
     state.timer.unref?.()
@@ -4362,22 +4384,30 @@ export class FactoryLoop implements Factory {
     })
     state.kinds.clear()
     state.deliveringKinds = kinds
-    await this.#recordPendingBabysitterWake(state)
-    const input = {
-      to: state.agentName,
-      from: 'factory',
-      text: renderBabysitterWake(state.repo, state.prNumber, kinds, this.#integrationsMountRoot()),
-      data: {
-        source: 'github',
-        repo: state.repo,
-        prNumber: state.prNumber,
-        kinds,
-      },
-    }
-
     try {
+      await this.#recordPendingBabysitterWake(state)
+      if (this.#stopping || state.cancelled) {
+        state.deliveringKinds = undefined
+        return
+      }
+      const input = {
+        to: state.agentName,
+        from: 'factory',
+        text: renderBabysitterWake(state.repo, state.prNumber, kinds, this.#integrationsMountRoot()),
+        data: {
+          source: 'github',
+          repo: state.repo,
+          prNumber: state.prNumber,
+          kinds,
+        },
+      }
+
       if (!this.#fleet.waitForInjected) {
         await this.#fleet.sendMessage(input)
+        if (this.#stopping || state.cancelled) {
+          state.deliveringKinds = undefined
+          return
+        }
         state.deliveringKinds = undefined
         await this.#recordPendingBabysitterWake(state)
         this.#increment('babysitterEventWakesDelivered')
@@ -4401,13 +4431,28 @@ export class FactoryLoop implements Factory {
         return
       }
       await this.#submitBabysitterWakeTargets(targets)
+      if (this.#stopping || state.cancelled) {
+        state.deliveringKinds = undefined
+        return
+      }
       state.deliveringKinds = undefined
       await this.#recordPendingBabysitterWake(state)
       this.#increment('babysitterEventWakesDelivered')
     } catch (error) {
+      if (this.#stopping || state.cancelled) {
+        state.deliveringKinds = undefined
+        return
+      }
       for (const kind of kinds) state.kinds.add(kind)
       state.deliveringKinds = undefined
-      await this.#recordPendingBabysitterWake(state)
+      try {
+        await this.#recordPendingBabysitterWake(state)
+      } catch (persistError) {
+        this.#logger.warn?.('[factory] could not persist recovered babysitter wake; retaining it in memory', {
+          babysitter: state.agentName,
+          error: describeError(persistError).errorMessage,
+        })
+      }
       this.#increment('babysitterEventWakeFailures')
       this.#logger.warn?.('[factory] babysitter event wake failed; preserving it for retry', {
         issue: state.issue.key,
@@ -4429,6 +4474,12 @@ export class FactoryLoop implements Factory {
 
   async #finishBabysitterCriticalSection(agentName: string): Promise<void> {
     this.#babysitterCriticalAgents.delete(agentName)
+    try {
+      await this.#persistBabysitterCriticalFence(agentName)
+    } catch (error) {
+      this.#babysitterCriticalAgents.add(agentName)
+      throw error
+    }
     for (const state of this.#babysitterWakeStates.values()) {
       if (state.agentName !== agentName) continue
       if (state.deferredSubmitTargets) {
@@ -4527,6 +4578,11 @@ export class FactoryLoop implements Factory {
     }
 
     if (!record) {
+      return
+    }
+
+    if (!existing && prSnapshotIssueMatchScore(snapshot, record.issue.key) < 30) {
+      this.#increment('babysitterPrDiscoveryWeakMatchIgnored')
       return
     }
 
@@ -4828,23 +4884,35 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    if (!this.#babysitterPr.has(issueKey(record.issue))) {
+      this.#increment('babysitterReadinessGuardBlocked')
+      this.#logger.info?.('[factory] babysitter ready signal ignored; PR ownership is no longer active', {
+        issue: record.issue.key,
+      })
+      return
+    }
     const snapshot = await this.#readBabysatPrSnapshot(record)
-    if (snapshot) {
-      const guard = prMetaAllowsHumanReview(snapshot)
-      if (!guard.ok) {
-        this.#increment('babysitterReadinessGuardBlocked')
-        this.#logger.info?.('[factory] babysitter ready signal ignored; PR meta not eligible', {
-          issue: record.issue.key,
-          reason: guard.reason,
-        })
-        return
-      }
+    if (!snapshot) {
+      this.#increment('babysitterReadinessGuardBlocked')
+      this.#logger.info?.('[factory] babysitter ready signal ignored; authoritative PR meta is unavailable', {
+        issue: record.issue.key,
+      })
+      return
+    }
+    const guard = prMetaAllowsHumanReview(snapshot)
+    if (!guard.ok) {
+      this.#increment('babysitterReadinessGuardBlocked')
+      this.#logger.info?.('[factory] babysitter ready signal ignored; PR meta not eligible', {
+        issue: record.issue.key,
+        reason: guard.reason,
+      })
+      return
     }
 
     this.#increment('babysitterReadinessReady')
     this.#logger.info?.('[factory] babysitter signalled PR ready; advancing to human review', {
       issue: record.issue.key,
-      prMetaChecked: Boolean(snapshot),
+      prMetaChecked: true,
     })
     await this.#completeIssue(record)
   }
@@ -7675,8 +7743,10 @@ type PullSnapshot = {
 
 const parsePullSnapshot = (content: unknown, fallbackNumber: number): PullSnapshot | undefined => {
   const payload = wrappedPayload(content)
-  const number = typeof payload.number === 'number' ? payload.number : fallbackNumber
-  if (!Number.isInteger(number) || number <= 0) return undefined
+  if (!Number.isInteger(fallbackNumber) || fallbackNumber <= 0) return undefined
+  const explicitNumber = payload.number === undefined ? undefined : positiveIntegerLike(payload.number)
+  if (payload.number !== undefined && explicitNumber !== fallbackNumber) return undefined
+  const number = fallbackNumber
   return {
     number,
     state: stringValue(payload.state),
@@ -7962,13 +8032,23 @@ const parseBabysitterCriticalSignal = (
   message: AgentMessage,
 ): { agentName: string; issueKey?: string; action: 'begin' | 'end' } | undefined => {
   if (!isFactoryQuestionTarget(message.target)) return undefined
-  const match = message.body.trim().match(/^\[factory-babysitter-critical\](?:\s+([A-Za-z]+-\d+|\d+))?\s+(begin|end)$/iu)
+  const match = message.body.trim().match(/^\[factory-babysitter-critical\](?:\s+([A-Za-z]+-\d+|\d+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+))?\s+(begin|end)$/iu)
   if (!match) return undefined
   return {
     agentName: message.from,
-    issueKey: match[1]?.toUpperCase(),
+    issueKey: match[1],
     action: match[2]!.toLowerCase() as 'begin' | 'end',
   }
+}
+
+const babysitterCriticalIssueMatches = (signalKey: string, issue: IssueRef): boolean => {
+  if (signalKey.toLowerCase() === issue.key.toLowerCase()) return true
+  const match = signalKey.match(/^([^/]+)\/([^#]+)#(\d+)$/u)
+  if (!match) return false
+  const parts = githubIssuePathParts(issue.path)
+  return Boolean(parts) &&
+    `${match[1]}/${match[2]}`.toLowerCase() === `${parts!.owner}/${parts!.repo}`.toLowerCase() &&
+    Number(match[3]) === parts!.number
 }
 
 const prSnapshotIssueMatchScore = (snapshot: PullSnapshot, issueKey: string): number => {

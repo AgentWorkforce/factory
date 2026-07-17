@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, stat, utimes } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -32,6 +32,36 @@ describe('FileStateStore', () => {
       await restarted.clearBabysitterSession('workspace-1', 'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json')
       expect(await new FileStateStore({ batchSize: 2, watchStatePath }).listBabysitterSessions('workspace-1'))
         .toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a persisted babysitter session that omits the critical fence state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-invalid-babysitter-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 2,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            babysitterSessions: {
+              'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json': {
+                issue: { uuid: 'uuid-87', key: 'AR-87', path: '/linear/issues/AR-87__uuid-87.json' },
+                repo: 'AgentWorkforce/factory',
+                prNumber: 87,
+                agentName: 'ar-87-babysit-factory',
+                pendingKinds: [],
+              },
+            },
+          },
+        },
+      }))
+
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      await expect(store.listBabysitterSessions('workspace-1')).rejects.toThrow('state file is invalid')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

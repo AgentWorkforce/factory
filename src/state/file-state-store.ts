@@ -563,7 +563,7 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
       (candidate.prNumber as number) < 1 ||
       typeof candidate.agentName !== 'string' ||
       (candidate.path !== undefined && typeof candidate.path !== 'string') ||
-      (candidate.critical !== undefined && typeof candidate.critical !== 'boolean') ||
+      typeof candidate.critical !== 'boolean' ||
       !Array.isArray(candidate.pendingKinds) ||
       !candidate.pendingKinds.every((kind) => typeof kind === 'string')
     ) {
@@ -575,7 +575,7 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
       prNumber: candidate.prNumber as number,
       agentName: candidate.agentName,
       ...(candidate.path === undefined ? {} : { path: candidate.path }),
-      critical: candidate.critical === true,
+      critical: candidate.critical,
       pendingKinds: [...candidate.pendingKinds] as string[],
     }
   }

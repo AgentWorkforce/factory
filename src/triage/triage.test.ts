@@ -287,6 +287,22 @@ describe('LlmTriage', () => {
     await expect(triage.triage(issue(), ctx)).resolves.toEqual(expected)
   })
 
+  it('strips durable orchestration fields supplied by model-facing agent specs', async () => {
+    const response = JSON.parse(JSON.stringify(decisionJson())) as Record<string, any>
+    for (const spec of [...response.implementers, response.reviewer]) {
+      spec.ownedPullRequest = { repo: 'attacker/repo', number: 999 }
+      spec.pendingPullRequestWake = { repo: 'attacker/repo', number: 999, kinds: ['checks-failed'] }
+    }
+    const triage = new LlmTriage(async () => JSON.stringify(response))
+
+    const decision = await triage.triage(issue(), ctx)
+
+    for (const spec of [...decision.implementers, decision.reviewer]) {
+      expect(spec).not.toHaveProperty('ownedPullRequest')
+      expect(spec).not.toHaveProperty('pendingPullRequestWake')
+    }
+  })
+
   it('throws on malformed JSON', async () => {
     const triage = new LlmTriage(async () => '{nope')
 

@@ -10802,6 +10802,58 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('accepts a repo-qualified GitHub issue identity for a babysitter critical section', async () => {
+    const number = 31
+    const issue = githubIssueFile(number, { repo: 'pear', labels: ['factory'] })
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const mount = new FakeMountClient({ [path]: issue })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.runOnce()
+      mount.files.set(prPath, {
+        content: { number, state: 'open', head_ref: `factory/${number}`, draft: false },
+      })
+      mount.emit(changeEvent(prPath, 'github-pr-critical-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-31-babysit-pear'))
+
+      fleet.emitAgentMessage({
+        from: 'ar-31-babysit-pear',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AgentWorkforce/pear#31 begin',
+      })
+      await vi.waitFor(() => expect(factory.status().counters.babysitterCriticalSectionsEntered).toBe(1))
+      const inputsAfterAck = fleet.inputs.length
+      mount.emit(changeEvent(`/github/repos/AgentWorkforce/pear/pulls/${number}/comments/3101.json`, 'critical-comment'))
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
+
+      fleet.emitAgentMessage({
+        from: 'ar-31-babysit-pear',
+        target: 'factory',
+        body: '[factory-babysitter-critical] agentworkforce/pear#31 end',
+      })
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
+      ).toBe(1))
+      expect(fleet.inputs.slice(inputsAfterAck)).toEqual([{ name: 'ar-31-babysit-pear', data: '\r' }])
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('installs the destructive fence before delivering its explicit begin acknowledgment', async () => {
     class PausedCriticalAckFleet extends FakeFleetClient {
       pendingAck?: { resolve: () => void }
@@ -10929,6 +10981,84 @@ describe('FactoryLoop PR babysitter', () => {
         { name: 'ar-426-babysit', data: '\r' },
       ]))
       expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('retains the critical fence and deferred submit when clearing it cannot be persisted', async () => {
+    class PausedWakeFleet extends FakeFleetClient {
+      pendingWake?: { resolve: (ack: { eventId: string; targets: string[] }) => void }
+
+      override async waitForInjected(
+        input: Parameters<FakeFleetClient['waitForInjected']>[0],
+        opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+      ): ReturnType<FakeFleetClient['waitForInjected']> {
+        if (!input.text.startsWith('<integration-event')) return super.waitForInjected(input, opts)
+        this.messages.push(input)
+        return await new Promise((resolve) => { this.pendingWake = { resolve } })
+      }
+    }
+    class FailNextBabysitterPersistStore extends InMemoryStateStore {
+      failNext = false
+
+      override async setBabysitterSession(
+        workspaceId: string,
+        key: string,
+        session: Parameters<InMemoryStateStore['setBabysitterSession']>[2],
+      ): Promise<void> {
+        if (this.failNext) {
+          this.failNext = false
+          throw new Error('critical fence persistence unavailable')
+        }
+        await super.setBabysitterSession(workspaceId, key, session)
+      }
+    }
+
+    const issue = realIssueFile(433, ready, { title: 'Real babysitter durable critical exit' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/433/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(433)]: issue })
+    const fleet = new PausedWakeFleet()
+    const stateStore = new FailNextBabysitterPersistStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage(), stateStore })
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(433), issue)))
+      mount.files.set(prPath, { content: { number: 433, state: 'open', head_ref: 'ar-433-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-433-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-433-babysit'))
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/433/comments/9903.json', 'comment-9903'))
+      await vi.waitFor(() => expect(fleet.pendingWake).toBeDefined(), { timeout: 3_000 })
+
+      fleet.emitAgentMessage({
+        from: 'ar-433-babysit',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AR-433 begin',
+      })
+      await vi.waitFor(() => expect(factory.status().counters.babysitterCriticalSectionsEntered).toBe(1))
+      const inputsAfterAck = fleet.inputs.length
+      fleet.pendingWake!.resolve({ eventId: 'wake-ack-433', targets: ['ar-433-babysit'] })
+      await vi.waitFor(() => expect(factory.status().counters.babysitterEventWakeSubmitsDeferredCritical).toBe(1))
+
+      stateStore.failNext = true
+      fleet.emitAgentMessage({
+        from: 'ar-433-babysit',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AR-433 end',
+      })
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(fleet.inputs).toHaveLength(inputsAfterAck)
+      expect((await stateStore.listBabysitterSessions('factory-test'))[0]?.[1].critical).toBe(true)
+
+      fleet.emitAgentMessage({
+        from: 'ar-433-babysit',
+        target: 'factory',
+        body: '[factory-babysitter-critical] AR-433 end',
+      })
+      await vi.waitFor(() => expect(fleet.inputs.slice(inputsAfterAck)).toEqual([
+        { name: 'ar-433-babysit', data: '\r' },
+      ]))
+      expect((await stateStore.listBabysitterSessions('factory-test'))[0]?.[1].critical).toBe(false)
     } finally {
       await factory.stop()
     }
@@ -11175,6 +11305,52 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('recovers and retries when durable pending-wake persistence fails', async () => {
+    class FailNextBabysitterPersistStore extends InMemoryStateStore {
+      failOnCall = 0
+      calls = 0
+
+      override async setBabysitterSession(
+        workspaceId: string,
+        key: string,
+        session: Parameters<InMemoryStateStore['setBabysitterSession']>[2],
+      ): Promise<void> {
+        this.calls += 1
+        if (this.failOnCall === this.calls) {
+          throw new Error('transient babysitter persistence failure')
+        }
+        await super.setBabysitterSession(workspaceId, key, session)
+      }
+    }
+
+    const issue = realIssueFile(429, ready, { title: 'Real babysitter persistence retry' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/429/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(429)]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new FailNextBabysitterPersistStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage(), stateStore })
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(429), issue)))
+      mount.files.set(prPath, { content: { number: 429, state: 'open', head_ref: 'ar-429-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-429-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-429-babysit'))
+
+      // Queue persistence succeeds; the next write is the flush's durable
+      // in-flight marker and exercises its recovery path.
+      stateStore.failOnCall = stateStore.calls + 2
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/429/comments/9901.json', 'comment-9901'))
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterEventWakeFailures).toBe(1), { timeout: 3_000 })
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
+      ).toBe(1), { timeout: 4_000 })
+      expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('cancels a queued babysitter wake when the owned PR closes before delivery', async () => {
     const issue = realIssueFile(427, ready, { title: 'Real babysitter terminal wake cancellation' })
     const prPath = '/github/repos/AgentWorkforce/pear/pulls/427/metadata.json'
@@ -11202,7 +11378,57 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
-  it('spawns the babysitter from a PR body issue reference when the branch omits the issue key', async () => {
+  it('does not recreate durable ownership when an in-flight wake finishes after PR cancellation', async () => {
+    class PausedCancelledWakeFleet extends FakeFleetClient {
+      pendingWake?: { resolve: (ack: { eventId: string; targets: string[] }) => void }
+
+      override async waitForInjected(
+        input: Parameters<FakeFleetClient['waitForInjected']>[0],
+        opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+      ): ReturnType<FakeFleetClient['waitForInjected']> {
+        if (!input.text.startsWith('<integration-event')) return super.waitForInjected(input, opts)
+        this.messages.push(input)
+        return await new Promise((resolve) => {
+          this.pendingWake = { resolve }
+        })
+      }
+    }
+
+    const issue = realIssueFile(432, ready, { title: 'Real babysitter in-flight cancellation' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/432/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(432)]: issue })
+    const fleet = new PausedCancelledWakeFleet()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage(), stateStore })
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(432), issue)))
+      mount.files.set(prPath, { content: { number: 432, state: 'open', head_ref: 'ar-432-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-432-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-432-babysit'))
+      const inputsBefore = fleet.inputs.length
+
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/432/comments/9902.json', 'comment-9902'))
+      await vi.waitFor(() => expect(fleet.pendingWake).toBeDefined(), { timeout: 3_000 })
+      mount.files.set(prPath, { content: { number: 432, state: 'closed', merged: false, head_ref: 'renamed' } })
+      mount.emit(changeEvent(prPath, 'pr-432-closed'))
+      await vi.waitFor(async () => expect(await stateStore.listBabysitterSessions('factory-test')).toEqual([]))
+
+      fleet.pendingWake!.resolve({ eventId: 'late-wake-ack', targets: ['ar-432-babysit'] })
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(fleet.inputs).toHaveLength(inputsBefore)
+      await expect(stateStore.listBabysitterSessions('factory-test')).resolves.toEqual([])
+
+      fleet.emitAgentMessage({ from: 'ar-432-babysit', target: 'factory', body: '[factory-pr-ready] AR-432' })
+      await flush()
+      expect(factory.status().counters.humanReview).toBeUndefined()
+      expect(factory.status().counters.babysitterReadinessGuardBlocked).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not claim babysitter ownership from only a PR body issue reference', async () => {
     const issue = realIssueFile(408, ready, { title: 'Real babysitter body match' })
     const mount = new FakeMountClient({ [issuePath(408)]: issue })
     const fleet = new FakeFleetClient()
@@ -11230,7 +11456,30 @@ describe('FactoryLoop PR babysitter', () => {
       })
       mount.emit(changeEvent(prPath, 'pr-408-open'))
 
-      await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-408-babysit'))
+      await vi.waitFor(() => expect(factory.status().counters.babysitterPrDiscoveryWeakMatchIgnored).toBe(1))
+      expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-408-babysit')
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('rejects PR metadata whose payload number disagrees with its canonical path', async () => {
+    const issue = realIssueFile(430, ready, { title: 'Real babysitter path identity' })
+    const mount = new FakeMountClient({ [issuePath(430)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(430), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/430/metadata.json'
+      mount.files.set(prPath, {
+        content: { number: 431, state: 'open', head_ref: 'ar-430-fix', draft: false },
+      })
+      mount.emit(changeEvent(prPath, 'pr-number-mismatch'))
+
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-430-babysit')
     } finally {
       await factory.stop()
     }
