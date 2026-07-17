@@ -7,7 +7,7 @@ import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '..
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import { installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -61,6 +61,35 @@ const githubIssueFile = (repo: string, number = 48) => ({
     url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
     repository: { name: repo, owner: { login: 'AgentWorkforce' } },
   },
+})
+
+describe('fleet CLI logging', () => {
+  it('keeps every argument when Errors and unserializable values reach the stream logger', () => {
+    const circular: Record<string, unknown> = { sibling: 'kept' }
+    circular.self = circular
+    const throwingToJson = {
+      sibling: 'also kept',
+      toJSON: () => {
+        throw new Error('must not run')
+      },
+    }
+
+    const output = formatLogArgs([
+      new Error('top-level failure'),
+      { nested: new Error('nested failure') },
+      circular,
+      throwingToJson,
+      42n,
+      'tail',
+    ])
+
+    expect(output).toContain('"message":"top-level failure"')
+    expect(output).toContain('"message":"nested failure"')
+    expect(output).toContain('"self":"[Circular]"')
+    expect(output).toContain('also kept')
+    expect(output).toContain('"42n"')
+    expect(output).toContain(' tail')
+  })
 })
 
 describe('fleet CLI parsing', () => {

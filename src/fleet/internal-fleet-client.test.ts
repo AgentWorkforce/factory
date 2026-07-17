@@ -1227,7 +1227,11 @@ describe('InternalFleetClient', () => {
     await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
     await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
       '[factory-sdk] readiness-triggered resend failed, but original event is still active',
-      resendError,
+      expect.objectContaining({
+        name: 'Error',
+        message: 'resend transport failed',
+        stack: expect.stringContaining('Error: resend transport failed'),
+      }),
     ))
     harness.emit({
       kind: 'delivery_injected',

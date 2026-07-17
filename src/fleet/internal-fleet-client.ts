@@ -8,6 +8,7 @@ import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@a
 
 import type { AgentMessage, AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
+import { normalizeLogger } from '../logging'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
 
 const requireForResolve = createRequire(import.meta.url)
@@ -132,7 +133,7 @@ export class InternalFleetClient implements FleetClient {
     this.#connectionPath = options.connectionPath
     this.#workspaceKey = options.workspaceKey
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
-    this.#logger = options.logger
+    this.#logger = options.logger ? normalizeLogger(options.logger) : undefined
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
     this.#ownsBroker = options.ownsBroker ?? false

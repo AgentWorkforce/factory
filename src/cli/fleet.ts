@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
+import { stringifyLogValue } from '../logging'
 import { ensureLocalMount } from '../mount/local-mount-preflight'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import {
@@ -820,13 +821,9 @@ function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {
   }
 }
 
-function formatLogArgs(args: unknown[]): string {
+export function formatLogArgs(args: unknown[]): string {
   if (args.length === 0) return ''
-  try {
-    return ` ${args.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))).join(' ')}`
-  } catch {
-    return ''
-  }
+  return ` ${args.map((arg) => (typeof arg === 'string' ? arg : stringifyLogValue(arg))).join(' ')}`
 }
 
 export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {

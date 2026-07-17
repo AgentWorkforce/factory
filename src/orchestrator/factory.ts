@@ -31,6 +31,7 @@ import type {
 import type { Clock, Logger } from '../ports/system'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
+import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
 import {
@@ -339,7 +340,7 @@ export class FactoryLoop implements Factory {
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
     this.#probePrGhRunner = ports.probePrGhRunner ?? failClosedGhRunner
     this.#probePrResolver = ports.probePrResolver ?? ((issue) => this.#resolveIssuePr(issue))
-    this.#logger = ports.logger ?? console
+    this.#logger = normalizeLogger(ports.logger ?? console)
     this.#clock = ports.clock ?? realClock
     this.#processIdentityReader = ports.processIdentityReader ?? readProcessIdentity
     this.#processFinder = ports.processFinder ?? ((agentName, opts) => findAgentProcessByName(agentName, {
@@ -4445,8 +4446,17 @@ export class FactoryLoop implements Factory {
 
   #error(error: unknown, issue?: IssueRef): void {
     this.#increment('errors')
-    this.#logger.error?.('[factory] error', error)
-    this.#emit('error', { error, ...describeError(error), issue })
+    const details = describeError(error)
+    const normalized = normalizeLogValue(error)
+    const errorFields = normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? normalized as Record<string, unknown>
+      : { error: normalized }
+    this.#logger.error?.('[factory] error', {
+      ...errorFields,
+      ...details,
+      ...(issue ? { issue: issue.key } : {}),
+    })
+    this.#emit('error', { error, ...details, issue })
   }
 
   #surfaceEscalationDeliveryFailure(
@@ -7418,24 +7428,30 @@ export const changeEventPath = (event: ChangeEvent): string | undefined => {
 }
 
 const describeError = (error: unknown): { errorMessage: string; errorStack?: string } => {
-  if (error instanceof Error) {
-    return {
-      errorMessage: error.message || error.name || 'Error',
-      errorStack: error.stack,
+  try {
+    if (error instanceof Error) {
+      const normalized = normalizeLogValue(error) as Record<string, unknown>
+      const message = typeof normalized.message === 'string' ? normalized.message : undefined
+      const name = typeof normalized.name === 'string' ? normalized.name : undefined
+      const stack = typeof normalized.stack === 'string' ? normalized.stack : undefined
+      return {
+        errorMessage: message || name || 'Error',
+        ...(stack ? { errorStack: stack } : {}),
+      }
     }
+  } catch {
+    // Continue through the serializer for hostile proxy values.
   }
   if (typeof error === 'string') {
     return { errorMessage: error }
   }
+  const serialized = stringifyLogValue(error)
+  if (serialized && serialized !== '{}') return { errorMessage: serialized }
   try {
-    const serialized = JSON.stringify(error)
-    if (serialized && serialized !== '{}') {
-      return { errorMessage: serialized }
-    }
+    return { errorMessage: String(error) }
   } catch {
-    // Fall through to String(error).
+    return { errorMessage: 'Unknown error' }
   }
-  return { errorMessage: String(error) }
 }
 
 const failedIterationReport = (error: unknown, dryRun: boolean): IterationReport => {
@@ -7480,7 +7496,11 @@ const contextualError = (context: string, error: unknown): Error => {
   const details = describeError(error)
   const wrapped = new Error(`${context}: ${details.errorMessage}`)
   if (details.errorStack) {
-    wrapped.stack = `${wrapped.stack ?? wrapped.message}\nCaused by: ${details.errorStack}`
+    const wrappedDetails = describeError(wrapped)
+    setSafeErrorStack(
+      wrapped,
+      `${wrappedDetails.errorStack ?? wrapped.message}\nCaused by: ${details.errorStack}`,
+    )
   }
   const withCause = wrapped as Error & { cause?: unknown }
   withCause.cause = error
