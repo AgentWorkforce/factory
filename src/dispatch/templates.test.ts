@@ -288,6 +288,28 @@ describe('renderAgentTask', () => {
     expect(task).not.toContain('[factory-needs-input]')
     expect(task).not.toContain('FACTORY_NEEDS_INPUT')
   })
+
+  it('preserves the relay and Slack clarification route without source GitHub metadata', () => {
+    const task = renderAgentTask({
+      issue: {
+        key: 'AR-124',
+        title: 'Linear-only task',
+        description: 'This issue has no source GitHub issue reference.',
+      },
+      route: { repo: 'pear', clonePath: '/tmp/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-124-review',
+      agentName: 'ar-124-impl-pear',
+    })
+
+    expect(task).toContain('no source GitHub issue metadata')
+    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(task).toContain('route the question through the issue Slack thread')
+    expect(task).toContain('keep the session available')
+    expect(task).not.toContain('### Factory human input request')
+    expect(task).not.toContain('exit cleanly')
+  })
 })
 
 describe('GitHub human input request comments', () => {

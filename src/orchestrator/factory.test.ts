@@ -3052,6 +3052,43 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('persists complete spawn tasks in the initial remote lifecycle claim', async () => {
+    class CrashAfterLifecycleClaimStore extends InMemoryStateStore {
+      override async claimDispatchLifecycle(
+        ...args: Parameters<InMemoryStateStore['claimDispatchLifecycle']>
+      ) {
+        await super.claimDispatchLifecycle(...args)
+        throw new Error('daemon crashed immediately after lifecycle claim')
+      }
+    }
+
+    const path = issuePath(584)
+    const issue = issueFile(584)
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new CrashAfterLifecycleClaimStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow('daemon crashed immediately after lifecycle claim')
+
+    const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+    const implementerTask = lifecycle?.decision.implementers[0]?.task
+    const reviewerTask = lifecycle?.decision.reviewer.task
+    expect(implementerTask).toContain('Full Linear issue description:')
+    expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-584-review`.')
+    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(implementerTask).toMatch(/exact branch `factory\/ar-584-agentworkforce-pear-[0-9a-f]{8}`/u)
+    expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-584-impl-pear.')
+    expect(fleet.spawns).toEqual([])
+    await factory.stop()
+  })
+
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
     const watchStatePath = join(root, 'state.json')
@@ -7228,10 +7265,10 @@ describe('FactoryLoop', () => {
     expect(implementerTask).toContain('Full Linear issue description:')
     expect(implementerTask).toContain('Implement the requested fix in src/orchestrator/factory.ts')
     expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
-    expect(implementerTask).toContain('### Factory human input request')
+    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
     expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-62-impl-pear.')
     expect(reviewerTask).toContain('Post review comments via the GitHub writeback path.')
-    expect(reviewerTask).toContain('### Factory human input request')
+    expect(reviewerTask).toContain('DM `factory` with `[factory-needs-input]`')
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(fleet.deliveryEvents).toEqual([])
@@ -10379,6 +10416,19 @@ describe('FactoryLoop', () => {
     expect(fleet.messages).toEqual([])
 
     mount.files.set(path, { content: githubIssueFile(59, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9000, {
+      body: [
+        '### Factory human input request',
+        'Agent: ar-59-impl-pear',
+        'Issue: 59',
+        'Question: A repository commenter must not be able to park this team.',
+      ].join('\n'),
+      author: { login: 'untrusted-commenter', type: 'User' },
+    })
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsIgnoredUntrustedAuthor).toBe(1))
+    expect(fleet.releases).toEqual([])
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 59, 9001, {
       body: [
         '### Factory human input request',
@@ -10454,6 +10504,41 @@ describe('FactoryLoop', () => {
     expect(fleet.inputs).toEqual([])
     expect(fleet.spawns.slice(2).every((spawn) => spawn.task?.includes('Use the GitHub issue record.'))).toBe(true)
     await factory.stop()
+  })
+
+  it('refuses to park a GitHub question when the issue has no authorized reporter', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 71)
+    const issue = githubIssueFile(71, { labels: ['factory'], author: '' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const errors: FactoryEventPayload[] = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger: { error: () => undefined },
+    })
+    factory.on('error', (payload) => errors.push(payload))
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    mount.files.set(path, { content: githubIssueFile(71, {
+      labels: ['factory', 'factory:in-progress'],
+      author: '',
+    }) })
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 71, 9101, {
+      body: '### Factory human input request\nAgent: ar-71-impl-pear\nIssue: 71\nQuestion: Who is allowed to answer?',
+      author: { login: 'factory-agent[bot]', type: 'Bot' },
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsIgnoredMissingAuthorizedAuthor).toBe(1))
+    expect(fleet.releases).toEqual([])
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    expect(errors).toContainEqual(expect.objectContaining({
+      issue: expect.objectContaining({ key: '71' }),
+      errorMessage: expect.stringContaining('no identifiable reporter authorized to answer'),
+    }))
   })
 
   it('mirrors a GitHub question to Slack without accepting Slack as the response record', async () => {
@@ -11366,10 +11451,10 @@ describe('FactoryLoop', () => {
 
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
     const implementerTask = fleet.spawns.find((spawn) => spawn.name === 'ar-39-impl-pear')?.task
-    expect(implementerTask).toContain('post one comment on the source GitHub issue')
-    expect(implementerTask).toContain('After the issue-comment writeback confirms, exit cleanly')
-    expect(implementerTask).toContain('Slack is optional and is not the request/response record')
-    expect(implementerTask).toContain('Do not DM `factory`, emit a needs-input marker')
+    expect(implementerTask).toContain('no source GitHub issue metadata')
+    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(implementerTask).toContain('route the question through the issue Slack thread')
+    expect(implementerTask).toContain('keep the session available')
     fleet.emitAgentMessage({
       from: 'ar-39-impl-pear',
       target: 'factory',

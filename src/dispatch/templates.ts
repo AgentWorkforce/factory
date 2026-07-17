@@ -84,12 +84,6 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   const implementers = input.implementerNames?.length ? input.implementerNames.join(', ') : 'the implementer(s)'
   const questionAgentName = input.agentName ?? '<your registered relay agent name>'
   const sourceGithubIssue = input.issue.github
-  const sourceGithubIssueLabel = sourceGithubIssue
-    ? `${sourceGithubIssue.owner}/${sourceGithubIssue.repo}#${sourceGithubIssue.number}`
-    : 'the source GitHub issue linked from this task'
-  const sourceGithubIssuePath = sourceGithubIssue
-    ? `${mountRoot}/github/repos/${sourceGithubIssue.owner}/${sourceGithubIssue.repo}/issues/${sourceGithubIssue.number}`
-    : `${mountRoot}/github/repos`
 
   const header = [
     `GitHub repo: ${repo}`,
@@ -114,18 +108,27 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
   ]
-  const questionInstructions = [
-    '',
-    `If you are blocked or need a human answer mid-task, finish any safe reversible work first, then post one comment on ${sourceGithubIssueLabel} through the connected GitHub issue-comment writeback under ${sourceGithubIssuePath}.`,
-    'The comment body must use this durable request format (replace only the question placeholder):',
-    '```markdown',
-    renderGithubHumanInputRequest(questionAgentName, input.issue.key, '<one concrete question>'),
-    '```',
-    'After the issue-comment writeback confirms, exit cleanly. Do not DM `factory`, emit a needs-input marker, wait, poll, or keep the session alive for an injected reply.',
-    'Factory reads the source issue comments, records the team as awaiting a human answer, and releases the team. A Slack copy may be posted for visibility, but Slack is optional and is not the request/response record.',
-    'After the first authorized human answer appears as a later comment on the same issue, Factory will start the released agents again with the question and answer folded into each fresh spawn task.',
-    'If session resume is unavailable, Factory will cold-start the team with the issue, question, answer, branch, and PR context so work can be re-hydrated explicitly.',
-  ]
+  const questionInstructions = sourceGithubIssue
+    ? [
+        '',
+        `If you are blocked or need a human answer mid-task, finish any safe reversible work first, then post one comment on ${sourceGithubIssue.owner}/${sourceGithubIssue.repo}#${sourceGithubIssue.number} through the connected GitHub issue-comment writeback under ${mountRoot}/github/repos/${sourceGithubIssue.owner}/${sourceGithubIssue.repo}/issues/${sourceGithubIssue.number}.`,
+        'The comment body must use this durable request format (replace only the question placeholder):',
+        '```markdown',
+        renderGithubHumanInputRequest(questionAgentName, input.issue.key, '<one concrete question>'),
+        '```',
+        'After the issue-comment writeback confirms, exit cleanly. Do not DM `factory`, emit a needs-input marker, wait, poll, or keep the session alive for an injected reply.',
+        'Factory reads the source issue comments, records the team as awaiting a human answer, and releases the team. A Slack copy may be posted for visibility, but Slack is optional and is not the request/response record.',
+        'After the first authorized human answer appears as a later comment on the same issue, Factory will start the released agents again with the question and answer folded into each fresh spawn task.',
+        'If session resume is unavailable, Factory will cold-start the team with the issue, question, answer, branch, and PR context so work can be re-hydrated explicitly.',
+      ]
+    : [
+        '',
+        'This task has no source GitHub issue metadata, so the durable issue-comment route is unavailable.',
+        'If you are blocked or need a human answer mid-task, finish any safe reversible work first, then DM `factory` with `[factory-needs-input]`, the issue key, and one concrete question.',
+        'Factory will route the question through the issue Slack thread when available and healthy. If no durable route is available, Factory emits an operator-visible delivery error instead of silently discarding the question.',
+        'After sending the marker, stop work but keep the session available until Factory releases or resumes the team; do not treat the question as task completion.',
+        'When a human answer arrives, Factory will release/resume or cold-start the team with the question and answer folded into a fresh spawn task, never by live reply injection.',
+      ]
 
   if (input.role === 'babysitter') {
     const prRef = input.pr

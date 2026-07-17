@@ -1721,8 +1721,18 @@ export class FactoryLoop implements Factory {
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
-    if (!dryRun && this.#fleet.placementLocality === 'remote') {
-      const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun)
+    // Full task rendering is part of the durable spawn specification. It must
+    // happen before a remote lifecycle is first claimed so takeover cannot
+    // recover a persisted minimal triage task after a crash in this gap.
+    const durableRemoteDispatch = !dryRun && this.#fleet.placementLocality === 'remote'
+    const lifecycleRunId = durableRemoteDispatch ? randomUUID() : undefined
+    if (lifecycleRunId) {
+      dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId)
+    }
+    dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
+    if (durableRemoteDispatch) {
+      const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun, lifecycleRunId)
+      this.#consumePendingDispatchClarifications(dispatchDecision.issue)
       dispatchDecision = structuredClone(lifecycleClaim.lifecycle.decision)
       if (lifecycleClaim.lifecycle.phase === 'waiting-for-human') {
         return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
@@ -1739,7 +1749,7 @@ export class FactoryLoop implements Factory {
         if (restored.result) return restored.result
       }
     }
-    dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
+    if (!durableRemoteDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
@@ -1963,10 +1973,14 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #claimDispatchLifecycle(decision: TriageDecision, dryRun: boolean): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
+  async #claimDispatchLifecycle(
+    decision: TriageDecision,
+    dryRun: boolean,
+    preparedRunId?: string,
+  ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
     const key = issueKey(decision.issue)
     const seed: DispatchLifecycle = {
-      runId: randomUUID(),
+      runId: preparedRunId ?? randomUUID(),
       issue: { ...decision.issue },
       decision: structuredClone(decision),
       dryRun,
@@ -1975,7 +1989,7 @@ export class FactoryLoop implements Factory {
       invocationIds: [],
       updatedAtMs: this.#clock.now(),
     }
-    seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
+    if (!preparedRunId) seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
     const claim = await this.#state.claimDispatchLifecycle(
       this.#workspaceId,
       key,
@@ -3904,9 +3918,9 @@ export class FactoryLoop implements Factory {
       }
     }
 
-    // Compatibility for agents dispatched with a pre-durable prompt. New
-    // tasks never emit this marker: their supported clarification path is the
-    // structured source-issue comment handled by #handleGithubIssueComment.
+    // Compatibility for pre-durable prompts and for Linear-only tasks that
+    // have no source GitHub issue to use as a durable record. New GitHub-source
+    // tasks use the structured comment handled by #handleGithubIssueComment.
     const question = parseAgentQuestion(message)
     if (!question || !isFactoryQuestionTarget(message.target)) {
       return
@@ -4990,9 +5004,13 @@ export class FactoryLoop implements Factory {
         commentId: normalizedCommentId,
         correlationId: pending.correlationId,
       })
-    } else if (pending && answerText && (
-      !pending.authorizedAuthor || comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()
-    )) {
+    } else if (
+      pending &&
+      answerText &&
+      typeof pending.authorizedAuthor === 'string' &&
+      pending.authorizedAuthor.length > 0 &&
+      comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()
+    ) {
       pending.claimedByCommentId = normalizedCommentId
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
       resolved = await this.#routeGithubAnswerToImplementers(watch, pending, comment, answerText)
@@ -5047,12 +5065,41 @@ export class FactoryLoop implements Factory {
       this.#increment('githubAgentQuestionsIgnoredUnknownAgent')
       return
     }
+    // Agents write through the connected GitHub App, whose comments are
+    // provider-authored bot records. Never let an arbitrary repository
+    // commenter forge the predictable structured fields and park a live team.
+    if (!comment.isBot) {
+      this.#increment('githubAgentQuestionsIgnoredUntrustedAuthor')
+      this.#logger.info?.('[factory] ignored GitHub agent question from an untrusted commenter', {
+        issue: watch.issue,
+        commentId: comment.commentId,
+        author: comment.author,
+      })
+      return
+    }
 
     const question: AgentQuestion = {
       agentName: request.agentName,
       issueKey: request.issueKey,
       question: request.question,
       eventId: `github:${watch.source.owner}/${watch.source.repo}#${watch.source.number}:${comment.commentId}`,
+    }
+    const correlationId = githubEscalationCorrelationId(
+      'agent-question',
+      record.issue,
+      `${comment.commentId}:${question.question}`,
+    )
+    const issue = await this.#readIssue(record.issue.path)
+    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    if (!authorizedAuthor) {
+      this.#increment('githubAgentQuestionsIgnoredMissingAuthorizedAuthor')
+      this.#surfaceEscalationDeliveryFailure(
+        'agent-question',
+        record.issue,
+        correlationId,
+        'source GitHub issue has no identifiable reporter authorized to answer the durable question',
+      )
+      return
     }
     this.#clarificationIntents.set(
       question.agentName,
@@ -5074,17 +5121,11 @@ export class FactoryLoop implements Factory {
       }
 
       durableClarificationOwnsExit = true
-      const correlationId = githubEscalationCorrelationId(
-        'agent-question',
-        record.issue,
-        `${comment.commentId}:${question.question}`,
-      )
       if (!watch.pending.some((pending) => pending.correlationId === correlationId)) {
-        const issue = await this.#readIssue(record.issue.path)
         watch.pending.push({
           correlationId,
           kind: 'agent-question',
-          authorizedAuthor: issue ? githubIssueAuthor(issue) ?? '' : '',
+          authorizedAuthor,
           replyAfterCommentId: comment.commentId,
         })
         await this.#state.setGithubIssueCommentWatch(this.#workspaceId, githubIssueSourceKey(watch.source), watch)
@@ -5240,13 +5281,17 @@ export class FactoryLoop implements Factory {
       }),
     })
 
-    this.#pendingSlackClarifications.delete(key)
-    this.#pendingGithubClarifications.delete(key)
     return {
       ...decision,
       implementers: decision.implementers.map(render),
       reviewer: render(decision.reviewer),
     }
+  }
+
+  #consumePendingDispatchClarifications(issue: IssueRef): void {
+    const key = issueKey(issue)
+    this.#pendingSlackClarifications.delete(key)
+    this.#pendingGithubClarifications.delete(key)
   }
 
   async #waitForInjectedAndSubmit(
