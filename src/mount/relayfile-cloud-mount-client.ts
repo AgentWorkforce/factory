@@ -112,6 +112,7 @@ export interface RelayfileSetupLike {
     background?: boolean
     agentName?: string
     scopes?: string[]
+    verifyProvider?: boolean
     readyTimeoutMs?: number
   }): Promise<MountedWorkspaceHandleLike>
 }
@@ -268,6 +269,9 @@ export class RelayfileCloudMountClient implements MountClient {
           background: true,
           agentName: this.#localMountAgentName,
           scopes: [...this.#localMountScopes],
+          // Factory mirrors the whole workspace across several integrations,
+          // so there is no single provider to verify before mounting.
+          verifyProvider: false,
           ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
         })
         this.#localMounts.set(localDir, mounted)

@@ -114,6 +114,10 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       out.write(helpText())
       return 0
     }
+    if (argv.some(isVersionFlag)) {
+      out.write(`${await readFactoryVersion()}\n`)
+      return 0
+    }
     const { globals, args } = parseGlobalOptions(argv)
     const command = parseFleetCommand(args)
 
@@ -1313,12 +1317,27 @@ Options:
   --agent-exit-timeout <ms>
                         Max owned-broker wait for task-exit agents (default: 1800000;
                         env: FACTORY_AGENT_EXIT_TIMEOUT_MS)
+  -V, --version         Show the installed Factory version
   -h, --help            Show this help
 `
 }
 
 function isHelpFlag(arg: string): boolean {
   return arg === '-h' || arg === '--help'
+}
+
+function isVersionFlag(arg: string): boolean {
+  return arg === '-V' || arg === '--version'
+}
+
+async function readFactoryVersion(): Promise<string> {
+  const manifest = JSON.parse(
+    await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
+  ) as { version?: unknown }
+  if (typeof manifest.version !== 'string' || manifest.version.length === 0) {
+    throw new Error('Factory package version is missing')
+  }
+  return manifest.version
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {

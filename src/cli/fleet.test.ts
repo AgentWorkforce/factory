@@ -313,6 +313,26 @@ describe('fleet CLI runtime', () => {
     expect(output.text()).not.toContain('usage: fleet')
   })
 
+  it.each(['--version', '-V'])('prints the installed package version for %s without constructing a fleet', async (flag) => {
+    const output = buffer()
+    const errors = buffer()
+    const manifest = JSON.parse(
+      await readFile(join(process.cwd(), 'package.json'), 'utf8'),
+    ) as { version: string }
+
+    const code = await runFleetCli([flag], {
+      createFleet: () => {
+        throw new Error('version should not construct a fleet')
+      },
+      stdout: output,
+      stderr: errors,
+    })
+
+    expect(code).toBe(0)
+    expect(errors.text()).toBe('')
+    expect(output.text()).toBe(`${manifest.version}\n`)
+  })
+
   it('uses real fleet and cloud mount for fixture-less factory configs on the operator path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-real-default-'))
     try {
