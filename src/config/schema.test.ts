@@ -29,6 +29,13 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.clonePaths).toEqual({})
     expect(parsed.batchSize).toBe(5)
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
+    // Agent CLI per role defaults to today's behavior: codex implements, claude
+    // reviews/babysits — so existing configs are unaffected unless set.
+    expect(parsed.agentCapabilities).toEqual({
+      implementer: 'spawn:codex',
+      reviewer: 'spawn:claude',
+      babysitter: 'spawn:claude',
+    })
     expect(parsed.babysitter).toEqual({ enabled: false })
     expect(parsed.terminalState).toBe('human-review')
     expect(parsed.stateIds.humanReview).toBeUndefined()
@@ -84,6 +91,29 @@ describe('FactoryConfigSchema', () => {
       implementer: 'gpt-5-codex',
       reviewer: 'claude-opus-4-1',
     })
+  })
+
+  it('honors an explicit per-role agent CLI override and rejects unwired capabilities', () => {
+    const parsed = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      // Swap the implementer CLI to claude to route around a codex-specific
+      // failure; reviewer/babysitter fall back to their defaults.
+      agentCapabilities: { implementer: 'spawn:claude' },
+    })
+
+    expect(parsed.agentCapabilities).toEqual({
+      implementer: 'spawn:claude',
+      reviewer: 'spawn:claude',
+      babysitter: 'spawn:claude',
+    })
+
+    // spawn:opencode / spawn:gemini have no capabilityCli mapping yet, so the
+    // schema refuses them rather than resolving to an undefined CLI at spawn.
+    expect(() => FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/pear' },
+      agentCapabilities: { implementer: 'spawn:opencode' },
+    })).toThrow()
   })
 
   it('honors explicit babysitter, terminalState, and humanReview config', () => {
