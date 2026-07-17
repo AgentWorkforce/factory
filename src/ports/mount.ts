@@ -30,7 +30,11 @@ export interface ProviderSyncStatus {
 
 export interface GithubPublishPullRequestInput {
   repo: string
-  clonePath: string
+  /** Local checkout fallback for internal/local dispatches. */
+  clonePath?: string
+  /** Exact branch already pushed by a remote implementer. Avoids reading its node-local clone. */
+  headRef?: string
+  headSha?: string
   baseRef: string
   title: string
   body: string

@@ -48,6 +48,7 @@ export interface Factory {
   runLoop(opts?: FactoryLoopRunOptions): Promise<IterationReport[]>
   triageIssue(issue: LinearIssue): Promise<TriageDecision>
   dispatch(decision: TriageDecision, opts?: { dryRun?: boolean }): Promise<DispatchResult>
+  waitForDispatchTerminal(issue: IssueRef): Promise<void>
   status(): FactoryStatus
   on(
     event: 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error',
@@ -56,7 +57,7 @@ export interface Factory {
 }
 
 export interface FactoryStartOptions {
-  mode?: 'backfill-and-subscribe' | 'live'
+  mode?: 'backfill-and-subscribe' | 'live' | 'dispatch-owner'
   liveSubscription?: Partial<FactoryLiveSubscriptionOptions>
 }
 

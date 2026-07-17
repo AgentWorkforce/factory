@@ -171,8 +171,16 @@ const mergedLinearIssueContent = (existing: unknown, content: unknown): unknown 
 }
 
 export class FakeFleetClient implements FleetClient {
+  readonly placementLocality: 'local' | 'remote' = 'local'
   readonly spawns: SpawnInput[] = []
-  readonly resumes: Array<{ name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }> = []
+  readonly resumes: Array<{
+    name?: string
+    sessionRef: string
+    node?: 'self' | string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }> = []
   readonly releases: Array<{ name: string; reason?: string }> = []
   readonly messages: SendInput[] = []
   readonly inputs: Array<{ name: string; data: string }> = []
@@ -201,7 +209,14 @@ export class FakeFleetClient implements FleetClient {
     return { name: input.name, sessionRef: this.#sessionRefs.get(input.name) ?? input.sessionRef }
   }
 
-  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
+  async resume(input: {
+    name?: string
+    sessionRef: string
+    node?: 'self' | string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }): Promise<SpawnResult> {
     this.resumes.push(input)
     const name = input.name ?? input.sessionRef
     this.#agents.add(name)

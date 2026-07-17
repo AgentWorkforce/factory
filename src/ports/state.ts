@@ -71,6 +71,49 @@ export type DispatchAttemptState = {
   backoffUntilMs: number
 }
 
+export type DispatchLifecyclePhase =
+  | 'queued'
+  | 'dispatching'
+  | 'retryable'
+  | 'running'
+  | 'parking'
+  | 'waiting-for-human'
+  | 'publishing'
+  | 'published'
+  | 'writeback-applied'
+  | 'releasing'
+  | 'complete'
+  | 'abandoned'
+
+export type DispatchLifecycleLease = {
+  owner: string
+  epoch: number
+  leaseUntilMs: number
+}
+
+export type DispatchLifecycle = {
+  /** Stable for one dispatch attempt and reused by crash takeover; new after a true reopen. */
+  runId: string
+  issue: IssueRef
+  decision: TriageDecision
+  dryRun: boolean
+  phase: DispatchLifecyclePhase
+  agents: Array<{ name: string; tracked: TrackedAgent; releasedAtMs?: number }>
+  invocationIds: string[]
+  result?: import('../types').DispatchResult
+  pullRequest?: import('./mount').GithubPublishPullRequestResult
+  releaseReason?: string
+  lease?: DispatchLifecycleLease
+  updatedAtMs: number
+}
+
+export type DispatchLifecycleClaim = {
+  acquired: boolean
+  lifecycle: DispatchLifecycle
+  lease?: DispatchLifecycleLease
+  created: boolean
+}
+
 export type GithubIssueCommentWatchPending = {
   correlationId: string
   kind: 'triage' | 'agent-question'
@@ -114,7 +157,9 @@ export interface BatchSnapshot {
     invocationId: string,
     result: SpawnResult,
   ): void
+  recordPlanned(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer']): void
   recordDryRun(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer'], invocationId: string): void
+  restore(record: InFlightIssue): InFlightIssue
 }
 
 export interface StateStore {
@@ -122,6 +167,47 @@ export interface StateStore {
   recordDispatchAttempt(workspaceId: string, issueKey: string, attempt: DispatchAttemptState): Promise<void>
   getDispatchAttempts(workspaceId: string, issueKey: string): Promise<DispatchAttemptState | undefined>
   releaseInFlight(workspaceId: string, issueKey: string): Promise<void>
+
+  claimDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    seed: DispatchLifecycle,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DispatchLifecycleClaim>
+  renewDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean>
+  promoteDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+  ): Promise<boolean>
+  releaseDispatchLifecycleLease(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+  ): Promise<void>
+  saveDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    lifecycle: DispatchLifecycle,
+  ): Promise<boolean>
+  getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined>
+  listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>>
+  clearDispatchLifecycle(workspaceId: string, key: string): Promise<void>
 
   recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void>
   consumeCritical(workspaceId: string, key: string): Promise<CriticalRecord | undefined>

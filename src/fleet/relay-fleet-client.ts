@@ -77,6 +77,7 @@ const DEFAULT_NODE_OFFLINE_GRACE_MS = 90_000
 const DEFAULT_REGISTRATION_GRACE_MS = 60_000
 
 export class RelayFleetClient implements FleetClient {
+  readonly placementLocality = 'remote' as const
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
   readonly #spawnAckTimeoutMs: number
@@ -164,17 +165,26 @@ export class RelayFleetClient implements FleetClient {
       log: this.#log,
     })
     const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
-    const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation)
+    const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
     this.#track(result.name, ack)
     return result
   }
 
-  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
+  async resume(input: {
+    name?: string
+    sessionRef: string
+    node?: 'self' | string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }): Promise<SpawnResult> {
     const name = input.name ?? input.sessionRef
     return await this.spawn({
       name,
       capability: input.capability ?? 'spawn:codex',
       node: input.node,
+      repo: input.repo,
+      clonePath: input.clonePath,
       sessionRef: input.sessionRef,
     })
   }
@@ -204,7 +214,11 @@ export class RelayFleetClient implements FleetClient {
       messaging.nodes.list(),
     ])
     return {
-      agents: agents.map((agent) => ({ name: agent.name })),
+      agents: agents.map((agent) => {
+        const record = asRecord(agent)
+        const node = readString(record, 'node', 'node_id', 'nodeId')
+        return { name: agent.name, ...(node ? { node } : {}) }
+      }),
       nodes: nodes.map((node) => ({
         name: node.name,
         capabilities: normalizeCapabilities(node.capabilities),
@@ -515,7 +529,12 @@ function spawnActionInput(input: SpawnInput): Record<string, unknown> {
   })
 }
 
-function spawnResultFromInvocation(fallbackName: string, fallbackSessionRef: string | undefined, invocation: RelayActionInvocation): SpawnResult {
+function spawnResultFromInvocation(
+  fallbackName: string,
+  fallbackSessionRef: string | undefined,
+  invocation: RelayActionInvocation,
+  ack: RelayActionInvocationAck & { placement?: { node?: string } },
+): SpawnResult {
   const output = asRecord(invocation.output)
   const agent = asRecord(output?.agent)
   const name = readString(output, 'name', 'agent_name', 'agentName') ?? readString(agent, 'name') ?? fallbackName
@@ -524,11 +543,14 @@ function spawnResultFromInvocation(fallbackName: string, fallbackSessionRef: str
     ?? fallbackSessionRef
   const pid = readNumber(output, 'pid') ?? readNumber(agent, 'pid')
   const pids = readNumberArray(output, 'pids') ?? readNumberArray(agent, 'pids')
+  const node = readString(output, 'node') ?? readString(agent, 'node') ?? ack.placement?.node ?? ack.dispatchedNodeId ?? undefined
   return {
     name,
     ...(sessionRef ? { sessionRef } : {}),
     ...(pid !== undefined ? { pid } : {}),
     ...(pids ? { pids } : {}),
+    ...(node ? { node } : {}),
+    locality: 'remote',
   }
 }
 

@@ -160,6 +160,11 @@ export class BatchTracker {
     })
   }
 
+  recordPlanned(record: InFlightIssue, spec: AgentSpec): void {
+    if (record.agents.has(spec.name)) return
+    record.agents.set(spec.name, { spec: { ...spec }, sessionRef: spec.sessionRef })
+  }
+
   recordDryRun(record: InFlightIssue, spec: AgentSpec, invocationId: string): void {
     record.invocationIds.add(invocationId)
     this.#invocationIds.add(invocationId)
@@ -168,6 +173,28 @@ export class BatchTracker {
       result: { name: spec.name, sessionRef: spec.sessionRef },
       sessionRef: spec.sessionRef,
     })
+  }
+
+  /** Restore a crash-safe lifecycle before the fleet emits reconciled exits. */
+  restore(record: InFlightIssue): InFlightIssue {
+    const key = issueKey(record.issue)
+    const existing = this.#inFlight.get(key)
+    if (existing) return existing
+    const restored: InFlightIssue = {
+      issue: { ...record.issue },
+      decision: structuredClone(record.decision),
+      dryRun: record.dryRun,
+      agents: new Map([...record.agents].map(([name, tracked]) => [name, {
+        spec: structuredClone(tracked.spec),
+        result: tracked.result ? { ...tracked.result } : undefined,
+        sessionRef: tracked.sessionRef,
+      }])),
+      invocationIds: new Set(record.invocationIds),
+      result: record.result ? structuredClone(record.result) : undefined,
+    }
+    this.#inFlight.set(key, restored)
+    for (const invocationId of restored.invocationIds) this.#invocationIds.add(invocationId)
+    return restored
   }
 }
 

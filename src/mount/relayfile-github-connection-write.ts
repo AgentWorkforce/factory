@@ -42,8 +42,15 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
     const { owner, repo } = githubRepoParts(input.repo)
-    const headRef = await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
-    const headSha = await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
+    const headRef = input.headRef ?? (input.clonePath
+      ? await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
+      : undefined)
+    const headSha = input.headSha ?? (input.clonePath && !input.headRef
+      ? await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
+      : undefined)
+    if (!headRef) {
+      throw new Error('GitHub PR publication requires headRef or clonePath')
+    }
     if (headRef === input.baseRef) {
       throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
     }
@@ -52,10 +59,14 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const fullHeadRef = `refs/heads/${headRef}`
     const refPath = `${repoRoot}/refs/${encodeURIComponent(fullHeadRef)}.json`
 
-    await this.#writeAndConfirm(refPath, {
-      ref: fullHeadRef,
-      sha: headSha,
-    })
+    // A remote implementer already pushed its branch. Only synthesize/update
+    // the ref for the legacy local-clone path where the publisher owns HEAD.
+    if (headSha) {
+      await this.#writeAndConfirm(refPath, {
+        ref: fullHeadRef,
+        sha: headSha,
+      })
+    }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
     await this.#writeAndConfirm(pullRequestPath, {
@@ -139,9 +150,10 @@ const githubRepoParts = (value: string): { owner: string; repo: string } => {
   return { owner: match[1], repo: match[2] }
 }
 
-const githubDraftName = (headRef: string, headSha: string): string => {
+const githubDraftName = (headRef: string, headSha?: string): string => {
   const branch = headRef.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '') || 'branch'
-  return `factory-${branch.slice(0, 80)}-${headSha.slice(0, 12)}`
+  const identity = headSha?.slice(0, 12) ?? 'pushed'
+  return `factory-${branch.slice(0, 80)}-${identity}`
 }
 
 const record = (value: unknown): Record<string, unknown> =>

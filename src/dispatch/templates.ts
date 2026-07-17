@@ -54,6 +54,8 @@ export interface RenderAgentTaskInput {
   }
   /** Pre-rendered writeback instructions for connected integrations. */
   integrationInstructions?: string
+  /** Exact branch Factory will publish after the implementer pushes it. */
+  branchName?: string
   /**
    * Absolute path to the .integrations mount root. The agent runs in its repo
    * clonePath, not the daemon cwd where .integrations lives, so every
@@ -84,7 +86,9 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   const common = [
     ...header,
     '',
-    'Create a branch for this issue before editing.',
+    input.branchName
+      ? `Create a branch for this issue before editing. Create or reset the exact branch \`${input.branchName}\` from the repository default branch, then commit and push only this branch.`
+      : 'Create a branch for this issue before editing.',
     'Commit the implementation and tests.',
     'Push the branch to origin.',
     'When implementation is complete, finish your session normally; Factory will open the PR targeting the repository default branch through the connected GitHub workspace.',

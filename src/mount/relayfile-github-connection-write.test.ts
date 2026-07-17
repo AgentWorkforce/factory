@@ -16,6 +16,50 @@ const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (ar
 })
 
 describe('RelayfileGithubConnectionWrite', () => {
+  it('publishes an already-pushed remote branch without reading an orchestrator-local clone', async () => {
+    const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-85-agentworkforce-factory-pushed.json'
+    class ReceiptMount extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 85, url: 'https://github.com/AgentWorkforce/factory/pull/85' } })
+        }
+      }
+    }
+    const mount = new ReceiptMount()
+    const git = vi.fn(async () => { throw new Error('remote publication must not inspect local git') })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
+
+    const input = {
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-85-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 85',
+      body: 'Fixes #85',
+    }
+    await expect(write.publishPullRequest(input)).resolves.toEqual({
+      repo: 'AgentWorkforce/factory',
+      number: 85,
+      url: 'https://github.com/AgentWorkforce/factory/pull/85',
+      headRef: 'factory/ar-85-agentworkforce-factory',
+      headSha: undefined,
+    })
+    expect(git).not.toHaveBeenCalled()
+    expect(mount.writes).toEqual([{
+      path: pullRequestPath,
+      content: {
+        title: 'Issue 85',
+        head: 'factory/ar-85-agentworkforce-factory',
+        base: 'main',
+        body: 'Fixes #85',
+        author: 'app',
+      },
+    }])
+
+    await expect(write.publishPullRequest(input)).resolves.toMatchObject({ number: 85 })
+    expect(mount.writes[1]?.path).toBe(pullRequestPath)
+  })
+
   it('pushes the current ref before creating a pull request through Relayfile', async () => {
     const draft = 'factory-fix-issue-52-1234567890ab'
     const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
