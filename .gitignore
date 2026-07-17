@@ -8,3 +8,11 @@ dist/
 !.workflow-artifacts/factory-p7-label-scope/
 !.workflow-artifacts/factory-p10-fleet-client/
 !.workflow-artifacts/factory-p13-factory-node-definition/
+
+# Local Agent Relay broker state and credentials
+.agentworkforce/relay/
+
+# Local Relayflow execution reports and guardian trajectories
+.agent-relay/step-outputs/
+.agent-relay/workflow-runs.jsonl
+.agentworkforce/trajectories/

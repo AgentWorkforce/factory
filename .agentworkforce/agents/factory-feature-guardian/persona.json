@@ -1,0 +1,54 @@
+{
+  "id": "factory-feature-guardian",
+  "intent": "relay-orchestrator",
+  "tags": ["factory", "verification", "proactive", "health", "release-safety", "durability"],
+  "description": "Validates the checked-in Factory catalog summary, then cycles through every @agent-relay/factory feature hourly. Each Slack check names the exact source surface, verification tier, and supported safety/topology boundary; progress persists across the exhaustive manifest and resets after a complete cycle.",
+  "cloud": true,
+  "useSubscription": true,
+  "harnessSettings": {
+    "reasoning": "low",
+    "timeoutSeconds": 300
+  },
+  "integrations": {
+    "slack": {
+      "scope": {
+        "paths": "/slack/channels/**"
+      }
+    }
+  },
+  "inputs": {
+    "SLACK_CHANNEL": {
+      "description": "Slack channel to post Factory feature checks to (for example factory-health or general).",
+      "env": "SLACK_CHANNEL",
+      "default": "C0BHWJSF309",
+      "picker": {
+        "provider": "slack",
+        "resource": "channels"
+      }
+    },
+    "SLACK_USER_WILL": {
+      "description": "Slack user ID for Will, used for optional mentions in feature checks.",
+      "env": "SLACK_USER_WILL",
+      "optional": true,
+      "picker": {
+        "provider": "slack",
+        "resource": "users"
+      }
+    },
+    "SLACK_USER_KHALIQ": {
+      "description": "Slack user ID for Khaliq, used for optional mentions in feature checks.",
+      "env": "SLACK_USER_KHALIQ",
+      "optional": true,
+      "picker": {
+        "provider": "slack",
+        "resource": "users"
+      }
+    }
+  },
+  "memory": {
+    "enabled": true,
+    "scopes": ["workspace"],
+    "ttlDays": 14
+  },
+  "onEvent": "./agent.ts"
+}
