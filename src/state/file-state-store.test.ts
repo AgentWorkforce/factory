@@ -4,10 +4,54 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
 
-import type { BabysitterSessionState, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import type { BabysitterSessionState, DispatchLifecycle, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
 import { FileStateStore } from './file-state-store'
 
 describe('FileStateStore', () => {
+  it('persists and fences dispatch lifecycle ownership across processes and crash takeover', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      const second = new FileStateStore({ batchSize: 2, watchStatePath })
+      const key = 'AR-85:uuid-85:/linear/issues/AR-85.json'
+      const seed = dispatchLifecycle(85)
+
+      const initial = await first.claimDispatchLifecycle('workspace-1', key, seed, 'owner-a', 1_000, 5_000)
+      expect(initial).toMatchObject({ acquired: true, created: true, lease: { owner: 'owner-a', epoch: 1 } })
+
+      const duplicate = await second.claimDispatchLifecycle('workspace-1', key, seed, 'owner-b', 2_000, 5_000)
+      expect(duplicate).toMatchObject({ acquired: false, created: false, lifecycle: { lease: { owner: 'owner-a', epoch: 1 } } })
+
+      const takeover = await second.claimDispatchLifecycle('workspace-1', key, seed, 'owner-b', 6_001, 5_000)
+      expect(takeover).toMatchObject({ acquired: true, created: false, lease: { owner: 'owner-b', epoch: 2 } })
+
+      expect(await first.saveDispatchLifecycle('workspace-1', key, 'owner-a', 1, 6_002, {
+        ...seed,
+        phase: 'published',
+      })).toBe(false)
+      expect(await second.saveDispatchLifecycle('workspace-1', key, 'owner-b', 2, 6_002, {
+        ...takeover.lifecycle,
+        phase: 'published',
+        pullRequest: {
+          repo: 'AgentWorkforce/factory',
+          number: 85,
+          url: 'https://github.com/AgentWorkforce/factory/pull/85',
+          headRef: 'factory/ar-85-agentworkforce-factory',
+        },
+      })).toBe(true)
+
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restarted.getDispatchLifecycle('workspace-1', key)).toMatchObject({
+        phase: 'published',
+        lease: { owner: 'owner-b', epoch: 2 },
+        pullRequest: { number: 85 },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('restores and clears babysitter ownership plus pending wake state in a fresh process-equivalent store', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-babysitter-'))
     try {
@@ -32,6 +76,78 @@ describe('FileStateStore', () => {
       await restarted.clearBabysitterSession('workspace-1', 'AR-87:uuid-87:/linear/issues/AR-87__uuid-87.json')
       expect(await new FileStateStore({ batchSize: 2, watchStatePath }).listBabysitterSessions('workspace-1'))
         .toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves babysitter sessions and dispatch lifecycles together across restart and independent updates', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-combined-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const issueKey = 'AR-9387:uuid-9387:/linear/issues/AR-9387__uuid-9387.json'
+      const session: BabysitterSessionState = {
+        issue: { uuid: 'uuid-9387', key: 'AR-9387', path: '/linear/issues/AR-9387__uuid-9387.json' },
+        repo: 'AgentWorkforce/factory',
+        prNumber: 93,
+        agentName: 'ar-9387-babysit-factory',
+        path: '/github/repos/AgentWorkforce/factory/pulls/93/metadata.json',
+        critical: true,
+        pendingKinds: ['review-comment'],
+      }
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      const claim = await first.claimDispatchLifecycle(
+        'workspace-1', issueKey, dispatchLifecycle(93), 'owner-a', 1_000, 5_000,
+      )
+      expect(claim.acquired).toBe(true)
+      await first.setBabysitterSession('workspace-1', issueKey, session)
+
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restarted.listBabysitterSessions('workspace-1')).toEqual([[issueKey, session]])
+      expect(await restarted.getDispatchLifecycle('workspace-1', issueKey)).toMatchObject({
+        phase: 'dispatching',
+        lease: { owner: 'owner-a', epoch: 1 },
+      })
+
+      expect(await restarted.saveDispatchLifecycle('workspace-1', issueKey, 'owner-a', 1, 1_001, {
+        ...claim.lifecycle,
+        phase: 'published',
+      })).toBe(true)
+      expect(await restarted.listBabysitterSessions('workspace-1')).toEqual([[issueKey, session]])
+
+      await restarted.clearBabysitterSession('workspace-1', issueKey)
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath }).getDispatchLifecycle('workspace-1', issueKey))
+        .toMatchObject({ phase: 'published' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('enforces batch capacity across store instances and promotes queued work after a durable slot release', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-capacity-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const first = new FileStateStore({ batchSize: 1, watchStatePath })
+      const second = new FileStateStore({ batchSize: 1, watchStatePath })
+      const firstKey = 'AR-851:uuid-851:/linear/issues/AR-851.json'
+      const secondKey = 'AR-852:uuid-852:/linear/issues/AR-852.json'
+      const firstClaim = await first.claimDispatchLifecycle(
+        'workspace-1', firstKey, dispatchLifecycle(851), 'owner-a', 1_000, 5_000,
+      )
+      const secondClaim = await second.claimDispatchLifecycle(
+        'workspace-1', secondKey, dispatchLifecycle(852), 'owner-b', 1_001, 5_000,
+      )
+
+      expect(firstClaim.lifecycle.phase).toBe('dispatching')
+      expect(secondClaim).toMatchObject({ acquired: true, lifecycle: { phase: 'queued' } })
+      expect(await second.promoteDispatchLifecycle('workspace-1', secondKey, 'owner-b', 1, 1_002)).toBe(false)
+
+      expect(await first.saveDispatchLifecycle('workspace-1', firstKey, 'owner-a', 1, 1_003, {
+        ...firstClaim.lifecycle,
+        phase: 'releasing',
+      })).toBe(true)
+      expect(await second.promoteDispatchLifecycle('workspace-1', secondKey, 'owner-b', 1, 1_004)).toBe(true)
+      expect(await second.getDispatchLifecycle('workspace-1', secondKey)).toMatchObject({ phase: 'dispatching' })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -324,6 +440,40 @@ describe('FileStateStore', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+})
+
+const dispatchLifecycle = (number: number): DispatchLifecycle => ({
+  runId: `run-${number}`,
+  issue: {
+    key: `AR-${number}`,
+    uuid: `uuid-${number}`,
+    path: `/linear/issues/AR-${number}.json`,
+  },
+  decision: {
+    issue: {
+      key: `AR-${number}`,
+      uuid: `uuid-${number}`,
+      path: `/linear/issues/AR-${number}.json`,
+    },
+    routes: [{ repo: 'AgentWorkforce/factory', clonePath: '/work/factory', rationale: 'test' }],
+    scope: 'single',
+    implementers: [],
+    reviewer: {
+      name: `ar-${number}-review`,
+      role: 'reviewer',
+      capability: 'spawn:claude',
+      task: 'review',
+      repo: 'AgentWorkforce/factory',
+    },
+    thin: false,
+    confidence: 'high',
+    rationale: 'test',
+  },
+  dryRun: false,
+  phase: 'dispatching',
+  agents: [],
+  invocationIds: [],
+  updatedAtMs: 1_000,
 })
 
 const waitingClarification = (number: number): WaitingClarification => {

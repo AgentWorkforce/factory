@@ -444,6 +444,21 @@ async function runFactoryCommand(
     return 0
   }
 
+  if (command.kind === 'factory-dispatch' && globals.backend === 'relay' && !globals.dryRun) {
+    // A relay dispatch is not placement-only. This process becomes the durable
+    // lifecycle publisher (or attaches to the current owner's durable row),
+    // and stays through takeover/publication/writeback/release to terminal.
+    await factory.start({ mode: 'dispatch-owner' })
+    try {
+      const result = await factory.dispatch(decision, { dryRun: false })
+      writeJson(out, result)
+      await factory.waitForDispatchTerminal(result.issue)
+      return 0
+    } finally {
+      await factory.stop()
+    }
+  }
+
   writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
   return 0
 }

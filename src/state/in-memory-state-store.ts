@@ -3,6 +3,8 @@ import type {
   BatchSnapshot,
   BabysitterSessionState,
   CriticalRecord,
+  DispatchLifecycle,
+  DispatchLifecycleClaim,
   DispatchAttemptState,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
@@ -24,6 +26,7 @@ type WorkspaceState = {
   canonicalIssueStates: Map<string, string>
   dispatchFailureReaperHandoffs: Map<string, RegistryHandoffAgent>
   babysitterSessions: Map<string, BabysitterSessionState>
+  dispatchLifecycles: Map<string, DispatchLifecycle>
 }
 
 export type InMemoryStateStoreOptions = {
@@ -59,6 +62,116 @@ export class InMemoryStateStore implements StateStore {
     if (attempt) {
       attempt.inFlight = false
     }
+  }
+
+  async claimDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    seed: DispatchLifecycle,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DispatchLifecycleClaim> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    let lifecycle = lifecycles.get(key)
+    const created = !lifecycle
+    if (!lifecycle) {
+      lifecycle = cloneDispatchLifecycle(seed)
+      if (activeDispatchLifecycleCount(lifecycles) >= this.#batchSize) lifecycle.phase = 'queued'
+      lifecycles.set(key, lifecycle)
+    }
+    const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
+    const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
+    if (terminal || activeOtherOwner) {
+      return { acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
+    }
+    const epoch = lifecycle.lease?.owner === owner
+      ? lifecycle.lease.epoch
+      : (lifecycle.lease?.epoch ?? 0) + 1
+    lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+    lifecycle.updatedAtMs = nowMs
+    return {
+      acquired: true,
+      lifecycle: cloneDispatchLifecycle(lifecycle),
+      lease: { ...lifecycle.lease },
+      created,
+    }
+  }
+
+  async renewDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
+    if (!lifecycle?.lease || lifecycle.lease.owner !== owner || lifecycle.lease.epoch !== epoch) return false
+    lifecycle.lease.leaseUntilMs = nowMs + leaseMs
+    lifecycle.updatedAtMs = nowMs
+    return true
+  }
+
+  async promoteDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    const lifecycle = lifecycles.get(key)
+    if (
+      (lifecycle?.phase !== 'queued' && lifecycle?.phase !== 'waiting-for-human') ||
+      !lifecycle.lease ||
+      lifecycle.lease.owner !== owner ||
+      lifecycle.lease.epoch !== epoch ||
+      lifecycle.lease.leaseUntilMs <= nowMs ||
+      activeDispatchLifecycleCount(lifecycles, key) >= this.#batchSize
+    ) return false
+    lifecycle.phase = 'dispatching'
+    lifecycle.updatedAtMs = nowMs
+    return true
+  }
+
+  async releaseDispatchLifecycleLease(workspaceId: string, key: string, owner: string, epoch: number): Promise<void> {
+    const lease = this.#workspace(workspaceId).dispatchLifecycles.get(key)?.lease
+    if (lease?.owner !== owner || lease.epoch !== epoch) return
+    lease.leaseUntilMs = Number.MIN_SAFE_INTEGER
+  }
+
+  async saveDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    lifecycle: DispatchLifecycle,
+  ): Promise<boolean> {
+    const current = this.#workspace(workspaceId).dispatchLifecycles.get(key)
+    if (!current?.lease || current.lease.owner !== owner || current.lease.epoch !== epoch || current.lease.leaseUntilMs <= nowMs) {
+      return false
+    }
+    const next = cloneDispatchLifecycle(lifecycle)
+    next.lease = { ...current.lease }
+    next.updatedAtMs = nowMs
+    this.#workspace(workspaceId).dispatchLifecycles.set(key, next)
+    return true
+  }
+
+  async getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined> {
+    const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
+    return lifecycle ? cloneDispatchLifecycle(lifecycle) : undefined
+  }
+
+  async listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>> {
+    return [...this.#workspace(workspaceId).dispatchLifecycles]
+      .map(([key, lifecycle]) => [key, cloneDispatchLifecycle(lifecycle)])
+  }
+
+  async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
+    this.#workspace(workspaceId).dispatchLifecycles.delete(key)
   }
 
   async recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void> {
@@ -378,12 +491,25 @@ export class InMemoryStateStore implements StateStore {
         canonicalIssueStates: new Map(),
         dispatchFailureReaperHandoffs: new Map(),
         babysitterSessions: new Map(),
+        dispatchLifecycles: new Map(),
       }
       this.#workspaces.set(workspaceId, state)
     }
     return state
   }
 }
+
+const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)
+
+const activeDispatchLifecycleCount = (lifecycles: Map<string, DispatchLifecycle>, exceptKey?: string): number =>
+  [...lifecycles].filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
+
+const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
+  lifecycle.phase !== 'queued' &&
+  lifecycle.phase !== 'waiting-for-human' &&
+  lifecycle.phase !== 'releasing' &&
+  lifecycle.phase !== 'complete' &&
+  lifecycle.phase !== 'abandoned'
 
 const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>
   structuredClone(record)

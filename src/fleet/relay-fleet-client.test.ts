@@ -163,7 +163,7 @@ describe('RelayFleetClient', () => {
       cwd: '/checkout',
       invocationId: 'factory-inv-1',
       channel: 'wf-factory',
-    })).resolves.toEqual({ name: 'ar-1-impl', sessionRef: 'session-1', pid: 123 })
+    })).resolves.toEqual({ name: 'ar-1-impl', sessionRef: 'session-1', pid: 123, node: 'mac-mini', locality: 'remote' })
 
     expect(messaging.placements).toHaveLength(1)
     const placement = messaging.placements[0]!

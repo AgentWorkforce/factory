@@ -449,6 +449,92 @@ class ManualClock {
   }
 }
 
+class RemoteLifecycleFleetClient extends FakeFleetClient {
+  override readonly placementLocality = 'remote' as const
+  exitImplementerOnReconcile = false
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const result = await super.spawn(input)
+    return { ...result, node: 'sf-mini', locality: 'remote' }
+  }
+
+  override async roster() {
+    const roster = await super.roster()
+    return { ...roster, agents: roster.agents.map((agent) => ({ ...agent, node: 'sf-mini' })) }
+  }
+
+  override async reconcileTrackedAgents(): Promise<void> {
+    await super.reconcileTrackedAgents()
+    if (!this.exitImplementerOnReconcile) return
+    const implementer = this.hydrated.find((agent) => agent.name.includes('-impl-'))
+    if (implementer) this.emitAgentExit(implementer.name, 'exited')
+  }
+}
+
+class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
+  failReleaseFor?: string
+  releaseFailures = 0
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (name === this.failReleaseFor && this.releaseFailures === 0) {
+      this.releaseFailures += 1
+      throw new Error(`transient release failure for ${name}`)
+    }
+    await super.release(name, reason)
+  }
+}
+
+class BlockingClarificationReleaseFleetClient extends RemoteLifecycleFleetClient {
+  readonly clarificationReleaseStarted: Promise<void>
+  #signalClarificationReleaseStarted!: () => void
+  #allowClarificationRelease!: () => void
+  readonly #clarificationReleaseAllowed: Promise<void>
+  #blocked = false
+
+  constructor() {
+    super()
+    this.clarificationReleaseStarted = new Promise((resolve) => {
+      this.#signalClarificationReleaseStarted = resolve
+    })
+    this.#clarificationReleaseAllowed = new Promise((resolve) => {
+      this.#allowClarificationRelease = resolve
+    })
+  }
+
+  allowClarificationRelease(): void {
+    this.#allowClarificationRelease()
+  }
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (!this.#blocked && reason === 'waiting-for-human') {
+      this.#blocked = true
+      this.#signalClarificationReleaseStarted()
+      await this.#clarificationReleaseAllowed
+    }
+    await super.release(name, reason)
+  }
+}
+
+class FailingClarificationReleaseFleetClient extends RemoteLifecycleFleetClient {
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason === 'waiting-for-human') {
+      throw new Error(`relay release unavailable for ${name}`)
+    }
+    await super.release(name, reason)
+  }
+}
+
+class ParkingTakeoverReconcileFleetClient extends BlockingClarificationReleaseFleetClient {
+  override async reconcileTrackedAgents(): Promise<void> {
+    await super.reconcileTrackedAgents()
+    // Relay reconciliation reports hydrated agents absent from the broker as
+    // exits immediately. Emit independently of FakeFleetClient's hydration so
+    // this regression also proves parking agents were excluded from hydration.
+    this.emitAgentExit('ar-991-impl-pear', 'exited')
+    this.emitAgentExit('ar-991-review', 'exited')
+  }
+}
+
 class TimestampFailingFleetClient extends FakeFleetClient {
   readonly attemptTimes: number[] = []
 
@@ -1410,6 +1496,8 @@ describe('FactoryLoop', () => {
         sessionRef: 'session-review-hoopsheet-26',
         node: 'self',
         capability: 'spawn:claude',
+        repo: 'AgentWorkforce/hoopsheet',
+        clonePath: '/work/hoopsheet',
       }))
 
       fleet.emitAgentExit('ar-26-impl-pear', 'issue-done')
@@ -2166,15 +2254,14 @@ describe('FactoryLoop', () => {
 
   it('re-dispatches a terminal issue after a canonical Done to Ready re-open', async () => {
     const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
-    const fleet = new FakeFleetClient()
+    const fleet = new RemoteLifecycleFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     const first = await factory.runOnce()
     expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
 
     fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
-    await flush()
-    expect(factory.status().counters.done).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
 
     await mount.writeFile(issuePath(364), issuePayload(364, ready))
     const reopened = await factory.runOnce()
@@ -2187,6 +2274,13 @@ describe('FactoryLoop', () => {
       'ar-364-impl-pear',
       'ar-364-review',
     ])
+    const branchInstructions = fleet.spawns
+      .filter((spawn) => spawn.name === 'ar-364-impl-pear')
+      .map((spawn) => /Factory publication branch: ([^\s]+)/u.exec(spawn.task ?? '')?.[1])
+    expect(branchInstructions).toHaveLength(2)
+    expect(branchInstructions[0]).not.toBe(branchInstructions[1])
+    expect(fleet.spawns[0]?.invocationId).not.toBe(fleet.spawns[2]?.invocationId)
+    expect(fleet.spawns[1]?.invocationId).not.toBe(fleet.spawns[3]?.invocationId)
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
   })
 
@@ -2202,8 +2296,7 @@ describe('FactoryLoop', () => {
     expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-366'])
 
     fleet.emitAgentExit('ar-366-impl-pear', 'issue-done')
-    await flush()
-    expect(factory.status().counters.humanReview).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
 
     await mount.writeFile(issuePath(366), issuePayload(366, ready))
     const reopened = await factory.runOnce()
@@ -2806,6 +2899,911 @@ describe('FactoryLoop', () => {
 
       await factory.stop()
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
+    const watchStatePath = join(root, 'state.json')
+    const clock = new ManualClock()
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 85,
+          url: 'https://github.com/AgentWorkforce/pear/pull/85',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(85)]: issueFile(85),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    try {
+      const firstFleet = new RemoteLifecycleFleetClient()
+      const first = createFactory(config(), {
+        mount,
+        fleet: firstFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        clock,
+        probePrResolver: async () => undefined,
+      })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(85), issueFile(85)))
+      const originalResult = await first.dispatch(decision)
+
+      const key = issueKey(decision.issue)
+      const crashedState = new FileStateStore({ batchSize: 2, watchStatePath })
+      const beforeCrash = await crashedState.getDispatchLifecycle('factory-test', key)
+      expect(beforeCrash?.phase).toBe('running')
+      expect(beforeCrash?.agents.find((agent) => agent.name === 'ar-85-impl-pear')?.tracked.result?.node).toBe('sf-mini')
+
+      // The replacement starts while the crashed owner's nominal lease is
+      // still live. It must attach without hydrating/spawning/publishing, then
+      // autonomously take over after expiry with no second start or event.
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restartedFleet.exitImplementerOnReconcile = true
+      const restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        clock,
+        probePrResolver: async () => undefined,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await expect(restarted.dispatch(decision)).resolves.toEqual(originalResult)
+      const terminal = restarted.waitForDispatchTerminal(decision.issue)
+      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      expect(restartedFleet.hydrated).toEqual([])
+      expect(restartedFleet.spawns).toEqual([])
+      expect(publishInputs).toEqual([])
+
+      clock.advance(5 * 60_000 + 1)
+      await terminal
+      await vi.waitFor(async () => {
+        expect(await crashedState.getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'complete' })
+      })
+
+      expect(restartedFleet.hydrated.map((agent) => agent.name).sort()).toEqual(['ar-85-impl-pear', 'ar-85-review'])
+      expect(publishInputs).toEqual([expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        headRef: expect.stringMatching(/^factory\/ar-85-agentworkforce-pear-[0-9a-f]{8}$/u),
+      })])
+      expect(publishInputs[0]).not.toHaveProperty('clonePath')
+      expect(restartedFleet.releases.map((release) => release.name).sort()).toEqual(['ar-85-impl-pear', 'ar-85-review'])
+      await first.stop()
+      await restarted.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['healthy owner', 1091, false],
+    ['waiting owner crash', 1092, true],
+  ] as const)('keeps an attached terminal waiter live across clarification with a %s', async (_scenario, number, crashAfterPark) => {
+    const root = await mkdtemp(join(tmpdir(), `factory-attached-clarification-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const clock = new ManualClock()
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(number)]: issueFile(number) })
+    const factoryConfig = config({ batchSize: 1, slack: slackConfig() })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    firstFleet.setSessionRef(`ar-${number}-impl-pear`, `session-ar-${number}-impl-pear`)
+    firstFleet.setSessionRef(`ar-${number}-review`, `session-ar-${number}-review`)
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      clock,
+    })
+    const attachedFleet = new RemoteLifecycleFleetClient()
+    const attached = createFactory(factoryConfig, {
+      mount,
+      fleet: attachedFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      clock,
+    })
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(number), issueFile(number)))
+      const result = await first.dispatch(decision)
+      await attached.start({ mode: 'dispatch-owner' })
+      await expect(attached.dispatch(decision)).resolves.toEqual(result)
+      const terminal = attached.waitForDispatchTerminal(decision.issue)
+
+      mount.files.set(issuePath(number), { content: issueFile(number, implementing) })
+      firstFleet.emitAgentMessage({
+        from: `ar-${number}-impl-pear`,
+        target: 'factory',
+        body: `[factory-needs-input] Keep the attached owner live for ${number}.`,
+        eventId: `agent-question-${number}`,
+      })
+      await vi.waitFor(() => expect(first.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(first.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await vi.waitFor(() => expect(attached.status().counters.dispatchTerminalWaitingObserved)
+        .toBeGreaterThanOrEqual(1), { timeout: 4_000 })
+      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      expect(attachedFleet.hydrated).toEqual([])
+      expect(attachedFleet.spawns).toEqual([])
+      expect(attachedFleet.resumes).toEqual([])
+      expect(attached.status().counters.githubPullRequestsPublished).toBeUndefined()
+
+      if (crashAfterPark) {
+        // Drop the healthy owner's subscriptions, then leave behind the same
+        // nominal foreign-lease window an ungraceful crash would expose.
+        await first.stop()
+        const persisted = state()
+        const key = issueKey(decision.issue)
+        const waitingLifecycle = await persisted.getDispatchLifecycle('factory-test', key)
+        expect(waitingLifecycle).toMatchObject({ phase: 'waiting-for-human' })
+        const crashLease = await persisted.claimDispatchLifecycle(
+          'factory-test',
+          key,
+          waitingLifecycle!,
+          'crashed-waiting-owner',
+          clock.now(),
+          5 * 60_000,
+        )
+        expect(crashLease.acquired).toBe(true)
+        const waitingObservations = attached.status().counters.dispatchTerminalWaitingObserved ?? 0
+        clock.advance(5 * 60_000 + 1)
+        await vi.waitFor(() => expect(attached.status().counters.dispatchTerminalWaitingObserved ?? 0)
+          .toBeGreaterThan(waitingObservations), { timeout: 4_000 })
+        await vi.waitFor(() => expect(attached.status().counters.slackWatchersRearmed).toBe(1), { timeout: 4_000 })
+      }
+      emitSlackReply(
+        mount,
+        slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, `human-answer-${number}`),
+        `human-answer-${number}`,
+        {
+          text: `Resume issue ${number}.`,
+          user: 'U123',
+          user_is_bot: false,
+        },
+      )
+
+      const completingFleet = crashAfterPark ? attachedFleet : firstFleet
+      await vi.waitFor(() => expect(completingFleet.resumes).toHaveLength(2), { timeout: 4_000 })
+      if (crashAfterPark) expect(firstFleet.resumes).toEqual([])
+      else expect(attachedFleet.resumes).toEqual([])
+      completingFleet.emitAgentExit(`ar-${number}-review`, 'completed')
+      await terminal
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'complete' })
+      expect(attachedFleet.spawns).toEqual([])
+      expect(attached.status().counters.githubPullRequestsPublished).toBeUndefined()
+    } finally {
+      await attached.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('fences a duplicate lifecycle owner before it can spawn a second remote team', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-duplicate-owner-'))
+    const watchStatePath = join(root, 'state.json')
+    const mount = new FakeMountClient({ [issuePath(85)]: issueFile(85) })
+    try {
+      const firstFleet = new RemoteLifecycleFleetClient()
+      const first = createFactory(config(), {
+        mount,
+        fleet: firstFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(85), issueFile(85)))
+      await first.dispatch(decision)
+
+      const duplicateFleet = new RemoteLifecycleFleetClient()
+      const duplicate = createFactory(config(), {
+        mount: new FakeMountClient({ [issuePath(85)]: issueFile(85) }),
+        fleet: duplicateFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      await expect(duplicate.dispatch(decision)).rejects.toThrow(/lifecycle is owned by/)
+      expect(firstFleet.spawns).toHaveLength(2)
+      expect(duplicateFleet.spawns).toEqual([])
+      await first.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a durable queued issue from spawning after restart until the running slot is released', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-durable-queue-restart-'))
+    const watchStatePath = join(root, 'state.json')
+    const clock = new ManualClock()
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 985,
+        url: 'https://github.com/AgentWorkforce/pear/pull/985',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(985)]: issueFile(985),
+      [issuePath(986)]: issueFile(986),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const first = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      clock,
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const running = await first.triageIssue(parseLinearIssue(issuePath(985), issueFile(985)))
+      const queued = await first.triageIssue(parseLinearIssue(issuePath(986), issueFile(986)))
+      await first.dispatch(running)
+      await first.dispatch(queued)
+      expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-985-impl-pear', 'ar-985-review'])
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(queued.issue))).toMatchObject({ phase: 'queued' })
+
+      clock.advance(5 * 60_000 + 1)
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(config({ batchSize: 1 }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        clock,
+        probePrResolver: async () => undefined,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      expect(restartedFleet.spawns).toEqual([])
+
+      restartedFleet.emitAgentExit('ar-985-impl-pear', 'exited')
+      await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-986-impl-pear', 'ar-986-review']), { timeout: 4_000 })
+      await first.stop()
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('enforces one global durable slot across concurrent same-host control-plane processes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-global-capacity-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const secondFleet = new RemoteLifecycleFleetClient()
+    const firstMount = new FakeMountClient({ [issuePath(987)]: issueFile(987) })
+    const secondMount = new FakeMountClient({ [issuePath(988)]: issueFile(988) })
+    const first = createFactory(config({ batchSize: 1 }), {
+      mount: firstMount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const second = createFactory(config({ batchSize: 1 }), {
+      mount: secondMount,
+      fleet: secondFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(987), issueFile(987))))
+      const secondDecision = await second.triageIssue(parseLinearIssue(issuePath(988), issueFile(988)))
+      await second.dispatch(secondDecision)
+
+      expect(firstFleet.spawns).toHaveLength(2)
+      expect(secondFleet.spawns).toEqual([])
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue))).toMatchObject({ phase: 'queued' })
+    } finally {
+      await second.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps global capacity occupied until a clarification team is confirmed parked', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-global-capacity-clarification-park-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new BlockingClarificationReleaseFleetClient()
+    const secondFleet = new RemoteLifecycleFleetClient()
+    const firstMount = new ConfirmRecordingSlackMountClient({ [issuePath(989)]: issueFile(989) })
+    const secondMount = new FakeMountClient({ [issuePath(990)]: issueFile(990) })
+    const first = createFactory(config({ batchSize: 1, slack: slackConfig() }), {
+      mount: firstMount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const second = createFactory(config({ batchSize: 1 }), {
+      mount: secondMount,
+      fleet: secondFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const firstDecision = await first.triageIssue(parseLinearIssue(issuePath(989), issueFile(989)))
+      const secondDecision = await second.triageIssue(parseLinearIssue(issuePath(990), issueFile(990)))
+      await first.dispatch(firstDecision)
+      firstFleet.emitAgentMessage({
+        from: 'ar-989-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Keep my slot until the remote team is absent.',
+        eventId: 'agent-question-989',
+      })
+      await firstFleet.clarificationReleaseStarted
+      await vi.waitFor(async () => {
+        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+          .toMatchObject({ phase: 'parking' })
+      })
+
+      await second.dispatch(secondDecision)
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue)))
+        .toMatchObject({ phase: 'queued' })
+      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      expect(secondFleet.spawns).toEqual([])
+
+      firstFleet.allowClarificationRelease()
+      await vi.waitFor(async () => {
+        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+          .toMatchObject({ phase: 'waiting-for-human' })
+      })
+      await vi.waitFor(() => expect(secondFleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-990-impl-pear', 'ar-990-review']), { timeout: 4_000 })
+    } finally {
+      firstFleet.allowClarificationRelease()
+      await second.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a durable clarification parking phase after the release owner stops', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-parking-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mount = new ConfirmRecordingSlackMountClient({
+      [issuePath(991)]: issueFile(991),
+      [issuePath(992)]: issueFile(992),
+    })
+    const firstFleet = new FailingClarificationReleaseFleetClient()
+    firstFleet.setSessionRef('ar-991-impl-pear', 'session-ar-991-impl-pear')
+    firstFleet.setSessionRef('ar-991-review', 'session-ar-991-review')
+    const first = createFactory(config({ batchSize: 1, slack: slackConfig() }), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    let restartedFleet: ParkingTakeoverReconcileFleetClient | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(991), issueFile(991)))
+      await first.dispatch(decision)
+      firstFleet.emitAgentMessage({
+        from: 'ar-991-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Recover my interrupted parking transition.',
+        eventId: 'agent-question-991',
+      })
+      await vi.waitFor(() => expect(first.status().counters.clarificationParkReleasePending).toBe(1))
+      await vi.waitFor(async () => {
+        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .toMatchObject({ phase: 'parking' })
+      })
+      const queuedDecision = await first.triageIssue(parseLinearIssue(issuePath(992), issueFile(992)))
+      await first.dispatch(queuedDecision)
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(queuedDecision.issue)))
+        .toMatchObject({ phase: 'queued' })
+      await first.stop()
+
+      restartedFleet = new ParkingTakeoverReconcileFleetClient()
+      restarted = createFactory(config({ batchSize: 1, slack: slackConfig() }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      const starting = restarted.start({ mode: 'dispatch-owner' })
+      await restartedFleet.clarificationReleaseStarted
+      await vi.waitFor(() => expect(restarted?.status().counters.clarificationParkingExitsSuppressed).toBe(2))
+      expect(restartedFleet.hydrated).toEqual([])
+      expect(restartedFleet.resumes).toEqual([])
+      expect(restartedFleet.spawns).toEqual([])
+      expect(restarted.status().counters.exitPrPublishSkipped).toBeUndefined()
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'parking' })
+
+      restartedFleet.allowClarificationRelease()
+      await starting
+      await vi.waitFor(async () => {
+        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .toMatchObject({ phase: 'waiting-for-human' })
+      })
+      expect(restartedFleet.releases.map((release) => release.name).sort())
+        .toEqual(['ar-991-impl-pear', 'ar-991-review'])
+      expect(restarted.status().counters.clarificationParksRecovered).toBe(1)
+      await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-992-impl-pear', 'ar-992-review']), { timeout: 4_000 })
+    } finally {
+      restartedFleet?.allowClarificationRelease()
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fences a duplicate owner while the active owner is inside a slow PR publication', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-slow-publish-owner-'))
+    const watchStatePath = join(root, 'state.json')
+    let signalPublishStarted!: () => void
+    let releasePublish!: () => void
+    const publishStarted = new Promise<void>((resolve) => { signalPublishStarted = resolve })
+    const publishReleased = new Promise<void>((resolve) => { releasePublish = resolve })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        signalPublishStarted()
+        await publishReleased
+        return {
+          repo: input.repo,
+          number: 685,
+          url: 'https://github.com/AgentWorkforce/pear/pull/685',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(685)]: issueFile(685),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const first = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(685), issueFile(685)))
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit('ar-685-impl-pear', 'exited')
+      await publishStarted
+
+      const duplicateFleet = new RemoteLifecycleFleetClient()
+      const duplicate = createFactory(config(), {
+        mount: new FakeMountClient({ [issuePath(685)]: issueFile(685) }),
+        fleet: duplicateFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await expect(duplicate.dispatch(decision)).rejects.toThrow(/lifecycle is owned by/)
+      expect(duplicateFleet.spawns).toEqual([])
+
+      releasePublish()
+      await vi.waitFor(() => expect(first.status().counters.done).toBe(1))
+      expect(firstFleet.spawns).toHaveLength(2)
+      await duplicate.stop()
+    } finally {
+      releasePublish()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('adopts a roster-visible remote spawn after crashing across the ack persistence gap', async () => {
+    class AckGapFleet extends RemoteLifecycleFleetClient {
+      failed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (!this.failed) {
+          this.failed = true
+          throw new Error('owner crashed after remote spawn ack')
+        }
+        return result
+      }
+    }
+    const root = await mkdtemp(join(tmpdir(), 'factory-ack-gap-'))
+    const watchStatePath = join(root, 'state.json')
+    const fleet = new AckGapFleet()
+    const mount = new FakeMountClient({ [issuePath(585)]: issueFile(585) })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+      triage: new StaticTriage(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(585), issueFile(585)))
+      await expect(factory.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
+      await vi.waitFor(async () => expect(await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+
+      expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-impl-pear')).toHaveLength(1)
+      expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-review')).toHaveLength(1)
+      expect((await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getDispatchLifecycle('factory-test', issueKey(decision.issue)))?.agents
+        .find((agent) => agent.name === 'ar-585-impl-pear')?.tracked.result?.node).toBe('sf-mini')
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('autonomously retries a transient remote PR publication without another exit event', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-retry-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (attempts === 1) throw new Error('transient provider outage')
+        return {
+          repo: input.repo,
+          number: 185,
+          url: 'https://github.com/AgentWorkforce/pear/pull/185',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(185)]: issueFile(185),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(185), issueFile(185)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-185-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 4_000 })
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 4_000 })
+      expect(fleet.resumes).toEqual([])
+      expect(fleet.releases.map((release) => release.name).sort()).toEqual(['ar-185-impl-pear', 'ar-185-review'])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reuses the provider receipt after losing the lifecycle lease between publication and persistence', async () => {
+    class RejectFirstPublishedSaveStore extends FileStateStore {
+      rejected = false
+
+      override async saveDispatchLifecycle(...args: Parameters<FileStateStore['saveDispatchLifecycle']>): Promise<boolean> {
+        const lifecycle = args[5]
+        if (lifecycle.phase === 'published' && !this.rejected) {
+          this.rejected = true
+          return false
+        }
+        return super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-receipt-lease-loss-'))
+    const watchStatePath = join(root, 'state.json')
+    let publishAttempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishAttempts += 1
+        return {
+          repo: input.repo,
+          number: 1085,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1085',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(1085)]: issueFile(1085),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new RejectFirstPublishedSaveStore({ batchSize: 2, watchStatePath })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(1085), issueFile(1085))))
+      fleet.emitAgentExit('ar-1085-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 4_000 })
+      expect(stateStore.rejected).toBe(true)
+      expect(publishAttempts).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('waits for mounted metadata to confirm the exact remote PR is open and non-draft', async () => {
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/885/metadata.json'
+    let signalStaleRead!: () => void
+    const staleRead = new Promise<void>((resolve) => { signalStaleRead = resolve })
+    class ConfirmingMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        const value = await super.readFile(path)
+        if (path === prPath) signalStaleRead()
+        return value
+      }
+    }
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 885,
+          url: 'https://github.com/AgentWorkforce/pear/pull/885',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new ConfirmingMount({
+      [issuePath(885)]: issueFile(885),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      [prPath]: {
+        number: 885,
+        state: 'open',
+        head_ref: 'factory/ar-885-agentworkforce-pear-stale-run',
+        isDraft: false,
+      },
+    }, githubWrite)
+    Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(885), issueFile(885))))
+      fleet.emitAgentExit('ar-885-impl-pear', 'exited')
+      await staleRead
+      expect(factory.status().counters.done ?? 0).toBe(0)
+
+      mount.files.set(prPath, { content: {
+        number: 885,
+        state: 'open',
+        head_ref: publishInputs[0]?.headRef,
+        isDraft: false,
+      } })
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      expect(fleet.releases.map((release) => release.name).sort()).toEqual(['ar-885-impl-pear', 'ar-885-review'])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('takes over a persisted publishing phase after the owner stops', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publishing-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    let providerReady = false
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (!providerReady) throw new Error('publisher unavailable')
+        return {
+          repo: input.repo,
+          number: 485,
+          url: 'https://github.com/AgentWorkforce/pear/pull/485',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(485)]: issueFile(485),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const first = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(485), issueFile(485)))
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit('ar-485-impl-pear', 'exited')
+      await vi.waitFor(() => expect(attempts).toBe(1))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'publishing' }))
+      await first.stop()
+
+      providerReady = true
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      const restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(restarted.status().counters.done).toBe(1), { timeout: 4_000 })
+      expect(attempts).toBe(2)
+      expect(restartedFleet.releases.map((release) => release.name).sort()).toEqual(['ar-485-impl-pear', 'ar-485-review'])
+      await restarted.stop()
+    } finally {
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('pins a resumed session to its placed node/repo and never signals its remote PID locally', async () => {
+    class RemotePidFleet extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        return { ...await super.spawn(input), pid: 4242 }
+      }
+    }
+    const fleet = new RemotePidFleet()
+    fleet.setSessionRef('ar-385-review', 'remote-review-session')
+    const killed: Array<{ pid: number; signal?: NodeJS.Signals | number }> = []
+    const mount = new FakeMountClient({ [issuePath(385)]: issueFile(385) })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      kill: (pid, signal) => { killed.push({ pid, signal }) },
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(385), issueFile(385))))
+    fleet.emitAgentExit('ar-385-review', 'crash')
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+
+    expect(fleet.resumes[0]).toMatchObject({
+      name: 'ar-385-review',
+      sessionRef: 'remote-review-session',
+      node: 'sf-mini',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
+    })
+    expect(killed).toEqual([])
+    await factory.stop()
+  })
+
+  it('frees the batch slot before retrying a transient remote release failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-release-retry-'))
+    const watchStatePath = join(root, 'state.json')
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 285,
+        url: 'https://github.com/AgentWorkforce/pear/pull/285',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(285)]: issueFile(285),
+      [issuePath(286)]: issueFile(286),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new TransientRemoteReleaseFleetClient()
+    fleet.failReleaseFor = 'ar-285-impl-pear'
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const first = await factory.triageIssue(parseLinearIssue(issuePath(285), issueFile(285)))
+      const second = await factory.triageIssue(parseLinearIssue(issuePath(286), issueFile(286)))
+      await factory.dispatch(first)
+      await factory.dispatch(second)
+      fleet.emitAgentExit('ar-285-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-286-impl-pear'), {
+        timeout: 4_000,
+      })
+      await vi.waitFor(() => expect(fleet.releases.filter((release) => release.name === 'ar-285-impl-pear')).toHaveLength(1), {
+        timeout: 4_000,
+      })
+      expect(fleet.releaseFailures).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('takes over persisted release cleanup after the publishing owner stops', async () => {
+    class ReleaseOutageFleet extends RemoteLifecycleFleetClient {
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name === 'ar-785-impl-pear') throw new Error('release service unavailable')
+        await super.release(name, reason)
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-release-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 785,
+        url: 'https://github.com/AgentWorkforce/pear/pull/785',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(785)]: issueFile(785),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new ReleaseOutageFleet()
+    const first = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(785), issueFile(785)))
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit('ar-785-impl-pear', 'exited')
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'releasing' }))
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(config({ batchSize: 1 }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'complete' }), { timeout: 4_000 })
+      // The reviewer acknowledgement was fenced before the first owner
+      // stopped, so takeover retries only the failed implementer release.
+      expect(restartedFleet.releases.map((release) => release.name)).toEqual(['ar-785-impl-pear'])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -5518,6 +6516,8 @@ describe('FactoryLoop', () => {
       sessionRef: 'session-review-6',
       node: 'self',
       capability: 'spawn:claude',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
     }])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl-pear', 'ar-6-review'])
   })
@@ -5960,6 +6960,8 @@ describe('FactoryLoop', () => {
       sessionRef: 'session-impl-256',
       node: 'self',
       capability: 'spawn:codex',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
     }])
   })
 
@@ -5992,6 +6994,8 @@ describe('FactoryLoop', () => {
       sessionRef: 'session-impl-255',
       node: 'self',
       capability: 'spawn:codex',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
     }])
     expect(fleet.releases).toEqual([])
     expect(factory.status().counters.done).toBeUndefined()
@@ -6016,6 +7020,8 @@ describe('FactoryLoop', () => {
       sessionRef: 'session-review-10',
       node: 'self',
       capability: 'spawn:claude',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
     }])
   })
 
@@ -8702,8 +9708,8 @@ describe('FactoryLoop', () => {
       { name: 'ar-36-review', data: '<integration-event source="slack" issue="AR-36">\nHuman reply in the Slack thread:\nUse the shared retry helper in factory.ts.\n</integration-event>\r' },
     ])
     expect(fleet.resumes).toEqual([
-      { name: 'ar-36-impl-pear', sessionRef: 'session-ar-36-impl-pear', node: 'self', capability: 'spawn:codex' },
-      { name: 'ar-36-review', sessionRef: 'session-ar-36-review', node: 'self', capability: 'spawn:claude' },
+      { name: 'ar-36-impl-pear', sessionRef: 'session-ar-36-impl-pear', node: 'self', capability: 'spawn:codex', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' },
+      { name: 'ar-36-review', sessionRef: 'session-ar-36-review', node: 'self', capability: 'spawn:claude', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' },
     ])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-36'])
     expect(fleet.messages).toHaveLength(2)
@@ -8931,7 +9937,7 @@ describe('FactoryLoop', () => {
     expect(pending?.releasedAgents).toEqual(['ar-50-impl-pear', 'ar-50-review'])
     expect(pending?.parkedAtMs).toBeUndefined()
     expect(factory.status().counters.agentQuestionTeamsReleased).toBeUndefined()
-    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-50'])
 
     mount.files.set(issuePath(50), { content: issueFile(50, implementing) })
     await factory.runLoop({ maxIterations: 1 })
@@ -9494,6 +10500,147 @@ describe('FactoryLoop', () => {
       expect(slackAnswerInputs(restartedFleet)).toHaveLength(2)
       expect(await restartedState.listWaitingClarifications('factory-test')).toEqual([])
       await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('dispatch-owner recovers a remote team parked for clarification and preserves its prior dispatch result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-dispatch-owner-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const mount = new ConfirmRecordingSlackMountClient({ [issuePath(955)]: issueFile(955) })
+      const firstFleet = new RemoteLifecycleFleetClient()
+      firstFleet.setSessionRef('ar-955-impl-pear', 'session-ar-955-impl-pear')
+      firstFleet.setSessionRef('ar-955-review', 'session-ar-955-review')
+      const factoryConfig = config({ batchSize: 1, slack: slackConfig() })
+      const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+      const first = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(955), issueFile(955)))
+      const originalResult = await first.dispatch(decision)
+      mount.files.set(issuePath(955), { content: issueFile(955, implementing) })
+      firstFleet.emitAgentMessage({
+        from: 'ar-955-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Recover this from a replacement dispatch owner.',
+        eventId: 'agent-question-955',
+      })
+      await vi.waitFor(() => expect(first.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(first.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      const restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await expect(restarted.dispatch(decision)).resolves.toEqual(originalResult)
+
+      const terminal = restarted.waitForDispatchTerminal(decision.issue)
+      emitSlackReply(
+        mount,
+        slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-955'),
+        'persisted-answer-955',
+        {
+          text: 'Resume on the original remote node.',
+          user: 'U123',
+          user_is_bot: false,
+        },
+      )
+      await vi.waitFor(() => expect(restarted.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(restartedFleet.resumes).toEqual([
+        expect.objectContaining({ node: 'sf-mini', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' }),
+        expect.objectContaining({ node: 'sf-mini', repo: 'AgentWorkforce/pear', clonePath: '/work/pear' }),
+      ])
+      restartedFleet.emitAgentExit('ar-955-review', 'completed')
+      await terminal
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'complete' })
+      await restarted.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves remote placement when adopting an online clarification wake across the spawn-ack crash gap', async () => {
+    class OnlineClarificationFleet extends RemoteLifecycleFleetClient {
+      override async roster() {
+        return {
+          agents: [
+            { name: 'ar-956-impl-pear', node: 'sf-mini' },
+            { name: 'ar-956-review', node: 'sf-mini' },
+          ],
+          nodes: [],
+        }
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-placement-gap-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const mount = new ConfirmRecordingSlackMountClient({ [issuePath(956)]: issueFile(956) })
+      const firstFleet = new RemoteLifecycleFleetClient()
+      firstFleet.setSessionRef('ar-956-impl-pear', 'session-ar-956-impl-pear')
+      firstFleet.setSessionRef('ar-956-review', 'session-ar-956-review')
+      const factoryConfig = config({ slack: slackConfig() })
+      const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+      const first = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(956), issueFile(956))))
+      mount.files.set(issuePath(956), { content: issueFile(956, implementing) })
+      firstFleet.emitAgentMessage({
+        from: 'ar-956-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Preserve placement across wake adoption.',
+        eventId: 'agent-question-956',
+      })
+      await vi.waitFor(() => expect(first.status().counters.agentQuestionTeamsReleased).toBe(1))
+      await vi.waitFor(() => expect(first.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await first.stop()
+
+      const persisted = state()
+      const [key] = (await persisted.listWaitingClarifications('factory-test'))[0]!
+      const claimed = await persisted.claimClarificationReply('factory-test', key, {
+        id: 'persisted-answer-956',
+        text: 'Adopt the already-online wake.',
+        receivedAtMs: 500,
+      })
+      expect(claimed?.reply?.id).toBe('persisted-answer-956')
+
+      const fleet = new OnlineClarificationFleet()
+      const killed: number[] = []
+      const restarted = createFactory(factoryConfig, {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        kill: (pid) => { killed.push(pid) },
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(restarted.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(fleet.resumes).toEqual([])
+
+      fleet.emitAgentExit('ar-956-review', 'crash')
+      await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+      expect(fleet.resumes[0]).toMatchObject({
+        name: 'ar-956-review',
+        node: 'sf-mini',
+        repo: 'AgentWorkforce/pear',
+        clonePath: '/work/pear',
+      })
+      expect(killed).toEqual([])
+      await restarted.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
     }

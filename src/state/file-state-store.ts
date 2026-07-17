@@ -4,17 +4,25 @@ import { dirname, join } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 
-import type { BabysitterSessionState, ClarificationReply, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import type {
+  BabysitterSessionState,
+  ClarificationReply,
+  DispatchLifecycle,
+  DispatchLifecycleClaim,
+  GithubIssueCommentWatchState,
+  WaitingClarification,
+} from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 
 type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   waitingClarifications: Record<string, WaitingClarification>
   babysitterSessions: Record<string, BabysitterSessionState>
+  dispatchLifecycles: Record<string, DispatchLifecycle>
 }
 
 type WatchStateDocument = {
-  version: 2
+  version: 3
   workspaces: Record<string, PersistedWorkspaceState>
 }
 
@@ -41,11 +49,160 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
  */
 export class FileStateStore extends InMemoryStateStore {
   readonly #watchStatePath: string
+  readonly #batchSize: number
   #operation: Promise<void> = Promise.resolve()
 
   constructor(options: FileStateStoreOptions) {
     super(options)
     this.#watchStatePath = options.watchStatePath
+    this.#batchSize = options.batchSize
+  }
+
+  override async claimDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    seed: DispatchLifecycle,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DispatchLifecycleClaim> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      let lifecycle = workspace.dispatchLifecycles[key]
+      const created = !lifecycle
+      if (!lifecycle) {
+        lifecycle = cloneLifecycle(seed)
+        if (activeDispatchLifecycleCount(workspace.dispatchLifecycles) >= this.#batchSize) lifecycle.phase = 'queued'
+        workspace.dispatchLifecycles[key] = lifecycle
+      }
+      const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
+      const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
+      if (terminal || activeOtherOwner) {
+        return { acquired: false, lifecycle: cloneLifecycle(lifecycle), created }
+      }
+      const epoch = lifecycle.lease?.owner === owner
+        ? lifecycle.lease.epoch
+        : (lifecycle.lease?.epoch ?? 0) + 1
+      lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+      lifecycle.updatedAtMs = nowMs
+      await this.#persist(document)
+      return {
+        acquired: true,
+        lifecycle: cloneLifecycle(lifecycle),
+        lease: { ...lifecycle.lease },
+        created,
+      }
+    }))
+  }
+
+  override async renewDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
+      if (!lifecycle?.lease || lifecycle.lease.owner !== owner || lifecycle.lease.epoch !== epoch) return false
+      lifecycle.lease.leaseUntilMs = nowMs + leaseMs
+      lifecycle.updatedAtMs = nowMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async promoteDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const lifecycle = workspace?.dispatchLifecycles[key]
+      if (
+        (lifecycle?.phase !== 'queued' && lifecycle?.phase !== 'waiting-for-human') ||
+        !lifecycle.lease ||
+        lifecycle.lease.owner !== owner ||
+        lifecycle.lease.epoch !== epoch ||
+        lifecycle.lease.leaseUntilMs <= nowMs ||
+        activeDispatchLifecycleCount(workspace!.dispatchLifecycles, key) >= this.#batchSize
+      ) return false
+      lifecycle.phase = 'dispatching'
+      lifecycle.updatedAtMs = nowMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async releaseDispatchLifecycleLease(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+  ): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const lease = document.workspaces[workspaceId]?.dispatchLifecycles[key]?.lease
+      if (lease?.owner !== owner || lease.epoch !== epoch) return
+      lease.leaseUntilMs = Number.MIN_SAFE_INTEGER
+      await this.#persist(document)
+    }))
+  }
+
+  override async saveDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    lifecycle: DispatchLifecycle,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const current = workspace?.dispatchLifecycles[key]
+      if (!current?.lease || current.lease.owner !== owner || current.lease.epoch !== epoch || current.lease.leaseUntilMs <= nowMs) {
+        return false
+      }
+      const next = cloneLifecycle(lifecycle)
+      next.lease = { ...current.lease }
+      next.updatedAtMs = nowMs
+      workspace!.dispatchLifecycles[key] = next
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined> {
+    return await this.#exclusive(async () => {
+      const lifecycle = (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchLifecycles[key]
+      return lifecycle ? cloneLifecycle(lifecycle) : undefined
+    })
+  }
+
+  override async listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>> {
+    return await this.#exclusive(async () => {
+      const lifecycles = (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchLifecycles ?? {}
+      return Object.entries(lifecycles).map(([key, lifecycle]) => [key, cloneLifecycle(lifecycle)])
+    })
+  }
+
+  override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      if (!workspace || !(key in workspace.dispatchLifecycles)) return
+      delete workspace.dispatchLifecycles[key]
+      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+    }))
   }
 
   override async setGithubIssueCommentWatch(
@@ -449,7 +606,7 @@ export class FileStateStore extends InMemoryStateStore {
       return parseDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
-      return { version: 2, workspaces: {} }
+      return { version: 3, workspaces: {} }
     }
   }
 
@@ -503,6 +660,31 @@ const parseDocument = (value: unknown): WatchStateDocument => {
   if (!isRecord(value) || !isRecord(value.workspaces)) {
     throw new Error('Factory GitHub watch state file is invalid')
   }
+  if (value.version === 3) {
+    const workspaces: Record<string, PersistedWorkspaceState> = {}
+    for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
+      if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
+      const watches = rawWorkspace.githubIssueCommentWatches
+      const clarifications = rawWorkspace.waitingClarifications
+      const babysitters = rawWorkspace.babysitterSessions
+      const lifecycles = rawWorkspace.dispatchLifecycles
+      if (
+        !isRecord(watches) ||
+        !isRecord(clarifications) ||
+        (babysitters !== undefined && !isRecord(babysitters)) ||
+        (lifecycles !== undefined && !isRecord(lifecycles))
+      ) {
+        throw new Error('Factory GitHub watch state file is invalid')
+      }
+      workspaces[workspaceId] = {
+        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
+        waitingClarifications: clarifications as Record<string, WaitingClarification>,
+        babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
+        dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
+      }
+    }
+    return { version: 3, workspaces }
+  }
   if (value.version === 2) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
     for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
@@ -517,9 +699,10 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
+        dispatchLifecycles: {},
       }
     }
-    return { version: 2, workspaces }
+    return { version: 3, workspaces }
   }
   if (value.version === 1) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -531,9 +714,10 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: {},
         babysitterSessions: {},
+        dispatchLifecycles: {},
       }
     }
-    return { version: 2, workspaces }
+    return { version: 3, workspaces }
   }
   throw new Error('Factory GitHub watch state file is invalid')
 }
@@ -582,16 +766,30 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
   return sessions
 }
 
+const cloneLifecycle = (record: DispatchLifecycle): DispatchLifecycle => structuredClone(record)
+
+const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecycle>, exceptKey?: string): number =>
+  Object.entries(lifecycles).filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
+
+const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
+  lifecycle.phase !== 'queued' &&
+  lifecycle.phase !== 'waiting-for-human' &&
+  lifecycle.phase !== 'releasing' &&
+  lifecycle.phase !== 'complete' &&
+  lifecycle.phase !== 'abandoned'
+
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
   waitingClarifications: {},
   babysitterSessions: {},
+  dispatchLifecycles: {},
 })
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&
-  Object.keys(workspace.babysitterSessions).length === 0
+  Object.keys(workspace.babysitterSessions).length === 0 &&
+  Object.keys(workspace.dispatchLifecycles).length === 0
 
 const syncParentDirectory = async (filePath: string): Promise<void> => {
   const handle = await open(dirname(filePath), 'r')

@@ -26,10 +26,14 @@ export interface SpawnResult {
   sessionRef?: string
   pid?: number
   pids?: number[]
+  /** Placement node that owns this process. Local PID operations are unsafe when this is remote. */
+  node?: string
+  /** Explicit process locality; never infer whether a PID is local from a node name. */
+  locality?: 'local' | 'remote'
 }
 
 export interface RosterEntry {
-  agents: Array<{ name: string }>
+  agents: Array<{ name: string; node?: string }>
   nodes: Array<{ name: string; capabilities: Capability[]; live: boolean }>
 }
 
@@ -43,8 +47,17 @@ export type AgentMessage = { from: string; target: string; body: string; threadI
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
 export interface FleetClient {
+  /** Backend-wide placement locality, used when recovering a spawn ack crash gap. */
+  readonly placementLocality?: 'local' | 'remote'
   spawn(input: SpawnInput): Promise<SpawnResult>
-  resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult>
+  resume(input: {
+    name?: string
+    sessionRef: string
+    node?: 'self' | string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
   resolveAgentPid?(name: string): Promise<AgentPidResolution>
@@ -95,4 +108,6 @@ export type AgentSpec = {
     number: number
     kinds: string[]
   }
+  /** Deterministic pushed branch used by the durable cross-node PR publisher. */
+  branch?: string
 }

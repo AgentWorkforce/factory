@@ -7,6 +7,7 @@ import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '..
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
+import type { GithubConnectionWrite, SpawnInput, SpawnResult } from '../ports'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
@@ -46,6 +47,29 @@ const issueFile = {
     team: { key: 'AR', name: 'Agent Relay' },
     state: { id: TEST_STATE_IDS.readyForAgent, name: 'Ready for Agent' },
   },
+}
+
+class CompletingRemoteFleetClient extends FakeFleetClient {
+  override readonly placementLocality = 'remote' as const
+  readonly lifecycleOrder: string[] = []
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const result = await super.spawn(input)
+    if (input.name.includes('-impl-')) {
+      setTimeout(() => this.emitAgentExit(input.name, 'exited'), 0)
+    }
+    return { ...result, node: 'sf-mini', locality: 'remote' }
+  }
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.lifecycleOrder.push(`release:${name}`)
+    await super.release(name, reason)
+  }
+
+  override async dispose(): Promise<void> {
+    this.lifecycleOrder.push('dispose')
+    await super.dispose()
+  }
 }
 
 const githubIssueFile = (repo: string, number = 48) => ({
@@ -542,6 +566,69 @@ describe('fleet CLI runtime', () => {
 
       expect(code).toBe(0)
       expect(git).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps relay dispatch ownership until the remote PR is published and the issue is parked', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-relay-owner-'))
+    try {
+      const configPath = await writeConfig(root, {
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const publishes: Parameters<GithubConnectionWrite['publishPullRequest']>[0][] = []
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => {
+          publishes.push(input)
+          return {
+            repo: input.repo,
+            number: 77,
+            url: 'https://github.com/AgentWorkforce/pear/pull/77',
+            headRef: input.headRef ?? 'unexpected-local-head',
+          }
+        },
+        closePullRequest: async () => undefined,
+      }
+      const mount = new FakeMountClient({
+        [issuePath]: issueFile,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const fleet = new CompletingRemoteFleetClient()
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: 'AR-77' }, dryRun: false })
+      expect(publishes).toEqual([expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        headRef: expect.stringMatching(/^factory\/ar-77-agentworkforce-pear-[0-9a-f]{8}$/u),
+      })])
+      expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-human-review', 'issue-human-review'])
+      const firstDispose = fleet.lifecycleOrder.indexOf('dispose')
+      expect(firstDispose).toBeGreaterThanOrEqual(0)
+      expect(fleet.lifecycleOrder.slice(0, firstDispose).every((event) => event.startsWith('release:'))).toBe(true)
+      expect(fleet.lifecycleOrder.slice(firstDispose).every((event) => event === 'dispose')).toBe(true)
+      expect(errors.text()).not.toContain('[factory] error')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

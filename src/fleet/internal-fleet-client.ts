@@ -95,6 +95,7 @@ const RELEASE_RETRY_MAX_ATTEMPTS = 3
 const RELEASE_RETRY_BACKOFF_MS = 250
 
 export class InternalFleetClient implements FleetClient {
+  readonly placementLocality = 'local' as const
   readonly #client: HarnessDriverClientLike
   #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number
@@ -178,7 +179,14 @@ export class InternalFleetClient implements FleetClient {
     return spawnResultFrom(handle)
   }
 
-  async resume(input: { name?: string; sessionRef: string; node?: 'self' | string; capability?: Capability }): Promise<SpawnResult> {
+  async resume(input: {
+    name?: string
+    sessionRef: string
+    node?: 'self' | string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }): Promise<SpawnResult> {
     assertSelfNode(input.node)
     this.#ensureEventSubscription()
     this.#readyAgentNames.delete(input.name ?? input.sessionRef)

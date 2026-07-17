@@ -212,6 +212,23 @@ required capability (a named `node` target passes through), the node runs the
 agent in its mapped checkout, and the orchestrator detects exits by reconciling
 its tracked agents against the engine roster.
 
+Relay dispatch is lifecycle-owned, not fire-and-forget. A one-shot `factory
+dispatch --backend relay` keeps a small publisher runtime alive until the
+remote branch has produced a PR, terminal issue writeback is acknowledged, and
+remote agents are released. The lifecycle (including a per-run branch,
+placement results, PR receipt, and a fenced owner lease) is persisted beside
+the configured loop registry so `factory start` or a replacement dispatch
+process on the same control-plane host can take over after a crash. Execution
+nodes never need access to that state file, and remote PIDs are never signalled
+as local processes.
+
+The supported topology is one Factory control-plane host per workspace, with
+any number of relay execution nodes. Multiple Factory processes on that host
+are fenced through the shared `FileStateStore` lock/lease. Active/active Factory
+control planes on different hosts are intentionally unsupported: the current
+Relayfile and Relay messaging APIs do not expose a shared compare-and-set lease,
+so separate local state files cannot provide a truthful cross-host fence.
+
 Tokens involved — set only the first one on the orchestrator host:
 
 | Token | Prefix | Who holds it |
