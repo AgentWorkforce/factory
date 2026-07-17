@@ -59,7 +59,7 @@ async function loadFeatures(ctx: WorkforceCtx): Promise<Feature[]> {
  * Agent Workforce deployment artifact. The parser rejects incomplete entries
  * and duplicate IDs instead of silently scheduling malformed checks.
  */
-function parseManifestFeatures(raw: string): Feature[] {
+export function parseManifestFeatures(raw: string): Feature[] {
   const features: Feature[] = []
   const seenIds = new Set<string>()
   let categoryCriticality: Criticality | undefined
@@ -77,6 +77,13 @@ function parseManifestFeatures(raw: string): Feature[] {
   }
 
   for (const line of raw.split(/\r?\n/u)) {
+    const categoryMatch = /^  [a-z][a-z0-9-]+:\s*$/u.exec(line)
+    if (categoryMatch) {
+      finishCurrent()
+      categoryCriticality = undefined
+      continue
+    }
+
     const criticalityMatch = /^    criticality:\s*(critical|hot|standard)\s*$/u.exec(line)
     if (criticalityMatch) {
       finishCurrent()
@@ -286,17 +293,22 @@ async function generateCheckMessage(ctx: WorkforceCtx, feature: Feature): Promis
   try {
     return (await ctx.llm.complete(prompt, { maxTokens: 320 })).trim()
   } catch {
-    return [
-      `🔍 *Factory Feature Check: ${feature.name}*`,
-      '',
-      featureSurface(feature),
-      '',
-      `This should: ${feature.desc}`,
-      `Verification prerequisite: tier ${feature.tier} — ${tierLabel(feature.tier)}.`,
-      '',
-      'Is this working as expected right now? React ✅ if working as expected, 🔧 if something is off, or ❓ if untested.',
-    ].join('\n')
+    return fallbackCheckMessage(feature)
   }
+}
+
+export function fallbackCheckMessage(feature: Feature): string {
+  return [
+    `🔍 *Factory Feature Check: ${feature.name}*`,
+    '',
+    featureSurface(feature),
+    `Source: ${feature.location}`,
+    '',
+    `This should: ${feature.desc}`,
+    `Verification prerequisite: tier ${feature.tier} — ${tierLabel(feature.tier)}.`,
+    '',
+    'Is this working as expected right now? React ✅ if working as expected, 🔧 if something is off, or ❓ if untested.',
+  ].join('\n')
 }
 
 export default defineAgent({

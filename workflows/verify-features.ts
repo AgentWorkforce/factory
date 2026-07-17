@@ -135,6 +135,24 @@ import { parse } from 'yaml'
 const manifest = parse(readFileSync('.agentworkforce/features/manifest.yaml', 'utf8'))
 const procedures = readFileSync('.agentworkforce/features/verify/procedures.md', 'utf8')
 const categories = Object.values(manifest.categories || {})
+const validCriticalities = new Set(['critical', 'hot', 'standard'])
+function validateCategoryCriticalities(categoryMap) {
+  for (const [categoryId, category] of Object.entries(categoryMap || {})) {
+    if (!validCriticalities.has(category?.criticality)) {
+      throw new Error('invalid manifest category criticality for ' + categoryId + ': ' + JSON.stringify(category?.criticality))
+    }
+  }
+}
+validateCategoryCriticalities(manifest.categories)
+for (const invalidCriticality of [undefined, 'urgent']) {
+  let rejected = false
+  try {
+    validateCategoryCriticalities({ regression: { criticality: invalidCriticality } })
+  } catch {
+    rejected = true
+  }
+  if (!rejected) throw new Error('category criticality regression was accepted: ' + JSON.stringify(invalidCriticality))
+}
 const features = categories.flatMap((category) => category.features || [])
 const ids = features.map((feature) => feature.id)
 if (categories.length === 0 || features.length === 0) throw new Error('manifest is empty')
@@ -218,6 +236,85 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+GUARDIAN_SELF_TEST="${ARTIFACTS}/guardian-self-test.ts"
+cat > "${ARTIFACTS}/guardian-delivery-stub.mjs" <<'JS'
+export const input = () => undefined
+JS
+cat > "${ARTIFACTS}/guardian-runtime-stub.mjs" <<'JS'
+export const defineAgent = (definition) => definition
+JS
+cat > "${ARTIFACTS}/guardian-slack-stub.mjs" <<'JS'
+export const slackClient = () => ({})
+JS
+cat > "$GUARDIAN_SELF_TEST" <<'TS'
+import { fallbackCheckMessage, parseManifestFeatures } from './guardian-test-bundle.mjs'
+
+const missingSecondCriticality = [
+  'catalog:',
+  '  category_count: 2',
+  '  feature_count: 2',
+  '  tier_counts:',
+  '    1: 2',
+  '    2: 0',
+  '    3: 0',
+  '    4: 0',
+  '    5: 0',
+  '    6: 0',
+  'categories:',
+  '  first:',
+  '    criticality: critical',
+  '    features:',
+  '      - id: first-feature',
+  '        name: First feature',
+  '        cli: factory first',
+  '        description: First expected behavior',
+  '        location: src/index.ts',
+  '        verify_tier: 1',
+  '  second:',
+  '    features:',
+  '      - id: second-feature',
+  '        name: Second feature',
+  '        cli: factory second',
+  '        description: Second expected behavior',
+  '        location: src/index.ts',
+  '        verify_tier: 1',
+].join('\\n')
+
+let rejected = false
+try {
+  parseManifestFeatures(missingSecondCriticality)
+} catch {
+  rejected = true
+}
+if (!rejected) throw new Error('guardian inherited criticality across category boundary')
+
+const source = 'src/orchestrator/factory.ts'
+const fallback = fallbackCheckMessage({
+  id: 'fallback-source-regression',
+  name: 'Fallback source regression',
+  cli: 'factory status',
+  desc: 'Preserve exact source context when LLM completion fails',
+  location: source,
+  tier: 1,
+  criticality: 'critical',
+})
+if (!fallback.includes('Source: ' + source)) throw new Error('guardian fallback omitted feature.location')
+TS
+if npx esbuild .agentworkforce/agents/factory-feature-guardian/agent.ts \
+  --bundle --platform=node --format=esm \
+  --alias:@agentworkforce/delivery="$PWD/${ARTIFACTS}/guardian-delivery-stub.mjs" \
+  --alias:@agentworkforce/runtime="$PWD/${ARTIFACTS}/guardian-runtime-stub.mjs" \
+  --alias:@relayfile/relay-helpers="$PWD/${ARTIFACTS}/guardian-slack-stub.mjs" \
+  --outfile="${ARTIFACTS}/guardian-test-bundle.mjs" >> "$LOG" 2>&1 && \
+  npx tsx "$GUARDIAN_SELF_TEST" >> "$LOG" 2>&1
+then
+  echo "PASS  guardian parser and fallback regressions" | tee -a "$LOG"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL  guardian parser and fallback regressions" | tee -a "$LOG"
+  FAIL=$((FAIL + 1))
+fi
+
 echo "Tier 1 result: $PASS passed, $FAIL failed" | tee -a "$LOG"
 if [ "$FAIL" -gt 0 ]; then
   echo "TIER1_FAIL" | tee -a "$LOG"
@@ -239,7 +336,7 @@ PASS=0
 FAIL=0
 : > "$LOG"
 
-if npm test >> "$LOG" 2>&1; then
+if npm test -- --maxWorkers=1 >> "$LOG" 2>&1; then
   echo "PASS  full Vitest suite" | tee -a "$LOG"
   PASS=$((PASS + 1))
 else
@@ -314,11 +411,13 @@ ISSUE=$(printenv FACTORY_VERIFY_CANARY_ISSUE 2>/dev/null || true)
 : > "$LOG"
 
 if [ -z "$ISSUE" ]; then
-  echo "TIER3_SKIP: FACTORY_VERIFY_CANARY_ISSUE is unset" | tee -a "$LOG"
+  echo "Skip reason: FACTORY_VERIFY_CANARY_ISSUE is unset" | tee -a "$LOG"
+  echo "TIER3_SKIP" | tee -a "$LOG"
   exit 0
 fi
 if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
-  echo "TIER3_FAIL: FACTORY_VERIFY_CONFIG must name a valid live config" | tee -a "$LOG"
+  echo "Failure reason: FACTORY_VERIFY_CONFIG must name a valid live config" | tee -a "$LOG"
+  echo "TIER3_FAIL" | tee -a "$LOG"
   exit 1
 fi
 if node bin/factory.mjs canary "$ISSUE" --config "$CONFIG" >> "$LOG" 2>&1; then
@@ -343,11 +442,13 @@ VERIFY_FLEET=$(printenv FACTORY_VERIFY_FLEET 2>/dev/null || true)
 BACKEND=$(printenv FACTORY_VERIFY_BACKEND 2>/dev/null || true)
 
 if [ "$VERIFY_FLEET" != "1" ]; then
-  echo "TIER4_SKIP: FACTORY_VERIFY_FLEET is not 1" | tee -a "$LOG"
+  echo "Skip reason: FACTORY_VERIFY_FLEET is not 1" | tee -a "$LOG"
+  echo "TIER4_SKIP" | tee -a "$LOG"
   exit 0
 fi
 if [ "$BACKEND" != "internal" ] && [ "$BACKEND" != "relay" ]; then
-  echo "TIER4_FAIL: FACTORY_VERIFY_BACKEND must be internal or relay" | tee -a "$LOG"
+  echo "Failure reason: FACTORY_VERIFY_BACKEND must be internal or relay" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
   exit 1
 fi
 if node bin/factory.mjs fleet roster --backend "$BACKEND" >> "$LOG" 2>&1; then
@@ -372,11 +473,13 @@ VERIFY_CLOUD=$(printenv FACTORY_VERIFY_CLOUD 2>/dev/null || true)
 : > "$LOG"
 
 if [ "$VERIFY_CLOUD" != "1" ]; then
-  echo "TIER5_SKIP: FACTORY_VERIFY_CLOUD is not 1" | tee -a "$LOG"
+  echo "Skip reason: FACTORY_VERIFY_CLOUD is not 1" | tee -a "$LOG"
+  echo "TIER5_SKIP" | tee -a "$LOG"
   exit 0
 fi
 if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
-  echo "TIER5_FAIL: FACTORY_VERIFY_CONFIG must name a valid cloud config" | tee -a "$LOG"
+  echo "Failure reason: FACTORY_VERIFY_CONFIG must name a valid cloud config" | tee -a "$LOG"
+  echo "TIER5_FAIL" | tee -a "$LOG"
   exit 1
 fi
 if node bin/factory.mjs run-once --config "$CONFIG" --dry-run >> "$LOG" 2>&1; then
@@ -432,6 +535,19 @@ overall_result() {
   fi
 }
 
+tier_result() {
+  requested_tier="$1"
+  tier_log="$2"
+  marker=$(grep -E '^TIER[0-9]+_' "$tier_log" | tail -1 || true)
+  case "$requested_tier:$marker" in
+    1:TIER1_PASS|1:TIER1_FAIL|2:TIER2_PASS|2:TIER2_FAIL|\
+    3:TIER3_PASS|3:TIER3_FAIL|3:TIER3_SKIP|\
+    4:TIER4_PASS|4:TIER4_FAIL|4:TIER4_SKIP|\
+    5:TIER5_PASS|5:TIER5_FAIL|5:TIER5_SKIP|6:TIER6_MANUAL) printf '%s' "$marker" ;;
+    *) printf 'TIER%s_UNKNOWN' "$requested_tier" ;;
+  esac
+}
+
 # Regression guard: an absent required tier log is represented as NOT_RUN and
 # must never be certified as an overall pass, even when no explicit *_FAIL
 # marker exists to match.
@@ -443,8 +559,19 @@ T3: TIER3_SKIP
 T4: TIER4_SKIP
 T5: TIER5_SKIP
 EOF
-if [ "$(overall_result 1 "$SELF_TEST")" != "FAIL" ]; then
+if [ "$(overall_result 0 "$SELF_TEST")" != "FAIL" ]; then
   echo "Collector regression failed: required NOT_RUN tier was accepted" >&2
+  exit 1
+fi
+
+printf '%s\n' 'TIER2_PASS' > "${ARTIFACTS}/collector-cross-tier-self-test.log"
+if [ "$(tier_result 1 "${ARTIFACTS}/collector-cross-tier-self-test.log")" != "TIER1_UNKNOWN" ]; then
+  echo "Collector regression failed: cross-tier marker was accepted" >&2
+  exit 1
+fi
+printf '%s\n' 'TIER1_PASS_EXTRA' > "${ARTIFACTS}/collector-suffix-self-test.log"
+if [ "$(tier_result 1 "${ARTIFACTS}/collector-suffix-self-test.log")" != "TIER1_UNKNOWN" ]; then
+  echo "Collector regression failed: suffixed marker was accepted" >&2
   exit 1
 fi
 
@@ -458,8 +585,7 @@ fi
       RESULT="NOT_RUN"
       FAIL=1
     else
-      RESULT=$(grep -E "^TIER[0-9]+_(PASS|FAIL|SKIP|MANUAL)" "$LOG" | tail -1 || true)
-      if [ -z "$RESULT" ]; then RESULT=$(printf 'TIER%s_UNKNOWN' "$tier"); FAIL=1; fi
+      RESULT=$(tier_result "$tier" "$LOG")
       case "$RESULT" in NOT_RUN|*_FAIL|*_UNKNOWN) FAIL=1 ;; esac
     fi
     echo "T$tier: $RESULT"
@@ -477,20 +603,32 @@ cat "$SUMMARY"
     type: 'deterministic',
     dependsOn: ['collect-results'],
     captureOutput: true,
-    failOnError: false,
+    failOnError: true,
     command: `
 set -euo pipefail
+report_result() {
+  ! grep -q '^Overall: FAIL$' "$1"
+}
+
+REPORT_SELF_TEST="${ARTIFACTS}/report-failure-self-test.txt"
+printf '%s\n' 'Overall: FAIL' > "$REPORT_SELF_TEST"
+if report_result "$REPORT_SELF_TEST"; then
+  echo "Report regression failed: Overall FAIL returned success" >&2
+  exit 1
+fi
+
 cat "${ARTIFACTS}/summary.txt"
 echo
 echo "Detailed logs: ${ARTIFACTS}/tier{1,2,3,4,5,6}.log"
 
-if grep -q '^Overall: FAIL$' "${ARTIFACTS}/summary.txt"; then
-  exit 1
-fi
+report_result "${ARTIFACTS}/summary.txt"
 `,
   })
 
-  await wf.run()
+  const run = await wf.run()
+  if (run.status !== 'completed') {
+    throw new Error(`Factory feature verification ended with status ${run.status}: ${run.error ?? 'no error detail'}`)
+  }
 }
 
 main()
