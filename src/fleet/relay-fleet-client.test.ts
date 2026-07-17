@@ -190,9 +190,15 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
 
-    await fleet.spawn({ name: 'ar-2-impl', capability: 'spawn:codex', node: 'mac-mini' })
+    await fleet.spawn({
+      name: 'ar-2-impl',
+      capability: 'spawn:codex',
+      node: 'mac-mini',
+      repo: 'AgentWorkforce/factory',
+    })
 
     expect(messaging.placements[0]?.node).toBe('mac-mini')
+    expect(messaging.placements[0]?.repo).toBe('AgentWorkforce/factory')
   })
 
   it('maps resume onto a placement spawn with session_ref', async () => {
