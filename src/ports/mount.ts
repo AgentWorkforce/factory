@@ -30,6 +30,16 @@ export interface ProviderSyncStatus {
   webhookHealthy?: boolean
 }
 
+export interface LocalMountOptions {
+  /** Alternate identifiers for the same workspace as recorded by the mount. */
+  acceptableWorkspaceIds?: readonly string[]
+  /** Refresh a stale mount instead of returning a warning. Defaults to true. */
+  refreshStaleMount?: boolean
+  /** Optional readiness controls for constrained environments and tests. */
+  stateWaitTimeoutMs?: number
+  stateWaitPollMs?: number
+}
+
 export interface GithubPublishPullRequestInput {
   repo: string
   /** Local checkout fallback for internal/local dispatches. */
@@ -63,6 +73,8 @@ export interface GithubConnectionWrite {
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readonly githubWrite?: GithubConnectionWrite
+  /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
+  ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>

@@ -7,7 +7,6 @@ import {
   type CloudSessionOptions,
 } from '@agent-relay/cloud'
 import {
-  RelayfileSetup,
   type ChangeEvent,
   type DeleteFileInput,
   type EventFeedResponse,
@@ -21,8 +20,10 @@ import {
   type WriteFileInput,
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
+import { RelayfileSetup } from '@relayfile/sdk/cli'
+import { join, resolve } from 'node:path'
 
-import type { EventPage, GithubConnectionWrite, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
+import type { EventPage, GithubConnectionWrite, LocalMountOptions, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
 import {
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
@@ -30,6 +31,10 @@ import {
   type WorkspaceEventClientSource,
 } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import {
+  ensureLocalMount as runLocalMountPreflight,
+  type EnsureLocalMountOptions,
+} from './local-mount-preflight'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
@@ -87,17 +92,36 @@ export async function resolveFactoryWorkspace(
 }
 
 export interface RelayfileWorkspaceHandleLike {
+  workspaceId?: string
   info: { relayfileUrl: string }
   client(): RelayFileClientLike
   getToken(): Promise<string> | string
 }
 
+export interface RelayfileSetupLike {
+  joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
+  ensureMountedWorkspace?(input: {
+    workspace: RelayfileWorkspaceHandleLike
+    localDir: string
+    remotePath?: string
+    mode?: 'poll' | 'fuse'
+    background?: boolean
+    agentName?: string
+    scopes?: string[]
+    readyTimeoutMs?: number
+  }): Promise<unknown>
+}
+
 export type RelayfileSetupFactory = (options: {
   cloudApiUrl: string
   tokenProvider: () => Promise<string>
-}) => {
-  joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
-}
+}) => RelayfileSetupLike
+
+export type LocalMountPreflight = (
+  workspaceId: string,
+  startDir: string,
+  options: EnsureLocalMountOptions,
+) => Promise<void>
 
 export interface RelayfileCloudMountClientConfig {
   backend?: 'relayfile-cloud'
@@ -107,6 +131,10 @@ export interface RelayfileCloudMountClientConfig {
   cloudSessionRefreshTimeoutMs?: number
   cloudSessionEnv?: NodeJS.ProcessEnv
   relayfileSetupFactory?: RelayfileSetupFactory
+  /** Internal SDK objects retained by fromConfig() for local mount startup. */
+  relayfileSetup?: RelayfileSetupLike
+  relayfileWorkspace?: RelayfileWorkspaceHandleLike
+  localMountPreflight?: LocalMountPreflight
   agentName?: string
   scopes?: string[]
   client?: RelayFileClientLike
@@ -141,6 +169,11 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #tokenProvider: TokenProvider
   readonly #baseUrl?: string
   readonly #eventClient?: RelayfileEventClient
+  readonly #relayfileSetup?: RelayfileSetupLike
+  readonly #relayfileWorkspace?: RelayfileWorkspaceHandleLike
+  readonly #localMountPreflight: LocalMountPreflight
+  readonly #localMountAgentName: string
+  readonly #localMountScopes: string[]
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
@@ -155,6 +188,11 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
+    this.#relayfileSetup = config.relayfileSetup
+    this.#relayfileWorkspace = config.relayfileWorkspace
+    this.#localMountPreflight = config.localMountPreflight ?? runLocalMountPreflight
+    this.#localMountAgentName = config.agentName ?? DEFAULT_AGENT_NAME
+    this.#localMountScopes = config.scopes ?? [...FACTORY_RELAYFILE_SCOPES]
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
@@ -190,6 +228,34 @@ export class RelayfileCloudMountClient implements MountClient {
       client: handle.client(),
       tokenProvider: () => handle.getToken(),
       baseUrl: handle.info.relayfileUrl,
+      relayfileSetup: setup,
+      relayfileWorkspace: handle,
+    })
+  }
+
+  async ensureLocalMount(startDir: string, options: LocalMountOptions = {}): Promise<void> {
+    const setup = this.#relayfileSetup
+    const workspace = this.#relayfileWorkspace
+    if (!setup?.ensureMountedWorkspace || !workspace) {
+      throw new Error('Relayfile SDK mount setup is unavailable; construct the mount with RelayfileCloudMountClient.fromConfig()')
+    }
+    const ensureMountedWorkspace = setup.ensureMountedWorkspace.bind(setup)
+
+    const localDir = join(resolve(startDir), '.integrations')
+    await this.#localMountPreflight(this.workspaceId, startDir, {
+      ...options,
+      startMount: async () => {
+        await ensureMountedWorkspace({
+          workspace,
+          localDir,
+          remotePath: '/',
+          mode: 'poll',
+          background: true,
+          agentName: this.#localMountAgentName,
+          scopes: [...this.#localMountScopes],
+          ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
+        })
+      },
     })
   }
 
@@ -366,7 +432,7 @@ const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, token
   new RelayfileSetup({
     cloudApiUrl,
     accessToken: tokenProvider,
-  })
+  }) as unknown as RelayfileSetupLike
 
 const createSharedCloudSessionResolver = (config: RelayfileCloudMountClientConfig): {
   resolve: () => Promise<CloudSession>

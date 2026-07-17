@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CloudAuthError, type CloudSession, type StoredAuth } from '@agent-relay/cloud'
 import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
+import { join } from 'node:path'
 
 import {
   FACTORY_RELAYFILE_SCOPES,
@@ -186,6 +187,54 @@ class FakeRelayFileClient implements RelayFileClientLike {
 }
 
 describe('RelayfileCloudMountClient', () => {
+  it('starts local mirrors through the authenticated Relayfile SDK mount session', async () => {
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const ensureMountedWorkspace = vi.fn(async () => ({ ready: true }))
+    const setup = {
+      joinWorkspace: vi.fn(async () => handle),
+      ensureMountedWorkspace,
+    }
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => setup),
+      localMountPreflight,
+    })
+
+    await expect(mount.ensureLocalMount('/work/repo', {
+      acceptableWorkspaceIds: ['cloud-workspace-uuid'],
+      stateWaitTimeoutMs: 3210,
+    })).resolves.toBeUndefined()
+
+    expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/repo', expect.objectContaining({
+      acceptableWorkspaceIds: ['cloud-workspace-uuid'],
+      stateWaitTimeoutMs: 3210,
+      startMount: expect.any(Function),
+    }))
+    expect(ensureMountedWorkspace).toHaveBeenCalledWith({
+      workspace: handle,
+      localDir: join('/work/repo', '.integrations'),
+      remotePath: '/',
+      mode: 'poll',
+      background: true,
+      agentName: 'agent-relay-factory',
+      scopes: [...FACTORY_RELAYFILE_SCOPES],
+      readyTimeoutMs: 3210,
+    })
+  })
+
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {
     const fake = new FakeRelayFileClient()
     const auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })

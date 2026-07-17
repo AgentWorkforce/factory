@@ -1621,6 +1621,48 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('uses the mount client SDK path without requiring a relayfile CLI', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-sdk-mount-'))
+    try {
+      const configPath = await writeConfig(root)
+      const ensureSdkMount = vi.fn(async () => {})
+      const mount = new FakeMountClient() as FakeMountClient & {
+        ensureLocalMount: typeof ensureSdkMount
+      }
+      mount.ensureLocalMount = ensureSdkMount
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(ensureSdkMount).toHaveBeenCalledWith(process.cwd(), {
+        acceptableWorkspaceIds: undefined,
+      })
+      expect(ensureSdkMount).toHaveBeenCalledWith('/work/pear', {
+        acceptableWorkspaceIds: undefined,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not resolve the workspace when config pins workspaceId', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-pinned-'))
     try {

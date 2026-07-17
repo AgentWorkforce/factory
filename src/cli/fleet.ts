@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 import { stringifyLogValue } from '../logging'
-import { ensureLocalMount } from '../mount/local-mount-preflight'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import {
   FileStateStore,
@@ -40,6 +39,7 @@ import {
   type GhRunner,
   type FactoryStateResolution,
   type Logger,
+  type LocalMountOptions,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
@@ -61,7 +61,7 @@ interface FleetCliDeps {
   ensureLocalMount?: (
     workspaceId: string,
     startDir: string,
-    options?: { acceptableWorkspaceIds?: readonly string[] },
+    options?: LocalMountOptions,
   ) => Promise<void>
   waitForStopSignal?: () => Promise<number | void>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
@@ -348,12 +348,13 @@ async function runFactoryCommand(
   workspaceId: string = config.workspaceId ?? '',
   acceptableMountIds?: readonly string[],
 ): Promise<number> {
+  const mountFn = resolveLocalMountFn(deps, mount)
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      await (deps.ensureLocalMount ?? ensureLocalMount)(workspaceId, process.cwd(), {
+      await mountFn(workspaceId, process.cwd(), {
         acceptableWorkspaceIds: acceptableMountIds,
       })
-      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndExit = async (code: number): Promise<void> => {
@@ -384,7 +385,7 @@ async function runFactoryCommand(
       }
     }
     if (command.action === 'run-once') {
-      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
     }
@@ -416,7 +417,7 @@ async function runFactoryCommand(
       return 0
     }
 
-    await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+    await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
@@ -476,7 +477,7 @@ async function runStandaloneBabysitCommand(
 ): Promise<number> {
   const repo = resolveStandaloneBabysitRepo(command.repo, config)
   const clonePath = standaloneBabysitClonePath(repo, config)
-  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
+  const mountFn = resolveLocalMountFn(deps, mount)
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts, deps.stderr)
   if (clonePath && resolve(clonePath) !== resolve(process.cwd())) {
@@ -638,12 +639,11 @@ function standaloneBabysitClonePath(repo: string, config: FactoryConfig): string
  * these paths for integration writebacks (Slack, GitHub, etc.).
  */
 async function ensureClonePathMounts(
-  deps: FleetCliDeps,
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
   workspaceId: string,
   config: FactoryConfig,
   acceptableMountIds?: readonly string[],
 ): Promise<void> {
-  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
   for (const clonePath of new Set(Object.values(config.clonePaths ?? {}))) {
@@ -656,6 +656,20 @@ async function ensureClonePathMounts(
         process.stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
       }
     }
+  }
+}
+
+function resolveLocalMountFn(
+  deps: FleetCliDeps,
+  mount: MountClient,
+): NonNullable<FleetCliDeps['ensureLocalMount']> {
+  if (deps.ensureLocalMount) return deps.ensureLocalMount
+  if (mount.ensureLocalMount) {
+    const ensureLocalMount = mount.ensureLocalMount.bind(mount)
+    return async (_workspaceId, startDir, options) => ensureLocalMount(startDir, options)
+  }
+  return async () => {
+    throw new Error('Mount client does not provide Relayfile SDK local-mount support')
   }
 }
 
