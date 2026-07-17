@@ -150,7 +150,14 @@ export class InMemoryStateStore implements StateStore {
     lifecycle: DispatchLifecycle,
   ): Promise<boolean> {
     const current = this.#workspace(workspaceId).dispatchLifecycles.get(key)
-    if (!current?.lease || current.lease.owner !== owner || current.lease.epoch !== epoch || current.lease.leaseUntilMs <= nowMs) {
+    if (
+      !current?.lease ||
+      current.runId !== lifecycle.runId ||
+      current.lease.owner !== owner ||
+      current.lease.epoch !== epoch ||
+      current.lease.leaseUntilMs <= nowMs ||
+      (current.phase === 'aborting' && lifecycle.phase !== 'aborting' && lifecycle.phase !== 'abandoned')
+    ) {
       return false
     }
     const next = cloneDispatchLifecycle(lifecycle)
@@ -158,6 +165,26 @@ export class InMemoryStateStore implements StateStore {
     next.updatedAtMs = nowMs
     this.#workspace(workspaceId).dispatchLifecycles.set(key, next)
     return true
+  }
+
+  async beginCriticalDeliveryAbort(
+    workspaceId: string,
+    key: string,
+    runId: string,
+    nowMs: number,
+    releaseReason: string,
+  ): Promise<DispatchLifecycle | undefined> {
+    const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
+    if (
+      !lifecycle ||
+      lifecycle.runId !== runId ||
+      lifecycle.phase === 'complete' ||
+      lifecycle.phase === 'abandoned'
+    ) return undefined
+    lifecycle.phase = 'aborting'
+    lifecycle.releaseReason ??= releaseReason
+    lifecycle.updatedAtMs = nowMs
+    return cloneDispatchLifecycle(lifecycle)
   }
 
   async getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined> {
@@ -184,6 +211,19 @@ export class InMemoryStateStore implements StateStore {
       this.#workspace(workspaceId).criticalMessages.delete(key)
     }
     return critical
+  }
+
+  async clearCriticalForIssue(workspaceId: string, issue: CriticalRecord['issue']): Promise<void> {
+    const criticalMessages = this.#workspace(workspaceId).criticalMessages
+    for (const [key, critical] of criticalMessages) {
+      if (
+        critical.issue.key === issue.key &&
+        critical.issue.uuid === issue.uuid &&
+        critical.issue.path === issue.path
+      ) {
+        criticalMessages.delete(key)
+      }
+    }
   }
 
   async isResumed(workspaceId: string, exitKey: string): Promise<boolean> {

@@ -168,7 +168,14 @@ export class FileStateStore extends InMemoryStateStore {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
       const current = workspace?.dispatchLifecycles[key]
-      if (!current?.lease || current.lease.owner !== owner || current.lease.epoch !== epoch || current.lease.leaseUntilMs <= nowMs) {
+      if (
+        !current?.lease ||
+        current.runId !== lifecycle.runId ||
+        current.lease.owner !== owner ||
+        current.lease.epoch !== epoch ||
+        current.lease.leaseUntilMs <= nowMs ||
+        (current.phase === 'aborting' && lifecycle.phase !== 'aborting' && lifecycle.phase !== 'abandoned')
+      ) {
         return false
       }
       const next = cloneLifecycle(lifecycle)
@@ -177,6 +184,30 @@ export class FileStateStore extends InMemoryStateStore {
       workspace!.dispatchLifecycles[key] = next
       await this.#persist(document)
       return true
+    }))
+  }
+
+  override async beginCriticalDeliveryAbort(
+    workspaceId: string,
+    key: string,
+    runId: string,
+    nowMs: number,
+    releaseReason: string,
+  ): Promise<DispatchLifecycle | undefined> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
+      if (
+        !lifecycle ||
+        lifecycle.runId !== runId ||
+        lifecycle.phase === 'complete' ||
+        lifecycle.phase === 'abandoned'
+      ) return undefined
+      lifecycle.phase = 'aborting'
+      lifecycle.releaseReason ??= releaseReason
+      lifecycle.updatedAtMs = nowMs
+      await this.#persist(document)
+      return cloneLifecycle(lifecycle)
     }))
   }
 

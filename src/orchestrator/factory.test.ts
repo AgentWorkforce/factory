@@ -25,7 +25,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { ChangeEvent, DispatchLifecycle, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -238,6 +238,7 @@ class StaticTriage implements TriageEngine {
 class RecordingGithubWriteback implements GithubWriteback {
   readonly comments: Array<{ key: string; body: string }> = []
   readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
+  readonly clearedStatuses: string[] = []
   readonly closes: Array<{ key: string; body: string }> = []
 
   async postComment(issue: LinearIssue, body: string): Promise<void> {
@@ -248,6 +249,10 @@ class RecordingGithubWriteback implements GithubWriteback {
     this.statuses.push({ key: issue.key, status })
   }
 
+  async clearStatus(issue: LinearIssue): Promise<void> {
+    this.clearedStatuses.push(issue.key)
+  }
+
   async closeIssue(issue: LinearIssue, body: string): Promise<void> {
     this.closes.push({ key: issue.key, body })
   }
@@ -256,6 +261,16 @@ class RecordingGithubWriteback implements GithubWriteback {
 class FailingGithubCommentWriteback extends RecordingGithubWriteback {
   override async postComment(): Promise<void> {
     throw new Error('GitHub comment writeback unavailable')
+  }
+}
+
+class TransientGithubClearStatusWriteback extends RecordingGithubWriteback {
+  clearAttempts = 0
+
+  override async clearStatus(issue: LinearIssue): Promise<void> {
+    this.clearAttempts += 1
+    if (this.clearAttempts === 1) throw new Error('GitHub status clear unavailable')
+    await super.clearStatus(issue)
   }
 }
 
@@ -592,6 +607,67 @@ class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
   }
 }
 
+class RemoteInitialInjectionAndReleaseFailureFleetClient extends RemoteLifecycleFleetClient {
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    this.messages.push(input)
+    throw new Error(`recipient unavailable: ${input.to}`)
+  }
+
+  override async release(name: string): Promise<void> {
+    throw new Error(`relay release unavailable for ${name}`)
+  }
+}
+
+class RemoteInitialInjectionFailureFleetClient extends RemoteLifecycleFleetClient {
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    _opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    this.messages.push(input)
+    throw new Error(`recipient unavailable: ${input.to}`)
+  }
+}
+
+class RemoteReinjectionFailingFleetClient extends RemoteLifecycleFleetClient {
+  readonly attemptsByTarget = new Map<string, number>()
+
+  constructor(readonly failingTarget: string) {
+    super()
+  }
+
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    const attempts = (this.attemptsByTarget.get(input.to) ?? 0) + 1
+    this.attemptsByTarget.set(input.to, attempts)
+    if (input.to === this.failingTarget && attempts > 1) {
+      this.messages.push(input)
+      throw new Error(`recipient unavailable: ${input.to}`)
+    }
+    return await super.waitForInjected(input, opts)
+  }
+}
+
+class RejectFirstAbortingSaveStateStore extends InMemoryStateStore {
+  abortingSaveRejections = 0
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    const [, key, owner, epoch, , lifecycle] = args
+    if (lifecycle.phase === 'aborting' && this.abortingSaveRejections === 0) {
+      this.abortingSaveRejections += 1
+      await super.releaseDispatchLifecycleLease(args[0], key, owner, epoch)
+      return false
+    }
+    return await super.saveDispatchLifecycle(...args)
+  }
+}
+
 class BlockingClarificationReleaseFleetClient extends RemoteLifecycleFleetClient {
   readonly clarificationReleaseStarted: Promise<void>
   #signalClarificationReleaseStarted!: () => void
@@ -828,6 +904,46 @@ class LagThenInjectedFleetClient extends FakeFleetClient {
     const eventId = `fake-${this.messages.length}`
     this.deliveryEvents.push({ kind: 'injected', to: input.to, eventId })
     return { eventId, targets: [input.to] }
+  }
+}
+
+class ReinjectionFailingFleetClient extends FakeFleetClient {
+  readonly attemptsByTarget = new Map<string, number>()
+
+  constructor(readonly failingTarget: string) {
+    super()
+  }
+
+  override async waitForInjected(
+    input: Parameters<FakeFleetClient['waitForInjected']>[0],
+    opts?: Parameters<FakeFleetClient['waitForInjected']>[1],
+  ): ReturnType<FakeFleetClient['waitForInjected']> {
+    const attempts = (this.attemptsByTarget.get(input.to) ?? 0) + 1
+    this.attemptsByTarget.set(input.to, attempts)
+    if (input.to === this.failingTarget && attempts > 1) {
+      this.messages.push(input)
+      throw new Error(`recipient unavailable: ${input.to}`)
+    }
+    return await super.waitForInjected(input, opts)
+  }
+}
+
+class TransientAbortReleaseFleetClient extends ReinjectionFailingFleetClient {
+  releaseFailures = 0
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason?.startsWith('critical-delivery-failed:') && this.releaseFailures === 0) {
+      this.releaseFailures += 1
+      throw new Error(`transient release failure for ${name}`)
+    }
+    await super.release(name, reason)
+  }
+}
+
+class ExitDuringAbortFleetClient extends ReinjectionFailingFleetClient {
+  override async release(name: string, reason?: string): Promise<void> {
+    this.emitAgentExit(name, 'release-exit-race')
+    await super.release(name, reason)
   }
 }
 
@@ -4442,7 +4558,7 @@ describe('FactoryLoop', () => {
       expect(reports[1]?.error).toBeUndefined()
       expect(factory.status().inFlight).toEqual([])
       expect(factory.status().counters.loopIterationFailures).toBe(1)
-      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
+      expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1)
       expect([...alive]).toEqual([])
       expect(killed.map((entry) => entry.pid)).toEqual(expect.arrayContaining([7_602, 7_601, 7_604, 7_603]))
       const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
@@ -4519,7 +4635,7 @@ describe('FactoryLoop', () => {
       const firstFailedKill = killed.findIndex((entry) => failedPids.has(entry.pid) && entry.signal !== 0)
       expect(firstFailedKill).toBeGreaterThanOrEqual(0)
       expect(firstHealthyKill).toBeGreaterThan(firstFailedKill)
-      expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBe(2)
+      expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -7211,6 +7327,8 @@ describe('FactoryLoop', () => {
 
     expect(errors).toHaveLength(1)
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-8' } })
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight).toMatchObject([{ key: 'AR-8' }])
     await factory.stop()
   })
 
@@ -7365,6 +7483,436 @@ describe('FactoryLoop', () => {
     expect(fleet.deliveryEvents.at(-2)).toEqual({ kind: 'injected', to: 'ar-64-review', eventId: 'fake-3' })
     expect(fleet.deliveryEvents.at(-1)).toEqual({ kind: 'input', name: 'ar-64-review', data: '\r' })
   })
+
+  it('aborts the whole team and restores Linear readiness when the initial implementer briefing cannot be delivered', async () => {
+    const mount = new FakeMountClient({ [issuePath(68)]: issueFile(68) })
+    const clock = new ManualClock()
+    const fleet = new InjectFailingPidFleetClient([])
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(68), issueFile(68)))))
+      .rejects.toThrow('Critical task injection failed to ar-68-impl-pear')
+
+    expect(fleet.releases).toEqual([
+      { name: 'ar-68-impl-pear', reason: 'critical-delivery-failed:ar-68-impl-pear' },
+      { name: 'ar-68-review', reason: 'critical-delivery-failed:ar-68-impl-pear' },
+    ])
+    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1)
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    expect(mount.writes.some((write) => JSON.stringify(write.content).includes('factory-critical-delivery-abort'))).toBe(true)
+  })
+
+  it('aborts both workers when the initial reviewer briefing fails after the implementer was injected', async () => {
+    const mount = new FakeMountClient({ [issuePath(69)]: issueFile(69) })
+    const fleet = new SelectiveInjectFailingPidFleetClient([], 'ar-69-review')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock: new ManualClock() })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(69), issueFile(69)))))
+      .rejects.toThrow('Critical task injection failed to ar-69-review')
+
+    expect(fleet.inputs).toEqual([{ name: 'ar-69-impl-pear', data: '\r' }])
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-69-impl-pear', 'ar-69-review'])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('aborts exactly once when confirmed critical reinjection exhausts and ignores a duplicate delivery failure', async () => {
+    const mount = new FakeMountClient({ [issuePath(70)]: issueFile(70) })
+    const fleet = new ReinjectionFailingFleetClient('ar-70-impl-pear')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock: new ManualClock() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(70), issueFile(70))))
+    fleet.emitDeliveryFailed({ to: 'ar-70-impl-pear', msgId: 'fake-1', reason: 'dead-lettered' })
+    fleet.emitDeliveryFailed({ to: 'ar-70-impl-pear', msgId: 'fake-1', reason: 'duplicate' })
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1))
+    expect(fleet.releases).toEqual([
+      { name: 'ar-70-impl-pear', reason: 'critical-delivery-failed:ar-70-impl-pear' },
+      { name: 'ar-70-review', reason: 'critical-delivery-failed:ar-70-impl-pear' },
+    ])
+    expect(factory.status().inFlight).toEqual([])
+    expect(fleet.resumes).toEqual([])
+  })
+
+  it('aborts the complete team when confirmed reviewer reinjection exhausts', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new ReinjectionFailingFleetClient('ar-75-review')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock: new ManualClock() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(75), issueFile(75))))
+    fleet.emitDeliveryFailed({ to: 'ar-75-review', msgId: 'fake-2', reason: 'dead-lettered' })
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1))
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-75-impl-pear', 'ar-75-review'])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('suppresses release-driven agent exits so abort cleanup cannot restart the team', async () => {
+    const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
+    const fleet = new ExitDuringAbortFleetClient('ar-76-impl-pear')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock: new ManualClock() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(76), issueFile(76))))
+    fleet.emitDeliveryFailed({ to: 'ar-76-impl-pear', msgId: 'fake-1', reason: 'dead-lettered' })
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1))
+    expect(fleet.resumes).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-76-impl-pear', 'ar-76-review'])
+    expect(factory.status().counters.criticalDeliveryAbortExitsSuppressed).toBe(2)
+  })
+
+  it('publishes a visible GitHub abort and removes the in-progress lifecycle label only after team release', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 71)
+    const file = githubIssueFile(71, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: file })
+    const fleet = new InjectFailingPidFleetClient([])
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+      clock: new ManualClock(),
+    })
+
+    const issue = parseGithubFactoryIssue(path, file)
+    await expect(factory.dispatch(await factory.triageIssue(issue)))
+      .rejects.toThrow('Critical task injection failed to ar-71-impl-pear')
+
+    expect(fleet.releases.map((release) => release.name)).toEqual(['ar-71-impl-pear', 'ar-71-review-pear'])
+    expect(githubWriteback.statuses).toEqual([{ key: '71', status: 'in-progress' }])
+    expect(githubWriteback.clearedStatuses).toEqual(['71'])
+    expect(githubWriteback.comments.at(-1)?.body).toContain('Factory aborted this dispatch')
+    expect(githubWriteback.comments.at(-1)?.body).toContain('factory-critical-delivery-abort')
+  })
+
+  it('retains the abort fence until a transient team release failure is acknowledged', async () => {
+    const mount = new FakeMountClient({ [issuePath(72)]: issueFile(72) })
+    const fleet = new TransientAbortReleaseFleetClient('ar-72-impl-pear')
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), clock: new ManualClock() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(72), issueFile(72))))
+    fleet.emitDeliveryFailed({ to: 'ar-72-impl-pear', msgId: 'fake-1', reason: 'dead-lettered' })
+
+    await vi.waitFor(() => expect(fleet.releaseFailures).toBe(1))
+    expect(factory.status().inFlight).toMatchObject([{ key: 'AR-72' }])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing])
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1), { timeout: 3_000 })
+    expect(factory.status().inFlight).toEqual([])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+  })
+
+  it('reconciles an idempotent GitHub abort notice before retrying failed status publication', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 73)
+    const file = githubIssueFile(73, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: file })
+    const fleet = new InjectFailingPidFleetClient([])
+    const githubWriteback = new TransientGithubClearStatusWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+      clock: new ManualClock(),
+    })
+
+    const issue = parseGithubFactoryIssue(path, file)
+    await expect(factory.dispatch(await factory.triageIssue(issue)))
+      .rejects.toThrow('Critical task injection failed to ar-73-impl-pear')
+    expect(factory.status().inFlight).toMatchObject([{ key: '73' }])
+    expect(githubWriteback.comments.filter((comment) => comment.body.includes('factory-critical-delivery-abort'))).toHaveLength(1)
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1), { timeout: 3_000 })
+    expect(githubWriteback.clearAttempts).toBe(2)
+    expect(githubWriteback.comments.filter((comment) => comment.body.includes('factory-critical-delivery-abort'))).toHaveLength(1)
+    expect(githubWriteback.clearedStatuses).toEqual(['73'])
+  })
+
+  it('persists remote abort cleanup for restart takeover instead of resuming an unbriefed team', async () => {
+    const mount = new FakeMountClient({ [issuePath(74)]: issueFile(74) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteInitialInjectionAndReleaseFailureFleetClient()
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(74), issueFile(74)))
+
+    await expect(firstFactory.dispatch(decision)).rejects.toThrow('Critical task injection failed')
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'aborting',
+      releaseReason: 'critical-delivery-failed:ar-74-impl-pear',
+    })
+    expect(firstFactory.status().inFlight).toMatchObject([{ key: 'AR-74' }])
+    await firstFactory.stop()
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-74-impl-pear',
+      'ar-74-review',
+    ])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    await takeover.stop()
+  })
+
+  it('keeps exact-run abort intent durable when the first aborting save loses its lease, then takeover cleans up', async () => {
+    const mount = new FakeMountClient({ [issuePath(77)]: issueFile(77) })
+    const stateStore = new RejectFirstAbortingSaveStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteInitialInjectionFailureFleetClient()
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(77), issueFile(77)))
+
+    await expect(firstFactory.dispatch(decision)).rejects.toThrow('Critical task injection failed')
+    const aborting = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+    expect(aborting).toMatchObject({
+      phase: 'aborting',
+      releaseReason: 'critical-delivery-failed:ar-77-impl-pear',
+    })
+    expect(stateStore.abortingSaveRejections).toBe(1)
+    expect(firstFleet.releases.map((release) => release.name)).toEqual(['ar-77-impl-pear'])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing])
+    await firstFactory.stop()
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        runId: aborting?.runId,
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-77-impl-pear',
+      'ar-77-review',
+    ])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    await takeover.stop()
+  })
+
+  it('retains consumed async failure evidence across abort-save lease loss and takeover', async () => {
+    const mount = new FakeMountClient({ [issuePath(78)]: issueFile(78) })
+    const stateStore = new RejectFirstAbortingSaveStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteReinjectionFailingFleetClient('ar-78-impl-pear')
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(78), issueFile(78)))
+
+    await firstFactory.dispatch(decision)
+    firstFleet.emitDeliveryFailed({ to: 'ar-78-impl-pear', msgId: 'fake-1', reason: 'dead-lettered' })
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'aborting',
+        releaseReason: 'critical-delivery-failed:ar-78-impl-pear',
+      })
+      expect(stateStore.abortingSaveRejections).toBe(1)
+    })
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing])
+    await firstFactory.stop()
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-78-impl-pear',
+      'ar-78-review',
+    ])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    await takeover.stop()
+  })
+
+  it('ignores a delayed critical failure record from an older dispatch run', async () => {
+    const mount = new FakeMountClient({ [issuePath(79)]: issueFile(79) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(79), issueFile(79)))
+
+    await factory.dispatch(decision)
+    await stateStore.recordCritical('factory-test', 'stale-critical-event', {
+      issue: decision.issue,
+      input: fleet.messages[0]!,
+      runId: 'older-dispatch-run',
+    })
+    fleet.emitDeliveryFailed({
+      to: 'ar-79-impl-pear',
+      msgId: 'stale-critical-event',
+      reason: 'delayed-old-run-event',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryFailuresIgnoredStaleRun).toBe(1))
+
+    expect(fleet.releases).toEqual([])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'running',
+    })
+    await factory.stop()
+  })
+
+  it.each(['complete', 'abandoned'] as const)(
+    'does not restore batch capacity for a late exact-run failure after durable %s',
+    async (phase) => {
+      const issueNumber = phase === 'complete' ? 96 : 97
+      const mount = new FakeMountClient({ [issuePath(issueNumber)]: issueFile(issueNumber) })
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const fleet = new RemoteLifecycleFleetClient()
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        stateStore,
+        clock: new ManualClock(),
+      })
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(issueNumber), issueFile(issueNumber)))
+      const runId = `terminal-run-${phase}`
+      const specs = [...decision.implementers, decision.reviewer]
+      const lifecycle: DispatchLifecycle = {
+        runId,
+        issue: decision.issue,
+        decision,
+        dryRun: false,
+        phase: 'running',
+        agents: specs.map((spec) => ({
+          name: spec.name,
+          tracked: {
+            spec,
+            result: { name: spec.name, node: 'sf-mini', locality: 'remote' },
+          },
+        })),
+        invocationIds: [],
+        updatedAtMs: 0,
+      }
+      const key = issueKey(decision.issue)
+      const claim = await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        key,
+        lifecycle,
+        'completed-owner',
+        0,
+        10_000,
+      )
+      expect(claim).toMatchObject({ acquired: true, lease: { owner: 'completed-owner', epoch: 1 } })
+      await expect(stateStore.saveDispatchLifecycle(
+        'factory-test',
+        key,
+        'completed-owner',
+        1,
+        1,
+        { ...claim.lifecycle, phase },
+      )).resolves.toBe(true)
+      const target = decision.implementers[0]!.name
+      await stateStore.recordCritical('factory-test', `late-${phase}`, {
+        issue: decision.issue,
+        input: { to: target, text: 'late terminal briefing', from: 'factory', data: { issue: decision.issue } },
+        runId,
+      })
+
+      await factory.start({ mode: 'dispatch-owner' })
+      fleet.emitDeliveryFailed({ to: target, msgId: `late-${phase}`, reason: 'late-terminal-event' })
+      await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryFailuresIgnoredTerminalRun).toBe(1))
+
+      await expect(stateStore.getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({ runId, phase })
+      await expect(stateStore.consumeCritical('factory-test', `late-${phase}`)).resolves.toBeUndefined()
+      const batch = await stateStore.getBatch('factory-test')
+      expect(batch.size).toBe(0)
+      expect(batch.inFlight).toEqual([])
+      expect(batch.canStart()).toBe(true)
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      expect(fleet.resumes).toEqual([])
+      expect(fleet.releases).toEqual([])
+      expect(fleet.messages).toEqual([])
+      expect(fleet.inputs).toEqual([])
+      expect(mount.writes).toEqual([])
+
+      fleet.emitDeliveryFailed({ to: target, msgId: `late-${phase}`, reason: 'duplicate-terminal-event' })
+      await new Promise((resolve) => setTimeout(resolve, 1_100))
+      await expect(stateStore.getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({ runId, phase })
+      expect(factory.status().counters.criticalDeliveryFailuresIgnoredTerminalRun).toBe(1)
+      expect(factory.status().inFlight).toEqual([])
+      expect((await stateStore.getBatch('factory-test')).size).toBe(0)
+      expect(fleet.spawns).toEqual([])
+      expect(fleet.resumes).toEqual([])
+      expect(fleet.releases).toEqual([])
+      expect(mount.writes).toEqual([])
+      await factory.stop()
+    },
+  )
 
   it('emits error and rejects when writeback verification fails', async () => {
     const mount = new FakeMountClient({ [issuePath(9)]: issueFile(9) })

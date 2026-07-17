@@ -156,6 +156,12 @@ class ClarificationWakeLeaseLostError extends Error {}
 class ClarificationQuestionDeliveryLeaseLostError extends Error {}
 class GithubEscalationReconciliationUnavailableError extends Error {}
 class GithubEscalationPostAmbiguousError extends Error {}
+class CriticalTaskInjectionError extends Error {
+  constructor(readonly target: string, cause: unknown) {
+    super(`Critical task injection failed to ${target}: ${describeError(cause).errorMessage}`, { cause })
+    this.name = 'CriticalTaskInjectionError'
+  }
+}
 
 type GithubEscalationReconciliation = 'found' | 'absent' | 'unavailable'
 class ClarificationWakeStoppedError extends Error {}
@@ -306,6 +312,10 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #criticalDeliveryAborts = new Map<string, Promise<void>>()
+  readonly #criticalDeliveryAborting = new Set<string>()
+  readonly #criticalDeliveryAbortRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #criticalDeliveryNotices = new Set<string>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
   #clarificationSweepDueAtMs?: number
@@ -654,6 +664,8 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    for (const timer of this.#criticalDeliveryAbortRetryTimers.values()) clearTimeout(timer)
+    this.#criticalDeliveryAbortRetryTimers.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
@@ -1714,11 +1726,18 @@ export class FactoryLoop implements Factory {
     }
 
     let dispatchDecision = labelDispatch.decision
+    let dispatchRunId: string | undefined
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
     if (!dryRun && this.#fleet.placementLocality === 'remote') {
+      const previousLifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(dispatchDecision.issue))
+      if (previousLifecycle && isRetryableCriticalDeliveryAbort(previousLifecycle)) {
+        await this.#state.clearDispatchLifecycle(this.#workspaceId, issueKey(dispatchDecision.issue))
+        this.#dispatchLifecycleEpochs.delete(issueKey(dispatchDecision.issue))
+      }
       const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun)
+      dispatchRunId = lifecycleClaim.lifecycle.runId
       dispatchDecision = structuredClone(lifecycleClaim.lifecycle.decision)
       if (lifecycleClaim.lifecycle.phase === 'waiting-for-human') {
         return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
@@ -1743,6 +1762,7 @@ export class FactoryLoop implements Factory {
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
       return { issue: dispatchDecision.issue, agents: [], dryRun }
     }
+    record.runId ??= dispatchRunId
 
     if (record.result) {
       return record.result
@@ -1809,6 +1829,11 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
+      if (error instanceof CriticalTaskInjectionError) {
+        await this.#abortCriticalDelivery(record, error.target, error)
+        this.#error(error, decision.issue)
+        throw error
+      }
       await this.#persistDispatchFailureReaperHandoff(record, spawnedForReaperHandoff)
       await this.#recordDispatchFailure(decision.issue)
       const failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
@@ -2008,9 +2033,15 @@ export class FactoryLoop implements Factory {
       return false
     }
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    if (!record.runId || previous?.runId !== record.runId) {
+      this.#dispatchLifecycleEpochs.delete(key)
+      this.#increment('dispatchLifecycleRunFencesRejected')
+      this.#scheduleDispatchLifecycleRetry(record)
+      return false
+    }
     const lifecycle = lifecycleFromInFlightRecord(
       record,
-      previous?.runId ?? randomUUID(),
+      record.runId,
       phase,
       this.#clock.now(),
       pullRequest ?? previous?.pullRequest,
@@ -2138,6 +2169,11 @@ export class FactoryLoop implements Factory {
     }
     if (lifecycle.phase === 'dispatching' || lifecycle.phase === 'retryable') {
       await this.#resumeDurableDispatch(record)
+      return
+    }
+    if (lifecycle.phase === 'aborting') {
+      const target = criticalDeliveryAbortTarget(lifecycle.releaseReason) ?? 'unknown agent'
+      await this.#abortCriticalDelivery(record, target, new Error('critical briefing delivery failed'))
       return
     }
     if (lifecycle.phase === 'publishing') {
@@ -3239,6 +3275,10 @@ export class FactoryLoop implements Factory {
     if (!record) {
       return
     }
+    if (this.#criticalDeliveryAborting.has(issueKey(record.issue))) {
+      this.#increment('criticalDeliveryAbortExitsSuppressed')
+      return
+    }
     if (!await this.#assertDispatchLifecycleOwner(record)) {
       this.#logger.warn?.('[factory] ignored agent exit after durable lifecycle ownership was lost', {
         issue: record.issue.key,
@@ -3790,19 +3830,242 @@ export class FactoryLoop implements Factory {
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
     const critical = await this.#state.consumeCritical(this.#workspaceId, info.msgId ?? '')
-    const record = (await this.#batch()).getIssueByAgent(info.to)
+    const batch = await this.#batch()
+    let record = batch.getIssueByAgent(info.to)
+    let terminalCriticalRun = false
+    if (!record && critical?.runId && this.#fleet.placementLocality === 'remote') {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(critical.issue))
+      if (lifecycle?.runId === critical.runId) {
+        if (isTerminalDispatchLifecycle(lifecycle)) terminalCriticalRun = true
+        // Reconstruct only the cleanup input. Do not speculatively consume a
+        // batch slot: the lifecycle can become terminal before the atomic
+        // abort-intent transition, and a rejected intent must leave no local
+        // in-flight record behind.
+        else record = inFlightRecordFromLifecycle(lifecycle)
+      }
+    }
     const issue = critical?.issue ?? record?.issue
     const error = new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`)
     this.#error(error, issue)
 
     if (critical && this.#fleet.waitForInjected) {
+      if (terminalCriticalRun) {
+        this.#increment('criticalDeliveryFailuresIgnoredTerminalRun')
+        return
+      }
+      if (this.#fleet.placementLocality === 'remote' && (
+        !critical.runId || !record?.runId || critical.runId !== record.runId
+      )) {
+        this.#increment('criticalDeliveryFailuresIgnoredStaleRun')
+        return
+      }
+      if (record && !await this.#assertDispatchLifecycleOwner(record)) {
+        // The message has already failed and was consumed. Persist the exact
+        // run's fatal intent even though this process lost its side-effect
+        // lease, so the successor cannot hydrate/resume an unbriefed team.
+        await this.#abortCriticalDelivery(record, info.to, error)
+        return
+      }
       try {
         const ack = await this.#waitForInjectedAndSubmit(critical.input)
         await this.#state.recordCritical(this.#workspaceId, ack.eventId, critical)
       } catch (retryError) {
         this.#error(retryError, critical.issue)
+        if (record) {
+          await this.#abortCriticalDelivery(record, info.to, retryError)
+        }
       }
     }
+  }
+
+  async #abortCriticalDelivery(record: InFlightIssue, target: string, cause: unknown): Promise<void> {
+    const key = issueKey(record.issue)
+    const existing = this.#criticalDeliveryAborts.get(key)
+    if (existing) return await existing
+
+    // Fence exit/resume handling synchronously, before the first ownership or
+    // persistence await. A release-driven exit must never restart an unbriefed
+    // worker while the team-wide abort is in progress.
+    this.#criticalDeliveryAborting.add(key)
+    const abort = this.#doAbortCriticalDelivery(record, target, cause)
+    this.#criticalDeliveryAborts.set(key, abort)
+    try {
+      await abort
+    } finally {
+      if (this.#criticalDeliveryAborts.get(key) === abort) this.#criticalDeliveryAborts.delete(key)
+    }
+  }
+
+  async #doAbortCriticalDelivery(record: InFlightIssue, target: string, cause: unknown): Promise<void> {
+    const key = issueKey(record.issue)
+    const reason = `critical-delivery-failed:${target}`
+    const agents = [...record.agents]
+    const released = new Set<string>()
+    if (this.#fleet.placementLocality === 'remote') {
+      if (!record.runId) {
+        this.#criticalDeliveryAborting.delete(key)
+        this.#increment('criticalDeliveryAbortsIgnoredMissingRun')
+        return
+      }
+      const lifecycle = await this.#state.beginCriticalDeliveryAbort(
+        this.#workspaceId,
+        key,
+        record.runId,
+        this.#clock.now(),
+        reason,
+      )
+      if (!lifecycle) {
+        this.#criticalDeliveryAborting.delete(key)
+        this.#increment('criticalDeliveryAbortsIgnoredStaleRun')
+        return
+      }
+      for (const agent of lifecycle.agents) {
+        if (agent.releasedAtMs !== undefined) released.add(agent.name)
+      }
+    }
+    if (!await this.#assertDispatchLifecycleOwner(record)) {
+      this.#criticalDeliveryAborting.delete(key)
+      this.#increment('criticalDeliveryAbortsDeferredToOwner')
+      return
+    }
+    if (this.#fleet.placementLocality !== 'remote') {
+      await this.#persistDispatchFailureReaperHandoff(record, agents.map(([name, tracked]) => ({
+        issue: record.issue,
+        name,
+        tracked: cloneTrackedAgent(tracked),
+        persistedAtMs: this.#clock.now(),
+      })))
+    }
+
+    for (const [agentName] of agents) {
+      this.#fleet.markAgentTerminal?.(agentName, reason)
+    }
+
+    const failed = new Set<string>()
+    for (const agent of agents) {
+      if (released.has(agent[0])) continue
+      const releaseFailed = await this.#releaseAndTerminateAgents([agent], reason, 'completion')
+      if (releaseFailed.length > 0) {
+        failed.add(agent[0])
+        continue
+      }
+      released.add(agent[0])
+      if (this.#fleet.placementLocality === 'remote' && !await this.#saveDispatchLifecycle(
+        record,
+        'aborting',
+        undefined,
+        reason,
+        released,
+      )) return
+    }
+
+    if (failed.size > 0) {
+      this.#increment('criticalDeliveryAbortReleaseRetries')
+      try {
+        await this.#publishCriticalDeliveryAbortNotice(record, target, cause, true)
+      } catch (error) {
+        this.#logger.warn?.('[factory] critical delivery abort notice failed while cleanup remained pending', {
+          issue: record.issue.key,
+          target,
+          error: describeError(error).errorMessage,
+        })
+      }
+      await this.#writeInFlightRegistry()
+      this.#scheduleCriticalDeliveryAbortRetry(record, target, cause)
+      return
+    }
+
+    // Publishing the operator-visible failure and restoring provider readiness
+    // are part of the abort transaction. Until both succeed, keep the batch
+    // slot and dispatch-attempt fence held even though the workers are gone.
+    try {
+      await this.#publishCriticalDeliveryAbortNotice(record, target, cause, false)
+    } catch (error) {
+      this.#increment('criticalDeliveryAbortPublicationRetries')
+      this.#logger.warn?.('[factory] critical delivery abort publication failed; retaining abort fence', {
+        issue: record.issue.key,
+        target,
+        error: describeError(error).errorMessage,
+      })
+      this.#scheduleCriticalDeliveryAbortRetry(record, target, cause)
+      return
+    }
+
+    await this.#state.clearCriticalForIssue(this.#workspaceId, record.issue)
+    await this.#stopSlackWatcher(record.issue)
+    await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
+    if (this.#fleet.placementLocality === 'remote') {
+      if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason, released)) return
+      this.#resolveDispatchTerminalWaiters(record.issue)
+    }
+
+    const next = (await this.#batch()).complete(record.issue)
+    await this.#recordDispatchFailure(record.issue)
+    for (const [agentName] of agents) {
+      await this.#state.clearFailureHandoff(this.#workspaceId, registryHandoffKey(record.issue, agentName))
+    }
+    await this.#writeInFlightRegistry()
+    this.#criticalDeliveryAborting.delete(key)
+    this.#increment('criticalDeliveryAbortsCompleted')
+    if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
+  }
+
+  #scheduleCriticalDeliveryAbortRetry(record: InFlightIssue, target: string, cause: unknown): void {
+    const key = issueKey(record.issue)
+    if (this.#stopping || this.#criticalDeliveryAbortRetryTimers.has(key)) return
+    const timer = setTimeout(() => {
+      this.#criticalDeliveryAbortRetryTimers.delete(key)
+      void this.#abortCriticalDelivery(record, target, cause).catch((error) => {
+        this.#logger.warn?.('[factory] critical delivery abort retry failed', {
+          issue: record.issue.key,
+          target,
+          error: describeError(error).errorMessage,
+        })
+        this.#scheduleCriticalDeliveryAbortRetry(record, target, cause)
+      })
+    }, DISPATCH_LIFECYCLE_RETRY_MS)
+    timer.unref?.()
+    this.#criticalDeliveryAbortRetryTimers.set(key, timer)
+  }
+
+  async #publishCriticalDeliveryAbortNotice(
+    record: InFlightIssue,
+    target: string,
+    cause: unknown,
+    cleanupPending: boolean,
+  ): Promise<void> {
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue) throw new Error(`Unable to publish critical delivery failure for unreadable issue ${record.issue.key}`)
+    const attempt = (await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(record.issue)))?.attempts ?? 0
+    const state = cleanupPending ? 'cleanup-pending' : 'aborted'
+    const marker = criticalDeliveryAbortMarker(record.issue, attempt, state)
+    const detail = describeError(cause).errorMessage
+    const body = cleanupPending
+      ? `${marker}\nFactory could not deliver the critical briefing to \`${target}\` for ${record.issue.key}. The dispatch is aborting, but one or more workers have not yet acknowledged release. Factory is retaining the in-progress fence and will retry cleanup; do not retry this issue yet.\n\nDelivery error: ${detail}`
+      : `${marker}\nFactory aborted this dispatch because the critical briefing could not be delivered to \`${target}\`. Every spawned worker was released before the issue can be made retryable, so no agent can continue on an incomplete task. Factory is returning the issue to Ready for Agent as this abort finalizes; retry after fleet delivery is healthy.\n\nDelivery error: ${detail}`
+
+    if (!this.#criticalDeliveryNotices.has(marker)) {
+      if (isGithubIssue(issue) && this.#githubWriteback.hasCommentMarker) {
+        if (!await this.#githubWriteback.hasCommentMarker(issue, marker)) {
+          await this.#githubWriteback.postComment(issue, body)
+        }
+      } else {
+        await this.#postIssueComment(issue, body)
+      }
+      this.#criticalDeliveryNotices.add(marker)
+    }
+    if (cleanupPending) return
+    if (isGithubIssue(issue)) {
+      if (!this.#githubWriteback.clearStatus) {
+        throw new Error('GitHub writeback does not support clearing lifecycle status after a critical delivery abort')
+      }
+      await this.#githubWriteback.clearStatus(issue)
+    } else {
+      const readyStateId = this.#states.idFor(issue.team, 'readyForAgent')
+      await this.#linear.setState(issue, readyStateId)
+      await this.#recordCanonicalIssueState({ ...record.issue, stateId: readyStateId })
+    }
+    this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
   }
 
   async #handleAgentMessage(message: AgentMessage): Promise<void> {
@@ -5027,8 +5290,12 @@ export class FactoryLoop implements Factory {
       from: 'factory',
       data: { issue: record.issue },
     }
-    const ack = await this.#waitForInjectedAndSubmit(input)
-    await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
+    try {
+      const ack = await this.#waitForInjectedAndSubmit(input)
+      await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input, runId: record.runId })
+    } catch (error) {
+      throw new CriticalTaskInjectionError(input.to, error)
+    }
   }
 
   async #sendImplementerTask(record: InFlightIssue): Promise<void> {
@@ -5064,8 +5331,12 @@ export class FactoryLoop implements Factory {
         from: 'factory',
         data: { issue: record.issue },
       }
-      const ack = await this.#waitForInjectedAndSubmit(input)
-      await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
+      try {
+        const ack = await this.#waitForInjectedAndSubmit(input)
+        await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input, runId: record.runId })
+      } catch (error) {
+        throw new CriticalTaskInjectionError(input.to, error)
+      }
     }
   }
 
@@ -5923,7 +6194,7 @@ export class FactoryLoop implements Factory {
           data: { issue: record.issue },
         }
         const ack = await this.#waitForInjectedAndSubmit(input)
-        await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
+        await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input, runId: record.runId })
       }
     } catch (error) {
       // Allow a later event to retry the spawn.
@@ -9743,6 +10014,22 @@ const durableBabysitterTrackedAgent = (session: BabysitterSessionState): Tracked
 const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
+const CRITICAL_DELIVERY_ABORT_REASON_PREFIX = 'critical-delivery-failed:'
+
+const criticalDeliveryAbortTarget = (reason?: string): string | undefined =>
+  reason?.startsWith(CRITICAL_DELIVERY_ABORT_REASON_PREFIX)
+    ? reason.slice(CRITICAL_DELIVERY_ABORT_REASON_PREFIX.length)
+    : undefined
+
+const isRetryableCriticalDeliveryAbort = (lifecycle: DispatchLifecycle): boolean =>
+  lifecycle.phase === 'abandoned' && criticalDeliveryAbortTarget(lifecycle.releaseReason) !== undefined
+
+const criticalDeliveryAbortMarker = (
+  issue: IssueRef,
+  attempt: number,
+  state: 'cleanup-pending' | 'aborted',
+): string => `<!-- factory-critical-delivery-abort:${encodeURIComponent(issue.uuid)}:${attempt}:${state} -->`
+
 const lifecycleFromInFlightRecord = (
   record: InFlightIssue,
   runId: string,
@@ -9765,6 +10052,7 @@ const lifecycleFromInFlightRecord = (
 })
 
 const inFlightRecordFromLifecycle = (lifecycle: DispatchLifecycle): InFlightIssue => ({
+  runId: lifecycle.runId,
   issue: { ...lifecycle.issue },
   decision: structuredClone(lifecycle.decision),
   dryRun: lifecycle.dryRun,

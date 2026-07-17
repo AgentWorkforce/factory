@@ -555,8 +555,8 @@ categories:
       - id: dispatch-critical-delivery-retry
         name: Critical Delivery Retry
         api: FleetClient.onDeliveryFailed()
-        description: Persist critical messages by event ID and retry them when broker delivery fails
-        location: src/orchestrator/factory.ts, src/state/in-memory-state-store.ts
+        description: Persist critical messages by event ID, retry confirmed failures, and on exhausted initial delivery or reinjection durably fence and release the full team before an idempotent issue-visible abort restores retryable source state
+        location: src/orchestrator/factory.ts, src/state/in-memory-state-store.ts, src/state/file-state-store.ts, src/writeback/github.ts
         verify_tier: 4
 
       - id: dispatch-agent-resume

@@ -2,7 +2,7 @@ import type { SendInput, SpawnResult } from './fleet'
 import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
 
-export type CriticalRecord = { issue: IssueRef; input: SendInput }
+export type CriticalRecord = { issue: IssueRef; input: SendInput; runId?: string }
 
 export type ClarificationReply = {
   id: string
@@ -77,6 +77,7 @@ export type DispatchLifecyclePhase =
   | 'queued'
   | 'dispatching'
   | 'retryable'
+  | 'aborting'
   | 'running'
   | 'parking'
   | 'waiting-for-human'
@@ -207,12 +208,26 @@ export interface StateStore {
     nowMs: number,
     lifecycle: DispatchLifecycle,
   ): Promise<boolean>
+  /**
+   * Atomically records a fatal delivery failure for one exact dispatch run.
+   * This deliberately does not require or transfer the cleanup lease: a stale
+   * owner may preserve the fail-closed intent, but only the lease holder may
+   * perform fleet or provider side effects.
+   */
+  beginCriticalDeliveryAbort(
+    workspaceId: string,
+    key: string,
+    runId: string,
+    nowMs: number,
+    releaseReason: string,
+  ): Promise<DispatchLifecycle | undefined>
   getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined>
   listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>>
   clearDispatchLifecycle(workspaceId: string, key: string): Promise<void>
 
   recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void>
   consumeCritical(workspaceId: string, key: string): Promise<CriticalRecord | undefined>
+  clearCriticalForIssue(workspaceId: string, issue: IssueRef): Promise<void>
   isResumed(workspaceId: string, exitKey: string): Promise<boolean>
   markResumed(workspaceId: string, exitKey: string): Promise<void>
 

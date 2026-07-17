@@ -23,5 +23,7 @@ export interface GithubWriteback {
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
   setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
+  /** Remove Factory lifecycle labels after work is safely aborted before implementation starts. */
+  clearStatus?(issue: LinearIssue): Promise<void>
   closeIssue(issue: LinearIssue, body: string): Promise<void>
 }

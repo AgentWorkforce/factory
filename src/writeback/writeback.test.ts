@@ -796,6 +796,7 @@ describe('GhCliGithubWriteback', () => {
     await github.postComment(githubIssue, 'Factory dispatch for 48')
     await github.setStatus(githubIssue, 'in-progress')
     await github.setStatus(githubIssue, 'human-review')
+    await github.clearStatus(githubIssue)
 
     expect(calls).toEqual([
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
@@ -805,6 +806,8 @@ describe('GhCliGithubWriteback', () => {
       ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:human-review'],
     ])
   })
 

@@ -52,6 +52,51 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('atomically persists abort intent for only the exact dispatch run without transferring its lease', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-abort-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      const key = 'AR-86:uuid-86:/linear/issues/AR-86.json'
+      const seed = dispatchLifecycle(86)
+      const claim = await store.claimDispatchLifecycle('workspace-1', key, seed, 'owner-a', 1_000, 5_000)
+
+      await expect(store.beginCriticalDeliveryAbort(
+        'workspace-1',
+        key,
+        'older-run',
+        1_001,
+        'critical-delivery-failed:stale-agent',
+      )).resolves.toBeUndefined()
+      await expect(store.getDispatchLifecycle('workspace-1', key)).resolves.toMatchObject({
+        runId: seed.runId,
+        phase: 'dispatching',
+        lease: claim.lease,
+      })
+
+      await expect(store.beginCriticalDeliveryAbort(
+        'workspace-1',
+        key,
+        seed.runId,
+        1_002,
+        'critical-delivery-failed:ar-86-impl-factory',
+      )).resolves.toMatchObject({
+        runId: seed.runId,
+        phase: 'aborting',
+        releaseReason: 'critical-delivery-failed:ar-86-impl-factory',
+        lease: claim.lease,
+      })
+      await expect(store.saveDispatchLifecycle('workspace-1', key, 'owner-a', 1, 1_003, {
+        ...seed,
+        phase: 'complete',
+      })).resolves.toBe(false)
+      await expect(new FileStateStore({ batchSize: 2, watchStatePath }).getDispatchLifecycle('workspace-1', key))
+        .resolves.toMatchObject({ runId: seed.runId, phase: 'aborting', lease: claim.lease })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('restores and clears babysitter ownership plus pending wake state in a fresh process-equivalent store', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-babysitter-'))
     try {

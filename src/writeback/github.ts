@@ -131,6 +131,23 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
   }
 
+  async clearStatus(issue: LinearIssue): Promise<void> {
+    const ref = githubIssueRef(issue)
+    const labels = await this.#issueLabels(ref)
+    const lifecycleLabels = Object.values(STATUS_LABELS)
+      .map((status) => status.name)
+      .filter((name) => labels.has(name.toLowerCase()))
+    if (lifecycleLabels.length === 0) return
+    await this.#run([
+      'issue',
+      'edit',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      ...lifecycleLabels.flatMap((name) => ['--remove-label', name]),
+    ])
+  }
+
   async #issueLabels(ref: { repo: string; number: number }): Promise<Set<string>> {
     const result = await this.#run([
       'issue',

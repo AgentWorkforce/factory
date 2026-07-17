@@ -241,6 +241,7 @@ Against a disposable fixture/provider issue, verify:
 1. implementer(s) and reviewer/workflow spawn once;
 2. task delivery receives `delivery_injected` acknowledgement before input submission;
 3. a simulated delivery failure retries the persisted critical message;
+   exhausted initial delivery and exhausted reinjection must converge on one owner-fenced abort that releases the full team, posts one correlated provider-visible failure, restores source readiness only after cleanup acknowledgement, and survives release/writeback failure plus remote-owner restart without respawning workers;
 4. an interrupted session resumes once;
 5. batch overflow queues and completion promotes the next issue;
 6. registry data contains agent/session/PID or remote invocation/node identity;

@@ -56,6 +56,8 @@ For GitHub-native issues, every collision-prone role is repository-qualified and
 
 Batch capacity must queue excess work and promote the next issue when the current record completes. Dispatch failures must back off and stop at `dispatch.maxAttempts`. Local internal dispatch expands supported home-relative clone paths, infers cwd only for one remote-matching repository, and fails before spawn when a configured checkout is missing, non-git, or not its worktree root.
 
+Critical briefing delivery is fail-closed. A confirmed delivery failure retries the persisted message, but exhausted initial delivery or reinjection must atomically persist an abort intent for the exact dispatch run, fence side effects to its lease owner, release the complete team, publish a correlated issue-visible abort, and only then restore Ready for Agent plus retry eligibility. Partial release or writeback failures retain the in-progress fence and batch slot for durable cleanup takeover; stale failures from older runs cannot abort a newer team.
+
 **What breaks if this fails:** agent execution, batch fairness, retry safety, issue lifecycle accuracy.
 
 ---
@@ -237,7 +239,7 @@ Internal execution must reuse an operator-owned broker when present, otherwise s
 | Repo-qualified identity + composite issue key | Equal-number issues share agents, PR caches, or lifecycle state | `src/triage/agent-names.ts`, `src/orchestrator/factory.ts` |
 | Clone expansion/inference/preflight | Local work spawns in a missing or wrong checkout | `src/config/schema.ts`, `src/config/local-clone-paths.ts`, `src/cli/fleet.ts` |
 | Live high-water + replay suppression | Missed or duplicate dispatch | `src/orchestrator/factory.ts`, `src/subscriptions/event-client.ts` |
-| Critical message confirmation | Agents start without receiving tasks | `src/orchestrator/factory.ts`, `src/fleet/internal-fleet-client.ts` |
+| Critical message confirmation + abort cleanup | Agents start without receiving tasks, or dirty lifecycle state blocks a safe retry | `src/orchestrator/factory.ts`, `src/fleet/internal-fleet-client.ts`, `src/writeback/github.ts` |
 | Durable relay lifecycle + owner epoch | Duplicate remote team/PR, leaked capacity, or stalled release | `src/orchestrator/factory.ts`, `src/ports/state.ts`, `src/state/file-state-store.ts` |
 | Remote head publication + receipt recovery | In-flight issue stalls or publishes a stale/local branch | `src/orchestrator/factory.ts`, `src/mount/relayfile-github-connection-write.ts` |
 | Canonical babysitter routing + durable wake | Wrong PR wakes, event loss, or duplicate branch mutation | `src/orchestrator/factory.ts`, `src/ports/state.ts`, `src/state/file-state-store.ts` |

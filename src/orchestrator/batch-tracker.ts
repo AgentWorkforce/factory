@@ -8,6 +8,8 @@ export interface TrackedAgent {
 }
 
 export interface InFlightIssue {
+  /** Exact durable dispatch attempt; absent for local-only dispatches. */
+  runId?: string
   issue: IssueRef
   decision: TriageDecision
   dryRun: boolean
@@ -181,6 +183,7 @@ export class BatchTracker {
     const existing = this.#inFlight.get(key)
     if (existing) return existing
     const restored: InFlightIssue = {
+      runId: record.runId,
       issue: { ...record.issue },
       decision: structuredClone(record.decision),
       dryRun: record.dryRun,
