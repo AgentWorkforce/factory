@@ -88,6 +88,8 @@ interface LoadedConfig {
   fixtureFiles?: Record<string, unknown>
 }
 
+const autoDetectedIssueSources = new WeakSet<FactoryConfig>()
+
 type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
@@ -860,14 +862,37 @@ async function resolveStatesForIssueSource(
     return stateResolutionFromIds(config.stateIds, config.linear.states)
   }
   if (!config.issueSource) {
-    const linearReady = await mount.ensureSubRoot('/linear/issues', { timeoutMs: 90_000 })
-    if (linearReady !== 'ready') {
+    autoDetectedIssueSources.add(config)
+    if (shouldAutoDetectGithubSource(config)) {
       config.issueSource = 'github'
       return stateResolutionFromIds(config.stateIds, config.linear.states)
     }
-    config.issueSource = 'linear'
+    const linearReady = await mount.ensureSubRoot('/linear/issues', { timeoutMs: 90_000 })
+    config.issueSource = linearReady === 'ready' ? 'linear' : 'github'
+    if (config.issueSource === 'github') {
+      return stateResolutionFromIds(config.stateIds, config.linear.states)
+    }
   }
   return (resolveStates ?? defaultResolveStates)(mount, config)
+}
+
+function shouldAutoDetectGithubSource(config: FactoryConfig): boolean {
+  if (!config.repos.org || configuredGithubIssueRepos(config).length === 0) return false
+  return Object.keys(config.stateIds).length === 0 &&
+    hasDefaultLinearStateNames(config.linear.states) &&
+    Object.keys(config.linear.statesByTeam).length === 0 &&
+    Object.keys(config.linear.teamIds).length === 0 &&
+    config.subscription.teams.length === 0 &&
+    config.subscription.projects.length === 0 &&
+    config.subscription.assignees.length === 0
+}
+
+function hasDefaultLinearStateNames(states: FactoryConfig['linear']['states']): boolean {
+  return states.readyForAgent === 'Ready for Agent' &&
+    states.agentImplementing === 'Agent Implementing' &&
+    states.inPlanning === 'In Planning' &&
+    states.done === 'Done' &&
+    states.humanReview === 'In Human Review'
 }
 
 async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
@@ -955,19 +980,36 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
   if (config.issueSource === 'github') {
     const number = Number(key.replace(/^#/, ''))
     if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`Unable to resolve GitHub issue ${key}: expected a positive issue number`)
+      throw new Error(`${githubIssueResolutionError(config, key)}: expected a positive issue number`)
     }
-    const defaultRepo = config.repos.default?.toLowerCase()
-    const matches = (await mount.listTree('/github/repos'))
+    const configuredRepos = configuredGithubIssueRepos(config)
+    if (configuredRepos.length === 0 && hasConfiguredGithubIssueRoutes(config)) {
+      throw new Error(
+        `${githubIssueResolutionError(config, key)}: configured repository routes do not resolve to owner/repo; ` +
+        'set repos.default to owner/repo or map its label in repos.byLabel',
+      )
+    }
+    if (configuredRepos.length === 1) {
+      const directPath = await findDirectGithubIssuePath(mount, configuredRepos[0]!, number)
+      if (directPath) return directPath
+    }
+
+    const roots = configuredRepos.length > 0
+      ? configuredRepos.flatMap(githubIssueRoots)
+      : ['/github/repos']
+    const matches = (await Promise.all([...new Set(roots)].map((root) => mount.listTree(root))))
+      .flat()
       .filter((path) => path.endsWith('.json'))
       .filter((path) => {
         const parts = githubIssuePathParts(path)
         if (!parts || parts.number !== number) return false
-        return !defaultRepo || `${parts.owner}/${parts.repo}`.toLowerCase() === defaultRepo
+        return configuredRepos.length === 0 || configuredRepos.some((repo) =>
+          repo.toLowerCase() === `${parts.owner}/${parts.repo}`.toLowerCase(),
+        )
       })
       .sort((left, right) => githubIssuePathPreference(left) - githubIssuePathPreference(right) || left.localeCompare(right))
     if (matches.length === 0) {
-      throw new Error(`Unable to resolve GitHub issue ${key}: found 0 matches`)
+      throw new Error(`${githubIssueResolutionError(config, key)}: found 0 matches`)
     }
     const matchesByRepo = new Map<string, { repo: string; path: string }>()
     for (const path of matches) {
@@ -977,10 +1019,10 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
         matchesByRepo.set(repo.toLowerCase(), { repo, path })
       }
     }
-    if (!defaultRepo && matchesByRepo.size > 1) {
+    if (!config.repos.default && matchesByRepo.size > 1) {
       const repos = [...matchesByRepo.values()].map((match) => match.repo).sort((left, right) => left.localeCompare(right))
       throw new Error(
-        `Unable to resolve GitHub issue ${key}: matches multiple repositories (${repos.join(', ')}); ` +
+        `${githubIssueResolutionError(config, key)}: matches multiple repositories (${repos.join(', ')}); ` +
         'set repos.default or pass a repo-qualified argument',
       )
     }
@@ -989,9 +1031,112 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
   const matches = (await mount.listTree('/linear/issues/'))
     .filter((path) => path.startsWith(`/linear/issues/${key}__`) || path === `/linear/issues/${key}.json`)
   if (matches.length !== 1) {
-    throw new Error(`Unable to resolve issue ${key}: found ${matches.length} matches`)
+    const detected = autoDetectedIssueSources.has(config) ? ', auto-detected' : ''
+    throw new Error(
+      `Unable to resolve issue ${key} in Linear (issueSource=linear${detected}): found ${matches.length} matches; ` +
+      `set issueSource: 'github' if these are GitHub issues`,
+    )
   }
   return matches[0]
+}
+
+function configuredGithubIssueRepos(config: FactoryConfig): string[] {
+  const candidates = config.repos.default
+    ? [config.repos.default]
+    : [
+        ...Object.values(config.repos.byLabel),
+        ...Object.values(config.repos.byProject),
+        ...config.repos.keywordRules.map((rule) => rule.repo),
+      ]
+  const repos = new Map<string, string>()
+  const routedRepos = [
+    ...Object.values(config.repos.byLabel),
+    ...Object.values(config.repos.byProject),
+    ...config.repos.keywordRules.map((rule) => rule.repo),
+  ]
+  for (const candidate of candidates) {
+    const mapped = Object.entries(config.repos.byLabel).find(([label]) =>
+      label.toLowerCase() === candidate.toLowerCase(),
+    )?.[1]
+    const canonicalRoute = routedRepos.find((route) =>
+      route.includes('/') && route.toLowerCase() === candidate.toLowerCase(),
+    )
+    const repo = candidate.includes('/')
+      ? canonicalRoute ?? candidate
+      : mapped?.includes('/')
+        ? mapped
+        : config.repos.org ? `${config.repos.org}/${mapped ?? candidate}` : undefined
+    if (!repo || !/^[^/]+\/[^/]+$/u.test(repo)) continue
+    repos.set(repo.toLowerCase(), repo)
+  }
+  return [...repos.values()]
+}
+
+function hasConfiguredGithubIssueRoutes(config: FactoryConfig): boolean {
+  return Boolean(
+    config.repos.default ||
+    Object.keys(config.repos.byLabel).length > 0 ||
+    Object.keys(config.repos.byProject).length > 0 ||
+    config.repos.keywordRules.length > 0,
+  )
+}
+
+async function findDirectGithubIssuePath(
+  mount: MountClient,
+  repo: string,
+  number: number,
+): Promise<string | undefined> {
+  for (const path of githubIssueDirectPaths(repo, number)) {
+    try {
+      await mount.readFile(path)
+      return path
+    } catch (error) {
+      if (!isMountFileNotFound(error)) {
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(`Unable to read GitHub issue candidate ${path}: ${message}`, { cause: error })
+      }
+      // Direct reads are an optimization. A scoped tree scan below handles
+      // slugged directories and older mount shapes when these paths are absent.
+    }
+  }
+  return undefined
+}
+
+function isMountFileNotFound(error: unknown): boolean {
+  const record = asRecord(error)
+  const response = asRecord(record.response)
+  const status = record.status ?? record.statusCode ?? response.status ?? response.statusCode
+  const code = typeof record.code === 'string' ? record.code.toLowerCase() : undefined
+  const message = error instanceof Error ? error.message : String(error)
+  return status === 404 || status === '404' ||
+    code === 'not_found' || code === 'file_not_found' ||
+    /(?:file\s+not\s+found|\b404\b)/iu.test(message)
+}
+
+function githubIssueDirectPaths(repo: string, number: number): string[] {
+  const [owner, name] = repo.split('/') as [string, string]
+  const roots = [
+    `/github/repos/${owner}__${name}/issues`,
+    `/github/repos/${owner}/${name}/issues`,
+  ]
+  return [
+    ...roots.map((root) => `${root}/${number}/meta.json`),
+    ...roots.map((root) => `${root}/by-id/${number}.json`),
+    ...roots.map((root) => `${root}/${number}.json`),
+  ]
+}
+
+function githubIssueRoots(repo: string): string[] {
+  const [owner, name] = repo.split('/') as [string, string]
+  return [
+    `/github/repos/${owner}__${name}/issues`,
+    `/github/repos/${owner}/${name}/issues`,
+  ]
+}
+
+function githubIssueResolutionError(config: FactoryConfig, key: string): string {
+  const detected = autoDetectedIssueSources.has(config) ? ', auto-detected' : ''
+  return `Unable to resolve GitHub issue ${key} (issueSource=github${detected})`
 }
 
 const githubIssuePathPreference = (path: string): number =>
