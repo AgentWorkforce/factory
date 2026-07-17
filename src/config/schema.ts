@@ -90,6 +90,21 @@ const modelsSchema = z.object({
   babysitter: z.string().default('sonnet'),
 }).default({})
 
+// Which agent CLI backs each spawn role. `models.*` picks the model; this picks
+// the CLI. Restricted to the two spawn capabilities actually wired into
+// capabilityCli (internal-fleet-client.ts) — spawn:opencode / spawn:gemini would
+// resolve to an undefined CLI and are intentionally excluded until mapped.
+// Defaults preserve today's behavior (codex implements, claude reviews/babysits)
+// so existing configs are unaffected unless a role is set explicitly. The map is
+// named agentCapabilities rather than `capabilities` because the node config
+// already owns a top-level `capabilities` (advertised node capability list).
+const spawnCapabilitySchema = z.enum(['spawn:codex', 'spawn:claude'])
+const agentCapabilitiesSchema = z.object({
+  implementer: spawnCapabilitySchema.default('spawn:codex'),
+  reviewer: spawnCapabilitySchema.default('spawn:claude'),
+  babysitter: spawnCapabilitySchema.default('spawn:claude'),
+}).default({})
+
 const slackSchema = z.object({
   channel: z.string(),
   style: z.literal('threaded-summarized').default('threaded-summarized'),
@@ -151,6 +166,7 @@ const WorkspaceConfigObjectSchema = z.object({
   repos: workspaceReposSchema,
   batchSize: z.number().int().min(1).max(5).default(5),
   models: modelsSchema,
+  agentCapabilities: agentCapabilitiesSchema,
   slack: slackSchema,
   // Linear remains the default whenever its issue sub-root is connected. When
   // omitted, the orchestrator probes that sub-root once and falls back to

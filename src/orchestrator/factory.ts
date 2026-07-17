@@ -10,6 +10,7 @@ import type {
   AgentMessage,
   AgentPidResolution,
   AgentSpec,
+  Capability,
   ChangeEvent,
   FleetClient,
   GithubPublishPullRequestResult,
@@ -5154,7 +5155,7 @@ export class FactoryLoop implements Factory {
       const record = batch.getIssue(session.issue)
       const tracked = record?.agents.get(session.agentName)
         ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
-        ?? durableBabysitterTrackedAgent(session)
+        ?? durableBabysitterTrackedAgent(session, this.#config.agentCapabilities.babysitter)
       const ref: BabysitterPrRef = {
         repo: session.repo,
         prNumber: session.prNumber,
@@ -5267,7 +5268,7 @@ export class FactoryLoop implements Factory {
       if (ref?.agentName && githubPrIdentity(ref.repo, ref.prNumber) === wanted) {
         const tracked = record?.agents.get(ref.agentName)
           ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
-          ?? durableBabysitterTrackedAgent({ issue, repo: ref.repo, prNumber: ref.prNumber, path: ref.path, agentName: ref.agentName, critical: false, pendingKinds: [] })
+          ?? durableBabysitterTrackedAgent({ issue, repo: ref.repo, prNumber: ref.prNumber, path: ref.path, agentName: ref.agentName, critical: false, pendingKinds: [] }, this.#config.agentCapabilities.babysitter)
         return { issue, record, ref, tracked }
       }
     }
@@ -8310,7 +8311,7 @@ function routeImplementerSpec(
   return {
     name: agentNameForRole(issue, 'impl', { repo: route.repo, discriminator: slug }),
     role: 'implementer',
-    capability: 'spawn:codex',
+    capability: config.agentCapabilities.implementer,
     model: config.models.implementer,
     task: taskForDispatch(issue, route, 'implementer'),
     repo: route.repo,
@@ -8361,7 +8362,7 @@ function routeReviewerSpec(
     ...reviewer,
     name: agentNameForRole(issue, 'review', { repo: route.repo }),
     role: 'reviewer',
-    capability: reviewer.capability ?? 'spawn:claude',
+    capability: reviewer.capability ?? config.agentCapabilities.reviewer,
     model: reviewer.model ?? config.models.reviewer,
     task: taskForDispatch(issue, route, 'reviewer'),
     repo: route.repo,
@@ -9725,11 +9726,14 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   sessionRef: tracked.sessionRef,
 })
 
-const durableBabysitterTrackedAgent = (session: BabysitterSessionState): TrackedAgent => ({
+const durableBabysitterTrackedAgent = (
+  session: BabysitterSessionState,
+  capability: Capability = 'spawn:claude',
+): TrackedAgent => ({
   spec: {
     name: session.agentName,
     role: 'babysitter',
-    capability: 'spawn:claude',
+    capability,
     task: '',
     repo: session.repo,
     ownedPullRequest: { repo: session.repo, number: session.prNumber, path: session.path },

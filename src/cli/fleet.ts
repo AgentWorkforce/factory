@@ -569,7 +569,7 @@ async function runStandaloneBabysitCommand(
 
   const spawned = await fleet.spawn({
     name: agentName,
-    capability: 'spawn:claude',
+    capability: config.agentCapabilities.babysitter,
     node: 'self',
     repo,
     clonePath,
