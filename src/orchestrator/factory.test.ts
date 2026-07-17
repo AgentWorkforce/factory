@@ -10987,8 +10987,7 @@ describe('FactoryLoop', () => {
       body: '[factory-needs-input] Issue: AR-37\nQuestion: Which retry helper should I use?',
       eventId: 'agent-question-37',
     })
-    await flush()
-    await flush()
+    await vi.waitFor(() => expect(factory.status().counters.clarificationQuestionsDelivered).toBe(1))
 
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-37'), 'human-answer-37', {
       text: 'Use retryOnTimeout from factory.ts.',

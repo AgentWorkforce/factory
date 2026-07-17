@@ -4733,8 +4733,9 @@ export class FactoryLoop implements Factory {
       watch.detectAgentQuestions = true
     }
     if (this.#githubIssueCommentWatchers.has(key)) {
-      this.#githubIssueCommentWatchStates.set(key, normalizeGithubIssueCommentWatch(watch))
-      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+      const normalizedWatch = normalizeGithubIssueCommentWatch(watch)
+      this.#githubIssueCommentWatchStates.set(key, normalizedWatch)
+      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, normalizedWatch)
       return
     }
     await this.#watchGithubIssueComments(watch)
