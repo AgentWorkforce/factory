@@ -3783,8 +3783,12 @@ describe('FactoryLoop', () => {
       const decision = await first.triageIssue(parseLinearIssue(issuePath(785), issueFile(785)))
       await first.dispatch(decision)
       firstFleet.emitAgentExit('ar-785-impl-pear', 'exited')
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
-        .toMatchObject({ phase: 'releasing' }))
+      await vi.waitFor(async () => {
+        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        expect(lifecycle).toMatchObject({ phase: 'releasing' })
+        expect(lifecycle?.agents.find((agent) => agent.name === 'ar-785-review')?.releasedAtMs)
+          .toEqual(expect.any(Number))
+      })
       await first.stop()
 
       const restartedFleet = new RemoteLifecycleFleetClient()
@@ -11461,6 +11465,15 @@ describe('FactoryLoop PR babysitter', () => {
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
       expect(fleet.messages.slice(messagesBeforeRestart).filter((message) =>
         message.to === 'ar-493-impl-pear' || message.to === 'ar-493-review')).toEqual([])
+
+      fleet.emitAgentMessage({
+        from: 'ar-493-babysit',
+        target: 'factory',
+        body: '[factory-pr-ready] AR-493',
+      })
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'complete' }))
+      expect(await state().listBabysitterSessions('factory-test')).toEqual([])
     } finally {
       await first.stop()
       await restarted?.stop()

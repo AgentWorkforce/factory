@@ -2244,6 +2244,12 @@ export class FactoryLoop implements Factory {
       this.#scheduleDispatchLifecycleRetry(record)
       return false
     }
+    // Terminal lifecycle saves intentionally relinquish the owner epoch. Clear
+    // the babysitter's durable ownership/wake/critical state while that epoch
+    // is still valid so a later reopened issue cannot inherit a stale PR owner.
+    if (this.#fleet.placementLocality === 'remote' && this.#config.babysitter.enabled) {
+      await this.#cancelBabysitterWake(issueKey(record.issue))
+    }
     if (!await this.#saveDispatchLifecycle(record, 'complete')) return false
     this.#increment(releaseReason === 'issue-human-review' ? 'humanReview' : 'done')
     this.#emit('issue-done', { issue: record.issue })
