@@ -64,7 +64,49 @@ describe('resolveRelayfileMountBinary', () => {
       vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
       vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64')
 
-      expect(resolveRelayfileMountBinary(dir)).toBe(packageBinary)
+      // Isolate the deployment fallback from this checkout's real node_modules.
+      expect(resolveRelayfileMountBinary(dir, join(dir, 'empty-install'))).toBe(packageBinary)
+    })
+  })
+
+  it('resolves a hoisted npx install without a factory config in the workspace', async () => {
+    await withTempDir(async (dir) => {
+      const installDir = join(dir, 'node_modules', '@agent-relay', 'factory', 'dist', 'mount')
+      const workspaceDir = join(dir, 'workspace')
+      await mkdir(installDir, { recursive: true })
+      await mkdir(workspaceDir, { recursive: true })
+
+      const packageBinDir = join(dir, 'node_modules', '@relayfile', 'mount-darwin-arm64', 'bin')
+      await mkdir(packageBinDir, { recursive: true })
+      const packageBinary = join(packageBinDir, 'relayfile-mount')
+      await writeFile(packageBinary, '#!/bin/sh\n', 'utf8')
+      await chmod(packageBinary, 0o755)
+
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
+      vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64')
+
+      expect(resolveRelayfileMountBinary(workspaceDir, installDir)).toBe(packageBinary)
+    })
+  })
+
+  it('resolves an optional mount nested under a global factory install', async () => {
+    await withTempDir(async (dir) => {
+      const factoryRoot = join(dir, 'lib', 'node_modules', '@agent-relay', 'factory')
+      const installDir = join(factoryRoot, 'dist', 'mount')
+      const workspaceDir = join(dir, 'workspace')
+      await mkdir(installDir, { recursive: true })
+      await mkdir(workspaceDir, { recursive: true })
+
+      const packageBinDir = join(factoryRoot, 'node_modules', '@relayfile', 'mount-linux-x64', 'bin')
+      await mkdir(packageBinDir, { recursive: true })
+      const packageBinary = join(packageBinDir, 'relayfile-mount')
+      await writeFile(packageBinary, '#!/bin/sh\n', 'utf8')
+      await chmod(packageBinary, 0o755)
+
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('linux')
+      vi.spyOn(process, 'arch', 'get').mockReturnValue('x64')
+
+      expect(resolveRelayfileMountBinary(workspaceDir, installDir)).toBe(packageBinary)
     })
   })
 

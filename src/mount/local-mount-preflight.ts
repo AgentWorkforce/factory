@@ -113,8 +113,8 @@ async function spawnMountViaCli(cli: string, workspaceId: string, startDir: stri
 }
 
 async function spawnMountViaRawBinary(workspaceId: string, startDir: string): Promise<void> {
-  // Search from the deployment dir (where factory.config.json + the bundled
-  // @relayfile/mount live), not this module's install location.
+  // The resolver searches both factory's installation tree (global/npx/local)
+  // and the deployment dir for backwards-compatible development fallbacks.
   const binaryPath = resolveRelayfileMountBinary(startDir)
   await runRelayfile(binaryPath, ['start', workspaceId, '.integrations', '--background', '--rehome'], startDir, workspaceId)
 }
