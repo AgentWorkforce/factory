@@ -237,6 +237,20 @@ describe('HeuristicTriage thin and scope detection', () => {
     })
   })
 
+  it('routes per-role agent CLI overrides into implementer, reviewer, and babysitter specs', async () => {
+    const overridden = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' }, clonePaths: { 'AgentWorkforce/pear': '/work/pear' }, default: 'AgentWorkforce/pear' },
+      models: { implementer: 'codex-test', reviewer: 'claude-test' },
+      agentCapabilities: { implementer: 'spawn:claude', reviewer: 'spawn:codex', babysitter: 'spawn:codex' },
+    })
+    const decision = await new HeuristicTriage().triage(issue(), { ...ctx, config: overridden })
+
+    expect(decision.implementers[0]).toMatchObject({ capability: 'spawn:claude' })
+    expect(decision.reviewer).toMatchObject({ capability: 'spawn:codex' })
+    expect(babysitterSpec(issue(), overridden, decision.routes[0])).toMatchObject({ capability: 'spawn:codex' })
+  })
+
   it('repo-qualifies every collision-prone GitHub-native role while preserving its source repo identity', async () => {
     const githubIssue = issue({
       uuid: 'AgentWorkforce/hoopsheet#26',
