@@ -186,6 +186,7 @@ export class InternalFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }): Promise<SpawnResult> {
     assertSelfNode(input.node)
     this.#ensureEventSubscription()
@@ -197,6 +198,7 @@ export class InternalFleetClient implements FleetClient {
       cli: capabilityCli[input.capability ?? this.#resumeCapability],
       cwd: this.#cwd,
       continueFrom: input.sessionRef,
+      task: input.task,
     })
     const requestedName = input.name ?? input.sessionRef
     const exitSequenceAtSpawnStart = this.#trackAgentStart(requestedName)

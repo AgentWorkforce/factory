@@ -180,6 +180,7 @@ export class FakeFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }> = []
   readonly releases: Array<{ name: string; reason?: string }> = []
   readonly messages: SendInput[] = []
@@ -216,6 +217,7 @@ export class FakeFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }): Promise<SpawnResult> {
     this.resumes.push(input)
     const name = input.name ?? input.sessionRef

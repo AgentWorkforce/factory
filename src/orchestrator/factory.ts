@@ -43,7 +43,11 @@ import {
   deriveDescriptorsFromMount,
   prescriptiveInstructions,
 } from '@agent-relay/integration-prompts'
-import { renderAgentTask } from '../dispatch/templates'
+import {
+  parseGithubHumanInputRequest,
+  renderAgentTask,
+  type GithubHumanInputRequest,
+} from '../dispatch/templates'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
 import type {
@@ -1718,8 +1722,18 @@ export class FactoryLoop implements Factory {
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
-    if (!dryRun && this.#fleet.placementLocality === 'remote') {
-      const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun)
+    // Full task rendering is part of the durable spawn specification. It must
+    // happen before a remote lifecycle is first claimed so takeover cannot
+    // recover a persisted minimal triage task after a crash in this gap.
+    const durableRemoteDispatch = !dryRun && this.#fleet.placementLocality === 'remote'
+    const lifecycleRunId = durableRemoteDispatch ? randomUUID() : undefined
+    if (lifecycleRunId) {
+      dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId)
+    }
+    dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
+    if (durableRemoteDispatch) {
+      const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun, lifecycleRunId)
+      this.#consumePendingDispatchClarifications(dispatchDecision.issue)
       dispatchDecision = structuredClone(lifecycleClaim.lifecycle.decision)
       if (lifecycleClaim.lifecycle.phase === 'waiting-for-human') {
         return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
@@ -1736,6 +1750,7 @@ export class FactoryLoop implements Factory {
         if (restored.result) return restored.result
       }
     }
+    if (!durableRemoteDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
@@ -1749,6 +1764,7 @@ export class FactoryLoop implements Factory {
       return record.result
     }
     await this.#saveDispatchLifecycle(record, 'dispatching')
+    if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
@@ -1803,10 +1819,6 @@ export class FactoryLoop implements Factory {
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result)
-        await this.#sendImplementerTask(record)
-        await this.#sendCriticalReviewerMessage(record)
-        await this.#injectPendingSlackClarification(record)
-        await this.#injectPendingGithubClarification(record)
       }
       return result
     } catch (error) {
@@ -1962,10 +1974,14 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #claimDispatchLifecycle(decision: TriageDecision, dryRun: boolean): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
+  async #claimDispatchLifecycle(
+    decision: TriageDecision,
+    dryRun: boolean,
+    preparedRunId?: string,
+  ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
     const key = issueKey(decision.issue)
     const seed: DispatchLifecycle = {
-      runId: randomUUID(),
+      runId: preparedRunId ?? randomUUID(),
       issue: { ...decision.issue },
       decision: structuredClone(decision),
       dryRun,
@@ -1974,7 +1990,7 @@ export class FactoryLoop implements Factory {
       invocationIds: [],
       updatedAtMs: this.#clock.now(),
     }
-    seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
+    if (!preparedRunId) seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
     const claim = await this.#state.claimDispatchLifecycle(
       this.#workspaceId,
       key,
@@ -2176,7 +2192,6 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
-    const hadResult = Boolean(record.result)
     const agents: DispatchResult['agents'] = []
     const specs = dispatchSpecs(record.decision)
     const plannedNames = new Set(specs.map((spec) => spec.name))
@@ -2193,6 +2208,7 @@ export class FactoryLoop implements Factory {
     if (!record.dryRun) {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
+      await this.#ensureGithubAgentQuestionWatch(record, issue)
       if (isGithubIssue(issue)) {
         await this.#githubWriteback.setStatus(issue, 'in-progress')
       } else {
@@ -2207,10 +2223,6 @@ export class FactoryLoop implements Factory {
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
     if (!record.dryRun) {
-      if (!hadResult) {
-        await this.#sendImplementerTask(record)
-        await this.#sendCriticalReviewerMessage(record)
-      }
       for (const tracked of record.agents.values()) {
         const owned = tracked.spec.ownedPullRequest
         if (tracked.spec.role !== 'babysitter' || !owned) continue
@@ -3248,6 +3260,15 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // The issue-comment subscription and the fleet exit callback are separate
+    // event streams. Reconcile comments that are already durable in the mount
+    // before interpreting a clean exit as task completion, so an agent that
+    // writes its question and immediately exits cannot race the sync callback.
+    if (await this.#reconcileGithubQuestionBeforeAgentExit(record, name)) {
+      this.#increment('githubQuestionExitsSuppressed')
+      return
+    }
+
     const exiting = record.agents.get(name)
 
     if (this.#fleet.placementLocality === 'remote') {
@@ -3898,6 +3919,9 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    // Compatibility for pre-durable prompts and for Linear-only tasks that
+    // have no source GitHub issue to use as a durable record. New GitHub-source
+    // tasks use the structured comment handled by #handleGithubIssueComment.
     const question = parseAgentQuestion(message)
     if (!question || !isFactoryQuestionTarget(message.target)) {
       return
@@ -3917,7 +3941,6 @@ export class FactoryLoop implements Factory {
         this.#increment('agentQuestionsIgnoredNoInFlight')
         return
       }
-
       if (question.issueKey && question.issueKey !== record.issue.key) {
         this.#increment('agentQuestionsIgnoredIssueMismatch')
         this.#logger.warn?.('[factory] ignored agent question for mismatched issue', {
@@ -4145,6 +4168,10 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    if (!claimed.threadId) {
+      return await this.#deliverClarificationQuestionToGithub(key, claimed, 'no Slack dispatch thread exists')
+    }
+
     if (await this.#shouldSkipSlackWriteback('agent-question')) {
       return await this.#deliverClarificationQuestionToGithub(
         key,
@@ -4325,6 +4352,7 @@ export class FactoryLoop implements Factory {
       decision: structuredClone(record.decision),
       dryRun: record.dryRun,
       threadId,
+      questionSource: 'slack',
       askerName: question.agentName,
       question: question.question,
       askedAtMs: this.#clock.now(),
@@ -4343,6 +4371,73 @@ export class FactoryLoop implements Factory {
     }
     this.#scheduleClarificationSweep(CLARIFICATION_STALE_WARN_MS)
     return waiting
+  }
+
+  async #reserveGithubHumanClarification(
+    record: InFlightIssue,
+    question: AgentQuestion,
+  ): Promise<WaitingClarification | false> {
+    const key = issueKey(record.issue)
+    const agents = [...record.agents].map(([name, tracked]) => ({
+      name,
+      tracked: structuredClone(tracked),
+    }))
+    if (agents.length === 0) {
+      this.#increment('agentQuestionReleaseSkippedNoAgents')
+      return false
+    }
+
+    const nowMs = this.#clock.now()
+    const waiting: WaitingClarification = {
+      issue: { ...record.issue },
+      decision: structuredClone(record.decision),
+      dryRun: record.dryRun,
+      threadId: await this.#state.getSlackThread(this.#workspaceId, key),
+      questionSource: 'github',
+      askerName: question.agentName,
+      question: question.question,
+      askedAtMs: nowMs,
+      questionPostedAtMs: nowMs,
+      agents,
+    }
+    if (!await this.#state.reserveWaitingClarification(this.#workspaceId, key, waiting)) {
+      this.#increment('agentQuestionClarificationAlreadyReserved')
+      this.#logger.info?.('[factory] ignored a second GitHub agent question while clarification is already reserved', {
+        issue: record.issue.key,
+        asker: question.agentName,
+      })
+      return false
+    }
+    this.#scheduleClarificationSweep(CLARIFICATION_STALE_WARN_MS)
+    return waiting
+  }
+
+  async #mirrorGithubAgentQuestionToSlack(record: InFlightIssue, question: AgentQuestion): Promise<void> {
+    if (!this.#slack || !this.#config.slack) return
+    if (await this.#shouldSkipSlackWriteback('agent-question-mirror')) {
+      this.#increment('agentQuestionSlackMirrorsSkippedDegraded')
+      return
+    }
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
+    if (!threadId) {
+      this.#increment('agentQuestionSlackMirrorsSkippedMissingThread')
+      return
+    }
+    try {
+      await this.#slack.reply(
+        threadId,
+        agentQuestionSlackText(record.issue, question, this.#config.slack.stakeholderUserIds),
+      )
+      this.#increment('agentQuestionsMirroredToSlack')
+      this.#recordSlackWritebackSuccess('agent-question-mirror')
+    } catch (error) {
+      this.#markSlackWritebackFailure('agent-question-mirror', error)
+      this.#increment('agentQuestionSlackMirrorFailures')
+      this.#logger.warn?.('[factory] optional Slack question mirror failed', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+    }
   }
 
   async #parkForHumanClarification(record: InFlightIssue, waiting: WaitingClarification): Promise<void> {
@@ -4613,6 +4708,55 @@ export class FactoryLoop implements Factory {
     return added
   }
 
+  async #ensureGithubAgentQuestionWatch(record: InFlightIssue, issue: LinearIssue): Promise<void> {
+    const source = githubIssueSourceRef(issue)
+    if (!source) return
+
+    const key = githubIssueSourceKey(source)
+    let watch = this.#githubIssueCommentWatchStates.get(key)
+    if (!watch) {
+      const persisted = await this.#state.listGithubIssueCommentWatches(this.#workspaceId)
+      watch = persisted.find(([persistedKey]) => persistedKey === key)?.[1]
+    }
+    if (!watch) {
+      const sinceCommentId = await this.#latestGithubIssueCommentId(source)
+      watch = {
+        issue: { ...record.issue },
+        source,
+        pending: [],
+        detectAgentQuestions: true,
+        sinceCommentId,
+        lastSeenCommentId: sinceCommentId,
+        processedCommentIds: [],
+      }
+    } else {
+      watch.issue = { ...record.issue }
+      watch.detectAgentQuestions = true
+    }
+    if (this.#githubIssueCommentWatchers.has(key)) {
+      const normalizedWatch = normalizeGithubIssueCommentWatch(watch)
+      this.#githubIssueCommentWatchStates.set(key, normalizedWatch)
+      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, normalizedWatch)
+      return
+    }
+    await this.#watchGithubIssueComments(watch)
+    if (!this.#githubIssueCommentWatchStates.has(key)) {
+      throw new Error(`Unable to watch source GitHub issue comments for ${record.issue.key}`)
+    }
+  }
+
+  async #reconcileGithubQuestionBeforeAgentExit(record: InFlightIssue, agentName: string): Promise<boolean> {
+    const watchEntry = [...this.#githubIssueCommentWatchStates].find(([, watch]) => (
+      watch.detectAgentQuestions === true
+      && (watch.issue.uuid === record.issue.uuid || watch.issue.path === record.issue.path)
+    ))
+    if (!watchEntry) return false
+
+    await this.#replayGithubIssueComments(watchEntry[0])
+    const waiting = await this.#state.getWaitingClarification(this.#workspaceId, issueKey(record.issue))
+    return waiting?.questionSource === 'github' && waiting.agents.some(({ name }) => name === agentName)
+  }
+
   async #watchGithubIssueComments(watch: GithubIssueCommentWatchState): Promise<boolean> {
     watch = normalizeGithubIssueCommentWatch(watch)
     const key = githubIssueSourceKey(watch.source)
@@ -4711,7 +4855,7 @@ export class FactoryLoop implements Factory {
     const watch = this.#githubIssueCommentWatchStates.get(key)
     if (!watch) return
     watch.pending = watch.pending.filter((pending) => pending.correlationId !== correlationId)
-    if (watch.pending.length === 0) {
+    if (watch.pending.length === 0 && !watch.detectAgentQuestions) {
       await this.#stopGithubIssueCommentWatcher(source)
       return
     }
@@ -4720,7 +4864,7 @@ export class FactoryLoop implements Factory {
 
   async #rearmGithubIssueCommentWatchers(): Promise<void> {
     for (const [, watch] of await this.#state.listGithubIssueCommentWatches(this.#workspaceId)) {
-      if (watch.pending.length === 0) continue
+      if (watch.pending.length === 0 && !watch.detectAgentQuestions) continue
       try {
         await this.#watchGithubIssueComments(watch)
         this.#increment('githubIssueCommentWatchersRearmed')
@@ -4830,10 +4974,26 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    const request = watch.detectAgentQuestions
+      ? parseGithubHumanInputRequest(comment.body)
+      : undefined
+    if (request) {
+      await this.#handleGithubAgentQuestionComment(watch, comment, request)
+      processedCommentIds.add(normalizedCommentId)
+      watch.processedCommentIds = [...processedCommentIds]
+      watch.lastSeenCommentId = String(Math.max(commentId, githubCommentNumericId(watch.lastSeenCommentId)))
+      await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+      return
+    }
+
     const reply = githubCorrelatedReply(comment.body)
     const pending = reply
       ? watch.pending.find((candidate) => candidate.correlationId === reply.correlationId)
-      : undefined
+      : watch.pending.find((candidate) =>
+          candidate.kind === 'agent-question' &&
+          candidate.replyAfterCommentId !== undefined &&
+          commentId > githubCommentNumericId(candidate.replyAfterCommentId))
+    const answerText = reply?.text ?? comment.body.trim()
     let resolved = false
     let discardClaimedPending = false
     if (pending?.claimedByCommentId === normalizedCommentId) {
@@ -4846,10 +5006,16 @@ export class FactoryLoop implements Factory {
         commentId: normalizedCommentId,
         correlationId: pending.correlationId,
       })
-    } else if (pending && comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()) {
+    } else if (
+      pending &&
+      answerText &&
+      typeof pending.authorizedAuthor === 'string' &&
+      pending.authorizedAuthor.length > 0 &&
+      comment.author?.toLowerCase() === pending.authorizedAuthor.toLowerCase()
+    ) {
       pending.claimedByCommentId = normalizedCommentId
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
-      resolved = await this.#routeGithubAnswerToImplementers(watch, pending, comment, reply!.text)
+      resolved = await this.#routeGithubAnswerToImplementers(watch, pending, comment, answerText)
       if (!resolved) {
         delete pending.claimedByCommentId
       }
@@ -4879,10 +5045,102 @@ export class FactoryLoop implements Factory {
     if ((resolved || discardClaimedPending) && pending) {
       watch.pending = watch.pending.filter((candidate) => candidate.correlationId !== pending.correlationId)
     }
-    if (watch.pending.length === 0) {
+    if (watch.pending.length === 0 && !watch.detectAgentQuestions) {
       await this.#stopGithubIssueCommentWatcher(watch.source)
     } else {
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+    }
+  }
+
+  async #handleGithubAgentQuestionComment(
+    watch: GithubIssueCommentWatchState,
+    comment: GithubIssueComment,
+    request: GithubHumanInputRequest,
+  ): Promise<void> {
+    const record = (await this.#batch()).getIssue(watch.issue)
+    if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
+      this.#increment('githubAgentQuestionsIgnoredNoInFlight')
+      return
+    }
+    const tracked = record.agents.get(request.agentName)
+    if (!tracked || !['implementer', 'reviewer', 'babysitter'].includes(tracked.spec.role)) {
+      this.#increment('githubAgentQuestionsIgnoredUnknownAgent')
+      return
+    }
+    // Agents write through the connected GitHub App, whose comments are
+    // provider-authored bot records. Never let an arbitrary repository
+    // commenter forge the predictable structured fields and park a live team.
+    if (!comment.isBot) {
+      this.#increment('githubAgentQuestionsIgnoredUntrustedAuthor')
+      this.#logger.info?.('[factory] ignored GitHub agent question from an untrusted commenter', {
+        issue: watch.issue,
+        commentId: comment.commentId,
+        author: comment.author,
+      })
+      return
+    }
+
+    const question: AgentQuestion = {
+      agentName: request.agentName,
+      issueKey: request.issueKey,
+      question: request.question,
+      eventId: `github:${watch.source.owner}/${watch.source.repo}#${watch.source.number}:${comment.commentId}`,
+    }
+    const correlationId = githubEscalationCorrelationId(
+      'agent-question',
+      record.issue,
+      `${comment.commentId}:${question.question}`,
+    )
+    const issue = await this.#readIssue(record.issue.path)
+    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    if (!authorizedAuthor) {
+      this.#increment('githubAgentQuestionsIgnoredMissingAuthorizedAuthor')
+      this.#surfaceEscalationDeliveryFailure(
+        'agent-question',
+        record.issue,
+        correlationId,
+        'source GitHub issue has no identifiable reporter authorized to answer the durable question',
+      )
+      return
+    }
+    this.#clarificationIntents.set(
+      question.agentName,
+      (this.#clarificationIntents.get(question.agentName) ?? 0) + 1,
+    )
+    let durableClarificationOwnsExit = false
+    try {
+      const dedupeKey = agentQuestionDedupeKey(record.issue, question)
+      if (!await this.#state.claimAgentQuestion(this.#workspaceId, dedupeKey)) {
+        this.#increment('agentQuestionDuplicatesSuppressed')
+        return
+      }
+
+      const reserved = await this.#reserveGithubHumanClarification(record, question)
+      if (reserved === false) {
+        const existing = await this.#state.getWaitingClarification(this.#workspaceId, issueKey(record.issue))
+        durableClarificationOwnsExit = Boolean(existing?.agents.some(({ name }) => name === question.agentName))
+        return
+      }
+
+      durableClarificationOwnsExit = true
+      if (!watch.pending.some((pending) => pending.correlationId === correlationId)) {
+        watch.pending.push({
+          correlationId,
+          kind: 'agent-question',
+          authorizedAuthor,
+          replyAfterCommentId: comment.commentId,
+        })
+        await this.#state.setGithubIssueCommentWatch(this.#workspaceId, githubIssueSourceKey(watch.source), watch)
+      }
+      await this.#parkForHumanClarification(record, reserved)
+      this.#increment('githubAgentQuestionsDetected')
+      void this.#mirrorGithubAgentQuestionToSlack(record, question)
+    } finally {
+      if (!durableClarificationOwnsExit) {
+        const remaining = (this.#clarificationIntents.get(question.agentName) ?? 1) - 1
+        if (remaining > 0) this.#clarificationIntents.set(question.agentName, remaining)
+        else this.#clarificationIntents.delete(question.agentName)
+      }
     }
   }
 
@@ -4916,27 +5174,8 @@ export class FactoryLoop implements Factory {
       return true
     }
 
-    const liveRecord = (await this.#batch()).getIssue(watch.issue)
-    if (!liveRecord || liveRecord.dryRun) {
-      this.#increment('githubAnswersIgnoredNoInFlight')
-      return false
-    }
-    if (!this.#fleet.sendInput) return false
-
-    const recipients = [...liveRecord.agents.values()]
-      .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
-      .map((agent) => agent.result?.name ?? agent.spec.name)
-      .filter((name): name is string => Boolean(name))
-    if (recipients.length === 0) {
-      this.#increment('githubAnswersIgnoredNoImplementer')
-      return false
-    }
-
-    for (const recipient of new Set(recipients)) {
-      await this.#fleet.sendInput(recipient, githubReplyEvent(liveRecord.issue, text, comment.author))
-      this.#increment('githubAnswersInjected')
-    }
-    return true
+    this.#increment('githubAnswersIgnoredNoDurableClarification')
+    return false
   }
 
   async #handleTriageEscalationGithubAnswer(record: InFlightIssue, text: string): Promise<boolean> {
@@ -5012,62 +5251,49 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  async #sendCriticalReviewerMessage(record: InFlightIssue): Promise<void> {
-    if (!this.#fleet.waitForInjected) {
-      return
-    }
+  async #withRenderedDispatchTasks(decision: TriageDecision, issue: LinearIssue): Promise<TriageDecision> {
+    if (decision.scope === 'workflow') return decision
 
-    const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
-    if (!reviewer) {
-      return
-    }
+    const key = issueKey(decision.issue)
+    const slackClarification = this.#pendingSlackClarifications.get(key)
+    const githubClarification = this.#pendingGithubClarifications.get(key)
+    const templateIssue = templateIssueFromRecord({ issue: decision.issue }, issue)
+    templateIssue.description = [
+      templateIssue.description,
+      slackClarification ? `Human clarification from Slack:\n${slackClarification}` : undefined,
+      githubClarification ? `Human clarification from GitHub:\n${githubClarification}` : undefined,
+    ].filter((part): part is string => Boolean(part)).join('\n\n')
 
-    const input = {
-      to: reviewer.result?.name ?? reviewer.spec.name,
-      text: `Review is queued for ${record.issue.key}. Watch implementer PR handoff and report readiness.`,
-      from: 'factory',
-      data: { issue: record.issue },
+    const implementerNames = decision.implementers.map((implementer) => implementer.name)
+    const reviewerName = decision.reviewer.name
+    const integrationInstructions = await this.#resolveIntegrationInstructions()
+    const render = (spec: AgentSpec): AgentSpec => ({
+      ...spec,
+      task: renderAgentTask({
+        issue: templateIssue,
+        route: routeForSpec(decision, spec),
+        role: spec.role,
+        config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
+        reviewerName,
+        implementerNames,
+        integrationsMountRoot: this.#integrationsMountRoot(),
+        integrationInstructions,
+        branchName: spec.branch,
+        agentName: spec.name,
+      }),
+    })
+
+    return {
+      ...decision,
+      implementers: decision.implementers.map(render),
+      reviewer: render(decision.reviewer),
     }
-    const ack = await this.#waitForInjectedAndSubmit(input)
-    await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
   }
 
-  async #sendImplementerTask(record: InFlightIssue): Promise<void> {
-    if (!this.#fleet.waitForInjected) {
-      return
-    }
-
-    const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
-    if (implementers.length === 0) {
-      return
-    }
-
-    const issue = await this.#readIssue(record.issue.path)
-    const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
-    const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name ?? 'reviewer'
-    const implementerNames = implementers.map((agent) => agent.result?.name ?? agent.spec.name)
-    const integrationInstructions = await this.#resolveIntegrationInstructions()
-    for (const implementer of implementers) {
-      const input = {
-        to: implementer.result?.name ?? implementer.spec.name,
-        text: renderAgentTask({
-          issue: templateIssueFromRecord(record, issue),
-          route: routeForImplementer(record, implementer.spec),
-          role: 'implementer',
-          config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
-          reviewerName,
-          implementerNames,
-          slackDispatchThread: await this.#slackDispatchThreadFor(record),
-          integrationsMountRoot: this.#integrationsMountRoot(),
-          integrationInstructions,
-          branchName: implementer.spec.branch,
-        }),
-        from: 'factory',
-        data: { issue: record.issue },
-      }
-      const ack = await this.#waitForInjectedAndSubmit(input)
-      await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
-    }
+  #consumePendingDispatchClarifications(issue: IssueRef): void {
+    const key = issueKey(issue)
+    this.#pendingSlackClarifications.delete(key)
+    this.#pendingGithubClarifications.delete(key)
   }
 
   async #waitForInjectedAndSubmit(
@@ -5889,8 +6115,9 @@ export class FactoryLoop implements Factory {
         implementerNames,
         pr: { number: prRef.prNumber, url: prRef.url },
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
-          integrationsMountRoot: this.#integrationsMountRoot(),
+        integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
+        agentName: spec.name,
       })
 
       const spawned = await this.#spawnAgent(record, {
@@ -6839,6 +7066,7 @@ export class FactoryLoop implements Factory {
     }
     await this.#sweepWaitingClarifications()
     for (const [, waiting] of await this.#state.listWaitingClarifications(this.#workspaceId)) {
+      if (!waiting.threadId) continue
       const key = issueKey(waiting.issue)
       // stop() clears ephemeral thread lookup state, but the durable
       // clarification record owns the canonical thread while parked. Restore
@@ -6911,6 +7139,7 @@ export class FactoryLoop implements Factory {
       // of parking so agents remain released throughout an outage.
       if (waiting.questionPostedAtMs === undefined) continue
       if (waiting.reply || waiting.escalatedAtMs) continue
+      if (!waiting.threadId) continue
       const waitingAgeMs = this.#clock.now() - waiting.askedAtMs
       const untilEscalationMs = CLARIFICATION_STALE_WARN_MS - waitingAgeMs
       if (untilEscalationMs > 0) {
@@ -6941,7 +7170,7 @@ export class FactoryLoop implements Factory {
       })
       try {
         await this.#slack.reply(
-          escalated.threadId,
+          waiting.threadId,
           clarificationStaleSlackText(escalated, this.#config.slack.stakeholderUserIds),
         )
         const completed = await this.#state.completeClarificationEscalation(
@@ -7032,6 +7261,10 @@ export class FactoryLoop implements Factory {
 
     const clarificationKey = issueKey(record.issue)
     const waiting = await this.#state.getWaitingClarification(this.#workspaceId, clarificationKey)
+    if (waiting?.questionSource === 'github' && waiting.threadId === reply.threadTs) {
+      this.#increment('slackClarificationRepliesIgnoredGithubRecord')
+      return
+    }
     if (waiting?.threadId === reply.threadTs) {
       const claimed = await this.#state.claimClarificationReply(this.#workspaceId, clarificationKey, {
         id: `${reply.threadTs}:${reply.messageTs}`,
@@ -7253,33 +7486,6 @@ export class FactoryLoop implements Factory {
           await renewLease()
         }
 
-        const event = reply.source === 'github'
-          ? githubReplyEvent(waiting.issue, reply.text, reply.author)
-          : slackReplyEvent(waiting.issue, reply.text)
-        for (const [name] of resumed) {
-          if (waiting.wake?.injectedAgents.includes(name)) continue
-          this.#assertClarificationWakeRunning()
-          await renewLease()
-          if (this.#fleet.sendInput) {
-            await this.#fleet.sendInput(name, event)
-          } else {
-            await this.#fleet.sendMessage({
-              to: name,
-              from: 'factory',
-              text: event.replace(/\r$/u, ''),
-            })
-          }
-          this.#assertClarificationWakeRunning()
-          const marked = await this.#state.markClarificationAgentInjected(
-            this.#workspaceId,
-            key,
-            this.#clarificationWakeOwner,
-            name,
-          )
-          if (!marked) throw new ClarificationWakeLeaseLostError('clarification wake lease lost after injection')
-          this.#increment('clarificationReplyInjections')
-        }
-
         await renewLease()
         await this.#writeInFlightRegistry()
         await this.#saveDispatchLifecycle(record, 'running')
@@ -7287,7 +7493,7 @@ export class FactoryLoop implements Factory {
         const completed = await this.#state.completeClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
         if (!completed) throw new ClarificationWakeLeaseLostError('clarification wake completion lost ownership')
         this.#increment('clarificationTeamsWoken')
-        this.#logger.info?.('[factory] woke team after human clarification', {
+        this.#logger.info?.('[factory] restarted team after human clarification', {
           issue: waiting.issue.key,
           agents: resumed.map(([name]) => name),
           coldStarts: resumed.filter(([, tracked]) => !tracked.sessionRef).length,
@@ -7398,6 +7604,7 @@ export class FactoryLoop implements Factory {
     tracked: TrackedAgent,
     waiting: WaitingClarification,
   ): Promise<SpawnResult> {
+    const task = clarificationResumeTask(tracked.spec.task, waiting)
     if (tracked.sessionRef) {
       try {
         const resumed = await this.#fleet.resume({
@@ -7407,6 +7614,7 @@ export class FactoryLoop implements Factory {
           capability: tracked.spec.capability,
           repo: tracked.spec.repo,
           clonePath: tracked.spec.clonePath,
+          task,
         })
         return {
           ...resumed,
@@ -7428,19 +7636,11 @@ export class FactoryLoop implements Factory {
     }
 
     this.#assertClarificationWakeRunning()
-    const reply = waiting.reply?.text ?? ''
     return await this.#fleet.spawn({
       name,
       capability: tracked.spec.capability,
       node: tracked.result?.node ?? tracked.spec.node ?? 'self',
-      task: [
-        tracked.spec.task,
-        '',
-        'Factory released this team while waiting for human input and could not restore the prior harness session.',
-        `The blocked question was: ${waiting.question}`,
-        `The human replied: ${reply}`,
-        'Re-hydrate from the issue, branch, worktree, and any open PR, then continue the task. Do not repeat completed work.',
-      ].join('\n'),
+      task,
       workflow: tracked.spec.workflow,
       inputs: tracked.spec.inputs,
       model: tracked.spec.model,
@@ -7535,67 +7735,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #injectPendingSlackClarification(record: InFlightIssue): Promise<void> {
-    const key = issueKey(record.issue)
-    const text = this.#pendingSlackClarifications.get(key)
-    if (!text || !this.#fleet.sendInput) {
-      return
-    }
-
-    const recipients = [...record.agents.values()]
-      .filter((agent) =>
-        agent.spec.role === 'implementer' ||
-        agent.spec.role === 'workflow' ||
-        agent.spec.role === 'babysitter')
-      .map((agent) => agent.result?.name ?? agent.spec.name)
-      .filter((name): name is string => Boolean(name))
-
-    for (const recipient of new Set(recipients)) {
-      try {
-        await this.#injectSlackReplyEvent(recipient, record.issue, text)
-        this.#increment('slackTriageAnswersInjectedToAgents')
-      } catch (error) {
-        this.#logger.warn?.('[factory] failed to inject Slack triage clarification into agent', {
-          issue: record.issue.key,
-          recipient,
-          error,
-        })
-      }
-    }
-    this.#pendingSlackClarifications.delete(key)
-  }
-
-  async #injectPendingGithubClarification(record: InFlightIssue): Promise<void> {
-    const key = issueKey(record.issue)
-    const text = this.#pendingGithubClarifications.get(key)
-    if (!text || !this.#fleet.sendInput) {
-      return
-    }
-
-    const recipients = [...record.agents.values()]
-      .filter((agent) =>
-        agent.spec.role === 'implementer' ||
-        agent.spec.role === 'workflow' ||
-        agent.spec.role === 'babysitter')
-      .map((agent) => agent.result?.name ?? agent.spec.name)
-      .filter((name): name is string => Boolean(name))
-
-    for (const recipient of new Set(recipients)) {
-      try {
-        await this.#fleet.sendInput(recipient, githubReplyEvent(record.issue, text))
-        this.#increment('githubTriageAnswersInjectedToAgents')
-      } catch (error) {
-        this.#logger.warn?.('[factory] failed to inject GitHub triage clarification into agent', {
-          issue: record.issue.key,
-          recipient,
-          error,
-        })
-      }
-    }
-    this.#pendingGithubClarifications.delete(key)
-  }
-
-  // Inject the human's Slack reply into the agent framed as the
+  // Route ordinary Slack conversation into a live agent framed as the
   // <integration-event> the spawn prompt tells it to expect (not an ambiguous
   // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
   // event. (A broker confirmed-delivery path via waitForInjected is a possible
@@ -8464,16 +8604,17 @@ function taskForDispatch(issue: LinearIssue, route: TriageDecision['routes'][num
   ].join('\n\n')
 }
 
-const templateIssueFromRecord = (record: InFlightIssue, issue: LinearIssue | undefined) => ({
+const templateIssueFromRecord = (record: Pick<InFlightIssue, 'issue'>, issue: LinearIssue | undefined) => ({
   key: issue?.key ?? record.issue.key,
   title: issue?.title ?? record.issue.key,
   description: issue?.description ?? '',
+  github: issue ? githubIssueSourceRef(issue) : undefined,
 })
 
-const routeForImplementer = (record: InFlightIssue, spec: AgentSpec) => {
-  const route = record.decision.routes.find((candidate) =>
+const routeForSpec = (decision: TriageDecision, spec: AgentSpec) => {
+  const route = decision.routes.find((candidate) =>
     candidate.repo === spec.repo && candidate.clonePath === spec.clonePath,
-  ) ?? record.decision.routes.find((candidate) => candidate.repo === spec.repo)
+  ) ?? decision.routes.find((candidate) => candidate.repo === spec.repo)
 
   return {
     repo: spec.repo,
@@ -9897,8 +10038,17 @@ const slackAnswerInput = (issue: IssueRef, text: string): string =>
 const slackReplyEvent = (issue: IssueRef, text: string): string =>
   `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
 
-const githubReplyEvent = (issue: IssueRef, text: string, author?: string): string =>
-  `<integration-event source="github" issue="${issue.key}">\nHuman reply${author ? ` from @${author}` : ''} on the GitHub issue:\n${text}\n</integration-event>\r`
+const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification): string => {
+  const reply = waiting.reply
+  return [
+    baseTask,
+    '',
+    'Factory released this team while waiting for human input and is now starting a fresh task after the durable issue-comment response.',
+    `The blocked question was: ${waiting.question}`,
+    `The human answered${reply?.author ? ` as @${reply.author}` : ''}: ${reply?.text ?? ''}`,
+    'Re-hydrate from the issue, branch, worktree, and any open PR, then continue the task. Do not repeat completed work.',
+  ].join('\n')
+}
 
 const isFactoryQuestionTarget = (target: string): boolean => {
   const normalized = target.trim().replace(/^@/u, '').toLowerCase()

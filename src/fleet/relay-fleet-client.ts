@@ -177,6 +177,7 @@ export class RelayFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }): Promise<SpawnResult> {
     const name = input.name ?? input.sessionRef
     return await this.spawn({
@@ -186,6 +187,7 @@ export class RelayFleetClient implements FleetClient {
       repo: input.repo,
       clonePath: input.clonePath,
       sessionRef: input.sessionRef,
+      task: input.task,
     })
   }
 

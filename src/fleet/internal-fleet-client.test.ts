@@ -729,7 +729,12 @@ describe('InternalFleetClient', () => {
     harness.nextSessionRef = 'resumed-session'
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
 
-    await expect(fleet.resume({ name: 'ar-1-impl', sessionRef: 'session-original', node: 'self' })).resolves.toEqual({
+    await expect(fleet.resume({
+      name: 'ar-1-impl',
+      sessionRef: 'session-original',
+      node: 'self',
+      task: 'Continue with the durable human answer.',
+    })).resolves.toEqual({
       name: 'ar-1-impl',
       sessionRef: 'resumed-session',
     })
@@ -739,6 +744,7 @@ describe('InternalFleetClient', () => {
       cli: 'codex',
       cwd: '/worktree',
       continueFrom: 'session-original',
+      task: 'Continue with the durable human answer.',
     })
   })
 
