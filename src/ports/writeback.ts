@@ -24,6 +24,6 @@ export interface GithubWriteback {
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
   setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
   /** Remove Factory lifecycle labels after work is safely aborted before implementation starts. */
-  clearStatus?(issue: LinearIssue): Promise<void>
+  clearStatus(issue: LinearIssue): Promise<void>
   closeIssue(issue: LinearIssue, body: string): Promise<void>
 }

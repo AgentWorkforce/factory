@@ -240,6 +240,7 @@ class RecordingGithubWriteback implements GithubWriteback {
   readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
   readonly clearedStatuses: string[] = []
   readonly closes: Array<{ key: string; body: string }> = []
+  beforeClearStatus?: (issue: LinearIssue) => void
 
   async postComment(issue: LinearIssue, body: string): Promise<void> {
     this.comments.push({ key: issue.key, body })
@@ -250,6 +251,7 @@ class RecordingGithubWriteback implements GithubWriteback {
   }
 
   async clearStatus(issue: LinearIssue): Promise<void> {
+    this.beforeClearStatus?.(issue)
     this.clearedStatuses.push(issue.key)
   }
 
@@ -271,6 +273,12 @@ class TransientGithubClearStatusWriteback extends RecordingGithubWriteback {
     this.clearAttempts += 1
     if (this.clearAttempts === 1) throw new Error('GitHub status clear unavailable')
     await super.clearStatus(issue)
+  }
+}
+
+class ProviderAwareTransientGithubClearStatusWriteback extends TransientGithubClearStatusWriteback {
+  async hasCommentMarker(issue: LinearIssue, marker: string): Promise<boolean> {
+    return this.comments.some((comment) => comment.key === issue.key && comment.body.includes(marker))
   }
 }
 
@@ -665,6 +673,113 @@ class RejectFirstAbortingSaveStateStore extends InMemoryStateStore {
       return false
     }
     return await super.saveDispatchLifecycle(...args)
+  }
+}
+
+class RejectFirstAbandonedSaveStateStore extends InMemoryStateStore {
+  abandonedSaveRejections = 0
+  dispatchAttemptInFlightAtRejection?: boolean
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    const [, key, owner, epoch, , lifecycle] = args
+    if (lifecycle.phase === 'abandoned' && this.abandonedSaveRejections === 0) {
+      this.abandonedSaveRejections += 1
+      this.dispatchAttemptInFlightAtRejection = (
+        await this.getDispatchAttempts(args[0], lifecycle.issue.key) ??
+        await this.getDispatchAttempts(args[0], issueKey(lifecycle.issue))
+      )?.inFlight
+      await super.releaseDispatchLifecycleLease(args[0], key, owner, epoch)
+      return false
+    }
+    return await super.saveDispatchLifecycle(...args)
+  }
+}
+
+class ThrowFirstAbortIntentStateStore extends InMemoryStateStore {
+  abortIntentFailures = 0
+
+  override async beginCriticalDeliveryAbort(
+    ...args: Parameters<InMemoryStateStore['beginCriticalDeliveryAbort']>
+  ) {
+    if (this.abortIntentFailures === 0) {
+      this.abortIntentFailures += 1
+      throw new Error('transient abort intent persistence failure')
+    }
+    return await super.beginCriticalDeliveryAbort(...args)
+  }
+}
+
+class BlockingThrowFirstAbortIntentStateStore extends InMemoryStateStore {
+  readonly abortIntentStarted: Promise<void>
+  #signalAbortIntentStarted!: () => void
+  readonly #abortIntentAllowed: Promise<void>
+  #allowAbortIntent!: () => void
+  abortIntentFailures = 0
+  abortIntentAttempts = 0
+
+  constructor(options: ConstructorParameters<typeof InMemoryStateStore>[0]) {
+    super(options)
+    this.abortIntentStarted = new Promise((resolve) => {
+      this.#signalAbortIntentStarted = resolve
+    })
+    this.#abortIntentAllowed = new Promise((resolve) => {
+      this.#allowAbortIntent = resolve
+    })
+  }
+
+  allowAbortIntent(): void {
+    this.#allowAbortIntent()
+  }
+
+  override async beginCriticalDeliveryAbort(
+    ...args: Parameters<InMemoryStateStore['beginCriticalDeliveryAbort']>
+  ) {
+    this.abortIntentAttempts += 1
+    if (this.abortIntentFailures === 0) {
+      this.#signalAbortIntentStarted()
+      await this.#abortIntentAllowed
+      this.abortIntentFailures += 1
+      throw new Error('transient abort intent persistence failure during stop')
+    }
+    return await super.beginCriticalDeliveryAbort(...args)
+  }
+}
+
+class BlockingCriticalAbortFleetClient extends RemoteInitialInjectionFailureFleetClient {
+  readonly abortReleaseStarted: Promise<void>
+  #signalAbortReleaseStarted!: () => void
+  readonly #abortReleaseAllowed: Promise<void>
+  #allowAbortRelease!: () => void
+  #blocked = false
+  disposeCalls = 0
+
+  constructor() {
+    super()
+    this.abortReleaseStarted = new Promise((resolve) => {
+      this.#signalAbortReleaseStarted = resolve
+    })
+    this.#abortReleaseAllowed = new Promise((resolve) => {
+      this.#allowAbortRelease = resolve
+    })
+  }
+
+  allowAbortRelease(): void {
+    this.#allowAbortRelease()
+  }
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (!this.#blocked && reason?.startsWith('critical-delivery-failed:')) {
+      this.#blocked = true
+      this.#signalAbortReleaseStarted()
+      await this.#abortReleaseAllowed
+    }
+    await super.release(name, reason)
+  }
+
+  override async dispose(): Promise<void> {
+    this.disposeCalls += 1
   }
 }
 
@@ -7569,6 +7684,12 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({ [path]: file })
     const fleet = new InjectFailingPidFleetClient([])
     const githubWriteback = new RecordingGithubWriteback()
+    githubWriteback.beforeClearStatus = () => {
+      expect(fleet.releases.map((release) => release.name)).toEqual([
+        'ar-71-impl-pear',
+        'ar-71-review-pear',
+      ])
+    }
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
@@ -7609,30 +7730,57 @@ describe('FactoryLoop', () => {
       .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
   })
 
-  it('reconciles an idempotent GitHub abort notice before retrying failed status publication', async () => {
+  it('reconciles an idempotent GitHub abort notice across restart before retrying failed status publication', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 73)
     const file = githubIssueFile(73, { labels: ['factory'] })
     const mount = new FakeMountClient({ [path]: file })
-    const fleet = new InjectFailingPidFleetClient([])
-    const githubWriteback = new TransientGithubClearStatusWriteback()
-    const factory = createFactory(config({ issueSource: 'github' }), {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteInitialInjectionFailureFleetClient()
+    const githubWriteback = new ProviderAwareTransientGithubClearStatusWriteback()
+    const firstFactory = createFactory(config({ issueSource: 'github' }), {
       mount,
-      fleet,
+      fleet: firstFleet,
       triage: new StaticTriage(),
       githubWriteback,
+      stateStore,
       clock: new ManualClock(),
     })
 
     const issue = parseGithubFactoryIssue(path, file)
-    await expect(factory.dispatch(await factory.triageIssue(issue)))
+    const decision = await firstFactory.triageIssue(issue)
+    await expect(firstFactory.dispatch(decision))
       .rejects.toThrow('Critical task injection failed to ar-73-impl-pear')
-    expect(factory.status().inFlight).toMatchObject([{ key: '73' }])
+    expect(firstFactory.status().inFlight).toMatchObject([{ key: '73' }])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'aborting',
+    })
     expect(githubWriteback.comments.filter((comment) => comment.body.includes('factory-critical-delivery-abort'))).toHaveLength(1)
+    expect(githubWriteback.clearAttempts).toBe(1)
+    await firstFactory.stop()
 
-    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1), { timeout: 3_000 })
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
     expect(githubWriteback.clearAttempts).toBe(2)
     expect(githubWriteback.comments.filter((comment) => comment.body.includes('factory-critical-delivery-abort'))).toHaveLength(1)
     expect(githubWriteback.clearedStatuses).toEqual(['73'])
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases).toEqual([])
+    await takeover.stop()
   })
 
   it('persists remote abort cleanup for restart takeover instead of resuming an unbriefed team', async () => {
@@ -7707,6 +7855,10 @@ describe('FactoryLoop', () => {
     expect(mount.writes
       .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
       .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing])
+    firstFleet.emitAgentExit('ar-77-review', 'late-after-lease-loss')
+    await flush()
+    expect(firstFactory.status().counters.criticalDeliveryAbortExitsSuppressed).toBeUndefined()
+    expect(firstFleet.resumes).toEqual([])
     await firstFactory.stop()
 
     const takeoverFleet = new RemoteLifecycleFleetClient()
@@ -7791,6 +7943,250 @@ describe('FactoryLoop', () => {
     await takeover.stop()
   })
 
+  it('retries an unexpected abort failure while retaining the fail-closed exit fence', async () => {
+    const mount = new FakeMountClient({ [issuePath(98)]: issueFile(98) })
+    const stateStore = new ThrowFirstAbortIntentStateStore({ batchSize: 2 })
+    const fleet = new RemoteInitialInjectionFailureFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(98), issueFile(98)))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow('transient abort intent persistence failure')
+    expect(stateStore.abortIntentFailures).toBe(1)
+    expect(factory.status().counters.criticalDeliveryAbortUnexpectedFailures).toBe(1)
+    fleet.emitAgentExit('ar-98-review', 'exit-during-abort-retry')
+    await flush()
+    expect(factory.status().counters.criticalDeliveryAbortExitsSuppressed).toBe(1)
+    expect(fleet.resumes).toEqual([])
+
+    await vi.waitFor(() => expect(factory.status().counters.criticalDeliveryAbortsCompleted).toBe(1), { timeout: 3_000 })
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'abandoned',
+    })
+    expect(factory.status().inFlight).toEqual([])
+    await factory.stop()
+  })
+
+  it('drains an active critical abort before fleet disposal without starting queued work', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(100)]: issueFile(100),
+      [issuePath(101)]: issueFile(101),
+    })
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const fleet = new BlockingCriticalAbortFleetClient()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const first = await factory.triageIssue(parseLinearIssue(issuePath(100), issueFile(100)))
+    const queued = await factory.triageIssue(parseLinearIssue(issuePath(101), issueFile(101)))
+    const firstDispatch = factory.dispatch(first).catch((error: unknown) => error)
+
+    await fleet.abortReleaseStarted
+    await expect(factory.dispatch(queued)).resolves.toMatchObject({
+      issue: { key: 'AR-101' },
+      agents: [],
+    })
+    const stopping = factory.stop()
+    await flush()
+    expect(fleet.disposeCalls).toBe(0)
+
+    fleet.allowAbortRelease()
+    await expect(firstDispatch).resolves.toBeInstanceOf(Error)
+    await stopping
+
+    expect(fleet.disposeCalls).toBe(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-100-impl-pear', 'ar-100-review'])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue))).resolves.toMatchObject({
+      phase: 'abandoned',
+    })
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(queued.issue))).resolves.toMatchObject({
+      phase: 'queued',
+    })
+  })
+
+  it('preserves consumed async abort evidence when the first intent write fails during stop', async () => {
+    const mount = new FakeMountClient({ [issuePath(105)]: issueFile(105) })
+    const stateStore = new BlockingThrowFirstAbortIntentStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteReinjectionFailingFleetClient('ar-105-impl-pear')
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(105), issueFile(105)))
+
+    await firstFactory.dispatch(decision)
+    firstFleet.emitDeliveryFailed({
+      to: 'ar-105-impl-pear',
+      msgId: 'fake-1',
+      reason: 'dead-lettered-during-stop',
+    })
+    await stateStore.abortIntentStarted
+
+    let stopSettled = false
+    const stopping = firstFactory.stop().finally(() => { stopSettled = true })
+    await flush()
+    expect(stopSettled).toBe(false)
+    stateStore.allowAbortIntent()
+    await stopping
+
+    expect(stateStore.abortIntentFailures).toBe(1)
+    expect(stateStore.abortIntentAttempts).toBe(2)
+    expect(firstFactory.status().counters.criticalDeliveryAbortStopIntentsPreserved).toBe(1)
+    await expect(stateStore.consumeCritical('factory-test', 'fake-1')).resolves.toBeUndefined()
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      runId: expect.any(String),
+      phase: 'aborting',
+      releaseReason: 'critical-delivery-failed:ar-105-impl-pear',
+    })
+    expect(firstFleet.releases).toEqual([])
+    expect(firstFleet.resumes).toEqual([])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing])
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-105-impl-pear',
+      'ar-105-review',
+    ])
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    await takeover.stop()
+  })
+
+  it('preserves consumed abort evidence when stop cancels an already-scheduled retry', async () => {
+    const mount = new FakeMountClient({ [issuePath(106)]: issueFile(106) })
+    const stateStore = new ThrowFirstAbortIntentStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteReinjectionFailingFleetClient('ar-106-impl-pear')
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(106), issueFile(106)))
+
+    await firstFactory.dispatch(decision)
+    firstFleet.emitDeliveryFailed({
+      to: 'ar-106-impl-pear',
+      msgId: 'fake-1',
+      reason: 'dead-lettered-before-stop',
+    })
+    await vi.waitFor(() => expect(stateStore.abortIntentFailures).toBe(1))
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'running',
+    })
+
+    await firstFactory.stop()
+    expect(firstFactory.status().counters.criticalDeliveryAbortStopIntentsPreserved).toBe(1)
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'aborting',
+      releaseReason: 'critical-delivery-failed:ar-106-impl-pear',
+    })
+    expect(firstFleet.releases).toEqual([])
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-106-impl-pear',
+      'ar-106-review',
+    ])
+    await takeover.stop()
+  })
+
+  it('releases the local exit fence when the final abandoned save loses ownership', async () => {
+    const mount = new FakeMountClient({ [issuePath(99)]: issueFile(99) })
+    const stateStore = new RejectFirstAbandonedSaveStateStore({ batchSize: 2 })
+    const firstFleet = new RemoteInitialInjectionFailureFleetClient()
+    const firstFactory = createFactory(config(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    const decision = await firstFactory.triageIssue(parseLinearIssue(issuePath(99), issueFile(99)))
+
+    await expect(firstFactory.dispatch(decision)).rejects.toThrow('Critical task injection failed')
+    expect(stateStore.abandonedSaveRejections).toBe(1)
+    expect(stateStore.dispatchAttemptInFlightAtRejection).toBe(false)
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      phase: 'aborting',
+      releaseReason: 'critical-delivery-failed:ar-99-impl-pear',
+    })
+    expect(mount.writes
+      .filter((write) => 'stateId' in (write.content as Record<string, unknown>))
+      .map((write) => (write.content as { stateId: string }).stateId)).toEqual([implementing, ready])
+    firstFleet.emitAgentExit('ar-99-review', 'late-after-final-save-lease-loss')
+    await flush()
+    expect(firstFactory.status().counters.criticalDeliveryAbortExitsSuppressed).toBeUndefined()
+    expect(firstFleet.resumes).toEqual([])
+    await firstFactory.stop()
+
+    const takeoverFleet = new RemoteLifecycleFleetClient()
+    const takeover = createFactory(config(), {
+      mount,
+      fleet: takeoverFleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock: new ManualClock(),
+    })
+    await takeover.start({ mode: 'dispatch-owner' })
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'abandoned',
+      })
+    }, { timeout: 3_000 })
+    expect(takeoverFleet.spawns).toEqual([])
+    expect(takeoverFleet.resumes).toEqual([])
+    expect(takeoverFleet.releases).toEqual([])
+    await takeover.stop()
+  })
+
   it('ignores a delayed critical failure record from an older dispatch run', async () => {
     const mount = new FakeMountClient({ [issuePath(79)]: issueFile(79) })
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
@@ -7824,14 +8220,24 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it.each(['complete', 'abandoned'] as const)(
-    'does not restore batch capacity for a late exact-run failure after durable %s',
-    async (phase) => {
-      const issueNumber = phase === 'complete' ? 96 : 97
-      const mount = new FakeMountClient({ [issuePath(issueNumber)]: issueFile(issueNumber) })
-      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+  it.each([
+    { phase: 'complete' as const, seededBatch: false },
+    { phase: 'abandoned' as const, seededBatch: false },
+    { phase: 'complete' as const, seededBatch: true },
+  ])(
+    'does not mutate batch capacity for a late exact-run failure after durable $phase (seeded=$seededBatch)',
+    async ({ phase, seededBatch }) => {
+      const issueNumber = phase === 'complete' ? (seededBatch ? 102 : 96) : 97
+      const mount = new FakeMountClient({
+        [issuePath(issueNumber)]: issueFile(issueNumber),
+        ...(seededBatch ? {
+          [issuePath(103)]: issueFile(103),
+          [issuePath(104)]: issueFile(104),
+        } : {}),
+      })
+      const stateStore = new InMemoryStateStore({ batchSize: seededBatch ? 1 : 2 })
       const fleet = new RemoteLifecycleFleetClient()
-      const factory = createFactory(config(), {
+      const factory = createFactory(config({ batchSize: seededBatch ? 1 : 2 }), {
         mount,
         fleet,
         triage: new StaticTriage(),
@@ -7881,6 +8287,13 @@ describe('FactoryLoop', () => {
         input: { to: target, text: 'late terminal briefing', from: 'factory', data: { issue: decision.issue } },
         runId,
       })
+      const stateBatch = await stateStore.getBatch('factory-test')
+      if (seededBatch) {
+        const occupied = await factory.triageIssue(parseLinearIssue(issuePath(103), issueFile(103)))
+        const queued = await factory.triageIssue(parseLinearIssue(issuePath(104), issueFile(104)))
+        expect(stateBatch.start(occupied, false)).toBeDefined()
+        expect(stateBatch.queue(queued, false)).toBe(true)
+      }
 
       await factory.start({ mode: 'dispatch-owner' })
       fleet.emitDeliveryFailed({ to: target, msgId: `late-${phase}`, reason: 'late-terminal-event' })
@@ -7889,10 +8302,11 @@ describe('FactoryLoop', () => {
       await expect(stateStore.getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({ runId, phase })
       await expect(stateStore.consumeCritical('factory-test', `late-${phase}`)).resolves.toBeUndefined()
       const batch = await stateStore.getBatch('factory-test')
-      expect(batch.size).toBe(0)
-      expect(batch.inFlight).toEqual([])
-      expect(batch.canStart()).toBe(true)
-      expect(factory.status().inFlight).toEqual([])
+      expect(batch.size).toBe(seededBatch ? 1 : 0)
+      expect(batch.inFlight.map((record) => record.issue.key)).toEqual(seededBatch ? ['AR-103'] : [])
+      expect(batch.queued.map((record) => record.issue.key)).toEqual(seededBatch ? ['AR-104'] : [])
+      expect(batch.canStart()).toBe(!seededBatch)
+      expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(seededBatch ? ['AR-103'] : [])
       expect(fleet.spawns).toEqual([])
       expect(fleet.resumes).toEqual([])
       expect(fleet.releases).toEqual([])
@@ -7904,8 +8318,10 @@ describe('FactoryLoop', () => {
       await new Promise((resolve) => setTimeout(resolve, 1_100))
       await expect(stateStore.getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({ runId, phase })
       expect(factory.status().counters.criticalDeliveryFailuresIgnoredTerminalRun).toBe(1)
-      expect(factory.status().inFlight).toEqual([])
-      expect((await stateStore.getBatch('factory-test')).size).toBe(0)
+      expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(seededBatch ? ['AR-103'] : [])
+      expect((await stateStore.getBatch('factory-test')).size).toBe(seededBatch ? 1 : 0)
+      expect((await stateStore.getBatch('factory-test')).queued.map((record) => record.issue.key))
+        .toEqual(seededBatch ? ['AR-104'] : [])
       expect(fleet.spawns).toEqual([])
       expect(fleet.resumes).toEqual([])
       expect(fleet.releases).toEqual([])

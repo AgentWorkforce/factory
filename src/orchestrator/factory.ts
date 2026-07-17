@@ -312,9 +312,15 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #deliveryFailureInFlight = new Set<Promise<void>>()
   readonly #criticalDeliveryAborts = new Map<string, Promise<void>>()
   readonly #criticalDeliveryAborting = new Set<string>()
   readonly #criticalDeliveryAbortRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #criticalDeliveryAbortRetryInputs = new Map<string, {
+    record: InFlightIssue
+    target: string
+    cause: unknown
+  }>()
   readonly #criticalDeliveryNotices = new Set<string>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -660,10 +666,15 @@ export class FactoryLoop implements Factory {
   async stop(): Promise<void> {
     this.#started = false
     this.#stopping = true
+    // Stop accepting new failure callbacks before draining callbacks that may
+    // already be between critical-record consumption and abort registration.
+    this.#offDeliveryFailed?.()
+    this.#offDeliveryFailed = undefined
     if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    const pendingCriticalDeliveryAbortRetries = [...this.#criticalDeliveryAbortRetryInputs.values()]
     for (const timer of this.#criticalDeliveryAbortRetryTimers.values()) clearTimeout(timer)
     this.#criticalDeliveryAbortRetryTimers.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
@@ -671,6 +682,19 @@ export class FactoryLoop implements Factory {
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
       await Promise.allSettled([...this.#dispatchLifecycleDrives])
+      while (this.#deliveryFailureInFlight.size > 0) {
+        await Promise.allSettled([...this.#deliveryFailureInFlight])
+      }
+      // A delivery-failure callback can be releasing a team while stop begins.
+      // Let that fenced cleanup settle before disposing the fleet; retry timers
+      // are already disabled by #stopping, so this drain cannot create new work.
+      while (this.#criticalDeliveryAborts.size > 0) {
+        await Promise.allSettled([...this.#criticalDeliveryAborts.values()])
+      }
+      for (const pending of pendingCriticalDeliveryAbortRetries) {
+        await this.#preserveCriticalDeliveryAbortIntentForStop(pending.record, pending.target)
+      }
+      this.#criticalDeliveryAbortRetryInputs.clear()
       // Fence every source of new clarification work before touching the fleet.
       // A wake already past the fence is allowed to unwind, and is awaited
       // without a timeout so it can never race fleet disposal.
@@ -721,10 +745,8 @@ export class FactoryLoop implements Factory {
       await this.#state.clearSlackThreads(this.#workspaceId)
       this.#slackWatcherStarts.clear()
       this.#offAgentExit?.()
-      this.#offDeliveryFailed?.()
       this.#offAgentMessage?.()
       this.#offAgentExit = undefined
-      this.#offDeliveryFailed = undefined
       this.#offAgentMessage = undefined
       await this.#fleet.dispose()
     } finally {
@@ -1876,7 +1898,14 @@ export class FactoryLoop implements Factory {
     }
     if (!this.#offDeliveryFailed) {
       this.#offDeliveryFailed = this.#fleet.onDeliveryFailed?.((info) => {
-        void this.#handleDeliveryFailed(info)
+        const handling = this.#handleDeliveryFailed(info).catch((error) => {
+          this.#logger.warn?.('[factory] delivery failure handler failed', {
+            target: info.to,
+            error: describeError(error).errorMessage,
+          })
+        })
+        this.#deliveryFailureInFlight.add(handling)
+        void handling.finally(() => this.#deliveryFailureInFlight.delete(handling))
       })
     }
     if (!this.#offAgentMessage) {
@@ -3891,6 +3920,19 @@ export class FactoryLoop implements Factory {
     this.#criticalDeliveryAborts.set(key, abort)
     try {
       await abort
+    } catch (error) {
+      // Keep the exit/resume fence fail-closed, but guarantee unexpected
+      // failures have a convergence path that will eventually clear it.
+      this.#increment('criticalDeliveryAbortUnexpectedFailures')
+      if (this.#stopping && await this.#preserveCriticalDeliveryAbortIntentForStop(record, target)) {
+        // Shutdown needs only the exact-run fatal intent to be durable. A
+        // successor can finish fleet release and provider publication without
+        // making stop depend on eventual control-plane/provider recovery.
+        this.#criticalDeliveryAborting.delete(key)
+        return
+      }
+      this.#scheduleCriticalDeliveryAbortRetry(record, target, cause)
+      throw error
     } finally {
       if (this.#criticalDeliveryAborts.get(key) === abort) this.#criticalDeliveryAborts.delete(key)
     }
@@ -3956,7 +3998,13 @@ export class FactoryLoop implements Factory {
         undefined,
         reason,
         released,
-      )) return
+      )) {
+        // The durable abort intent remains authoritative, but this process no
+        // longer owns cleanup side effects. Its exit handlers are separately
+        // owner-fenced, so release the local suppression fence for takeover.
+        this.#criticalDeliveryAborting.delete(key)
+        return
+      }
     }
 
     if (failed.size > 0) {
@@ -3991,30 +4039,87 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // Drop the dispatch-attempt fence before the terminal lifecycle save. The
+    // still-authoritative `aborting` lifecycle prevents redispatch until that
+    // save succeeds, while a crash immediately after `abandoned` can no longer
+    // strand an in-flight attempt forever.
+    await this.#recordDispatchFailure(record.issue)
     await this.#state.clearCriticalForIssue(this.#workspaceId, record.issue)
     await this.#stopSlackWatcher(record.issue)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     if (this.#fleet.placementLocality === 'remote') {
-      if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason, released)) return
+      if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason, released)) {
+        this.#criticalDeliveryAborting.delete(key)
+        return
+      }
       this.#resolveDispatchTerminalWaiters(record.issue)
     }
 
     const next = (await this.#batch()).complete(record.issue)
-    await this.#recordDispatchFailure(record.issue)
     for (const [agentName] of agents) {
       await this.#state.clearFailureHandoff(this.#workspaceId, registryHandoffKey(record.issue, agentName))
     }
     await this.#writeInFlightRegistry()
     this.#criticalDeliveryAborting.delete(key)
     this.#increment('criticalDeliveryAbortsCompleted')
-    if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
+    if (next) {
+      if (this.#stopping) {
+        (await this.#batch()).queue(next.decision, next.dryRun)
+      } else {
+        await this.dispatch(next.decision, { dryRun: next.dryRun })
+      }
+    }
+  }
+
+  async #preserveCriticalDeliveryAbortIntentForStop(record: InFlightIssue, target: string): Promise<boolean> {
+    if (this.#fleet.placementLocality !== 'remote' || !record.runId) return false
+    const key = issueKey(record.issue)
+    const reason = `critical-delivery-failed:${target}`
+    let failures = 0
+    // Once an exact critical record has been consumed, shutdown cannot safely
+    // release the lifecycle lease until a takeover-visible abort intent exists.
+    // Retry only this atomic state transition; full cleanup/provider recovery
+    // deliberately remains successor work.
+    while (this.#stopping) {
+      try {
+        const lifecycle = await this.#state.beginCriticalDeliveryAbort(
+          this.#workspaceId,
+          key,
+          record.runId,
+          this.#clock.now(),
+          reason,
+        )
+        if (lifecycle) {
+          this.#increment('criticalDeliveryAbortStopIntentsPreserved')
+          return true
+        }
+        const current = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (!current || current.runId !== record.runId || isTerminalDispatchLifecycle(current)) {
+          this.#increment('criticalDeliveryAbortStopIntentsObsolete')
+          return true
+        }
+      } catch (intentError) {
+        failures += 1
+        this.#increment('criticalDeliveryAbortStopIntentRetries')
+        this.#logger.warn?.('[factory] retrying critical delivery abort intent during shutdown', {
+          issue: record.issue.key,
+          target,
+          failures,
+          error: describeError(intentError).errorMessage,
+        })
+      }
+      await this.#clock.sleep(DISPATCH_LIFECYCLE_RETRY_MS)
+    }
+    return false
   }
 
   #scheduleCriticalDeliveryAbortRetry(record: InFlightIssue, target: string, cause: unknown): void {
     const key = issueKey(record.issue)
     if (this.#stopping || this.#criticalDeliveryAbortRetryTimers.has(key)) return
+    this.#criticalDeliveryAbortRetryInputs.set(key, { record, target, cause })
     const timer = setTimeout(() => {
       this.#criticalDeliveryAbortRetryTimers.delete(key)
+      this.#criticalDeliveryAbortRetryInputs.delete(key)
       void this.#abortCriticalDelivery(record, target, cause).catch((error) => {
         this.#logger.warn?.('[factory] critical delivery abort retry failed', {
           issue: record.issue.key,
@@ -4056,9 +4161,6 @@ export class FactoryLoop implements Factory {
     }
     if (cleanupPending) return
     if (isGithubIssue(issue)) {
-      if (!this.#githubWriteback.clearStatus) {
-        throw new Error('GitHub writeback does not support clearing lifecycle status after a critical delivery abort')
-      }
       await this.#githubWriteback.clearStatus(issue)
     } else {
       const readyStateId = this.#states.idFor(issue.team, 'readyForAgent')
