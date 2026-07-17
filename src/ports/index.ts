@@ -4,6 +4,7 @@ export type {
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  LocalMountOptions,
   MountClient,
   ProviderSyncStatus,
   SubscribeOptions,
