@@ -494,6 +494,15 @@ const normalizeProviderSyncStatus = (value: unknown, provider: string): Provider
     numberField(source, 'last_event_at_ms') ??
     (lastEventAt ? Date.parse(lastEventAt) : undefined)
   const watermarkTs = stringField(source, 'watermarkTs') ?? stringField(source, 'watermark_ts') ?? lastEventAt
+  // Webhook health is independent of sync freshness and may be reported on a
+  // wrapper while the provider watermark lives on a nested connection. Keep
+  // freshness source selection focused on sync fields, then reconcile health
+  // across every applicable shape. A reported false wins conservatively: a
+  // false-positive healthy result would send questions to an unread Slack.
+  const webhookHealthySignals = [source, ...candidates]
+    .map((candidate) =>
+      booleanField(candidate, 'webhookHealthy') ?? booleanField(candidate, 'webhook_healthy'))
+    .filter((signal): signal is boolean => signal !== undefined)
   return {
     provider: stringField(source, 'provider') ?? provider,
     status: stringField(source, 'status'),
@@ -501,6 +510,7 @@ const normalizeProviderSyncStatus = (value: unknown, provider: string): Provider
     lastEventAtMs: Number.isFinite(lastEventAtMs) ? lastEventAtMs : undefined,
     watermarkTs,
     lagSeconds: numberField(source, 'lagSeconds') ?? numberField(source, 'lag_seconds'),
+    webhookHealthy: webhookHealthySignals.includes(false) ? false : webhookHealthySignals[0],
   }
 }
 
@@ -522,6 +532,9 @@ const stringField = (record: Record<string, unknown>, key: string): string | und
 
 const numberField = (record: Record<string, unknown>, key: string): number | undefined =>
   typeof record[key] === 'number' ? record[key] : undefined
+
+const booleanField = (record: Record<string, unknown>, key: string): boolean | undefined =>
+  typeof record[key] === 'boolean' ? record[key] : undefined
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined

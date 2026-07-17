@@ -20,6 +20,8 @@ export type GithubIssueStatus = 'in-progress' | 'human-review'
 
 export interface GithubWriteback {
   postComment(issue: LinearIssue, body: string): Promise<void>
+  /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
+  hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
   setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
   closeIssue(issue: LinearIssue, body: string): Promise<void>
 }

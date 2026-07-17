@@ -424,17 +424,19 @@ describe('FileStateStore', () => {
       expect(owner).toMatch(/^factory-[ab]$/u)
       expect(await first.claimClarificationQuestionDelivery('workspace-1', key, owner!, 201, 60_000))
         .toBeUndefined()
+      expect(await first.renewClarificationQuestionDelivery('workspace-1', key, 'wrong-owner', 201)).toBe(false)
+      expect(await second.renewClarificationQuestionDelivery('workspace-1', key, owner!, 202)).toBe(true)
       expect(await second.claimClarificationReply('workspace-1', key, {
-        id: 'fast-answer', text: 'Visible in Slack before confirmation.', receivedAtMs: 202,
+        id: 'fast-answer', text: 'Visible in Slack before confirmation.', receivedAtMs: 203,
       })).toMatchObject({ reply: { id: 'fast-answer' } })
-      expect(await first.claimClarificationWake('workspace-1', key, 'too-early', 202, 60_000))
+      expect(await first.claimClarificationWake('workspace-1', key, 'too-early', 203, 60_000))
         .toBeUndefined()
 
       await second.releaseClarificationQuestionDelivery('workspace-1', key, owner!)
-      const retry = await first.claimClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 203, 60_000)
+      const retry = await first.claimClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 204, 60_000)
       expect(retry?.questionDelivery).toMatchObject({ owner: 'factory-retry', attempts: 2 })
-      expect(await second.completeClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 204)).toBe(true)
-      expect(await first.claimClarificationWake('workspace-1', key, 'factory-wake', 205, 60_000))
+      expect(await second.completeClarificationQuestionDelivery('workspace-1', key, 'factory-retry', 205)).toBe(true)
+      expect(await first.claimClarificationWake('workspace-1', key, 'factory-wake', 206, 60_000))
         .toMatchObject({ reply: { id: 'fast-answer' }, wake: { owner: 'factory-wake' } })
     } finally {
       await rm(root, { recursive: true, force: true })

@@ -429,6 +429,7 @@ describe('RelayfileCloudMountClient', () => {
         status: 'ready',
         lastEventAt: '2026-06-12T10:00:00.000Z',
         lagSeconds: 42,
+        webhookHealthy: true,
       }],
     }))
     const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
@@ -440,8 +441,79 @@ describe('RelayfileCloudMountClient', () => {
       lastEventAtMs: Date.parse('2026-06-12T10:00:00.000Z'),
       watermarkTs: '2026-06-12T10:00:00.000Z',
       lagSeconds: 42,
+      webhookHealthy: true,
     })
     expect(fake.getSyncStatus).toHaveBeenCalledWith('rw_test', { provider: 'slack' })
+  })
+
+  it('normalizes snake-case webhook health as independent provider freshness', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.getSyncStatus = vi.fn(async () => ({
+      status: 'ready',
+      connections: [{
+        provider: 'slack',
+        status: 'lagging',
+        last_event_at: '2026-06-06T12:05:00.000Z',
+        webhook_healthy: true,
+      }],
+    }))
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.getSyncStatus?.('slack')).resolves.toEqual({
+      provider: 'slack',
+      status: 'lagging',
+      lastEventAt: '2026-06-06T12:05:00.000Z',
+      lastEventAtMs: Date.parse('2026-06-06T12:05:00.000Z'),
+      watermarkTs: '2026-06-06T12:05:00.000Z',
+      lagSeconds: undefined,
+      webhookHealthy: true,
+    })
+  })
+
+  it.each([
+    { webhookHealthy: true, label: 'healthy' },
+    { webhookHealthy: false, label: 'unhealthy' },
+  ])('preserves nested sync freshness when wrapper webhook delivery is $label', async ({ webhookHealthy }) => {
+    const fake = new FakeRelayFileClient()
+    fake.getSyncStatus = vi.fn(async () => ({
+      webhookHealthy,
+      connections: [{
+        provider: 'slack',
+        status: 'lagging',
+        lastEventAt: '2026-06-06T12:05:00.000Z',
+        lagSeconds: 86_400,
+      }],
+    }))
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.getSyncStatus?.('slack')).resolves.toEqual({
+      provider: 'slack',
+      status: 'lagging',
+      lastEventAt: '2026-06-06T12:05:00.000Z',
+      lastEventAtMs: Date.parse('2026-06-06T12:05:00.000Z'),
+      watermarkTs: '2026-06-06T12:05:00.000Z',
+      lagSeconds: 86_400,
+      webhookHealthy,
+    })
+  })
+
+  it('lets an explicit unhealthy signal win across split provider metadata', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.getSyncStatus = vi.fn(async () => ({
+      webhookHealthy: true,
+      connections: [{
+        provider: 'slack',
+        status: 'ready',
+        last_event_at: '2026-06-12T10:00:00.000Z',
+        webhook_healthy: false,
+      }],
+    }))
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    await expect(mount.getSyncStatus?.('slack')).resolves.toMatchObject({
+      lastEventAt: '2026-06-12T10:00:00.000Z',
+      webhookHealthy: false,
+    })
   })
 
   it('prefers nested provider freshness over wrapper status metadata', async () => {
@@ -463,6 +535,7 @@ describe('RelayfileCloudMountClient', () => {
       lastEventAtMs: 1_781_267_200_000,
       watermarkTs: undefined,
       lagSeconds: 12,
+      webhookHealthy: undefined,
     })
   })
 

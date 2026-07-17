@@ -26,6 +26,8 @@ export interface ProviderSyncStatus {
   lastEventAtMs?: number
   watermarkTs?: string | null
   lagSeconds?: number
+  /** Independent health of provider webhook delivery, when reported by the mount. */
+  webhookHealthy?: boolean
 }
 
 export interface GithubPublishPullRequestInput {
