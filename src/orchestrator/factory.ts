@@ -244,6 +244,7 @@ const BABYSITTER_SUBSCRIPTION_EVENT_TYPES = [
 ]
 const BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES = ['pull_request.closed']
 const BABYSITTER_RESOURCE_DELIVERY_RETRY_MS = 5_000
+const BABYSITTER_RESOURCE_SUBSCRIPTION_RENEW_MS = (BABYSITTER_SUBSCRIPTION_TTL_SECONDS * 1_000) / 2
 const CLARIFICATION_WAKE_LEASE_MS = 60_000
 const CLARIFICATION_WAKE_RETRY_MS = 1_000
 const CLARIFICATION_PARK_RETRY_MS = 5_000
@@ -385,6 +386,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterSubscriptionOwners = new Map<string, string>()
   #babysitterResourceSubscriptionFault = false
   #babysitterResourceDeliveryRetryTimer?: ReturnType<typeof setTimeout>
+  #babysitterResourceSubscriptionRenewTimer?: ReturnType<typeof setTimeout>
   readonly #babysitterWakeStates = new Map<string, BabysitterWakeState>()
   // A babysitter announces this fence before invoking destructive git tooling
   // and clears it afterward. Event text can be broker-delivered while a prompt
@@ -688,6 +690,8 @@ export class FactoryLoop implements Factory {
     this.#stopping = true
     if (this.#babysitterResourceDeliveryRetryTimer) clearTimeout(this.#babysitterResourceDeliveryRetryTimer)
     this.#babysitterResourceDeliveryRetryTimer = undefined
+    if (this.#babysitterResourceSubscriptionRenewTimer) clearTimeout(this.#babysitterResourceSubscriptionRenewTimer)
+    this.#babysitterResourceSubscriptionRenewTimer = undefined
     if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
@@ -5333,6 +5337,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterSubscriptionOwners.set(subscription.subscriptionId, issueKey(issue))
       await this.#persistBabysitterSession(issue, ref, tracked)
       this.#babysitterResourceSubscriptionFault = false
+      this.#scheduleBabysitterResourceSubscriptionRenewal()
       this.#increment('babysitterResourceSubscriptionsRenewed')
     } catch (error) {
       if (isResourceSubscriptionsUnavailable(error)) {
@@ -5491,11 +5496,18 @@ export class FactoryLoop implements Factory {
   async #retryPendingBabysitterDeliveryAcceptances(): Promise<void> {
     const subscriptions = this.#mount.resourceSubscriptions
     if (!subscriptions) return
+    const retrySubscriptionRenewal = this.#babysitterResourceSubscriptionFault
 
     for (const [issueIdentity, ref] of this.#babysitterPr) {
+      const issue = this.#babysitterIssueRefs.get(issueIdentity)
+      if (issue && ref.agentName && !ref.resourceSubscription?.terminal && (!ref.resourceSubscription || retrySubscriptionRenewal)) {
+        const batch = await this.#batch()
+        const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+          ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        await this.#ensureBabysitterResourceSubscription(issue, ref, tracked)
+      }
       const subscription = ref.resourceSubscription
       const pendingDeliveryClaims = [...(ref.pendingDeliveryClaims ?? [])]
-      const issue = this.#babysitterIssueRefs.get(issueIdentity)
       if (!subscription || !issue || pendingDeliveryClaims.length === 0) continue
       const batch = await this.#batch()
       const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
@@ -5541,6 +5553,35 @@ export class FactoryLoop implements Factory {
     if ([...this.#babysitterPr.values()].some((ref) => ref.pendingDeliveryClaims?.length)) {
       this.#scheduleDurableBabysitterDeliveryRetry()
     }
+  }
+
+  #scheduleBabysitterResourceSubscriptionRenewal(): void {
+    if (
+      this.#babysitterResourceSubscriptionRenewTimer ||
+      this.#stopping ||
+      !this.#mount.resourceSubscriptions ||
+      ![...this.#babysitterPr.values()].some((ref) => ref.resourceSubscription && !ref.resourceSubscription.terminal)
+    ) return
+    this.#babysitterResourceSubscriptionRenewTimer = setTimeout(() => {
+      this.#babysitterResourceSubscriptionRenewTimer = undefined
+      void (async () => {
+        const batch = await this.#batch()
+        for (const [issueIdentity, ref] of this.#babysitterPr) {
+          const issue = this.#babysitterIssueRefs.get(issueIdentity)
+          if (!issue || !ref.resourceSubscription || ref.resourceSubscription.terminal) continue
+          const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+            ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+          await this.#ensureBabysitterResourceSubscription(issue, ref, tracked)
+        }
+      })().catch((error) => {
+        this.#logger.warn?.('[factory] durable babysitter subscription renewal rejected', {
+          error: describeError(error).errorMessage,
+        })
+      }).finally(() => {
+        this.#scheduleBabysitterResourceSubscriptionRenewal()
+      })
+    }, BABYSITTER_RESOURCE_SUBSCRIPTION_RENEW_MS)
+    this.#babysitterResourceSubscriptionRenewTimer.unref?.()
   }
 
   #scheduleDurableBabysitterDeliveryRetry(): void {
@@ -5973,6 +6014,11 @@ export class FactoryLoop implements Factory {
       }
       if (!this.#config.babysitter.enabled) return
       if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
+        // A provider close produces a separately indexed terminal claim. Keep
+        // the durable owner until it has been accepted (or a transient retry
+        // has claimed it); do not let closed-state cleanup erase that hand-off.
+        await this.#routeDurableBabysitterDeliveries()
+        if (this.#babysitterResourceSubscriptionFault) return
         await this.#cancelBabysitterWake(ownedKey)
         return
       }
@@ -6019,6 +6065,12 @@ export class FactoryLoop implements Factory {
     }
 
     if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
+      // `pull_request.closed` is a separately indexed Relayfile terminal
+      // event. Claim and accept its durable hand-off before the local closed
+      // PR cleanup drops the subscription owner. On a transient service fault,
+      // retain the owner so the retry loop can claim it without local fallback.
+      await this.#routeDurableBabysitterDeliveries()
+      if (this.#babysitterResourceSubscriptionFault) return
       if (babysitterKey && existing) await this.#cancelBabysitterWake(babysitterKey)
       return
     }
@@ -6550,8 +6602,8 @@ export class FactoryLoop implements Factory {
       const stateKey = issueStateKey(record.issue)
       this.#probePrGhBackoffUntilMs.delete(stateKey)
       this.#probePrResolvedCache.delete(stateKey)
-      this.#babysitterSpawned.delete(completionKey)
-      this.#babysitterPr.delete(completionKey)
+      // Cancellation must see the subscription identity so it can issue the
+      // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysitterWake(completionKey)
       const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
       if (this.#fleet.placementLocality !== 'remote' || (durable && isTerminalDispatchLifecycle(durable))) {

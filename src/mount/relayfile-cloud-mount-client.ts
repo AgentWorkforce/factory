@@ -118,6 +118,8 @@ export interface RelayfileCloudMountClientConfig {
   /** Override the standard Relayfile Cloud durable-subscription HTTP client. */
   resourceSubscriptions?: ResourceSubscriptionsClient
   resourceSubscriptionFetch?: typeof fetch
+  resourceSubscriptionRequestTimeoutMs?: number
+  resourceSubscriptionSignal?: AbortSignal
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
@@ -166,6 +168,8 @@ export class RelayfileCloudMountClient implements MountClient {
         baseUrl: this.#baseUrl,
         tokenProvider: this.#tokenProvider,
         fetch: config.resourceSubscriptionFetch,
+        requestTimeoutMs: config.resourceSubscriptionRequestTimeoutMs,
+        signal: config.resourceSubscriptionSignal,
       })
       : undefined)
     this.#isAllowedDraft = config.isAllowedDraft

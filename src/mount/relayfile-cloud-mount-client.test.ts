@@ -357,6 +357,41 @@ describe('RelayfileCloudMountClient', () => {
     expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({ claimToken: 'claim-token-1' })
   })
 
+  it('fails closed for malformed durable claim envelopes and stalled Relayfile requests', async () => {
+    const fake = new FakeRelayFileClient()
+    const malformed = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      baseUrl: 'https://relayfile.invalid',
+      tokenProvider: () => 'relayfile-token',
+      resourceSubscriptionFetch: async () => new Response(JSON.stringify({ notDeliveries: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    })
+    await expect(malformed.resourceSubscriptions!.claimDeliveryClaims('rw_test'))
+      .rejects.toMatchObject({ status: 502 })
+
+    const stalled = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      baseUrl: 'https://relayfile.invalid',
+      tokenProvider: () => 'relayfile-token',
+      resourceSubscriptionRequestTimeoutMs: 10,
+      resourceSubscriptionFetch: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) throw new Error('subscription request was not abortable')
+        if (signal.aborted) {
+          reject(signal.reason)
+          return
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      }),
+    })
+    await expect(stalled.resourceSubscriptions!.claimDeliveryClaims('rw_test'))
+      .rejects.toMatchObject({ status: 504 })
+  })
+
   it('coalesces concurrent shared session resolutions for relayfile token refresh', async () => {
     const setup = {
       joinWorkspace: vi.fn(async () => ({

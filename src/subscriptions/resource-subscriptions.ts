@@ -85,7 +85,13 @@ export type ResourceSubscriptionsHttpClientOptions = {
   baseUrl: string
   tokenProvider: () => string | undefined | Promise<string | undefined>
   fetch?: typeof fetch
+  /** Bounds an individual Relayfile API call; defaults to 15 seconds. */
+  requestTimeoutMs?: number
+  /** Optional lifecycle cancellation shared by all requests from this client. */
+  signal?: AbortSignal
 }
+
+const DEFAULT_RESOURCE_SUBSCRIPTION_REQUEST_TIMEOUT_MS = 15_000
 
 /**
  * Minimal REST adapter for Relayfile Cloud's public subscription contract.
@@ -94,19 +100,51 @@ export type ResourceSubscriptionsHttpClientOptions = {
 export function createResourceSubscriptionsHttpClient(
   options: ResourceSubscriptionsHttpClientOptions,
 ): ResourceSubscriptionsClient {
+  const requestTimeoutMs = options.requestTimeoutMs === undefined
+    ? DEFAULT_RESOURCE_SUBSCRIPTION_REQUEST_TIMEOUT_MS
+    : Math.max(1, Math.trunc(options.requestTimeoutMs))
+
   const request = async (workspaceId: string, path: string, init: RequestInit = {}): Promise<unknown> => {
     const token = await options.tokenProvider()
     if (!token) throw new ResourceSubscriptionsHttpError(401, 'Relayfile workspace bearer token is unavailable')
     const url = new URL(`/v1/workspaces/${encodeURIComponent(workspaceId)}${path}`, options.baseUrl)
-    const response = await (options.fetch ?? fetch)(url, {
-      ...init,
-      headers: {
-        accept: 'application/json',
-        authorization: `Bearer ${token}`,
-        ...(init.body ? { 'content-type': 'application/json' } : {}),
-        ...init.headers,
-      },
-    })
+    const abort = new AbortController()
+    const forwardedSignals = [options.signal, init.signal].filter((signal): signal is AbortSignal => Boolean(signal))
+    const removeAbortListeners: Array<() => void> = []
+    for (const signal of forwardedSignals) {
+      const forwardAbort = () => abort.abort(signal.reason)
+      if (signal.aborted) forwardAbort()
+      else {
+        signal.addEventListener('abort', forwardAbort, { once: true })
+        removeAbortListeners.push(() => signal.removeEventListener('abort', forwardAbort))
+      }
+    }
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      abort.abort(new Error('Relayfile resource-subscription request timed out'))
+    }, requestTimeoutMs)
+    let response: Response
+    try {
+      response = await (options.fetch ?? fetch)(url, {
+        ...init,
+        signal: abort.signal,
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${token}`,
+          ...(init.body ? { 'content-type': 'application/json' } : {}),
+          ...init.headers,
+        },
+      })
+    } catch (error) {
+      if (timedOut) {
+        throw new ResourceSubscriptionsHttpError(504, `Relayfile resource-subscription request timed out after ${requestTimeoutMs}ms`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      for (const remove of removeAbortListeners) remove()
+    }
     if (!response.ok) {
       if (response.status === 404) throw new ResourceSubscriptionsUnavailableError()
       throw new ResourceSubscriptionsHttpError(response.status, `Relayfile resource-subscription request failed (${response.status})`)
@@ -137,7 +175,10 @@ export function createResourceSubscriptionsHttpClient(
         ? payload
         : Array.isArray(envelope?.deliveries)
           ? envelope.deliveries
-          : []
+          : undefined
+      if (!deliveries) {
+        throw new ResourceSubscriptionsHttpError(502, 'Relayfile delivery claim response was invalid')
+      }
       return deliveries.map(parseDeliveryClaim)
     },
     async acceptDelivery(workspaceId, input) {

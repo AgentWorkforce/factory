@@ -12015,13 +12015,16 @@ describe('FactoryLoop PR babysitter', () => {
     readonly records: ResourceSubscription[] = []
     claims: ResourceDeliveryClaim[] = []
     readonly leasedClaims = new Map<string, ResourceDeliveryClaim>()
+    readonly acceptedClaims = new Map<string, { claimToken: string; receipt: AcceptedResourceDelivery }>()
     ownerId = 'configured-factory-agent'
     unavailable = false
+    createFailure?: Error
     claimFailure?: Error
     onAccept?: (deliveryId: string) => Promise<void> | void
 
     async createOrRenew(workspaceId: string, input: ResourceSubscriptionInput): Promise<ResourceSubscription> {
       if (this.unavailable) throw new ResourceSubscriptionsUnavailableError()
+      if (this.createFailure) throw this.createFailure
       this.createCalls.push({ workspaceId, input: structuredClone(input) })
       const identity = JSON.stringify([input.subscriberId, input.resourceRef, [...input.eventTypes].sort()])
       let record = this.records.find((candidate) => JSON.stringify([
@@ -12076,13 +12079,21 @@ describe('FactoryLoop PR babysitter', () => {
       input: { deliveryId: string; claimToken: string },
     ): Promise<AcceptedResourceDelivery> {
       if (this.unavailable) throw new ResourceSubscriptionsUnavailableError()
+      const accepted = this.acceptedClaims.get(input.deliveryId)
+      if (accepted) {
+        if (accepted.claimToken !== input.claimToken) throw new Error(`claim ${input.deliveryId} has an invalid token`)
+        this.accepted.push({ workspaceId, ...input })
+        return structuredClone(accepted.receipt)
+      }
       const claim = this.leasedClaims.get(input.deliveryId)
       if (!claim) throw new Error(`claim ${input.deliveryId} is unavailable`)
       if (claim.claimToken !== input.claimToken) throw new Error(`claim ${input.deliveryId} has an invalid token`)
       this.accepted.push({ workspaceId, ...input })
+      const receipt = { deliveryId: claim.deliveryId, subscriptionId: claim.subscriptionId, terminal: claim.terminal }
+      this.acceptedClaims.set(input.deliveryId, { claimToken: input.claimToken, receipt })
       await this.onAccept?.(input.deliveryId)
       this.leasedClaims.delete(input.deliveryId)
-      return { deliveryId: claim.deliveryId, subscriptionId: claim.subscriptionId, terminal: claim.terminal }
+      return structuredClone(receipt)
     }
 
     async cancel(workspaceId: string, input: { subscriptionId: string }): Promise<void> {
@@ -12615,6 +12626,194 @@ describe('FactoryLoop PR babysitter', () => {
         fleet.messages.filter((message) => message.text.startsWith('<integration-event')).map((message) => message.to),
       ).toEqual([`ar-${number}-babysit`]))
       expect(factory.status().counters.babysitterResourceSubscriptionUnavailable).toBeGreaterThan(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('renews quiet durable subscriptions and retries a transient initial create failure', async () => {
+    vi.useFakeTimers()
+    const number = 610
+    const issue = realIssueFile(number, ready, { title: 'Real durable renewal' })
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const subscriptions = new FakeResourceSubscriptions()
+    subscriptions.createFailure = Object.assign(new Error('transient create failure'), { status: 503 })
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(subscriptions.records).toEqual([])
+      expect(factory.status().counters.babysitterResourceSubscriptionRenewFailures).toBe(1)
+
+      subscriptions.createFailure = undefined
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(subscriptions.records).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(30 * 60_000)
+      expect(subscriptions.createCalls).toHaveLength(2)
+    } finally {
+      await factory.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('accepts a provider terminal claim before a closed PR tears down its local subscription owner', async () => {
+    const number = 607
+    const issue = realIssueFile(number, ready, { title: 'Real durable terminal close' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore: state,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
+
+      const subscription = subscriptions.records[0]!
+      subscriptions.claims = [subscriptions.claimFor(subscription, 'pull_request.closed', 'delivery-close')]
+      mount.files.set(prPath, { content: { number, state: 'closed', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'terminal-close'))
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId)).toEqual(['delivery-close']))
+      expect(subscriptions.cancelled).toEqual([{
+        workspaceId: 'factory-test',
+        subscriptionId: subscription.subscriptionId,
+      }])
+      await expect(state.listBabysitterSessions('factory-test')).resolves.toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('reuses the persisted claim token after a crash following terminal acceptance', async () => {
+    class FailingTerminalAcceptancePersistStore extends InMemoryStateStore {
+      failFinalTerminalPersist = false
+
+      override async setBabysitterSession(...args: Parameters<InMemoryStateStore['setBabysitterSession']>): Promise<void> {
+        const [, , session] = args
+        if (
+          this.failFinalTerminalPersist &&
+          session.resourceSubscription?.terminal &&
+          !session.pendingDeliveryClaims?.length
+        ) {
+          this.failFinalTerminalPersist = false
+          throw new Error('process stopped after Relayfile accepted the terminal delivery')
+        }
+        await super.setBabysitterSession(...args)
+      }
+    }
+
+    const number = 609
+    const issue = realIssueFile(number, ready, { title: 'Real durable acceptance restart' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const state = new FailingTerminalAcceptancePersistStore({ batchSize: 2 })
+    const first = createFactory(babysitterConfig(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      stateStore: state,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+
+    try {
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'acceptance-restart-open'))
+      await flush()
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+
+      const subscription = subscriptions.records[0]!
+      subscriptions.claims = [subscriptions.claimFor(subscription, 'pull_request.closed', 'delivery-accepted-before-crash')]
+      state.failFinalTerminalPersist = true
+      mount.emit(changeEvent(`/github/repos/AgentWorkforce/pear/pulls/${number}/comments/6091.json`, 'acceptance-restart-terminal'))
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId))
+        .toEqual(['delivery-accepted-before-crash']))
+      await vi.waitFor(async () => expect(await state.listBabysitterSessions('factory-test')).toEqual([
+        [expect.any(String), expect.objectContaining({
+          resourceSubscription: expect.objectContaining({ terminal: true }),
+          pendingDeliveryClaims: [{
+            deliveryId: 'delivery-accepted-before-crash',
+            claimToken: 'claim-token-delivery-accepted-before-crash',
+          }],
+        })],
+      ]))
+      await first.stop()
+
+      restarted = createFactory(babysitterConfig(), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        stateStore: state,
+      })
+      await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId))
+        .toEqual(['delivery-accepted-before-crash', 'delivery-accepted-before-crash']))
+      await vi.waitFor(async () => {
+        const [[, restored]] = await state.listBabysitterSessions('factory-test')
+        expect(restored?.resourceSubscription).toMatchObject({ terminal: true })
+        expect(restored?.pendingDeliveryClaims).toBeUndefined()
+      })
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+    }
+  })
+
+  it('cancels the durable subscription before completion clears the babysitter owner', async () => {
+    const number = 608
+    const issue = realIssueFile(number, ready, { title: 'Real durable completion cancellation' })
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+      const subscription = subscriptions.records[0]!
+
+      fleet.emitAgentMessage({ from: `ar-${number}-babysit`, target: 'factory', body: `[factory-pr-ready] AR-${number}` })
+      await vi.waitFor(() => expect(subscriptions.cancelled).toEqual([{
+        workspaceId: 'factory-test',
+        subscriptionId: subscription.subscriptionId,
+      }]))
     } finally {
       await factory.stop()
     }
