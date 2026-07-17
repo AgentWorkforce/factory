@@ -231,6 +231,7 @@ describe('RelayfileCloudMountClient', () => {
       background: true,
       agentName: 'agent-relay-factory',
       scopes: [...FACTORY_RELAYFILE_SCOPES],
+      verifyProvider: false,
       readyTimeoutMs: 3210,
     })
 
