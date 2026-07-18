@@ -1339,6 +1339,16 @@ export class FactoryLoop implements Factory {
     })
   }
 
+  async #openPrForIssue(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
+    if (this.#customProbePrResolver) {
+      return this.#probePrResolver(issue)
+    }
+    return this.#resolveIssuePr(issue, {
+      titleMarker: FACTORY_E2E_MARKER,
+      openOnly: true,
+    })
+  }
+
   async #resolveIssuePr(
     issue: LinearIssue,
     opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; failOnLookupError?: boolean } = {},
@@ -3708,7 +3718,9 @@ export class FactoryLoop implements Factory {
     }
 
     if (isCompletionReason(reason)) {
-      if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+      if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
+        openOnly: this.#config.babysitter.enabled,
+      })) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
         else await this.#completeIssue(record)
         return
@@ -3758,7 +3770,9 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
+        openOnly: this.#config.babysitter.enabled,
+      })) {
         if (this.#config.babysitter.enabled) {
           await this.#ensureBabysitterForIssue(record)
           return
@@ -4239,7 +4253,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #issueHasCompletionPr(record: InFlightIssue): Promise<boolean> {
+  async #issueHasCompletionPr(record: InFlightIssue, opts: { openOnly?: boolean } = {}): Promise<boolean> {
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
@@ -4249,7 +4263,9 @@ export class FactoryLoop implements Factory {
       // work isn't review-ready, so an implementer exiting with only a draft PR
       // must NOT mark the issue done / release agents — mirror the
       // #sweepPrStateCompletions draft guard, which keeps draft-PR issues in flight.
-      const pr = await this.#completionPrForIssue(issue)
+      const pr = opts.openOnly
+        ? await this.#openPrForIssue(issue)
+        : await this.#completionPrForIssue(issue)
       return Boolean(pr && !pr.draft)
     } catch (error) {
       this.#logger.warn?.('[factory] PR probe failed after implementer exit; preserving restart behavior', {
@@ -6550,7 +6566,7 @@ export class FactoryLoop implements Factory {
     if (!issue) {
       return
     }
-    const pr = await this.#completionPrForIssue(issue)
+    const pr = await this.#openPrForIssue(issue)
     if (!pr || pr.draft) {
       return
     }

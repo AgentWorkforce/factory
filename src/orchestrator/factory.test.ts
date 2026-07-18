@@ -13187,6 +13187,44 @@ describe('FactoryLoop PR babysitter', () => {
     expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-401'])
   })
 
+  it('does not attach a numeric GitHub issue to a merged PR whose body only contains a test count', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 52)
+    const issueFile = githubIssueFile(52, {
+      title: 'Add the requested widget',
+      labels: ['factory', 'pear'],
+    })
+    const mount = new FakeMountClient({
+      [path]: issueFile,
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/5.json': prFile(5, {
+        title: 'Unrelated observability work',
+        body: 'tsc, eslint, and 52 tests all pass.',
+        head_ref: 'claude/unrelated-observability',
+        state: 'merged',
+        merged: true,
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      babysitter: { enabled: true },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+    })
+
+    const issue = parseGithubFactoryIssue(path, issueFile)
+    await factory.dispatch(await factory.triageIssue(issue))
+    fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
+    await flush()
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-52-babysit-pear')
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['52'])
+  })
+
   it('does not respawn the babysitter on repeated implementer exits', async () => {
     const issue = realIssueFile(403, ready, { title: 'Real babysitter idempotent' })
     const mount = new FakeMountClient({ [issuePath(403)]: issue })

@@ -16,4 +16,11 @@ describe('issue key matching', () => {
     expect(containsExplicitIssueReference('Closes AR-229', 'AR-229')).toBe(true)
     expect(containsExplicitIssueReference('This merely mentions ar-229 in passing.', 'AR-229')).toBe(false)
   })
+
+  it('does not treat numeric test counts as GitHub issue references', () => {
+    expect(containsExplicitIssueReference('tsc, eslint, and 52 tests all pass.', '52')).toBe(false)
+    expect(containsExplicitIssueReference('Fixes #52', '52')).toBe(true)
+    expect(containsExplicitIssueReference('Issue: 52', '52')).toBe(true)
+    expect(containsExplicitIssueReference('https://github.com/AgentWorkforce/hoopsheet/issues/52', '52')).toBe(true)
+  })
 })
