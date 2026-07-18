@@ -31,7 +31,7 @@ import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, Gi
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { LIVE_GITHUB_ISSUE_GLOB, githubIssuePathParts, keyFromPath } from './factory'
+import { githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 
@@ -1064,10 +1064,6 @@ class ArrivesDuringPullMount extends FakeMountClient {
   onFirstListTree?: () => void
   #listed = false
 
-  override async getEventHighWatermark(): Promise<string | undefined> {
-    throw Object.assign(new Error('Route not found'), { status: 404 })
-  }
-
   override async listTree(prefix: string): Promise<string[]> {
     const result = await super.listTree(prefix)
     if (!this.#listed) {
@@ -1521,11 +1517,22 @@ describe('FactoryLoop', () => {
     })
   })
 
-  it('LIVE_GITHUB_ISSUE_GLOB matches every supported relayfile issue shape under the real glob matcher', () => {
+  it('repo-scoped GitHub globs match every supported relayfile shape only for configured repos', () => {
     // FakeMountClient.subscribe ignores globs, so assert against the real
     // globMatchesPath() the relayfile event client uses before publishing.
     // A non-terminal `**` is a single-segment wildcard, so the previous
     // `.../issues/**/*.json` glob silently dropped these in subscribe mode.
+    const globs = githubRepoSubscriptionGlobs(config({
+      repos: {
+        byLabel: {
+          cloud: 'AgentWorkforce/cloud',
+          pear: 'AgentWorkforce/pear',
+          platform: 'AgentWorkforce__cloud__platform',
+        },
+        clonePaths: {},
+        default: 'AgentWorkforce/cloud',
+      },
+    }))
     const supported = [
       '/github/repos/AgentWorkforce/cloud/issues/2174.json',
       '/github/repos/AgentWorkforce/cloud/issues/by-id/2174.json',
@@ -1543,9 +1550,10 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce__cloud__platform/issues/1126__directory-event',
     ]
     for (const path of supported) {
-      expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, path)).toBe(true)
+      expect(globs.some((glob) => globMatchesPath(glob, path))).toBe(true)
     }
-    expect(globMatchesPath(LIVE_GITHUB_ISSUE_GLOB, '/linear/issues/AR-173.json')).toBe(false)
+    expect(globs.some((glob) => globMatchesPath(glob, '/github/repos/AgentWorkforce/relay/issues/1/meta.json'))).toBe(false)
+    expect(globs.some((glob) => globMatchesPath(glob, '/linear/issues/AR-173.json'))).toBe(false)
   })
 
   it('dispatches a labeled GitHub issue without Linear and writes in-progress then human-review to GitHub', async () => {
@@ -2037,7 +2045,7 @@ describe('FactoryLoop', () => {
       ['[factory] relayfile listTree completed', expect.objectContaining({
         operation: 'listTree',
         phase: 'GitHub issue ingestion',
-        prefix: '/github/repos',
+        prefix: '/github/repos/AgentWorkforce/pear/issues',
         count: 1,
       })],
       ['[factory] relayfile listTree completed', expect.objectContaining({
@@ -2149,20 +2157,13 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
   })
 
-  it('mirrors compact GitHub issues when the repo root listing is shallow', async () => {
+  it('mirrors compact GitHub issues from a repo-scoped scan', async () => {
     const ghPath = githubIssueCompactPath('AgentWorkforce', 'relayfile-adapters', 224)
     class ShallowGithubRootMount extends FakeMountClient {
       readonly listTreePrefixes: string[] = []
 
       override async listTree(prefix: string): Promise<string[]> {
         this.listTreePrefixes.push(prefix)
-        if (prefix === '/github/repos') {
-          return [
-            '/github/repos/AgentWorkforce/relayfile-adapters',
-            '/github/repos/AgentWorkforce__relayfile-adapters',
-            '/github/repos/AgentWorkforce__relayfile-adapters/issues',
-          ]
-        }
         return super.listTree(prefix)
       }
     }
@@ -2188,9 +2189,10 @@ describe('FactoryLoop', () => {
     await factory.runOnce({ dryRun: false })
 
     expect(mount.listTreePrefixes).toEqual(expect.arrayContaining([
-      '/github/repos',
-      '/github/repos/AgentWorkforce__relayfile-adapters/issues/by-id',
+      '/github/repos/AgentWorkforce/relayfile-adapters/issues',
+      '/github/repos/AgentWorkforce__relayfile-adapters/issues',
     ]))
+    expect(mount.listTreePrefixes).not.toContain('/github/repos')
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
       title: '[factory] Export shared mount-path parser',
@@ -2249,10 +2251,15 @@ describe('FactoryLoop', () => {
     const dirPath = '/github/repos/AgentWorkforce__pear__tools/issues/1116__route-github-factory-issues'
     const metaPath = `${dirPath}/meta.json`
     const mount = new FakeMountClient({
-      [dirPath]: githubIssueFile(1116, { title: 'Directory and file both listed' }),
-      [metaPath]: githubIssueFile(1116, { title: 'Directory and file both listed' }),
+      [dirPath]: githubIssueFile(1116, { repo: 'pear__tools', title: 'Directory and file both listed' }),
+      [metaPath]: githubIssueFile(1116, { repo: 'pear__tools', title: 'Directory and file both listed' }),
     })
     const factory = createFactory(config({
+      repos: {
+        byLabel: { tools: 'AgentWorkforce/pear__tools' },
+        clonePaths: { 'AgentWorkforce/pear__tools': '/work/pear__tools' },
+        default: 'AgentWorkforce/pear__tools',
+      },
       safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
     }), { mount, fleet: new FakeFleetClient(), triage: new StaticTriage() })
 
@@ -4063,7 +4070,7 @@ describe('FactoryLoop', () => {
           return [issuePath(n), realIssueFile(n)]
         }),
       )
-      const mount = new BlockingIssueReadMount(files, clock, {
+      const mount = new BlockingIssueReadMount({}, clock, {
         heartbeatPath,
         staleMs,
         blockMs: 20,
@@ -4083,6 +4090,7 @@ describe('FactoryLoop', () => {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       for (let index = 0; index < issueCount; index += 1) {
         const n = 400 + index
+        mount.files.set(issuePath(n), { content: files[issuePath(n)] })
         mount.emit(changeEvent(issuePath(n), `event-live-burst-${n}`))
       }
 
@@ -5609,12 +5617,13 @@ describe('FactoryLoop', () => {
 
   it('suppresses duplicate live event identities within a parallel drain batch', async () => {
     const path = issuePath(18)
-    const mount = new FakeMountClient({ [path]: realIssueFile(18) })
+    const mount = new FakeMountClient()
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
     const event = changeEvent(path, 'event-duplicate-same-id')
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.files.set(path, { content: realIssueFile(18) })
     mount.emit(event)
     mount.emit(event)
 
@@ -5625,11 +5634,12 @@ describe('FactoryLoop', () => {
 
   it('does not double-dispatch the same issue from concurrent live events', async () => {
     const path = issuePath(19)
-    const mount = new DelayedIssueReadMount({ [path]: realIssueFile(19) }, 25)
+    const mount = new DelayedIssueReadMount({}, 25)
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.files.set(path, { content: realIssueFile(19) })
     mount.emit(changeEvent(path, 'event-same-issue-a'))
     mount.emit(changeEvent(path, 'event-same-issue-b'))
 
@@ -5826,8 +5836,8 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
     expect(mount.listTreePrefixes).toEqual([
-      '/github/repos',
-      '/github/repos/AgentWorkforce__pear/issues/by-id',
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
       '/linear/issues',
       '/linear/issues/by-state/ready-for-agent/',
       '.integrations/discovery',
@@ -5839,7 +5849,7 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it('live subscription skips the startup full pull when a high-watermark is present', async () => {
+  it('live subscription backfills ready issues when a high-watermark is present', async () => {
     const path = issuePath(41)
     const mount = new CountingListTreeMount({ [path]: realIssueFile(41) })
     const fleet = new FakeFleetClient()
@@ -5848,9 +5858,84 @@ describe('FactoryLoop', () => {
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
-    expect(mount.listTreePrefixes).toEqual([])
-    expect(fleet.spawns).toEqual([])
+    expect(mount.listTreePrefixes).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
+      '/linear/issues',
+      '/linear/issues/by-state/ready-for-agent/',
+      '.integrations/discovery',
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-41-impl-pear', 'ar-41-review'])
+    expect(factory.status().counters.liveStartupBackfills).toBe(1)
     expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBeUndefined()
+    await factory.stop()
+  })
+
+  it('derives a repo-scoped subscription and startup backfill from the simple hoopsheet config', async () => {
+    class ScopedStartupMount extends CountingEventsMount {
+      readonly listTreePrefixes: string[] = []
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.listTreePrefixes.push(prefix)
+        return super.listTree(prefix)
+      }
+    }
+
+    const path = githubIssueCompactPath('AgentWorkforce', 'hoopsheet', 77)
+    const mount = new ScopedStartupMount({
+      [path]: githubIssueFile(77, {
+        repo: 'hoopsheet',
+        labels: ['factory-ready'],
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factoryConfig = FactoryConfigSchema.parse({
+      workspaceId: 'hoopsheet-factory-test',
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['hoopsheet'],
+        cloneRoot: '/work',
+        default: 'AgentWorkforce/hoopsheet',
+      },
+      safety: { requireLabel: 'factory-ready' },
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+    })
+    const factory = createFactory(factoryConfig, {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+    expect(mount.subscribeGlobs[0]).toEqual([
+      '/github/repos/AgentWorkforce/hoopsheet/**',
+      '/github/repos/AgentWorkforce__hoopsheet/**',
+    ])
+    expect(mount.listTreePrefixes.slice(0, 2)).toEqual([
+      '/github/repos/AgentWorkforce/hoopsheet/issues',
+      '/github/repos/AgentWorkforce__hoopsheet/issues',
+    ])
+    expect(mount.listTreePrefixes).not.toContain('/github/repos')
+    expect(mount.listTreePrefixes.filter((prefix) => prefix.startsWith('/github/repos/')).every((prefix) =>
+      prefix.startsWith('/github/repos/AgentWorkforce/hoopsheet/') ||
+      prefix.startsWith('/github/repos/AgentWorkforce__hoopsheet/')
+    )).toBe(true)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-77-impl-hoopsheet',
+      'ar-77-review-hoopsheet',
+    ])
+
+    const cloudPath = githubIssuePath('AgentWorkforce', 'cloud', 88)
+    mount.files.set(cloudPath, { content: githubIssueFile(88, { repo: 'cloud', labels: ['factory-ready'] }) })
+    mount.emit(changeEvent(cloudPath, 'unrelated-cloud-event'))
+    await flush()
+
+    expect(factory.status().counters.liveGithubEventsOutsideConfiguredRepos).toBe(1)
+    expect(fleet.spawns).toHaveLength(2)
     await factory.stop()
   })
 
@@ -5881,6 +5966,7 @@ describe('FactoryLoop', () => {
 
     expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
     expect(factory.status().counters.liveHighWatermarkFullPullErrors).toBe(1)
+    expect(factory.status().counters.liveStartupBackfillErrors).toBe(1)
     await factory.stop()
   })
 
@@ -5909,8 +5995,8 @@ describe('FactoryLoop', () => {
     const tipPath = issuePath(36)
     const newPath = issuePath(35)
     const mount = new CountingEventsMount({
-      [replayPath]: realIssueFile(34),
-      [tipPath]: realIssueFile(36),
+      [replayPath]: realIssueFile(34, implementing),
+      [tipPath]: realIssueFile(36, implementing),
     })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
@@ -5940,24 +6026,27 @@ describe('FactoryLoop', () => {
     const freshPath = issuePath(38)
     const skewPath = issuePath(39)
     const mount = new ThrowingWatermarkMount({
-      [replayPath]: realIssueFile(37),
-      [freshPath]: realIssueFile(38),
-      [skewPath]: realIssueFile(39),
+      [replayPath]: realIssueFile(37, implementing),
+      [freshPath]: realIssueFile(38, implementing),
+      [skewPath]: realIssueFile(39, implementing),
     })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     await factory.start({ mode: 'live', liveSubscription: { replaySkewMarginMs: 60_000 } })
 
+    mount.files.set(replayPath, { content: realIssueFile(37) })
     mount.emit(changeEvent(replayPath, '201', new Date(Date.now() - 5 * 60_000).toISOString()))
     await flush()
 
     expect(fleet.spawns).toEqual([])
     expect(factory.status().counters.liveReplayEventsSuppressedByTime).toBe(1)
 
+    mount.files.set(skewPath, { content: realIssueFile(39) })
     mount.emit(changeEvent(skewPath, '202', new Date(Date.now() - 1_000).toISOString()))
     await flush()
 
+    mount.files.set(freshPath, { content: realIssueFile(38) })
     mount.emit(changeEvent(freshPath, '203', new Date(Date.now()).toISOString()))
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
       'ar-39-impl-pear',
@@ -5993,7 +6082,7 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it('live subscription starts from the current event cursor and does not replay pre-start history', async () => {
+  it('polling backfills existing issues and starts live events from the current cursor', async () => {
     vi.useFakeTimers()
     try {
       const oldPath = issuePath(30)
@@ -6006,13 +6095,18 @@ describe('FactoryLoop', () => {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'poll', pollIntervalMs: 10 } })
       await vi.advanceTimersByTimeAsync(0)
 
-      expect(fleet.spawns).toEqual([])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-30-impl-pear', 'ar-30-review'])
 
       mount.files.set(newPath, { content: realIssueFile(31) })
       mount.emit(changeEvent(newPath, 'event-after-start-31'))
       await vi.advanceTimersByTimeAsync(10)
 
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-31-impl-pear', 'ar-31-review'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        'ar-30-impl-pear',
+        'ar-30-review',
+        'ar-31-impl-pear',
+        'ar-31-review',
+      ])
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -12668,7 +12762,8 @@ describe('FactoryLoop PR babysitter', () => {
       }))
       expect(fleet.inputs.slice(inputsBefore)).toEqual([{ name: 'ar-420-babysit', data: '\r' }])
       expect(factory.status().counters.babysitterEventsIgnoredOwnershipMismatch).toBe(1)
-      expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBe(1)
+      expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBeUndefined()
+      expect(factory.status().counters.liveGithubEventsOutsideConfiguredRepos).toBe(1)
 
       const ambiguousCommentPath = '/github/repos/AgentWorkforce/pear/comments/9997.json'
       mount.files.set(ambiguousCommentPath, { content: {

@@ -185,15 +185,6 @@ const GITHUB_ISSUE_ROOT = '/github/repos'
 const READY_EVENTS_LIMIT = 100
 const LIVE_ISSUE_GLOB = `${ISSUE_ROOT}/**`
 const LIVE_RELAYFLOW_GLOB = '/**'
-// Subscribe broadly under /github/repos and let isGithubIssueFilePath() /
-// githubPullPathParts() re-validate the exact shape in the callback.
-// globMatchesPath() treats a non-terminal `**` as a single-segment wildcard, so
-// a more specific glob like `.../issues/**/*.json` would miss the two-segment
-// <owner>/<repo> prefix and the nested <number>__<slug>/meta.json (and
-// directory) event shapes this factory accepts. A terminal `**` prefix-matches
-// every descendant, so all supported issue AND pull-request path variants reach
-// the handler — including the PR change events the babysitter reacts to.
-export const LIVE_GITHUB_ISSUE_GLOB = `${GITHUB_ISSUE_ROOT}/**`
 const LIVE_DEDUPE_LIMIT = 5_000
 const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
 const COMPLETION_SWEEP_INTERVAL_MS = 15_000
@@ -608,7 +599,7 @@ export class FactoryLoop implements Factory {
     if ((opts.mode ?? 'live') === 'live') {
       this.#started = true
       try {
-        await this.#startLiveSubscription(opts.liveSubscription)
+        await this.#startLiveSubscription(issueSource, opts.liveSubscription)
         await this.#rearmSlackReplyWatchers()
         await this.#drainReadyClarificationWake()
         await this.#rearmGithubIssueCommentWatchers()
@@ -622,7 +613,7 @@ export class FactoryLoop implements Factory {
     }
 
     await this.#backfillReadyIssues()
-    this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs([`${ISSUE_ROOT}/**/*.json`, LIVE_GITHUB_ISSUE_GLOB]), (event) => {
+    this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs(issueSource, [`${ISSUE_ROOT}/**/*.json`]), (event) => {
       void this.#dispatchRelayflowEvent(event)
       // The SDK types `resource` as always-present, but the polling fallback and
       // degraded-sync paths can deliver events without it. Skip those rather
@@ -774,7 +765,10 @@ export class FactoryLoop implements Factory {
     await this.stop()
   }
 
-  async #startLiveSubscription(overrides: Partial<FactoryLiveSubscriptionOptions> = {}): Promise<void> {
+  async #startLiveSubscription(
+    issueSource: FactoryConfig['issueSource'],
+    overrides: Partial<FactoryLiveSubscriptionOptions> = {},
+  ): Promise<void> {
     const options = this.#liveOptions(overrides)
     await this.#startLiveHeartbeat()
     this.#liveConnectStartedAtMs = this.#clock.now()
@@ -789,41 +783,50 @@ export class FactoryLoop implements Factory {
       highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
     })
 
-    // Register the live subscription BEFORE the startup full pull so an issue
+    // Register the live subscription BEFORE the startup backfill so an issue
     // that becomes Ready *during* the pull is captured, not lost in the window
     // between listTree and subscribe. Events buffer (deferred drain) until the
     // pull finishes; batch dedupe then suppresses any overlap with what the
     // pull already dispatched.
-    if (options.transport !== 'poll') {
-      // LIVE_GITHUB_ISSUE_GLOB is a terminal `${GITHUB_ISSUE_ROOT}/**`, so it
-      // already covers the PR change events the babysitter consumes; pull-event
-      // *processing* is gated on babysitter.enabled in #prepareLiveEventForDrain.
-      this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs([LIVE_ISSUE_GLOB, LIVE_GITHUB_ISSUE_GLOB]), (event) => {
-        this.#enqueueLiveEvent(event)
-      }, { from: 'now', coalesce: 'none' })
-    }
+    this.#deferLiveEventDrain = true
+    try {
+      if (options.transport === 'poll') {
+        // Capture the cursor before the backfill. Events written while listTree
+        // is running are then picked up by the first poll instead of falling
+        // into a cursor-advance gap.
+        this.#liveEventCursor = await this.#currentEventCursor(options.eventLimit)
+      } else {
+        this.#subscription = this.#mount.subscribe(this.#subscriptionGlobs(issueSource, [LIVE_ISSUE_GLOB]), (event) => {
+          this.#enqueueLiveEvent(event)
+        }, { from: 'now', coalesce: 'none' })
+      }
 
-    if (highWatermark.routeUnavailable) {
-      this.#increment('liveHighWatermarkFullPullFallbacks')
-      this.#logger.info?.('[factory] live subscription high-watermark route unavailable; running startup full pull before draining buffered events')
-      this.#deferLiveEventDrain = true
+      if (highWatermark.routeUnavailable) {
+        this.#increment('liveHighWatermarkFullPullFallbacks')
+      }
+      this.#increment('liveStartupBackfills')
+      this.#logger.info?.('[factory] running startup ready-issue backfill before draining buffered events', {
+        highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
+      })
       try {
         await this.runOnce()
       } catch (error) {
-        // A startup pull failure must not abort the daemon: log it and fall back
-        // to the live event stream (plus any buffered events) instead of leaving
-        // the factory down.
-        this.#increment('liveHighWatermarkFullPullErrors')
+        // A startup backfill failure must not abort the daemon: log it and fall
+        // back to the live event stream (plus any buffered events) instead of
+        // leaving the factory down.
+        this.#increment('liveStartupBackfillErrors')
+        if (highWatermark.routeUnavailable) {
+          this.#increment('liveHighWatermarkFullPullErrors')
+        }
         this.#error(error)
-      } finally {
-        this.#deferLiveEventDrain = false
-        this.#scheduleLiveEventDrain()
       }
-      await this.#refreshLiveHeartbeatIfDue()
+    } finally {
+      this.#deferLiveEventDrain = false
+      this.#scheduleLiveEventDrain()
     }
+    await this.#refreshLiveHeartbeatIfDue()
 
     if (options.transport === 'poll') {
-      this.#liveEventCursor = await this.#currentEventCursor(options.eventLimit)
       this.#scheduleLivePoll(0, options)
     }
   }
@@ -1045,13 +1048,25 @@ export class FactoryLoop implements Factory {
     await this.#refreshLiveHeartbeat()
   }
 
-  #subscriptionGlobs(factoryGlobs: string[]): string[] {
-    return this.#relayflows ? [LIVE_RELAYFLOW_GLOB] : factoryGlobs
+  #subscriptionGlobs(issueSource: FactoryConfig['issueSource'], linearGlobs: string[]): string[] {
+    if (this.#relayflows) return [LIVE_RELAYFLOW_GLOB]
+    return [
+      ...(issueSource === 'linear' ? linearGlobs : []),
+      ...githubRepoSubscriptionGlobs(this.#config),
+    ]
   }
 
   async #prepareLiveEventForDrain(event: ChangeEvent, seenIssueKeys: Set<string>): Promise<PreparedLiveEvent> {
     const path = changeEventPath(event)
     if (!path) {
+      return { dispatchRelayflow: false }
+    }
+    if (
+      !this.#relayflows &&
+      path.startsWith(`${GITHUB_ISSUE_ROOT}/`) &&
+      !isConfiguredGithubRepoPath(path, this.#config)
+    ) {
+      this.#increment('liveGithubEventsOutsideConfiguredRepos')
       return { dispatchRelayflow: false }
     }
     const isPullPath = isGithubPullFilePath(path)
@@ -8946,14 +8961,63 @@ const reposFromConfig = (config: FactoryConfig): string[] => {
   return [...repos]
 }
 
-const githubIssueScanRoots = (config: FactoryConfig): string[] => {
-  const roots = new Set([GITHUB_ISSUE_ROOT])
-  for (const repo of reposFromConfig(config)) {
-    const parts = githubRepoParts(repo)
+const configuredGithubRepoParts = (config: FactoryConfig): Array<{ owner: string; repo: string }> => {
+  const repos = new Map<string, { owner: string; repo: string }>()
+  for (const configuredRepo of reposFromConfig(config)) {
+    let parts = githubRepoParts(configuredRepo)
+    if (!parts) {
+      try {
+        parts = githubRepoParts(normalizeGithubRepo(configuredRepo, config.repos.org))
+      } catch {
+        continue
+      }
+    }
     if (!parts) continue
-    roots.add(`/github/repos/${parts.owner}__${parts.repo}/issues/by-id`)
+    repos.set(`${parts.owner.toLowerCase()}/${parts.repo.toLowerCase()}`, parts)
+  }
+  return [...repos.values()]
+}
+
+// A terminal `**` is intentional: relayfile's matcher treats a non-terminal
+// `**` as a single-segment wildcard. Scoping at the repository root still
+// covers every supported issue, PR, review, comment, and check path without
+// subscribing this factory to other repositories in the workspace.
+export const githubRepoSubscriptionGlobs = (config: FactoryConfig): string[] =>
+  configuredGithubRepoParts(config).flatMap(({ owner, repo }) => [
+    `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/**`,
+    `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/**`,
+  ])
+
+const githubIssueScanRoots = (config: FactoryConfig): string[] => {
+  const roots = new Set<string>()
+  for (const { owner, repo } of configuredGithubRepoParts(config)) {
+    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`)
+    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`)
   }
   return [...roots]
+}
+
+const githubRepoPathParts = (path: string): { owner: string; repo: string } | undefined => {
+  const compactSegment = path.match(/^\/github\/repos\/([^/]+)\//u)?.[1]
+  const separator = compactSegment?.indexOf('__') ?? -1
+  if (compactSegment && separator > 0 && separator < compactSegment.length - 2) {
+    return {
+      owner: compactSegment.slice(0, separator),
+      repo: compactSegment.slice(separator + 2),
+    }
+  }
+  const nested = path.match(/^\/github\/repos\/([^/]+)\/([^/]+)\//u)
+  if (nested) return { owner: nested[1]!, repo: nested[2]! }
+  return undefined
+}
+
+const isConfiguredGithubRepoPath = (path: string, config: FactoryConfig): boolean => {
+  const pathParts = githubRepoPathParts(path)
+  if (!pathParts) return false
+  const pathRepo = `${pathParts.owner.toLowerCase()}/${pathParts.repo.toLowerCase()}`
+  return configuredGithubRepoParts(config).some(({ owner, repo }) =>
+    `${owner.toLowerCase()}/${repo.toLowerCase()}` === pathRepo
+  )
 }
 
 const githubRepoParts = (repo: string): { owner: string; repo: string } | undefined => {
@@ -8961,9 +9025,9 @@ const githubRepoParts = (repo: string): { owner: string; repo: string } | undefi
   if (split) {
     return { owner: split[1]!, repo: split[2]! }
   }
-  const compact = repo.match(/^([^/]+)__([^/]+)$/u)
-  if (compact) {
-    return { owner: compact[1]!, repo: compact[2]! }
+  const separator = repo.indexOf('__')
+  if (separator > 0 && separator < repo.length - 2 && !repo.includes('/')) {
+    return { owner: repo.slice(0, separator), repo: repo.slice(separator + 2) }
   }
   return undefined
 }
