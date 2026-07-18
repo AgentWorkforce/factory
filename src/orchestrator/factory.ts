@@ -1136,12 +1136,16 @@ export class FactoryLoop implements Factory {
     }
 
     if (isGithubIssueFilePath(path)) {
-      const sourceKey = `github:${path}`
+      const parts = githubIssuePathParts(path)
+      const sourceKey = parts
+        ? `github:${githubIssueIdentity(parts.owner, parts.repo, parts.number)}`
+        : `github:${path}`
       if (seenIssueKeys.has(sourceKey)) {
         this.#increment('liveDuplicateIssueEventsSuppressed')
-        this.#logger.debug?.('[factory] suppressed duplicate live GitHub issue event in current drain', {
+        this.#logger.debug?.('[factory] suppressed duplicate live GitHub issue alias in current drain', {
           id: event.id,
           path,
+          issue: parts ? sourceKey.slice('github:'.length) : undefined,
         })
         return { dispatchRelayflow: false }
       }
@@ -1414,10 +1418,13 @@ export class FactoryLoop implements Factory {
         }
 
         pulled.push(issueRef(issue))
-        const dispatchBlock = await this.#dispatchBlockReason(issue)
-        if (dispatchBlock) {
-          skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
-          continue
+        const wasReady = this.#isIssueReady(issue)
+        if (wasReady) {
+          const dispatchBlock = await this.#dispatchBlockReason(issue)
+          if (dispatchBlock) {
+            skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+            continue
+          }
         }
 
         const batch = await this.#batch()
@@ -1426,31 +1433,47 @@ export class FactoryLoop implements Factory {
           continue
         }
 
-        if (
-          !this.#isIssueReady(issue) &&
-          !await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
-        ) {
+        const recoveredOrphan = !wasReady &&
+          await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
+        if (!wasReady && !recoveredOrphan) {
+          const dispatchBlock = await this.#dispatchBlockReason(issue)
+          if (dispatchBlock) {
+            skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+            continue
+          }
           skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
           continue
         }
+        const recoveredIdentity = recoveredOrphan ? githubIssueRefIdentity(issueRef(issue)) : undefined
+        try {
+          if (recoveredOrphan) {
+            const dispatchBlock = await this.#dispatchBlockReason(issue)
+            if (dispatchBlock) {
+              skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+              continue
+            }
+          }
 
-        if (!isInFactoryScope(issue, this.#config.safety)) {
-          skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
-          continue
-        }
+          if (!isInFactoryScope(issue, this.#config.safety)) {
+            skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+            continue
+          }
 
-        if (!isDispatchableIssue(issue)) {
-          skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
-          continue
-        }
+          if (!isDispatchableIssue(issue)) {
+            skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+            continue
+          }
 
-        const decision = await this.triageIssue(issue)
-        triaged.push(decision)
-        const result = await this.dispatch(decision, { dryRun })
-        if (result.agents.length === 0 && !dryRun) {
-          skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
-        } else {
-          dispatched.push(result)
+          const decision = await this.triageIssue(issue)
+          triaged.push(decision)
+          const result = await this.dispatch(decision, { dryRun })
+          if (result.agents.length === 0 && !dryRun) {
+            skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
+          } else {
+            dispatched.push(result)
+          }
+        } finally {
+          if (recoveredIdentity) this.#reconciledGithubInProgress.delete(recoveredIdentity)
         }
       }
 
@@ -1587,6 +1610,10 @@ export class FactoryLoop implements Factory {
       if (providerStatus === 'in-progress') {
         await this.#githubWriteback.setStatus(issue, 'ready')
       }
+      // A crashed dispatch may leave its durable attempt marked in-flight even
+      // after every agent and lifecycle disappeared. Only clear that stale bit
+      // after all provider, agent, lifecycle, and open-PR safety checks pass.
+      await this.#clearDispatchInFlight(issue)
       this.#reconciledGithubInProgress.add(identity)
       this.#increment('githubOrphanedInProgressRecovered')
       this.#logger.warn?.('[factory] recovered orphaned GitHub in-progress issue for redispatch', {
@@ -9515,6 +9542,7 @@ const resolveIssuePrFromGh = async (
     }
     if (payload.length >= PROBE_PR_GH_CANDIDATE_LIMIT) {
       logger?.warn?.('[factory] gh PR resolver hit candidate limit', { issue: issue.key, repo, limit: PROBE_PR_GH_CANDIDATE_LIMIT })
+      if (opts.failOnLookupError) lookupFailures += 1
     }
 
     for (const entry of payload) {

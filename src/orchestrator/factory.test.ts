@@ -235,6 +235,18 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+class ThrowOnceTriage extends StaticTriage {
+  #failed = false
+
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    if (!this.#failed) {
+      this.#failed = true
+      throw new Error('transient triage failure')
+    }
+    return super.triage(issue)
+  }
+}
+
 class RecordingGithubWriteback implements GithubWriteback {
   readonly comments: Array<{ key: string; body: string }> = []
   readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
@@ -1817,12 +1829,23 @@ describe('FactoryLoop', () => {
       mount.setSubRoot('/linear/issues', 'absent')
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, githubIssueFile(52, {
+        labels: ['factory', 'pear', 'factory:in-progress'],
+      }))
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
       const restartedFactory = createFactory(config({
         issueSource: 'github',
         loop: { registryPath: join(root, 'registry.json') },
       }), {
         mount,
         fleet,
+        stateStore,
         triage: new StaticTriage(),
         githubWriteback,
         probePrGhRunner: async () => ({ stdout: '[]' }),
@@ -1836,7 +1859,43 @@ describe('FactoryLoop', () => {
         { key: '52', status: 'ready' },
         { key: '52', status: 'in-progress' },
       ])
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+        attempts: 2,
+        inFlight: true,
+        terminal: false,
+      })
       expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('consumes an orphan-recovery readiness exemption after a failed dispatch transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-one-shot-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 58)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(58, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new ThrowOnceTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow('transient triage failure')
+      await expect(factory.runOnce()).resolves.toMatchObject({
+        dispatched: [{ issue: { key: '58' } }],
+      })
+
+      expect(githubWriteback.statuses.filter(({ status }) => status === 'ready')).toHaveLength(2)
+      expect(githubWriteback.statuses.at(-1)).toEqual({ key: '58', status: 'in-progress' })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1934,6 +1993,41 @@ describe('FactoryLoop', () => {
         triage: new StaticTriage(),
         githubWriteback,
         probePrGhRunner: async () => { throw new Error('GitHub PR lookup unavailable') },
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an in-progress GitHub issue when open-PR discovery is truncated', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-pr-truncated-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 60)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(60, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify(Array.from({ length: 200 }, (_, index) => ghPr(index + 1, {
+            title: `Unrelated PR ${index + 1}`,
+            headRefName: `unrelated-${index + 1}`,
+          }))),
+        }),
       })
 
       const report = await factory.runOnce()
@@ -5882,6 +5976,33 @@ describe('FactoryLoop', () => {
 
     expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-19'])
+    await factory.stop()
+  })
+
+  it('deduplicates compact and nested live GitHub aliases by issue identity', async () => {
+    const compactPath = githubIssueCompactPath('AgentWorkforce', 'pear', 59)
+    const nestedPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 59)
+    const issue = githubIssueFile(59, { labels: ['factory', 'pear'] })
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    mount.files.set(compactPath, { content: issue })
+    mount.files.set(nestedPath, { content: issue })
+    mount.emit(changeEvent(nestedPath, 'github-alias-nested-59'))
+    mount.emit(changeEvent(compactPath, 'github-alias-compact-59'))
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-59-impl-pear',
+      'ar-59-review-pear',
+    ]))
+    expect(factory.status().counters.liveDuplicateIssueEventsSuppressed).toBe(1)
     await factory.stop()
   })
 
