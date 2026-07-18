@@ -6566,7 +6566,19 @@ export class FactoryLoop implements Factory {
         },
       }
 
-      if (!this.#fleet.waitForInjected) {
+      let targets: string[]
+      if (this.#fleet.promptDelivery === 'pty') {
+        if (!this.#fleet.sendInput) {
+          throw new Error('Fleet client advertises PTY prompt delivery without raw input support')
+        }
+        // Internal agents are harness-owned PTYs, not Relaycast identities.
+        // Stage the validated metadata-only wake directly through the broker so
+        // a missing Relaycast registration cannot strand a live babysitter.
+        // The CR remains a separate write: a critical-section begin can arrive
+        // while this write is in flight and must be able to defer submission.
+        await this.#fleet.sendInput(input.to, input.text)
+        targets = [input.to]
+      } else if (!this.#fleet.waitForInjected) {
         await this.#fleet.sendMessage(input)
         if (this.#stopping || state.cancelled) {
           state.deliveringKinds = undefined
@@ -6576,8 +6588,10 @@ export class FactoryLoop implements Factory {
         await this.#recordPendingBabysitterWake(state)
         this.#increment('babysitterEventWakesDelivered')
         return
+      } else {
+        const ack = await this.#waitForInjectedWithRetry(input)
+        targets = ack.targets.length > 0 ? [...new Set(ack.targets)] : [input.to]
       }
-      const ack = await this.#waitForInjectedWithRetry(input)
       if (this.#stopping || state.cancelled) return
       if (state.agentName !== input.to) {
         for (const kind of kinds) state.kinds.add(kind)
@@ -6585,7 +6599,6 @@ export class FactoryLoop implements Factory {
         await this.#recordPendingBabysitterWake(state)
         return
       }
-      const targets = ack.targets.length > 0 ? [...new Set(ack.targets)] : [input.to]
       // The critical marker can arrive while delivery confirmation is in
       // flight. Preserve the acknowledged prompt and submit it exactly once
       // after the babysitter clears the fence; never send a CR in the window.
