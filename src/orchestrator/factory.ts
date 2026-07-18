@@ -2473,7 +2473,7 @@ export class FactoryLoop implements Factory {
     if (lifecycle.phase === 'publishing') {
       const implementer = [...record.agents.values()].find((agent) => agent.spec.role === 'implementer')
       if (!implementer) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
-      const published = await this.#publishImplementerPullRequest(record, implementer)
+      const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
       if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request`)
       if (!await this.#saveDispatchLifecycle(record, 'published', published)) return
       if (this.#config.babysitter.enabled) {
@@ -3949,6 +3949,7 @@ export class FactoryLoop implements Factory {
   async #publishImplementerPullRequest(
     record: InFlightIssue,
     implementer: TrackedAgent,
+    opts: { reconcileExisting?: boolean } = {},
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
@@ -3978,6 +3979,21 @@ export class FactoryLoop implements Factory {
       ? sourceRepoParts.owner
       : undefined
     const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+    const expectedHeadRef = implementer.spec.branch ?? remoteBranch
+    if (opts.reconcileExisting && expectedHeadRef) {
+      const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
+      if (existing) {
+        this.#publishedPullRequests.set(key, existing)
+        this.#increment('githubPullRequestsReconciled')
+        this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
+          issue: issue.key,
+          repo: existing.repo,
+          prNumber: existing.number,
+          url: existing.url,
+        })
+        return existing
+      }
+    }
     const baseRef = await this.#githubDefaultBranch(repo)
     const result = await githubWrite.publishPullRequest({
       repo,
@@ -4007,6 +4023,55 @@ export class FactoryLoop implements Factory {
       url: result.url,
     })
     return result
+  }
+
+  async #openPullRequestByHead(
+    repo: string,
+    expectedHeadRef: string,
+  ): Promise<GithubPublishPullRequestResult | undefined> {
+    const parts = githubRepoParts(repo)
+    if (!parts) return undefined
+    const roots = [
+      `/github/repos/${encodeURIComponent(parts.owner)}/${encodeURIComponent(parts.repo)}/pulls/`,
+      `/github/repos/${encodeURIComponent(parts.owner)}__${encodeURIComponent(parts.repo)}/pulls/`,
+    ]
+    const candidates: GithubPublishPullRequestResult[] = []
+    for (const root of roots) {
+      let paths: string[]
+      try {
+        paths = await this.#mount.listTree(root)
+      } catch {
+        continue
+      }
+      for (const path of paths) {
+        const pathParts = githubPullPathParts(path)
+        if (
+          !pathParts ||
+          pathParts.owner.toLowerCase() !== parts.owner.toLowerCase() ||
+          pathParts.repo.toLowerCase() !== parts.repo.toLowerCase()
+        ) continue
+        try {
+          const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, pathParts.number)
+          const state = snapshot?.state?.trim().toUpperCase()
+          if (
+            !snapshot ||
+            snapshot.headRef !== expectedHeadRef ||
+            state !== 'OPEN' ||
+            snapshot.draft === true ||
+            snapshot.merged === true
+          ) continue
+          candidates.push({
+            repo,
+            number: snapshot.number,
+            url: snapshot.url ?? `https://github.com/${repo}/pull/${snapshot.number}`,
+            headRef: expectedHeadRef,
+          })
+        } catch {
+          // A partially materialized PR record cannot prove exact ownership.
+        }
+      }
+    }
+    return candidates.sort((a, b) => b.number - a.number)[0]
   }
 
   async #prepareAgentWorktree(record: InFlightIssue, spec: AgentSpec): Promise<void> {

@@ -280,4 +280,37 @@ describe('RelayfileGithubConnectionWrite', () => {
     })).resolves.toMatchObject({ number: 65 })
     expect(mount.receiptReads).toBe(2)
   })
+
+  it('uses the acknowledged provider id when Relayfile reconciles the create draft', async () => {
+    const draft = 'factory-fix-issue-52-1234567890ab'
+    const pullRequestPath = `/github/repos/AgentWorkforce/hoopsheet/pull-requests/${draft}.json`
+    class ReconciledDraftMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === pullRequestPath) throw new Error('draft was reconciled after provider acknowledgement')
+        return super.readFile(path)
+      }
+
+      override async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+        return path === pullRequestPath ? '53' : undefined
+      }
+    }
+    const mount = new ReconciledDraftMount()
+    const write = new RelayfileGithubConnectionWrite({
+      mount,
+      gitRunner: gitRunner(),
+      receiptReadAttempts: 1,
+      receiptReadDelayMs: 0,
+    })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/hoopsheet',
+      clonePath: '/work/hoopsheet',
+      baseRef: 'main',
+      title: '52: Bug: Creating a new league does not work',
+      body: 'Fixes #52',
+    })).resolves.toMatchObject({
+      number: 53,
+      url: 'https://github.com/AgentWorkforce/hoopsheet/pull/53',
+    })
+  })
 })

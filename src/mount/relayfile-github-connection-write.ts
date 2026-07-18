@@ -16,7 +16,7 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'getConfirmedWriteFailureReason' | 'readFile' | 'writeFile'>
+  mount: Pick<MountClient, 'confirmWrite' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'readFile' | 'writeFile'>
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
@@ -83,7 +83,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
-    await this.#writeAndConfirm(pullRequestPath, {
+    const confirmedPullRequestId = await this.#writeAndConfirm(pullRequestPath, {
       title: input.title,
       head: headRef,
       base: input.baseRef,
@@ -93,7 +93,11 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       author: 'app',
     })
 
-    const { number, url } = await this.#readPullRequestReceipt(pullRequestPath, input.repo)
+    const { number, url } = await this.#readPullRequestReceipt(
+      pullRequestPath,
+      input.repo,
+      confirmedPullRequestId,
+    )
 
     return {
       repo: input.repo,
@@ -125,7 +129,22 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     throw new Error(`Unable to resolve ${description} for GitHub PR publication`)
   }
 
-  async #readPullRequestReceipt(path: string, repo: string): Promise<{ number: number; url: string }> {
+  async #readPullRequestReceipt(
+    path: string,
+    repo: string,
+    confirmedExternalId?: string,
+  ): Promise<{ number: number; url: string }> {
+    // The cloud mount confirms provider success from the durable operation and
+    // retains its externalId. Relayfile may immediately reconcile (rename or
+    // remove) the authored draft, so reading that draft is not a reliable way
+    // to recover the receipt after an acknowledged create.
+    const confirmedNumber = positiveInteger(confirmedExternalId)
+    if (confirmedNumber) {
+      return {
+        number: confirmedNumber,
+        url: `https://github.com/${repo}/pull/${confirmedNumber}`,
+      }
+    }
     for (let attempt = 0; attempt < this.#receiptReadAttempts; attempt += 1) {
       try {
         const receipt = record((await this.#mount.readFile(path)).content)
@@ -142,7 +161,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     throw new Error(`GitHub pull request writeback returned an incomplete receipt for ${repo}`)
   }
 
-  async #writeAndConfirm(path: string, content: unknown): Promise<void> {
+  async #writeAndConfirm(path: string, content: unknown): Promise<string | undefined> {
     await this.#mount.writeFile(path, content, { guarded: true })
     const status = await this.#mount.confirmWrite(path, { timeoutMs: WRITE_CONFIRM_TIMEOUT_MS })
     if (status !== 'acked') {
@@ -151,6 +170,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
         : undefined
       throw new Error(`GitHub writeback did not complete for ${path}: ${failureReason ?? status}`)
     }
+    return this.#mount.getConfirmedWriteExternalId?.(path)
   }
 }
 

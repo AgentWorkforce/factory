@@ -4138,6 +4138,59 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('reconciles the exact existing branch after PR creation succeeded before receipt persistence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-reconcile-existing-'))
+    const watchStatePath = join(root, 'state.json')
+    let publishAttempts = 0
+    let branch: string | undefined
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishAttempts += 1
+        branch = input.headRef
+        mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1186/metadata.json', { content: {
+          number: 1186,
+          state: 'open',
+          head_ref: branch,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1186',
+        } })
+        throw new Error('receipt was lost after the provider created the PR')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(186)]: issueFile(186),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(186), issueFile(186)))
+      await factory.dispatch(decision)
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      expect(lifecycle?.decision.implementers[0]?.branch)
+        .toEqual(expect.stringMatching(/^factory\/ar-186-agentworkforce-pear-[0-9a-f]{8}$/u))
+
+      fleet.emitAgentExit('ar-186-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 4_000 })
+      expect(branch).toBe(lifecycle?.decision.implementers[0]?.branch)
+      expect(publishAttempts).toBe(1)
+      expect(factory.status().counters.githubPullRequestsReconciled).toBe(1)
+      expect(fleet.resumes).toEqual([])
+      expect(fleet.releases.map((release) => release.name).sort()).toEqual(['ar-186-impl-pear', 'ar-186-review'])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('reuses the provider receipt after losing the lifecycle lease between publication and persistence', async () => {
     class RejectFirstPublishedSaveStore extends FileStateStore {
       rejected = false
