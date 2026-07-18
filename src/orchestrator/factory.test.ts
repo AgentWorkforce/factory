@@ -135,6 +135,7 @@ const githubIssueFile = (
     labels?: Array<string | { name: string }>
     url?: string
     author?: string
+    updatedAt?: string
   } = {},
 ) => {
   const owner = payload.owner ?? 'AgentWorkforce'
@@ -148,6 +149,7 @@ const githubIssueFile = (
       title: payload.title ?? `GitHub factory issue ${number}`,
       body: payload.body ?? 'Implement the requested GitHub issue change and verify it with tests.',
       state: payload.state ?? 'open',
+      updated_at: payload.updatedAt,
       labels: payload.labels ?? [{ name: 'factory' }],
       url: payload.url ?? `https://github.com/${owner}/${repo}/issues/${number}`,
       author: { login: payload.author ?? 'issue-author' },
@@ -1931,6 +1933,44 @@ describe('FactoryLoop', () => {
       expect(factory.status().queued.map((issue) => issue.key)).toEqual(['11'])
       expect(githubWriteback.statuses[0]).toEqual({ key: '52', status: 'in-progress' })
       expect(githubWriteback.statuses).toContainEqual({ key: '11', status: 'ready' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reconciles the most recently updated GitHub orphan before an older numeric backlog', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-newest-orphan-first-'))
+    try {
+      const olderPath = githubIssuePath('AgentWorkforce', 'pear', 11)
+      const interruptedPath = githubIssuePath('AgentWorkforce', 'pear', 52)
+      const mount = new FakeMountClient({
+        [olderPath]: githubIssueFile(11, {
+          labels: ['factory', 'pear', 'factory:in-progress'],
+          updatedAt: '2026-07-17T12:00:00.000Z',
+        }),
+        [interruptedPath]: githubIssueFile(52, {
+          labels: ['factory', 'pear', 'factory:in-progress'],
+          updatedAt: '2026-07-18T12:00:00.000Z',
+        }),
+      })
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        batchSize: 1,
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['52'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-52-impl-pear', 'ar-52-review-pear'])
+      expect(factory.status().queued.map((issue) => issue.key)).toEqual(['11'])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

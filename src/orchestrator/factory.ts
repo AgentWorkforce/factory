@@ -1433,12 +1433,16 @@ export class FactoryLoop implements Factory {
       if (issueSource === 'github') {
         // New ready work must not sit behind a long sequence of stale
         // in-progress recoveries. Load the canonical snapshots first, then
-        // preserve their stable order within two priority buckets: genuinely
-        // ready issues first, orphan-recovery candidates second.
-        issueEntries.sort((left, right) =>
-          Number(Boolean(right.issue && this.#isIssueReady(right.issue))) -
-          Number(Boolean(left.issue && this.#isIssueReady(left.issue))),
-        )
+        // prioritize genuinely ready issues over orphan-recovery candidates.
+        // Within either bucket, resume the most recently changed provider work
+        // first so a just-interrupted dispatch does not sit behind an old
+        // numeric backlog of leaked in-progress labels.
+        issueEntries.sort((left, right) => {
+          const readiness = Number(Boolean(right.issue && this.#isIssueReady(right.issue))) -
+            Number(Boolean(left.issue && this.#isIssueReady(left.issue)))
+          if (readiness !== 0) return readiness
+          return githubIssueUpdatedAtMs(right.issue) - githubIssueUpdatedAtMs(left.issue)
+        })
       }
 
       for (const { issue } of issueEntries) {
@@ -8879,6 +8883,15 @@ const githubIssueAsFactoryIssue = (issue: GithubIssueSource): LinearIssue => {
       },
     },
   }
+}
+
+const githubIssueUpdatedAtMs = (issue?: LinearIssue): number => {
+  if (!issue || !isGithubIssue(issue)) return 0
+  const payload = wrappedPayload(issue.raw)
+  const updatedAt = stringValue(payload.updated_at) ?? stringValue(payload.updatedAt)
+  if (!updatedAt) return 0
+  const parsed = Date.parse(updatedAt)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 export async function readFactoryLoopHeartbeat(
