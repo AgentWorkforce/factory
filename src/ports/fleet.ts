@@ -63,6 +63,12 @@ export type FleetTrackedAgent = { invocationId?: string; node?: string }
 export interface FleetClient {
   /** Backend-wide placement locality, used when recovering a spawn ack crash gap. */
   readonly placementLocality?: 'local' | 'remote'
+  /**
+   * How follow-up prompts can be delivered to an already-running agent.
+   * `pty` means `sendInput` can stage prompt text directly in the owned PTY;
+   * callers submit it separately with a carriage return.
+   */
+  readonly promptDelivery?: 'message' | 'pty'
   /** Durable Relay action agents invoke instead of messaging a named control identity. */
   readonly lifecycleActionName?: string
   spawn(input: SpawnInput): Promise<SpawnResult>

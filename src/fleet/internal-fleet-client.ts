@@ -96,6 +96,7 @@ const RELEASE_RETRY_BACKOFF_MS = 250
 
 export class InternalFleetClient implements FleetClient {
   readonly placementLocality = 'local' as const
+  readonly promptDelivery = 'pty' as const
   readonly #client: HarnessDriverClientLike
   #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number

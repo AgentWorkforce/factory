@@ -946,6 +946,20 @@ class RosterPidHarnessClient implements HarnessDriverClientLike {
   }
 }
 
+class MissingRelaycastBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterRelaycastLookups = 0
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterRelaycastLookups += 1
+      throw new Error(
+        `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+      )
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
   resumeAttempts = 0
   shutdownCalls = 0
@@ -14003,6 +14017,59 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.stop()
     }
   })
+
+  it('delivers internal babysitter event wakes through the owned PTY without a Relaycast name lookup', async () => {
+    const issue = realIssueFile(421, ready, { title: 'Real internal babysitter PTY wake' })
+    const mount = new FakeMountClient({ [issuePath(421)]: issue })
+    const harness = new MissingRelaycastBabysitterHarnessClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' }),
+      readChildPids: async () => [],
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(421), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/421/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 421,
+        state: 'open',
+        head_ref: 'ar-421-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-421-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-421-babysit'))
+      await vi.waitFor(() => expect(harness.inputs).toContainEqual({ name: 'ar-421-babysit', data: '\r' }))
+      const inputsBefore = harness.inputs.length
+
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9421.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 421 },
+        comment: { id: 9421, body: 'untrusted provider text must stay out of the wake' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9421.json', 'comment-9421'))
+
+      await vi.waitFor(() => expect(harness.inputs.length).toBe(inputsBefore + 2), { timeout: 3_000 })
+      const [stagedWake, submit] = harness.inputs.slice(inputsBefore)
+      expect(stagedWake).toMatchObject({ name: 'ar-421-babysit' })
+      expect(stagedWake?.data).toContain('<integration-event source="github" trust="validated-metadata-only">')
+      expect(stagedWake?.data).toContain('AgentWorkforce/pear#421')
+      expect(stagedWake?.data).toContain('review-comment')
+      expect(stagedWake?.data).not.toContain('untrusted provider text')
+      expect(submit).toEqual({ name: 'ar-421-babysit', data: '\r' })
+      expect(harness.babysitterRelaycastLookups).toBe(0)
+      expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1)
+      expect(factory.status().counters.babysitterEventWakeFailures).toBeUndefined()
+    } finally {
+      await factory.stop()
+    }
+  }, 10_000)
 
   it('defers the babysitter wake and PTY submit throughout a declared destructive critical section', async () => {
     const issue = realIssueFile(422, ready, { title: 'Real babysitter critical section' })
