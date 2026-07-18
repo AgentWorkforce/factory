@@ -184,6 +184,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
   readonly #confirmedExternalIdByPath = new Map<string, string>()
+  readonly #confirmedFailureReasonByPath = new Map<string, string>()
 
   constructor(config: RelayfileCloudMountClientConfig = {}) {
     if (!config.client) {
@@ -301,6 +302,7 @@ export class RelayfileCloudMountClient implements MountClient {
 
     const serialized = serializeContent(content)
     this.#confirmedExternalIdByPath.delete(path)
+    this.#confirmedFailureReasonByPath.delete(path)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
       let baseRevision = '0'
@@ -329,6 +331,7 @@ export class RelayfileCloudMountClient implements MountClient {
 
   async deleteFile(path: string): Promise<void> {
     this.#confirmedExternalIdByPath.delete(path)
+    this.#confirmedFailureReasonByPath.delete(path)
     const current = await this.#client.readFile(this.workspaceId, path)
     const currentContent = parseRemoteContent(current)
     if (isProviderPath(path)) {
@@ -440,7 +443,13 @@ export class RelayfileCloudMountClient implements MountClient {
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
     for (;;) {
       const operation = await this.#client.getOp(this.workspaceId, opId)
-      const status = mapOperationStatus(operation)
+      let status: 'acked' | 'pending' | 'failed'
+      try {
+        status = mapOperationStatus(operation)
+      } catch (error) {
+        this.#confirmedFailureReasonByPath.set(path, providerResultError(operation))
+        throw error
+      }
       if (status !== 'pending') {
         const providerId = [
           operation.providerResult?.externalId,
@@ -455,6 +464,10 @@ export class RelayfileCloudMountClient implements MountClient {
       if (Date.now() >= deadline) return 'timeout'
       await sleep(Math.min(500, Math.max(25, deadline - Date.now())))
     }
+  }
+
+  async getConfirmedWriteFailureReason(path: string): Promise<string | undefined> {
+    return this.#confirmedFailureReasonByPath.get(path)
   }
 
   async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {

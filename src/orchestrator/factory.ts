@@ -1484,7 +1484,17 @@ export class FactoryLoop implements Factory {
 
           const decision = await this.triageIssue(issue)
           triaged.push(decision)
-          const result = await this.dispatch(decision, { dryRun })
+          let result: DispatchResult
+          try {
+            result = await this.dispatch(decision, { dryRun })
+          } catch (error) {
+            if (!(error instanceof LiveDispatchStateChangedError)) throw error
+            skipped.push({ issue: decision.issue, reason: 'live state changed during dispatch' })
+            this.#logger.info?.('[factory] skipped issue whose live state changed during dispatch', {
+              issue: decision.issue.key,
+            })
+            continue
+          }
           if (result.agents.length === 0 && !dryRun) {
             skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
           } else {
@@ -2013,7 +2023,7 @@ export class FactoryLoop implements Factory {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
-          throw new Error(`Live state changed before writeback for ${dispatchDecision.issue.key}`)
+          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
         }
         try {
           await this.#postIssueComment(issue, comment)
@@ -2051,12 +2061,20 @@ export class FactoryLoop implements Factory {
       const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
       await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
       const worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
-      await this.#recordDispatchFailure(decision.issue)
-      const failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-      await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+      const liveStateChanged = error instanceof LiveDispatchStateChangedError
+      let failedState: { terminal: boolean } | undefined
+      if (liveStateChanged) {
+        await this.#clearDispatchInFlight(decision.issue)
+        await this.#saveDispatchLifecycle(record, 'abandoned')
+        this.#increment('dispatchLiveStateRaces')
+      } else {
+        await this.#recordDispatchFailure(decision.issue)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+        await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+      }
       batch.abandon(decision.issue)
-      if (!failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
-      this.#error(error, decision.issue)
+      if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
+      if (!liveStateChanged) this.#error(error, decision.issue)
       // The teardown runs while the record still exists so it can safely
       // derive every shared checkout. Rewrite the registry only after abandon
       // removes those agents from the ordinary in-flight view.
@@ -4180,6 +4198,11 @@ export class FactoryLoop implements Factory {
       // cleanup fails, the durable handoff reaper retains responsibility rather
       // than leaving an invisible orphan under .factory-worktrees.
       await this.#persistDispatchFailureReaperHandoff(record, worktreeHandoffs)
+      const worktreeAgentNames = new Set(worktreeHandoffs.map((handoff) => handoff.name))
+      const nonWorktreeAgents = agents.filter(([name]) => !worktreeAgentNames.has(name))
+      if (nonWorktreeAgents.length > 0) {
+        await this.#releaseAndTerminateAgents(nonWorktreeAgents, 'issue-abandoned', 'completion')
+      }
       await this.#teardownFailedDispatchWorktrees(worktreeHandoffs)
     } else if (agents.length > 0) {
       await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
@@ -10751,7 +10774,14 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
 
-const triageEscalationQuestion = (decision: TriageDecision, issue?: LinearIssue): string => {
+class LiveDispatchStateChangedError extends Error {
+  constructor(issueKey: string) {
+    super(`Live state changed before writeback for ${issueKey}`)
+    this.name = 'LiveDispatchStateChangedError'
+  }
+}
+
+const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
   const routedRepos = decision.routes.map((route) => route.repo).filter(Boolean)
   const subject = issue?.title?.trim() || decision.issue.key
   const details = `For "${subject}", please reply with: (1) the exact user flow—where it starts, required inputs/actions, and the successful result; (2) permissions, validation, failure behavior, important edge cases, and anything out of scope; and (3) observable acceptance checks or tests. Say "use reasonable product defaults" for anything Factory may decide. After an authorized GitHub reply, Factory will dispatch agents; successful work will be opened as a pull request.`

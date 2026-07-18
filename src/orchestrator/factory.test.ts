@@ -1901,6 +1901,60 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('continues startup reconciliation when an issue changes state during dispatch', async () => {
+    const racedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
+    const racedReady = githubIssueFile(59, { labels: ['factory', 'pear'] })
+    class ConcurrentStateChangeMount extends FakeMountClient {
+      racedReads = 0
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === racedPath) {
+          this.racedReads += 1
+          if (this.racedReads >= 3) {
+            return {
+              content: githubIssueFile(59, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+            }
+          }
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new ConcurrentStateChangeMount({
+      [racedPath]: racedReady,
+      [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      worktrees,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: racedPath },
+      reason: 'live state changed during dispatch',
+    })
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-59-impl-pear',
+      'ar-59-review-pear',
+      'ar-60-impl-pear',
+      'ar-60-review-pear',
+    ])
+    expect(fleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-59-impl-pear',
+      'ar-59-review-pear',
+    ])
+    expect(factory.status().counters.dispatchLiveStateRaces).toBe(1)
+    expect(factory.status().counters.errors ?? 0).toBe(0)
+  })
+
   it('preserves an in-progress GitHub issue when a matching open PR exists', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-'))
     try {
@@ -7425,6 +7479,45 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.issuesStalledNoPr).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('releases non-worktree agents while tearing down a mixed abandoned dispatch', async () => {
+    const path = issuePath(820)
+    const issue = realIssueFile(820, ready, {
+      labels: [{ name: 'pear' }, { name: 'remote' }, { name: 'factory:team' }],
+    })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new ResumeNameCollisionFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    fleet.setSessionRef('ar-820-impl-pear', 'session-impl-820')
+    const factory = createFactory(config({
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          remote: 'AgentWorkforce/remote',
+        },
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      worktrees,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-820-impl-pear', 'crash')
+
+    await vi.waitFor(() => expect(worktrees.cleaned).toHaveLength(1))
+    expect(fleet.releases.map((release) => release.name).sort()).toEqual([
+      'ar-820-impl-pear',
+      'ar-820-impl-remote',
+      'ar-820-review',
+    ])
     expect(factory.status().inFlight).toEqual([])
   })
 

@@ -89,6 +89,8 @@ export interface MountClient {
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
   confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
+  /** Provider failure detail retained for a completed failed write, when available. */
+  getConfirmedWriteFailureReason?(path: string): Promise<string | undefined>
   /** Provider object id returned by the acknowledged write operation, when available. */
   getConfirmedWriteExternalId?(path: string): Promise<string | undefined>
   ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'>

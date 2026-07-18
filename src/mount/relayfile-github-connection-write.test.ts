@@ -151,11 +151,14 @@ describe('RelayfileGithubConnectionWrite', () => {
     const updateRefPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
     const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
     class ExistingRefMount extends FakeMountClient {
-      override async confirmWrite(path: string): Promise<'acked'> {
-        if (path === createRefPath) {
-          throw new Error('GitHub writeback failed with status 422: Reference already exists')
-        }
-        return 'acked'
+      override async confirmWrite(path: string): Promise<'acked' | 'failed'> {
+        return path === createRefPath ? 'failed' : 'acked'
+      }
+
+      async getConfirmedWriteFailureReason(path: string): Promise<string | undefined> {
+        return path === createRefPath
+          ? 'GitHub writeback failed with status 422: Reference already exists'
+          : undefined
       }
 
       override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
@@ -193,6 +196,36 @@ describe('RelayfileGithubConnectionWrite', () => {
         },
       },
     ])
+  })
+
+  it('recognizes an existing-reference failure from a plain provider error object', async () => {
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
+    const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-fix-issue-52-1234567890ab.json'
+    class PlainErrorMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked'> {
+        if (path === createRefPath) {
+          throw { message: 'GitHub writeback failed with status 422: Reference already exists' }
+        }
+        return 'acked'
+      }
+
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 67, url: 'https://github.com/AgentWorkforce/factory/pull/67' } })
+        }
+      }
+    }
+    const mount = new PlainErrorMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 67 })
   })
 
   it('rejects publishing from the base branch before writing a ref', async () => {

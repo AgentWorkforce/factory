@@ -1066,6 +1066,8 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 }))
       .rejects.toThrow(/Field "id" is read-only/)
+    await expect(mount.getConfirmedWriteFailureReason('/linear/issues/new.json'))
+      .resolves.toBe('Field "id" is read-only and cannot be written')
   })
 
   it('delegates subscribe through the workspace-scoped event client', () => {

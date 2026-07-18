@@ -16,7 +16,7 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'readFile' | 'writeFile'>
+  mount: Pick<MountClient, 'confirmWrite' | 'getConfirmedWriteFailureReason' | 'readFile' | 'writeFile'>
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
@@ -146,7 +146,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     await this.#mount.writeFile(path, content, { guarded: true })
     const status = await this.#mount.confirmWrite(path, { timeoutMs: WRITE_CONFIRM_TIMEOUT_MS })
     if (status !== 'acked') {
-      throw new Error(`GitHub writeback did not complete for ${path}: ${status}`)
+      const failureReason = status === 'failed'
+        ? await this.#mount.getConfirmedWriteFailureReason?.(path)
+        : undefined
+      throw new Error(`GitHub writeback did not complete for ${path}: ${failureReason ?? status}`)
     }
   }
 }
@@ -188,7 +191,13 @@ const nonNegativeInteger = (value: unknown): number | undefined =>
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
+const errorMessage = (error: unknown): string => {
+  if (error instanceof Error) return error.message
+  if (error !== null && typeof error === 'object' && 'message' in error) {
+    return String((error as { message?: unknown }).message)
+  }
+  return String(error)
+}
 
 const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
   /reference already exists/iu.test(errorMessage(error))
