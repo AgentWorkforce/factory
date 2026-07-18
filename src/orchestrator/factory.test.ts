@@ -2658,8 +2658,8 @@ describe('FactoryLoop', () => {
       [prPath]: prFile(51, {
         title: 'Fix GitHub issue #51',
         head_ref: 'github-issue-fix',
-        state: 'MERGED',
-        merged: true,
+        state: 'OPEN',
+        merged: false,
       }),
     })
     mount.setSubRoot('/linear/issues', 'absent')
@@ -2668,6 +2668,7 @@ describe('FactoryLoop', () => {
       issueSource: 'github',
       mergePolicy: 'never',
       terminalState: 'done',
+      babysitter: { enabled: true },
       slack: slackConfig(),
     }), {
       mount,
@@ -2681,6 +2682,14 @@ describe('FactoryLoop', () => {
       await factory.runOnce()
       expect(githubWriteback.closes).toEqual([])
 
+      mount.files.set(prPath, {
+        content: prFile(51, {
+          title: 'Fix GitHub issue #51',
+          head_ref: 'github-issue-fix',
+          state: 'MERGED',
+          merged: true,
+        }),
+      })
       mount.emit(changeEvent(prPath, 'github-pr-51-merged'))
 
       await vi.waitFor(() => expect(githubWriteback.closes).toHaveLength(1))
