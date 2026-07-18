@@ -248,9 +248,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     return [
       ...header,
       '',
-      input.branchName
+      input.branchName && input.branchPrepared
         ? `Use the existing isolated issue worktree on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it.`
-        : 'Use the existing issue checkout. Do not reset it or switch branches.',
+        : input.branchName
+          ? `Use the existing issue checkout on branch \`${input.branchName}\`. Do not reset it or switch branches.`
+          : 'Use the existing issue checkout. Do not reset it or switch branches.',
       `Wait for a DM from the implementer(s): ${implementers}.`,
       ...questionInstructions,
       '',

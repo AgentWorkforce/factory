@@ -6315,6 +6315,25 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('keeps workflow-only agents on their configured checkout when no implementer branch exists', async () => {
+    const routedIssue = realIssueFile(730, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:workflow' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(730)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), worktrees })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(730), routedIssue)))
+
+    expect(fleet.spawns).toHaveLength(1)
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-730-workflow',
+      cwd: '/work/pear',
+    })
+    expect(worktrees.prepared).toEqual([])
+  })
+
   it('dispatches explicit single labels as one implementer even with multiple repo labels', async () => {
     const routedIssue = realIssueFile(726, ready, {
       labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'agent:single' }],

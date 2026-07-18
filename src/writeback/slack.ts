@@ -59,7 +59,8 @@ const pathTs = (threadTs: string): string => threadTs.replace(/\./g, '_')
 
 const payloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
 
-const isSlackTs = (value: string | undefined): value is string => Boolean(value && /^\d+\.\d+$/u.test(value))
+const isSlackTs = (value: string | undefined): value is string =>
+  typeof value === 'string' && /^\d+\.\d+$/u.test(value)
 
 const rootClientId = (prefix: string, channelDir: string, text: string): string =>
   `${safePathSegment(prefix)}-${safePathSegment(channelIdFromDir(channelDir))}-${stableHash(text)}`

@@ -8755,33 +8755,34 @@ function decisionWithLifecycleBranches(
   runId: string,
   opts: { isolateLocalWorktree?: boolean } = {},
 ): TriageDecision {
-  const withBranch = (spec: AgentSpec): AgentSpec => {
+  const implementerBranch = (spec: AgentSpec): string => {
+    const runSuffix = `-${runId.slice(0, 8)}`
+    const stem = `${sanitizeAgentSlug(decision.issue.key)}-${sanitizeAgentSlug(spec.repo)}`
+      .slice(0, 120 - 'factory/'.length - runSuffix.length)
+    return `factory/${stem}${runSuffix}`
+  }
+  const branchByRepo = new Map(decision.implementers.map((spec) => [spec.repo, implementerBranch(spec)]))
+  const withBranch = (spec: AgentSpec, branch: string | undefined): AgentSpec => {
     const baseClonePath = spec.baseClonePath ?? spec.clonePath
-    const clonePath = opts.isolateLocalWorktree && baseClonePath
+    const clonePath = opts.isolateLocalWorktree && baseClonePath && branch
       ? factoryWorktreePath(baseClonePath, decision.issue.key, spec.repo, runId)
       : spec.clonePath
     const lifecycleSpec = {
       ...spec,
-      ...(opts.isolateLocalWorktree && baseClonePath ? { baseClonePath, clonePath } : {}),
+      ...(opts.isolateLocalWorktree && baseClonePath && branch ? { baseClonePath, clonePath } : {}),
       // The same persisted lifecycle reuses this id after takeover, while a
       // genuine reopen gets a new id and cannot replay an old placement ack.
       invocationId: `factory:${decision.issue.key}:${runId}:${spec.role}:${sanitizeAgentSlug(spec.name)}`,
     }
-    if (spec.role !== 'implementer') return lifecycleSpec
-    const runSuffix = `-${runId.slice(0, 8)}`
-    const stem = `${sanitizeAgentSlug(decision.issue.key)}-${sanitizeAgentSlug(spec.repo)}`
-      .slice(0, 120 - 'factory/'.length - runSuffix.length)
-    const branch = `factory/${stem}${runSuffix}`
-    return {
-      ...lifecycleSpec,
-      branch,
-    }
+    return branch ? { ...lifecycleSpec, branch } : lifecycleSpec
   }
   return {
     ...structuredClone(decision),
-    implementers: decision.implementers.map(withBranch),
-    reviewer: withBranch(decision.reviewer),
-    ...(decision.workflow ? { workflow: withBranch(decision.workflow) } : {}),
+    implementers: decision.implementers.map((spec) => withBranch(spec, branchByRepo.get(spec.repo))),
+    reviewer: withBranch(decision.reviewer, branchByRepo.get(decision.reviewer.repo)),
+    ...(decision.workflow
+      ? { workflow: withBranch(decision.workflow, branchByRepo.get(decision.workflow.repo)) }
+      : {}),
   }
 }
 
