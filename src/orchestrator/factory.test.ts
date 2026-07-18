@@ -599,6 +599,7 @@ class ManualClock {
 
 class RemoteLifecycleFleetClient extends FakeFleetClient {
   override readonly placementLocality = 'remote' as const
+  override readonly lifecycleActionName = 'factory.lifecycle'
   exitImplementerOnReconcile = false
 
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -3678,7 +3679,7 @@ describe('FactoryLoop', () => {
     const reviewerTask = lifecycle?.decision.reviewer.task
     expect(implementerTask).toContain('Full Linear issue description:')
     expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-584-review`.')
-    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(implementerTask).toContain('"kind":"blocked","issueKey":"AR-584","role":"implementer"')
     expect(implementerTask).toMatch(/exact branch `factory\/ar-584-agentworkforce-pear-[0-9a-f]{8}`/u)
     expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-584-impl-pear.')
     expect(fleet.spawns).toEqual([])
@@ -8219,10 +8220,10 @@ describe('FactoryLoop', () => {
     expect(implementerTask).toContain('Full Linear issue description:')
     expect(implementerTask).toContain('Implement the requested fix in src/orchestrator/factory.ts')
     expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
-    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(implementerTask).toContain('report one concrete question in your final outcome')
     expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-62-impl-pear.')
     expect(reviewerTask).toContain('Post review comments via the GitHub writeback path.')
-    expect(reviewerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(reviewerTask).toContain('report one concrete question in your final outcome')
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(fleet.deliveryEvents).toEqual([])
@@ -12528,7 +12529,7 @@ describe('FactoryLoop', () => {
     const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(39), issueFile(39))))
     const implementerTask = fleet.spawns.find((spawn) => spawn.name === 'ar-39-impl-pear')?.task
     expect(implementerTask).toContain('no source GitHub issue metadata')
-    expect(implementerTask).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(implementerTask).toContain('report one concrete question in your final outcome')
     expect(implementerTask).toContain('route the question through the issue Slack thread')
     expect(implementerTask).toContain('keep the session available')
     fleet.emitAgentMessage({
@@ -13573,11 +13574,31 @@ describe('FactoryLoop PR babysitter', () => {
     expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
   })
 
-  it('transitions to Human Review on the babysitter ready signal (open PR meta, no gh call)', async () => {
+  it('publishes a ready PR and reaches Human Review through lifecycle actions without control identities', async () => {
+    class LifecycleActionFleet extends FakeFleetClient {
+      override readonly lifecycleActionName = 'factory.lifecycle'
+    }
     const issue = realIssueFile(402, ready, { title: 'Real babysitter ready' })
-    const mount = new FakeMountClient({ [issuePath(402)]: issue })
-    seedPrMeta(mount, 'AgentWorkforce/pear', 402, { state: 'open', draft: false })
-    const fleet = new FakeFleetClient()
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    let mount!: FakeMountClient
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        seedPrMeta(mount, input.repo, 402, { state: 'open', draft: false })
+        return {
+          repo: input.repo,
+          number: 402,
+          url: `https://github.com/${input.repo}/pull/402`,
+          headRef: 'factory/ar-402-agentworkforce-pear',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    mount = new FakeMountClient({
+      [issuePath(402)]: issue,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new LifecycleActionFleet()
     const worktrees = new RecordingWorktreeManager()
     const cleanupReleaseCounts: number[] = []
     worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
@@ -13589,13 +13610,23 @@ describe('FactoryLoop PR babysitter', () => {
       triage: new StaticTriage(),
       linear: recordingLinear(states),
       worktrees,
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 402 }),
+      probePrResolver: async () => undefined,
       probePrGhRunner: async () => { ghCalls += 1; return { stdout: '[]' } },
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(402), issue)))
-    fleet.emitAgentExit('ar-402-impl-pear', 'worker_exited')
+    await fleet.emitAgentLifecycleSignal({
+      name: 'ar-402-impl-pear',
+      kind: 'completed',
+      issueKey: 'AR-402',
+      role: 'implementer',
+      invocationId: 'lifecycle-impl-402',
+    })
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-402-babysit'))
+
+    expect(publishInputs).toEqual([
+      expect.objectContaining({ repo: 'AgentWorkforce/pear', baseRef: 'main', title: 'AR-402: Real babysitter ready' }),
+    ])
 
     const isolatedCwds = new Set(fleet.spawns.map((spawn) => spawn.cwd))
     expect(isolatedCwds.size).toBe(1)
@@ -13606,8 +13637,20 @@ describe('FactoryLoop PR babysitter', () => {
       .toContain('Use the existing isolated issue worktree')
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-babysit')?.task)
       .toContain('Continue in the existing isolated issue worktree')
+    for (const task of fleet.spawns.map((spawn) => spawn.task ?? '')) {
+      expect(task).toContain('action name "factory.lifecycle"')
+      expect(task).not.toContain('DM `broker` when')
+      expect(task).not.toContain('with `[factory-pr-ready]')
+    }
+    expect(fleet.messages.some((message) => ['factory', 'broker', '#general'].includes(message.to))).toBe(false)
 
-    fleet.emitAgentMessage({ from: 'ar-402-babysit', target: 'factory', body: '[factory-pr-ready] AR-402' })
+    await fleet.emitAgentLifecycleSignal({
+      name: 'ar-402-babysit',
+      kind: 'ready',
+      issueKey: 'AR-402',
+      role: 'babysitter',
+      invocationId: 'lifecycle-ready-402',
+    })
 
     await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
     expect(states.at(-1)).toEqual({ key: 'AR-402', stateId: humanReviewStateId })

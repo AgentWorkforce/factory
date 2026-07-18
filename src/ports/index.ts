@@ -11,6 +11,7 @@ export type {
   Subscription,
 } from './mount'
 export type {
+  AgentLifecycleSignal,
   AgentMessage,
   AgentPidResolution,
   AgentSpec,
