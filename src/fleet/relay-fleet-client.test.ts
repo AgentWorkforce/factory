@@ -25,8 +25,10 @@ function relayMessage(overrides: Partial<RelayMessage> & { text: string }): Rela
 class FakeMessaging {
   readonly placements: RelaySpawnPlacementInput[] = []
   readonly invokes: Array<{ name: string; input?: Record<string, unknown> }> = []
-  readonly directs: Array<{ to: string; text: string }> = []
-  readonly channelSends: Array<{ channel: string; text: string }> = []
+  readonly directs: Array<{ to: string; text: string; mode?: 'wait' | 'steer' }> = []
+  readonly channelSends: Array<{ channel: string; text: string; mode?: 'wait' | 'steer' }> = []
+  readonly commandRegistrations: Array<{ command: string; handlerAgent: string }> = []
+  readonly completedInvocations: Array<{ name: string; invocationId: string; data: Record<string, unknown> }> = []
   readonly handlers = new Map<string, Set<EventHandler>>()
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
@@ -37,12 +39,14 @@ class FakeMessaging {
   disconnected = 0
   nextInvocationId = 0
   readonly agentListFilters: unknown[] = []
+  meName = 'relay-controller'
 
   readonly agents = {
     list: async (filter: unknown) => {
       this.agentListFilters.push(filter)
       return this.agentRows as never[]
     },
+    me: async () => ({ name: this.meName }),
   }
 
   readonly nodes = {
@@ -50,11 +54,11 @@ class FakeMessaging {
   }
 
   readonly messages = {
-    send: async (input: { channel: string; text: string }) => {
+    send: async (input: { channel: string; text: string; mode?: 'wait' | 'steer' }) => {
       this.channelSends.push(input)
       return relayMessage({ id: `sent-${this.channelSends.length}`, text: input.text, from: { name: 'factory' } })
     },
-    direct: async (input: { to: string; text: string }) => {
+    direct: async (input: { to: string; text: string; mode?: 'wait' | 'steer' }) => {
       if (this.directError) throw this.directError
       this.directs.push(input)
       return relayMessage({ id: `dm-${this.directs.length}`, text: input.text, from: { name: 'factory' } })
@@ -62,6 +66,11 @@ class FakeMessaging {
   }
 
   readonly commands = {
+    available: () => true,
+    register: async (input: { command: string; handlerAgent: string }) => {
+      this.commandRegistrations.push(input)
+      return input
+    },
     invoke: async (name: string, input?: Record<string, unknown>): Promise<RelayActionInvocationAck> => {
       this.invokes.push({ name, input })
       const invocationId = `inv-${++this.nextInvocationId}`
@@ -71,6 +80,10 @@ class FakeMessaging {
       const queue = this.invocations.get(invocationId)
       const next = queue?.shift()
       return next ?? { invocationId, actionName: name, status: 'completed', output: {} }
+    },
+    completeInvocation: async (name: string, invocationId: string, data: Record<string, unknown>) => {
+      this.completedInvocations.push({ name, invocationId, data })
+      return { invocationId, actionName: name, status: data.error ? 'failed' : 'completed' }
     },
   }
 
@@ -297,11 +310,11 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
 
-    await fleet.sendMessage({ to: 'ar-1-impl', text: 'hello' })
-    await fleet.sendMessage({ to: '#wf-factory', text: 'update' })
+    await fleet.sendMessage({ to: 'ar-1-impl', text: 'hello', mode: 'wait' })
+    await fleet.sendMessage({ to: '#wf-factory', text: 'update', mode: 'steer' })
 
-    expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello' }])
-    expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update' }])
+    expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello', mode: 'wait' }])
+    expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update', mode: 'steer' }])
   })
 
   it('confirms injected tasks with the sent message id', async () => {
@@ -363,6 +376,52 @@ describe('RelayFleetClient', () => {
     expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'offline' }])
     expect(messaging.connected).toBe(1)
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {
+    const messaging = new FakeMessaging()
+    messaging.meName = 'relay-controller-7'
+    messaging.agentRows = [{ name: 'ar-17-impl', status: 'online' }]
+    messaging.invocations.set('lifecycle-17', [{
+      invocationId: 'lifecycle-17',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-17-impl',
+      status: 'invoked',
+      input: { kind: 'completed', issueKey: 'AR-17', role: 'implementer' },
+    }])
+    const fleet = createClient(messaging)
+    const signals: unknown[] = []
+    fleet.onAgentLifecycleSignal?.((signal) => { signals.push(signal) })
+    await fleet.spawn({ name: 'ar-17-impl', capability: 'spawn:codex' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'actionInvoked',
+      invocationId: 'lifecycle-17',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-17-impl',
+      handlerAgentId: 'controller-id',
+    })
+
+    await vi.waitFor(() => expect(messaging.completedInvocations).toHaveLength(1))
+    expect(messaging.commandRegistrations).toEqual([
+      expect.objectContaining({ command: 'factory.lifecycle', handlerAgent: 'relay-controller-7' }),
+    ])
+    expect(messaging.agentRows.map((agent) => agent.name)).not.toEqual(expect.arrayContaining(['factory', 'broker']))
+    expect(signals).toEqual([{
+      name: 'ar-17-impl',
+      kind: 'completed',
+      issueKey: 'AR-17',
+      role: 'implementer',
+      invocationId: 'lifecycle-17',
+    }])
+    expect(messaging.completedInvocations).toEqual([{
+      name: 'factory.lifecycle',
+      invocationId: 'lifecycle-17',
+      data: { output: { accepted: true } },
+    }])
+    expect(messaging.directs).toEqual([])
+    expect(messaging.channelSends).toEqual([])
   })
 
   it('hydrates tracked agents for restart recovery', () => {

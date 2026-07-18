@@ -33,6 +33,7 @@ describe('renderAgentTask', () => {
       config: baseConfig,
       reviewerName: 'ar-123-review',
       agentName: 'ar-123-impl-pear',
+      lifecycleActionName: 'factory.lifecycle',
     })
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
@@ -54,7 +55,11 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Slack is optional')
     expect(task).toContain('question and answer folded into each fresh spawn task')
     expect(task).not.toContain('[factory-needs-input]')
-    expect(task).toContain('DM `broker` when fully done.')
+    expect(task).toContain('action name "factory.lifecycle"')
+    expect(task).toContain('"kind":"completed","issueKey":"AR-123","role":"implementer"')
+    expect(task).toContain('output `/exit` on its own line')
+    expect(task).toContain('including #general')
+    expect(task).not.toContain('DM `broker` when fully done.')
     expect(task).toContain('Do NOT auto-merge.')
     expect(task).toContain('Merge policy: never')
   })
@@ -70,6 +75,7 @@ describe('renderAgentTask', () => {
       agentName: 'ar-123-review',
       branchName: 'factory/ar-123-pear',
       branchPrepared: false,
+      lifecycleActionName: 'factory.lifecycle',
     })
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
@@ -77,7 +83,8 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Read the PR diff via .integrations/github/repos.')
     expect(task).toContain('Post review comments via the GitHub writeback path.')
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
-    expect(task).toContain('DM `broker` when the review cycle is complete.')
+    expect(task).toContain('"kind":"completed","issueKey":"AR-123","role":"reviewer"')
+    expect(task).not.toContain('DM `broker` when the review cycle is complete.')
     expect(task).toContain('Agent: ar-123-review')
     expect(task).toContain('Use the existing issue checkout on branch `factory/ar-123-pear`')
     expect(task).not.toContain('isolated issue worktree')
@@ -93,6 +100,7 @@ describe('renderAgentTask', () => {
       implementerNames: ['ar-123-impl'],
       pr: { number: 482, url: 'https://github.com/AgentWorkforce/pear/pull/482' },
       slackDispatchThread: { channel: 'C123', threadId: '170.000', mountRoot: '/work/.integrations' },
+      lifecycleActionName: 'factory.lifecycle',
     })
 
     // Carries the original spec (definition of done) and the open PR ref.
@@ -110,14 +118,13 @@ describe('renderAgentTask', () => {
     expect(task).toContain('metadata-only `<integration-event>`')
     expect(task).toContain('The event stream is not a correctness boundary')
     expect(task).toContain('on startup, after any resumed session')
-    expect(task).toContain('[factory-babysitter-critical] AR-123 begin')
-    expect(task).toContain('[factory-babysitter-critical-ack] AR-123 begin')
-    expect(task).toContain('send completion alone is not an acknowledgment')
-    expect(task).toContain('[factory-babysitter-critical] AR-123 end')
+    expect(task).toContain('PR activity through Agent Relay in wait mode')
+    expect(task).not.toContain('[factory-babysitter-critical]')
     // Team coordination + readiness signal + guardrail.
     expect(task).toContain('ar-123-impl')
     expect(task).toContain('ar-123-review')
-    expect(task).toContain('[factory-pr-ready] AR-123')
+    expect(task).toContain('"kind":"ready","issueKey":"AR-123","role":"babysitter"')
+    expect(task).not.toContain('[factory-pr-ready]')
     expect(task).toContain('move the issue to Human Review')
     expect(task).toContain('stop at Human Review')
     // It must NOT instruct opening a PR (one already exists).
@@ -165,7 +172,8 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Fix failing CI')
     expect(task).toContain('never merge it yourself')
     expect(task).toContain('Never search for, read, or substitute credentials or tokens')
-    expect(task).toContain('DM `broker` with a concise completion summary')
+    expect(task).toContain('output `/exit` on its own line')
+    expect(task).not.toContain('DM `broker`')
     expect(task).not.toContain('[factory-pr-ready]')
     expect(task).not.toContain('Coordinate the team')
     expect(task).not.toContain('implementer(s)')
@@ -284,7 +292,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('/github/repos/AgentWorkforce/factory/issues/123')
     expect(task).toContain('Agent: ar-123-impl-pear')
     expect(task).toContain('Question: <one concrete question>')
-    expect(task).toContain('Do not DM `factory`, emit a needs-input marker, wait, poll')
+    expect(task).toContain('Do not emit a needs-input message, wait, poll')
     expect(task).toContain('records the team as awaiting a human answer, and releases the team')
     expect(task).toContain('question and answer folded into each fresh spawn task')
     expect(task).toContain('cold-start the team with the issue, question, answer, branch, and PR context')
@@ -305,10 +313,12 @@ describe('renderAgentTask', () => {
       config: baseConfig,
       reviewerName: 'ar-124-review',
       agentName: 'ar-124-impl-pear',
+      lifecycleActionName: 'factory.lifecycle',
     })
 
     expect(task).toContain('no source GitHub issue metadata')
-    expect(task).toContain('DM `factory` with `[factory-needs-input]`')
+    expect(task).toContain('"kind":"blocked","issueKey":"AR-124","role":"implementer","question":"<one concrete question>"')
+    expect(task).toContain('Do not send the request to a named control agent or shared channel.')
     expect(task).toContain('route the question through the issue Slack thread')
     expect(task).toContain('keep the session available')
     expect(task).not.toContain('### Factory human input request')

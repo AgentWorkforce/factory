@@ -949,7 +949,7 @@ describe('InternalFleetClient', () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness })
 
-    await fleet.sendMessage({ to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } })
+    await fleet.sendMessage({ to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 }, mode: 'wait' })
     const injected = fleet.waitForInjected({ to: 'broker', text: 'done' }, { timeoutMs: 1000 })
     await Promise.resolve()
 
@@ -966,7 +966,7 @@ describe('InternalFleetClient', () => {
     })
 
     expect(harness.sent).toEqual([
-      { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } },
+      { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 }, mode: 'wait' },
       { to: 'broker', text: 'done', from: undefined, data: undefined },
     ])
   })

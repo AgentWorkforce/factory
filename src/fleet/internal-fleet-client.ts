@@ -1045,6 +1045,7 @@ function messageInputFrom(input: SendInput): SendMessageInput {
     text: input.text,
     from: input.from,
     data: input.data,
+    ...(input.mode ? { mode: input.mode } : {}),
   }
 }
 

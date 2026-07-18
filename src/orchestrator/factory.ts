@@ -8,6 +8,7 @@ import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/s
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import type {
   AgentMessage,
+  AgentLifecycleSignal,
   AgentPidResolution,
   AgentSpec,
   Capability,
@@ -215,9 +216,8 @@ const AGENT_QUESTION_DEDUPE_LIMIT = 500
 const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
 const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
 const GITHUB_ESCALATION_MARKER_PREFIX = 'factory-escalation:'
-// The babysitter DMs `factory` with this marker once it believes the PR is
-// green; the orchestrator confirms readiness with one authoritative gh read
-// before transitioning the issue to Human Review.
+// Legacy compatibility marker for agents launched before durable lifecycle
+// actions. New prompts report readiness through the Relay action surface.
 const AGENT_PR_READY_MARKER = '[factory-pr-ready]'
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
@@ -360,6 +360,7 @@ export class FactoryLoop implements Factory {
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
+  readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   // Composite issue identities for which a babysitter has already been spawned, so repeated PR
   // webhooks / agent-exit safety nets don't respawn it.
   readonly #babysitterSpawned = new Set<string>()
@@ -383,6 +384,7 @@ export class FactoryLoop implements Factory {
   #offAgentExit?: () => void
   #offDeliveryFailed?: () => void
   #offAgentMessage?: () => void
+  #offAgentLifecycleSignal?: () => void
   // undefined = readiness not yet probed; resolved lazily so the standalone
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
@@ -731,9 +733,12 @@ export class FactoryLoop implements Factory {
       this.#offAgentExit?.()
       this.#offDeliveryFailed?.()
       this.#offAgentMessage?.()
+      this.#offAgentLifecycleSignal?.()
+      await Promise.allSettled([...this.#agentLifecycleSignalsInFlight.values()])
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
       this.#offAgentMessage = undefined
+      this.#offAgentLifecycleSignal = undefined
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
@@ -2291,6 +2296,20 @@ export class FactoryLoop implements Factory {
     if (!this.#offAgentMessage) {
       this.#offAgentMessage = this.#fleet.onAgentMessage?.((message) => {
         void this.#handleAgentMessage(message)
+      })
+    }
+    if (!this.#offAgentLifecycleSignal) {
+      this.#offAgentLifecycleSignal = this.#fleet.onAgentLifecycleSignal?.((signal) => {
+        const key = signal.invocationId ?? `${signal.name}:${signal.kind}:${signal.issueKey ?? ''}`
+        const active = this.#agentLifecycleSignalsInFlight.get(key)
+        if (active) return active
+        const handling = this.#handleAgentLifecycleSignal(signal).finally(() => {
+          if (this.#agentLifecycleSignalsInFlight.get(key) === handling) {
+            this.#agentLifecycleSignalsInFlight.delete(key)
+          }
+        })
+        this.#agentLifecycleSignalsInFlight.set(key, handling)
+        return handling
       })
     }
   }
@@ -4418,7 +4437,7 @@ export class FactoryLoop implements Factory {
         await this.#fleet.sendMessage({
           to: reviewer,
           from: implementerName,
-          text: `[factory] implementer ${implementerName} has terminated (${reason}) and will send no further messages. If a pull request is open for this issue, review it now; otherwise conclude your review and DM \`broker\` that you are done.`,
+          text: `[factory] implementer ${implementerName} has terminated (${reason}) and will send no further messages. If a pull request is open for this issue, review it now; otherwise conclude your review and finish the Agent Relay task-exit lifecycle normally. Do not post a control message to a shared channel.`,
         })
         this.#increment('reviewerImplementerTerminatedSignals')
       } catch (error) {
@@ -4598,6 +4617,60 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #handleAgentLifecycleSignal(signal: AgentLifecycleSignal): Promise<void> {
+    if (this.#stopping) return
+
+    if (signal.kind === 'blocked') {
+      if (!signal.question?.trim()) {
+        this.#increment('agentLifecycleSignalsIgnoredInvalid')
+        return
+      }
+      // Reuse the durable clarification pipeline without requiring a Relay DM
+      // recipient. The synthetic target exists only inside this process.
+      await this.#handleAgentMessage({
+        from: signal.name,
+        target: 'factory',
+        body: `${AGENT_NEEDS_INPUT_MARKER} Issue: ${signal.issueKey ?? ''}\nQuestion: ${signal.question}`,
+        eventId: signal.invocationId ? `relay-action:${signal.invocationId}` : undefined,
+      })
+      return
+    }
+
+    const record = (await this.#batch()).getIssueByAgent(signal.name)
+    const tracked = record?.agents.get(signal.name)
+    if (!record || record.dryRun || !tracked) {
+      this.#increment('agentLifecycleSignalsIgnoredNoInFlight')
+      return
+    }
+    if (signal.issueKey && signal.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
+      this.#increment('agentLifecycleSignalsIgnoredIssueMismatch')
+      return
+    }
+    if (signal.role && signal.role !== tracked.spec.role) {
+      this.#increment('agentLifecycleSignalsIgnoredRoleMismatch')
+      return
+    }
+
+    if (signal.kind === 'ready') {
+      if (tracked.spec.role !== 'babysitter' || !this.#config.babysitter.enabled) {
+        this.#increment('agentLifecycleSignalsIgnoredRoleMismatch')
+        return
+      }
+      this.#increment('agentLifecycleReadySignals')
+      await this.#maybeAdvanceToHumanReview(record)
+      return
+    }
+
+    if (tracked.spec.role === 'babysitter') {
+      // Babysitters must make the stronger `ready` assertion; a generic task
+      // completion is not proof that checks and review feedback are clear.
+      this.#increment('agentLifecycleSignalsIgnoredRoleMismatch')
+      return
+    }
+    this.#increment('agentLifecycleCompletionSignals')
+    await this.#handleAgentExit(signal.name, 'completed')
+  }
+
   async #handleAgentMessage(message: AgentMessage): Promise<void> {
     const babysitterCritical = parseBabysitterCriticalSignal(message)
     if (babysitterCritical) {
@@ -4671,8 +4744,8 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    // The babysitter signals "PR is green" by DMing factory. Confirm with an
-    // authoritative readiness read before advancing to Human Review.
+    // Compatibility for agents launched by pre-action prompts. New agents use
+    // the durable Relay lifecycle action handled above.
     if (this.#config.babysitter.enabled && isFactoryQuestionTarget(message.target)) {
       const ready = parsePrReadySignal(message)
       if (ready) {
@@ -6062,6 +6135,7 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       }),
     })
 
@@ -6483,6 +6557,7 @@ export class FactoryLoop implements Factory {
         to: state.agentName,
         from: 'factory',
         text: renderBabysitterWake(state.repo, state.prNumber, kinds, this.#integrationsMountRoot()),
+        mode: 'wait' as const,
         data: {
           source: 'github',
           repo: state.repo,
@@ -6599,8 +6674,8 @@ export class FactoryLoop implements Factory {
   // (/github/repos/<owner>/<repo>/pulls/<n>/meta.json) — PR opened, new commits,
   // draft toggle, closed/merged — routes here. The PR readiness *verdict* (CI
   // green, conflicts resolved, comments addressed) is owned by the babysitter
-  // agent, which sees the same per-event webhook data in its sandbox and signals
-  // `[factory-pr-ready]`; the orchestrator never runs `gh`. PR meta events here
+  // agent, which sees the same per-event webhook data in its sandbox and reports
+  // through the durable Relay lifecycle action; the orchestrator never runs `gh`. PR meta events here
   // only (a) spawn the babysitter on open and (b) carry the latest open/draft/
   // merged state used to guard the final transition.
   async #handlePrChange(path: string): Promise<void> {
@@ -6940,6 +7015,7 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       })
 
       const spawned = await this.#spawnAgent(record, {
@@ -6996,7 +7072,7 @@ export class FactoryLoop implements Factory {
   // The babysitter owns the readiness verdict (CI green + conflicts resolved +
   // review comments addressed) — it sees the per-event PR webhook data in its
   // sandbox, exactly like AgentWorkforce/agents review. It signals readiness by
-  // DMing `[factory-pr-ready]`. The orchestrator trusts that signal and only
+  // invoking the lifecycle action with `kind: ready`. The orchestrator trusts that signal and only
   // guards on the PR's OWN webhook-fed meta (still open, not a draft, not already
   // merged) before flipping the issue to Human Review. No `gh` call.
   async #maybeAdvanceToHumanReview(record: InFlightIssue): Promise<void> {
@@ -10879,7 +10955,7 @@ const labelName = (value: unknown): string | undefined => {
 }
 
 const isCompletionReason = (reason?: string): boolean =>
-  reason === 'issue-done' || reason === 'done' || reason === 'completed'
+  reason === 'issue-done' || reason === 'done' || reason === 'completed' || reason === 'task_exit'
 
 const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
   if (repo.includes('/')) return repo

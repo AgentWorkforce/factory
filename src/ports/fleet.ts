@@ -42,13 +42,29 @@ export type AgentPidResolution =
   | { status: 'missing' }
   | { status: 'unresolved' }
 
-export type SendInput = { to: string; text: string; from?: string; data?: Record<string, unknown> }
+export type SendInput = {
+  to: string
+  text: string
+  from?: string
+  data?: Record<string, unknown>
+  mode?: 'wait' | 'steer'
+}
 export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
+export type AgentLifecycleSignal = {
+  name: string
+  kind: 'completed' | 'ready' | 'blocked'
+  issueKey?: string
+  role?: AgentSpec['role']
+  question?: string
+  invocationId?: string
+}
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
 export interface FleetClient {
   /** Backend-wide placement locality, used when recovering a spawn ack crash gap. */
   readonly placementLocality?: 'local' | 'remote'
+  /** Durable Relay action agents invoke instead of messaging a named control identity. */
+  readonly lifecycleActionName?: string
   spawn(input: SpawnInput): Promise<SpawnResult>
   resume(input: {
     name?: string
@@ -70,6 +86,7 @@ export interface FleetClient {
   markAgentTerminal?(name: string, reason?: string): void
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
+  onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
   // Remote backends track spawned-and-not-exited agents so the orchestrator can
   // persist them for crash recovery and re-adopt them after a restart.

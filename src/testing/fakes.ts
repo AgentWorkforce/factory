@@ -3,6 +3,7 @@ import type {
   EventPage,
   FleetClient,
   GithubConnectionWrite,
+  AgentLifecycleSignal,
   AgentMessage,
   MountClient,
   RosterEntry,
@@ -17,6 +18,7 @@ import type {
 type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
+type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Promise<void>
 
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
@@ -172,6 +174,7 @@ const mergedLinearIssueContent = (existing: unknown, content: unknown): unknown 
 
 export class FakeFleetClient implements FleetClient {
   readonly placementLocality: 'local' | 'remote' = 'local'
+  readonly lifecycleActionName?: string
   readonly spawns: SpawnInput[] = []
   readonly resumes: Array<{
     name?: string
@@ -198,6 +201,7 @@ export class FakeFleetClient implements FleetClient {
   #exitListeners = new Set<ExitListener>()
   #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   #agentMessageListeners = new Set<AgentMessageListener>()
+  #agentLifecycleSignalListeners = new Set<AgentLifecycleSignalListener>()
   #sessionRefs = new Map<string, string | undefined>()
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -298,6 +302,13 @@ export class FakeFleetClient implements FleetClient {
     }
   }
 
+  onAgentLifecycleSignal(listener: AgentLifecycleSignalListener): () => void {
+    this.#agentLifecycleSignalListeners.add(listener)
+    return () => {
+      this.#agentLifecycleSignalListeners.delete(listener)
+    }
+  }
+
   preserveInfrastructureOnDispose(): void {
     this.preservedInfrastructure += 1
   }
@@ -325,6 +336,12 @@ export class FakeFleetClient implements FleetClient {
   emitAgentMessage(message: AgentMessage): void {
     for (const listener of this.#agentMessageListeners) {
       listener(message)
+    }
+  }
+
+  async emitAgentLifecycleSignal(signal: AgentLifecycleSignal): Promise<void> {
+    for (const listener of this.#agentLifecycleSignalListeners) {
+      await listener(signal)
     }
   }
 }
