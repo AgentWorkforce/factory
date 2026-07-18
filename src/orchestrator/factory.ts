@@ -85,7 +85,14 @@ type Listener = (payload: FactoryEventPayload) => void
 type SlackThreadWatcher = { stop(): Promise<void> }
 type GithubIssueCommentWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
-type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
+type ResolvedIssuePr = {
+  repo: string
+  prNumber: number
+  draft?: boolean
+  headRef?: string
+  url?: string
+  path?: string
+}
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubOrphanRecoveryContext = {
@@ -202,6 +209,8 @@ const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+const SLACK_IDENTITY_MESSAGE_SCAN_LIMIT = 250
+const SLACK_IDENTITY_READ_BATCH_SIZE = 25
 const AGENT_QUESTION_DEDUPE_LIMIT = 500
 const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
 const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
@@ -290,6 +299,8 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
+  readonly #slackReporterUserIds = new Map<string, string | undefined>()
+  readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
@@ -1335,6 +1346,16 @@ export class FactoryLoop implements Factory {
     })
   }
 
+  async #openPrForIssue(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
+    if (this.#customProbePrResolver) {
+      return this.#probePrResolver(issue)
+    }
+    return this.#resolveIssuePr(issue, {
+      titleMarker: FACTORY_E2E_MARKER,
+      openOnly: true,
+    })
+  }
+
   async #resolveIssuePr(
     issue: LinearIssue,
     opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; failOnLookupError?: boolean } = {},
@@ -1399,6 +1420,7 @@ export class FactoryLoop implements Factory {
       let lastReadyReadProgressAtMs = this.#clock.now()
       let readyIssueReads = 0
 
+      const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         const issue = await this.#readIssue(path)
         readyIssueReads += 1
@@ -1413,6 +1435,24 @@ export class FactoryLoop implements Factory {
         if (issue && issueSource === 'linear') {
           await this.#recordCanonicalIssueState(issue)
         }
+        issueEntries.push({ path, issue })
+      }
+      if (issueSource === 'github') {
+        // New ready work must not sit behind a long sequence of stale
+        // in-progress recoveries. Load the canonical snapshots first, then
+        // prioritize genuinely ready issues over orphan-recovery candidates.
+        // Within either bucket, resume the most recently changed provider work
+        // first so a just-interrupted dispatch does not sit behind an old
+        // numeric backlog of leaked in-progress labels.
+        issueEntries.sort((left, right) => {
+          const readiness = Number(Boolean(right.issue && this.#isIssueReady(right.issue))) -
+            Number(Boolean(left.issue && this.#isIssueReady(left.issue)))
+          if (readiness !== 0) return readiness
+          return githubIssueUpdatedAtMs(right.issue) - githubIssueUpdatedAtMs(left.issue)
+        })
+      }
+
+      for (const { issue } of issueEntries) {
         if (!issue) {
           continue
         }
@@ -1480,7 +1520,17 @@ export class FactoryLoop implements Factory {
 
           const decision = await this.triageIssue(issue)
           triaged.push(decision)
-          const result = await this.dispatch(decision, { dryRun })
+          let result: DispatchResult
+          try {
+            result = await this.dispatch(decision, { dryRun })
+          } catch (error) {
+            if (!(error instanceof LiveDispatchStateChangedError)) throw error
+            skipped.push({ issue: decision.issue, reason: 'live state changed during dispatch' })
+            this.#logger.info?.('[factory] skipped issue whose live state changed during dispatch', {
+              issue: decision.issue.key,
+            })
+            continue
+          }
           if (result.agents.length === 0 && !dryRun) {
             skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
           } else {
@@ -1601,9 +1651,9 @@ export class FactoryLoop implements Factory {
       return false
     }
 
-    let hasOpenPr: boolean
+    let openPr: ResolvedIssuePr | undefined
     try {
-      hasOpenPr = await this.#hasOpenCompletionPr(issue)
+      openPr = await this.#openCompletionPr(issue)
     } catch (error) {
       this.#increment('githubOrphanRecoveryPrProbeFailures')
       this.#logger.warn?.('[factory] could not prove an in-progress GitHub issue has no open PR; preserving it', {
@@ -1612,10 +1662,26 @@ export class FactoryLoop implements Factory {
       })
       return false
     }
-    if (hasOpenPr) {
+    if (openPr) {
+      let adopted = false
+      try {
+        adopted = await this.#adoptOrphanedGithubPullRequest(issue, openPr)
+      } catch (error) {
+        this.#increment('githubOrphanedPullRequestAdoptionFailures')
+        this.#logger.warn?.('[factory] could not adopt orphaned in-progress GitHub issue at its open PR', {
+          issue: issue.key,
+          repo: openPr.repo,
+          prNumber: openPr.prNumber,
+          error: describeError(error).errorMessage,
+        })
+      }
       this.#increment('githubOrphanRecoveriesBlockedOpenPr')
-      this.#logger.info?.('[factory] preserved in-progress GitHub issue because a matching open PR exists', {
+      this.#logger.info?.(adopted
+        ? '[factory] adopted orphaned in-progress GitHub issue at its existing PR'
+        : '[factory] preserved in-progress GitHub issue because a matching open PR exists', {
         issue: issue.key,
+        repo: openPr.repo,
+        prNumber: openPr.prNumber,
       })
       return false
     }
@@ -1645,15 +1711,109 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #hasOpenCompletionPr(issue: LinearIssue): Promise<boolean> {
+  async #openCompletionPr(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
     if (this.#customProbePrResolver) {
-      return Boolean(await this.#probePrResolver(issue))
+      return await this.#probePrResolver(issue)
     }
-    return Boolean(await this.#resolveIssuePr(issue, {
+    return await this.#resolveIssuePr(issue, {
       titleMarker: FACTORY_E2E_MARKER,
       openOnly: true,
       failOnLookupError: true,
-    }))
+    })
+  }
+
+  async #adoptOrphanedGithubPullRequest(issue: LinearIssue, pr: ResolvedIssuePr): Promise<boolean> {
+    if (
+      !this.#config.babysitter.enabled ||
+      pr.draft === true ||
+      !pr.headRef?.startsWith('factory/') ||
+      !factoryBranchMatchesIssue(pr.headRef, issue.key)
+    ) return false
+
+    const triaged = await this.triageIssue(issue)
+    const routed = labelDerivedDispatchDecision(issue, triaged, this.#config)
+    if (!routed.ok) return false
+    const route = routed.decision.routes.find((candidate) =>
+      normalizeGithubRepo(candidate.repo, this.#config.repos.org).toLowerCase() === pr.repo.toLowerCase()
+    )
+    if (!route) return false
+
+    let decision = routed.decision
+    if (this.#worktrees && route.clonePath) {
+      const worktreePath = factoryWorktreePath(
+        route.clonePath,
+        issue.key,
+        route.repo,
+        stableHash(`${pr.repo}#${pr.prNumber}:${pr.headRef}`),
+      )
+      decision = {
+        ...decision,
+        implementers: decision.implementers.map((spec) => spec.repo === route.repo
+          ? {
+              ...spec,
+              baseClonePath: route.clonePath,
+              clonePath: worktreePath,
+              branch: pr.headRef,
+            }
+          : spec),
+      }
+    }
+
+    const durableRemoteAdoption = this.#fleet.placementLocality === 'remote'
+    const publishedPr: GithubPublishPullRequestResult = {
+      repo: pr.repo,
+      number: pr.prNumber,
+      url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
+      headRef: pr.headRef,
+    }
+    if (durableRemoteAdoption) {
+      const claim = await this.#claimDispatchLifecycle(decision, false, randomUUID(), {
+        phase: 'published',
+        pullRequest: publishedPr,
+      })
+      decision = structuredClone(claim.lifecycle.decision)
+      if (claim.lifecycle.phase === 'queued') {
+        this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
+        this.#increment('queued')
+        this.#increment('githubOrphanedPullRequestsAdopted')
+        return true
+      }
+    }
+
+    const batch = await this.#batch()
+    const record = batch.start(decision, false)
+    if (!record) {
+      if (durableRemoteAdoption) {
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+        if (durable) {
+          this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(durable))
+          this.#increment('githubOrphanedPullRequestsAdopted')
+          return true
+        }
+      }
+      return false
+    }
+    await this.#ensureBabysitter(record, {
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
+      path: pr.path,
+      headRef: pr.headRef,
+    })
+    const babysitter = [...record.agents.values()].find((tracked) => tracked.spec.role === 'babysitter')
+    if (!babysitter) {
+      if (durableRemoteAdoption) this.#scheduleDispatchLifecycleRetry(record)
+      else batch.abandon(record.issue)
+      return false
+    }
+    record.result = {
+      issue: record.issue,
+      agents: [{ name: babysitter.result?.name ?? babysitter.spec.name, role: 'babysitter' }],
+      dryRun: false,
+    }
+    await this.#writeInFlightRegistry()
+    this.#increment('githubOrphanedPullRequestsAdopted')
+    return true
   }
 
   async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
@@ -2009,7 +2169,7 @@ export class FactoryLoop implements Factory {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
-          throw new Error(`Live state changed before writeback for ${dispatchDecision.issue.key}`)
+          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
         }
         try {
           await this.#postIssueComment(issue, comment)
@@ -2046,13 +2206,37 @@ export class FactoryLoop implements Factory {
       // acknowledged spawns, so cleanup never races a name-only survivor.
       const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
       await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
-      const worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
-      await this.#recordDispatchFailure(decision.issue)
-      const failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-      await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
+      const liveStateChanged = error instanceof LiveDispatchStateChangedError
+      if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
+        const failed = await this.#releaseAndTerminateAgents(
+          failureHandoffs.map((handoff) => [handoff.name, handoff.tracked]),
+          'live dispatch state changed',
+          'completion',
+        )
+        if (failed.length === 0) {
+          for (const handoff of failureHandoffs) {
+            await this.#state.clearFailureHandoff(
+              this.#workspaceId,
+              registryHandoffKey(handoff.issue, handoff.name),
+            )
+          }
+          worktreesTornDown = failureHandoffs.length > 0
+        }
+      }
+      let failedState: { terminal: boolean } | undefined
+      if (liveStateChanged) {
+        await this.#clearDispatchInFlight(decision.issue)
+        await this.#saveDispatchLifecycle(record, 'abandoned')
+        this.#increment('dispatchLiveStateRaces')
+      } else {
+        await this.#recordDispatchFailure(decision.issue)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+        await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+      }
       batch.abandon(decision.issue)
-      if (!failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
-      this.#error(error, decision.issue)
+      if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
+      if (!liveStateChanged) this.#error(error, decision.issue)
       // The teardown runs while the record still exists so it can safely
       // derive every shared checkout. Rewrite the registry only after abandon
       // removes those agents from the ordinary in-flight view.
@@ -2215,6 +2399,10 @@ export class FactoryLoop implements Factory {
     decision: TriageDecision,
     dryRun: boolean,
     preparedRunId?: string,
+    initial: {
+      phase?: DispatchLifecyclePhase
+      pullRequest?: GithubPublishPullRequestResult
+    } = {},
   ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
     const key = issueKey(decision.issue)
     const seed: DispatchLifecycle = {
@@ -2222,11 +2410,12 @@ export class FactoryLoop implements Factory {
       issue: { ...decision.issue },
       decision: structuredClone(decision),
       dryRun,
-      phase: 'dispatching',
+      phase: initial.phase ?? 'dispatching',
       agents: [],
       invocationIds: [],
       updatedAtMs: this.#clock.now(),
     }
+    if (initial.pullRequest) seed.pullRequest = initial.pullRequest
     if (!preparedRunId) seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
     const claim = await this.#state.claimDispatchLifecycle(
       this.#workspaceId,
@@ -2387,7 +2576,17 @@ export class FactoryLoop implements Factory {
       if (!promoted || promoted.phase !== 'dispatching') {
         throw new Error(`durable dispatch ${lifecycle.issue.key} lost its promoted lifecycle`)
       }
-      lifecycle = promoted
+      if (promoted.pullRequest) {
+        const promotedRecord = inFlightRecordFromLifecycle(promoted)
+        if (!await this.#saveDispatchLifecycle(promotedRecord, 'published', promoted.pullRequest)) return
+        const published = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (!published || published.phase !== 'published') {
+          throw new Error(`durable dispatch ${lifecycle.issue.key} lost its published PR during promotion`)
+        }
+        lifecycle = published
+      } else {
+        lifecycle = promoted
+      }
     }
     const batch = await this.#batch()
     const durableRecord = inFlightRecordFromLifecycle(lifecycle)
@@ -2422,7 +2621,7 @@ export class FactoryLoop implements Factory {
     if (lifecycle.phase === 'publishing') {
       const implementer = [...record.agents.values()].find((agent) => agent.spec.role === 'implementer')
       if (!implementer) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
-      const published = await this.#publishImplementerPullRequest(record, implementer)
+      const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
       if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request`)
       if (!await this.#saveDispatchLifecycle(record, 'published', published)) return
       if (this.#config.babysitter.enabled) {
@@ -2646,6 +2845,12 @@ export class FactoryLoop implements Factory {
         }
       }
     } catch (error) {
+      if (error instanceof LiveDispatchStateChangedError) {
+        this.#logger.info?.('[factory] ignored issue event whose live state changed during dispatch', {
+          issue: error.issueKey,
+        })
+        return
+      }
       this.#logger.error?.('[factory] failed to handle issue change', error)
     }
   }
@@ -2808,7 +3013,6 @@ export class FactoryLoop implements Factory {
             continue
           } else if (isGithubIssueTreePath(path)) {
             this.#increment('githubIssuesIgnoredByPathRegex')
-            this.#logger.debug?.('[factory] ignored GitHub issue path with unsupported relayfile shape', { path })
           }
         }
       }
@@ -3666,7 +3870,9 @@ export class FactoryLoop implements Factory {
     }
 
     if (isCompletionReason(reason)) {
-      if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+      if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
+        openOnly: this.#config.babysitter.enabled,
+      })) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
         else await this.#completeIssue(record)
         return
@@ -3716,7 +3922,9 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record)) {
+      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
+        openOnly: this.#config.babysitter.enabled,
+      })) {
         if (this.#config.babysitter.enabled) {
           await this.#ensureBabysitterForIssue(record)
           return
@@ -3889,6 +4097,7 @@ export class FactoryLoop implements Factory {
   async #publishImplementerPullRequest(
     record: InFlightIssue,
     implementer: TrackedAgent,
+    opts: { reconcileExisting?: boolean } = {},
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
@@ -3918,6 +4127,21 @@ export class FactoryLoop implements Factory {
       ? sourceRepoParts.owner
       : undefined
     const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+    const expectedHeadRef = implementer.spec.branch ?? remoteBranch
+    if (opts.reconcileExisting && expectedHeadRef) {
+      const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
+      if (existing) {
+        this.#publishedPullRequests.set(key, existing)
+        this.#increment('githubPullRequestsReconciled')
+        this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
+          issue: issue.key,
+          repo: existing.repo,
+          prNumber: existing.number,
+          url: existing.url,
+        })
+        return existing
+      }
+    }
     const baseRef = await this.#githubDefaultBranch(repo)
     const result = await githubWrite.publishPullRequest({
       repo,
@@ -3947,6 +4171,55 @@ export class FactoryLoop implements Factory {
       url: result.url,
     })
     return result
+  }
+
+  async #openPullRequestByHead(
+    repo: string,
+    expectedHeadRef: string,
+  ): Promise<GithubPublishPullRequestResult | undefined> {
+    const parts = githubRepoParts(repo)
+    if (!parts) return undefined
+    const roots = [
+      `/github/repos/${encodeURIComponent(parts.owner)}/${encodeURIComponent(parts.repo)}/pulls/`,
+      `/github/repos/${encodeURIComponent(parts.owner)}__${encodeURIComponent(parts.repo)}/pulls/`,
+    ]
+    const candidates: GithubPublishPullRequestResult[] = []
+    for (const root of roots) {
+      let paths: string[]
+      try {
+        paths = await this.#mount.listTree(root)
+      } catch {
+        continue
+      }
+      for (const path of paths) {
+        const pathParts = githubPullPathParts(path)
+        if (
+          !pathParts ||
+          pathParts.owner.toLowerCase() !== parts.owner.toLowerCase() ||
+          pathParts.repo.toLowerCase() !== parts.repo.toLowerCase()
+        ) continue
+        try {
+          const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, pathParts.number)
+          const state = snapshot?.state?.trim().toUpperCase()
+          if (
+            !snapshot ||
+            snapshot.headRef !== expectedHeadRef ||
+            state !== 'OPEN' ||
+            snapshot.draft !== false ||
+            snapshot.merged === true
+          ) continue
+          candidates.push({
+            repo,
+            number: snapshot.number,
+            url: snapshot.url ?? `https://github.com/${repo}/pull/${snapshot.number}`,
+            headRef: expectedHeadRef,
+          })
+        } catch {
+          // A partially materialized PR record cannot prove exact ownership.
+        }
+      }
+    }
+    return candidates.sort((a, b) => b.number - a.number)[0]
   }
 
   async #prepareAgentWorktree(record: InFlightIssue, spec: AgentSpec): Promise<void> {
@@ -4165,12 +4438,35 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
-    const remaining = [...record.agents].filter(([, tracked]) => tracked.spec.role !== 'implementer')
-    for (const [agentName] of remaining) {
+    const agents = [...record.agents]
+    for (const [agentName, tracked] of agents) {
+      if (tracked.spec.role === 'implementer') continue
       this.#fleet.markAgentTerminal?.(agentName, `implementer-terminal:${reason}`)
     }
-    if (remaining.length > 0) {
-      await this.#releaseAndTerminateAgents(remaining, 'issue-abandoned', 'completion')
+    const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
+    let cleanupComplete = true
+    if (worktreeHandoffs.length > 0) {
+      // A terminal no-PR dispatch no longer owns useful work. Fence and release
+      // every agent sharing the checkout before removing it. If release or
+      // cleanup fails, the durable handoff reaper retains responsibility rather
+      // than leaving an invisible orphan under .factory-worktrees.
+      await this.#persistDispatchFailureReaperHandoff(record, worktreeHandoffs)
+      const worktreeAgentNames = new Set(worktreeHandoffs.map((handoff) => handoff.name))
+      const nonWorktreeAgents = agents.filter(([name]) => !worktreeAgentNames.has(name))
+      if (nonWorktreeAgents.length > 0) {
+        const failed = await this.#releaseAndTerminateAgents(nonWorktreeAgents, 'issue-abandoned', 'completion')
+        cleanupComplete = failed.length === 0
+      }
+      cleanupComplete = await this.#teardownFailedDispatchWorktrees(worktreeHandoffs) && cleanupComplete
+    } else if (agents.length > 0) {
+      const failed = await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
+      cleanupComplete = failed.length === 0
+    }
+    if (!cleanupComplete) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      await this.#writeInFlightRegistry()
+      return
     }
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
@@ -4183,7 +4479,24 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #issueHasCompletionPr(record: InFlightIssue): Promise<boolean> {
+  #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
+    const key = issueKey(record.issue)
+    if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
+    const timer = setTimeout(() => {
+      this.#dispatchLifecycleRetryTimers.delete(key)
+      void this.#abandonStuckDispatch(record, reason).catch((error) => {
+        this.#logger.warn?.('[factory] abandoned dispatch cleanup retry failed', {
+          issue: record.issue.key,
+          error: describeError(error).errorMessage,
+        })
+        this.#scheduleAbandonedDispatchRetry(record, reason)
+      })
+    }, DISPATCH_LIFECYCLE_RETRY_MS)
+    timer.unref?.()
+    this.#dispatchLifecycleRetryTimers.set(key, timer)
+  }
+
+  async #issueHasCompletionPr(record: InFlightIssue, opts: { openOnly?: boolean } = {}): Promise<boolean> {
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
@@ -4193,7 +4506,9 @@ export class FactoryLoop implements Factory {
       // work isn't review-ready, so an implementer exiting with only a draft PR
       // must NOT mark the issue done / release agents — mirror the
       // #sweepPrStateCompletions draft guard, which keeps draft-PR issues in flight.
-      const pr = await this.#completionPrForIssue(issue)
+      const pr = opts.openOnly
+        ? await this.#openPrForIssue(issue)
+        : await this.#completionPrForIssue(issue)
       return Boolean(pr && !pr.draft)
     } catch (error) {
       this.#logger.warn?.('[factory] PR probe failed after implementer exit; preserving restart behavior', {
@@ -4259,12 +4574,21 @@ export class FactoryLoop implements Factory {
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
     const critical = await this.#state.consumeCritical(this.#workspaceId, info.msgId ?? '')
+    if (!critical) {
+      this.#increment('nonCriticalDeliveryFailuresIgnored')
+      return
+    }
     const record = (await this.#batch()).getIssueByAgent(info.to)
-    const issue = critical?.issue ?? record?.issue
+    const issue = critical.issue ?? record?.issue
     const error = new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`)
     this.#error(error, issue)
 
-    if (critical && this.#fleet.waitForInjected) {
+    if (isTerminalDeliveryFailure(info.reason)) {
+      this.#increment('criticalDeliveryTerminalFailures')
+      return
+    }
+
+    if (this.#fleet.waitForInjected) {
       try {
         const ack = await this.#waitForInjectedAndSubmit(critical.input)
         await this.#state.recordCritical(this.#workspaceId, ack.eventId, critical)
@@ -5179,6 +5503,14 @@ export class FactoryLoop implements Factory {
     } else {
       watch.issue = { ...record.issue }
       watch.detectAgentQuestions = true
+      const humanReplyDispatch = record.decision.rationale.includes('Human answered the GitHub triage escalation')
+      if (!triageEscalationReason(record.decision) && !humanReplyDispatch) {
+        const pendingCount = watch.pending.length
+        watch.pending = watch.pending.filter((pending) => pending.kind !== 'triage')
+        if (watch.pending.length < pendingCount) {
+          this.#increment('triageEscalationsSupersededByActionableIssue')
+        }
+      }
     }
     if (this.#githubIssueCommentWatchers.has(key)) {
       const normalizedWatch = normalizeGithubIssueCommentWatch(watch)
@@ -5668,7 +6000,9 @@ export class FactoryLoop implements Factory {
     }
 
     this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
-    const result = await this.#startOrQueueGithubClarifiedDecision(decision)
+    const result = await this.#startOrQueueGithubClarifiedDecision(
+      dispatchAfterGithubClarification(decision, 'human clarification resolved triage'),
+    )
     this.#increment('githubTriageAnswersDispatched')
     return Boolean(result) || (await this.#batch()).isQueued(decision.issue)
   }
@@ -5824,6 +6158,23 @@ export class FactoryLoop implements Factory {
       }
       if (!await this.#assertIssueDispatchLifecycleOwner(session.issue)) {
         this.#increment('babysitterOwnershipRestoreSkippedNonOwner')
+        continue
+      }
+      const snapshot = await this.#readPrSnapshot(session)
+      const guard = snapshot ? prMetaAllowsHumanReview(snapshot) : undefined
+      if (!snapshot || !guard?.ok || prSnapshotIssueMatchScore(snapshot, session.issue.key) < 30) {
+        await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
+        this.#increment('babysitterOwnershipRestoreStale')
+        this.#logger.warn?.('[factory] discarded stale babysitter ownership during restore', {
+          issue: session.issue.key,
+          repo: session.repo,
+          prNumber: session.prNumber,
+          reason: !snapshot
+            ? 'authoritative PR meta is unavailable'
+            : !guard?.ok
+              ? guard?.reason
+              : 'PR branch does not identify the issue',
+        })
         continue
       }
       const record = batch.getIssue(session.issue)
@@ -6475,14 +6826,20 @@ export class FactoryLoop implements Factory {
     if (!issue) {
       return
     }
-    const pr = await this.#completionPrForIssue(issue)
+    const pr = await this.#openPrForIssue(issue)
     if (!pr || pr.draft) {
       return
     }
     await this.#ensureBabysitter(record, { repo: pr.repo, prNumber: pr.prNumber })
   }
 
-  async #ensureBabysitter(record: InFlightIssue, prRef: { repo: string; prNumber: number; url?: string; path?: string }): Promise<void> {
+  async #ensureBabysitter(record: InFlightIssue, prRef: {
+    repo: string
+    prNumber: number
+    url?: string
+    path?: string
+    headRef?: string
+  }): Promise<void> {
     const babysitterKey = issueKey(record.issue)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
@@ -6550,7 +6907,9 @@ export class FactoryLoop implements Factory {
       const sharedCheckout = [...record.agents.values()]
         .map((agent) => agent.spec)
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
-      const implementerBranch = record.decision.implementers
+        ?? record.decision.implementers
+          .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
+      const implementerBranch = prRef.headRef ?? record.decision.implementers
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
       const spec: AgentSpec = sharedCheckout
         ? {
@@ -6686,7 +7045,12 @@ export class FactoryLoop implements Factory {
     if (!ref) {
       return undefined
     }
-    const candidatePaths = ref.path ? [ref.path] : await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
+    return await this.#readPrSnapshot(ref)
+  }
+
+  async #readPrSnapshot(ref: Pick<BabysitterPrRef, 'repo' | 'prNumber' | 'path'>): Promise<PullSnapshot | undefined> {
+    const discoveredPaths = await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
+    const candidatePaths = [...new Set([ref.path, ...discoveredPaths].filter((path): path is string => Boolean(path)))]
     for (const path of candidatePaths) {
       try {
         const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, ref.prNumber)
@@ -7270,9 +7634,9 @@ export class FactoryLoop implements Factory {
   }
 
   async #escalateTriageToGithub(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
-    const question = triageEscalationQuestion(decision)
-    const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const issue = await this.#readIssue(decision.issue.path)
+    const question = triageEscalationQuestion(decision, issue)
+    const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const source = issue ? githubIssueSourceRef(issue) : undefined
     const authorizedAuthor = issue ? await this.#resolveGithubIssueAuthor(issue) : undefined
     if (!issue || !source || !authorizedAuthor) {
@@ -7369,7 +7733,11 @@ export class FactoryLoop implements Factory {
     const source = githubIssueSourceRef(issue)
     const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
     const reporter = await this.#resolveGithubIssueAuthor(issue)
-    const audience = [stakeholderMentions, reporter ? `GitHub reporter: @${reporter}.` : undefined]
+    const reporterSlackUserId = reporter ? await this.#resolveSlackUserIdForGithubReporter(reporter) : undefined
+    const reporterAudience = reporter
+      ? `GitHub reporter: ${reporterSlackUserId ? `<@${reporterSlackUserId}>` : `${reporter} (GitHub)`}.`
+      : undefined
+    const audience = [stakeholderMentions, reporterAudience]
       .filter((part): part is string => Boolean(part))
       .join(' ')
     const replyInstruction = source?.url
@@ -7380,7 +7748,7 @@ export class FactoryLoop implements Factory {
       text: [
         `${audience ? `${audience} ` : ''}${decision.issue.key}: factory triage escalation for ${issue.title}`,
         `Reason: ${reason}`,
-        `Question: ${triageEscalationQuestion(decision)} ${replyInstruction}`,
+        `Question: ${triageEscalationQuestion(decision, issue)} ${replyInstruction}`,
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
@@ -7430,6 +7798,71 @@ export class FactoryLoop implements Factory {
     return pending
   }
 
+  async #resolveSlackUserIdForGithubReporter(reporter: string): Promise<string | undefined> {
+    const identity = normalizedCrossProviderIdentity(reporter)
+    if (!identity) return undefined
+    if (this.#slackReporterUserIds.has(identity)) {
+      return this.#slackReporterUserIds.get(identity)
+    }
+    const existing = this.#slackReporterUserIdLookups.get(identity)
+    if (existing) return existing
+
+    const pending = this.#findSlackUserIdByIdentity(identity)
+      .then((userId) => {
+        this.#slackReporterUserIds.set(identity, userId)
+        if (userId) this.#increment('slackReporterIdentitiesResolved')
+        return userId
+      })
+      .catch(() => {
+        this.#slackReporterUserIds.set(identity, undefined)
+        this.#increment('slackReporterIdentityLookupFailures')
+        return undefined
+      })
+      .finally(() => {
+        this.#slackReporterUserIdLookups.delete(identity)
+      })
+    this.#slackReporterUserIdLookups.set(identity, pending)
+    return pending
+  }
+
+  async #findSlackUserIdByIdentity(identity: string): Promise<string | undefined> {
+    const list = async (prefix: string): Promise<string[]> => {
+      try {
+        return await this.#mount.listTree(prefix)
+      } catch {
+        return []
+      }
+    }
+    const [userPaths, channelPaths] = await Promise.all([
+      list('/slack/users'),
+      list('/slack/channels'),
+    ])
+    const candidates = [
+      ...userPaths.filter(isSlackIdentityRecordPath),
+      ...channelPaths
+        .filter(isSlackIdentityRecordPath)
+        .sort((left, right) => slackIdentityPathTimestamp(right) - slackIdentityPathTimestamp(left))
+        .slice(0, SLACK_IDENTITY_MESSAGE_SCAN_LIMIT),
+    ]
+    const matches = new Set<string>()
+    for (let offset = 0; offset < candidates.length; offset += SLACK_IDENTITY_READ_BATCH_SIZE) {
+      const batch = candidates.slice(offset, offset + SLACK_IDENTITY_READ_BATCH_SIZE)
+      const records = await Promise.all(batch.map(async (path) => {
+        try {
+          return wrappedPayload((await this.#mount.readFile(path)).content)
+        } catch {
+          return undefined
+        }
+      }))
+      for (const payload of records) {
+        const userId = payload ? slackUserIdMatchingIdentity(payload, identity) : undefined
+        if (userId) matches.add(userId)
+        if (matches.size > 1) return undefined
+      }
+    }
+    return matches.size === 1 ? [...matches][0] : undefined
+  }
+
   async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
     if (!this.#slack || !this.#config.slack) {
       return
@@ -7442,7 +7875,7 @@ export class FactoryLoop implements Factory {
       text: [
         `${stakeholderMentions ? `${stakeholderMentions} ` : ''}${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
         `Reason: ${reason}`,
-        `Question: ${triageEscalationQuestion(decision)}`,
+        `Question: ${triageEscalationQuestion(decision, issue)}`,
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
@@ -8699,6 +9132,15 @@ const githubIssueAsFactoryIssue = (issue: GithubIssueSource): LinearIssue => {
   }
 }
 
+const githubIssueUpdatedAtMs = (issue?: LinearIssue): number => {
+  if (!issue || !isGithubIssue(issue)) return 0
+  const payload = wrappedPayload(issue.raw)
+  const updatedAt = stringValue(payload.updated_at) ?? stringValue(payload.updatedAt)
+  if (!updatedAt) return 0
+  const parsed = Date.parse(updatedAt)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 export async function readFactoryLoopHeartbeat(
   path = DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
 ): Promise<FactoryLoopHeartbeat | undefined> {
@@ -9011,22 +9453,32 @@ function labelRoutesForIssue(
   offendingLabels: string[]
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
-  const githubReadinessLabel = isGithubIssue(issue) ? config.safety.requireLabel.trim().toLowerCase() : undefined
-  const labels = uniqueNormalizedLabels(issue.labels).filter((label) =>
+  const githubIssue = isGithubIssue(issue)
+  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim().toLowerCase() : undefined
+  const candidateLabels = uniqueNormalizedLabels(issue.labels).filter((label) =>
     !isShapeLabel(label) &&
     label.toLowerCase() !== githubReadinessLabel &&
-    (!isGithubIssue(issue) || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
+    (!githubIssue || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
   )
+  const labels: string[] = []
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []
   const seenRepos = new Set<string>()
 
-  for (const label of labels) {
+  for (const label of candidateLabels) {
     const entry = findLabelRoute(config.repos.byLabel, label)
     if (!entry) {
-      offendingLabels.push(label)
+      // GitHub repositories commonly carry metadata labels such as `bug` and
+      // `enhancement`; only explicitly configured repo labels participate in
+      // routing. Linear labels remain authoritative and therefore fail closed
+      // when unmapped.
+      if (!githubIssue) {
+        labels.push(label)
+        offendingLabels.push(label)
+      }
       continue
     }
+    labels.push(label)
 
     const repo = entry.repo
     if (seenRepos.has(repo)) {
@@ -9506,7 +9958,15 @@ const resolveIssuePrFromMount = async (
         ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
         : 0
       if (!pr || score <= 0) continue
-      candidates.push({ repo, prNumber: pr.number, draft: pr.draft, score })
+      candidates.push({
+        repo,
+        prNumber: pr.number,
+        draft: pr.draft,
+        headRef: pr.headRef,
+        url: pr.url,
+        path,
+        score,
+      })
     }
   }
 
@@ -9533,7 +9993,7 @@ const resolveIssuePrFromGh = async (
         '--state',
         'all',
         '--json',
-        'number,title,body,headRefName,isDraft,state',
+        'number,title,body,headRefName,isDraft,state,url',
         '--limit',
         String(PROBE_PR_GH_CANDIDATE_LIMIT),
       ])
@@ -9561,7 +10021,7 @@ const resolveIssuePrFromGh = async (
 
     for (const entry of payload) {
       const pr = ghProbePrCandidate(entry)
-      if (!pr || !containsIssueKey(pr.headRef, issue.key)) continue
+      if (!pr || !factoryBranchMatchesIssue(pr.headRef, issue.key)) continue
       if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') continue
       const score = issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
       if (score <= 0) continue
@@ -9569,6 +10029,8 @@ const resolveIssuePrFromGh = async (
         repo,
         prNumber: pr.number,
         draft: pr.draft,
+        headRef: pr.headRef,
+        url: pr.url,
         score,
         open: normalizePrState(pr.state) === 'OPEN',
       })
@@ -9675,7 +10137,15 @@ const githubPullRoot = (repo: string): string => {
 const readProbePrCandidate = async (
   mount: MountClient,
   path: string,
-): Promise<{ number: number; title: string; body: string; headRef: string; draft?: boolean; state?: string } | undefined> => {
+): Promise<{
+  number: number
+  title: string
+  body: string
+  headRef: string
+  draft?: boolean
+  state?: string
+  url?: string
+} | undefined> => {
   try {
     const payload = wrappedPayload((await mount.readFile(path)).content)
     const number = typeof payload.number === 'number'
@@ -9689,6 +10159,7 @@ const readProbePrCandidate = async (
       headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? '',
       draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
       state: stringValue(payload.state),
+      url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
   } catch {
     return undefined
@@ -9697,7 +10168,15 @@ const readProbePrCandidate = async (
 
 const ghProbePrCandidate = (
   value: unknown,
-): { number: number; title: string; body: string; headRef: string; draft?: boolean; state?: string } | undefined => {
+): {
+  number: number
+  title: string
+  body: string
+  headRef: string
+  draft?: boolean
+  state?: string
+  url?: string
+} | undefined => {
   const payload = asRecord(value)
   if (!payload) return undefined
   const number = numberValue(payload.number)
@@ -9709,6 +10188,7 @@ const ghProbePrCandidate = (
     headRef: stringValue(payload.headRefName) ?? '',
     draft: booleanValue(payload.isDraft),
     state: stringValue(payload.state),
+    url: stringValue(payload.url),
   }
 }
 
@@ -9720,7 +10200,7 @@ const issuePrMatchScore = (
 ): number => {
   if (opts.requireTitleMarker && !hasTitlePrefix(pr.title, marker)) return 0
 
-  if (containsIssueKey(pr.headRef, issue.key)) return 30
+  if (factoryBranchMatchesIssue(pr.headRef, issue.key)) return 30
   if (containsIssueKey(pr.title, issue.key)) return 20
   if (containsExplicitIssueReference(pr.body, issue.key)) return 10
   return 0
@@ -9728,6 +10208,12 @@ const issuePrMatchScore = (
 
 const hasTitlePrefix = (title: string, marker: string): boolean =>
   title === marker || title.startsWith(`${marker} `)
+
+const factoryBranchMatchesIssue = (headRef: string, issueKey: string): boolean =>
+  /^\d+$/u.test(issueKey)
+    ? headRef.toLowerCase() === `factory/${issueKey.toLowerCase()}` ||
+      headRef.toLowerCase().startsWith(`factory/${issueKey.toLowerCase()}-`)
+    : containsIssueKey(headRef, issueKey)
 
 const normalizePrState = (state?: string): string | undefined => state?.toUpperCase()
 
@@ -10101,7 +10587,7 @@ const babysitterCriticalIssueMatches = (signalKey: string, issue: IssueRef): boo
 }
 
 const prSnapshotIssueMatchScore = (snapshot: PullSnapshot, issueKey: string): number => {
-  if (containsIssueKey(snapshot.headRef ?? '', issueKey)) return 30
+  if (factoryBranchMatchesIssue(snapshot.headRef ?? '', issueKey)) return 30
   if (containsIssueKey(snapshot.title ?? '', issueKey)) return 20
   if (containsExplicitIssueReference(snapshot.body ?? '', issueKey)) return 10
   return 0
@@ -10209,7 +10695,7 @@ const isAllowedFactoryDraft = async (
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/refs%2Fheads%2F[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,
@@ -10661,25 +11147,31 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
 
-const triageEscalationQuestion = (decision: TriageDecision): string => {
+class LiveDispatchStateChangedError extends Error {
+  readonly issueKey: string
+
+  constructor(issueKey: string) {
+    super(`Live state changed before writeback for ${issueKey}`)
+    this.name = 'LiveDispatchStateChangedError'
+    this.issueKey = issueKey
+  }
+}
+
+const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
   const routedRepos = decision.routes.map((route) => route.repo).filter(Boolean)
+  const subject = issue?.title?.trim() || decision.issue.key
+  const details = `For "${subject}", please reply with: (1) the exact user flow—where it starts, required inputs/actions, and the successful result; (2) permissions, validation, failure behavior, important edge cases, and anything out of scope; and (3) observable acceptance checks or tests. Say "use reasonable product defaults" for anything Factory may decide. After an authorized GitHub reply, Factory will dispatch agents; successful work will be opened as a pull request.`
   if (routedRepos.length === 0) {
-    return [
-      'Which repository or repositories should handle this issue?',
-      'Please include the intended approach and the acceptance criteria/tests the agent should satisfy.',
-    ].join(' ')
+    return `Which repository or repositories should handle this issue? ${details}`
   }
   if (decision.thin) {
-    return [
-      `Factory matched ${routedRepos.join(', ')}.`,
-      'Please clarify the concrete expected behavior, constraints, and acceptance criteria/tests before dispatch.',
-    ].join(' ')
+    return `Factory matched ${routedRepos.join(', ')}. ${details}`
   }
-  return [
-    `Factory matched ${routedRepos.join(', ')}, but triage confidence is low.`,
-    'Please confirm the intended repo/approach or correct the route before dispatch.',
-  ].join(' ')
+  return `Factory matched ${routedRepos.join(', ')}, but triage confidence is low. Please confirm that repository and intended approach, or provide the correct route. ${details}`
 }
+
+const isTerminalDeliveryFailure = (reason?: string): boolean =>
+  /worker[_ -]?(?:exited|disappeared)|max delivery retries exceeded/iu.test(reason ?? '')
 
 const isTriageEscalationWatchRecord = (record: InFlightIssue): boolean =>
   record.agents.size === 0 && record.invocationIds.size === 0 && triageEscalationReason(record.decision) !== undefined
@@ -10812,6 +11304,47 @@ const slackMentions = (userIds: string[]): string | undefined => {
   const mentions = [...new Set(userIds.map((id) => id.trim()).filter(Boolean))]
     .map((id) => `<@${id}>`)
   return mentions.length > 0 ? mentions.join(' ') : undefined
+}
+
+const normalizedCrossProviderIdentity = (value: string): string =>
+  value.trim().toLowerCase().replace(/[^a-z0-9]+/gu, '')
+
+const isSlackIdentityRecordPath = (path: string): boolean =>
+  path.endsWith('.json') && (
+    path.startsWith('/slack/users/') ||
+    path.startsWith('/slack/channels/')
+  )
+
+const slackIdentityPathTimestamp = (path: string): number => {
+  const timestamps = [...path.matchAll(/(?:^|\/)(\d{10})[_\.][0-9]+/gu)]
+  return Number(timestamps.at(-1)?.[1] ?? 0)
+}
+
+const slackUserIdMatchingIdentity = (
+  payload: Record<string, unknown>,
+  identity: string,
+): string | undefined => {
+  if (
+    payload.is_bot === true ||
+    payload.user_is_bot === true ||
+    payload.is_deleted === true ||
+    payload.deleted === true
+  ) return undefined
+  const userId = stringValue(payload.id) ?? stringValue(payload.user)
+  if (!userId || !/^[UW][A-Z0-9]+$/u.test(userId)) return undefined
+  const email = stringValue(payload.email) ?? stringValue(payload.user_email)
+  const aliases = [
+    stringValue(payload.name),
+    stringValue(payload.real_name),
+    stringValue(payload.display_name),
+    stringValue(payload.user_name),
+    stringValue(payload.user_real_name),
+    stringValue(payload.user_display_name),
+    email?.split('@')[0],
+  ]
+  return aliases.some((alias) => alias && normalizedCrossProviderIdentity(alias) === identity)
+    ? userId
+    : undefined
 }
 
 const agentQuestionSlackText = (issue: IssueRef, question: AgentQuestion, stakeholderUserIds: string[] = []): string => [

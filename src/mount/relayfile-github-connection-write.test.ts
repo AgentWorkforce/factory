@@ -99,7 +99,7 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(git).toHaveBeenNthCalledWith(2, ['-C', '/work/factory', 'rev-parse', 'HEAD'])
     expect(mount.writes).toEqual([
       {
-        path: '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json',
+        path: '/github/repos/AgentWorkforce/factory/refs/factory.json',
         content: {
           ref: 'refs/heads/fix/issue-52',
           sha: '1234567890abcdef1234567890abcdef12345678',
@@ -118,6 +118,48 @@ describe('RelayfileGithubConnectionWrite', () => {
     ])
   })
 
+  it('serializes concurrent create-ref confirmations that share the repository draft path', async () => {
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
+    let releaseFirst!: () => void
+    const firstConfirmation = new Promise<void>((resolve) => { releaseFirst = resolve })
+    class ConcurrentRefMount extends FakeMountClient {
+      createConfirmations = 0
+
+      override async confirmWrite(path: string): Promise<'acked'> {
+        if (path === createRefPath && ++this.createConfirmations === 1) await firstConfirmation
+        return 'acked'
+      }
+
+      async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+        if (!path.includes('/pull-requests/')) return undefined
+        return path.includes('concurrent-one') ? '71' : '72'
+      }
+    }
+    const mount = new ConcurrentRefMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+    const publish = (headRef: string, headSha: string) => write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef,
+      headSha,
+      baseRef: 'main',
+      title: headRef,
+      body: 'Concurrent publication proof',
+    })
+
+    const first = publish('factory/concurrent-one', '1111111111111111111111111111111111111111')
+    await vi.waitFor(() => expect(mount.createConfirmations).toBe(1))
+    const second = publish('factory/concurrent-two', '2222222222222222222222222222222222222222')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(mount.writes.filter((entry) => entry.path === createRefPath)).toHaveLength(1)
+
+    releaseFirst()
+    await expect(Promise.all([first, second])).resolves.toMatchObject([
+      { number: 71 },
+      { number: 72 },
+    ])
+    expect(mount.writes.filter((entry) => entry.path === createRefPath)).toHaveLength(2)
+  })
+
   it('closes a pull request through its exact Relayfile writeback path', async () => {
     const mount = new FakeMountClient()
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
@@ -132,7 +174,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('fails closed when the provider does not acknowledge a write', async () => {
     const mount = new FakeMountClient()
-    const refPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
+    const refPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
     mount.setConfirmWrite(refPath, 'timeout')
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
@@ -143,6 +185,89 @@ describe('RelayfileGithubConnectionWrite', () => {
       title: 'Title',
       body: 'Body',
     })).rejects.toThrow(`GitHub writeback did not complete for ${refPath}: timeout`)
+  })
+
+  it('updates an existing branch when retrying local-clone publication', async () => {
+    const draft = 'factory-fix-issue-52-1234567890ab'
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
+    const updateRefPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
+    const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
+    class ExistingRefMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked' | 'failed'> {
+        return path === createRefPath ? 'failed' : 'acked'
+      }
+
+      async getConfirmedWriteFailureReason(path: string): Promise<string | undefined> {
+        return path === createRefPath
+          ? 'GitHub writeback failed with status 422: Reference already exists'
+          : undefined
+      }
+
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 66, url: 'https://github.com/AgentWorkforce/factory/pull/66' } })
+        }
+      }
+    }
+    const mount = new ExistingRefMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 66 })
+
+    expect(mount.writes.slice(0, 2)).toEqual([
+      {
+        path: createRefPath,
+        content: {
+          ref: 'refs/heads/fix/issue-52',
+          sha: '1234567890abcdef1234567890abcdef12345678',
+        },
+      },
+      {
+        path: updateRefPath,
+        content: {
+          ref: 'refs/heads/fix/issue-52',
+          sha: '1234567890abcdef1234567890abcdef12345678',
+          force: false,
+        },
+      },
+    ])
+  })
+
+  it('recognizes an existing-reference failure from a plain provider error object', async () => {
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
+    const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-fix-issue-52-1234567890ab.json'
+    class PlainErrorMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked'> {
+        if (path === createRefPath) {
+          throw { message: 'GitHub writeback failed with status 422: Reference already exists' }
+        }
+        return 'acked'
+      }
+
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 67, url: 'https://github.com/AgentWorkforce/factory/pull/67' } })
+        }
+      }
+    }
+    const mount = new PlainErrorMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 67 })
   })
 
   it('rejects publishing from the base branch before writing a ref', async () => {
@@ -196,5 +321,38 @@ describe('RelayfileGithubConnectionWrite', () => {
       body: 'Body',
     })).resolves.toMatchObject({ number: 65 })
     expect(mount.receiptReads).toBe(2)
+  })
+
+  it('uses the acknowledged provider id when Relayfile reconciles the create draft', async () => {
+    const draft = 'factory-fix-issue-52-1234567890ab'
+    const pullRequestPath = `/github/repos/AgentWorkforce/hoopsheet/pull-requests/${draft}.json`
+    class ReconciledDraftMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === pullRequestPath) throw new Error('draft was reconciled after provider acknowledgement')
+        return super.readFile(path)
+      }
+
+      override async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+        return path === pullRequestPath ? '53' : undefined
+      }
+    }
+    const mount = new ReconciledDraftMount()
+    const write = new RelayfileGithubConnectionWrite({
+      mount,
+      gitRunner: gitRunner(),
+      receiptReadAttempts: 1,
+      receiptReadDelayMs: 0,
+    })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/hoopsheet',
+      clonePath: '/work/hoopsheet',
+      baseRef: 'main',
+      title: '52: Bug: Creating a new league does not work',
+      body: 'Fixes #52',
+    })).resolves.toMatchObject({
+      number: 53,
+      url: 'https://github.com/AgentWorkforce/hoopsheet/pull/53',
+    })
   })
 })

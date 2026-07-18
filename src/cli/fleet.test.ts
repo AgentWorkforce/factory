@@ -1494,6 +1494,7 @@ describe('fleet CLI runtime', () => {
 
   it('configures guarded GitHub writeback when close-probe creates a cloud mount', async () => {
     const output = buffer()
+    const errors = buffer()
     const closes: Array<{ repo: string; number: number }> = []
     const cloudMountFromConfig = vi.fn(async (opts) => {
       const mount = new FakeMountClient()
@@ -1503,6 +1504,26 @@ describe('fleet CLI runtime', () => {
           const path = `/github/repos/${input.repo}/pulls/${input.number}/close.json`
           const allowed = await opts?.isAllowedDraft?.(path, {}, { guarded: true })
           if (!allowed) throw new Error('GitHub close draft rejected by mount predicate')
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/factory.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Ffactory%2F77.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Fmain.json`,
+            { ref: 'refs/heads/main', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/arbitrary.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(false)
           closes.push(input)
         },
       }
@@ -1519,7 +1540,7 @@ describe('fleet CLI runtime', () => {
       'AR-77',
     ], {
       stdout: output,
-      stderr: buffer(),
+      stderr: errors,
       resolveWorkspace: async () => ({ workspaceId: 'rw_test' }),
       cloudMountFromConfig,
       probePrGhRunner: async () => ({
@@ -1532,7 +1553,7 @@ describe('fleet CLI runtime', () => {
       }),
     })
 
-    expect(code).toBe(0)
+    expect(code, errors.text()).toBe(0)
     expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
       workspaceId: 'rw_test',
       isAllowedDraft: expect.any(Function),
