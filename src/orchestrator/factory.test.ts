@@ -2030,24 +2030,33 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.errors ?? 0).toBe(0)
   })
 
-  it('preserves an in-progress GitHub issue when a matching open PR exists', async () => {
+  it('adopts an orphaned in-progress GitHub issue when its ready PR already exists', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-'))
     try {
       const path = githubIssuePath('AgentWorkforce', 'pear', 53)
       const mount = new FakeMountClient({
         [path]: githubIssueFile(53, { labels: ['factory', 'pear', 'factory:in-progress'] }),
       })
-      const fleet = new FakeFleetClient()
+      const fleet = new RemoteLifecycleFleetClient()
+      const worktrees = new RecordingWorktreeManager()
       const githubWriteback = new RecordingGithubWriteback()
       const factory = createFactory(config({
         issueSource: 'github',
+        babysitter: { enabled: true },
+        terminalState: 'human-review',
         loop: { registryPath: join(root, 'registry.json') },
       }), {
         mount,
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
-        probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 153 }),
+        worktrees,
+        probePrResolver: async () => ({
+          repo: 'AgentWorkforce/pear',
+          prNumber: 153,
+          headRef: 'factory/53-agentworkforce-pear-proof',
+          url: 'https://github.com/AgentWorkforce/pear/pull/153',
+        }),
       })
 
       const report = await factory.runOnce()
@@ -2057,9 +2066,21 @@ describe('FactoryLoop', () => {
         issue: { uuid: 'AgentWorkforce/pear#53', key: '53', path },
         reason: 'live state is not ready-for-agent',
       }])
-      expect(fleet.spawns).toEqual([])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-53-babysit-pear'])
+      expect(fleet.spawns[0]).toMatchObject({
+        repo: 'AgentWorkforce/pear',
+        cwd: expect.stringMatching(/\/\.factory-worktrees\/pear\/53-pear-[a-z0-9]+$/u),
+      })
+      expect(fleet.spawns[0]?.task)
+        .toContain('Continue in the existing isolated issue worktree on branch `factory/53-agentworkforce-pear-proof`.')
+      expect(worktrees.prepared).toEqual([expect.objectContaining({
+        issueKey: '53',
+        branch: 'factory/53-agentworkforce-pear-proof',
+      })])
       expect(githubWriteback.statuses).toEqual([])
       expect(factory.status().counters.githubOrphanRecoveriesBlockedOpenPr).toBe(1)
+      expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
+      expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['53'])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

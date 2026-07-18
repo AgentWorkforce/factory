@@ -85,7 +85,14 @@ type Listener = (payload: FactoryEventPayload) => void
 type SlackThreadWatcher = { stop(): Promise<void> }
 type GithubIssueCommentWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
-type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
+type ResolvedIssuePr = {
+  repo: string
+  prNumber: number
+  draft?: boolean
+  headRef?: string
+  url?: string
+  path?: string
+}
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubOrphanRecoveryContext = {
@@ -1644,9 +1651,9 @@ export class FactoryLoop implements Factory {
       return false
     }
 
-    let hasOpenPr: boolean
+    let openPr: ResolvedIssuePr | undefined
     try {
-      hasOpenPr = await this.#hasOpenCompletionPr(issue)
+      openPr = await this.#openCompletionPr(issue)
     } catch (error) {
       this.#increment('githubOrphanRecoveryPrProbeFailures')
       this.#logger.warn?.('[factory] could not prove an in-progress GitHub issue has no open PR; preserving it', {
@@ -1655,10 +1662,26 @@ export class FactoryLoop implements Factory {
       })
       return false
     }
-    if (hasOpenPr) {
+    if (openPr) {
+      let adopted = false
+      try {
+        adopted = await this.#adoptOrphanedGithubPullRequest(issue, openPr)
+      } catch (error) {
+        this.#increment('githubOrphanedPullRequestAdoptionFailures')
+        this.#logger.warn?.('[factory] could not adopt orphaned in-progress GitHub issue at its open PR', {
+          issue: issue.key,
+          repo: openPr.repo,
+          prNumber: openPr.prNumber,
+          error: describeError(error).errorMessage,
+        })
+      }
       this.#increment('githubOrphanRecoveriesBlockedOpenPr')
-      this.#logger.info?.('[factory] preserved in-progress GitHub issue because a matching open PR exists', {
+      this.#logger.info?.(adopted
+        ? '[factory] adopted orphaned in-progress GitHub issue at its existing PR'
+        : '[factory] preserved in-progress GitHub issue because a matching open PR exists', {
         issue: issue.key,
+        repo: openPr.repo,
+        prNumber: openPr.prNumber,
       })
       return false
     }
@@ -1688,15 +1711,97 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #hasOpenCompletionPr(issue: LinearIssue): Promise<boolean> {
+  async #openCompletionPr(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
     if (this.#customProbePrResolver) {
-      return Boolean(await this.#probePrResolver(issue))
+      return await this.#probePrResolver(issue)
     }
-    return Boolean(await this.#resolveIssuePr(issue, {
+    return await this.#resolveIssuePr(issue, {
       titleMarker: FACTORY_E2E_MARKER,
       openOnly: true,
       failOnLookupError: true,
-    }))
+    })
+  }
+
+  async #adoptOrphanedGithubPullRequest(issue: LinearIssue, pr: ResolvedIssuePr): Promise<boolean> {
+    if (
+      !this.#config.babysitter.enabled ||
+      pr.draft === true ||
+      !pr.headRef?.startsWith('factory/') ||
+      !factoryBranchMatchesIssue(pr.headRef, issue.key)
+    ) return false
+
+    const triaged = await this.triageIssue(issue)
+    const routed = labelDerivedDispatchDecision(issue, triaged, this.#config)
+    if (!routed.ok) return false
+    const route = routed.decision.routes.find((candidate) =>
+      normalizeGithubRepo(candidate.repo, this.#config.repos.org).toLowerCase() === pr.repo.toLowerCase()
+    )
+    if (!route) return false
+
+    let decision = routed.decision
+    if (this.#worktrees && route.clonePath) {
+      const worktreePath = factoryWorktreePath(
+        route.clonePath,
+        issue.key,
+        route.repo,
+        stableHash(`${pr.repo}#${pr.prNumber}:${pr.headRef}`),
+      )
+      decision = {
+        ...decision,
+        implementers: decision.implementers.map((spec) => spec.repo === route.repo
+          ? {
+              ...spec,
+              baseClonePath: route.clonePath,
+              clonePath: worktreePath,
+              branch: pr.headRef,
+            }
+          : spec),
+      }
+    }
+
+    const batch = await this.#batch()
+    const record = batch.start(decision, false)
+    if (!record) return false
+    const durableRemoteAdoption = this.#fleet.placementLocality === 'remote'
+    if (durableRemoteAdoption) {
+      try {
+        await this.#claimDispatchLifecycle(decision, false, randomUUID())
+        const saved = await this.#saveDispatchLifecycle(record, 'published', {
+          repo: pr.repo,
+          number: pr.prNumber,
+          url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
+          headRef: pr.headRef,
+        })
+        if (!saved) {
+          batch.abandon(record.issue)
+          return false
+        }
+      } catch (error) {
+        batch.abandon(record.issue)
+        throw error
+      }
+    }
+    await this.#ensureBabysitter(record, {
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
+      path: pr.path,
+      headRef: pr.headRef,
+    })
+    const babysitter = [...record.agents.values()].find((tracked) => tracked.spec.role === 'babysitter')
+    if (!babysitter) {
+      if (durableRemoteAdoption) this.#scheduleDispatchLifecycleRetry(record)
+      else batch.abandon(record.issue)
+      return false
+    }
+    record.result = {
+      issue: record.issue,
+      agents: [{ name: babysitter.result?.name ?? babysitter.spec.name, role: 'babysitter' }],
+      dryRun: false,
+    }
+    await this.#writeInFlightRegistry()
+    this.#increment('githubOrphanedPullRequestsAdopted')
+    return true
   }
 
   async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
@@ -6659,7 +6764,13 @@ export class FactoryLoop implements Factory {
     await this.#ensureBabysitter(record, { repo: pr.repo, prNumber: pr.prNumber })
   }
 
-  async #ensureBabysitter(record: InFlightIssue, prRef: { repo: string; prNumber: number; url?: string; path?: string }): Promise<void> {
+  async #ensureBabysitter(record: InFlightIssue, prRef: {
+    repo: string
+    prNumber: number
+    url?: string
+    path?: string
+    headRef?: string
+  }): Promise<void> {
     const babysitterKey = issueKey(record.issue)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
@@ -6727,7 +6838,9 @@ export class FactoryLoop implements Factory {
       const sharedCheckout = [...record.agents.values()]
         .map((agent) => agent.spec)
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
-      const implementerBranch = record.decision.implementers
+        ?? record.decision.implementers
+          .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
+      const implementerBranch = prRef.headRef ?? record.decision.implementers
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
       const spec: AgentSpec = sharedCheckout
         ? {
@@ -9776,7 +9889,15 @@ const resolveIssuePrFromMount = async (
         ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
         : 0
       if (!pr || score <= 0) continue
-      candidates.push({ repo, prNumber: pr.number, draft: pr.draft, score })
+      candidates.push({
+        repo,
+        prNumber: pr.number,
+        draft: pr.draft,
+        headRef: pr.headRef,
+        url: pr.url,
+        path,
+        score,
+      })
     }
   }
 
@@ -9803,7 +9924,7 @@ const resolveIssuePrFromGh = async (
         '--state',
         'all',
         '--json',
-        'number,title,body,headRefName,isDraft,state',
+        'number,title,body,headRefName,isDraft,state,url',
         '--limit',
         String(PROBE_PR_GH_CANDIDATE_LIMIT),
       ])
@@ -9831,7 +9952,7 @@ const resolveIssuePrFromGh = async (
 
     for (const entry of payload) {
       const pr = ghProbePrCandidate(entry)
-      if (!pr || !containsIssueKey(pr.headRef, issue.key)) continue
+      if (!pr || !factoryBranchMatchesIssue(pr.headRef, issue.key)) continue
       if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') continue
       const score = issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
       if (score <= 0) continue
@@ -9839,6 +9960,8 @@ const resolveIssuePrFromGh = async (
         repo,
         prNumber: pr.number,
         draft: pr.draft,
+        headRef: pr.headRef,
+        url: pr.url,
         score,
         open: normalizePrState(pr.state) === 'OPEN',
       })
@@ -9945,7 +10068,15 @@ const githubPullRoot = (repo: string): string => {
 const readProbePrCandidate = async (
   mount: MountClient,
   path: string,
-): Promise<{ number: number; title: string; body: string; headRef: string; draft?: boolean; state?: string } | undefined> => {
+): Promise<{
+  number: number
+  title: string
+  body: string
+  headRef: string
+  draft?: boolean
+  state?: string
+  url?: string
+} | undefined> => {
   try {
     const payload = wrappedPayload((await mount.readFile(path)).content)
     const number = typeof payload.number === 'number'
@@ -9959,6 +10090,7 @@ const readProbePrCandidate = async (
       headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? '',
       draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
       state: stringValue(payload.state),
+      url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
   } catch {
     return undefined
@@ -9967,7 +10099,15 @@ const readProbePrCandidate = async (
 
 const ghProbePrCandidate = (
   value: unknown,
-): { number: number; title: string; body: string; headRef: string; draft?: boolean; state?: string } | undefined => {
+): {
+  number: number
+  title: string
+  body: string
+  headRef: string
+  draft?: boolean
+  state?: string
+  url?: string
+} | undefined => {
   const payload = asRecord(value)
   if (!payload) return undefined
   const number = numberValue(payload.number)
@@ -9979,6 +10119,7 @@ const ghProbePrCandidate = (
     headRef: stringValue(payload.headRefName) ?? '',
     draft: booleanValue(payload.isDraft),
     state: stringValue(payload.state),
+    url: stringValue(payload.url),
   }
 }
 
@@ -9990,7 +10131,7 @@ const issuePrMatchScore = (
 ): number => {
   if (opts.requireTitleMarker && !hasTitlePrefix(pr.title, marker)) return 0
 
-  if (containsIssueKey(pr.headRef, issue.key)) return 30
+  if (factoryBranchMatchesIssue(pr.headRef, issue.key)) return 30
   if (containsIssueKey(pr.title, issue.key)) return 20
   if (containsExplicitIssueReference(pr.body, issue.key)) return 10
   return 0
@@ -9998,6 +10139,12 @@ const issuePrMatchScore = (
 
 const hasTitlePrefix = (title: string, marker: string): boolean =>
   title === marker || title.startsWith(`${marker} `)
+
+const factoryBranchMatchesIssue = (headRef: string, issueKey: string): boolean =>
+  /^\d+$/u.test(issueKey)
+    ? headRef.toLowerCase() === `factory/${issueKey.toLowerCase()}` ||
+      headRef.toLowerCase().startsWith(`factory/${issueKey.toLowerCase()}-`)
+    : containsIssueKey(headRef, issueKey)
 
 const normalizePrState = (state?: string): string | undefined => state?.toUpperCase()
 
@@ -10371,7 +10518,7 @@ const babysitterCriticalIssueMatches = (signalKey: string, issue: IssueRef): boo
 }
 
 const prSnapshotIssueMatchScore = (snapshot: PullSnapshot, issueKey: string): number => {
-  if (containsIssueKey(snapshot.headRef ?? '', issueKey)) return 30
+  if (factoryBranchMatchesIssue(snapshot.headRef ?? '', issueKey)) return 30
   if (containsIssueKey(snapshot.title ?? '', issueKey)) return 20
   if (containsExplicitIssueReference(snapshot.body ?? '', issueKey)) return 10
   return 0
