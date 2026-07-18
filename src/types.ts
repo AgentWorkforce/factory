@@ -220,7 +220,15 @@ export interface PrSummary {
   filesChanged?: string[]
 }
 
-export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'> & { draft?: boolean }
+export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'> & {
+  draft?: boolean
+  headRef?: string
+  headRepo?: string
+  crossRepository?: boolean
+  state?: string
+  url?: string
+  path?: string
+}
 
 export type ProbePrResolver = (issue: LinearIssue) => Promise<ProbePrRef | undefined>
 
