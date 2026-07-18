@@ -202,6 +202,8 @@ const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
+const SLACK_IDENTITY_MESSAGE_SCAN_LIMIT = 250
+const SLACK_IDENTITY_READ_BATCH_SIZE = 25
 const AGENT_QUESTION_DEDUPE_LIMIT = 500
 const AGENT_NEEDS_INPUT_MARKER = '[factory-needs-input]'
 const LEGACY_AGENT_NEEDS_INPUT_MARKER = 'FACTORY_NEEDS_INPUT'
@@ -290,6 +292,8 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
+  readonly #slackReporterUserIds = new Map<string, string | undefined>()
+  readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
@@ -7386,7 +7390,11 @@ export class FactoryLoop implements Factory {
     const source = githubIssueSourceRef(issue)
     const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
     const reporter = await this.#resolveGithubIssueAuthor(issue)
-    const audience = [stakeholderMentions, reporter ? `GitHub reporter: @${reporter}.` : undefined]
+    const reporterSlackUserId = reporter ? await this.#resolveSlackUserIdForGithubReporter(reporter) : undefined
+    const reporterAudience = reporter
+      ? `GitHub reporter: ${reporterSlackUserId ? `<@${reporterSlackUserId}>` : `${reporter} (GitHub)`}.`
+      : undefined
+    const audience = [stakeholderMentions, reporterAudience]
       .filter((part): part is string => Boolean(part))
       .join(' ')
     const replyInstruction = source?.url
@@ -7445,6 +7453,71 @@ export class FactoryLoop implements Factory {
       })
     this.#githubIssueAuthorLookups.set(key, pending)
     return pending
+  }
+
+  async #resolveSlackUserIdForGithubReporter(reporter: string): Promise<string | undefined> {
+    const identity = normalizedCrossProviderIdentity(reporter)
+    if (!identity) return undefined
+    if (this.#slackReporterUserIds.has(identity)) {
+      return this.#slackReporterUserIds.get(identity)
+    }
+    const existing = this.#slackReporterUserIdLookups.get(identity)
+    if (existing) return existing
+
+    const pending = this.#findSlackUserIdByIdentity(identity)
+      .then((userId) => {
+        this.#slackReporterUserIds.set(identity, userId)
+        if (userId) this.#increment('slackReporterIdentitiesResolved')
+        return userId
+      })
+      .catch(() => {
+        this.#slackReporterUserIds.set(identity, undefined)
+        this.#increment('slackReporterIdentityLookupFailures')
+        return undefined
+      })
+      .finally(() => {
+        this.#slackReporterUserIdLookups.delete(identity)
+      })
+    this.#slackReporterUserIdLookups.set(identity, pending)
+    return pending
+  }
+
+  async #findSlackUserIdByIdentity(identity: string): Promise<string | undefined> {
+    const list = async (prefix: string): Promise<string[]> => {
+      try {
+        return await this.#mount.listTree(prefix)
+      } catch {
+        return []
+      }
+    }
+    const [userPaths, channelPaths] = await Promise.all([
+      list('/slack/users'),
+      list('/slack/channels'),
+    ])
+    const candidates = [
+      ...userPaths.filter(isSlackIdentityRecordPath),
+      ...channelPaths
+        .filter(isSlackIdentityRecordPath)
+        .sort((left, right) => slackIdentityPathTimestamp(right) - slackIdentityPathTimestamp(left))
+        .slice(0, SLACK_IDENTITY_MESSAGE_SCAN_LIMIT),
+    ]
+    const matches = new Set<string>()
+    for (let offset = 0; offset < candidates.length; offset += SLACK_IDENTITY_READ_BATCH_SIZE) {
+      const batch = candidates.slice(offset, offset + SLACK_IDENTITY_READ_BATCH_SIZE)
+      const records = await Promise.all(batch.map(async (path) => {
+        try {
+          return wrappedPayload((await this.#mount.readFile(path)).content)
+        } catch {
+          return undefined
+        }
+      }))
+      for (const payload of records) {
+        const userId = payload ? slackUserIdMatchingIdentity(payload, identity) : undefined
+        if (userId) matches.add(userId)
+        if (matches.size > 1) return undefined
+      }
+    }
+    return matches.size === 1 ? [...matches][0] : undefined
   }
 
   async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
@@ -10226,7 +10299,7 @@ const isAllowedFactoryDraft = async (
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/refs%2Fheads%2F[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,
@@ -10825,6 +10898,47 @@ const slackMentions = (userIds: string[]): string | undefined => {
   const mentions = [...new Set(userIds.map((id) => id.trim()).filter(Boolean))]
     .map((id) => `<@${id}>`)
   return mentions.length > 0 ? mentions.join(' ') : undefined
+}
+
+const normalizedCrossProviderIdentity = (value: string): string =>
+  value.trim().toLowerCase().replace(/[^a-z0-9]+/gu, '')
+
+const isSlackIdentityRecordPath = (path: string): boolean =>
+  path.endsWith('.json') && (
+    path.startsWith('/slack/users/') ||
+    path.startsWith('/slack/channels/')
+  )
+
+const slackIdentityPathTimestamp = (path: string): number => {
+  const timestamps = [...path.matchAll(/(?:^|\/)(\d{10})[_\.][0-9]+/gu)]
+  return Number(timestamps.at(-1)?.[1] ?? 0)
+}
+
+const slackUserIdMatchingIdentity = (
+  payload: Record<string, unknown>,
+  identity: string,
+): string | undefined => {
+  if (
+    payload.is_bot === true ||
+    payload.user_is_bot === true ||
+    payload.is_deleted === true ||
+    payload.deleted === true
+  ) return undefined
+  const userId = stringValue(payload.id) ?? stringValue(payload.user)
+  if (!userId || !/^[UW][A-Z0-9]+$/u.test(userId)) return undefined
+  const email = stringValue(payload.email) ?? stringValue(payload.user_email)
+  const aliases = [
+    stringValue(payload.name),
+    stringValue(payload.real_name),
+    stringValue(payload.display_name),
+    stringValue(payload.user_name),
+    stringValue(payload.user_real_name),
+    stringValue(payload.user_display_name),
+    email?.split('@')[0],
+  ]
+  return aliases.some((alias) => alias && normalizedCrossProviderIdentity(alias) === identity)
+    ? userId
+    : undefined
 }
 
 const agentQuestionSlackText = (issue: IssueRef, question: AgentQuestion, stakeholderUserIds: string[] = []): string => [

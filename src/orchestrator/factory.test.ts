@@ -9918,7 +9918,20 @@ describe('FactoryLoop', () => {
 
   it('keeps GitHub clarification durable on GitHub and mirrors one stakeholder escalation to Slack', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 56)
-    const mount = new CloudWritebackFakeMountClient({ [path]: githubIssueFile(56, { labels: ['factory'] }) })
+    const mount = new CloudWritebackFakeMountClient({
+      [path]: githubIssueFile(56, { labels: ['factory'] }),
+      '/slack/channels/C0PRODUCT__product/messages/1780751600_000001/meta.json': {
+        provider: 'slack',
+        objectType: 'message',
+        payload: {
+          user: 'UISSUEAUTHOR',
+          user_name: 'issue-author',
+          user_real_name: 'Issue Author',
+          user_is_bot: false,
+          text: 'A previously mounted message from the GitHub reporter.',
+        },
+      },
+    })
     const githubWriteback = new RecordingGithubWriteback()
     const factory = createFactory(config({
       issueSource: 'github',
@@ -9938,12 +9951,13 @@ describe('FactoryLoop', () => {
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('<@UOWNER> <@ULEAD>')
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @issue-author.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: <@UISSUEAUTHOR>.')
     expect((slackRoots[0]?.content as { text?: string }).text)
       .toContain('Reply on the GitHub issue so Factory can resume: https://github.com/AgentWorkforce/pear/issues/56')
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
     expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
+    expect(factory.status().counters.slackReporterIdentitiesResolved).toBe(1)
   })
 
   it('resolves a missing mounted GitHub reporter before posting and mirrors that reporter to Slack', async () => {
@@ -9970,7 +9984,7 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.comments[0]?.body).toContain('@provider-reporter, Factory needs clarification')
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @provider-reporter.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: provider-reporter (GitHub).')
     expect(factory.status().counters.githubIssueAuthorsResolvedFromProvider).toBe(1)
   })
 
