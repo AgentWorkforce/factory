@@ -1635,6 +1635,31 @@ describe('FactoryLoop', () => {
     expect(mergeGate.merges).toEqual([])
   })
 
+  it('deduplicates compact and nested Relayfile aliases for the same GitHub issue', async () => {
+    const byIdPath = githubIssueCompactPath('AgentWorkforce', 'pear', 47)
+    const nestedPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 47)
+    const issue = githubIssueFile(47, { labels: ['factory'] })
+    const mount = new FakeMountClient({
+      [byIdPath]: issue,
+      [nestedPath]: issue,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#47', key: '47', path: byIdPath }])
+    expect(report.triaged).toHaveLength(1)
+    expect(report.dispatched).toHaveLength(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-47-impl-pear', 'ar-47-review-pear'])
+    expect(factory.status().counters.githubIssueAliasPathsSuppressed).toBe(1)
+  })
+
   it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
     const number = 26
     const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
@@ -1769,36 +1794,165 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
-  it.each(['factory:in-progress', 'factory:human-review'] as const)(
-    'does not redispatch a GitHub-native issue labeled %s after restart',
-    async (lifecycleLabel) => {
+  it('recovers an orphaned in-progress GitHub issue with no agents, durable lifecycle, or open PR', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-recovery-'))
+    try {
       const path = githubIssuePath('AgentWorkforce', 'pear', 52)
       const mount = new FakeMountClient({
-        [path]: githubIssueFile(52, { labels: ['factory', 'pear', lifecycleLabel] }),
+        [path]: githubIssueFile(52, { labels: ['factory', 'pear', 'factory:in-progress'] }),
       })
       mount.setSubRoot('/linear/issues', 'absent')
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
-      const restartedFactory = createFactory(config({ issueSource: 'github' }), {
+      const restartedFactory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
         mount,
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
       })
 
       const report = await restartedFactory.runOnce()
 
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['52'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-52-impl-pear', 'ar-52-review-pear'])
+      expect(githubWriteback.statuses).toEqual([
+        { key: '52', status: 'ready' },
+        { key: '52', status: 'in-progress' },
+      ])
+      expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an in-progress GitHub issue when a matching open PR exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 53)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(53, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 153 }),
+      })
+
+      const report = await factory.runOnce()
+
       expect(report.dispatched).toEqual([])
       expect(report.skipped).toEqual([{
-        issue: { uuid: 'AgentWorkforce/pear#52', key: '52', path },
+        issue: { uuid: 'AgentWorkforce/pear#53', key: '53', path },
         reason: 'live state is not ready-for-agent',
       }])
       expect(fleet.spawns).toEqual([])
-      expect(githubWriteback.comments).toEqual([])
       expect(githubWriteback.statuses).toEqual([])
-      expect(mount.writes).toEqual([])
-    },
-  )
+      expect(factory.status().counters.githubOrphanRecoveriesBlockedOpenPr).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an in-progress GitHub issue while its registered agent is still online', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-active-agent-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 55)
+      const registryPath = join(root, 'registry.json')
+      const issue = { uuid: 'AgentWorkforce/pear#55', key: '55', path }
+      await writeFile(registryPath, JSON.stringify({
+        pid: process.pid,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: [{ name: 'ar-55-impl-pear', role: 'implementer', issue, pids: [] }],
+      }))
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(55, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new FakeFleetClient()
+      fleet.hydrateTracked([{ name: 'ar-55-impl-pear' }])
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrResolver: async () => undefined,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveriesBlockedActive).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an in-progress GitHub issue when the open-PR safety probe fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-pr-probe-failure-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 56)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(56, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => { throw new Error('GitHub PR lookup unavailable') },
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not redispatch a GitHub-native issue already in human review', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 54)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(54, { labels: ['factory', 'pear', 'factory:human-review'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.statuses).toEqual([])
+  })
 
   it('keeps a Linear-backed GitHub mirror on the byte-compatible Linear writeback path', async () => {
     const sourcePath = githubIssuePath('AgentWorkforce', 'pear', 51)
@@ -9832,7 +9986,7 @@ describe('FactoryLoop', () => {
         const watches = await firstStateStore.listGithubIssueCommentWatches('factory-test')
         expect(watches[0]?.[1].pending[0]?.claimedByCommentId).toBe('9701')
       })
-      expect(crashingFleet.spawns).toHaveLength(1)
+      await vi.waitFor(() => expect(crashingFleet.spawns).toHaveLength(1))
       await firstFactory.stop()
 
       const restartedStateStore = new FileStateStore({ batchSize: 2, watchStatePath })

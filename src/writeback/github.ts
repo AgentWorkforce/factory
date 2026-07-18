@@ -4,7 +4,7 @@ import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
 
-const STATUS_LABELS: Record<GithubIssueStatus, { name: string; color: string; description: string }> = {
+const STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
   'in-progress': {
     name: 'factory:in-progress',
     color: '1d76db',
@@ -114,6 +114,19 @@ export class GhCliGithubWriteback implements GithubWriteback {
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
+    if (status === 'ready') {
+      const labels = await this.#issueLabels(ref)
+      const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
+      for (const lifecycle of Object.values(STATUS_LABELS)) {
+        if (labels.has(lifecycle.name.toLowerCase())) {
+          editArgs.push('--remove-label', lifecycle.name)
+        }
+      }
+      if (editArgs.length > 5) {
+        await this.#run(editArgs)
+      }
+      return
+    }
     const target = STATUS_LABELS[status]
     const previous = STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
     await this.#run([

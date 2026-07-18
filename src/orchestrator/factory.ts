@@ -87,6 +87,10 @@ type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
 type ResolvedIssuePr = { repo: string; prNumber: number; draft?: boolean }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
+type GithubOrphanRecoveryContext = {
+  activeIssueIdentities: Set<string>
+  onlineAgentNames: Set<string>
+}
 type BabysitterWakeKind =
   | 'pull-request-state'
   | 'review'
@@ -285,6 +289,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
+  readonly #reconciledGithubInProgress = new Set<string>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
@@ -1327,9 +1332,10 @@ export class FactoryLoop implements Factory {
 
   async #resolveIssuePr(
     issue: LinearIssue,
-    opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
+    opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; failOnLookupError?: boolean } = {},
   ): Promise<ResolvedIssuePr | undefined> {
-    const key = issueStateKey(issueRef(issue))
+    const issueKey = issueStateKey(issueRef(issue))
+    const key = opts.openOnly ? `${issueKey}:open` : issueKey
     const now = this.#clock.now()
     const cached = this.#probePrResolvedCache.get(key)
     if (cached && cached.expiresAtMs > now) {
@@ -1378,6 +1384,9 @@ export class FactoryLoop implements Factory {
         await this.#ensureGithubIngestionReady()
       }
       const paths = await this.#readyIssuePaths()
+      const orphanRecovery = issueSource === 'github'
+        ? await this.#githubOrphanRecoveryContext()
+        : undefined
       const pulled: IssueRef[] = []
       const triaged: TriageDecision[] = []
       const dispatched: DispatchResult[] = []
@@ -1416,7 +1425,10 @@ export class FactoryLoop implements Factory {
           continue
         }
 
-        if (!this.#isIssueReady(issue)) {
+        if (
+          !this.#isIssueReady(issue) &&
+          !await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
+        ) {
           skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
           continue
         }
@@ -1466,6 +1478,117 @@ export class FactoryLoop implements Factory {
         })
       }
     }
+  }
+
+  async #githubOrphanRecoveryContext(): Promise<GithubOrphanRecoveryContext | undefined> {
+    try {
+      const [registry, roster, lifecycles, waitingClarifications] = await Promise.all([
+        readFactoryInFlightRegistry(this.#config.loop.registryPath),
+        this.#fleet.roster(),
+        this.#state.listDispatchLifecycles(this.#workspaceId),
+        this.#state.listWaitingClarifications(this.#workspaceId),
+      ])
+      const onlineAgents = new Set(roster.agents.map((agent) => agent.name))
+      const activeIssueIdentities = new Set<string>()
+      for (const [, lifecycle] of lifecycles) {
+        if (isTerminalDispatchLifecycle(lifecycle)) continue
+        const identity = githubIssueRefIdentity(lifecycle.issue)
+        if (identity) activeIssueIdentities.add(identity)
+      }
+      for (const [, waiting] of waitingClarifications) {
+        const identity = githubIssueRefIdentity(waiting.issue)
+        if (identity) activeIssueIdentities.add(identity)
+      }
+      for (const agent of registry?.agents ?? []) {
+        if (!onlineAgents.has(agent.name) || !agent.issue) continue
+        const identity = githubIssueRefIdentity(agent.issue)
+        if (identity) activeIssueIdentities.add(identity)
+      }
+      return {
+        activeIssueIdentities,
+        onlineAgentNames: onlineAgents,
+      }
+    } catch (error) {
+      this.#increment('githubOrphanRecoveryContextFailures')
+      this.#logger.warn?.('[factory] could not establish orphan-recovery safety context; preserving in-progress issues', {
+        error: describeError(error).errorMessage,
+      })
+      return undefined
+    }
+  }
+
+  async #reconcileOrphanedGithubInProgress(
+    issue: LinearIssue,
+    context: GithubOrphanRecoveryContext | undefined,
+    dryRun: boolean,
+  ): Promise<boolean> {
+    if (dryRun || !context || !isGithubIssue(issue)) return false
+    const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+    const required = this.#config.safety.requireLabel.trim().toLowerCase()
+    if (
+      !required ||
+      !labels.has(required) ||
+      !labels.has('factory:in-progress') ||
+      labels.has('factory:human-review')
+    ) return false
+
+    const identity = githubIssueRefIdentity(issueRef(issue))
+    if (
+      !identity ||
+      context.activeIssueIdentities.has(identity) ||
+      [...context.onlineAgentNames].some((name) => githubAgentNameMatchesIssue(name, issue))
+    ) {
+      this.#increment('githubOrphanRecoveriesBlockedActive')
+      return false
+    }
+
+    let hasOpenPr: boolean
+    try {
+      hasOpenPr = await this.#hasOpenCompletionPr(issue)
+    } catch (error) {
+      this.#increment('githubOrphanRecoveryPrProbeFailures')
+      this.#logger.warn?.('[factory] could not prove an in-progress GitHub issue has no open PR; preserving it', {
+        issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+    if (hasOpenPr) {
+      this.#increment('githubOrphanRecoveriesBlockedOpenPr')
+      this.#logger.info?.('[factory] preserved in-progress GitHub issue because a matching open PR exists', {
+        issue: issue.key,
+      })
+      return false
+    }
+
+    try {
+      await this.#githubWriteback.setStatus(issue, 'ready')
+      this.#reconciledGithubInProgress.add(identity)
+      this.#increment('githubOrphanedInProgressRecovered')
+      this.#logger.warn?.('[factory] recovered orphaned GitHub in-progress issue for redispatch', {
+        issue: issue.key,
+        path: issue.path,
+      })
+      return true
+    } catch (error) {
+      this.#increment('githubOrphanRecoveryWritebackFailures')
+      this.#logger.warn?.('[factory] failed to clear orphaned GitHub lifecycle status; preserving in-progress issue', {
+        issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+  }
+
+  async #hasOpenCompletionPr(issue: LinearIssue): Promise<boolean> {
+    if (this.#customProbePrResolver) {
+      return Boolean(await this.#probePrResolver(issue))
+    }
+    return Boolean(await this.#resolveIssuePr(issue, {
+      titleMarker: FACTORY_E2E_MARKER,
+      openOnly: true,
+      failOnLookupError: true,
+    }))
   }
 
   async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
@@ -2487,11 +2610,12 @@ export class FactoryLoop implements Factory {
     if (githubState === 'closed') {
       return false
     }
-    if (issue.labels.some((label) => GITHUB_LIFECYCLE_LABELS.has(label.trim().toLowerCase()))) {
-      return false
-    }
+    const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+    if (labels.has('factory:human-review')) return false
+    const identity = githubIssueRefIdentity(issueRef(issue))
+    if (labels.has('factory:in-progress') && (!identity || !this.#reconciledGithubInProgress.has(identity))) return false
     const required = this.#config.safety.requireLabel.trim().toLowerCase()
-    return Boolean(required) && issue.labels.some((label) => label.trim().toLowerCase() === required)
+    return Boolean(required) && labels.has(required)
   }
 
   async #postIssueComment(issue: LinearIssue, body: string): Promise<void> {
@@ -2596,12 +2720,20 @@ export class FactoryLoop implements Factory {
 
   async #githubIssuePaths(): Promise<string[]> {
     try {
-      const issuePaths = new Set<string>()
+      const issuePaths = new Map<string, string>()
       for (const root of githubIssueScanRoots(this.#config)) {
         const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
         for (const path of paths) {
-          if (githubIssuePathParts(path) !== undefined) {
-            issuePaths.add(path)
+          const parts = githubIssuePathParts(path)
+          if (parts) {
+            const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+            const existing = issuePaths.get(identity)
+            if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
+              if (existing) this.#increment('githubIssueAliasPathsSuppressed')
+              issuePaths.set(identity, path)
+            } else {
+              this.#increment('githubIssueAliasPathsSuppressed')
+            }
           } else if (githubIssueDirectoryPathParts(path) !== undefined) {
             // listTree returns the issue directory entry alongside its
             // meta.json file; githubIssuePathParts() already collected the
@@ -2615,7 +2747,7 @@ export class FactoryLoop implements Factory {
           }
         }
       }
-      return [...issuePaths].sort()
+      return [...issuePaths.values()].sort()
     } catch (error) {
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
@@ -9085,6 +9217,27 @@ export const githubIssuePathParts = (path: string): { owner: string; repo: strin
   }
 }
 
+const githubIssueIdentity = (owner: string, repo: string, number: number): string =>
+  `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`
+
+const githubIssueRefIdentity = (issue: IssueRef): string | undefined => {
+  const parts = githubIssuePathParts(issue.path)
+  return parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
+}
+
+const githubIssuePathPreference = (path: string): number => {
+  if (path.includes('/issues/by-id/')) return 0
+  if (path.endsWith('/meta.json')) return 1
+  if (path.endsWith('.json')) return 2
+  return 3
+}
+
+const githubAgentNameMatchesIssue = (name: string, issue: LinearIssue): boolean => {
+  const parts = githubIssuePathParts(issue.path)
+  if (!parts) return false
+  return name.startsWith(`ar-${parts.number}-`) && name.endsWith(`-${sanitizeAgentSlug(parts.repo)}`)
+}
+
 const githubIssueCommentPathParts = (path: string): { owner: string; repo: string; number: number; commentId: string } | undefined => {
   const match = path.match(
     /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(\d+)(?:__[^/]*)?\/comments\/([^/]+?)(?:\.json|\/(?:meta|metadata)\.json)$/u,
@@ -9276,13 +9429,14 @@ const resolveIssuePrFromMount = async (
   mount: MountClient,
   config: FactoryConfig,
   issue: LinearIssue,
-  opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
+  opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; failOnLookupError?: boolean } = {},
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   for (const repo of reposFromConfig(config)) {
     for (const path of await mount.listTree(githubPullRoot(repo))) {
       if (!path.endsWith('.json')) continue
       const pr = await readProbePrCandidate(mount, path)
+      if (opts.openOnly && normalizePrState(pr?.state) !== 'OPEN') continue
       const score = pr
         ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
         : 0
@@ -9298,10 +9452,11 @@ const resolveIssuePrFromGh = async (
   run: GhRunner,
   config: FactoryConfig,
   issue: LinearIssue,
-  opts: { requireTitleMarker?: boolean; titleMarker?: string } = {},
+  opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; failOnLookupError?: boolean } = {},
   logger?: Logger,
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number; open: boolean }> = []
+  let lookupFailures = 0
   for (const repo of reposFromConfig(config)) {
     let payload: unknown
     try {
@@ -9318,16 +9473,19 @@ const resolveIssuePrFromGh = async (
         String(PROBE_PR_GH_CANDIDATE_LIMIT),
       ])
       if (!result.stdout.trim()) {
+        lookupFailures += 1
         logger?.warn?.('[factory] gh PR resolver returned empty output', { issue: issue.key, repo })
         continue
       }
       payload = parseJsonContent(result.stdout)
     } catch (error) {
+      lookupFailures += 1
       logger?.warn?.('[factory] gh PR resolver failed', { issue: issue.key, repo, error })
       continue
     }
 
     if (!Array.isArray(payload)) {
+      lookupFailures += 1
       logger?.warn?.('[factory] gh PR resolver returned non-array payload', { issue: issue.key, repo })
       continue
     }
@@ -9338,6 +9496,7 @@ const resolveIssuePrFromGh = async (
     for (const entry of payload) {
       const pr = ghProbePrCandidate(entry)
       if (!pr || !containsIssueKey(pr.headRef, issue.key)) continue
+      if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') continue
       const score = issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
       if (score <= 0) continue
       candidates.push({
@@ -9350,11 +9509,15 @@ const resolveIssuePrFromGh = async (
     }
   }
 
-  return candidates.sort((a, b) =>
+  const resolved = candidates.sort((a, b) =>
     b.score - a.score ||
     Number(b.open) - Number(a.open) ||
     b.prNumber - a.prNumber
   )[0]
+  if (!resolved && opts.failOnLookupError && lookupFailures > 0) {
+    throw new Error(`Unable to confirm open pull request state for ${issue.key} in ${lookupFailures} configured repository lookup(s)`)
+  }
+  return resolved
 }
 
 const reposFromConfig = (config: FactoryConfig): string[] => {
@@ -9446,7 +9609,7 @@ const githubPullRoot = (repo: string): string => {
 const readProbePrCandidate = async (
   mount: MountClient,
   path: string,
-): Promise<{ number: number; title: string; body: string; headRef: string; draft?: boolean } | undefined> => {
+): Promise<{ number: number; title: string; body: string; headRef: string; draft?: boolean; state?: string } | undefined> => {
   try {
     const payload = wrappedPayload((await mount.readFile(path)).content)
     const number = typeof payload.number === 'number'
@@ -9459,6 +9622,7 @@ const readProbePrCandidate = async (
       body: stringValue(payload.body) ?? '',
       headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? '',
       draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
+      state: stringValue(payload.state),
     }
   } catch {
     return undefined

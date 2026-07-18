@@ -882,6 +882,40 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return {
+            stdout: JSON.stringify({
+              labels: [{ name: 'factory-ready' }, { name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+            }),
+          }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await github.setStatus(githubIssue, 'ready')
+
+    expect(calls).toEqual([
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      [
+        'issue',
+        'edit',
+        '48',
+        '--repo',
+        'AgentWorkforce/factory',
+        '--remove-label',
+        'factory:in-progress',
+        '--remove-label',
+        'factory:human-review',
+      ],
+    ])
+  })
+
   it('comments and closes the GitHub issue after merge', async () => {
     const calls: string[][] = []
     const github = new GhCliGithubWriteback({

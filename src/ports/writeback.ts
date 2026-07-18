@@ -16,7 +16,7 @@ export interface GithubRead {
   getPr(repo: string, number: number): Promise<PrSummary>
 }
 
-export type GithubIssueStatus = 'in-progress' | 'human-review'
+export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
 
 export interface GithubWriteback {
   /** Provider-authoritative fallback when the mounted issue record omits its reporter. */
