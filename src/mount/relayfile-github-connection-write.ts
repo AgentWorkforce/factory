@@ -57,7 +57,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const draftName = githubDraftName(headRef, headSha)
     const repoRoot = `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
     const fullHeadRef = `refs/heads/${headRef}`
-    const createRefPath = `${repoRoot}/refs/${draftName}.json`
+    // Relayfile's GitHub adapter exposes one guarded draft endpoint for create
+    // and a canonical encoded endpoint for update. The draft filename is an
+    // adapter contract; the requested branch identity lives in the payload.
+    const createRefPath = `${repoRoot}/refs/factory.json`
     const updateRefPath = `${repoRoot}/refs/${encodeURIComponent(fullHeadRef)}.json`
 
     // A remote implementer already pushed its branch. For the legacy local-clone

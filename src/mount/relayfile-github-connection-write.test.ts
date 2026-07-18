@@ -99,7 +99,7 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(git).toHaveBeenNthCalledWith(2, ['-C', '/work/factory', 'rev-parse', 'HEAD'])
     expect(mount.writes).toEqual([
       {
-        path: `/github/repos/AgentWorkforce/factory/refs/${draft}.json`,
+        path: '/github/repos/AgentWorkforce/factory/refs/factory.json',
         content: {
           ref: 'refs/heads/fix/issue-52',
           sha: '1234567890abcdef1234567890abcdef12345678',
@@ -132,7 +132,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('fails closed when the provider does not acknowledge a write', async () => {
     const mount = new FakeMountClient()
-    const refPath = '/github/repos/AgentWorkforce/factory/refs/factory-fix-issue-52-1234567890ab.json'
+    const refPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
     mount.setConfirmWrite(refPath, 'timeout')
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
@@ -147,7 +147,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('updates an existing branch when retrying local-clone publication', async () => {
     const draft = 'factory-fix-issue-52-1234567890ab'
-    const createRefPath = `/github/repos/AgentWorkforce/factory/refs/${draft}.json`
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
     const updateRefPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
     const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
     class ExistingRefMount extends FakeMountClient {
