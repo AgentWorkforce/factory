@@ -283,7 +283,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
-  readonly #githubIssueAuthors = new Map<string, string>()
+  readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
@@ -7200,20 +7200,21 @@ export class FactoryLoop implements Factory {
     if (!source || !lookup) return undefined
 
     const key = githubIssueSourceKey(source)
-    const cached = this.#githubIssueAuthors.get(key)
-    if (cached) return cached
+    if (this.#githubIssueAuthors.has(key)) {
+      return this.#githubIssueAuthors.get(key)
+    }
 
     const existing = this.#githubIssueAuthorLookups.get(key)
-    if (existing) return await existing
+    if (existing) return existing
 
     const pending = lookup.call(this.#githubWriteback, issue)
       .then((author) => {
-        const normalized = author?.trim()
+        const normalized = author?.trim() || undefined
+        this.#githubIssueAuthors.set(key, normalized)
         if (normalized) {
-          this.#githubIssueAuthors.set(key, normalized)
           this.#increment('githubIssueAuthorsResolvedFromProvider')
         }
-        return normalized || undefined
+        return normalized
       })
       .catch((error) => {
         this.#increment('githubIssueAuthorLookupFailures')
@@ -7229,7 +7230,7 @@ export class FactoryLoop implements Factory {
         this.#githubIssueAuthorLookups.delete(key)
       })
     this.#githubIssueAuthorLookups.set(key, pending)
-    return await pending
+    return pending
   }
 
   async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {

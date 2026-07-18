@@ -256,7 +256,7 @@ class RecordingGithubWriteback implements GithubWriteback {
 class AuthorResolvingGithubWriteback extends RecordingGithubWriteback {
   readonly authorLookups: string[] = []
 
-  constructor(private readonly author: string) {
+  constructor(private readonly author: string | undefined) {
     super()
   }
 
@@ -9617,6 +9617,26 @@ describe('FactoryLoop', () => {
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @provider-reporter.')
     expect(factory.status().counters.githubIssueAuthorsResolvedFromProvider).toBe(1)
+  })
+
+  it('caches a provider-confirmed missing GitHub reporter across triage passes', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 60)
+    const issueWithoutAuthor = githubIssueFile(60, { labels: ['factory'] })
+    delete (issueWithoutAuthor.payload as { author?: unknown }).author
+    const mount = new FakeMountClient({ [path]: issueWithoutAuthor })
+    const githubWriteback = new AuthorResolvingGithubWriteback(undefined)
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+    await factory.runOnce()
+
+    expect(githubWriteback.authorLookups).toEqual(['60'])
+    expect(githubWriteback.comments).toEqual([])
   })
 
   it('logs and emits an observable error when GitHub triage escalation has no usable write path', async () => {
