@@ -10309,7 +10309,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), issueFile(21))))
     fleet.emitAgentExit('ar-21-impl-pear', 'issue-done')
-    await flush()
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
     emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-after-done'), 'slack-human-after-done', {
       text: 'please add one more test',
       user: 'U123',

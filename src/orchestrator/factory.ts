@@ -1419,7 +1419,19 @@ export class FactoryLoop implements Factory {
 
         pulled.push(issueRef(issue))
         const wasReady = this.#isIssueReady(issue)
-        if (wasReady) {
+        const labels = isGithubIssue(issue)
+          ? new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+          : undefined
+        const requiredLabel = this.#config.safety.requireLabel.trim().toLowerCase()
+        const mayRecoverGithubOrphan = !wasReady &&
+          !dryRun &&
+          issueSource === 'github' &&
+          Boolean(orphanRecovery) &&
+          Boolean(requiredLabel) &&
+          Boolean(labels?.has(requiredLabel)) &&
+          Boolean(labels?.has('factory:in-progress')) &&
+          !labels?.has('factory:human-review')
+        if (!mayRecoverGithubOrphan) {
           const dispatchBlock = await this.#dispatchBlockReason(issue)
           if (dispatchBlock) {
             skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
@@ -1433,13 +1445,15 @@ export class FactoryLoop implements Factory {
           continue
         }
 
-        const recoveredOrphan = !wasReady &&
+        const recoveredOrphan = mayRecoverGithubOrphan &&
           await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
         if (!wasReady && !recoveredOrphan) {
-          const dispatchBlock = await this.#dispatchBlockReason(issue)
-          if (dispatchBlock) {
-            skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
-            continue
+          if (mayRecoverGithubOrphan) {
+            const dispatchBlock = await this.#dispatchBlockReason(issue)
+            if (dispatchBlock) {
+              skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+              continue
+            }
           }
           skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
           continue
