@@ -1403,6 +1403,7 @@ export class FactoryLoop implements Factory {
       let lastReadyReadProgressAtMs = this.#clock.now()
       let readyIssueReads = 0
 
+      const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         const issue = await this.#readIssue(path)
         readyIssueReads += 1
@@ -1417,6 +1418,20 @@ export class FactoryLoop implements Factory {
         if (issue && issueSource === 'linear') {
           await this.#recordCanonicalIssueState(issue)
         }
+        issueEntries.push({ path, issue })
+      }
+      if (issueSource === 'github') {
+        // New ready work must not sit behind a long sequence of stale
+        // in-progress recoveries. Load the canonical snapshots first, then
+        // preserve their stable order within two priority buckets: genuinely
+        // ready issues first, orphan-recovery candidates second.
+        issueEntries.sort((left, right) =>
+          Number(Boolean(right.issue && this.#isIssueReady(right.issue))) -
+          Number(Boolean(left.issue && this.#isIssueReady(left.issue))),
+        )
+      }
+
+      for (const { issue } of issueEntries) {
         if (!issue) {
           continue
         }
@@ -2668,6 +2683,12 @@ export class FactoryLoop implements Factory {
         }
       }
     } catch (error) {
+      if (error instanceof LiveDispatchStateChangedError) {
+        this.#logger.info?.('[factory] ignored issue event whose live state changed during dispatch', {
+          issue: error.issueKey,
+        })
+        return
+      }
       this.#logger.error?.('[factory] failed to handle issue change', error)
     }
   }
@@ -5223,6 +5244,14 @@ export class FactoryLoop implements Factory {
     } else {
       watch.issue = { ...record.issue }
       watch.detectAgentQuestions = true
+      const humanReplyDispatch = record.decision.rationale.includes('Human answered the GitHub triage escalation')
+      if (!triageEscalationReason(record.decision) && !humanReplyDispatch) {
+        const pendingCount = watch.pending.length
+        watch.pending = watch.pending.filter((pending) => pending.kind !== 'triage')
+        if (watch.pending.length < pendingCount) {
+          this.#increment('triageEscalationsSupersededByActionableIssue')
+        }
+      }
     }
     if (this.#githubIssueCommentWatchers.has(key)) {
       const normalizedWatch = normalizeGithubIssueCommentWatch(watch)
@@ -5712,7 +5741,9 @@ export class FactoryLoop implements Factory {
     }
 
     this.#pendingGithubClarifications.set(issueKey(decision.issue), text)
-    const result = await this.#startOrQueueGithubClarifiedDecision(decision)
+    const result = await this.#startOrQueueGithubClarifiedDecision(
+      dispatchAfterGithubClarification(decision, 'human clarification resolved triage'),
+    )
     this.#increment('githubTriageAnswersDispatched')
     return Boolean(result) || (await this.#batch()).isQueued(decision.issue)
   }
@@ -10775,9 +10806,12 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
 }
 
 class LiveDispatchStateChangedError extends Error {
+  readonly issueKey: string
+
   constructor(issueKey: string) {
     super(`Live state changed before writeback for ${issueKey}`)
     this.name = 'LiveDispatchStateChangedError'
+    this.issueKey = issueKey
   }
 }
 

@@ -269,7 +269,8 @@ function implementationAssignments(
 }
 
 function hasAcceptanceSignal(issue: LinearIssue): boolean {
-  return ACCEPTANCE_SIGNAL_PATTERNS.some((pattern) => pattern.test(issue.description))
+  const taskText = `${issue.title}\n${issue.description}`
+  return ACCEPTANCE_SIGNAL_PATTERNS.some((pattern) => pattern.test(taskText))
 }
 
 function issueRefFor(issue: LinearIssue): IssueRef {

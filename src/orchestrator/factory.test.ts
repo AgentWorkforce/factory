@@ -1901,6 +1901,41 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('prioritizes fresh GitHub-ready work ahead of orphan recovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-ready-before-orphans-'))
+    try {
+      const orphanPath = githubIssuePath('AgentWorkforce', 'pear', 11)
+      const freshPath = githubIssuePath('AgentWorkforce', 'pear', 52)
+      const mount = new FakeMountClient({
+        [orphanPath]: githubIssueFile(11, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+        [freshPath]: githubIssueFile(52, { labels: ['factory', 'pear'] }),
+      })
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        batchSize: 1,
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['52'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-52-impl-pear', 'ar-52-review-pear'])
+      expect(factory.status().queued.map((issue) => issue.key)).toEqual(['11'])
+      expect(githubWriteback.statuses[0]).toEqual({ key: '52', status: 'in-progress' })
+      expect(githubWriteback.statuses).toContainEqual({ key: '11', status: 'ready' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('continues startup reconciliation when an issue changes state during dispatch', async () => {
     const racedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
     const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
@@ -9890,11 +9925,13 @@ describe('FactoryLoop', () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 55)
     const mount = new CountingEventsMount({ [path]: githubIssueFile(55, { labels: ['factory'] }) })
     const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet: new FakeFleetClient(),
       triage: new EscalatingTriage({ rationale: 'Issue lacks acceptance criteria.' }),
       githubWriteback,
+      stateStore,
     })
 
     const report = await factory.runOnce()
@@ -9927,6 +9964,15 @@ describe('FactoryLoop', () => {
       glob,
       '/github/repos/OtherOrg/pear/issues/55/comments/9003/meta.json',
     ))).toBe(false)
+
+    const issue = parseGithubFactoryIssue(path, githubIssueFile(55, { labels: ['factory'] }))
+    const actionableDecision = await new StaticTriage().triage(issue)
+    await factory.dispatch(actionableDecision)
+
+    const watches = await stateStore.listGithubIssueCommentWatches('factory-test')
+    expect(watches).toHaveLength(1)
+    expect(watches[0]?.[1]).toMatchObject({ detectAgentQuestions: true, pending: [] })
+    expect(factory.status().counters.triageEscalationsSupersededByActionableIssue).toBe(1)
   })
 
   it('preserves the GitHub reporter on a Linear mirror and authorizes their escalation reply', async () => {

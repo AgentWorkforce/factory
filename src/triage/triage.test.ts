@@ -140,10 +140,16 @@ describe('HeuristicTriage routing', () => {
 describe('HeuristicTriage thin and scope detection', () => {
   it.each([
     { name: 'short description is thin', description: 'Fix tests in src/main/broker.ts.', thin: true },
-    { name: 'long description without acceptance signal is thin', description: 'Background '.repeat(30), thin: true },
+    { name: 'long description without acceptance signal is thin', title: 'Background context', description: 'Background '.repeat(30), thin: true },
     { name: 'long description with acceptance signal is not thin', description: richDescription('Add regression tests in src/main/broker.ts and verify the error path.'), thin: false },
-  ])('$name', async ({ description, thin }) => {
-    const decision = await new HeuristicTriage().triage(issue({ description }), ctx)
+    {
+      name: 'bug title makes detailed reproduction steps actionable',
+      title: 'Bug: Creating a new league does not work',
+      description: 'Steps to reproduce: Login, click new league, enter a league name, submit, and observe the broken admin page. '.repeat(2),
+      thin: false,
+    },
+  ])('$name', async ({ title, description, thin }) => {
+    const decision = await new HeuristicTriage().triage(issue({ ...(title ? { title } : {}), description }), ctx)
 
     expect(decision.thin).toBe(thin)
   })
