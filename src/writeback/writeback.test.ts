@@ -827,6 +827,27 @@ describe('GhCliGithubWriteback', () => {
     },
   }
 
+  it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: JSON.stringify({ author: { login: 'issue-reporter' } }) }
+      },
+    })
+
+    await expect(github.getIssueAuthor(githubIssue)).resolves.toBe('issue-reporter')
+    expect(calls).toEqual([[
+      'issue',
+      'view',
+      '48',
+      '--repo',
+      'AgentWorkforce/factory',
+      '--json',
+      'author',
+    ]])
+  })
+
   it('sets the first lifecycle status without removing an absent label, then transitions statuses', async () => {
     const calls: string[][] = []
     const labels = new Set<string>()
@@ -859,6 +880,42 @@ describe('GhCliGithubWriteback', () => {
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
     ])
+  })
+
+  it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return {
+            stdout: JSON.stringify({
+              labels: [{ name: 'factory-ready' }, { name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+            }),
+          }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await github.setStatus(githubIssue, 'ready')
+
+    expect(calls).toEqual([
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
+    ])
+  })
+
+  it('treats provider human-review status as authoritative over a stale in-progress label', async () => {
+    const github = new GhCliGithubWriteback({
+      runner: async () => ({
+        stdout: JSON.stringify({
+          labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+        }),
+      }),
+    })
+
+    await expect(github.getIssueStatus(githubIssue)).resolves.toBe('human-review')
   })
 
   it('comments and closes the GitHub issue after merge', async () => {

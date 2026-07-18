@@ -4,7 +4,7 @@ import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
 
-const STATUS_LABELS: Record<GithubIssueStatus, { name: string; color: string; description: string }> = {
+const STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
   'in-progress': {
     name: 'factory:in-progress',
     color: '1d76db',
@@ -71,6 +71,29 @@ export class GhCliGithubWriteback implements GithubWriteback {
     this.#run = config.runner ?? defaultGhRunner
   }
 
+  async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
+    const ref = githubIssueRef(issue)
+    const result = await this.#run([
+      'issue',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'author',
+    ])
+    if (!result.stdout.trim()) return undefined
+    const author = asRecord(JSON.parse(result.stdout))?.author
+    return stringValue(asRecord(author)?.login)?.trim() || undefined
+  }
+
+  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
+    const labels = await this.#issueLabels(githubIssueRef(issue))
+    if (labels.has(STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
+    if (labels.has(STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
+    return 'ready'
+  }
+
   async postComment(issue: LinearIssue, body: string): Promise<void> {
     const ref = githubIssueRef(issue)
     await this.#run([
@@ -98,6 +121,18 @@ export class GhCliGithubWriteback implements GithubWriteback {
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
+    if (status === 'ready') {
+      const labels = await this.#issueLabels(ref)
+      const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
+      const inProgress = STATUS_LABELS['in-progress']
+      if (labels.has(inProgress.name.toLowerCase())) {
+        editArgs.push('--remove-label', inProgress.name)
+      }
+      if (editArgs.length > 5) {
+        await this.#run(editArgs)
+      }
+      return
+    }
     const target = STATUS_LABELS[status]
     const previous = STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
     await this.#run([
