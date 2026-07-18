@@ -14044,6 +14044,7 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(commentPath, 'pre-restart-comment'))
       await vi.waitFor(() => expect(first.status().counters.babysitterEventsQueued).toBe(1))
       expect(firstFleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
+      mount.files.set(prPath, { content: { number: 423, state: 'open', head_ref: 'ar-423-fix', draft: false } })
       await first.stop()
 
       const restartedFleet = new FakeFleetClient()
@@ -14083,6 +14084,51 @@ describe('FactoryLoop PR babysitter', () => {
       await first.stop()
       await restarted?.stop()
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('discards restored babysitter ownership when the persisted PR is merged and unrelated', async () => {
+    const issue = { uuid: 'AgentWorkforce/pear#52', key: '52', path: githubIssuePath('AgentWorkforce', 'pear', 52) }
+    const persistedKey = issueKey(issue)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    await stateStore.setBabysitterSession('factory-test', persistedKey, {
+      issue,
+      repo: 'AgentWorkforce/pear',
+      prNumber: 5,
+      agentName: 'ar-52-babysit-pear',
+      path: '/github/repos/AgentWorkforce__pear/pulls/by-id/5.json',
+      critical: false,
+      pendingKinds: [],
+    })
+    const mount = new FakeMountClient({
+      [issue.path]: githubIssueFile(52, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/5.json': prFile(5, {
+        title: 'Unrelated observability work',
+        body: 'tsc, eslint, and 52 tests all pass.',
+        head_ref: 'claude/unrelated-observability',
+        state: 'merged',
+        merged: true,
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const factory = createFactory(config({
+      issueSource: 'github',
+      babysitter: { enabled: true },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      stateStore,
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await expect(stateStore.listBabysitterSessions('factory-test')).resolves.toEqual([])
+      expect(factory.status().counters.babysitterOwnershipRestoreStale).toBe(1)
+      expect(factory.status().counters.babysitterOwnershipRestored).toBeUndefined()
+    } finally {
+      await factory.stop()
     }
   })
 

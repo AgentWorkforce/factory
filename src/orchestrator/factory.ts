@@ -5917,6 +5917,23 @@ export class FactoryLoop implements Factory {
         this.#increment('babysitterOwnershipRestoreSkippedNonOwner')
         continue
       }
+      const snapshot = await this.#readPrSnapshot(session)
+      const guard = snapshot ? prMetaAllowsHumanReview(snapshot) : undefined
+      if (!snapshot || !guard?.ok || prSnapshotIssueMatchScore(snapshot, session.issue.key) < 30) {
+        await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
+        this.#increment('babysitterOwnershipRestoreStale')
+        this.#logger.warn?.('[factory] discarded stale babysitter ownership during restore', {
+          issue: session.issue.key,
+          repo: session.repo,
+          prNumber: session.prNumber,
+          reason: !snapshot
+            ? 'authoritative PR meta is unavailable'
+            : !guard?.ok
+              ? guard?.reason
+              : 'PR branch does not identify the issue',
+        })
+        continue
+      }
       const record = batch.getIssue(session.issue)
       const tracked = record?.agents.get(session.agentName)
         ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
@@ -6777,7 +6794,12 @@ export class FactoryLoop implements Factory {
     if (!ref) {
       return undefined
     }
-    const candidatePaths = ref.path ? [ref.path] : await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
+    return await this.#readPrSnapshot(ref)
+  }
+
+  async #readPrSnapshot(ref: Pick<BabysitterPrRef, 'repo' | 'prNumber' | 'path'>): Promise<PullSnapshot | undefined> {
+    const discoveredPaths = await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
+    const candidatePaths = [...new Set([ref.path, ...discoveredPaths].filter((path): path is string => Boolean(path)))]
     for (const path of candidatePaths) {
       try {
         const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, ref.prNumber)
