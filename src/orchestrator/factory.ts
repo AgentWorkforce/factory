@@ -9155,22 +9155,32 @@ function labelRoutesForIssue(
   offendingLabels: string[]
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
-  const githubReadinessLabel = isGithubIssue(issue) ? config.safety.requireLabel.trim().toLowerCase() : undefined
-  const labels = uniqueNormalizedLabels(issue.labels).filter((label) =>
+  const githubIssue = isGithubIssue(issue)
+  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim().toLowerCase() : undefined
+  const candidateLabels = uniqueNormalizedLabels(issue.labels).filter((label) =>
     !isShapeLabel(label) &&
     label.toLowerCase() !== githubReadinessLabel &&
-    (!isGithubIssue(issue) || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
+    (!githubIssue || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
   )
+  const labels: string[] = []
   const routes: Array<{ slug: string; route: TriageDecision['routes'][number] }> = []
   const offendingLabels: string[] = []
   const seenRepos = new Set<string>()
 
-  for (const label of labels) {
+  for (const label of candidateLabels) {
     const entry = findLabelRoute(config.repos.byLabel, label)
     if (!entry) {
-      offendingLabels.push(label)
+      // GitHub repositories commonly carry metadata labels such as `bug` and
+      // `enhancement`; only explicitly configured repo labels participate in
+      // routing. Linear labels remain authoritative and therefore fail closed
+      // when unmapped.
+      if (!githubIssue) {
+        labels.push(label)
+        offendingLabels.push(label)
+      }
       continue
     }
+    labels.push(label)
 
     const repo = entry.repo
     if (seenRepos.has(repo)) {

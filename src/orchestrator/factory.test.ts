@@ -1619,7 +1619,7 @@ describe('FactoryLoop', () => {
   it('dispatches a labeled GitHub issue without Linear and writes in-progress then human-review to GitHub', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 48)
     const mount = new FakeMountClient({
-      [path]: githubIssueFile(48, { labels: ['factory'] }),
+      [path]: githubIssueFile(48, { labels: ['factory', 'bug'] }),
     })
     mount.setSubRoot('/linear/issues', 'absent')
     const fleet = new FakeFleetClient()
