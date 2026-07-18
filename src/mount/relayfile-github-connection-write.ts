@@ -32,6 +32,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #git: GitCommandRunner
   readonly #receiptReadAttempts: number
   readonly #receiptReadDelayMs: number
+  readonly #writesByPath = new Map<string, Promise<string | undefined>>()
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
     this.#mount = config.mount
@@ -162,6 +163,19 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   }
 
   async #writeAndConfirm(path: string, content: unknown): Promise<string | undefined> {
+    const previous = this.#writesByPath.get(path) ?? Promise.resolve(undefined)
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => await this.#writeAndConfirmUnlocked(path, content))
+    this.#writesByPath.set(path, current)
+    try {
+      return await current
+    } finally {
+      if (this.#writesByPath.get(path) === current) this.#writesByPath.delete(path)
+    }
+  }
+
+  async #writeAndConfirmUnlocked(path: string, content: unknown): Promise<string | undefined> {
     await this.#mount.writeFile(path, content, { guarded: true })
     const status = await this.#mount.confirmWrite(path, { timeoutMs: WRITE_CONFIRM_TIMEOUT_MS })
     if (status !== 'acked') {

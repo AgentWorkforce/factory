@@ -118,6 +118,48 @@ describe('RelayfileGithubConnectionWrite', () => {
     ])
   })
 
+  it('serializes concurrent create-ref confirmations that share the repository draft path', async () => {
+    const createRefPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'
+    let releaseFirst!: () => void
+    const firstConfirmation = new Promise<void>((resolve) => { releaseFirst = resolve })
+    class ConcurrentRefMount extends FakeMountClient {
+      createConfirmations = 0
+
+      override async confirmWrite(path: string): Promise<'acked'> {
+        if (path === createRefPath && ++this.createConfirmations === 1) await firstConfirmation
+        return 'acked'
+      }
+
+      async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+        if (!path.includes('/pull-requests/')) return undefined
+        return path.includes('concurrent-one') ? '71' : '72'
+      }
+    }
+    const mount = new ConcurrentRefMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+    const publish = (headRef: string, headSha: string) => write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef,
+      headSha,
+      baseRef: 'main',
+      title: headRef,
+      body: 'Concurrent publication proof',
+    })
+
+    const first = publish('factory/concurrent-one', '1111111111111111111111111111111111111111')
+    await vi.waitFor(() => expect(mount.createConfirmations).toBe(1))
+    const second = publish('factory/concurrent-two', '2222222222222222222222222222222222222222')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(mount.writes.filter((entry) => entry.path === createRefPath)).toHaveLength(1)
+
+    releaseFirst()
+    await expect(Promise.all([first, second])).resolves.toMatchObject([
+      { number: 71 },
+      { number: 72 },
+    ])
+    expect(mount.writes.filter((entry) => entry.path === createRefPath)).toHaveLength(2)
+  })
+
   it('closes a pull request through its exact Relayfile writeback path', async () => {
     const mount = new FakeMountClient()
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })

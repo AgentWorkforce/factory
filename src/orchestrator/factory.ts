@@ -2206,8 +2206,24 @@ export class FactoryLoop implements Factory {
       // acknowledged spawns, so cleanup never races a name-only survivor.
       const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
       await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
-      const worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
+      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
       const liveStateChanged = error instanceof LiveDispatchStateChangedError
+      if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
+        const failed = await this.#releaseAndTerminateAgents(
+          failureHandoffs.map((handoff) => [handoff.name, handoff.tracked]),
+          'live dispatch state changed',
+          'completion',
+        )
+        if (failed.length === 0) {
+          for (const handoff of failureHandoffs) {
+            await this.#state.clearFailureHandoff(
+              this.#workspaceId,
+              registryHandoffKey(handoff.issue, handoff.name),
+            )
+          }
+          worktreesTornDown = failureHandoffs.length > 0
+        }
+      }
       let failedState: { terminal: boolean } | undefined
       if (liveStateChanged) {
         await this.#clearDispatchInFlight(decision.issue)
@@ -4189,7 +4205,7 @@ export class FactoryLoop implements Factory {
             !snapshot ||
             snapshot.headRef !== expectedHeadRef ||
             state !== 'OPEN' ||
-            snapshot.draft === true ||
+            snapshot.draft !== false ||
             snapshot.merged === true
           ) continue
           candidates.push({
@@ -4428,6 +4444,7 @@ export class FactoryLoop implements Factory {
       this.#fleet.markAgentTerminal?.(agentName, `implementer-terminal:${reason}`)
     }
     const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
+    let cleanupComplete = true
     if (worktreeHandoffs.length > 0) {
       // A terminal no-PR dispatch no longer owns useful work. Fence and release
       // every agent sharing the checkout before removing it. If release or
@@ -4437,11 +4454,19 @@ export class FactoryLoop implements Factory {
       const worktreeAgentNames = new Set(worktreeHandoffs.map((handoff) => handoff.name))
       const nonWorktreeAgents = agents.filter(([name]) => !worktreeAgentNames.has(name))
       if (nonWorktreeAgents.length > 0) {
-        await this.#releaseAndTerminateAgents(nonWorktreeAgents, 'issue-abandoned', 'completion')
+        const failed = await this.#releaseAndTerminateAgents(nonWorktreeAgents, 'issue-abandoned', 'completion')
+        cleanupComplete = failed.length === 0
       }
-      await this.#teardownFailedDispatchWorktrees(worktreeHandoffs)
+      cleanupComplete = await this.#teardownFailedDispatchWorktrees(worktreeHandoffs) && cleanupComplete
     } else if (agents.length > 0) {
-      await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
+      const failed = await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
+      cleanupComplete = failed.length === 0
+    }
+    if (!cleanupComplete) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      await this.#writeInFlightRegistry()
+      return
     }
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
@@ -4452,6 +4477,23 @@ export class FactoryLoop implements Factory {
     if (next) {
       await this.dispatch(next.decision, { dryRun: next.dryRun })
     }
+  }
+
+  #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
+    const key = issueKey(record.issue)
+    if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
+    const timer = setTimeout(() => {
+      this.#dispatchLifecycleRetryTimers.delete(key)
+      void this.#abandonStuckDispatch(record, reason).catch((error) => {
+        this.#logger.warn?.('[factory] abandoned dispatch cleanup retry failed', {
+          issue: record.issue.key,
+          error: describeError(error).errorMessage,
+        })
+        this.#scheduleAbandonedDispatchRetry(record, reason)
+      })
+    }, DISPATCH_LIFECYCLE_RETRY_MS)
+    timer.unref?.()
+    this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
 
   async #issueHasCompletionPr(record: InFlightIssue, opts: { openOnly?: boolean } = {}): Promise<boolean> {
@@ -10653,7 +10695,7 @@ const isAllowedFactoryDraft = async (
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,

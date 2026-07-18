@@ -1510,6 +1510,16 @@ describe('fleet CLI runtime', () => {
             { guarded: true },
           )).toBe(true)
           expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Ffactory%2F77.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Fmain.json`,
+            { ref: 'refs/heads/main', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
             `/github/repos/${input.repo}/refs/arbitrary.json`,
             { ref: 'refs/heads/factory/77', sha: 'abc123' },
             { guarded: true },

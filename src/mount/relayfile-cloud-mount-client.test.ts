@@ -11,6 +11,7 @@ import {
   type RelayfileCloudMountClientConfig,
   type RelayFileClientLike,
 } from './relayfile-cloud-mount-client'
+import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
@@ -1068,6 +1069,49 @@ describe('RelayfileCloudMountClient', () => {
       .rejects.toThrow(/Field "id" is read-only/)
     await expect(mount.getConfirmedWriteFailureReason('/linear/issues/new.json'))
       .resolves.toBe('Field "id" is read-only and cannot be written')
+  })
+
+  it('feeds an existing-reference provider failure into the GitHub update-ref fallback', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'GitHub writeback failed with status 422: Reference already exists',
+    })
+    fake.ops.set('op-2', {
+      opId: 'op-2',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: { status: 200, externalId: 'factory/test-existing-ref' },
+    })
+    fake.ops.set('op-3', {
+      opId: 'op-3',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: { status: 201, externalId: '66' },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    const writer = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(writer.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/test-existing-ref',
+      headSha: '1234567890abcdef1234567890abcdef12345678',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 66 })
+
+    expect(fake.writeFileCalls.map((call) => call.path)).toEqual([
+      '/github/repos/AgentWorkforce/factory/refs/factory.json',
+      '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffactory%2Ftest-existing-ref.json',
+      expect.stringMatching(/\/github\/repos\/AgentWorkforce\/factory\/pull-requests\/factory-/u),
+    ])
   })
 
   it('delegates subscribe through the workspace-scoped event client', () => {

@@ -1976,7 +1976,9 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('continues startup reconciliation when an issue changes state during dispatch', async () => {
+  it.each([true, false])(
+    'continues startup reconciliation when an issue changes state during dispatch (worktrees: %s)',
+    async (withWorktrees) => {
     const racedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
     const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
     const racedReady = githubIssueFile(59, { labels: ['factory', 'pear'] })
@@ -2006,7 +2008,7 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
-      worktrees,
+      ...(withWorktrees ? { worktrees } : {}),
     })
 
     const report = await factory.runOnce()
@@ -2028,7 +2030,8 @@ describe('FactoryLoop', () => {
     ])
     expect(factory.status().counters.dispatchLiveStateRaces).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
-  })
+    },
+  )
 
   it('adopts an orphaned in-progress GitHub issue when its ready PR already exists', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-'))
@@ -4282,6 +4285,7 @@ describe('FactoryLoop', () => {
         mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1186/metadata.json', { content: {
           number: 1186,
           state: 'open',
+          draft: false,
           head_ref: branch,
           url: 'https://github.com/AgentWorkforce/pear/pull/1186',
         } })
@@ -4317,6 +4321,57 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.githubPullRequestsReconciled).toBe(1)
       expect(fleet.resumes).toEqual([])
       expect(fleet.releases.map((release) => release.name).sort()).toEqual(['ar-186-impl-pear', 'ar-186-review'])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not reconcile an existing branch when its PR draft state is unknown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-reject-unknown-draft-'))
+    const watchStatePath = join(root, 'state.json')
+    let publishAttempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishAttempts += 1
+        if (publishAttempts === 1) {
+          mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1187/metadata.json', { content: {
+            number: 1187,
+            state: 'open',
+            head_ref: input.headRef,
+            url: 'https://github.com/AgentWorkforce/pear/pull/1187',
+          } })
+          throw new Error('receipt was lost after the provider created a PR with unknown draft state')
+        }
+        return {
+          repo: input.repo,
+          number: 1188,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1188',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(187)]: issueFile(187),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(187), issueFile(187)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-187-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 4_000 })
+      expect(publishAttempts).toBe(2)
+      expect(factory.status().counters.githubPullRequestsReconciled).toBeUndefined()
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
@@ -7779,6 +7834,54 @@ describe('FactoryLoop', () => {
       'ar-820-review',
     ])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('retains mixed abandoned-dispatch ownership until a failed agent release succeeds', async () => {
+    class FailOnceReleaseFleet extends ResumeNameCollisionFleetClient {
+      failed = false
+
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name === 'ar-821-impl-remote' && !this.failed) {
+          this.failed = true
+          throw new Error('transient remote release failure')
+        }
+        await super.release(name, reason)
+      }
+    }
+
+    const path = issuePath(821)
+    const issue = realIssueFile(821, ready, {
+      labels: [{ name: 'pear' }, { name: 'remote' }, { name: 'factory:team' }],
+    })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FailOnceReleaseFleet()
+    const worktrees = new RecordingWorktreeManager()
+    fleet.setSessionRef('ar-821-impl-pear', 'session-impl-821')
+    const factory = createFactory(config({
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          remote: 'AgentWorkforce/remote',
+        },
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      worktrees,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-821-impl-pear', 'crash')
+
+    await vi.waitFor(() => expect(factory.status().counters.abandonedDispatchReleaseRetries).toBe(1))
+    expect(factory.status().inFlight.map((entry) => entry.key)).toEqual(['AR-821'])
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 3_000 })
+    expect(fleet.releases.map((release) => release.name)).toContain('ar-821-impl-remote')
   })
 
   // If the PR the implementer opened becomes visible only after the collision
