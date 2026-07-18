@@ -2040,6 +2040,7 @@ describe('FactoryLoop', () => {
       const fleet = new RemoteLifecycleFleetClient()
       const worktrees = new RecordingWorktreeManager()
       const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
       const factory = createFactory(config({
         issueSource: 'github',
         babysitter: { enabled: true },
@@ -2050,6 +2051,7 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
+        stateStore,
         worktrees,
         probePrResolver: async () => ({
           repo: 'AgentWorkforce/pear',
@@ -2081,7 +2083,116 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.githubOrphanRecoveriesBlockedOpenPr).toBe(1)
       expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
       expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['53'])
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey({
+        uuid: 'AgentWorkforce/pear#53',
+        key: '53',
+        path,
+      }))).toMatchObject({
+        phase: 'running',
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 153,
+          headRef: 'factory/53-agentworkforce-pear-proof',
+        },
+      })
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('queues an orphaned open PR and promotes it directly to a babysitter when capacity opens', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-queued-'))
+    const clock = new ManualClock()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const runningPath = githubIssuePath('AgentWorkforce', 'pear', 54)
+    const adoptedPath = githubIssuePath('AgentWorkforce', 'pear', 53)
+    const mount = new FakeMountClient({
+      [runningPath]: githubIssueFile(54, {
+        labels: ['factory', 'pear'],
+        updatedAt: '2026-07-18T12:00:00.000Z',
+      }),
+      [adoptedPath]: githubIssueFile(53, {
+        labels: ['factory', 'pear', 'factory:in-progress'],
+        updatedAt: '2026-07-18T11:00:00.000Z',
+      }),
+    })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factoryConfig = config({
+      issueSource: 'github',
+      batchSize: 1,
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+      loop: { registryPath: join(root, 'registry.json') },
+    })
+    const dependencies = {
+      mount,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      worktrees,
+      clock,
+      probePrResolver: async (issue: LinearIssue) => issue.key === '53'
+        ? {
+            repo: 'AgentWorkforce/pear',
+            prNumber: 153,
+            headRef: 'factory/53-agentworkforce-pear-proof',
+            url: 'https://github.com/AgentWorkforce/pear/pull/153',
+          }
+        : undefined,
+    }
+    const first = createFactory(factoryConfig, { ...dependencies, fleet: firstFleet })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      await first.runOnce()
+
+      expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-54-impl-pear', 'ar-54-review-pear'])
+      const adoptedRef = { uuid: 'AgentWorkforce/pear#53', key: '53', path: adoptedPath }
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(adoptedRef))).toMatchObject({
+        phase: 'queued',
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 153,
+          headRef: 'factory/53-agentworkforce-pear-proof',
+        },
+      })
+      expect(first.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
+
+      await first.stop()
+      clock.advance(5 * 60_000)
+      const runningRef = { uuid: 'AgentWorkforce/pear#54', key: '54', path: runningPath }
+      const runningKey = issueKey(runningRef)
+      const running = await stateStore.getDispatchLifecycle('factory-test', runningKey)
+      expect(running).toBeDefined()
+      const completion = await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        runningKey,
+        running!,
+        'test-completer',
+        clock.now(),
+        60_000,
+      )
+      expect(completion.acquired).toBe(true)
+      expect(await stateStore.saveDispatchLifecycle(
+        'factory-test',
+        runningKey,
+        'test-completer',
+        completion.lease!.epoch,
+        clock.now(),
+        { ...completion.lifecycle, phase: 'complete', updatedAtMs: clock.now() },
+      )).toBe(true)
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(factoryConfig, { ...dependencies, fleet: restartedFleet })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-53-babysit-pear']), { timeout: 4_000 })
+      expect(restartedFleet.spawns.some((spawn) => spawn.name.includes('-impl-') || spawn.name.includes('-review-')))
+        .toBe(false)
+    } finally {
+      await restarted?.stop()
+      await first.stop()
       await rm(root, { recursive: true, force: true })
     }
   })

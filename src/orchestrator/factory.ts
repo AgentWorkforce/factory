@@ -1759,27 +1759,39 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    const durableRemoteAdoption = this.#fleet.placementLocality === 'remote'
+    const publishedPr: GithubPublishPullRequestResult = {
+      repo: pr.repo,
+      number: pr.prNumber,
+      url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
+      headRef: pr.headRef,
+    }
+    if (durableRemoteAdoption) {
+      const claim = await this.#claimDispatchLifecycle(decision, false, randomUUID(), {
+        phase: 'published',
+        pullRequest: publishedPr,
+      })
+      decision = structuredClone(claim.lifecycle.decision)
+      if (claim.lifecycle.phase === 'queued') {
+        this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
+        this.#increment('queued')
+        this.#increment('githubOrphanedPullRequestsAdopted')
+        return true
+      }
+    }
+
     const batch = await this.#batch()
     const record = batch.start(decision, false)
-    if (!record) return false
-    const durableRemoteAdoption = this.#fleet.placementLocality === 'remote'
-    if (durableRemoteAdoption) {
-      try {
-        await this.#claimDispatchLifecycle(decision, false, randomUUID())
-        const saved = await this.#saveDispatchLifecycle(record, 'published', {
-          repo: pr.repo,
-          number: pr.prNumber,
-          url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
-          headRef: pr.headRef,
-        })
-        if (!saved) {
-          batch.abandon(record.issue)
-          return false
+    if (!record) {
+      if (durableRemoteAdoption) {
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+        if (durable) {
+          this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(durable))
+          this.#increment('githubOrphanedPullRequestsAdopted')
+          return true
         }
-      } catch (error) {
-        batch.abandon(record.issue)
-        throw error
       }
+      return false
     }
     await this.#ensureBabysitter(record, {
       repo: pr.repo,
@@ -2371,6 +2383,10 @@ export class FactoryLoop implements Factory {
     decision: TriageDecision,
     dryRun: boolean,
     preparedRunId?: string,
+    initial: {
+      phase?: DispatchLifecyclePhase
+      pullRequest?: GithubPublishPullRequestResult
+    } = {},
   ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
     const key = issueKey(decision.issue)
     const seed: DispatchLifecycle = {
@@ -2378,11 +2394,12 @@ export class FactoryLoop implements Factory {
       issue: { ...decision.issue },
       decision: structuredClone(decision),
       dryRun,
-      phase: 'dispatching',
+      phase: initial.phase ?? 'dispatching',
       agents: [],
       invocationIds: [],
       updatedAtMs: this.#clock.now(),
     }
+    if (initial.pullRequest) seed.pullRequest = initial.pullRequest
     if (!preparedRunId) seed.decision = decisionWithLifecycleBranches(seed.decision, seed.runId)
     const claim = await this.#state.claimDispatchLifecycle(
       this.#workspaceId,
@@ -2543,7 +2560,17 @@ export class FactoryLoop implements Factory {
       if (!promoted || promoted.phase !== 'dispatching') {
         throw new Error(`durable dispatch ${lifecycle.issue.key} lost its promoted lifecycle`)
       }
-      lifecycle = promoted
+      if (promoted.pullRequest) {
+        const promotedRecord = inFlightRecordFromLifecycle(promoted)
+        if (!await this.#saveDispatchLifecycle(promotedRecord, 'published', promoted.pullRequest)) return
+        const published = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (!published || published.phase !== 'published') {
+          throw new Error(`durable dispatch ${lifecycle.issue.key} lost its published PR during promotion`)
+        }
+        lifecycle = published
+      } else {
+        lifecycle = promoted
+      }
     }
     const batch = await this.#batch()
     const durableRecord = inFlightRecordFromLifecycle(lifecycle)
