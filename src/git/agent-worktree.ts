@@ -41,6 +41,10 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
 
   async #prepare(worktree: AgentWorktree): Promise<void> {
     assertSafeWorktree(worktree)
+    // Deleted linked checkouts remain in Git's registry as prunable entries.
+    // Remove those before validating an existing healthy Factory checkout so
+    // an unrelated stale registration cannot make realpath validation fail.
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     const exists = await pathExists(worktree.worktreePath)
     if (exists) {
       await this.#assertRegisteredCheckout(worktree)
@@ -54,7 +58,6 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     }
 
     await mkdir(dirname(worktree.worktreePath), { recursive: true })
-    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (await this.#localBranchExists(worktree.baseClonePath, worktree.branch)) {
       await this.#git(worktree.baseClonePath, ['worktree', 'add', worktree.worktreePath, worktree.branch])
     } else {
@@ -74,8 +77,8 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
   async cleanup(worktree: AgentWorktree): Promise<void> {
     await this.#prepares.get(resolve(worktree.worktreePath))
     assertSafeWorktree(worktree)
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (!await pathExists(worktree.worktreePath)) {
-      await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
       await removeEmptyWorktreeParents(worktree.worktreePath)
       return
     }
@@ -157,7 +160,7 @@ const sanitizeSegment = (value: string): string =>
 const assertSafeWorktree = (worktree: AgentWorktree): void => {
   const base = resolve(worktree.baseClonePath)
   const target = resolve(worktree.worktreePath)
-  const expectedRoot = resolve(dirname(base), '.factory-worktrees', basename(base))
+  const expectedRoot = resolve(dirname(base), '.factory-worktrees', sanitizeSegment(basename(base)))
   if (target === base || !target.startsWith(`${expectedRoot}/`)) {
     throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
   }

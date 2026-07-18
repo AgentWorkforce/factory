@@ -1228,6 +1228,8 @@ class CloudWritebackFakeMountClient extends FakeMountClient {
 class RecordingWorktreeManager implements AgentWorktreeManager {
   readonly prepared: AgentWorktree[] = []
   readonly cleaned: AgentWorktree[] = []
+  cleanupAttempts = 0
+  failCleanups = 0
   onCleanup?: () => void
 
   async prepare(worktree: AgentWorktree): Promise<void> {
@@ -1235,7 +1237,12 @@ class RecordingWorktreeManager implements AgentWorktreeManager {
   }
 
   async cleanup(worktree: AgentWorktree): Promise<void> {
+    this.cleanupAttempts += 1
     this.onCleanup?.()
+    if (this.failCleanups > 0) {
+      this.failCleanups -= 1
+      throw new Error('transient worktree cleanup failure')
+    }
     this.cleaned.push(structuredClone(worktree))
   }
 }
@@ -12618,6 +12625,97 @@ describe('FactoryLoop PR babysitter', () => {
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([3])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('releases failed-dispatch agents before cleaning their isolated worktree', async () => {
+    const issue = realIssueFile(408, ready, { title: '[factory-e2e] Failed dispatch worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(408)]: issue })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const cleanupReleaseCounts: number[] = []
+    worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      linear: {
+        async postComment() {},
+        async setState() {
+          throw new Error('setState failed after spawn')
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(408), issue))))
+      .rejects.toThrow('setState failed after spawn')
+
+    expect(fleet.releases.map((release) => release.name).sort())
+      .toEqual(['ar-408-impl-pear', 'ar-408-review'])
+    expect(worktrees.cleaned).toHaveLength(1)
+    expect(cleanupReleaseCounts).toEqual([2])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('releases a planned agent and cleans its worktree when the spawn ack fails', async () => {
+    const issue = realIssueFile(409, ready, { title: '[factory-e2e] Failed spawn worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(409)]: issue })
+    const fleet = new SpawnFailingFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const cleanupReleaseCounts: number[] = []
+    worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(409), issue))))
+      .rejects.toThrow('Dispatch spawn failed for AR-409/ar-409-impl-pear')
+
+    expect(fleet.releases).toEqual([{ name: 'ar-409-impl-pear', reason: 'dispatch failed' }])
+    expect(worktrees.cleaned).toHaveLength(1)
+    expect(cleanupReleaseCounts).toEqual([1])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('retries transient local worktree cleanup without re-releasing completed agents', async () => {
+    const issue = realIssueFile(410, ready, { title: 'Real retry completed worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(410)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 410, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    worktrees.failCleanups = 1
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 410 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(410), issue)))
+    fleet.emitAgentExit('ar-410-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-410-babysit'))
+
+    fleet.emitAgentMessage({ from: 'ar-410-babysit', target: 'factory', body: '[factory-pr-ready] AR-410' })
+
+    await vi.waitFor(() => expect(worktrees.cleanupAttempts).toBe(1))
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-410'])
+    expect(fleet.releases).toHaveLength(3)
+
+    await vi.waitFor(() => expect(worktrees.cleaned).toHaveLength(1), { timeout: 3_000 })
+    expect(worktrees.cleanupAttempts).toBe(2)
+    expect(fleet.releases).toHaveLength(3)
+    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().counters.humanReview).toBe(1)
   })
 
   it('honors terminalState: done — a ready signal lands on Done, not Human Review', async () => {

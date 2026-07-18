@@ -14,7 +14,7 @@ const git = async (cwd: string, args: string[]): Promise<string> =>
 describe('GitAgentWorktreeManager', () => {
   it('prepares one idempotent issue worktree and removes it after release', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-'))
-    const base = join(root, 'pear')
+    const base = join(root, 'PearCheckout')
     try {
       await mkdir(base)
       await git(base, ['init', '-b', 'main'])
@@ -59,5 +59,40 @@ describe('GitAgentWorktreeManager', () => {
       worktreePath: '/work/pear',
       branch: 'factory/ar-33-pear',
     })).rejects.toThrow(/unsafe Factory worktree path/u)
+  })
+
+  it('prunes an unrelated deleted registration before validating an existing checkout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-prune-'))
+    const base = join(root, 'pear')
+    try {
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      await git(base, ['config', 'user.email', 'factory@example.test'])
+      await git(base, ['config', 'user.name', 'Factory Test'])
+      await writeFile(join(base, 'README.md'), '# pear\n', 'utf8')
+      await git(base, ['add', 'README.md'])
+      await git(base, ['commit', '-m', 'initial'])
+
+      const manager = new GitAgentWorktreeManager()
+      const worktreePath = factoryWorktreePath(base, 'AR-34', 'AgentWorkforce/pear', 'abcdefgh-rest')
+      const worktree = {
+        repo: 'AgentWorkforce/pear',
+        issueKey: 'AR-34',
+        baseClonePath: base,
+        worktreePath,
+        branch: 'factory/ar-34-pear-abcdefgh',
+      }
+      await manager.prepare(worktree)
+
+      const stalePath = join(root, 'deleted-unrelated-worktree')
+      await git(base, ['worktree', 'add', '-b', 'unrelated-stale', stalePath, 'main'])
+      await rm(stalePath, { recursive: true, force: true })
+
+      await expect(manager.prepare(worktree)).resolves.toBeUndefined()
+      expect(await git(worktreePath, ['branch', '--show-current']))
+        .toBe('factory/ar-34-pear-abcdefgh\n')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

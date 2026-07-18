@@ -305,6 +305,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
   #clarificationSweepDueAtMs?: number
@@ -1806,6 +1807,7 @@ export class FactoryLoop implements Factory {
             name: spawned.name,
             tracked: cloneTrackedAgent(tracked),
             persistedAtMs: this.#clock.now(),
+            worktree: this.#agentWorktree(record, tracked.spec),
           })
         }
         agents.push({ name: spawned.name, role: spec.role })
@@ -1849,13 +1851,31 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
-      await this.#persistDispatchFailureReaperHandoff(record, spawnedForReaperHandoff)
+      // A spawn can fail after the broker accepted it but before its ack
+      // reached Factory. Include every planned worktree agent, not only the
+      // acknowledged spawns, so cleanup never races a name-only survivor.
+      const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
+      await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
+      const worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
       await this.#recordDispatchFailure(decision.issue)
       const failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
       await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
       batch.abandon(decision.issue)
       if (!failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
       this.#error(error, decision.issue)
+      // The teardown runs while the record still exists so it can safely
+      // derive every shared checkout. Rewrite the registry only after abandon
+      // removes those agents from the ordinary in-flight view.
+      if (worktreesTornDown) {
+        try {
+          await this.#writeInFlightRegistry()
+        } catch (registryError) {
+          this.#logger.warn?.('[factory] failed to rewrite registry after dispatch worktree teardown', {
+            issue: record.issue,
+            error: describeError(registryError).errorMessage,
+          })
+        }
+      }
       throw error
     }
   }
@@ -2110,6 +2130,31 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
 
+  #scheduleReleaseRetry(record: InFlightIssue, reason: string): void {
+    if (this.#fleet.placementLocality === 'remote') {
+      this.#scheduleDispatchLifecycleRetry(record)
+      return
+    }
+    const key = issueKey(record.issue)
+    if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
+    const timer = setTimeout(() => {
+      this.#dispatchLifecycleRetryTimers.delete(key)
+      const drive = this.#finishDurableRelease(record, reason)
+        .then(() => undefined)
+        .catch((error) => {
+          this.#logger.warn?.('[factory] local completion cleanup retry failed', {
+            issue: record.issue.key,
+            error: describeError(error).errorMessage,
+          })
+          this.#scheduleReleaseRetry(record, reason)
+        })
+        .finally(() => this.#dispatchLifecycleDrives.delete(drive))
+      this.#dispatchLifecycleDrives.add(drive)
+    }, DISPATCH_LIFECYCLE_RETRY_MS)
+    timer.unref?.()
+    this.#dispatchLifecycleRetryTimers.set(key, timer)
+  }
+
   async #driveDispatchLifecycle(key: string): Promise<void> {
     if (this.#stopping) return
     let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
@@ -2265,10 +2310,11 @@ export class FactoryLoop implements Factory {
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
     const batch = await this.#batch()
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const releaseKey = issueKey(record.issue)
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, releaseKey)
     const released = new Set(lifecycle?.agents
       .filter((agent) => agent.releasedAtMs !== undefined)
-      .map((agent) => agent.name) ?? [])
+      .map((agent) => agent.name) ?? this.#localReleaseCheckpoints.get(releaseKey) ?? [])
     const failed: string[] = []
     for (const agent of record.agents) {
       if (released.has(agent[0])) continue
@@ -2278,6 +2324,9 @@ export class FactoryLoop implements Factory {
         continue
       }
       released.add(agent[0])
+      if (this.#fleet.placementLocality === 'local') {
+        this.#localReleaseCheckpoints.set(releaseKey, new Set(released))
+      }
       // Persist each acknowledged release independently. A takeover retries
       // only agents whose release did not reach a fenced durable checkpoint.
       if (!await this.#saveDispatchLifecycle(record, 'releasing', undefined, reason, released)) return false
@@ -2285,14 +2334,23 @@ export class FactoryLoop implements Factory {
     await this.#writeInFlightRegistry()
     if (failed.length > 0) {
       this.#increment('dispatchLifecycleReleaseRetries')
-      this.#scheduleDispatchLifecycleRetry(record)
+      this.#scheduleReleaseRetry(record, reason)
       return false
     }
     // The PR branch is already pushed and the babysitter has declared the
     // current PR green with review feedback addressed. Release is now fenced,
     // so no agent can race cleanup of the shared per-issue worktree.
-    await this.#cleanupAgentWorktrees(record)
+    try {
+      await this.#cleanupAgentWorktrees(record)
+    } catch {
+      // Completion remains in-flight until the isolated checkout is gone.
+      // Remote lifecycles retry from their durable `releasing` phase; local
+      // lifecycles retain this record and retry directly from the same fence.
+      this.#scheduleReleaseRetry(record, reason)
+      return false
+    }
     const next = this.#fleet.placementLocality === 'remote' ? undefined : batch.complete(record.issue)
+    this.#localReleaseCheckpoints.delete(releaseKey)
     if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
     // Terminal lifecycle saves intentionally relinquish the owner epoch. Clear
     // the babysitter's durable ownership/wake/critical state while that epoch
@@ -2833,6 +2891,7 @@ export class FactoryLoop implements Factory {
     try {
       const protectedPids = await this.#protectedPids()
       let registryChanged = false
+      const readyToClear = new Set<string>()
       for (const [key, handoff] of handoffs) {
         const roots = await this.#terminationRoots(handoff.name, handoff.tracked, protectedPids)
         if (roots.pids.length === 0 && roots.status === 'unresolved') {
@@ -2845,8 +2904,6 @@ export class FactoryLoop implements Factory {
             unresolvedAgeMs,
           })
           if (unresolvedAgeMs >= DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS) {
-            await this.#state.clearFailureHandoff(this.#workspaceId, key)
-            registryChanged = true
             this.#increment('dispatchFailureReaperHandoffsDroppedStaleUnresolved')
             this.#logger.warn?.('[factory] dropped stale unresolved dispatch-failed handoff', {
               agentName: handoff.name,
@@ -2856,6 +2913,7 @@ export class FactoryLoop implements Factory {
             })
             try {
               await this.#fleet.release(handoff.name, 'dispatch failed')
+              readyToClear.add(key)
             } catch (error) {
               this.#logger.warn?.('[factory] failed to release unresolved dispatch-failure handoff after pruning', {
                 agentName: handoff.name,
@@ -2890,13 +2948,48 @@ export class FactoryLoop implements Factory {
         }
 
         if (!blockingSkip) {
-          await this.#state.clearFailureHandoff(this.#workspaceId, key)
-          registryChanged = true
           try {
             await this.#fleet.release(handoff.name, 'dispatch failed')
+            readyToClear.add(key)
           } catch (error) {
             this.#logger.warn?.(`[factory] failed to release ${handoff.name} after dispatch-failure reap`, error)
           }
+        }
+      }
+      if (readyToClear.size > 0) {
+        const worktreeGroups = new Map<string, Array<[string, RegistryHandoffAgent]>>()
+        for (const entry of handoffs) {
+          const worktreePath = entry[1].worktree?.worktreePath
+          if (!worktreePath) continue
+          const group = worktreeGroups.get(worktreePath) ?? []
+          group.push(entry)
+          worktreeGroups.set(worktreePath, group)
+        }
+        for (const group of worktreeGroups.values()) {
+          if (!group.every(([key]) => readyToClear.has(key))) continue
+          try {
+            await this.#cleanupFailureHandoffWorktrees(group.map(([, handoff]) => handoff))
+          } catch (error) {
+            this.#increment('agentWorktreeCleanupFailures')
+            this.#logger.warn?.('[factory] retained dispatch-failure handoff after worktree cleanup failed', {
+              issue: group[0]?.[1].issue,
+              worktreePath: group[0]?.[1].worktree?.worktreePath,
+              error: describeError(error).errorMessage,
+            })
+            continue
+          }
+          for (const [key] of group) {
+            await this.#state.clearFailureHandoff(this.#workspaceId, key)
+            readyToClear.delete(key)
+            registryChanged = true
+          }
+        }
+        // Legacy and non-worktree handoffs can be cleared directly once their
+        // process is gone and the broker accepted the release.
+        for (const [key, handoff] of handoffs) {
+          if (!readyToClear.has(key) || handoff.worktree) continue
+          await this.#state.clearFailureHandoff(this.#workspaceId, key)
+          registryChanged = true
         }
       }
       if (registryChanged) {
@@ -3126,6 +3219,68 @@ export class FactoryLoop implements Factory {
         error,
       })
       this.#error(error, record.issue)
+    }
+  }
+
+  #dispatchFailureHandoffs(
+    record: InFlightIssue,
+    acknowledged: RegistryHandoffAgent[],
+  ): RegistryHandoffAgent[] {
+    const handoffs = new Map(acknowledged.map((handoff) => [handoff.name, handoff]))
+    if (!this.#worktrees) return [...handoffs.values()]
+    for (const [name, tracked] of record.agents) {
+      const worktree = this.#agentWorktree(record, tracked.spec)
+      if (!worktree) continue
+      const existing = handoffs.get(name)
+      handoffs.set(name, {
+        issue: record.issue,
+        name,
+        tracked: cloneTrackedAgent(tracked),
+        persistedAtMs: existing?.persistedAtMs ?? this.#clock.now(),
+        worktree,
+      })
+    }
+    return [...handoffs.values()]
+  }
+
+  async #teardownFailedDispatchWorktrees(handoffs: RegistryHandoffAgent[]): Promise<boolean> {
+    if (!this.#worktrees || !handoffs.some((handoff) => handoff.worktree)) return false
+    const failed = await this.#releaseAndTerminateAgents(
+      handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+      'dispatch failed',
+      'completion',
+    )
+    if (failed.length > 0) return false
+    try {
+      await this.#cleanupFailureHandoffWorktrees(handoffs)
+      for (const handoff of handoffs) {
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+      return true
+    } catch (error) {
+      // Keep the durable handoffs. The loop reaper will retry cleanup only
+      // after it has reconfirmed every agent sharing the checkout is gone.
+      this.#increment('agentWorktreeCleanupFailures')
+      this.#logger.warn?.('[factory] retained dispatch-failure handoffs after worktree cleanup failed', {
+        issue: handoffs[0]?.issue,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+  }
+
+  async #cleanupFailureHandoffWorktrees(handoffs: RegistryHandoffAgent[]): Promise<void> {
+    if (!this.#worktrees) return
+    const unique = new Map<string, AgentWorktree>()
+    for (const handoff of handoffs) {
+      if (handoff.worktree) unique.set(handoff.worktree.worktreePath, handoff.worktree)
+    }
+    for (const worktree of unique.values()) {
+      await this.#worktrees.cleanup(worktree)
+      this.#increment('agentWorktreesCleaned')
     }
   }
 
@@ -6401,6 +6556,7 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#completionInFlight.add(completionKey)
+    let releaseReasonForRetry: string | undefined
     try {
       if (!await this.#assertDispatchLifecycleOwner(record)) return
       const issue = await this.#readIssue(record.issue.path)
@@ -6489,6 +6645,7 @@ export class FactoryLoop implements Factory {
       }
 
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
+      releaseReasonForRetry = releaseReason
       if (this.#fleet.placementLocality === 'remote') {
         // Durable capacity is released as soon as terminal writeback is
         // acknowledged. Agent cleanup remains fenced/retryable in `releasing`.
@@ -6503,7 +6660,8 @@ export class FactoryLoop implements Factory {
       await this.#drainReadyClarificationWake()
     } catch (error) {
       this.#error(error, record.issue)
-      this.#scheduleDispatchLifecycleRetry(record)
+      if (releaseReasonForRetry) this.#scheduleReleaseRetry(record, releaseReasonForRetry)
+      else this.#scheduleDispatchLifecycleRetry(record)
     } finally {
       this.#completionInFlight.delete(completionKey)
       const stateKey = issueStateKey(record.issue)
@@ -8617,12 +8775,6 @@ function decisionWithLifecycleBranches(
     return {
       ...lifecycleSpec,
       branch,
-      task: [
-        spec.task,
-        '',
-        `Factory publication branch: ${branch}`,
-        'Before editing, create or reset that exact branch from the repository default branch. Commit and push only that branch.',
-      ].join('\n'),
     }
   }
   return {

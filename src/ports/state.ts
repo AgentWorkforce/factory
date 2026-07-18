@@ -1,4 +1,5 @@
 import type { SendInput, SpawnResult } from './fleet'
+import type { AgentWorktree } from './worktree'
 import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
 
@@ -56,6 +57,8 @@ export type RegistryHandoffAgent = {
   name: string
   tracked: TrackedAgent
   persistedAtMs: number
+  /** Isolated checkout that must survive until this handoff is fully reaped. */
+  worktree?: AgentWorktree
 }
 
 export type BabysitterSessionState = {
