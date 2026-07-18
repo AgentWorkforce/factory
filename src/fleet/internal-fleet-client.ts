@@ -196,7 +196,7 @@ export class InternalFleetClient implements FleetClient {
       name: input.name ?? input.sessionRef,
       // followups [fleet→W6]: W6 owns resume-vs-respawn and passes the per-agent capability.
       cli: capabilityCli[input.capability ?? this.#resumeCapability],
-      cwd: this.#cwd,
+      cwd: input.clonePath ?? this.#cwd,
       continueFrom: input.sessionRef,
       task: input.task,
     })

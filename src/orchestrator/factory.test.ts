@@ -25,7 +25,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeManager, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -1225,6 +1225,28 @@ class CloudWritebackFakeMountClient extends FakeMountClient {
   }
 }
 
+class RecordingWorktreeManager implements AgentWorktreeManager {
+  readonly prepared: AgentWorktree[] = []
+  readonly cleaned: AgentWorktree[] = []
+  cleanupAttempts = 0
+  failCleanups = 0
+  onCleanup?: () => void
+
+  async prepare(worktree: AgentWorktree): Promise<void> {
+    this.prepared.push(structuredClone(worktree))
+  }
+
+  async cleanup(worktree: AgentWorktree): Promise<void> {
+    this.cleanupAttempts += 1
+    this.onCleanup?.()
+    if (this.failCleanups > 0) {
+      this.failCleanups -= 1
+      throw new Error('transient worktree cleanup failure')
+    }
+    this.cleaned.push(structuredClone(worktree))
+  }
+}
+
 class HumanReplyDuringQuestionMountClient extends CloudWritebackFakeMountClient {
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
     await super.writeFile(path, content, opts)
@@ -1908,10 +1930,9 @@ describe('FactoryLoop', () => {
     expect(mount.writes.some((write) => write.path === issuePath(1) && (write.content as { stateId?: string }).stateId === implementing)).toBe(true)
 
     fleet.emitAgentExit('ar-1-impl-pear', 'issue-done')
-    await flush()
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl-pear'))
 
     expect(fleet.releases.map((release) => release.name)).toEqual(['ar-1-impl-pear', 'ar-1-review'])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-3-impl-pear')
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-2', 'AR-3'])
     expect(factory.status().queued).toEqual([])
   })
@@ -4561,7 +4582,10 @@ describe('FactoryLoop', () => {
       expect(reports.every((report) => report.error === undefined)).toBe(true)
       expect(fleet.messages).toEqual([])
       expect(fleet.spawns).toHaveLength(4)
-      expect(fleet.spawns.every((spawn) => spawn.task?.includes('Factory will hand the opened PR'))).toBe(true)
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
+        .every((spawn) => spawn.task?.includes('Factory will hand the opened PR'))).toBe(true)
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('-review'))
+        .every((spawn) => spawn.task?.includes('Use the existing issue checkout'))).toBe(true)
       expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -6291,6 +6315,25 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('keeps workflow-only agents on their configured checkout when no implementer branch exists', async () => {
+    const routedIssue = realIssueFile(730, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:workflow' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(730)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), worktrees })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(730), routedIssue)))
+
+    expect(fleet.spawns).toHaveLength(1)
+    expect(fleet.spawns[0]).toMatchObject({
+      name: 'ar-730-workflow',
+      cwd: '/work/pear',
+    })
+    expect(worktrees.prepared).toEqual([])
+  })
+
   it('dispatches explicit single labels as one implementer even with multiple repo labels', async () => {
     const routedIssue = realIssueFile(726, ready, {
       labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'agent:single' }],
@@ -7871,6 +7914,8 @@ describe('FactoryLoop', () => {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(241), issueFile(241))))
       await vi.advanceTimersByTimeAsync(0)
+      vi.useRealTimers()
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
 
       expect(closeInputs).toEqual([{
         repo: 'AgentWorkforce/pear',
@@ -7878,7 +7923,6 @@ describe('FactoryLoop', () => {
         expectedIssueKey: 'AR-241',
         requireTitleMarker: false,
       }])
-      expect(factory.status().inFlight).toEqual([])
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -7912,6 +7956,8 @@ describe('FactoryLoop', () => {
       expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-243'])
 
       await vi.advanceTimersByTimeAsync(0)
+      vi.useRealTimers()
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
 
       expect(closeInputs).toEqual([{
         repo: 'AgentWorkforce/pear',
@@ -7919,7 +7965,6 @@ describe('FactoryLoop', () => {
         expectedIssueKey: 'AR-243',
         requireTitleMarker: false,
       }])
-      expect(factory.status().inFlight).toEqual([])
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -9480,6 +9525,7 @@ describe('FactoryLoop', () => {
     expect(report.dispatched).toEqual([])
     expect(githubWriteback.comments).toHaveLength(1)
     expect(githubWriteback.comments[0]).toMatchObject({ key: 'AR-64' })
+    expect(githubWriteback.comments[0]?.body).toContain('@github-reporter, Factory needs clarification')
     expect(githubWriteback.comments[0]?.body).toContain('Authorized responder: @github-reporter (the issue reporter).')
     const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
     expect(githubWriteback.comments[0]?.body).toContain(`Reply with a comment that starts with \`${prefix}\`.`)
@@ -9502,11 +9548,14 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
   })
 
-  it('prefers Slack over a GitHub issue comment for triage escalation when Slack is configured', async () => {
+  it('keeps GitHub clarification durable on GitHub and mirrors one stakeholder escalation to Slack', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 56)
     const mount = new CloudWritebackFakeMountClient({ [path]: githubIssueFile(56, { labels: ['factory'] }) })
     const githubWriteback = new RecordingGithubWriteback()
-    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+    const factory = createFactory(config({
+      issueSource: 'github',
+      slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER', 'ULEAD'] },
+    }), {
       mount,
       fleet: new FakeFleetClient(),
       triage: new EscalatingTriage(),
@@ -9514,10 +9563,19 @@ describe('FactoryLoop', () => {
     })
 
     await factory.runOnce()
+    await factory.runOnce()
 
-    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
-    expect(githubWriteback.comments).toEqual([])
-    expect(factory.status().counters.triageEscalationsPostedToGithub).toBeUndefined()
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]?.body).toContain('@issue-author, Factory needs clarification')
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('<@UOWNER> <@ULEAD>')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @issue-author.')
+    expect((slackRoots[0]?.content as { text?: string }).text)
+      .toContain('Reply on the GitHub issue so Factory can resume: https://github.com/AgentWorkforce/pear/issues/56')
+    expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
+    expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
+    expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
   })
 
   it('logs and emits an observable error when GitHub triage escalation has no usable write path', async () => {
@@ -12045,6 +12103,26 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-29-impl-pear', 'ar-29-review'])
   })
 
+  it('replaces a legacy synthetic Slack thread id before posting replies', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(28)]: issueFile(28) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const stateKey = issueKey({ uuid: 'uuid-28', key: 'AR-28', path: issuePath(28) })
+    await stateStore.setSlackThread('factory-test', stateKey, 'factory-c0factory-stale-client-id')
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(28), issueFile(28))))
+
+    await expect(stateStore.getSlackThread('factory-test', stateKey)).resolves.toBe(mount.threadTs)
+    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    expect(factory.status().counters.invalidSlackThreadsCleared).toBe(1)
+  })
+
   it('continues processing Slack reply events after one answer injection fails', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(30)]: issueFile(30) })
     const fleet = new FailingSlackAnswerFleetClient()
@@ -12538,6 +12616,9 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({ [issuePath(402)]: issue })
     seedPrMeta(mount, 'AgentWorkforce/pear', 402, { state: 'open', draft: false })
     const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const cleanupReleaseCounts: number[] = []
+    worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
     const states: Array<{ key: string; stateId: string }> = []
     let ghCalls = 0
     const factory = createFactory(babysitterConfig(), {
@@ -12545,6 +12626,7 @@ describe('FactoryLoop PR babysitter', () => {
       fleet,
       triage: new StaticTriage(),
       linear: recordingLinear(states),
+      worktrees,
       probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 402 }),
       probePrGhRunner: async () => { ghCalls += 1; return { stdout: '[]' } },
     })
@@ -12553,6 +12635,16 @@ describe('FactoryLoop PR babysitter', () => {
     fleet.emitAgentExit('ar-402-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-402-babysit'))
 
+    const isolatedCwds = new Set(fleet.spawns.map((spawn) => spawn.cwd))
+    expect(isolatedCwds.size).toBe(1)
+    expect([...isolatedCwds][0]).toMatch(/^\/work\/\.factory-worktrees\/pear\/ar-402-pear-/u)
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-impl-pear')?.task)
+      .toContain('Factory already prepared this isolated checkout')
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-review')?.task)
+      .toContain('Use the existing isolated issue worktree')
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-babysit')?.task)
+      .toContain('Continue in the existing isolated issue worktree')
+
     fleet.emitAgentMessage({ from: 'ar-402-babysit', target: 'factory', body: '[factory-pr-ready] AR-402' })
 
     await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
@@ -12560,7 +12652,100 @@ describe('FactoryLoop PR babysitter', () => {
     expect(factory.status().counters.done).toBeUndefined()
     expect(ghCalls).toBe(0) // readiness comes from the webhook-fed mount + the babysitter's signal
     expect(fleet.releases.map((r) => r.name).sort()).toEqual(['ar-402-babysit', 'ar-402-impl-pear', 'ar-402-review'])
+    expect(worktrees.cleaned).toHaveLength(1)
+    expect(cleanupReleaseCounts).toEqual([3])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('releases failed-dispatch agents before cleaning their isolated worktree', async () => {
+    const issue = realIssueFile(408, ready, { title: '[factory-e2e] Failed dispatch worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(408)]: issue })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const cleanupReleaseCounts: number[] = []
+    worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      linear: {
+        async postComment() {},
+        async setState() {
+          throw new Error('setState failed after spawn')
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(408), issue))))
+      .rejects.toThrow('setState failed after spawn')
+
+    expect(fleet.releases.map((release) => release.name).sort())
+      .toEqual(['ar-408-impl-pear', 'ar-408-review'])
+    expect(worktrees.cleaned).toHaveLength(1)
+    expect(cleanupReleaseCounts).toEqual([2])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('releases a planned agent and cleans its worktree when the spawn ack fails', async () => {
+    const issue = realIssueFile(409, ready, { title: '[factory-e2e] Failed spawn worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(409)]: issue })
+    const fleet = new SpawnFailingFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const cleanupReleaseCounts: number[] = []
+    worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(409), issue))))
+      .rejects.toThrow('Dispatch spawn failed for AR-409/ar-409-impl-pear')
+
+    expect(fleet.releases).toEqual([{ name: 'ar-409-impl-pear', reason: 'dispatch failed' }])
+    expect(worktrees.cleaned).toHaveLength(1)
+    expect(cleanupReleaseCounts).toEqual([1])
+    expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('retries transient local worktree cleanup without re-releasing completed agents', async () => {
+    const issue = realIssueFile(410, ready, { title: 'Real retry completed worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(410)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 410, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    worktrees.failCleanups = 1
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 410 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(410), issue)))
+    fleet.emitAgentExit('ar-410-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-410-babysit'))
+
+    fleet.emitAgentMessage({ from: 'ar-410-babysit', target: 'factory', body: '[factory-pr-ready] AR-410' })
+
+    await vi.waitFor(() => expect(worktrees.cleanupAttempts).toBe(1))
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-410'])
+    expect(fleet.releases).toHaveLength(3)
+
+    await vi.waitFor(() => expect(worktrees.cleaned).toHaveLength(1), { timeout: 3_000 })
+    expect(worktrees.cleanupAttempts).toBe(2)
+    expect(fleet.releases).toHaveLength(3)
+    expect(factory.status().inFlight).toEqual([])
+    expect(factory.status().counters.humanReview).toBe(1)
   })
 
   it('honors terminalState: done — a ready signal lands on Done, not Human Review', async () => {

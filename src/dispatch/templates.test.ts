@@ -68,6 +68,8 @@ describe('renderAgentTask', () => {
       reviewerName: 'ar-123-review',
       implementerNames: ['ar-123-impl-ui', 'ar-123-impl-broker'],
       agentName: 'ar-123-review',
+      branchName: 'factory/ar-123-pear',
+      branchPrepared: false,
     })
 
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
@@ -77,6 +79,8 @@ describe('renderAgentTask', () => {
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
     expect(task).toContain('DM `broker` when the review cycle is complete.')
     expect(task).toContain('Agent: ar-123-review')
+    expect(task).toContain('Use the existing issue checkout on branch `factory/ar-123-pear`')
+    expect(task).not.toContain('isolated issue worktree')
   })
 
   it('renders an aggressive, spec-grounded babysitter task referencing the open PR', () => {
@@ -318,12 +322,14 @@ describe('GitHub human input request comments', () => {
       'ar-123-review',
       'AR-123',
       'Should this retry preserve the original idempotency key?',
+      'issue-reporter',
     )
 
     expect(parseGithubHumanInputRequest(body)).toEqual({
       agentName: 'ar-123-review',
       issueKey: 'AR-123',
       question: 'Should this retry preserve the original idempotency key?',
+      stakeholder: 'issue-reporter',
     })
   })
 

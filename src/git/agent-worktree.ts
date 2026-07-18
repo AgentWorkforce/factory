@@ -1,0 +1,199 @@
+import { execFile } from 'node:child_process'
+import { mkdir, realpath, rmdir, stat } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
+import { promisify } from 'node:util'
+
+import type { AgentWorktree, AgentWorktreeManager } from '../ports/worktree'
+
+const execFileAsync = promisify(execFile)
+
+export type AgentWorktreeGitRunner = (cwd: string, args: string[]) => Promise<string>
+
+export interface GitAgentWorktreeManagerOptions {
+  git?: AgentWorktreeGitRunner
+}
+
+/**
+ * Owns the isolated checkout used by one issue/repository lifecycle. All roles
+ * for that lifecycle share this checkout, while unrelated issues can never
+ * switch each other's branches in the configured source clone.
+ */
+export class GitAgentWorktreeManager implements AgentWorktreeManager {
+  readonly #git: AgentWorktreeGitRunner
+  readonly #prepares = new Map<string, Promise<void>>()
+
+  constructor(options: GitAgentWorktreeManagerOptions = {}) {
+    this.#git = options.git ?? runGit
+  }
+
+  async prepare(worktree: AgentWorktree): Promise<void> {
+    const key = resolve(worktree.worktreePath)
+    const existing = this.#prepares.get(key)
+    if (existing) return await existing
+    const pending = this.#prepare(worktree)
+    this.#prepares.set(key, pending)
+    try {
+      await pending
+    } finally {
+      if (this.#prepares.get(key) === pending) this.#prepares.delete(key)
+    }
+  }
+
+  async #prepare(worktree: AgentWorktree): Promise<void> {
+    assertSafeWorktree(worktree)
+    // Deleted linked checkouts remain in Git's registry as prunable entries.
+    // Remove those before validating an existing healthy Factory checkout so
+    // an unrelated stale registration cannot make realpath validation fail.
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
+    const exists = await pathExists(worktree.worktreePath)
+    if (exists) {
+      await this.#assertRegisteredCheckout(worktree)
+      const branch = (await this.#git(worktree.worktreePath, ['symbolic-ref', '--short', 'HEAD'])).trim()
+      if (branch !== worktree.branch) {
+        throw new Error(
+          `Factory worktree branch mismatch for ${worktree.issueKey}: expected ${worktree.branch}, found ${branch}`,
+        )
+      }
+      return
+    }
+
+    await mkdir(dirname(worktree.worktreePath), { recursive: true })
+    if (await this.#localBranchExists(worktree.baseClonePath, worktree.branch)) {
+      await this.#git(worktree.baseClonePath, ['worktree', 'add', worktree.worktreePath, worktree.branch])
+    } else {
+      const baseRef = await this.#defaultBaseRef(worktree.baseClonePath)
+      await this.#git(worktree.baseClonePath, [
+        'worktree',
+        'add',
+        '-b',
+        worktree.branch,
+        worktree.worktreePath,
+        baseRef,
+      ])
+    }
+    await this.#assertRegisteredCheckout(worktree)
+  }
+
+  async cleanup(worktree: AgentWorktree): Promise<void> {
+    await this.#prepares.get(resolve(worktree.worktreePath))
+    assertSafeWorktree(worktree)
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
+    if (!await pathExists(worktree.worktreePath)) {
+      await removeEmptyWorktreeParents(worktree.worktreePath)
+      return
+    }
+    await this.#assertRegisteredCheckout(worktree)
+    await this.#git(worktree.baseClonePath, ['worktree', 'remove', '--force', worktree.worktreePath])
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
+    await removeEmptyWorktreeParents(worktree.worktreePath)
+  }
+
+  async #assertRegisteredCheckout(worktree: AgentWorktree): Promise<void> {
+    const wanted = await realpath(worktree.worktreePath)
+    const root = await realpath((await this.#git(worktree.worktreePath, ['rev-parse', '--show-toplevel'])).trim())
+    if (root !== wanted) {
+      throw new Error(`Refusing Factory worktree operation outside ${wanted}: git root is ${root}`)
+    }
+    const registeredPaths = (await this.#git(worktree.baseClonePath, ['worktree', 'list', '--porcelain']))
+      .split(/\r?\n/u)
+      .filter((line) => line.startsWith('worktree '))
+      .map((line) => line.slice('worktree '.length).trim())
+    const registered = await Promise.all(registeredPaths.map(async (path) => await realpath(path)))
+    if (!registered.includes(wanted)) {
+      throw new Error(`Refusing Factory worktree operation for unregistered checkout ${wanted}`)
+    }
+  }
+
+  async #localBranchExists(baseClonePath: string, branch: string): Promise<boolean> {
+    try {
+      await this.#git(baseClonePath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async #defaultBaseRef(baseClonePath: string): Promise<string> {
+    try {
+      const remoteHead = (await this.#git(baseClonePath, [
+        'symbolic-ref',
+        '--quiet',
+        '--short',
+        'refs/remotes/origin/HEAD',
+      ])).trim()
+      if (remoteHead) return remoteHead
+    } catch {
+      // Fall through to common default branches and finally the current HEAD.
+    }
+    for (const candidate of ['origin/main', 'origin/master', 'main', 'master']) {
+      try {
+        await this.#git(baseClonePath, ['rev-parse', '--verify', '--quiet', candidate])
+        return candidate
+      } catch {
+        // try the next candidate
+      }
+    }
+    return 'HEAD'
+  }
+}
+
+export function factoryWorktreePath(
+  baseClonePath: string,
+  issueKey: string,
+  repo: string,
+  runId: string,
+): string {
+  const repoSlug = sanitizeSegment(repo.split('/').at(-1) ?? repo)
+  const issueSlug = sanitizeSegment(issueKey)
+  const checkoutSlug = sanitizeSegment(basename(resolve(baseClonePath)))
+  return join(
+    dirname(resolve(baseClonePath)),
+    '.factory-worktrees',
+    checkoutSlug,
+    `${issueSlug}-${repoSlug}-${runId.slice(0, 8)}`,
+  )
+}
+
+const sanitizeSegment = (value: string): string =>
+  value.toLowerCase().replace(/[^a-z0-9._-]+/gu, '-').replace(/^-+|-+$/gu, '') || 'worktree'
+
+const assertSafeWorktree = (worktree: AgentWorktree): void => {
+  const base = resolve(worktree.baseClonePath)
+  const target = resolve(worktree.worktreePath)
+  const expectedRoot = resolve(dirname(base), '.factory-worktrees', sanitizeSegment(basename(base)))
+  if (target === base || !target.startsWith(`${expectedRoot}/`)) {
+    throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
+  }
+  if (!worktree.branch.startsWith('factory/')) {
+    throw new Error(`Refusing unsafe Factory worktree branch ${worktree.branch}`)
+  }
+}
+
+const pathExists = async (path: string): Promise<boolean> => {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+const removeEmptyWorktreeParents = async (worktreePath: string): Promise<void> => {
+  const repoRoot = dirname(worktreePath)
+  const factoryRoot = dirname(repoRoot)
+  await rmdir(repoRoot).catch(ignoreNonEmptyOrMissing)
+  await rmdir(factoryRoot).catch(ignoreNonEmptyOrMissing)
+}
+
+const ignoreNonEmptyOrMissing = (error: unknown): void => {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined
+  if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') return
+  throw error
+}
+
+const runGit: AgentWorktreeGitRunner = async (cwd, args) => {
+  const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  })
+  return stdout
+}

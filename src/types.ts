@@ -3,6 +3,7 @@ import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
+import type { AgentWorktreeManager } from './ports/worktree'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
@@ -33,6 +34,8 @@ export interface FactoryPorts {
   readChildPids?: (pid: number) => Promise<number[]>
   terminationGraceMs?: number
   relayflows?: FactoryRelayflowDispatchPort
+  /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
+  worktrees?: AgentWorktreeManager
 }
 
 export interface FactoryRelayflowDispatchPort extends Omit<DispatchRelayflowOptions, 'cwd'> {

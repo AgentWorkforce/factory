@@ -733,6 +733,7 @@ describe('InternalFleetClient', () => {
       name: 'ar-1-impl',
       sessionRef: 'session-original',
       node: 'self',
+      clonePath: '/isolated/ar-1',
       task: 'Continue with the durable human answer.',
     })).resolves.toEqual({
       name: 'ar-1-impl',
@@ -742,7 +743,7 @@ describe('InternalFleetClient', () => {
     expect(harness.spawned[0]).toMatchObject({
       name: 'ar-1-impl',
       cli: 'codex',
-      cwd: '/worktree',
+      cwd: '/isolated/ar-1',
       continueFrom: 'session-original',
       task: 'Continue with the durable human answer.',
     })
