@@ -87,6 +87,13 @@ export class GhCliGithubWriteback implements GithubWriteback {
     return stringValue(asRecord(author)?.login)?.trim() || undefined
   }
 
+  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
+    const labels = await this.#issueLabels(githubIssueRef(issue))
+    if (labels.has(STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
+    if (labels.has(STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
+    return 'ready'
+  }
+
   async postComment(issue: LinearIssue, body: string): Promise<void> {
     const ref = githubIssueRef(issue)
     await this.#run([
@@ -117,10 +124,9 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
       const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
-      for (const lifecycle of Object.values(STATUS_LABELS)) {
-        if (labels.has(lifecycle.name.toLowerCase())) {
-          editArgs.push('--remove-label', lifecycle.name)
-        }
+      const inProgress = STATUS_LABELS['in-progress']
+      if (labels.has(inProgress.name.toLowerCase())) {
+        editArgs.push('--remove-label', inProgress.name)
       }
       if (editArgs.length > 5) {
         await this.#run(editArgs)

@@ -902,18 +902,20 @@ describe('GhCliGithubWriteback', () => {
 
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
-      [
-        'issue',
-        'edit',
-        '48',
-        '--repo',
-        'AgentWorkforce/factory',
-        '--remove-label',
-        'factory:in-progress',
-        '--remove-label',
-        'factory:human-review',
-      ],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
     ])
+  })
+
+  it('treats provider human-review status as authoritative over a stale in-progress label', async () => {
+    const github = new GhCliGithubWriteback({
+      runner: async () => ({
+        stdout: JSON.stringify({
+          labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+        }),
+      }),
+    })
+
+    await expect(github.getIssueStatus(githubIssue)).resolves.toBe('human-review')
   })
 
   it('comments and closes the GitHub issue after merge', async () => {

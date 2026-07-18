@@ -13,6 +13,7 @@ import type {
   Capability,
   ChangeEvent,
   FleetClient,
+  GithubIssueStatus,
   GithubPublishPullRequestResult,
   GithubWriteback,
   LinearWriteback,
@@ -1542,6 +1543,27 @@ export class FactoryLoop implements Factory {
       return false
     }
 
+    const getProviderStatus = this.#githubWriteback.getIssueStatus
+    if (!getProviderStatus) {
+      this.#increment('githubOrphanRecoveryStatusLookupUnavailable')
+      return false
+    }
+    let providerStatus: GithubIssueStatus | undefined
+    try {
+      providerStatus = await getProviderStatus.call(this.#githubWriteback, issue)
+    } catch (error) {
+      this.#increment('githubOrphanRecoveryStatusLookupFailures')
+      this.#logger.warn?.('[factory] could not verify provider-authoritative GitHub issue status; preserving it', {
+        issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+    if (!providerStatus || providerStatus === 'human-review') {
+      this.#increment('githubOrphanRecoveriesBlockedProviderStatus')
+      return false
+    }
+
     let hasOpenPr: boolean
     try {
       hasOpenPr = await this.#hasOpenCompletionPr(issue)
@@ -1562,7 +1584,9 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      await this.#githubWriteback.setStatus(issue, 'ready')
+      if (providerStatus === 'in-progress') {
+        await this.#githubWriteback.setStatus(issue, 'ready')
+      }
       this.#reconciledGithubInProgress.add(identity)
       this.#increment('githubOrphanedInProgressRecovered')
       this.#logger.warn?.('[factory] recovered orphaned GitHub in-progress issue for redispatch', {

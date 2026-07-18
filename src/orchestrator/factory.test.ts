@@ -240,6 +240,13 @@ class RecordingGithubWriteback implements GithubWriteback {
   readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
   readonly closes: Array<{ key: string; body: string }> = []
 
+  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
+    const labels = new Set(issue.labels.map((label) => label.toLowerCase()))
+    if (labels.has('factory:human-review')) return 'human-review'
+    if (labels.has('factory:in-progress')) return 'in-progress'
+    return 'ready'
+  }
+
   async postComment(issue: LinearIssue, body: string): Promise<void> {
     this.comments.push({ key: issue.key, body })
   }
@@ -263,6 +270,12 @@ class AuthorResolvingGithubWriteback extends RecordingGithubWriteback {
   async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
     this.authorLookups.push(issue.key)
     return this.author
+  }
+}
+
+class ProviderHumanReviewGithubWriteback extends RecordingGithubWriteback {
+  override async getIssueStatus(): Promise<GithubIssueStatus> {
+    return 'human-review'
   }
 }
 
@@ -1928,6 +1941,36 @@ describe('FactoryLoop', () => {
       expect(report.dispatched).toEqual([])
       expect(githubWriteback.statuses).toEqual([])
       expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves provider-authoritative human review when the mounted issue still says in-progress', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-provider-status-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 57)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(57, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new ProviderHumanReviewGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveriesBlockedProviderStatus).toBe(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
