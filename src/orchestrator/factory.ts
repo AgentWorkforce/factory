@@ -2808,7 +2808,6 @@ export class FactoryLoop implements Factory {
             continue
           } else if (isGithubIssueTreePath(path)) {
             this.#increment('githubIssuesIgnoredByPathRegex')
-            this.#logger.debug?.('[factory] ignored GitHub issue path with unsupported relayfile shape', { path })
           }
         }
       }
@@ -4165,12 +4164,21 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
-    const remaining = [...record.agents].filter(([, tracked]) => tracked.spec.role !== 'implementer')
-    for (const [agentName] of remaining) {
+    const agents = [...record.agents]
+    for (const [agentName, tracked] of agents) {
+      if (tracked.spec.role === 'implementer') continue
       this.#fleet.markAgentTerminal?.(agentName, `implementer-terminal:${reason}`)
     }
-    if (remaining.length > 0) {
-      await this.#releaseAndTerminateAgents(remaining, 'issue-abandoned', 'completion')
+    const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
+    if (worktreeHandoffs.length > 0) {
+      // A terminal no-PR dispatch no longer owns useful work. Fence and release
+      // every agent sharing the checkout before removing it. If release or
+      // cleanup fails, the durable handoff reaper retains responsibility rather
+      // than leaving an invisible orphan under .factory-worktrees.
+      await this.#persistDispatchFailureReaperHandoff(record, worktreeHandoffs)
+      await this.#teardownFailedDispatchWorktrees(worktreeHandoffs)
+    } else if (agents.length > 0) {
+      await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
     }
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
@@ -4259,12 +4267,21 @@ export class FactoryLoop implements Factory {
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
     const critical = await this.#state.consumeCritical(this.#workspaceId, info.msgId ?? '')
+    if (!critical) {
+      this.#increment('nonCriticalDeliveryFailuresIgnored')
+      return
+    }
     const record = (await this.#batch()).getIssueByAgent(info.to)
-    const issue = critical?.issue ?? record?.issue
+    const issue = critical.issue ?? record?.issue
     const error = new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`)
     this.#error(error, issue)
 
-    if (critical && this.#fleet.waitForInjected) {
+    if (isTerminalDeliveryFailure(info.reason)) {
+      this.#increment('criticalDeliveryTerminalFailures')
+      return
+    }
+
+    if (this.#fleet.waitForInjected) {
       try {
         const ack = await this.#waitForInjectedAndSubmit(critical.input)
         await this.#state.recordCritical(this.#workspaceId, ack.eventId, critical)
@@ -7270,9 +7287,9 @@ export class FactoryLoop implements Factory {
   }
 
   async #escalateTriageToGithub(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
-    const question = triageEscalationQuestion(decision)
-    const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const issue = await this.#readIssue(decision.issue.path)
+    const question = triageEscalationQuestion(decision, issue)
+    const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const source = issue ? githubIssueSourceRef(issue) : undefined
     const authorizedAuthor = issue ? await this.#resolveGithubIssueAuthor(issue) : undefined
     if (!issue || !source || !authorizedAuthor) {
@@ -7380,7 +7397,7 @@ export class FactoryLoop implements Factory {
       text: [
         `${audience ? `${audience} ` : ''}${decision.issue.key}: factory triage escalation for ${issue.title}`,
         `Reason: ${reason}`,
-        `Question: ${triageEscalationQuestion(decision)} ${replyInstruction}`,
+        `Question: ${triageEscalationQuestion(decision, issue)} ${replyInstruction}`,
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
@@ -7442,7 +7459,7 @@ export class FactoryLoop implements Factory {
       text: [
         `${stakeholderMentions ? `${stakeholderMentions} ` : ''}${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
         `Reason: ${reason}`,
-        `Question: ${triageEscalationQuestion(decision)}`,
+        `Question: ${triageEscalationQuestion(decision, issue)}`,
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
@@ -10661,25 +10678,21 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
 
-const triageEscalationQuestion = (decision: TriageDecision): string => {
+const triageEscalationQuestion = (decision: TriageDecision, issue?: LinearIssue): string => {
   const routedRepos = decision.routes.map((route) => route.repo).filter(Boolean)
+  const subject = issue?.title?.trim() || decision.issue.key
+  const details = `For "${subject}", please reply with: (1) the exact user flow—where it starts, required inputs/actions, and the successful result; (2) permissions, validation, failure behavior, important edge cases, and anything out of scope; and (3) observable acceptance checks or tests. Say "use reasonable product defaults" for anything Factory may decide. After an authorized GitHub reply, Factory will dispatch agents; successful work will be opened as a pull request.`
   if (routedRepos.length === 0) {
-    return [
-      'Which repository or repositories should handle this issue?',
-      'Please include the intended approach and the acceptance criteria/tests the agent should satisfy.',
-    ].join(' ')
+    return `Which repository or repositories should handle this issue? ${details}`
   }
   if (decision.thin) {
-    return [
-      `Factory matched ${routedRepos.join(', ')}.`,
-      'Please clarify the concrete expected behavior, constraints, and acceptance criteria/tests before dispatch.',
-    ].join(' ')
+    return `Factory matched ${routedRepos.join(', ')}. ${details}`
   }
-  return [
-    `Factory matched ${routedRepos.join(', ')}, but triage confidence is low.`,
-    'Please confirm the intended repo/approach or correct the route before dispatch.',
-  ].join(' ')
+  return `Factory matched ${routedRepos.join(', ')}, but triage confidence is low. Please confirm that repository and intended approach, or provide the correct route. ${details}`
 }
+
+const isTerminalDeliveryFailure = (reason?: string): boolean =>
+  /worker[_ -]?(?:exited|disappeared)|max delivery retries exceeded/iu.test(reason ?? '')
 
 const isTriageEscalationWatchRecord = (record: InFlightIssue): boolean =>
   record.agents.size === 0 && record.invocationIds.size === 0 && triageEscalationReason(record.decision) !== undefined

@@ -57,15 +57,26 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const draftName = githubDraftName(headRef, headSha)
     const repoRoot = `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
     const fullHeadRef = `refs/heads/${headRef}`
-    const refPath = `${repoRoot}/refs/${encodeURIComponent(fullHeadRef)}.json`
+    const createRefPath = `${repoRoot}/refs/${draftName}.json`
+    const updateRefPath = `${repoRoot}/refs/${encodeURIComponent(fullHeadRef)}.json`
 
-    // A remote implementer already pushed its branch. Only synthesize/update
-    // the ref for the legacy local-clone path where the publisher owns HEAD.
+    // A remote implementer already pushed its branch. For the legacy local-clone
+    // path, create the branch before opening the PR. Relayfile's canonical encoded
+    // ref path updates an existing ref and GitHub rejects it for a new branch.
     if (headSha) {
-      await this.#writeAndConfirm(refPath, {
-        ref: fullHeadRef,
-        sha: headSha,
-      })
+      try {
+        await this.#writeAndConfirm(createRefPath, {
+          ref: fullHeadRef,
+          sha: headSha,
+        })
+      } catch (error) {
+        if (!isGithubReferenceAlreadyExistsError(error)) throw error
+        await this.#writeAndConfirm(updateRefPath, {
+          ref: fullHeadRef,
+          sha: headSha,
+          force: false,
+        })
+      }
     }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
@@ -175,3 +186,6 @@ const nonNegativeInteger = (value: unknown): number | undefined =>
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
+
+const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
+  /reference already exists/iu.test(errorMessage(error))

@@ -7397,12 +7397,14 @@ describe('FactoryLoop', () => {
   it('signals and releases a waiting reviewer when an implementer resume collides and no PR exists (#67)', async () => {
     const mount = new FakeMountClient({ [issuePath(82)]: issueFile(82) })
     const fleet = new ResumeNameCollisionFleetClient()
+    const worktrees = new RecordingWorktreeManager()
     fleet.setSessionRef('ar-82-impl-pear', 'session-impl-82')
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
       probePrResolver: async () => undefined,
+      worktrees,
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(82), issueFile(82)))
 
@@ -7418,7 +7420,8 @@ describe('FactoryLoop', () => {
     expect(reviewerSignal).toBeDefined()
     expect(reviewerSignal?.text).toMatch(/terminated/i)
     // ... and then torn down so the dispatch does not hang.
-    expect(fleet.releases.map((release) => release.name)).toContain('ar-82-review')
+    await vi.waitFor(() => expect(worktrees.cleaned).toHaveLength(1))
+    expect(fleet.releases.map((release) => release.name).sort()).toEqual(['ar-82-impl-pear', 'ar-82-review'])
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.issuesStalledNoPr).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
@@ -7699,7 +7702,7 @@ describe('FactoryLoop', () => {
     })
   })
 
-  it('emits an escalation on delivery_failed for an in-flight agent', async () => {
+  it('ignores an untracked delivery_failed event for an in-flight agent', async () => {
     const mount = new FakeMountClient({ [issuePath(8)]: issueFile(8) })
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
@@ -7712,9 +7715,36 @@ describe('FactoryLoop', () => {
     fleet.emitDeliveryFailed({ to: 'ar-8-review', reason: 'dead-lettered' })
     await flush()
 
-    expect(errors).toHaveLength(1)
-    expect(errors[0]).toMatchObject({ issue: { key: 'AR-8' } })
+    expect(errors).toEqual([])
+    expect(factory.status().counters.nonCriticalDeliveryFailuresIgnored).toBe(1)
     await factory.stop()
+  })
+
+  it('surfaces a tracked critical delivery failure once without retrying a dead worker', async () => {
+    const mount = new FakeMountClient({ [issuePath(68)]: issueFile(68) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), stateStore })
+    const errors: unknown[] = []
+    factory.on('error', (payload) => errors.push(payload))
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(68), issueFile(68)))
+
+    await factory.dispatch(decision)
+    await stateStore.recordCritical('factory-test', 'critical-68', {
+      issue: decision.issue,
+      input: { to: 'ar-68-review', from: 'factory', text: 'Review the completed PR.' },
+    })
+    fleet.emitDeliveryFailed({
+      to: 'ar-68-review',
+      msgId: 'critical-68',
+      reason: 'max delivery retries exceeded',
+    })
+    await flush()
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({ issue: { key: 'AR-68' } })
+    expect(fleet.messages).toEqual([])
+    expect(factory.status().counters.criticalDeliveryTerminalFailures).toBe(1)
   })
 
   it('delivers the complete implementer and reviewer briefings in their spawn tasks', async () => {
@@ -7800,8 +7830,8 @@ describe('FactoryLoop', () => {
       .toContain('Linear issue: AR-63')
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
-    expect(errors).toHaveLength(1)
-    expect(errors[0]).toMatchObject({ issue: { key: 'AR-63' } })
+    expect(errors).toEqual([])
+    expect(factory.status().counters.nonCriticalDeliveryFailuresIgnored).toBe(1)
   })
 
   it('does not retry an obsolete reviewer handoff injection after delivery_failed', async () => {
@@ -9753,7 +9783,11 @@ describe('FactoryLoop', () => {
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-20: factory triage escalation for [factory-e2e] Fix factory issue 20')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: Matched repository from Linear label.')
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Factory matched AgentWorkforce/pear. Please clarify the concrete expected behavior, constraints, and acceptance criteria/tests before dispatch.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Factory matched AgentWorkforce/pear.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('For "[factory-e2e] Fix factory issue 20", please reply with:')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('(1) the exact user flow—where it starts, required inputs/actions, and the successful result;')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('(3) observable acceptance checks or tests.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('successful work will be opened as a pull request.')
     expect(factory.status().counters.errors).toBeUndefined()
     expect(factory.status().counters.triageEscalations).toBe(1)
     expect(slack.roots).toEqual([])
@@ -9777,6 +9811,9 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification before dispatching 55.')
     expect(githubWriteback.comments[0]?.body).toContain('Reason: low-confidence triage and thin issue context: Issue lacks acceptance criteria.')
     expect(githubWriteback.comments[0]?.body).toContain('Question: Factory matched AgentWorkforce/pear.')
+    expect(githubWriteback.comments[0]?.body).toContain('For "GitHub factory issue 55", please reply with:')
+    expect(githubWriteback.comments[0]?.body).toContain('(2) permissions, validation, failure behavior, important edge cases, and anything out of scope;')
+    expect(githubWriteback.comments[0]?.body).toContain('successful work will be opened as a pull request.')
     expect(githubWriteback.comments[0]?.body).toMatch(/<!-- factory-escalation:factory-triage-/u)
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.errors).toBeUndefined()
@@ -9987,7 +10024,24 @@ describe('FactoryLoop', () => {
 
   it('dispatches a thin GitHub issue after a human replies to the clarification comment', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 58)
-    const mount = new FakeMountClient({ [path]: githubIssueFile(58, { labels: ['factory'] }) })
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 158,
+          url: 'https://github.com/AgentWorkforce/pear/pull/158',
+          headRef: 'factory/58-agentworkforce-pear',
+          headSha: 'sha-58',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(58, { labels: ['factory'] }),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
     const fleet = new FakeFleetClient()
     const githubWriteback = new RecordingGithubWriteback()
     const factory = createFactory(config({ issueSource: 'github' }), {
@@ -10013,6 +10067,16 @@ describe('FactoryLoop', () => {
     expect(fleet.inputs).toEqual([])
     expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
     expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBeUndefined()
+
+    fleet.emitAgentExit('ar-58-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+    expect(publishInputs[0]).toMatchObject({
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
+      baseRef: 'main',
+      title: '58: GitHub factory issue 58',
+    })
+    expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
   })
 
   it('requires a start-of-body correlation token from the issue reporter before resolving GitHub triage', async () => {

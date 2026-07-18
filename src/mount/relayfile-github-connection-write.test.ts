@@ -99,7 +99,7 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(git).toHaveBeenNthCalledWith(2, ['-C', '/work/factory', 'rev-parse', 'HEAD'])
     expect(mount.writes).toEqual([
       {
-        path: '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json',
+        path: `/github/repos/AgentWorkforce/factory/refs/${draft}.json`,
         content: {
           ref: 'refs/heads/fix/issue-52',
           sha: '1234567890abcdef1234567890abcdef12345678',
@@ -132,7 +132,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('fails closed when the provider does not acknowledge a write', async () => {
     const mount = new FakeMountClient()
-    const refPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
+    const refPath = '/github/repos/AgentWorkforce/factory/refs/factory-fix-issue-52-1234567890ab.json'
     mount.setConfirmWrite(refPath, 'timeout')
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
@@ -143,6 +143,56 @@ describe('RelayfileGithubConnectionWrite', () => {
       title: 'Title',
       body: 'Body',
     })).rejects.toThrow(`GitHub writeback did not complete for ${refPath}: timeout`)
+  })
+
+  it('updates an existing branch when retrying local-clone publication', async () => {
+    const draft = 'factory-fix-issue-52-1234567890ab'
+    const createRefPath = `/github/repos/AgentWorkforce/factory/refs/${draft}.json`
+    const updateRefPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffix%2Fissue-52.json'
+    const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
+    class ExistingRefMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked'> {
+        if (path === createRefPath) {
+          throw new Error('GitHub writeback failed with status 422: Reference already exists')
+        }
+        return 'acked'
+      }
+
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 66, url: 'https://github.com/AgentWorkforce/factory/pull/66' } })
+        }
+      }
+    }
+    const mount = new ExistingRefMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 66 })
+
+    expect(mount.writes.slice(0, 2)).toEqual([
+      {
+        path: createRefPath,
+        content: {
+          ref: 'refs/heads/fix/issue-52',
+          sha: '1234567890abcdef1234567890abcdef12345678',
+        },
+      },
+      {
+        path: updateRefPath,
+        content: {
+          ref: 'refs/heads/fix/issue-52',
+          sha: '1234567890abcdef1234567890abcdef12345678',
+          force: false,
+        },
+      },
+    ])
   })
 
   it('rejects publishing from the base branch before writing a ref', async () => {
