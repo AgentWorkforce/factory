@@ -19,6 +19,8 @@ export interface GithubRead {
 export type GithubIssueStatus = 'in-progress' | 'human-review'
 
 export interface GithubWriteback {
+  /** Provider-authoritative fallback when the mounted issue record omits its reporter. */
+  getIssueAuthor?(issue: LinearIssue): Promise<string | undefined>
   postComment(issue: LinearIssue, body: string): Promise<void>
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>

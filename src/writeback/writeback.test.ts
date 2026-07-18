@@ -827,6 +827,27 @@ describe('GhCliGithubWriteback', () => {
     },
   }
 
+  it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: JSON.stringify({ author: { login: 'issue-reporter' } }) }
+      },
+    })
+
+    await expect(github.getIssueAuthor(githubIssue)).resolves.toBe('issue-reporter')
+    expect(calls).toEqual([[
+      'issue',
+      'view',
+      '48',
+      '--repo',
+      'AgentWorkforce/factory',
+      '--json',
+      'author',
+    ]])
+  })
+
   it('sets the first lifecycle status without removing an absent label, then transitions statuses', async () => {
     const calls: string[][] = []
     const labels = new Set<string>()

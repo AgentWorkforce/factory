@@ -283,6 +283,8 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
+  readonly #githubIssueAuthors = new Map<string, string>()
+  readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
@@ -4787,7 +4789,7 @@ export class FactoryLoop implements Factory {
     const correlationId = githubEscalationCorrelationId('agent-question', record.issue, question.question)
     const issue = await this.#readIssue(record.issue.path)
     const source = issue ? githubIssueSourceRef(issue) : undefined
-    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    const authorizedAuthor = issue ? await this.#resolveGithubIssueAuthor(issue) : undefined
     if (!issue || !source || !authorizedAuthor) {
       this.#surfaceEscalationDeliveryFailure(
         'agent-question',
@@ -5340,7 +5342,7 @@ export class FactoryLoop implements Factory {
       `${comment.commentId}:${question.question}`,
     )
     const issue = await this.#readIssue(record.issue.path)
-    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    const authorizedAuthor = issue ? await this.#resolveGithubIssueAuthor(issue) : undefined
     if (!authorizedAuthor) {
       this.#increment('githubAgentQuestionsIgnoredMissingAuthorizedAuthor')
       this.#surfaceEscalationDeliveryFailure(
@@ -7075,7 +7077,7 @@ export class FactoryLoop implements Factory {
     const correlationId = githubEscalationCorrelationId('triage', decision.issue, question)
     const issue = await this.#readIssue(decision.issue.path)
     const source = issue ? githubIssueSourceRef(issue) : undefined
-    const authorizedAuthor = issue ? githubIssueAuthor(issue) : undefined
+    const authorizedAuthor = issue ? await this.#resolveGithubIssueAuthor(issue) : undefined
     if (!issue || !source || !authorizedAuthor) {
       this.#surfaceEscalationDeliveryFailure(
         'triage',
@@ -7169,7 +7171,7 @@ export class FactoryLoop implements Factory {
     if (!this.#slack || !this.#config.slack) return
     const source = githubIssueSourceRef(issue)
     const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
-    const reporter = githubIssueAuthor(issue)
+    const reporter = await this.#resolveGithubIssueAuthor(issue)
     const audience = [stakeholderMentions, reporter ? `GitHub reporter: @${reporter}.` : undefined]
       .filter((part): part is string => Boolean(part))
       .join(' ')
@@ -7187,6 +7189,47 @@ export class FactoryLoop implements Factory {
     await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
     this.#increment('triageEscalationsMirroredToSlack')
     this.#recordSlackWritebackSuccess('triage-escalation-mirror')
+  }
+
+  async #resolveGithubIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
+    const embeddedAuthor = githubIssueAuthor(issue)
+    if (embeddedAuthor) return embeddedAuthor
+
+    const source = githubIssueSourceRef(issue)
+    const lookup = this.#githubWriteback.getIssueAuthor
+    if (!source || !lookup) return undefined
+
+    const key = githubIssueSourceKey(source)
+    const cached = this.#githubIssueAuthors.get(key)
+    if (cached) return cached
+
+    const existing = this.#githubIssueAuthorLookups.get(key)
+    if (existing) return await existing
+
+    const pending = lookup.call(this.#githubWriteback, issue)
+      .then((author) => {
+        const normalized = author?.trim()
+        if (normalized) {
+          this.#githubIssueAuthors.set(key, normalized)
+          this.#increment('githubIssueAuthorsResolvedFromProvider')
+        }
+        return normalized || undefined
+      })
+      .catch((error) => {
+        this.#increment('githubIssueAuthorLookupFailures')
+        this.#logger.warn?.('[factory] provider-authoritative GitHub issue author lookup failed', {
+          owner: source.owner,
+          repo: source.repo,
+          issue: source.number,
+          error: describeError(error).errorMessage,
+        })
+        return undefined
+      })
+      .finally(() => {
+        this.#githubIssueAuthorLookups.delete(key)
+      })
+    this.#githubIssueAuthorLookups.set(key, pending)
+    return await pending
   }
 
   async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {

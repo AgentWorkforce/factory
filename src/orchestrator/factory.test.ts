@@ -253,6 +253,19 @@ class RecordingGithubWriteback implements GithubWriteback {
   }
 }
 
+class AuthorResolvingGithubWriteback extends RecordingGithubWriteback {
+  readonly authorLookups: string[] = []
+
+  constructor(private readonly author: string) {
+    super()
+  }
+
+  async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
+    this.authorLookups.push(issue.key)
+    return this.author
+  }
+}
+
 class FailingGithubCommentWriteback extends RecordingGithubWriteback {
   override async postComment(): Promise<void> {
     throw new Error('GitHub comment writeback unavailable')
@@ -9576,6 +9589,34 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
     expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
+  })
+
+  it('resolves a missing mounted GitHub reporter before posting and mirrors that reporter to Slack', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const issueWithoutAuthor = githubIssueFile(59, { labels: ['factory'] })
+    delete (issueWithoutAuthor.payload as { author?: unknown }).author
+    const mount = new CloudWritebackFakeMountClient({ [path]: issueWithoutAuthor })
+    const githubWriteback = new AuthorResolvingGithubWriteback('provider-reporter')
+    const factory = createFactory(config({
+      issueSource: 'github',
+      slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER'] },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new EscalatingTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+    await factory.runOnce()
+
+    expect(githubWriteback.authorLookups).toEqual(['59'])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]?.body).toContain('@provider-reporter, Factory needs clarification')
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @provider-reporter.')
+    expect(factory.status().counters.githubIssueAuthorsResolvedFromProvider).toBe(1)
   })
 
   it('logs and emits an observable error when GitHub triage escalation has no usable write path', async () => {

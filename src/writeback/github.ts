@@ -71,6 +71,22 @@ export class GhCliGithubWriteback implements GithubWriteback {
     this.#run = config.runner ?? defaultGhRunner
   }
 
+  async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
+    const ref = githubIssueRef(issue)
+    const result = await this.#run([
+      'issue',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'author',
+    ])
+    if (!result.stdout.trim()) return undefined
+    const author = asRecord(JSON.parse(result.stdout))?.author
+    return stringValue(asRecord(author)?.login)?.trim() || undefined
+  }
+
   async postComment(issue: LinearIssue, body: string): Promise<void> {
     const ref = githubIssueRef(issue)
     await this.#run([
