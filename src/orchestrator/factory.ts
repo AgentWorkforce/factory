@@ -7020,11 +7020,14 @@ export class FactoryLoop implements Factory {
     }
 
     // A source GitHub issue is the durable stakeholder record. Keep both the
-    // question and authorized response there even when Slack is configured;
-    // Slack is visibility-only and must not steal the clarification workflow.
+    // question and authorized response there, then mirror the escalation once
+    // to Slack for stakeholder visibility without making Slack a competing
+    // clarification workflow.
     const sourceIssue = await this.#readIssue(decision.issue.path)
     if (sourceIssue && githubIssueSourceRef(sourceIssue)) {
-      return await this.#escalateTriageToGithub(decision, reason)
+      const result = await this.#escalateTriageToGithub(decision, reason)
+      await this.#mirrorGithubTriageEscalationToSlack(decision, sourceIssue, reason)
+      return result
     }
 
     if (!this.#slack || !this.#config.slack) {
@@ -7116,16 +7119,87 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #mirrorGithubTriageEscalationToSlack(
+    decision: TriageDecision,
+    issue: LinearIssue,
+    reason: string,
+  ): Promise<void> {
+    if (!this.#slack || !this.#config.slack) return
+    if (await this.#shouldSkipSlackWriteback('triage-escalation-mirror')) {
+      this.#increment('triageEscalationSlackMirrorsSkippedDegraded')
+      return
+    }
+
+    const key = issueKey(decision.issue)
+    const existingThread = await this.#persistedSlackThread(key)
+    const inFlight = this.#slackWatcherStarts.get(key)
+    if (existingThread || inFlight) {
+      if (inFlight) {
+        try {
+          await inFlight
+        } catch {
+          // The initiator records the optional mirror failure.
+        }
+      }
+      this.#increment('triageEscalationSlackMirrorDuplicatesSuppressed')
+      return
+    }
+
+    const start = this.#postGithubTriageSlackMirror(decision, issue, reason)
+    this.#slackWatcherStarts.set(key, start)
+    try {
+      await start
+    } catch (error) {
+      this.#markSlackWritebackFailure('triage-escalation-mirror', error)
+      this.#increment('triageEscalationSlackMirrorFailures')
+      this.#logger.warn?.('[factory] optional GitHub triage Slack mirror failed', {
+        issue: decision.issue.key,
+        error: describeError(error).errorMessage,
+      })
+    } finally {
+      this.#slackWatcherStarts.delete(key)
+    }
+  }
+
+  async #postGithubTriageSlackMirror(
+    decision: TriageDecision,
+    issue: LinearIssue,
+    reason: string,
+  ): Promise<void> {
+    if (!this.#slack || !this.#config.slack) return
+    const source = githubIssueSourceRef(issue)
+    const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
+    const reporter = githubIssueAuthor(issue)
+    const audience = [stakeholderMentions, reporter ? `GitHub reporter: @${reporter}.` : undefined]
+      .filter((part): part is string => Boolean(part))
+      .join(' ')
+    const replyInstruction = source?.url
+      ? `Reply on the GitHub issue so Factory can resume: ${source.url}`
+      : 'Reply on the source GitHub issue so Factory can resume.'
+    const root = await this.#slack.postThread({
+      channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
+      text: [
+        `${audience ? `${audience} ` : ''}${decision.issue.key}: factory triage escalation for ${issue.title}`,
+        `Reason: ${reason}`,
+        `Question: ${triageEscalationQuestion(decision)} ${replyInstruction}`,
+      ].join('\n'),
+    })
+    await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
+    this.#increment('triageEscalationsMirroredToSlack')
+    this.#recordSlackWritebackSuccess('triage-escalation-mirror')
+  }
+
   async #postAndWatchSlackEscalationThread(decision: TriageDecision, reason: string): Promise<DispatchResult | undefined> {
     if (!this.#slack || !this.#config.slack) {
       return
     }
 
     const issue = await this.#readIssue(decision.issue.path)
+    const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
-        `${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
+        `${stakeholderMentions ? `${stakeholderMentions} ` : ''}${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
         `Reason: ${reason}`,
         `Question: ${triageEscalationQuestion(decision)}`,
       ].join('\n'),

@@ -9548,11 +9548,14 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
   })
 
-  it('keeps GitHub issue clarification on GitHub even when Slack is configured', async () => {
+  it('keeps GitHub clarification durable on GitHub and mirrors one stakeholder escalation to Slack', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 56)
     const mount = new CloudWritebackFakeMountClient({ [path]: githubIssueFile(56, { labels: ['factory'] }) })
     const githubWriteback = new RecordingGithubWriteback()
-    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+    const factory = createFactory(config({
+      issueSource: 'github',
+      slack: { ...slackConfig(), stakeholderUserIds: ['UOWNER', 'ULEAD'] },
+    }), {
       mount,
       fleet: new FakeFleetClient(),
       triage: new EscalatingTriage(),
@@ -9560,11 +9563,19 @@ describe('FactoryLoop', () => {
     })
 
     await factory.runOnce()
+    await factory.runOnce()
 
-    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toEqual([])
     expect(githubWriteback.comments).toHaveLength(1)
     expect(githubWriteback.comments[0]?.body).toContain('@issue-author, Factory needs clarification')
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('<@UOWNER> <@ULEAD>')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: @issue-author.')
+    expect((slackRoots[0]?.content as { text?: string }).text)
+      .toContain('Reply on the GitHub issue so Factory can resume: https://github.com/AgentWorkforce/pear/issues/56')
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
+    expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
+    expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
   })
 
   it('logs and emits an observable error when GitHub triage escalation has no usable write path', async () => {
