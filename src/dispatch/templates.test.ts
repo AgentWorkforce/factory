@@ -318,12 +318,14 @@ describe('GitHub human input request comments', () => {
       'ar-123-review',
       'AR-123',
       'Should this retry preserve the original idempotency key?',
+      'issue-reporter',
     )
 
     expect(parseGithubHumanInputRequest(body)).toEqual({
       agentName: 'ar-123-review',
       issueKey: 'AR-123',
       question: 'Should this retry preserve the original idempotency key?',
+      stakeholder: 'issue-reporter',
     })
   })
 

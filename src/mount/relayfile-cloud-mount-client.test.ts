@@ -662,6 +662,7 @@ describe('RelayfileCloudMountClient', () => {
     await mount.writeFile('/github/pull-requests/new.json', { title: 'new' })
 
     await expect(mount.confirmWrite('/github/pull-requests/new.json', { timeoutMs: 5 })).resolves.toBe('acked')
+    await expect(mount.getConfirmedWriteExternalId('/github/pull-requests/new.json')).resolves.toBe('52')
   })
 
   it('fails closed on unpollable write confirmations for legacy clients and restarted instances', async () => {

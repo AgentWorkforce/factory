@@ -2,12 +2,12 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { LocalMountOptions } from '../ports'
-import { checkMountStaleness, coercePid } from './relayfile-binary'
+import { checkMountStaleness } from './relayfile-binary'
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
 // How long to wait for a freshly-spawned mount to write a valid state.json
-// (workspace match + a live pid). A CLI mount over a large `.integrations` tree
+// (workspace match + a fresh reconcile timestamp). A CLI mount over a large `.integrations` tree
 // can take well over 10s to complete its FIRST reconcile (early cycles hit
 // `context deadline exceeded` while it materializes the tree), so a 10s wait
 // reported a spurious "did not become ready" on a mount that was simply still
@@ -122,16 +122,14 @@ function isValidMountState(
   acceptableWorkspaceIds: readonly string[] = [],
 ): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
-  const state = value as { workspaceId?: unknown; lastReconcileAt?: unknown; pid?: unknown; daemon?: { pid?: unknown } }
+  const state = value as { workspaceId?: unknown; lastReconcileAt?: unknown }
   const accepted = new Set([workspaceId, ...acceptableWorkspaceIds])
-  // An SDK-launched mount records its pid under `daemon.pid`, not necessarily
-  // the top-level `pid` — accept either, matching
-  // checkMountStaleness (else a freshly-started CLI mount is never confirmed ready).
-  const pid = coercePid(state.pid) ?? coercePid(state.daemon?.pid)
+  // Background SDK mounts may deliberately omit a pid. Freshness and workspace
+  // identity are the readiness contract; checkMountStaleness still validates a
+  // pid when one is present.
   return typeof state.workspaceId === 'string' && accepted.has(state.workspaceId) &&
     typeof state.lastReconcileAt === 'string' &&
-    Number.isFinite(Date.parse(state.lastReconcileAt)) &&
-    pid !== undefined
+    Number.isFinite(Date.parse(state.lastReconcileAt))
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))

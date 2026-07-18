@@ -183,6 +183,7 @@ export class RelayfileCloudMountClient implements MountClient {
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
+  readonly #confirmedExternalIdByPath = new Map<string, string>()
 
   constructor(config: RelayfileCloudMountClientConfig = {}) {
     if (!config.client) {
@@ -299,6 +300,7 @@ export class RelayfileCloudMountClient implements MountClient {
     }
 
     const serialized = serializeContent(content)
+    this.#confirmedExternalIdByPath.delete(path)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
       let baseRevision = '0'
@@ -326,6 +328,7 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async deleteFile(path: string): Promise<void> {
+    this.#confirmedExternalIdByPath.delete(path)
     const current = await this.#client.readFile(this.workspaceId, path)
     const currentContent = parseRemoteContent(current)
     if (isProviderPath(path)) {
@@ -436,11 +439,26 @@ export class RelayfileCloudMountClient implements MountClient {
 
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
     for (;;) {
-      const status = mapOperationStatus(await this.#client.getOp(this.workspaceId, opId))
-      if (status !== 'pending') return status
+      const operation = await this.#client.getOp(this.workspaceId, opId)
+      const status = mapOperationStatus(operation)
+      if (status !== 'pending') {
+        const providerId = [
+          operation.providerResult?.externalId,
+          operation.providerResult?.ts,
+          operation.providerResult?.thread_ts,
+        ].find((value): value is string => typeof value === 'string' && value.length > 0)
+        if (status === 'acked' && providerId) {
+          this.#confirmedExternalIdByPath.set(path, providerId)
+        }
+        return status
+      }
       if (Date.now() >= deadline) return 'timeout'
       await sleep(Math.min(500, Math.max(25, deadline - Date.now())))
     }
+  }
+
+  async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+    return this.#confirmedExternalIdByPath.get(path)
   }
 
   async ensureSubRoot(prefix: string, _opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {

@@ -579,6 +579,59 @@ describe('MountSlackWriteback', () => {
     })
   })
 
+  it('uses the cloud operation external id when the mirrored root has not reconciled yet', async () => {
+    const backing = new FakeMountClient()
+    const cloudMount: MountClient = {
+      writebackTransport: 'relayfile-cloud',
+      readFile: (path) => backing.readFile(path),
+      writeFile: (path, content, opts) => backing.writeFile(path, content, opts),
+      deleteFile: (path) => backing.deleteFile(path),
+      listTree: (prefix) => backing.listTree(prefix),
+      subscribe: (globs, onChange, opts) => backing.subscribe(globs, onChange, opts),
+      getEvents: (opts) => backing.getEvents(opts),
+      confirmWrite: (path, opts) => backing.confirmWrite(path, opts),
+      getConfirmedWriteExternalId: async () => '1780751612.176219',
+      ensureSubRoot: (prefix, opts) => backing.ensureSubRoot(prefix, opts),
+    }
+    const slack = MountSlackWriteback(cloudMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    const root = await slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })
+    await slack.reply(root.threadId, 'Factory reply')
+
+    expect(root.threadId).toBe('1780751612.176219')
+    expect(backing.writes[1]?.content).toMatchObject({ thread_ts: '1780751612.176219' })
+  })
+
+  it('fails closed when an acked cloud root has no provider thread timestamp', async () => {
+    const backing = new FakeMountClient()
+    const cloudMount: MountClient = {
+      writebackTransport: 'relayfile-cloud',
+      readFile: (path) => backing.readFile(path),
+      writeFile: (path, content, opts) => backing.writeFile(path, content, opts),
+      deleteFile: (path) => backing.deleteFile(path),
+      listTree: (prefix) => backing.listTree(prefix),
+      subscribe: (globs, onChange, opts) => backing.subscribe(globs, onChange, opts),
+      getEvents: (opts) => backing.getEvents(opts),
+      confirmWrite: (path, opts) => backing.confirmWrite(path, opts),
+      ensureSubRoot: (prefix, opts) => backing.ensureSubRoot(prefix, opts),
+    }
+    const slack = MountSlackWriteback(cloudMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    await expect(slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })).rejects.toThrow(/without a provider thread timestamp/u)
+  })
+
   it('refuses Slack writes over a local mirror mount even if file writes appear acked', async () => {
     const writes: Array<{ path: string; content: unknown }> = []
     const localMirrorMount: MountClient = {

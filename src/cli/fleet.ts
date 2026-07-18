@@ -46,6 +46,7 @@ import {
   type ResolvedFactoryWorkspace,
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
+import { GitAgentWorktreeManager } from '../git/agent-worktree'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -240,6 +241,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
           logger,
+          worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
         })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
       }

@@ -34,3 +34,7 @@ export type {
   Logger,
   TelemetrySink,
 } from './system'
+export type {
+  AgentWorktree,
+  AgentWorktreeManager,
+} from './worktree'

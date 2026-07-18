@@ -47,6 +47,24 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('accepts a fresh SDK mount state that intentionally omits a daemon pid', async () => {
+    await withTempDir(async (dir) => {
+      const startMount = vi.fn(async () => {
+        await writeMountState(dir, {
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+        })
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+      expect(startMount).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('accepts the cloud UUID alias emitted by an SDK mount session', async () => {
     await withTempDir(async (dir) => {
       const startMount = vi.fn(async () => {
@@ -116,6 +134,19 @@ describe('ensureLocalMount', () => {
         workspaceId: 'rw_test',
         lastReconcileAt: new Date().toISOString(),
         pid: process.pid,
+      })
+      const startMount = vi.fn(async () => {})
+
+      await expect(ensureLocalMount('rw_test', dir, { startMount })).resolves.toBeUndefined()
+      expect(startMount).not.toHaveBeenCalled()
+    })
+  })
+
+  it('does not restart a fresh pidless existing mount', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
       })
       const startMount = vi.fn(async () => {})
 

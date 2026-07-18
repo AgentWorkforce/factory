@@ -92,6 +92,8 @@ export type AgentSpec = {
   workflow?: string
   inputs?: Record<string, unknown>
   repo: string
+  /** Configured shared checkout from which an isolated local worktree was created. */
+  baseClonePath?: string
   clonePath?: string
   channel?: string
   node?: 'self' | string

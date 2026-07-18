@@ -34,6 +34,8 @@ import type {
   WaitingClarification,
 } from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
+import type { AgentWorktree, AgentWorktreeManager } from '../ports/worktree'
+import { factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
@@ -269,6 +271,7 @@ export class FactoryLoop implements Factory {
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
+  readonly #worktrees?: AgentWorktreeManager
   #batchView?: BatchSnapshot
   #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
@@ -405,6 +408,7 @@ export class FactoryLoop implements Factory {
     this.#terminationGraceMs = ports.terminationGraceMs
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
+    this.#worktrees = ports.worktrees
     this.#state = ports.stateStore ?? new InMemoryStateStore({
       batchSize: config.batchSize,
       agentQuestionDedupeLimit: AGENT_QUESTION_DEDUPE_LIMIT,
@@ -1382,7 +1386,9 @@ export class FactoryLoop implements Factory {
         const issue = await this.#readIssue(path)
         readyIssueReads += 1
         lastReadyReadProgressAtMs = this.#logTimedProgress(
-          '[factory] Linear ready issue read progress',
+          this.#config.issueSource === 'github'
+            ? '[factory] GitHub ready issue read progress'
+            : '[factory] Linear ready issue read progress',
           startedAtMs,
           lastReadyReadProgressAtMs,
           { read: readyIssueReads, total: paths.length, path },
@@ -1741,9 +1747,15 @@ export class FactoryLoop implements Factory {
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
     const durableRemoteDispatch = !dryRun && this.#fleet.placementLocality === 'remote'
-    const lifecycleRunId = durableRemoteDispatch ? randomUUID() : undefined
+    // Local dispatches need the same deterministic branch identity as remote
+    // ones. Without it, every worker starts in the configured shared checkout
+    // and concurrent issues can switch each other back to the base branch.
+    const isolateLocalWorktree = this.#fleet.placementLocality === 'local' && Boolean(this.#worktrees)
+    const lifecycleRunId = !dryRun && (durableRemoteDispatch || isolateLocalWorktree) ? randomUUID() : undefined
     if (lifecycleRunId) {
-      dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId)
+      dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId, {
+        isolateLocalWorktree,
+      })
     }
     dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
     if (durableRemoteDispatch) {
@@ -2252,7 +2264,6 @@ export class FactoryLoop implements Factory {
 
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
     const batch = await this.#batch()
-    const next = this.#fleet.placementLocality === 'remote' ? undefined : batch.complete(record.issue)
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
     const released = new Set(lifecycle?.agents
@@ -2271,13 +2282,18 @@ export class FactoryLoop implements Factory {
       // only agents whose release did not reach a fenced durable checkpoint.
       if (!await this.#saveDispatchLifecycle(record, 'releasing', undefined, reason, released)) return false
     }
-    if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
     await this.#writeInFlightRegistry()
     if (failed.length > 0) {
       this.#increment('dispatchLifecycleReleaseRetries')
       this.#scheduleDispatchLifecycleRetry(record)
       return false
     }
+    // The PR branch is already pushed and the babysitter has declared the
+    // current PR green with review feedback addressed. Release is now fenced,
+    // so no agent can race cleanup of the shared per-issue worktree.
+    await this.#cleanupAgentWorktrees(record)
+    const next = this.#fleet.placementLocality === 'remote' ? undefined : batch.complete(record.issue)
+    if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
     // Terminal lifecycle saves intentionally relinquish the owner epoch. Clear
     // the babysitter's durable ownership/wake/critical state while that epoch
     // is still valid so a later reopened issue cannot inherit a stale PR owner.
@@ -3217,6 +3233,7 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
+    await this.#prepareAgentWorktree(record, spec)
     let result
     try {
       result = await this.#fleet.spawn({
@@ -3440,6 +3457,7 @@ export class FactoryLoop implements Factory {
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
         try {
+          await this.#prepareAgentWorktree(record, tracked.spec)
           const result = await this.#fleet.spawn({
             name: tracked.spec.name,
             capability: tracked.spec.capability,
@@ -3575,6 +3593,65 @@ export class FactoryLoop implements Factory {
       url: result.url,
     })
     return result
+  }
+
+  async #prepareAgentWorktree(record: InFlightIssue, spec: AgentSpec): Promise<void> {
+    const worktree = this.#agentWorktree(record, spec)
+    if (!worktree || !this.#worktrees) return
+    try {
+      await this.#worktrees.prepare(worktree)
+      this.#increment('agentWorktreesPrepared')
+    } catch (error) {
+      throw contextualError(
+        `Unable to prepare isolated worktree for ${record.issue.key}/${spec.repo} at ${worktree.worktreePath}`,
+        error,
+      )
+    }
+  }
+
+  #agentWorktree(record: InFlightIssue, spec: AgentSpec): AgentWorktree | undefined {
+    if (!spec.baseClonePath || !spec.clonePath || spec.baseClonePath === spec.clonePath) return undefined
+    const implementer = record.decision.implementers.find((candidate) => candidate.repo === spec.repo && candidate.branch)
+      ?? [...record.agents.values()]
+        .map((tracked) => tracked.spec)
+        .find((candidate) => candidate.repo === spec.repo && candidate.role === 'implementer' && candidate.branch)
+    const branch = spec.branch ?? implementer?.branch
+    if (!branch) return undefined
+    return {
+      repo: spec.repo,
+      issueKey: record.issue.key,
+      baseClonePath: spec.baseClonePath,
+      worktreePath: spec.clonePath,
+      branch,
+    }
+  }
+
+  async #cleanupAgentWorktrees(record: InFlightIssue): Promise<void> {
+    if (!this.#worktrees) return
+    const unique = new Map<string, AgentWorktree>()
+    for (const tracked of record.agents.values()) {
+      const worktree = this.#agentWorktree(record, tracked.spec)
+      if (worktree) unique.set(worktree.worktreePath, worktree)
+    }
+    const failures: string[] = []
+    for (const worktree of unique.values()) {
+      try {
+        await this.#worktrees.cleanup(worktree)
+        this.#increment('agentWorktreesCleaned')
+      } catch (error) {
+        failures.push(`${worktree.worktreePath}: ${describeError(error).errorMessage}`)
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] failed to clean completed issue worktree', {
+          issue: record.issue.key,
+          repo: worktree.repo,
+          worktreePath: worktree.worktreePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`Factory worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
+    }
   }
 
   async #confirmPublishedRemotePullRequest(
@@ -3783,6 +3860,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    await this.#prepareAgentWorktree(record, tracked.spec)
     const result = await this.#fleet.resume({
       name,
       sessionRef: tracked.sessionRef,
@@ -4033,7 +4111,7 @@ export class FactoryLoop implements Factory {
       // The initiator logs Slack watcher startup failures.
     }
 
-    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+    const threadId = await this.#persistedSlackThread(key)
     if (!threadId) {
       this.#increment('agentQuestionsSkippedMissingThread')
       this.#logger.warn?.('[factory] agent question has no Slack dispatch thread', {
@@ -4347,7 +4425,7 @@ export class FactoryLoop implements Factory {
       return undefined
     }
     const key = issueKey(record.issue)
-    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+    const threadId = await this.#persistedSlackThread(key)
     if (!threadId) {
       this.#increment('agentQuestionReleaseSkippedMissingThread')
       return undefined
@@ -4407,7 +4485,7 @@ export class FactoryLoop implements Factory {
       issue: { ...record.issue },
       decision: structuredClone(record.decision),
       dryRun: record.dryRun,
-      threadId: await this.#state.getSlackThread(this.#workspaceId, key),
+      threadId: await this.#persistedSlackThread(key),
       questionSource: 'github',
       askerName: question.agentName,
       question: question.question,
@@ -4433,7 +4511,7 @@ export class FactoryLoop implements Factory {
       this.#increment('agentQuestionSlackMirrorsSkippedDegraded')
       return
     }
-    const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
+    const threadId = await this.#persistedSlackThread(issueKey(record.issue))
     if (!threadId) {
       this.#increment('agentQuestionSlackMirrorsSkippedMissingThread')
       return
@@ -5293,7 +5371,8 @@ export class FactoryLoop implements Factory {
         implementerNames,
         integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
-        branchName: spec.branch,
+        branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
+        branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
       }),
     })
@@ -6113,7 +6192,20 @@ export class FactoryLoop implements Factory {
 
       const route = record.decision.routes.find((candidate) => candidate.repo === prRef.repo)
         ?? record.decision.routes[0]
-      const spec = babysitterSpec(issue, this.#config, route)
+      const initialSpec = babysitterSpec(issue, this.#config, route)
+      const sharedCheckout = [...record.agents.values()]
+        .map((agent) => agent.spec)
+        .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
+      const implementerBranch = record.decision.implementers
+        .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
+      const spec: AgentSpec = sharedCheckout
+        ? {
+            ...initialSpec,
+            baseClonePath: sharedCheckout.baseClonePath,
+            clonePath: sharedCheckout.clonePath,
+            ...(implementerBranch ? { branch: implementerBranch } : {}),
+          }
+        : initialSpec
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
       const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name
         ?? agentNameForRole(issue, 'review', { repo: route?.repo ?? prRef.repo })
@@ -6123,7 +6215,7 @@ export class FactoryLoop implements Factory {
       const integrationInstructions = await this.#resolveIntegrationInstructions()
       const task = renderAgentTask({
         issue: templateIssueFromRecord(record, issue),
-        route: route ?? { repo: prRef.repo },
+        route: { ...(route ?? { repo: prRef.repo }), clonePath: spec.clonePath },
         role: 'babysitter',
         config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
         reviewerName,
@@ -6132,6 +6224,8 @@ export class FactoryLoop implements Factory {
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
         integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
+        branchName: spec.branch,
+        branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
       })
 
@@ -6688,6 +6782,20 @@ export class FactoryLoop implements Factory {
     this.#increment('slackWebhookEventsObserved')
   }
 
+  async #persistedSlackThread(key: string): Promise<string | undefined> {
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+    if (!threadId || /^\d+[._]\d+$/u.test(threadId)) return threadId
+
+    // Older Factory versions persisted the Relayfile draft client id when the
+    // acknowledged file had not yet reconciled its provider payload. Slack
+    // cannot use that value as thread_ts. Drop it so the caller establishes a
+    // fresh provider-backed root instead of producing invalid_thread_ts.
+    await this.#state.clearSlackThread(this.#workspaceId, key)
+    this.#increment('invalidSlackThreadsCleared')
+    this.#logger.warn?.('[factory] cleared invalid persisted Slack thread id', { issue: key })
+    return undefined
+  }
+
   async #ensureSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
     if (!this.#slack || !this.#config.slack || result.dryRun) {
       return
@@ -6698,7 +6806,7 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(record.issue)
-    const existingThread = await this.#state.getSlackThread(this.#workspaceId, key)
+    const existingThread = await this.#persistedSlackThread(key)
     const watcherStart = this.#slackWatcherStarts.get(key)
     if (existingThread || watcherStart) {
       try {
@@ -6753,6 +6861,14 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // A source GitHub issue is the durable stakeholder record. Keep both the
+    // question and authorized response there even when Slack is configured;
+    // Slack is visibility-only and must not steal the clarification workflow.
+    const sourceIssue = await this.#readIssue(decision.issue.path)
+    if (sourceIssue && githubIssueSourceRef(sourceIssue)) {
+      return await this.#escalateTriageToGithub(decision, reason)
+    }
+
     if (!this.#slack || !this.#config.slack) {
       return await this.#escalateTriageToGithub(decision, reason)
     }
@@ -6762,7 +6878,7 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(decision.issue)
-    const existingThread = await this.#state.getSlackThread(this.#workspaceId, key)
+    const existingThread = await this.#persistedSlackThread(key)
     const watcherStart = this.#slackWatcherStarts.get(key)
     if (existingThread || watcherStart) {
       try {
@@ -6821,7 +6937,7 @@ export class FactoryLoop implements Factory {
 
     try {
       await this.#githubWriteback.postComment(issue, [
-        `Factory needs clarification before dispatching ${decision.issue.key}.`,
+        `@${authorizedAuthor}, Factory needs clarification before dispatching ${decision.issue.key}.`,
         `Reason: ${reason}`,
         `Question: ${question}`,
         `Authorized responder: @${authorizedAuthor} (the issue reporter).`,
@@ -7069,7 +7185,7 @@ export class FactoryLoop implements Factory {
       }
       let threadId: string | undefined
       try {
-        threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+        threadId = await this.#persistedSlackThread(key)
       } catch (error) {
         this.#logger.warn?.('[factory] unable to read persisted Slack thread during watcher rehydration', { issue: record.issue.key, error })
         continue
@@ -7620,6 +7736,7 @@ export class FactoryLoop implements Factory {
     waiting: WaitingClarification,
   ): Promise<SpawnResult> {
     const task = clarificationResumeTask(tracked.spec.task, waiting)
+    await this.#prepareAgentWorktree(waitingRecord(waiting), tracked.spec)
     if (tracked.sessionRef) {
       try {
         const resumed = await this.#fleet.resume({
@@ -7843,7 +7960,7 @@ export class FactoryLoop implements Factory {
       return undefined
     }
 
-    const threadId = await this.#state.getSlackThread(this.#workspaceId, issueKey(record.issue))
+    const threadId = await this.#persistedSlackThread(issueKey(record.issue))
     const channel = await this.#slackChannelDir() ?? this.#config.slack.channel
     return threadId
       ? { channel, threadId, mountRoot: this.#integrationsMountRoot() }
@@ -8475,10 +8592,19 @@ function routeImplementerSpec(
   }
 }
 
-function decisionWithLifecycleBranches(decision: TriageDecision, runId: string): TriageDecision {
+function decisionWithLifecycleBranches(
+  decision: TriageDecision,
+  runId: string,
+  opts: { isolateLocalWorktree?: boolean } = {},
+): TriageDecision {
   const withBranch = (spec: AgentSpec): AgentSpec => {
+    const baseClonePath = spec.baseClonePath ?? spec.clonePath
+    const clonePath = opts.isolateLocalWorktree && baseClonePath
+      ? factoryWorktreePath(baseClonePath, decision.issue.key, spec.repo, runId)
+      : spec.clonePath
     const lifecycleSpec = {
       ...spec,
+      ...(opts.isolateLocalWorktree && baseClonePath ? { baseClonePath, clonePath } : {}),
       // The same persisted lifecycle reuses this id after takeover, while a
       // genuine reopen gets a new id and cannot replay an old placement ack.
       invocationId: `factory:${decision.issue.key}:${runId}:${spec.role}:${sanitizeAgentSlug(spec.name)}`,
@@ -8619,12 +8745,21 @@ function taskForDispatch(issue: LinearIssue, route: TriageDecision['routes'][num
   ].join('\n\n')
 }
 
-const templateIssueFromRecord = (record: Pick<InFlightIssue, 'issue'>, issue: LinearIssue | undefined) => ({
-  key: issue?.key ?? record.issue.key,
-  title: issue?.title ?? record.issue.key,
-  description: issue?.description ?? '',
-  github: issue ? githubIssueSourceRef(issue) : undefined,
-})
+const templateIssueFromRecord = (record: Pick<InFlightIssue, 'issue'>, issue: LinearIssue | undefined) => {
+  const github = issue ? githubIssueSourceRef(issue) : undefined
+  const reporter = issue ? githubIssueAuthor(issue) : undefined
+  return {
+    key: issue?.key ?? record.issue.key,
+    title: issue?.title ?? record.issue.key,
+    description: issue?.description ?? '',
+    github: github
+      ? {
+          ...github,
+          ...(reporter ? { reporter } : {}),
+        }
+      : undefined,
+  }
+}
 
 const routeForSpec = (decision: TriageDecision, spec: AgentSpec) => {
   const route = decision.routes.find((candidate) =>
@@ -9788,12 +9923,10 @@ const isAgentAlreadyExistsError = (error: unknown): boolean => {
 }
 
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
-  // Implementers and babysitters are both long-running and resumable — the
-  // babysitter shepherds an open PR over many CI/review cycles, so an abnormal
-  // exit should resume its session rather than drop the PR. The reviewer is
-  // short-lived and keeps the fleet default.
+  // Factory owns durable resume/respawn decisions. Broker-level retries race
+  // that lifecycle and can re-register the same name before Factory resumes it.
   spec.role === 'implementer' || spec.role === 'babysitter'
-    ? { maxRestarts: 3, strategy: 'resume' } as AgentSpec['restartPolicy']
+    ? { maxRestarts: 0 } as AgentSpec['restartPolicy']
     : spec.restartPolicy
 
 const slackPayloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
