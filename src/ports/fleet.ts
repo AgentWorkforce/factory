@@ -137,4 +137,6 @@ export type AgentSpec = {
   }
   /** Deterministic pushed branch used by the durable cross-node PR publisher. */
   branch?: string
+  /** Existing same-repository PR head authorized for isolated legacy-branch adoption. */
+  existingPullRequestBranch?: boolean
 }

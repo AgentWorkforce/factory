@@ -58,7 +58,43 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     }
 
     await mkdir(dirname(worktree.worktreePath), { recursive: true })
-    if (await this.#localBranchExists(worktree.baseClonePath, worktree.branch)) {
+    if (worktree.existingPullRequestBranch) {
+      const remoteRef = `refs/remotes/origin/${worktree.branch}`
+      await this.#git(worktree.baseClonePath, [
+        'fetch',
+        '--no-tags',
+        'origin',
+        `+refs/heads/${worktree.branch}:${remoteRef}`,
+      ])
+      if (await this.#localBranchExists(worktree.baseClonePath, worktree.branch)) {
+        const checkedOutAt = await this.#branchCheckoutPath(worktree.baseClonePath, worktree.branch)
+        if (checkedOutAt) {
+          throw new Error(
+            `Refusing to adopt existing PR branch ${worktree.branch}: it is already checked out at ${checkedOutAt}; Factory will not reuse or remove a checkout outside ${worktree.worktreePath}`,
+          )
+        }
+        const [localHead, remoteHead] = await Promise.all([
+          this.#git(worktree.baseClonePath, ['rev-parse', `refs/heads/${worktree.branch}`]),
+          this.#git(worktree.baseClonePath, ['rev-parse', remoteRef]),
+        ])
+        if (localHead.trim() !== remoteHead.trim()) {
+          throw new Error(
+            `Refusing to overwrite divergent local PR branch ${worktree.branch} while adopting ${worktree.issueKey}`,
+          )
+        }
+        await this.#git(worktree.baseClonePath, ['worktree', 'add', worktree.worktreePath, worktree.branch])
+      } else {
+        await this.#git(worktree.baseClonePath, [
+          'worktree',
+          'add',
+          '--track',
+          '-b',
+          worktree.branch,
+          worktree.worktreePath,
+          remoteRef,
+        ])
+      }
+    } else if (await this.#localBranchExists(worktree.baseClonePath, worktree.branch)) {
       await this.#git(worktree.baseClonePath, ['worktree', 'add', worktree.worktreePath, worktree.branch])
     } else {
       const baseRef = await this.#defaultBaseRef(worktree.baseClonePath)
@@ -113,6 +149,19 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     }
   }
 
+  async #branchCheckoutPath(baseClonePath: string, branch: string): Promise<string | undefined> {
+    const lines = (await this.#git(baseClonePath, ['worktree', 'list', '--porcelain'])).split(/\r?\n/u)
+    let path: string | undefined
+    for (const line of lines) {
+      if (line.startsWith('worktree ')) {
+        path = line.slice('worktree '.length).trim()
+      } else if (line === `branch refs/heads/${branch}`) {
+        return path
+      }
+    }
+    return undefined
+  }
+
   async #defaultBaseRef(baseClonePath: string): Promise<string> {
     try {
       const remoteHead = (await this.#git(baseClonePath, [
@@ -164,10 +213,15 @@ const assertSafeWorktree = (worktree: AgentWorktree): void => {
   if (target === base || !target.startsWith(`${expectedRoot}/`)) {
     throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
   }
-  if (!worktree.branch.startsWith('factory/')) {
+  if (!worktree.branch.startsWith('factory/') && !isAuthorizedExistingPrBranch(worktree)) {
     throw new Error(`Refusing unsafe Factory worktree branch ${worktree.branch}`)
   }
 }
+
+const isAuthorizedExistingPrBranch = (worktree: AgentWorktree): boolean =>
+  worktree.existingPullRequestBranch === true &&
+  /^\d+$/u.test(worktree.issueKey) &&
+  new RegExp(`^${worktree.issueKey}-[A-Za-z0-9][A-Za-z0-9._-]*$`, 'u').test(worktree.branch)
 
 const pathExists = async (path: string): Promise<boolean> => {
   try {

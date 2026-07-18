@@ -61,6 +61,92 @@ describe('GitAgentWorktreeManager', () => {
     })).rejects.toThrow(/unsafe Factory worktree path/u)
   })
 
+  it('checks out a verified numeric legacy PR head from origin without synthesizing it from base', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-legacy-pr-worktree-'))
+    const remote = join(root, 'remote.git')
+    const base = join(root, 'HoopsheetCheckout')
+    try {
+      await git(root, ['init', '--bare', remote])
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      await git(base, ['config', 'user.email', 'factory@example.test'])
+      await git(base, ['config', 'user.name', 'Factory Test'])
+      await writeFile(join(base, 'README.md'), '# hoopsheet\n', 'utf8')
+      await git(base, ['add', 'README.md'])
+      await git(base, ['commit', '-m', 'initial'])
+      await git(base, ['remote', 'add', 'origin', remote])
+      await git(base, ['push', '-u', 'origin', 'main'])
+      await git(base, ['switch', '-c', '26-league-schedule-timezone'])
+      await writeFile(join(base, 'timezone.md'), 'legacy PR head\n', 'utf8')
+      await git(base, ['add', 'timezone.md'])
+      await git(base, ['commit', '-m', 'fix schedule timezone'])
+      const remoteHead = (await git(base, ['rev-parse', 'HEAD'])).trim()
+      await git(base, ['push', 'origin', '26-league-schedule-timezone'])
+      await git(base, ['switch', 'main'])
+      const manager = new GitAgentWorktreeManager()
+      const worktreePath = factoryWorktreePath(base, '26', 'AgentWorkforce/hoopsheet', 'legacy26')
+      const worktree = {
+        repo: 'AgentWorkforce/hoopsheet',
+        issueKey: '26',
+        baseClonePath: base,
+        worktreePath,
+        branch: '26-league-schedule-timezone',
+        existingPullRequestBranch: true,
+      }
+      const manualWorktree = join(root, 'manual-hoopsheet-wt-26')
+      await git(base, ['worktree', 'add', manualWorktree, '26-league-schedule-timezone'])
+
+      await expect(manager.prepare(worktree)).rejects.toThrow(
+        /already checked out.*Factory will not reuse or remove a checkout outside/u,
+      )
+      expect(await git(manualWorktree, ['branch', '--show-current']))
+        .toBe('26-league-schedule-timezone\n')
+
+      await git(base, ['worktree', 'remove', manualWorktree])
+      await git(base, ['branch', '-D', '26-league-schedule-timezone'])
+
+      await manager.prepare(worktree)
+
+      expect(await git(worktreePath, ['branch', '--show-current']))
+        .toBe('26-league-schedule-timezone\n')
+      expect((await git(worktreePath, ['rev-parse', 'HEAD'])).trim()).toBe(remoteHead)
+      expect(await git(worktreePath, ['rev-parse', '--abbrev-ref', '@{upstream}']))
+        .toBe('origin/26-league-schedule-timezone\n')
+      await expect(stat(join(worktreePath, 'timezone.md'))).resolves.toMatchObject({})
+
+      await manager.cleanup(worktree)
+      await expect(stat(worktreePath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await git(base, ['branch', '-f', '26-league-schedule-timezone', 'main'])
+      await expect(manager.prepare(worktree)).rejects.toThrow(/Refusing to overwrite divergent local PR branch/u)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a numeric legacy branch unless Factory authorized the matching existing PR head', async () => {
+    const manager = new GitAgentWorktreeManager()
+    const base = '/work/hoopsheet'
+    const worktreePath = '/work/.factory-worktrees/hoopsheet/26-hoopsheet-legacy'
+
+    await expect(manager.prepare({
+      repo: 'AgentWorkforce/hoopsheet',
+      issueKey: '26',
+      baseClonePath: base,
+      worktreePath,
+      branch: '26-league-schedule-timezone',
+    })).rejects.toThrow(/unsafe Factory worktree branch/u)
+
+    await expect(manager.prepare({
+      repo: 'AgentWorkforce/hoopsheet',
+      issueKey: '27',
+      baseClonePath: base,
+      worktreePath,
+      branch: '26-league-schedule-timezone',
+      existingPullRequestBranch: true,
+    })).rejects.toThrow(/unsafe Factory worktree branch/u)
+  })
+
   it('prunes an unrelated deleted registration before validating an existing checkout', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-prune-'))
     const base = join(root, 'pear')
