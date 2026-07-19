@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
-import type { AgentMessage, AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
@@ -96,7 +96,7 @@ const RELEASE_RETRY_BACKOFF_MS = 250
 
 export class InternalFleetClient implements FleetClient {
   readonly placementLocality = 'local' as const
-  readonly promptDelivery = 'pty' as const
+  readonly durableOwnership = true
   readonly #client: HarnessDriverClientLike
   #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number
@@ -122,6 +122,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #agentExitSequences = new Map<string, number>()
   readonly #readyAgentNames = new Set<string>()
   readonly #activeSpawnedAgentNames = new Set<string>()
+  readonly #tracked = new Map<string, FleetTrackedAgent>()
   readonly #activeAgentsDrainedListeners = new Set<() => void>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
@@ -163,6 +164,7 @@ export class InternalFleetClient implements FleetClient {
       exitAfterTask: true,
     })
     const exitSequenceAtSpawnStart = this.#trackAgentStart(input.name)
+    this.#tracked.set(input.name, { invocationId: input.invocationId })
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -203,6 +205,7 @@ export class InternalFleetClient implements FleetClient {
     })
     const requestedName = input.name ?? input.sessionRef
     const exitSequenceAtSpawnStart = this.#trackAgentStart(requestedName)
+    this.#tracked.set(requestedName, {})
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -279,6 +282,35 @@ export class InternalFleetClient implements FleetClient {
     return {
       agents: agents.map((agent) => ({ name: agent.name })),
       nodes: [selfNode],
+    }
+  }
+
+  trackedAgents(): ReadonlyMap<string, FleetTrackedAgent> {
+    return this.#tracked
+  }
+
+  hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
+    this.#ensureEventSubscription()
+    for (const agent of agents) {
+      if (this.#tracked.has(agent.name)) continue
+      this.#clearAgentExitLatch(agent.name)
+      this.#tracked.set(agent.name, {
+        invocationId: agent.invocationId,
+        node: agent.node,
+      })
+      this.#activeSpawnedAgentNames.add(agent.name)
+    }
+  }
+
+  async reconcileTrackedAgents(): Promise<void> {
+    this.#ensureEventSubscription()
+    const online = new Set((await this.#client.listAgents()).map((agent) => agent.name))
+    for (const name of [...this.#tracked.keys()]) {
+      if (online.has(name)) continue
+      this.#emitAgentExit(name, 'reconciled-missing', {
+        key: `reconciled-missing:${name}`,
+        hasStableId: true,
+      })
     }
   }
 
@@ -461,6 +493,8 @@ export class InternalFleetClient implements FleetClient {
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
     this.#readyAgentNames.clear()
+    this.#tracked.clear()
+    this.#activeSpawnedAgentNames.clear()
     // If we started the broker, shut it down so the process can exit cleanly
     // (a spawned broker's owner-lease renewal otherwise keeps the event loop
     // alive). A reused broker is only disconnected — never shut down — so we
@@ -773,6 +807,8 @@ export class InternalFleetClient implements FleetClient {
     if (requestedName === actualName) return
 
     this.#activeSpawnedAgentNames.delete(requestedName)
+    const tracked = this.#tracked.get(requestedName)
+    this.#tracked.delete(requestedName)
     const actualExitSequence = this.#agentExitSequences.get(actualName) ?? 0
     const exitedDuringSpawn = this.#exitedAgentNames.has(actualName) && actualExitSequence > exitSequenceAtSpawnStart
     if (!exitedDuringSpawn) {
@@ -780,11 +816,13 @@ export class InternalFleetClient implements FleetClient {
       // lifetime of the broker-returned name and must not suppress tracking.
       this.#clearAgentExitLatch(actualName)
       this.#activeSpawnedAgentNames.add(actualName)
+      if (tracked) this.#tracked.set(actualName, tracked)
     }
     this.#notifyIfActiveAgentsDrained()
   }
 
   #trackAgentExit(name: string): void {
+    this.#tracked.delete(name)
     if (!this.#activeSpawnedAgentNames.delete(name)) return
     this.#notifyIfActiveAgentsDrained()
   }

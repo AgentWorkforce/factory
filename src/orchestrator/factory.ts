@@ -102,6 +102,7 @@ type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
+  legacyUnownedAgentsByIssue: Map<string, FactoryInFlightRegistryAgent[]>
 }
 type BabysitterWakeKind =
   | 'pull-request-state'
@@ -1592,6 +1593,7 @@ export class FactoryLoop implements Factory {
       ])
       const onlineAgents = new Set(roster.agents.map((agent) => agent.name))
       const activeIssueIdentities = new Set<string>()
+      const legacyUnownedAgentsByIssue = new Map<string, FactoryInFlightRegistryAgent[]>()
       for (const [, lifecycle] of lifecycles) {
         if (isTerminalDispatchLifecycle(lifecycle)) continue
         const identity = githubIssueRefIdentity(lifecycle.issue)
@@ -1604,11 +1606,24 @@ export class FactoryLoop implements Factory {
       for (const agent of registry?.agents ?? []) {
         if (!onlineAgents.has(agent.name) || !agent.issue) continue
         const identity = githubIssueRefIdentity(agent.issue)
-        if (identity) activeIssueIdentities.add(identity)
+        if (!identity) continue
+        const isLegacyLocalWorker = this.#usesDurableDispatchLifecycle() &&
+          this.#fleet.placementLocality === 'local' &&
+          !agent.node &&
+          !agent.invocationId &&
+          !activeIssueIdentities.has(identity)
+        if (isLegacyLocalWorker) {
+          const agents = legacyUnownedAgentsByIssue.get(identity) ?? []
+          agents.push(agent)
+          legacyUnownedAgentsByIssue.set(identity, agents)
+        } else {
+          activeIssueIdentities.add(identity)
+        }
       }
       return {
         activeIssueIdentities,
         onlineAgentNames: onlineAgents,
+        legacyUnownedAgentsByIssue,
       }
     } catch (error) {
       this.#increment('githubOrphanRecoveryContextFailures')
@@ -1635,10 +1650,17 @@ export class FactoryLoop implements Factory {
     ) return false
 
     const identity = githubIssueRefIdentity(issueRef(issue))
+    const legacyUnownedAgents = identity
+      ? (context.legacyUnownedAgentsByIssue.get(identity) ?? [])
+        .filter((agent) => githubAgentNameMatchesIssue(agent.name, issue))
+      : []
+    const legacyUnownedAgentNames = new Set(legacyUnownedAgents.map((agent) => agent.name))
     if (
       !identity ||
       context.activeIssueIdentities.has(identity) ||
-      [...context.onlineAgentNames].some((name) => githubAgentNameMatchesIssue(name, issue))
+      [...context.onlineAgentNames].some((name) =>
+        githubAgentNameMatchesIssue(name, issue) && !legacyUnownedAgentNames.has(name)
+      )
     ) {
       this.#increment('githubOrphanRecoveriesBlockedActive')
       return false
@@ -1679,7 +1701,7 @@ export class FactoryLoop implements Factory {
     if (openPr) {
       let adopted = false
       try {
-        adopted = await this.#adoptOrphanedGithubPullRequest(issue, openPr)
+        adopted = await this.#adoptOrphanedGithubPullRequest(issue, openPr, legacyUnownedAgents)
       } catch (error) {
         this.#increment('githubOrphanedPullRequestAdoptionFailures')
         this.#logger.warn?.('[factory] could not adopt orphaned in-progress GitHub issue at its open PR', {
@@ -1697,6 +1719,15 @@ export class FactoryLoop implements Factory {
         repo: openPr.repo,
         prNumber: openPr.prNumber,
       })
+      return false
+    }
+
+    // A pre-durable local Factory may have left live, registry-proven workers
+    // without a lifecycle record. They are safe to adopt only once their open
+    // PR proves which dispatch they own. Without that proof, preserve the issue
+    // and workers instead of redispatching duplicate agents.
+    if (legacyUnownedAgents.length > 0) {
+      this.#increment('githubOrphanRecoveriesBlockedActive')
       return false
     }
 
@@ -1737,7 +1768,11 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  async #adoptOrphanedGithubPullRequest(issue: LinearIssue, pr: ResolvedIssuePr): Promise<boolean> {
+  async #adoptOrphanedGithubPullRequest(
+    issue: LinearIssue,
+    pr: ResolvedIssuePr,
+    legacyUnownedAgents: FactoryInFlightRegistryAgent[] = [],
+  ): Promise<boolean> {
     const headRef = pr.headRef
     if (!headRef) return false
     const explicitlyForeignHead = pr.crossRepository === true ||
@@ -1785,14 +1820,14 @@ export class FactoryLoop implements Factory {
       }
     }
 
-    const durableRemoteAdoption = this.#fleet.placementLocality === 'remote'
+    const durableAdoption = this.#usesDurableDispatchLifecycle()
     const publishedPr: GithubPublishPullRequestResult = {
       repo: pr.repo,
       number: pr.prNumber,
       url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
       headRef,
     }
-    if (durableRemoteAdoption) {
+    if (durableAdoption) {
       const claim = await this.#claimDispatchLifecycle(decision, false, randomUUID(), {
         phase: 'published',
         pullRequest: publishedPr,
@@ -1809,7 +1844,7 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const record = batch.start(decision, false)
     if (!record) {
-      if (durableRemoteAdoption) {
+      if (durableAdoption) {
         const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
         if (durable) {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(durable))
@@ -1818,6 +1853,44 @@ export class FactoryLoop implements Factory {
         }
       }
       return false
+    }
+    if (durableAdoption && legacyUnownedAgents.length > 0) {
+      const specsByName = new Map(dispatchSpecs(record.decision).map((spec) => [spec.name, spec]))
+      const initialBabysitter = babysitterSpec(issue, this.#config, route)
+      const sharedCheckout = record.decision.implementers.find((candidate) =>
+        candidate.repo === initialBabysitter.repo && candidate.baseClonePath && candidate.clonePath
+      )
+      const legacyBabysitter: AgentSpec = {
+        ...initialBabysitter,
+        ...(sharedCheckout
+          ? {
+              baseClonePath: sharedCheckout.baseClonePath,
+              clonePath: sharedCheckout.clonePath,
+              ...(headRef ? { branch: headRef } : {}),
+              ...(sharedCheckout.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
+            }
+          : {}),
+        ownedPullRequest: { repo: pr.repo, number: pr.prNumber, path: pr.path },
+      }
+      specsByName.set(legacyBabysitter.name, legacyBabysitter)
+      const adopted = []
+      for (const agent of legacyUnownedAgents) {
+        const spec = specsByName.get(agent.name)
+        if (!spec) continue
+        const invocationId = batch.invocationIdFor(record.issue, spec)
+        batch.recordSpawn(record, spec, invocationId, {
+          name: agent.name,
+          sessionRef: agent.sessionRef,
+          pids: agent.pids,
+          locality: 'local',
+        })
+        adopted.push({ name: agent.name, invocationId })
+      }
+      if (adopted.length > 0) {
+        this.#fleet.hydrateTracked?.(adopted)
+        await this.#saveDispatchLifecycle(record, 'published', publishedPr)
+        for (const _agent of adopted) this.#increment('legacyLocalWorkersAdopted')
+      }
     }
     await this.#ensureBabysitter(record, {
       repo: pr.repo,
@@ -1828,16 +1901,20 @@ export class FactoryLoop implements Factory {
     })
     const babysitter = [...record.agents.values()].find((tracked) => tracked.spec.role === 'babysitter')
     if (!babysitter) {
-      if (durableRemoteAdoption) this.#scheduleDispatchLifecycleRetry(record)
+      if (durableAdoption) this.#scheduleDispatchLifecycleRetry(record)
       else batch.abandon(record.issue)
       return false
     }
     record.result = {
       issue: record.issue,
-      agents: [{ name: babysitter.result?.name ?? babysitter.spec.name, role: 'babysitter' }],
+      agents: [...record.agents.values()].map((tracked) => ({
+        name: tracked.result?.name ?? tracked.spec.name,
+        role: tracked.spec.role,
+      })),
       dryRun: false,
     }
     await this.#writeInFlightRegistry()
+    if (durableAdoption) await this.#saveDispatchLifecycle(record, 'running', publishedPr)
     this.#increment('githubOrphanedPullRequestsAdopted')
     return true
   }
@@ -2047,7 +2124,7 @@ export class FactoryLoop implements Factory {
     if (existingRecord?.result) {
       return existingRecord.result
     }
-    if (!dryRun && this.#fleet.placementLocality === 'remote') {
+    if (!dryRun && this.#usesDurableDispatchLifecycle()) {
       const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
       if (durable && !isTerminalDispatchLifecycle(durable)) {
         if (durable.result && this.#dispatchLifecycleEpochs.has(issueKey(decision.issue))) {
@@ -2123,19 +2200,19 @@ export class FactoryLoop implements Factory {
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
-    const durableRemoteDispatch = !dryRun && this.#fleet.placementLocality === 'remote'
+    const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
     // ones. Without it, every worker starts in the configured shared checkout
     // and concurrent issues can switch each other back to the base branch.
     const isolateLocalWorktree = this.#fleet.placementLocality === 'local' && Boolean(this.#worktrees)
-    const lifecycleRunId = !dryRun && (durableRemoteDispatch || isolateLocalWorktree) ? randomUUID() : undefined
+    const lifecycleRunId = !dryRun && (durableDispatch || isolateLocalWorktree) ? randomUUID() : undefined
     if (lifecycleRunId) {
       dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId, {
         isolateLocalWorktree,
       })
     }
     dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
-    if (durableRemoteDispatch) {
+    if (durableDispatch) {
       const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun, lifecycleRunId)
       this.#consumePendingDispatchClarifications(dispatchDecision.issue)
       dispatchDecision = structuredClone(lifecycleClaim.lifecycle.decision)
@@ -2154,7 +2231,7 @@ export class FactoryLoop implements Factory {
         if (restored.result) return restored.result
       }
     }
-    if (!durableRemoteDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
+    if (!durableDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
@@ -2335,7 +2412,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  // Remote backends survive orchestrator restarts: re-adopt the agents recorded
+  // Durable backends survive orchestrator restarts: re-adopt the agents recorded
   // in the durable lifecycle store, restore their full batch/spec association,
   // then reconcile once so exits that happened while this process was down are
   // handled instead of being dropped as unknown agents.
@@ -2380,7 +2457,9 @@ export class FactoryLoop implements Factory {
         for (const agent of claim.lifecycle.agents) {
           const invocationId = agent.tracked.spec.invocationId
           const node = agent.tracked.result?.node
-          if (invocationId || node) agents.push({ name: agent.name, invocationId, node })
+          if (invocationId || node || agent.tracked.result) {
+            agents.push({ name: agent.name, invocationId, node })
+          }
         }
       }
       // Migration fallback for registries written before durable lifecycle
@@ -2476,6 +2555,10 @@ export class FactoryLoop implements Factory {
     return { created: claim.created, lifecycle: claim.lifecycle }
   }
 
+  #usesDurableDispatchLifecycle(): boolean {
+    return this.#fleet.durableOwnership ?? this.#fleet.placementLocality === 'remote'
+  }
+
   async #saveDispatchLifecycle(
     record: InFlightIssue,
     phase: DispatchLifecyclePhase,
@@ -2483,7 +2566,7 @@ export class FactoryLoop implements Factory {
     releaseReason?: string,
     releasedAgentNames: ReadonlySet<string> = new Set(),
   ): Promise<boolean> {
-    if (record.dryRun || this.#fleet.placementLocality !== 'remote') return true
+    if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     const key = issueKey(record.issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) {
@@ -2550,7 +2633,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleReleaseRetry(record: InFlightIssue, reason: string): void {
-    if (this.#fleet.placementLocality === 'remote') {
+    if (this.#usesDurableDispatchLifecycle()) {
       this.#scheduleDispatchLifecycleRetry(record)
       return
     }
@@ -2778,13 +2861,13 @@ export class FactoryLoop implements Factory {
       this.#scheduleReleaseRetry(record, reason)
       return false
     }
-    const next = this.#fleet.placementLocality === 'remote' ? undefined : batch.complete(record.issue)
+    const next = this.#usesDurableDispatchLifecycle() ? undefined : batch.complete(record.issue)
     this.#localReleaseCheckpoints.delete(releaseKey)
     if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
     // Terminal lifecycle saves intentionally relinquish the owner epoch. Clear
     // the babysitter's durable ownership/wake/critical state while that epoch
     // is still valid so a later reopened issue cannot inherit a stale PR owner.
-    if (this.#fleet.placementLocality === 'remote' && this.#config.babysitter.enabled) {
+    if (this.#usesDurableDispatchLifecycle() && this.#config.babysitter.enabled) {
       await this.#cancelBabysitterWake(issueKey(record.issue))
     }
     if (!await this.#saveDispatchLifecycle(record, 'complete')) return false
@@ -2800,7 +2883,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #assertIssueDispatchLifecycleOwner(issue: IssueRef): Promise<boolean> {
-    if (this.#fleet.placementLocality !== 'remote') return true
+    if (!this.#usesDurableDispatchLifecycle()) return true
     const key = issueKey(issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) return false
@@ -3901,7 +3984,7 @@ export class FactoryLoop implements Factory {
 
     const exiting = record.agents.get(name)
 
-    if (this.#fleet.placementLocality === 'remote') {
+    if (this.#usesDurableDispatchLifecycle()) {
       const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
       if (lifecycle?.phase === 'parking') {
         this.#increment('clarificationParkingExitsSuppressed')
@@ -6316,7 +6399,7 @@ export class FactoryLoop implements Factory {
 
   async #cancelBabysitterWake(issueIdentity: string): Promise<void> {
     const issue = this.#babysitterIssueRefs.get(issueIdentity)
-    const mayClearDurable = this.#fleet.placementLocality !== 'remote'
+    const mayClearDurable = !this.#usesDurableDispatchLifecycle()
       || Boolean(issue && await this.#assertIssueDispatchLifecycleOwner(issue))
     for (const [key, state] of this.#babysitterWakeStates) {
       if (issueKey(state.issue) !== issueIdentity) continue
@@ -6591,18 +6674,7 @@ export class FactoryLoop implements Factory {
       }
 
       let targets: string[]
-      if (this.#fleet.promptDelivery === 'pty') {
-        if (!this.#fleet.sendInput) {
-          throw new Error('Fleet client advertises PTY prompt delivery without raw input support')
-        }
-        // Internal agents are harness-owned PTYs, not Relaycast identities.
-        // Stage the validated metadata-only wake directly through the broker so
-        // a missing Relaycast registration cannot strand a live babysitter.
-        // The CR remains a separate write: a critical-section begin can arrive
-        // while this write is in flight and must be able to defer submission.
-        await this.#fleet.sendInput(input.to, input.text)
-        targets = [input.to]
-      } else if (!this.#fleet.waitForInjected) {
+      if (!this.#fleet.waitForInjected) {
         await this.#fleet.sendMessage(input)
         if (this.#stopping || state.cancelled) {
           state.deliveringKinds = undefined
@@ -7079,7 +7151,12 @@ export class FactoryLoop implements Factory {
         babysitter: spawned.name,
       })
 
-      if (this.#fleet.waitForInjected) {
+      // Internal PTY spawns receive `task` atomically in spawnPty. Re-sending
+      // the same task through Relaycast before the worker has registered its
+      // messaging identity can fail an otherwise successful spawn and erase
+      // valid babysitter ownership. Remote placement still needs the explicit,
+      // confirmed follow-up injection used by its spawn protocol.
+      if (this.#fleet.waitForInjected && this.#fleet.placementLocality !== 'local') {
         const input = {
           to: tracked?.result?.name ?? spawned.name,
           text: task,
@@ -7323,7 +7400,7 @@ export class FactoryLoop implements Factory {
 
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
       releaseReasonForRetry = releaseReason
-      if (this.#fleet.placementLocality === 'remote') {
+      if (this.#usesDurableDispatchLifecycle()) {
         // Durable capacity is released as soon as terminal writeback is
         // acknowledged. Agent cleanup remains fenced/retryable in `releasing`.
         const batch = await this.#batch()
@@ -7348,7 +7425,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterPr.delete(completionKey)
       await this.#cancelBabysitterWake(completionKey)
       const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
-      if (this.#fleet.placementLocality !== 'remote' || (durable && isTerminalDispatchLifecycle(durable))) {
+      if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
         for (const publishedKey of this.#publishedPullRequests.keys()) {
           if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
         }
@@ -8561,7 +8638,7 @@ export class FactoryLoop implements Factory {
 
       let lifecycleDecision = waiting.decision
       let promotedLifecycle: DispatchLifecycle | undefined
-      if (!waiting.dryRun && this.#fleet.placementLocality === 'remote') {
+      if (!waiting.dryRun && this.#usesDurableDispatchLifecycle()) {
         try {
           const claim = await this.#claimDispatchLifecycle(waiting.decision, false)
           const lifecycleKey = issueKey(waiting.issue)
@@ -11207,7 +11284,7 @@ const failedIterationReport = (error: unknown, dryRun: boolean): IterationReport
 
 const isRegistrationLagInjectionError = (error: unknown): boolean => {
   const { errorMessage } = describeError(error)
-  return /recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
+  return /agent_not_found|recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
 }
 

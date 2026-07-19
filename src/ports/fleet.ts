@@ -64,11 +64,10 @@ export interface FleetClient {
   /** Backend-wide placement locality, used when recovering a spawn ack crash gap. */
   readonly placementLocality?: 'local' | 'remote'
   /**
-   * How follow-up prompts can be delivered to an already-running agent.
-   * `pty` means `sendInput` can stage prompt text directly in the owned PTY;
-   * callers submit it separately with a carriage return.
+   * The backend can re-adopt spawned workers after an orchestrator restart.
+   * Backends that enable this must implement the tracked-agent hydration hooks.
    */
-  readonly promptDelivery?: 'message' | 'pty'
+  readonly durableOwnership?: boolean
   /** Durable Relay action agents invoke instead of messaging a named control identity. */
   readonly lifecycleActionName?: string
   spawn(input: SpawnInput): Promise<SpawnResult>
@@ -94,8 +93,8 @@ export interface FleetClient {
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
-  // Remote backends track spawned-and-not-exited agents so the orchestrator can
-  // persist them for crash recovery and re-adopt them after a restart.
+  // Durable backends track spawned-and-not-exited agents so the orchestrator
+  // can persist them for crash recovery and re-adopt them after a restart.
   trackedAgents?(): ReadonlyMap<string, FleetTrackedAgent>
   hydrateTracked?(agents: Array<{ name: string; invocationId?: string; node?: string }>): void
   reconcileTrackedAgents?(): Promise<void>

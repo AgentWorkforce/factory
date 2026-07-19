@@ -620,6 +620,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   }
 }
 
+class LocalLifecycleFleetClient extends FakeFleetClient {
+  readonly durableOwnership = true
+}
+
 class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
   failReleaseFor?: string
   releaseFailures = 0
@@ -946,15 +950,19 @@ class RosterPidHarnessClient implements HarnessDriverClientLike {
   }
 }
 
-class MissingRelaycastBabysitterHarnessClient extends RosterPidHarnessClient {
+class RegistrationLagBabysitterHarnessClient extends RosterPidHarnessClient {
   babysitterRelaycastLookups = 0
+  failedFirstWake = false
 
   override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
     if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
       this.babysitterRelaycastLookups += 1
-      throw new Error(
-        `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
-      )
+      if (!this.failedFirstWake) {
+        this.failedFirstWake = true
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
     }
     return await super.sendMessage(input)
   }
@@ -2413,6 +2421,112 @@ describe('FactoryLoop', () => {
       const report = await factory.runOnce()
 
       expect(report.dispatched).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveriesBlockedActive).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('adopts legacy local workers into durable ownership when their open PR proves the dispatch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-legacy-local-agents-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 55)
+      const registryPath = join(root, 'registry.json')
+      const issue = { uuid: 'AgentWorkforce/pear#55', key: '55', path }
+      const agentNames = ['ar-55-impl-pear', 'ar-55-review-pear', 'ar-55-babysit-pear']
+      await writeFile(registryPath, JSON.stringify({
+        pid: process.pid,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: agentNames.map((name) => ({
+          name,
+          role: name.includes('-impl-') ? 'implementer' : name.includes('-review-') ? 'reviewer' : 'babysitter',
+          issue,
+          sessionRef: `session-${name}`,
+          pids: [],
+        })),
+      }))
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(55, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new LocalLifecycleFleetClient()
+      fleet.hydrateTracked(agentNames.map((name) => ({ name })))
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const factory = createFactory(config({
+        issueSource: 'github',
+        babysitter: { enabled: true },
+        loop: { registryPath },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrResolver: async () => ({
+          repo: 'AgentWorkforce/pear',
+          prNumber: 155,
+          headRef: 'factory/55-agentworkforce-pear-proof',
+          headRepo: 'AgentWorkforce/pear',
+          crossRepository: false,
+          state: 'OPEN',
+        }),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      expect(factory.status().counters.legacyLocalWorkersAdopted).toBe(3)
+      expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
+      expect(factory.status().inFlight.map((inFlight) => inFlight.key)).toEqual(['55'])
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+        phase: 'running',
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 155,
+          headRef: 'factory/55-agentworkforce-pear-proof',
+        },
+        agents: expect.arrayContaining(agentNames.map((name) => expect.objectContaining({ name }))),
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not redispatch a legacy local worker until an open PR proves what it owns', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-unproven-local-agent-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 55)
+      const registryPath = join(root, 'registry.json')
+      const issue = { uuid: 'AgentWorkforce/pear#55', key: '55', path }
+      await writeFile(registryPath, JSON.stringify({
+        pid: process.pid,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: [{ name: 'ar-55-impl-pear', role: 'implementer', issue, pids: [] }],
+      }))
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(55, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      })
+      const fleet = new LocalLifecycleFleetClient()
+      fleet.hydrateTracked([{ name: 'ar-55-impl-pear' }])
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath },
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrResolver: async () => undefined,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(fleet.spawns).toEqual([])
       expect(githubWriteback.statuses).toEqual([])
       expect(factory.status().counters.githubOrphanRecoveriesBlockedActive).toBe(1)
     } finally {
@@ -4418,6 +4532,66 @@ describe('FactoryLoop', () => {
       await duplicate.stop()
     } finally {
       releasePublish()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-adopts live internal workers from durable lifecycle state after an owner restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-owner-restart-'))
+    const watchStatePath = join(root, 'state.json')
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issue = issueFile(590)
+    const mount = new FakeMountClient({ [issuePath(590)]: issue })
+    const harness = new RosterPidHarnessClient()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const options = {
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' as const }),
+      readChildPids: async () => [],
+    }
+    const factoryConfig = config({ loop: { registryPath, heartbeatPath } })
+    const firstFleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      ...options,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(590), issue))
+      await first.dispatch(decision)
+      const names = ['ar-590-impl-pear', 'ar-590-review']
+      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+        phase: 'running',
+        agents: names.map((name) => expect.objectContaining({
+          name,
+          tracked: expect.objectContaining({ result: expect.objectContaining({ name }) }),
+        })),
+      })
+
+      await first.stop()
+      for (const name of names) harness.agents.set(name, { name })
+      const spawnCountBeforeRestart = harness.spawned.length
+      const restartedFleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        ...options,
+      })
+
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      expect(restarted.status().inFlight.map((entry) => entry.key)).toEqual(['AR-590'])
+      expect([...restartedFleet.trackedAgents().keys()].sort()).toEqual(names)
+      expect(harness.spawned).toHaveLength(spawnCountBeforeRestart)
+    } finally {
+      await restarted?.stop()
       await first.stop()
       await rm(root, { recursive: true, force: true })
     }
@@ -14332,10 +14506,10 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
-  it('delivers internal babysitter event wakes through the owned PTY without a Relaycast name lookup', async () => {
-    const issue = realIssueFile(421, ready, { title: 'Real internal babysitter PTY wake' })
+  it('retries internal babysitter wakes at a confirmed safe boundary without staging prompt text in the PTY', async () => {
+    const issue = realIssueFile(421, ready, { title: 'Real internal babysitter safe wake' })
     const mount = new FakeMountClient({ [issuePath(421)]: issue })
-    const harness = new MissingRelaycastBabysitterHarnessClient()
+    const harness = new RegistrationLagBabysitterHarnessClient()
     const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
     const factory = createFactory(babysitterConfig(), {
       mount,
@@ -14359,7 +14533,6 @@ describe('FactoryLoop PR babysitter', () => {
       } })
       mount.emit(changeEvent(prPath, 'pr-421-open'))
       await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-421-babysit'))
-      await vi.waitFor(() => expect(harness.inputs).toContainEqual({ name: 'ar-421-babysit', data: '\r' }))
       const inputsBefore = harness.inputs.length
 
       mount.files.set('/github/repos/AgentWorkforce/pear/comments/9421.json', { content: {
@@ -14369,15 +14542,16 @@ describe('FactoryLoop PR babysitter', () => {
       } })
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9421.json', 'comment-9421'))
 
-      await vi.waitFor(() => expect(harness.inputs.length).toBe(inputsBefore + 2), { timeout: 3_000 })
-      const [stagedWake, submit] = harness.inputs.slice(inputsBefore)
-      expect(stagedWake).toMatchObject({ name: 'ar-421-babysit' })
-      expect(stagedWake?.data).toContain('<integration-event source="github" trust="validated-metadata-only">')
-      expect(stagedWake?.data).toContain('AgentWorkforce/pear#421')
-      expect(stagedWake?.data).toContain('review-comment')
-      expect(stagedWake?.data).not.toContain('untrusted provider text')
-      expect(submit).toEqual({ name: 'ar-421-babysit', data: '\r' })
-      expect(harness.babysitterRelaycastLookups).toBe(0)
+      await vi.waitFor(() => expect(harness.inputs.length).toBe(inputsBefore + 1), { timeout: 4_000 })
+      expect(harness.inputs.slice(inputsBefore)).toEqual([{ name: 'ar-421-babysit', data: '\r' }])
+      const deliveredWake = harness.sent.find((message) => message.text.startsWith('<integration-event'))
+      expect(deliveredWake).toMatchObject({ to: 'ar-421-babysit', mode: 'wait' })
+      expect(deliveredWake?.text).toContain('AgentWorkforce/pear#421')
+      expect(deliveredWake?.text).toContain('review-comment')
+      expect(deliveredWake?.text).not.toContain('untrusted provider text')
+      expect(harness.inputs.some((input) => input.data.includes('<integration-event'))).toBe(false)
+      expect(harness.babysitterRelaycastLookups).toBe(2)
+      expect(factory.status().counters.injectionRegistrationLagRetries).toBe(1)
       expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1)
       expect(factory.status().counters.babysitterEventWakeFailures).toBeUndefined()
     } finally {
@@ -14973,7 +15147,7 @@ describe('FactoryLoop PR babysitter', () => {
       expect(fleet.failedWake).toBe(true)
       expect(factory.status().counters.babysitterEventWakeFailures).toBe(1)
       expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1)
-      expect(fleet.inputs.filter((input) => input.name === 'ar-425-babysit')).toHaveLength(2) // initial task + one wake
+      expect(fleet.inputs.filter((input) => input.name === 'ar-425-babysit')).toHaveLength(1) // one confirmed wake submit
     } finally {
       await factory.stop()
     }

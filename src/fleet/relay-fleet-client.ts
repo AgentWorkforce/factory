@@ -82,6 +82,7 @@ const DEFAULT_REGISTRATION_GRACE_MS = 60_000
 
 export class RelayFleetClient implements FleetClient {
   readonly placementLocality = 'remote' as const
+  readonly durableOwnership = true
   readonly lifecycleActionName: string
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
