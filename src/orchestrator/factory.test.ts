@@ -544,6 +544,15 @@ class SpawnFailingFleetClient extends FakeFleetClient {
   }
 }
 
+class SpawnDeliveryFailingFleetClient extends FakeFleetClient {
+  override readonly durableOwnership = true
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    this.spawns.push(input)
+    throw new Error(`recipient unavailable: ${input.name}`)
+  }
+}
+
 // Mimics the broker rejecting a resume because it never released the agent's
 // name on exit (relay#1116-family): http 500 "agent '<name>' already exists".
 class ResumeNameCollisionFleetClient extends FakeFleetClient {
@@ -636,6 +645,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 
 class LocalLifecycleFleetClient extends FakeFleetClient {
   readonly durableOwnership = true
+}
+
+class DurableSpawnFailingFleetClient extends SpawnFailingFleetClient {
+  override readonly durableOwnership = true
 }
 
 class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
@@ -2068,11 +2081,13 @@ describe('FactoryLoop', () => {
       [racedPath]: racedReady,
       [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
     })
-    const fleet = new FakeFleetClient()
+    const fleet = new LocalLifecycleFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const reporter = new RecordingFactoryEventReporter()
     const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
       mount,
       fleet,
+      reporter,
       triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
       ...(withWorktrees ? { worktrees } : {}),
@@ -2097,6 +2112,15 @@ describe('FactoryLoop', () => {
     ])
     expect(factory.status().counters.dispatchLiveStateRaces).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
+    expect(reporter.events
+      .filter((event) => event.type === 'agent.released')
+      .map((event) => event.attributes?.releaseReason))
+      .toEqual(['source_state_changed', 'source_state_changed'])
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      phase: 'abandoned',
+      status: 'cancelled',
+      attributes: { cancellationReason: 'source_state_changed' },
+    })
     },
   )
 
@@ -14257,13 +14281,15 @@ describe('FactoryLoop PR babysitter', () => {
   it('releases a planned agent and cleans its worktree when the spawn ack fails', async () => {
     const issue = realIssueFile(409, ready, { title: '[factory-e2e] Failed spawn worktree cleanup' })
     const mount = new FakeMountClient({ [issuePath(409)]: issue })
-    const fleet = new SpawnFailingFleetClient()
+    const fleet = new DurableSpawnFailingFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const reporter = new RecordingFactoryEventReporter()
     const cleanupReleaseCounts: number[] = []
     worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
-    const factory = createFactory(config(), {
+    const factory = createFactory(config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }), {
       mount,
       fleet,
+      reporter,
       triage: new StaticTriage(),
       worktrees,
     })
@@ -14275,6 +14301,32 @@ describe('FactoryLoop PR babysitter', () => {
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([1])
     expect(factory.status().inFlight).toEqual([])
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      status: 'cancelled',
+      attributes: { cancellationReason: 'agent_spawn_failed' },
+    })
+  })
+
+  it('categorizes dispatch delivery failures without forwarding provider messages', async () => {
+    const issue = realIssueFile(411, ready, { title: '[factory-e2e] Failed spawn delivery' })
+    const mount = new FakeMountClient({ [issuePath(411)]: issue })
+    const fleet = new SpawnDeliveryFailingFleetClient()
+    const reporter = new RecordingFactoryEventReporter()
+    const factory = createFactory(config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }), {
+      mount,
+      fleet,
+      reporter,
+      triage: new StaticTriage(),
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(411), issue))))
+      .rejects.toThrow('recipient unavailable')
+
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      status: 'cancelled',
+      attributes: { cancellationReason: 'agent_delivery_failed' },
+    })
+    expect(JSON.stringify(reporter.events)).not.toContain('recipient unavailable')
   })
 
   it('retries transient local worktree cleanup without re-releasing completed agents', async () => {

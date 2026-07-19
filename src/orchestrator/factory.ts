@@ -84,6 +84,7 @@ import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
   createFactoryCloudEventV1,
   factoryCloudReleaseReasonV1,
+  type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
 
@@ -2321,8 +2322,10 @@ export class FactoryLoop implements Factory {
       // acknowledged spawns, so cleanup never races a name-only survivor.
       const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
       await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
-      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
       const liveStateChanged = error instanceof LiveDispatchStateChangedError
+      const cancellationReason = factoryCloudDispatchCancellationReason(error)
+      const cleanupReason = liveStateChanged ? 'live dispatch state changed' : 'dispatch failed'
+      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs, cleanupReason)
       if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
         const failed = await this.#releaseAndTerminateAgents(
           failureHandoffs.map((handoff) => [handoff.name, handoff.tracked]),
@@ -2342,12 +2345,26 @@ export class FactoryLoop implements Factory {
       let failedState: { terminal: boolean } | undefined
       if (liveStateChanged) {
         await this.#clearDispatchInFlight(decision.issue)
-        await this.#saveDispatchLifecycle(record, 'abandoned')
+        await this.#saveDispatchLifecycle(
+          record,
+          'abandoned',
+          undefined,
+          undefined,
+          new Set(),
+          { cancellationReason },
+        )
         this.#increment('dispatchLiveStateRaces')
       } else {
         await this.#recordDispatchFailure(decision.issue)
         failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-        await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+        await this.#saveDispatchLifecycle(
+          record,
+          failedState?.terminal ? 'abandoned' : 'retryable',
+          undefined,
+          undefined,
+          new Set(),
+          { cancellationReason: failedState?.terminal ? cancellationReason : undefined },
+        )
       }
       batch.abandon(decision.issue)
       if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
@@ -2606,6 +2623,7 @@ export class FactoryLoop implements Factory {
       level?: FactoryCloudEventInputV1['level']
       previousPhase?: DispatchLifecyclePhase
       errorCode?: string
+      cancellationReason?: FactoryCloudCancellationReasonV1
     } = {},
   ): Promise<void> {
     await this.#report({
@@ -2626,6 +2644,7 @@ export class FactoryLoop implements Factory {
         operation: 'save_lifecycle',
         previousPhase: options.previousPhase,
         errorCode: options.errorCode,
+        cancellationReason: options.cancellationReason,
         dryRun: lifecycle.dryRun,
         trackedAgents: lifecycle.agents.length,
       },
@@ -2671,6 +2690,7 @@ export class FactoryLoop implements Factory {
     pullRequest?: GithubPublishPullRequestResult,
     releaseReason?: string,
     releasedAgentNames: ReadonlySet<string> = new Set(),
+    telemetry: { cancellationReason?: FactoryCloudCancellationReasonV1 } = {},
   ): Promise<boolean> {
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     const key = issueKey(record.issue)
@@ -2719,7 +2739,7 @@ export class FactoryLoop implements Factory {
           : lifecycle.phase === 'abandoned'
             ? 'run.cancelled'
             : 'run.phase_changed',
-        { previousPhase: previous?.phase },
+        { previousPhase: previous?.phase, cancellationReason: telemetry.cancellationReason },
       )
     }
     if (isTerminalDispatchLifecycle(lifecycle)) {
@@ -3917,11 +3937,14 @@ export class FactoryLoop implements Factory {
     return [...handoffs.values()]
   }
 
-  async #teardownFailedDispatchWorktrees(handoffs: RegistryHandoffAgent[]): Promise<boolean> {
+  async #teardownFailedDispatchWorktrees(
+    handoffs: RegistryHandoffAgent[],
+    releaseReason = 'dispatch failed',
+  ): Promise<boolean> {
     if (!this.#worktrees || !handoffs.some((handoff) => handoff.worktree)) return false
     const failed = await this.#releaseAndTerminateAgents(
       handoffs.map((handoff) => [handoff.name, handoff.tracked]),
-      'dispatch failed',
+      releaseReason,
       'completion',
     )
     if (failed.length > 0) return false
@@ -4083,10 +4106,15 @@ export class FactoryLoop implements Factory {
         channel: spec.channel,
       })
     } catch (error) {
-      throw contextualError(
+      const wrapped = contextualError(
         `Dispatch spawn failed for ${record.issue.key}/${spec.name} (${spec.capability}) cwd=${spec.clonePath ?? 'default'}`,
         error,
       )
+      throw Object.assign(wrapped, {
+        factoryCancellationReason: isDispatchDeliveryError(error)
+          ? 'agent_delivery_failed' as const
+          : 'agent_spawn_failed' as const,
+      })
     }
     batch.recordSpawn(record, spec, invocationId, result)
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
@@ -11512,6 +11540,21 @@ const isRegistrationLagInjectionError = (error: unknown): boolean => {
   const { errorMessage } = describeError(error)
   return /agent_not_found|recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
+}
+
+const isDispatchDeliveryError = (error: unknown): boolean => {
+  if (isRegistrationLagInjectionError(error)) return true
+  const { errorMessage } = describeError(error)
+  return /delivery[_ -]failed|dead-lettered|max delivery retries exceeded/iu.test(errorMessage)
+}
+
+const factoryCloudDispatchCancellationReason = (error: unknown): FactoryCloudCancellationReasonV1 => {
+  if (error instanceof LiveDispatchStateChangedError) return 'source_state_changed'
+  if (error && typeof error === 'object' && 'factoryCancellationReason' in error) {
+    const reason = error.factoryCancellationReason
+    if (reason === 'agent_spawn_failed' || reason === 'agent_delivery_failed') return reason
+  }
+  return 'dispatch_failed'
 }
 
 const telemetryRunStatus = (

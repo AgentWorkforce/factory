@@ -87,7 +87,9 @@ describe('Factory cloud event v1 contract', () => {
 
   it('maps raw fleet exit reasons to a closed privacy-safe category', () => {
     expect(factoryCloudReleaseReasonV1('node-offline')).toBe('node_offline')
+    expect(factoryCloudReleaseReasonV1('worker_exited')).toBe('exited')
     expect(factoryCloudReleaseReasonV1('max delivery retries exceeded')).toBe('delivery_failed')
+    expect(factoryCloudReleaseReasonV1('live dispatch state changed')).toBe('source_state_changed')
     expect(factoryCloudReleaseReasonV1('customer path /private/repo failed')).toBe('other')
     expect(factoryCloudReleaseReasonV1(undefined)).toBeUndefined()
 
@@ -96,6 +98,24 @@ describe('Factory cloud event v1 contract', () => {
       occurredAt: '2026-07-19T12:00:00.000Z',
       type: 'agent.exited',
       attributes: { releaseReason: 'customer-private-reason' },
+    })).toThrow()
+  })
+
+  it('accepts only closed cancellation reasons', () => {
+    const cancelled = createFactoryCloudEventV1({
+      type: 'run.cancelled',
+      runId: 'run-cancelled',
+      status: 'cancelled',
+      attributes: { cancellationReason: 'agent_delivery_failed' },
+    })
+    expect(cancelled.attributes?.cancellationReason).toBe('agent_delivery_failed')
+
+    expect(() => FactoryCloudEventInputV1Schema.parse({
+      id: 'event-private-cancellation',
+      occurredAt: '2026-07-19T12:00:00.000Z',
+      type: 'run.cancelled',
+      runId: 'run-private-cancellation',
+      attributes: { cancellationReason: 'recipient unavailable: /private/customer/repo' },
     })).toThrow()
   })
 
