@@ -136,6 +136,7 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       ? Number.POSITIVE_INFINITY
       : this.#now() + Math.max(0, options.deadlineMs)
     let operation = this.#flushInFlight
+    const joinedInFlight = operation !== undefined
     if (!operation) {
       operation = this.#flush(deadlineAt).finally(() => {
         if (this.#flushInFlight === operation) this.#flushInFlight = undefined
@@ -150,7 +151,19 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       })
       this.#flushInFlight = operation
     }
-    return await this.#awaitFlush(operation, deadlineAt)
+    const result = await this.#awaitFlush(operation, deadlineAt)
+    if (
+      joinedInFlight
+      && result.pending > 0
+      && result.stoppedReason === 'deadline'
+      && this.#now() < deadlineAt
+    ) {
+      const remainingMs = Number.isFinite(deadlineAt)
+        ? Math.max(0, deadlineAt - this.#now())
+        : undefined
+      return await this.flush({ deadlineMs: remainingMs })
+    }
+    return result
   }
 
   async close(options: { deadlineMs?: number } = {}): Promise<FactoryEventReportResult> {
