@@ -11303,7 +11303,7 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-58-impl-pear')?.task)
       .toContain('Human clarification from GitHub:\nUse the shared retry helper and add regression coverage.')
     expect(fleet.inputs).toEqual([])
-    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
     expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBeUndefined()
 
     fleet.emitAgentExit('ar-58-impl-pear', 'issue-done')
