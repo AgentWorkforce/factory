@@ -122,6 +122,7 @@ const babysitterSchema = z.object({
 
 const reportingSchema = z.object({
   enabled: z.boolean().default(true),
+  instanceName: z.string().trim().min(1).max(256).optional(),
   outboxPath: z.string().min(1).optional(),
   batchSize: z.number().int().min(1).max(100).default(100),
   requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
@@ -297,6 +298,7 @@ function normalizeFactoryConfig(cfg: z.infer<typeof FactoryConfigObjectSchema>) 
     },
     repos: {
       ...(cfg.repos.org !== undefined ? { org: cfg.repos.org } : {}),
+      ...(cfg.repos.names !== undefined ? { names: cfg.repos.names } : {}),
       byLabel: resolved.byLabel,
       byProject: resolved.byProject,
       keywordRules: resolved.keywordRules,

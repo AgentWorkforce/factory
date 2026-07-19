@@ -544,6 +544,15 @@ class SpawnFailingFleetClient extends FakeFleetClient {
   }
 }
 
+class SpawnDeliveryFailingFleetClient extends FakeFleetClient {
+  override readonly durableOwnership = true
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    this.spawns.push(input)
+    throw new Error(`recipient unavailable: ${input.name}`)
+  }
+}
+
 // Mimics the broker rejecting a resume because it never released the agent's
 // name on exit (relay#1116-family): http 500 "agent '<name>' already exists".
 class ResumeNameCollisionFleetClient extends FakeFleetClient {
@@ -636,6 +645,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 
 class LocalLifecycleFleetClient extends FakeFleetClient {
   readonly durableOwnership = true
+}
+
+class DurableSpawnFailingFleetClient extends SpawnFailingFleetClient {
+  override readonly durableOwnership = true
 }
 
 class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
@@ -1525,6 +1538,15 @@ describe('FactoryLoop', () => {
       ...githubIssue,
       raw: { payload: { source: { provider: 'github', number: 2174 } } },
     })).toBe(false)
+    for (const path of [
+      githubIssueNestedMetaPath('AgentWorkforce', 'cloud', 2174),
+      githubIssuePath('AgentWorkforce', 'cloud', 2174),
+    ]) {
+      expect(isDispatchableIssue(parseGithubFactoryIssue(path, githubIssueFile(2174, {
+        repo: 'cloud',
+        state: 'closed',
+      })))).toBe(false)
+    }
     expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174, ready, { url: undefined })))).toBe(false)
     expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174)))).toBe(true)
   })
@@ -1699,6 +1721,36 @@ describe('FactoryLoop', () => {
     expect(mergeGate.merges).toEqual([])
   })
 
+  it('spawns the reviewer with maxRestarts:0 so a torn-down reviewer is not re-registered as a broker orphan', async () => {
+    // Regression: without an explicit restart policy the reviewer fell through
+    // to the broker's default, which re-registers a name on exit. When Factory
+    // tore the reviewer down (dispatch-failure teardown / release) the broker
+    // respawned it as an orphan while the dashboard only reported
+    // dispatch_failed. Every Factory-owned dispatch role must opt out of
+    // broker-level restarts because Factory owns durable resume/respawn.
+    const path = githubIssuePath('AgentWorkforce', 'pear', 49)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(49, { labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.runOnce()
+
+    const bySuffix = (suffix: string) => fleet.spawns.find((spawn) => spawn.name.includes(suffix))
+    expect(bySuffix('-impl-')?.name).toBe('ar-49-impl-pear')
+    expect(bySuffix('-review-')?.name).toBe('ar-49-review-pear')
+    // Both dispatch roles must carry the maxRestarts:0 opt-out; before the fix
+    // the reviewer's restartPolicy was undefined.
+    expect(bySuffix('-impl-')?.restartPolicy).toEqual({ maxRestarts: 0 })
+    expect(bySuffix('-review-')?.restartPolicy).toEqual({ maxRestarts: 0 })
+  })
+
   it('deduplicates compact and nested Relayfile aliases for the same GitHub issue', async () => {
     const byIdPath = githubIssueCompactPath('AgentWorkforce', 'pear', 47)
     const nestedPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 47)
@@ -1717,11 +1769,98 @@ describe('FactoryLoop', () => {
 
     const report = await factory.runOnce()
 
-    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#47', key: '47', path: byIdPath }])
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#47', key: '47', path: nestedPath }])
     expect(report.triaged).toHaveLength(1)
     expect(report.dispatched).toHaveLength(1)
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-47-impl-pear', 'ar-47-review-pear'])
     expect(factory.status().counters.githubIssueAliasPathsSuppressed).toBe(1)
+  })
+
+  it('trusts a closed canonical GitHub issue over a stale ready alias', async () => {
+    const canonicalPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 46)
+    const aliasPath = githubIssueCompactPath('AgentWorkforce', 'pear', 46)
+    const mount = new FakeMountClient({
+      [canonicalPath]: githubIssueFile(46, { state: 'closed', labels: ['factory'] }),
+      [aliasPath]: githubIssueFile(46, { state: 'open', labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath }])
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([{
+      issue: { uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath },
+      reason: 'live state is not ready-for-agent',
+    }])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it('builds one shared canonical GitHub path index for explicit alias dispatches', async () => {
+    class RecordingTreeMount extends FakeMountClient {
+      readonly treePrefixes: string[] = []
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.treePrefixes.push(prefix)
+        return super.listTree(prefix)
+      }
+    }
+
+    const firstAlias = githubIssuePath('AgentWorkforce', 'pear', 43)
+    const secondAlias = githubIssuePath('AgentWorkforce', 'pear', 44)
+    const firstCanonical = '/github/repos/AgentWorkforce/pear/issues/43__first-closed/meta.json'
+    const secondCanonical = '/github/repos/AgentWorkforce/pear/issues/44__second-closed/meta.json'
+    const firstOpen = githubIssueFile(43, { state: 'open', labels: ['factory'] })
+    const secondOpen = githubIssueFile(44, { state: 'open', labels: ['factory'] })
+    const mount = new RecordingTreeMount({
+      [firstAlias]: firstOpen,
+      [secondAlias]: secondOpen,
+      [firstCanonical]: githubIssueFile(43, { state: 'closed', labels: ['factory'] }),
+      [secondCanonical]: githubIssueFile(44, { state: 'closed', labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(firstAlias, firstOpen))))
+      .rejects.toThrow(/Live state changed/)
+    await expect(factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(secondAlias, secondOpen))))
+      .rejects.toThrow(/Live state changed/)
+
+    expect(mount.treePrefixes).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
+    ])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it.each([
+    ['canonical', githubIssueNestedMetaPath('AgentWorkforce', 'pear', 45)],
+    ['by-id alias', githubIssuePath('AgentWorkforce', 'pear', 45)],
+  ])('refuses explicit dispatch for a closed GitHub issue from its %s path before spawning', async (_kind, path) => {
+    const content = githubIssueFile(45, { state: 'closed', labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: content })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    const decision = await factory.triageIssue(parseGithubFactoryIssue(path, content))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(/Live state changed/)
+    expect(fleet.spawns).toEqual([])
   })
 
   it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
@@ -2038,11 +2177,13 @@ describe('FactoryLoop', () => {
       [racedPath]: racedReady,
       [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
     })
-    const fleet = new FakeFleetClient()
+    const fleet = new LocalLifecycleFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const reporter = new RecordingFactoryEventReporter()
     const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
       mount,
       fleet,
+      reporter,
       triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
       ...(withWorktrees ? { worktrees } : {}),
@@ -2056,17 +2197,21 @@ describe('FactoryLoop', () => {
     })
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-      'ar-59-impl-pear',
-      'ar-59-review-pear',
       'ar-60-impl-pear',
       'ar-60-review-pear',
     ])
-    expect(fleet.releases.map((release) => release.name).sort()).toEqual([
-      'ar-59-impl-pear',
-      'ar-59-review-pear',
-    ])
+    expect(fleet.releases).toEqual([])
     expect(factory.status().counters.dispatchLiveStateRaces).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
+    expect(reporter.events
+      .filter((event) => event.type === 'agent.released')
+      .map((event) => event.attributes?.releaseReason))
+      .toEqual([])
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      phase: 'abandoned',
+      status: 'cancelled',
+      attributes: { cancellationReason: 'source_state_changed' },
+    })
     },
   )
 
@@ -4698,6 +4843,133 @@ describe('FactoryLoop', () => {
         .find((agent) => agent.name === 'ar-585-impl-pear')?.tracked.result?.node).toBe('sf-mini')
     } finally {
       await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['closed canonical dispatching lifecycle', 586, false, 'dispatching', 'closed'],
+    ['closed canonical from a stale by-id alias retryable lifecycle', 587, true, 'retryable', 'closed'],
+    ['temporarily unreadable dispatching lifecycle', 588, false, 'dispatching', 'unreadable'],
+  ] as const)('revalidates a durable GitHub dispatch with a %s', async (
+    _kind,
+    number,
+    staleAlias,
+    persistedPhase,
+    liveState,
+  ) => {
+    class AckGapFleet extends RemoteLifecycleFleetClient {
+      failed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (!this.failed) {
+          this.failed = true
+          throw new Error('owner crashed after remote spawn ack')
+        }
+        return result
+      }
+    }
+
+    class CrashAfterLifecycleClaimStore extends FileStateStore {
+      crashed = false
+
+      override async claimDispatchLifecycle(...args: Parameters<FileStateStore['claimDispatchLifecycle']>) {
+        const claimed = await super.claimDispatchLifecycle(...args)
+        if (!this.crashed) {
+          this.crashed = true
+          throw new Error('owner crashed after durable lifecycle claim')
+        }
+        return claimed
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), `factory-closed-durable-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const canonicalPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+    const aliasPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const dispatchPath = staleAlias ? aliasPath : canonicalPath
+    const openIssue = githubIssueFile(number, { state: 'open', labels: ['factory'] })
+    const mount = new FakeMountClient({
+      [dispatchPath]: openIssue,
+      ...(staleAlias ? { [canonicalPath]: openIssue } : {}),
+    })
+    const fleet = persistedPhase === 'retryable' ? new AckGapFleet() : new RemoteLifecycleFleetClient()
+    const clock = new ManualClock()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore: persistedPhase === 'dispatching'
+        ? new CrashAfterLifecycleClaimStore({ batchSize: 2, watchStatePath })
+        : state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      clock,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseGithubFactoryIssue(dispatchPath, openIssue))
+      await expect(first.dispatch(decision)).rejects.toThrow(
+        persistedPhase === 'dispatching'
+          ? 'owner crashed after durable lifecycle claim'
+          : 'owner crashed after remote spawn ack',
+      )
+      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({
+          phase: persistedPhase,
+          agents: persistedPhase === 'retryable'
+            ? [expect.objectContaining({ name: `ar-${number}-impl-pear` })]
+            : [],
+        })
+      await first.stop()
+      clock.advance(5 * 60_000 + 1)
+
+      if (liveState === 'closed') {
+        mount.files.set(canonicalPath, {
+          content: githubIssueFile(number, { state: 'closed', labels: ['factory'] }),
+        })
+      } else {
+        mount.files.delete(dispatchPath)
+      }
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      if (liveState === 'unreadable') {
+        await new Promise((resolve) => setTimeout(resolve, 1_200))
+        await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .resolves.toMatchObject({ phase: persistedPhase })
+        expect(fleet.spawns).toEqual([])
+        expect(fleet.releases).toEqual([])
+        expect(restarted.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBeUndefined()
+        return
+      }
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+      )).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      await vi.waitFor(() => expect(restarted?.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBe(1))
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(
+        persistedPhase === 'retryable' ? [`ar-${number}-impl-pear`] : [],
+      )
+      if (persistedPhase === 'retryable') {
+        expect(fleet.releases).toContainEqual({
+          name: `ar-${number}-impl-pear`,
+          reason: 'live dispatch state changed',
+        })
+      }
+      expect(restarted.status().inFlight).toEqual([])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -11073,7 +11345,7 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-58-impl-pear')?.task)
       .toContain('Human clarification from GitHub:\nUse the shared retry helper and add regression coverage.')
     expect(fleet.inputs).toEqual([])
-    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1))
     expect(factory.status().counters.githubTriageAnswersInjectedToAgents).toBeUndefined()
 
     fleet.emitAgentExit('ar-58-impl-pear', 'issue-done')
@@ -14193,11 +14465,13 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({ [issuePath(408)]: issue })
     const fleet = new FakeFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const cleanupReleaseCounts: number[] = []
     worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
     const factory = createFactory(config(), {
       mount,
       fleet,
+      stateStore,
       triage: new StaticTriage(),
       worktrees,
       linear: {
@@ -14221,19 +14495,22 @@ describe('FactoryLoop PR babysitter', () => {
       .toEqual(['ar-408-impl-pear', 'ar-408-review'])
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([2])
+    await expect(stateStore.listFailureHandoffs('factory-test')).resolves.toEqual([])
     expect(factory.status().inFlight).toEqual([])
   })
 
   it('releases a planned agent and cleans its worktree when the spawn ack fails', async () => {
     const issue = realIssueFile(409, ready, { title: '[factory-e2e] Failed spawn worktree cleanup' })
     const mount = new FakeMountClient({ [issuePath(409)]: issue })
-    const fleet = new SpawnFailingFleetClient()
+    const fleet = new DurableSpawnFailingFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const reporter = new RecordingFactoryEventReporter()
     const cleanupReleaseCounts: number[] = []
     worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
-    const factory = createFactory(config(), {
+    const factory = createFactory(config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }), {
       mount,
       fleet,
+      reporter,
       triage: new StaticTriage(),
       worktrees,
     })
@@ -14245,6 +14522,32 @@ describe('FactoryLoop PR babysitter', () => {
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([1])
     expect(factory.status().inFlight).toEqual([])
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      status: 'cancelled',
+      attributes: { cancellationReason: 'agent_spawn_failed' },
+    })
+  })
+
+  it('categorizes dispatch delivery failures without forwarding provider messages', async () => {
+    const issue = realIssueFile(411, ready, { title: '[factory-e2e] Failed spawn delivery' })
+    const mount = new FakeMountClient({ [issuePath(411)]: issue })
+    const fleet = new SpawnDeliveryFailingFleetClient()
+    const reporter = new RecordingFactoryEventReporter()
+    const factory = createFactory(config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }), {
+      mount,
+      fleet,
+      reporter,
+      triage: new StaticTriage(),
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(411), issue))))
+      .rejects.toThrow('recipient unavailable')
+
+    expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
+      status: 'cancelled',
+      attributes: { cancellationReason: 'agent_delivery_failed' },
+    })
+    expect(JSON.stringify(reporter.events)).not.toContain('recipient unavailable')
   })
 
   it('retries transient local worktree cleanup without re-releasing completed agents', async () => {

@@ -84,6 +84,7 @@ import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
   createFactoryCloudEventV1,
   factoryCloudReleaseReasonV1,
+  type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
 
@@ -310,6 +311,8 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
+  readonly #githubIssuePreferredPaths = new Map<string, string>()
+  #githubIssuePathIndexReady = false
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
@@ -2164,6 +2167,10 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
+    if (!this.#isIssueReady(liveIssue)) {
+      throw new LiveDispatchStateChangedError(decision.issue.key)
+    }
+
     if (!isDispatchableIssue(liveIssue)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not reconciled real Linear issue`)
       this.#error(error, decision.issue)
@@ -2261,6 +2268,12 @@ export class FactoryLoop implements Factory {
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
+      if (!dryRun) {
+        const issue = await this.#readIssue(dispatchDecision.issue.path)
+        if (!issue || !this.#isIssueReady(issue)) {
+          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+        }
+      }
       const specs = dispatchSpecs(dispatchDecision)
       const agents: DispatchResult['agents'] = []
       for (const spec of specs) {
@@ -2321,8 +2334,10 @@ export class FactoryLoop implements Factory {
       // acknowledged spawns, so cleanup never races a name-only survivor.
       const failureHandoffs = this.#dispatchFailureHandoffs(record, spawnedForReaperHandoff)
       await this.#persistDispatchFailureReaperHandoff(record, failureHandoffs)
-      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs)
       const liveStateChanged = error instanceof LiveDispatchStateChangedError
+      const cancellationReason = factoryCloudDispatchCancellationReason(error)
+      const cleanupReason = liveStateChanged ? 'live dispatch state changed' : 'dispatch failed'
+      let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs, cleanupReason)
       if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
         const failed = await this.#releaseAndTerminateAgents(
           failureHandoffs.map((handoff) => [handoff.name, handoff.tracked]),
@@ -2342,12 +2357,26 @@ export class FactoryLoop implements Factory {
       let failedState: { terminal: boolean } | undefined
       if (liveStateChanged) {
         await this.#clearDispatchInFlight(decision.issue)
-        await this.#saveDispatchLifecycle(record, 'abandoned')
+        await this.#saveDispatchLifecycle(
+          record,
+          'abandoned',
+          undefined,
+          undefined,
+          new Set(),
+          { cancellationReason },
+        )
         this.#increment('dispatchLiveStateRaces')
       } else {
         await this.#recordDispatchFailure(decision.issue)
         failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-        await this.#saveDispatchLifecycle(record, failedState?.terminal ? 'abandoned' : 'retryable')
+        await this.#saveDispatchLifecycle(
+          record,
+          failedState?.terminal ? 'abandoned' : 'retryable',
+          undefined,
+          undefined,
+          new Set(),
+          { cancellationReason: failedState?.terminal ? cancellationReason : undefined },
+        )
       }
       batch.abandon(decision.issue)
       if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
@@ -2606,6 +2635,7 @@ export class FactoryLoop implements Factory {
       level?: FactoryCloudEventInputV1['level']
       previousPhase?: DispatchLifecyclePhase
       errorCode?: string
+      cancellationReason?: FactoryCloudCancellationReasonV1
     } = {},
   ): Promise<void> {
     await this.#report({
@@ -2626,6 +2656,7 @@ export class FactoryLoop implements Factory {
         operation: 'save_lifecycle',
         previousPhase: options.previousPhase,
         errorCode: options.errorCode,
+        cancellationReason: options.cancellationReason,
         dryRun: lifecycle.dryRun,
         trackedAgents: lifecycle.agents.length,
       },
@@ -2671,6 +2702,7 @@ export class FactoryLoop implements Factory {
     pullRequest?: GithubPublishPullRequestResult,
     releaseReason?: string,
     releasedAgentNames: ReadonlySet<string> = new Set(),
+    telemetry: { cancellationReason?: FactoryCloudCancellationReasonV1 } = {},
   ): Promise<boolean> {
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     const key = issueKey(record.issue)
@@ -2719,7 +2751,7 @@ export class FactoryLoop implements Factory {
           : lifecycle.phase === 'abandoned'
             ? 'run.cancelled'
             : 'run.phase_changed',
-        { previousPhase: previous?.phase },
+        { previousPhase: previous?.phase, cancellationReason: telemetry.cancellationReason },
       )
     }
     if (isTerminalDispatchLifecycle(lifecycle)) {
@@ -2897,6 +2929,16 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
+    if (!record.dryRun) {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) {
+        throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
+      }
+      if (isGithubIssue(issue) && !this.#isGithubIssueResumable(issue)) {
+        await this.#abandonDurableResume(record, 'live GitHub issue is closed or no longer ready-for-agent')
+        return
+      }
+    }
     const agents: DispatchResult['agents'] = []
     const specs = dispatchSpecs(record.decision)
     const plannedNames = new Set(specs.map((spec) => spec.name))
@@ -2938,6 +2980,69 @@ export class FactoryLoop implements Factory {
         })
       }
     }
+  }
+
+  #isGithubIssueResumable(issue: LinearIssue): boolean {
+    if (this.#isIssueReady(issue)) return true
+    if (githubFactoryIssueIsClosed(issue)) return false
+    const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+    const required = this.#config.safety.requireLabel.trim().toLowerCase()
+    return Boolean(required) &&
+      labels.has(required) &&
+      labels.has('factory:in-progress') &&
+      !labels.has('factory:human-review')
+  }
+
+  async #abandonDurableResume(record: InFlightIssue, reason: string): Promise<void> {
+    const handoffs = this.#dispatchFailureHandoffs(record, [...record.agents].map(([name, tracked]) => ({
+      issue: record.issue,
+      name,
+      tracked: cloneTrackedAgent(tracked),
+      persistedAtMs: this.#clock.now(),
+    })))
+    await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    if (!await this.#saveDispatchLifecycle(
+      record,
+      'abandoned',
+      undefined,
+      reason,
+      new Set(),
+      { cancellationReason: 'source_state_changed' },
+    )) return
+
+    await this.#clearDispatchInFlight(record.issue)
+    const batch = await this.#batch()
+    batch.abandon(record.issue)
+    for (const [name] of record.agents) {
+      this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
+    }
+
+    if (handoffs.some((handoff) => handoff.worktree)) {
+      await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')
+    } else if (handoffs.length > 0) {
+      const failed = new Set(await this.#releaseAndTerminateAgents(
+        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+        'live dispatch state changed',
+        'completion',
+      ))
+      for (const handoff of handoffs) {
+        if (failed.has(handoff.name)) continue
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
+
+    await this.#stopSlackWatcher(record.issue)
+    await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
+    await this.#writeInFlightRegistry()
+    this.#increment('dispatchLifecycleStaleIssuesAbandoned')
+    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#logger.info?.('[factory] abandoned durable dispatch whose live issue is no longer ready', {
+      issue: record.issue.key,
+      reason,
+    })
   }
 
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
@@ -3120,8 +3225,7 @@ export class FactoryLoop implements Factory {
     if (!isGithubIssue(issue)) {
       return this.#states.isRole(issue.stateId, 'readyForAgent')
     }
-    const githubState = (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase()
-    if (githubState === 'closed') {
+    if (githubFactoryIssueIsClosed(issue)) {
       return false
     }
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
@@ -3260,8 +3364,13 @@ export class FactoryLoop implements Factory {
           }
         }
       }
+      for (const [identity, path] of issuePaths) {
+        this.#githubIssuePreferredPaths.set(identity, path)
+      }
+      this.#githubIssuePathIndexReady = true
       return [...issuePaths.values()].sort()
     } catch (error) {
+      this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
       return []
@@ -3341,7 +3450,11 @@ export class FactoryLoop implements Factory {
   }
 
   async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
-    const candidatePaths = githubIssueReadCandidatePaths(path)
+    const preferredPath = await this.#preferredGithubIssuePath(path)
+    const candidatePaths = [...new Set([
+      ...githubIssueReadCandidatePaths(preferredPath),
+      ...githubIssueReadCandidatePaths(path),
+    ])]
     try {
       for (const candidatePath of candidatePaths) {
         try {
@@ -3362,6 +3475,30 @@ export class FactoryLoop implements Factory {
       }
       throw error
     }
+  }
+
+  async #preferredGithubIssuePath(path: string): Promise<string> {
+    const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+    if (!parts) return path
+    const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+    const cached = this.#githubIssuePreferredPaths.get(identity)
+    if (cached && githubIssuePathPreference(cached) <= githubIssuePathPreference(path)) return cached
+    if (githubIssuePathPreference(path) === 0) {
+      this.#githubIssuePreferredPaths.set(identity, path)
+      return path
+    }
+
+    // Normal discovery has already indexed every configured GitHub issue path.
+    // A dispatch-only replacement owner can reach this method before that
+    // backfill, so build the same shared index once instead of traversing both
+    // repository trees separately for every durable issue it recovers.
+    if (!this.#githubIssuePathIndexReady) {
+      await this.#githubIssuePaths()
+    }
+    const indexed = this.#githubIssuePreferredPaths.get(identity)
+    return indexed && githubIssuePathPreference(indexed) < githubIssuePathPreference(path)
+      ? indexed
+      : path
   }
 
   async #findGithubIssueMirror(
@@ -3917,11 +4054,14 @@ export class FactoryLoop implements Factory {
     return [...handoffs.values()]
   }
 
-  async #teardownFailedDispatchWorktrees(handoffs: RegistryHandoffAgent[]): Promise<boolean> {
+  async #teardownFailedDispatchWorktrees(
+    handoffs: RegistryHandoffAgent[],
+    releaseReason = 'dispatch failed',
+  ): Promise<boolean> {
     if (!this.#worktrees || !handoffs.some((handoff) => handoff.worktree)) return false
     const failed = await this.#releaseAndTerminateAgents(
       handoffs.map((handoff) => [handoff.name, handoff.tracked]),
-      'dispatch failed',
+      releaseReason,
       'completion',
     )
     if (failed.length > 0) return false
@@ -4083,10 +4223,15 @@ export class FactoryLoop implements Factory {
         channel: spec.channel,
       })
     } catch (error) {
-      throw contextualError(
+      const wrapped = contextualError(
         `Dispatch spawn failed for ${record.issue.key}/${spec.name} (${spec.capability}) cwd=${spec.clonePath ?? 'default'}`,
         error,
       )
+      throw Object.assign(wrapped, {
+        factoryCancellationReason: isDispatchDeliveryError(error)
+          ? 'agent_delivery_failed' as const
+          : 'agent_spawn_failed' as const,
+      })
     }
     batch.recordSpawn(record, spec, invocationId, result)
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
@@ -9599,6 +9744,9 @@ export function isDispatchableIssue(issue: LinearIssue): boolean {
   if (!isGithubIssue(issue)) {
     return false
   }
+  if (githubFactoryIssueIsClosed(issue)) {
+    return false
+  }
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
   const sourceId = stringValue(source?.id)
@@ -9614,6 +9762,9 @@ const isGithubIssue = (issue: LinearIssue): boolean => {
   return stringValue(source?.provider)?.toLowerCase() === 'github' &&
     (stringValue(wrapper?.provider)?.toLowerCase() === 'github' || isGithubIssueFilePath(issue.path))
 }
+
+const githubFactoryIssueIsClosed = (issue: LinearIssue): boolean =>
+  (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase() === 'closed'
 
 const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefined => {
   const source = asRecord(wrappedPayload(issue.raw).source)
@@ -10154,10 +10305,11 @@ const githubIssueRefIdentity = (issue: IssueRef): string | undefined => {
 }
 
 const githubIssuePathPreference = (path: string): number => {
-  if (path.includes('/issues/by-id/')) return 0
-  if (path.endsWith('/meta.json')) return 1
-  if (path.endsWith('.json')) return 2
-  return 3
+  if (path.endsWith('/meta.json')) return 0
+  if (path.endsWith('/metadata.json')) return 1
+  if (path.includes('/issues/by-id/')) return 2
+  if (path.endsWith('.json')) return 3
+  return 4
 }
 
 const githubAgentNameMatchesIssue = (name: string, issue: LinearIssue): boolean => {
@@ -10538,11 +10690,15 @@ export const githubRepoSubscriptionGlobs = (config: FactoryConfig): string[] =>
 const githubIssueScanRoots = (config: FactoryConfig): string[] => {
   const roots = new Set<string>()
   for (const { owner, repo } of configuredGithubRepoParts(config)) {
-    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`)
-    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`)
+    for (const root of githubIssueRepoRoots(owner, repo)) roots.add(root)
   }
   return [...roots]
 }
+
+const githubIssueRepoRoots = (owner: string, repo: string): string[] => [
+  `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+  `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+]
 
 const githubRepoPathParts = (path: string): { owner: string; repo: string } | undefined => {
   const compactSegment = path.match(/^\/github\/repos\/([^/]+)\//u)?.[1]
@@ -11435,7 +11591,13 @@ const isAgentAlreadyExistsError = (error: unknown): boolean => {
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
   // Factory owns durable resume/respawn decisions. Broker-level retries race
   // that lifecycle and can re-register the same name before Factory resumes it.
-  spec.role === 'implementer' || spec.role === 'babysitter'
+  // The reviewer shares the implementer's dispatch lifecycle: it is spawned in
+  // the same batch, torn down by the same dispatch-failure/teardown paths, and
+  // resumed through the same durable #resumeDurableDispatch flow. Without this
+  // opt-out the broker's default restart policy re-registers a torn-down
+  // reviewer's name as an orphan (relay#1116-family) while the dashboard only
+  // reports dispatch_failed — the exact orphan/restart sequence being audited.
+  spec.role === 'implementer' || spec.role === 'reviewer' || spec.role === 'babysitter'
     ? { maxRestarts: 0 } as AgentSpec['restartPolicy']
     : spec.restartPolicy
 
@@ -11506,6 +11668,21 @@ const isRegistrationLagInjectionError = (error: unknown): boolean => {
   const { errorMessage } = describeError(error)
   return /agent_not_found|recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
+}
+
+const isDispatchDeliveryError = (error: unknown): boolean => {
+  if (isRegistrationLagInjectionError(error)) return true
+  const { errorMessage } = describeError(error)
+  return /delivery[_ -]failed|dead-lettered|max delivery retries exceeded/iu.test(errorMessage)
+}
+
+const factoryCloudDispatchCancellationReason = (error: unknown): FactoryCloudCancellationReasonV1 => {
+  if (error instanceof LiveDispatchStateChangedError) return 'source_state_changed'
+  if (error && typeof error === 'object' && 'factoryCancellationReason' in error) {
+    const reason = error.factoryCancellationReason
+    if (reason === 'agent_spawn_failed' || reason === 'agent_delivery_failed') return reason
+  }
+  return 'dispatch_failed'
 }
 
 const telemetryRunStatus = (

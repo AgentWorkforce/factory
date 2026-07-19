@@ -257,6 +257,7 @@ export {
   FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE,
   FACTORY_CLOUD_EVENT_MAX_PAYLOAD_BYTES,
   FACTORY_CLOUD_EVENT_TYPES,
+  FACTORY_CLOUD_CANCELLATION_REASONS_V1,
   FACTORY_CLOUD_RELEASE_REASONS_V1,
   FactoryCloudEventAttributesV1Schema,
   FactoryCloudEventBatchV1Schema,
@@ -284,6 +285,7 @@ export type {
 } from './observability/cloud-reporter'
 export type {
   CreateFactoryCloudEventV1Options,
+  FactoryCloudCancellationReasonV1,
   FactoryCloudEventAttributesV1,
   FactoryCloudEventBatchV1,
   FactoryCloudEventInputV1,

@@ -19,10 +19,20 @@ export const FACTORY_CLOUD_RELEASE_REASONS_V1 = [
   'reconciled_missing',
   'delivery_failed',
   'dispatch_failed',
+  'source_state_changed',
   'other',
 ] as const
 
 export type FactoryCloudReleaseReasonV1 = (typeof FACTORY_CLOUD_RELEASE_REASONS_V1)[number]
+
+export const FACTORY_CLOUD_CANCELLATION_REASONS_V1 = [
+  'source_state_changed',
+  'agent_spawn_failed',
+  'agent_delivery_failed',
+  'dispatch_failed',
+] as const
+
+export type FactoryCloudCancellationReasonV1 = (typeof FACTORY_CLOUD_CANCELLATION_REASONS_V1)[number]
 
 export const FACTORY_CLOUD_EVENT_TYPES = [
   'instance.started',
@@ -98,6 +108,7 @@ export const FactoryCloudEventAttributesV1Schema = z.object({
   nodeId: opaqueString.optional(),
   previousPhase: categoryString.optional(),
   releaseReason: z.enum(FACTORY_CLOUD_RELEASE_REASONS_V1).optional(),
+  cancellationReason: z.enum(FACTORY_CLOUD_CANCELLATION_REASONS_V1).optional(),
   dryRun: z.boolean().optional(),
   count: boundedCount.optional(),
   activeRuns: boundedCount.optional(),
@@ -118,6 +129,7 @@ export const FactoryCloudInstanceV1Schema = z.object({
   bootId: opaqueString,
   version: z.string().trim().min(1).max(64),
   metadata: z.object({
+    name: opaqueString.optional(),
     backend: categoryString.optional(),
     mode: categoryString.optional(),
     platform: categoryString.optional(),
@@ -234,6 +246,7 @@ export function factoryCloudReleaseReasonV1(value: string | undefined): FactoryC
     case 'waiting-for-human':
       return 'waiting_for_human'
     case 'task_exit':
+    case 'worker_exited':
     case 'exited':
       return 'exited'
     case 'offline':
@@ -252,6 +265,9 @@ export function factoryCloudReleaseReasonV1(value: string | undefined): FactoryC
       return 'delivery_failed'
     case 'dispatch failed':
       return 'dispatch_failed'
+    case 'live dispatch state changed':
+    case 'source state changed':
+      return 'source_state_changed'
     default:
       return 'other'
   }
