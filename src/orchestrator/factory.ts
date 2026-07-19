@@ -3001,7 +3001,14 @@ export class FactoryLoop implements Factory {
       persistedAtMs: this.#clock.now(),
     })))
     await this.#persistDispatchFailureReaperHandoff(record, handoffs)
-    if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) return
+    if (!await this.#saveDispatchLifecycle(
+      record,
+      'abandoned',
+      undefined,
+      reason,
+      new Set(),
+      { cancellationReason: 'source_state_changed' },
+    )) return
 
     await this.#clearDispatchInFlight(record.issue)
     const batch = await this.#batch()
@@ -3011,11 +3018,11 @@ export class FactoryLoop implements Factory {
     }
 
     if (handoffs.some((handoff) => handoff.worktree)) {
-      await this.#teardownFailedDispatchWorktrees(handoffs)
+      await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')
     } else if (handoffs.length > 0) {
       const failed = new Set(await this.#releaseAndTerminateAgents(
         handoffs.map((handoff) => [handoff.name, handoff.tracked]),
-        'live issue no longer ready',
+        'live dispatch state changed',
         'completion',
       ))
       for (const handoff of handoffs) {

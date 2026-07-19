@@ -2164,7 +2164,7 @@ describe('FactoryLoop', () => {
     expect(reporter.events
       .filter((event) => event.type === 'agent.released')
       .map((event) => event.attributes?.releaseReason))
-      .toEqual(['source_state_changed', 'source_state_changed'])
+      .toEqual([])
     expect(reporter.events.find((event) => event.type === 'run.cancelled')).toMatchObject({
       phase: 'abandoned',
       status: 'cancelled',
@@ -4905,7 +4905,7 @@ describe('FactoryLoop', () => {
       if (persistedPhase === 'retryable') {
         expect(fleet.releases).toContainEqual({
           name: `ar-${number}-impl-pear`,
-          reason: 'live issue no longer ready',
+          reason: 'live dispatch state changed',
         })
       }
       expect(restarted.status().inFlight).toEqual([])
