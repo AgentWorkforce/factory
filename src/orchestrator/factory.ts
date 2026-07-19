@@ -11435,7 +11435,13 @@ const isAgentAlreadyExistsError = (error: unknown): boolean => {
 const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | undefined =>
   // Factory owns durable resume/respawn decisions. Broker-level retries race
   // that lifecycle and can re-register the same name before Factory resumes it.
-  spec.role === 'implementer' || spec.role === 'babysitter'
+  // The reviewer shares the implementer's dispatch lifecycle: it is spawned in
+  // the same batch, torn down by the same dispatch-failure/teardown paths, and
+  // resumed through the same durable #resumeDurableDispatch flow. Without this
+  // opt-out the broker's default restart policy re-registers a torn-down
+  // reviewer's name as an orphan (relay#1116-family) while the dashboard only
+  // reports dispatch_failed — the exact orphan/restart sequence being audited.
+  spec.role === 'implementer' || spec.role === 'reviewer' || spec.role === 'babysitter'
     ? { maxRestarts: 0 } as AgentSpec['restartPolicy']
     : spec.restartPolicy
 

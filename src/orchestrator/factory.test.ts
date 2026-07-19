@@ -1699,6 +1699,36 @@ describe('FactoryLoop', () => {
     expect(mergeGate.merges).toEqual([])
   })
 
+  it('spawns the reviewer with maxRestarts:0 so a torn-down reviewer is not re-registered as a broker orphan', async () => {
+    // Regression: without an explicit restart policy the reviewer fell through
+    // to the broker's default, which re-registers a name on exit. When Factory
+    // tore the reviewer down (dispatch-failure teardown / release) the broker
+    // respawned it as an orphan while the dashboard only reported
+    // dispatch_failed. Every Factory-owned dispatch role must opt out of
+    // broker-level restarts because Factory owns durable resume/respawn.
+    const path = githubIssuePath('AgentWorkforce', 'pear', 49)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(49, { labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.runOnce()
+
+    const bySuffix = (suffix: string) => fleet.spawns.find((spawn) => spawn.name.includes(suffix))
+    expect(bySuffix('-impl-')?.name).toBe('ar-49-impl-pear')
+    expect(bySuffix('-review-')?.name).toBe('ar-49-review-pear')
+    // Both dispatch roles must carry the maxRestarts:0 opt-out; before the fix
+    // the reviewer's restartPolicy was undefined.
+    expect(bySuffix('-impl-')?.restartPolicy).toEqual({ maxRestarts: 0 })
+    expect(bySuffix('-review-')?.restartPolicy).toEqual({ maxRestarts: 0 })
+  })
+
   it('deduplicates compact and nested Relayfile aliases for the same GitHub issue', async () => {
     const byIdPath = githubIssueCompactPath('AgentWorkforce', 'pear', 47)
     const nestedPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 47)
