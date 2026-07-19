@@ -621,7 +621,7 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 }
 
 class LocalLifecycleFleetClient extends FakeFleetClient {
-  override readonly durableOwnership = true
+  readonly durableOwnership = true
 }
 
 class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
