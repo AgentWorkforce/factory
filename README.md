@@ -128,6 +128,32 @@ to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
 
+### Cloud progress and trace correlation
+
+Authenticated Cloud progress reporting is enabled by default. Factory persists
+its bounded lifecycle events to a local outbox before delivery; set
+`reporting.enabled` to `false` only when the Cloud dashboard is intentionally
+not part of the deployment.
+
+Every run-scoped event carries the same deterministic, W3C-valid `traceId`,
+derived from the durable opaque run ID. This is a correlation identifier only:
+Factory does **not** currently create or export OpenTelemetry spans, and it does
+not invent span IDs. No task text, prompt, message, path, command, source code,
+or exception stack is used to derive the identifier or admitted by the event
+contract.
+
+The exporter follow-up should add optional OpenTelemetry SDK initialization,
+short spans around dispatch, spawn, writeback, publish, and release operations,
+and W3C context propagation across Cloud requests and remote fleet delivery.
+Persist or rehydrate the run context so replacement Factory processes keep the
+same trace; do not hold a single span open for the lifetime of a long-running
+run. Export with a batch processor through the standard OTLP environment
+contract (`OTEL_EXPORTER_OTLP_ENDPOINT`, signal-specific overrides, and headers)
+to an OpenTelemetry Collector. Keep the existing bounded attribute allowlist
+and make exporter failure non-fatal. See the official
+[OpenTelemetry JavaScript exporter guidance](https://opentelemetry.io/docs/languages/js/exporters/)
+and [W3C Trace Context specification](https://www.w3.org/TR/trace-context/).
+
 `factory babysit 10` uses `repos.default`; a full URL such as
 `factory babysit https://github.com/org/repo/pull/10` supplies the repository
 directly. The explicit command is opt-in on its own and does not require
@@ -251,6 +277,16 @@ an invalid config fails fast with a field-level error. See
 [`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
+
+Authenticated Factory progress reporting is enabled by default for real CLI
+sessions. Factory sends privacy-bounded lifecycle events, worker ownership,
+heartbeats, and sanitized failure categories to the active Cloud workspace; it
+never sends task text, prompts, agent output, source code, local paths, command
+lines, tokens, or raw stack traces. Delivery uses a private disk outbox and does
+not interrupt orchestration when Cloud is unavailable. Serialized event batches
+are capped at 240 KiB, below Cloud's 256 KiB ingestion limit. Set
+`reporting.enabled` to `false` to disable it, or use `reporting.outboxPath`,
+`batchSize`, and `requestTimeoutMs` to tune delivery.
 
 `cloneRoot` and every `clonePaths` value accept `~` or a leading `~/`, expanded
 against the current user's home directory. Named-user forms such as `~alice`

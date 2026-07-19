@@ -3,6 +3,7 @@ import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
+import type { FactoryEventReporter } from './ports/observability'
 import type { AgentWorktreeManager } from './ports/worktree'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
@@ -27,6 +28,8 @@ export interface FactoryPorts {
   probePrResolver?: ProbePrResolver
   probePrGhRunner?: GhRunner
   logger?: Logger
+  /** Optional durable, no-throw progress reporter for the authenticated Cloud dashboard. */
+  reporter?: FactoryEventReporter
   clock?: Clock
   processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
   processFinder?: AgentProcessFinder

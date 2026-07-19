@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
@@ -11,7 +13,10 @@ import {
   closeProbePr,
   createFactory,
   createFleet,
+  createFactoryCloudEventV1,
   ensureRelayBroker,
+  FactoryCloudReporter,
+  FileFactoryCloudEventOutbox,
   defaultGhRunner,
   explicitLinkedIssueKey,
   githubIssuePathParts,
@@ -32,6 +37,7 @@ import {
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
+  type FactoryEventReporter,
   type FactoryConfig,
   type IterationReport,
   type FleetBackend,
@@ -47,6 +53,7 @@ import {
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
+import { loadOrCreateFactoryInstanceId } from '../observability/instance-identity'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -76,6 +83,8 @@ interface FleetCliDeps {
   flushDaemonOutput?: () => Promise<void>
   /** Hermetic local-checkout probes for CLI integration tests. */
   localClonePathOptions?: LocalClonePathOptions
+  reporter?: FactoryEventReporter
+  cloudSessionProvider?: (options?: Parameters<typeof ensureCloudSession>[0]) => Promise<CloudSession>
 }
 
 interface GlobalOptions {
@@ -109,6 +118,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   const err = deps.stderr ?? process.stderr
   let fleet: FleetClient | undefined
   let mount: MountClient | undefined
+  let reporter: FactoryEventReporter | undefined
 
   try {
     if (argv.some(isHelpFlag)) {
@@ -234,6 +244,24 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           batchSize: loaded.config.batchSize,
           watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
         })
+        reporter = deps.reporter ?? await buildFactoryCloudReporter({
+          config: loaded.config,
+          backend: globals.backend,
+          mode: factoryReportingMode(command),
+          logger,
+          deps,
+        })
+        if (reporter) {
+          await reporter.report(createFactoryCloudEventV1({
+            type: 'instance.started',
+            attributes: {
+              backend: globals.backend,
+              mode: factoryReportingMode(command),
+              component: 'cli',
+              operation: 'start',
+            },
+          }))
+        }
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
@@ -241,6 +269,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
           logger,
+          reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
         })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
@@ -248,13 +277,43 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     }
     return 1
   } catch (error) {
+    if (reporter) {
+      try {
+        await reporter.report(createFactoryCloudEventV1({
+          type: 'factory.failure',
+          level: 'error',
+          attributes: { component: 'cli', operation: 'command', errorCode: 'command_failed' },
+        }))
+      } catch {
+        // An injected reporter may violate the no-reject port contract. The
+        // original command failure still determines the CLI result.
+      }
+    }
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 1
   } finally {
     try {
       await mount?.dispose?.()
     } finally {
-      await fleet?.dispose()
+      try {
+        await fleet?.dispose()
+      } finally {
+        if (reporter) {
+          try {
+            await reporter.report(createFactoryCloudEventV1({
+              type: 'instance.stopping',
+              attributes: { component: 'cli', operation: 'stop' },
+            }))
+            await reporter.report(createFactoryCloudEventV1({
+              type: 'instance.stopped',
+              attributes: { component: 'cli', operation: 'stop' },
+            }))
+            await reporter.close?.({ deadlineMs: 2_000 })
+          } catch {
+            err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+          }
+        }
+      }
     }
   }
 }
@@ -368,19 +427,20 @@ async function runFactoryCommand(
       await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
-      const flushAndExit = async (code: number): Promise<void> => {
+      const flushAndResolve = async (code: number): Promise<void> => {
         try {
           await (deps.flushDaemonOutput ?? flushProcessOutput)()
         } finally {
-          const daemonExit = deps.daemonExit ?? ((exitCode: number) => process.exit(exitCode))
-          daemonExit(code)
           waiter.resolve(code)
         }
       }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
-          void flushAndExit(code)
+          // Resolve the command instead of calling process.exit here. Returning
+          // through runFleetCli's outer finally gives Cloud lifecycle reporting
+          // its bounded shutdown opportunity before the caller applies `code`.
+          void flushAndResolve(code)
         },
         processLike: deps.stopSignalProcessLike,
       })
@@ -799,6 +859,63 @@ function commandUsesLocalCheckout(command: ParsedCommand): boolean {
       return true
     default:
       return false
+  }
+}
+
+function factoryReportingMode(command: Extract<ParsedCommand, { kind: `factory${string}` | 'factory' }>): string {
+  return command.kind === 'factory' ? command.action : command.kind.slice('factory-'.length)
+}
+
+async function buildFactoryCloudReporter(input: {
+  config: FactoryConfig
+  backend: FleetBackend
+  mode: string
+  logger: Logger
+  deps: FleetCliDeps
+}): Promise<FactoryEventReporter | undefined> {
+  if (!input.config.reporting.enabled) return undefined
+  if (hasInjectedFactoryRuntime(input.deps) && !input.deps.cloudSessionProvider) return undefined
+
+  try {
+    const activeWorkspace = await (input.deps.resolveWorkspace ?? resolveFactoryWorkspace)()
+    const activeWorkspaceIds = new Set([
+      activeWorkspace.workspaceId,
+      activeWorkspace.cloudWorkspaceId,
+    ].filter((value): value is string => Boolean(value)))
+    if (!input.config.workspaceId || !activeWorkspaceIds.has(input.config.workspaceId)) {
+      input.logger.warn?.('[factory] Cloud progress reporting skipped because the active account workspace differs from Factory config')
+      return undefined
+    }
+    const session = await (input.deps.cloudSessionProvider ?? ensureCloudSession)({ interactive: false })
+    const outboxPath = input.config.reporting.outboxPath
+      ?? join(dirname(input.config.loop.registryPath), 'factory-cloud-events.json')
+    const instanceId = await loadOrCreateFactoryInstanceId(`${outboxPath}.instance-id`)
+    const cloudFetch: typeof fetch = async (_request, init) =>
+      session.client.fetch('/api/v1/factory/events', init)
+    return new FactoryCloudReporter({
+      apiUrl: session.auth.apiUrl,
+      instance: {
+        id: instanceId,
+        bootId: randomUUID(),
+        version: await readFactoryVersion(),
+        metadata: {
+          backend: input.backend,
+          mode: input.mode,
+          runtime: 'node',
+        },
+      },
+      outbox: new FileFactoryCloudEventOutbox({ path: outboxPath }),
+      getAccessToken: async () => session.client.snapshot().accessToken,
+      fetch: cloudFetch,
+      logger: input.logger,
+      batchSize: input.config.reporting.batchSize,
+      requestTimeoutMs: input.config.reporting.requestTimeoutMs,
+    })
+  } catch (error) {
+    input.logger.warn?.('[factory] Cloud progress reporting is unavailable', {
+      errorClass: error instanceof Error ? error.name : 'Error',
+    })
+    return undefined
   }
 }
 
