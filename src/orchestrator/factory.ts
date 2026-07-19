@@ -311,6 +311,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
+  readonly #githubIssuePreferredPaths = new Map<string, string>()
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
@@ -2165,6 +2166,10 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
+    if (!this.#isIssueReady(liveIssue)) {
+      throw new LiveDispatchStateChangedError(decision.issue.key)
+    }
+
     if (!isDispatchableIssue(liveIssue)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not reconciled real Linear issue`)
       this.#error(error, decision.issue)
@@ -2262,6 +2267,12 @@ export class FactoryLoop implements Factory {
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     try {
+      if (!dryRun) {
+        const issue = await this.#readIssue(dispatchDecision.issue.path)
+        if (!issue || !this.#isIssueReady(issue)) {
+          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+        }
+      }
       const specs = dispatchSpecs(dispatchDecision)
       const agents: DispatchResult['agents'] = []
       for (const spec of specs) {
@@ -2917,6 +2928,17 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
+    if (!record.dryRun) {
+      const issue = await this.#readIssue(record.issue.path)
+      const resumable = Boolean(issue && (
+        !isGithubIssue(issue) ||
+        (isDispatchableIssue(issue) && this.#isGithubIssueResumable(issue))
+      ))
+      if (!resumable) {
+        await this.#abandonDurableResume(record, 'live GitHub issue is closed or no longer ready-for-agent')
+        return
+      }
+    }
     const agents: DispatchResult['agents'] = []
     const specs = dispatchSpecs(record.decision)
     const plannedNames = new Set(specs.map((spec) => spec.name))
@@ -2958,6 +2980,62 @@ export class FactoryLoop implements Factory {
         })
       }
     }
+  }
+
+  #isGithubIssueResumable(issue: LinearIssue): boolean {
+    if (this.#isIssueReady(issue)) return true
+    if (githubFactoryIssueIsClosed(issue)) return false
+    const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+    const required = this.#config.safety.requireLabel.trim().toLowerCase()
+    return Boolean(required) &&
+      labels.has(required) &&
+      labels.has('factory:in-progress') &&
+      !labels.has('factory:human-review')
+  }
+
+  async #abandonDurableResume(record: InFlightIssue, reason: string): Promise<void> {
+    const handoffs = this.#dispatchFailureHandoffs(record, [...record.agents].map(([name, tracked]) => ({
+      issue: record.issue,
+      name,
+      tracked: cloneTrackedAgent(tracked),
+      persistedAtMs: this.#clock.now(),
+    })))
+    await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) return
+
+    await this.#clearDispatchInFlight(record.issue)
+    const batch = await this.#batch()
+    batch.abandon(record.issue)
+    for (const [name] of record.agents) {
+      this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
+    }
+
+    if (handoffs.some((handoff) => handoff.worktree)) {
+      await this.#teardownFailedDispatchWorktrees(handoffs)
+    } else if (handoffs.length > 0) {
+      const failed = new Set(await this.#releaseAndTerminateAgents(
+        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+        'live issue no longer ready',
+        'completion',
+      ))
+      for (const handoff of handoffs) {
+        if (failed.has(handoff.name)) continue
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
+
+    await this.#stopSlackWatcher(record.issue)
+    await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
+    await this.#writeInFlightRegistry()
+    this.#increment('dispatchLifecycleStaleIssuesAbandoned')
+    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#logger.info?.('[factory] abandoned durable dispatch whose live issue is no longer ready', {
+      issue: record.issue.key,
+      reason,
+    })
   }
 
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
@@ -3140,8 +3218,7 @@ export class FactoryLoop implements Factory {
     if (!isGithubIssue(issue)) {
       return this.#states.isRole(issue.stateId, 'readyForAgent')
     }
-    const githubState = (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase()
-    if (githubState === 'closed') {
+    if (githubFactoryIssueIsClosed(issue)) {
       return false
     }
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
@@ -3280,6 +3357,9 @@ export class FactoryLoop implements Factory {
           }
         }
       }
+      for (const [identity, path] of issuePaths) {
+        this.#githubIssuePreferredPaths.set(identity, path)
+      }
       return [...issuePaths.values()].sort()
     } catch (error) {
       this.#increment('githubIssueListFailures')
@@ -3361,7 +3441,11 @@ export class FactoryLoop implements Factory {
   }
 
   async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
-    const candidatePaths = githubIssueReadCandidatePaths(path)
+    const preferredPath = await this.#preferredGithubIssuePath(path)
+    const candidatePaths = [...new Set([
+      ...githubIssueReadCandidatePaths(preferredPath),
+      ...githubIssueReadCandidatePaths(path),
+    ])]
     try {
       for (const candidatePath of candidatePaths) {
         try {
@@ -3382,6 +3466,40 @@ export class FactoryLoop implements Factory {
       }
       throw error
     }
+  }
+
+  async #preferredGithubIssuePath(path: string): Promise<string> {
+    const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+    if (!parts) return path
+    const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+    const cached = this.#githubIssuePreferredPaths.get(identity)
+    if (cached && githubIssuePathPreference(cached) <= githubIssuePathPreference(path)) return cached
+    if (githubIssuePathPreference(path) === 0) {
+      this.#githubIssuePreferredPaths.set(identity, path)
+      return path
+    }
+
+    let preferred = cached ?? path
+    for (const root of githubIssueRepoRoots(parts.owner, parts.repo)) {
+      let paths: string[]
+      try {
+        paths = await this.#listRelayfileTree(root, 'GitHub canonical issue resolution')
+      } catch {
+        continue
+      }
+      for (const candidate of paths) {
+        const candidateParts = githubIssuePathParts(candidate)
+        if (
+          !candidateParts ||
+          githubIssueIdentity(candidateParts.owner, candidateParts.repo, candidateParts.number) !== identity
+        ) continue
+        if (githubIssuePathPreference(candidate) < githubIssuePathPreference(preferred)) {
+          preferred = candidate
+        }
+      }
+    }
+    this.#githubIssuePreferredPaths.set(identity, preferred)
+    return preferred
   }
 
   async #findGithubIssueMirror(
@@ -9627,6 +9745,9 @@ export function isDispatchableIssue(issue: LinearIssue): boolean {
   if (!isGithubIssue(issue)) {
     return false
   }
+  if (githubFactoryIssueIsClosed(issue)) {
+    return false
+  }
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
   const sourceId = stringValue(source?.id)
@@ -9642,6 +9763,9 @@ const isGithubIssue = (issue: LinearIssue): boolean => {
   return stringValue(source?.provider)?.toLowerCase() === 'github' &&
     (stringValue(wrapper?.provider)?.toLowerCase() === 'github' || isGithubIssueFilePath(issue.path))
 }
+
+const githubFactoryIssueIsClosed = (issue: LinearIssue): boolean =>
+  (issue.state?.name ?? stringValue(wrappedPayload(issue.raw).state) ?? '').trim().toLowerCase() === 'closed'
 
 const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefined => {
   const source = asRecord(wrappedPayload(issue.raw).source)
@@ -10182,10 +10306,11 @@ const githubIssueRefIdentity = (issue: IssueRef): string | undefined => {
 }
 
 const githubIssuePathPreference = (path: string): number => {
-  if (path.includes('/issues/by-id/')) return 0
-  if (path.endsWith('/meta.json')) return 1
-  if (path.endsWith('.json')) return 2
-  return 3
+  if (path.endsWith('/meta.json')) return 0
+  if (path.endsWith('/metadata.json')) return 1
+  if (path.includes('/issues/by-id/')) return 2
+  if (path.endsWith('.json')) return 3
+  return 4
 }
 
 const githubAgentNameMatchesIssue = (name: string, issue: LinearIssue): boolean => {
@@ -10566,11 +10691,15 @@ export const githubRepoSubscriptionGlobs = (config: FactoryConfig): string[] =>
 const githubIssueScanRoots = (config: FactoryConfig): string[] => {
   const roots = new Set<string>()
   for (const { owner, repo } of configuredGithubRepoParts(config)) {
-    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`)
-    roots.add(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`)
+    for (const root of githubIssueRepoRoots(owner, repo)) roots.add(root)
   }
   return [...roots]
 }
+
+const githubIssueRepoRoots = (owner: string, repo: string): string[] => [
+  `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+  `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+]
 
 const githubRepoPathParts = (path: string): { owner: string; repo: string } | undefined => {
   const compactSegment = path.match(/^\/github\/repos\/([^/]+)\//u)?.[1]

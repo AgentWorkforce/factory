@@ -1538,6 +1538,15 @@ describe('FactoryLoop', () => {
       ...githubIssue,
       raw: { payload: { source: { provider: 'github', number: 2174 } } },
     })).toBe(false)
+    for (const path of [
+      githubIssueNestedMetaPath('AgentWorkforce', 'cloud', 2174),
+      githubIssuePath('AgentWorkforce', 'cloud', 2174),
+    ]) {
+      expect(isDispatchableIssue(parseGithubFactoryIssue(path, githubIssueFile(2174, {
+        repo: 'cloud',
+        state: 'closed',
+      })))).toBe(false)
+    }
     expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174, ready, { url: undefined })))).toBe(false)
     expect(isDispatchableIssue(parseLinearIssue(issuePath(2174), realIssueFile(2174)))).toBe(true)
   })
@@ -1760,11 +1769,56 @@ describe('FactoryLoop', () => {
 
     const report = await factory.runOnce()
 
-    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#47', key: '47', path: byIdPath }])
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#47', key: '47', path: nestedPath }])
     expect(report.triaged).toHaveLength(1)
     expect(report.dispatched).toHaveLength(1)
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-47-impl-pear', 'ar-47-review-pear'])
     expect(factory.status().counters.githubIssueAliasPathsSuppressed).toBe(1)
+  })
+
+  it('trusts a closed canonical GitHub issue over a stale ready alias', async () => {
+    const canonicalPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 46)
+    const aliasPath = githubIssueCompactPath('AgentWorkforce', 'pear', 46)
+    const mount = new FakeMountClient({
+      [canonicalPath]: githubIssueFile(46, { state: 'closed', labels: ['factory'] }),
+      [aliasPath]: githubIssueFile(46, { state: 'open', labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.pulled).toEqual([{ uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath }])
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([{
+      issue: { uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath },
+      reason: 'live state is not ready-for-agent',
+    }])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it.each([
+    ['canonical', githubIssueNestedMetaPath('AgentWorkforce', 'pear', 45)],
+    ['by-id alias', githubIssuePath('AgentWorkforce', 'pear', 45)],
+  ])('refuses explicit dispatch for a closed GitHub issue from its %s path before spawning', async (_kind, path) => {
+    const content = githubIssueFile(45, { state: 'closed', labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: content })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    const decision = await factory.triageIssue(parseGithubFactoryIssue(path, content))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(/Live state changed/)
+    expect(fleet.spawns).toEqual([])
   })
 
   it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
@@ -2101,15 +2155,10 @@ describe('FactoryLoop', () => {
     })
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-      'ar-59-impl-pear',
-      'ar-59-review-pear',
       'ar-60-impl-pear',
       'ar-60-review-pear',
     ])
-    expect(fleet.releases.map((release) => release.name).sort()).toEqual([
-      'ar-59-impl-pear',
-      'ar-59-review-pear',
-    ])
+    expect(fleet.releases).toEqual([])
     expect(factory.status().counters.dispatchLiveStateRaces).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0)
     expect(reporter.events
@@ -4752,6 +4801,117 @@ describe('FactoryLoop', () => {
         .find((agent) => agent.name === 'ar-585-impl-pear')?.tracked.result?.node).toBe('sf-mini')
     } finally {
       await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['canonical dispatching lifecycle', 586, false, 'dispatching'],
+    ['stale by-id alias retryable lifecycle', 587, true, 'retryable'],
+  ] as const)('abandons a durable GitHub dispatch when the %s resolves to a closed issue', async (
+    _kind,
+    number,
+    staleAlias,
+    persistedPhase,
+  ) => {
+    class AckGapFleet extends RemoteLifecycleFleetClient {
+      failed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (!this.failed) {
+          this.failed = true
+          throw new Error('owner crashed after remote spawn ack')
+        }
+        return result
+      }
+    }
+
+    class CrashAfterLifecycleClaimStore extends FileStateStore {
+      crashed = false
+
+      override async claimDispatchLifecycle(...args: Parameters<FileStateStore['claimDispatchLifecycle']>) {
+        const claimed = await super.claimDispatchLifecycle(...args)
+        if (!this.crashed) {
+          this.crashed = true
+          throw new Error('owner crashed after durable lifecycle claim')
+        }
+        return claimed
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), `factory-closed-durable-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const canonicalPath = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+    const aliasPath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const dispatchPath = staleAlias ? aliasPath : canonicalPath
+    const openIssue = githubIssueFile(number, { state: 'open', labels: ['factory'] })
+    const mount = new FakeMountClient({
+      [dispatchPath]: openIssue,
+      ...(staleAlias ? { [canonicalPath]: openIssue } : {}),
+    })
+    const fleet = persistedPhase === 'retryable' ? new AckGapFleet() : new RemoteLifecycleFleetClient()
+    const clock = new ManualClock()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore: persistedPhase === 'dispatching'
+        ? new CrashAfterLifecycleClaimStore({ batchSize: 2, watchStatePath })
+        : state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      clock,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseGithubFactoryIssue(dispatchPath, openIssue))
+      await expect(first.dispatch(decision)).rejects.toThrow(
+        persistedPhase === 'dispatching'
+          ? 'owner crashed after durable lifecycle claim'
+          : 'owner crashed after remote spawn ack',
+      )
+      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({
+          phase: persistedPhase,
+          agents: persistedPhase === 'retryable'
+            ? [expect.objectContaining({ name: `ar-${number}-impl-pear` })]
+            : [],
+        })
+      await first.stop()
+      clock.advance(5 * 60_000 + 1)
+
+      mount.files.set(canonicalPath, {
+        content: githubIssueFile(number, { state: 'closed', labels: ['factory'] }),
+      })
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+      )).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      await vi.waitFor(() => expect(restarted?.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBe(1))
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(
+        persistedPhase === 'retryable' ? [`ar-${number}-impl-pear`] : [],
+      )
+      if (persistedPhase === 'retryable') {
+        expect(fleet.releases).toContainEqual({
+          name: `ar-${number}-impl-pear`,
+          reason: 'live issue no longer ready',
+        })
+      }
+      expect(restarted.status().inFlight).toEqual([])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
