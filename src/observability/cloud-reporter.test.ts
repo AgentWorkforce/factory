@@ -169,16 +169,19 @@ describe('FactoryCloudReporter', () => {
   })
 
   it('bounds close even when an earlier unbounded flush is already running', async () => {
-    const tokenRequested = Promise.withResolvers<void>()
+    let resolveTokenRequested!: () => void
+    const tokenRequested = new Promise<void>((resolve) => {
+      resolveTokenRequested = resolve
+    })
     const reporter = await createReporter({
       getAccessToken: async () => {
-        tokenRequested.resolve()
+        resolveTokenRequested()
         return await new Promise<string>(() => {})
       },
     })
     await reporter.report(progress('event-existing-flush'))
     void reporter.flush()
-    await tokenRequested.promise
+    await tokenRequested
 
     const startedAt = Date.now()
     await expect(reporter.close({ deadlineMs: 25 })).resolves.toMatchObject({
