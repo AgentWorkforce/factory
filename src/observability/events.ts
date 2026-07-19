@@ -129,6 +129,7 @@ export const FactoryCloudInstanceV1Schema = z.object({
   bootId: opaqueString,
   version: z.string().trim().min(1).max(64),
   metadata: z.object({
+    name: opaqueString.optional(),
     backend: categoryString.optional(),
     mode: categoryString.optional(),
     platform: categoryString.optional(),

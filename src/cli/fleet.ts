@@ -53,7 +53,7 @@ import {
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
-import { loadOrCreateFactoryInstanceId } from '../observability/instance-identity'
+import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -890,6 +890,7 @@ async function buildFactoryCloudReporter(input: {
     const outboxPath = input.config.reporting.outboxPath
       ?? join(dirname(input.config.loop.registryPath), 'factory-cloud-events.json')
     const instanceId = await loadOrCreateFactoryInstanceId(`${outboxPath}.instance-id`)
+    const instanceName = resolveFactoryInstanceName(input.config)
     const cloudFetch: typeof fetch = async (_request, init) =>
       session.client.fetch('/api/v1/factory/events', init)
     return new FactoryCloudReporter({
@@ -899,6 +900,7 @@ async function buildFactoryCloudReporter(input: {
         bootId: randomUUID(),
         version: await readFactoryVersion(),
         metadata: {
+          ...(instanceName !== undefined ? { name: instanceName } : {}),
           backend: input.backend,
           mode: input.mode,
           runtime: 'node',

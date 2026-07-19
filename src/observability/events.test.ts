@@ -138,7 +138,12 @@ describe('Factory cloud event v1 contract', () => {
   it('validates the exact authenticated ingestion batch shape', () => {
     const parsed = FactoryCloudEventBatchV1Schema.parse({
       contract: 'factory.telemetry.v1',
-      instance: { id: 'instance-1', bootId: 'boot-1', version: '0.1.32' },
+      instance: {
+        id: 'instance-1',
+        bootId: 'boot-1',
+        version: '0.1.32',
+        metadata: { name: '  hoopsheet  ' },
+      },
       events: [{
         id: 'event-1',
         sequence: 1,
@@ -147,6 +152,33 @@ describe('Factory cloud event v1 contract', () => {
       }],
     })
     expect(parsed.events).toHaveLength(1)
+    expect(parsed.instance.metadata?.name).toBe('hoopsheet')
     expect(parsed).not.toHaveProperty('workspaceId')
+  })
+
+  it('keeps instance metadata.name optional and validates its bounded display value', () => {
+    const instance = { id: 'instance-1', bootId: 'boot-1', version: '0.1.32' }
+    const event = {
+      id: 'event-1',
+      sequence: 1,
+      occurredAt: '2026-07-19T12:00:00.000Z',
+      type: 'instance.heartbeat',
+    }
+
+    expect(FactoryCloudEventBatchV1Schema.parse({
+      contract: 'factory.telemetry.v1',
+      instance,
+      events: [event],
+    }).instance).toEqual(instance)
+    expect(() => FactoryCloudEventBatchV1Schema.parse({
+      contract: 'factory.telemetry.v1',
+      instance: { ...instance, metadata: { name: '   ' } },
+      events: [event],
+    })).toThrow()
+    expect(() => FactoryCloudEventBatchV1Schema.parse({
+      contract: 'factory.telemetry.v1',
+      instance: { ...instance, metadata: { name: 'x'.repeat(257) } },
+      events: [event],
+    })).toThrow()
   })
 })

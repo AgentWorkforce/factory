@@ -98,6 +98,23 @@ describe('FactoryConfigSchema', () => {
     })
   })
 
+  it('trims and validates an explicit reporting instance name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: '  Oslo Factory  ' },
+    })
+
+    expect(parsed.reporting.instanceName).toBe('Oslo Factory')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: '   ' },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: 'x'.repeat(257) },
+    })).toThrow()
+  })
+
   it('honors an explicit per-role agent CLI override and rejects unwired capabilities', () => {
     const parsed = FactoryConfigSchema.parse({
       workspaceId: 'ws_123',
@@ -201,6 +218,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.subscription.labels).toEqual(['pear', 'cloud', 'agentswarm'])
     expect(parsed.repos.default).toBe('pear')
     expect(parsed.repos.org).toBe('AgentWorkforce')
+    expect(parsed.repos.names).toEqual(['pear', 'cloud', 'agentswarm'])
   })
 
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {

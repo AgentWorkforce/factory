@@ -4,7 +4,33 @@ import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import { loadOrCreateFactoryInstanceId } from './instance-identity'
+import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from './instance-identity'
+
+describe('resolveFactoryInstanceName', () => {
+  it('prefers an explicit reporting name over the sole configured repository', () => {
+    expect(resolveFactoryInstanceName({
+      reporting: { instanceName: '  Production Factory  ' },
+      repos: { names: ['hoopsheet'] },
+    })).toBe('Production Factory')
+  })
+
+  it('uses the trimmed sole repository name for HoopSheet', () => {
+    expect(resolveFactoryInstanceName({
+      reporting: {},
+      repos: { names: ['  hoopsheet  '] },
+    })).toBe('hoopsheet')
+  })
+
+  it.each([
+    { names: undefined, description: 'no configured repositories' },
+    { names: [], description: 'an empty repository list' },
+    { names: ['pear', 'hoopsheet'], description: 'multiple repositories' },
+    { names: ['   '], description: 'an empty trimmed repository name' },
+    { names: ['x'.repeat(257)], description: 'an overlong repository name' },
+  ])('omits the name for $description instead of deriving one from the hostname', ({ names }) => {
+    expect(resolveFactoryInstanceName({ reporting: {}, repos: { names } })).toBeUndefined()
+  })
+})
 
 describe('loadOrCreateFactoryInstanceId', () => {
   it('persists one opaque identity across starts and concurrent creators', async () => {

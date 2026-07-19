@@ -3,6 +3,25 @@ import { link, mkdir, open, readFile, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+const MAX_FACTORY_INSTANCE_NAME_LENGTH = 256
+
+export interface FactoryInstanceNameConfig {
+  reporting: { instanceName?: string }
+  repos: { names?: readonly string[] }
+}
+
+/**
+ * Resolve the operator-facing instance name without fingerprinting the host.
+ * An explicit reporting name wins; otherwise only an unambiguous, valid sole
+ * repository name is used.
+ */
+export function resolveFactoryInstanceName(config: FactoryInstanceNameConfig): string | undefined {
+  if (config.reporting.instanceName !== undefined) {
+    return normalizeFactoryInstanceName(config.reporting.instanceName)
+  }
+  if (config.repos.names?.length !== 1) return undefined
+  return normalizeFactoryInstanceName(config.repos.names[0])
+}
 
 /**
  * Return one opaque identity for this Factory installation. The create-only
@@ -53,3 +72,8 @@ const isAlreadyExistsError = (error: unknown): boolean =>
 
 const isMissingFileError = (error: unknown): boolean =>
   Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+
+const normalizeFactoryInstanceName = (value: string): string | undefined => {
+  const name = value.trim()
+  return name.length >= 1 && name.length <= MAX_FACTORY_INSTANCE_NAME_LENGTH ? name : undefined
+}
