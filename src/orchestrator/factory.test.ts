@@ -4806,13 +4806,15 @@ describe('FactoryLoop', () => {
   })
 
   it.each([
-    ['canonical dispatching lifecycle', 586, false, 'dispatching'],
-    ['stale by-id alias retryable lifecycle', 587, true, 'retryable'],
-  ] as const)('abandons a durable GitHub dispatch when the %s resolves to a closed issue', async (
+    ['closed canonical dispatching lifecycle', 586, false, 'dispatching', 'closed'],
+    ['closed canonical from a stale by-id alias retryable lifecycle', 587, true, 'retryable', 'closed'],
+    ['temporarily unreadable dispatching lifecycle', 588, false, 'dispatching', 'unreadable'],
+  ] as const)('revalidates a durable GitHub dispatch with a %s', async (
     _kind,
     number,
     staleAlias,
     persistedPhase,
+    liveState,
   ) => {
     class AckGapFleet extends RemoteLifecycleFleetClient {
       failed = false
@@ -4881,9 +4883,13 @@ describe('FactoryLoop', () => {
       await first.stop()
       clock.advance(5 * 60_000 + 1)
 
-      mount.files.set(canonicalPath, {
-        content: githubIssueFile(number, { state: 'closed', labels: ['factory'] }),
-      })
+      if (liveState === 'closed') {
+        mount.files.set(canonicalPath, {
+          content: githubIssueFile(number, { state: 'closed', labels: ['factory'] }),
+        })
+      } else {
+        mount.files.delete(dispatchPath)
+      }
       restarted = createFactory(config({ issueSource: 'github' }), {
         mount,
         fleet,
@@ -4893,6 +4899,16 @@ describe('FactoryLoop', () => {
         clock,
       })
       await restarted.start({ mode: 'dispatch-owner' })
+
+      if (liveState === 'unreadable') {
+        await new Promise((resolve) => setTimeout(resolve, 1_200))
+        await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .resolves.toMatchObject({ phase: persistedPhase })
+        expect(fleet.spawns).toEqual([])
+        expect(fleet.releases).toEqual([])
+        expect(restarted.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBeUndefined()
+        return
+      }
 
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
         'factory-test',

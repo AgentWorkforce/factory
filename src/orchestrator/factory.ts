@@ -2930,11 +2930,10 @@ export class FactoryLoop implements Factory {
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
     if (!record.dryRun) {
       const issue = await this.#readIssue(record.issue.path)
-      const resumable = Boolean(issue && (
-        !isGithubIssue(issue) ||
-        (isDispatchableIssue(issue) && this.#isGithubIssueResumable(issue))
-      ))
-      if (!resumable) {
+      if (!issue) {
+        throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
+      }
+      if (isGithubIssue(issue) && !this.#isGithubIssueResumable(issue)) {
         await this.#abandonDurableResume(record, 'live GitHub issue is closed or no longer ready-for-agent')
         return
       }
