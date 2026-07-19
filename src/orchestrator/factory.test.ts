@@ -1802,6 +1802,48 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('builds one shared canonical GitHub path index for explicit alias dispatches', async () => {
+    class RecordingTreeMount extends FakeMountClient {
+      readonly treePrefixes: string[] = []
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.treePrefixes.push(prefix)
+        return super.listTree(prefix)
+      }
+    }
+
+    const firstAlias = githubIssuePath('AgentWorkforce', 'pear', 43)
+    const secondAlias = githubIssuePath('AgentWorkforce', 'pear', 44)
+    const firstCanonical = '/github/repos/AgentWorkforce/pear/issues/43__first-closed/meta.json'
+    const secondCanonical = '/github/repos/AgentWorkforce/pear/issues/44__second-closed/meta.json'
+    const firstOpen = githubIssueFile(43, { state: 'open', labels: ['factory'] })
+    const secondOpen = githubIssueFile(44, { state: 'open', labels: ['factory'] })
+    const mount = new RecordingTreeMount({
+      [firstAlias]: firstOpen,
+      [secondAlias]: secondOpen,
+      [firstCanonical]: githubIssueFile(43, { state: 'closed', labels: ['factory'] }),
+      [secondCanonical]: githubIssueFile(44, { state: 'closed', labels: ['factory'] }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(firstAlias, firstOpen))))
+      .rejects.toThrow(/Live state changed/)
+    await expect(factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(secondAlias, secondOpen))))
+      .rejects.toThrow(/Live state changed/)
+
+    expect(mount.treePrefixes).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
+    ])
+    expect(fleet.spawns).toEqual([])
+  })
+
   it.each([
     ['canonical', githubIssueNestedMetaPath('AgentWorkforce', 'pear', 45)],
     ['by-id alias', githubIssuePath('AgentWorkforce', 'pear', 45)],
@@ -14423,11 +14465,13 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({ [issuePath(408)]: issue })
     const fleet = new FakeFleetClient()
     const worktrees = new RecordingWorktreeManager()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const cleanupReleaseCounts: number[] = []
     worktrees.onCleanup = () => cleanupReleaseCounts.push(fleet.releases.length)
     const factory = createFactory(config(), {
       mount,
       fleet,
+      stateStore,
       triage: new StaticTriage(),
       worktrees,
       linear: {
@@ -14451,6 +14495,7 @@ describe('FactoryLoop PR babysitter', () => {
       .toEqual(['ar-408-impl-pear', 'ar-408-review'])
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([2])
+    await expect(stateStore.listFailureHandoffs('factory-test')).resolves.toEqual([])
     expect(factory.status().inFlight).toEqual([])
   })
 

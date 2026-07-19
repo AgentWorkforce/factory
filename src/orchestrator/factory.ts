@@ -312,6 +312,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
+  #githubIssuePathIndexReady = false
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
@@ -3366,8 +3367,10 @@ export class FactoryLoop implements Factory {
       for (const [identity, path] of issuePaths) {
         this.#githubIssuePreferredPaths.set(identity, path)
       }
+      this.#githubIssuePathIndexReady = true
       return [...issuePaths.values()].sort()
     } catch (error) {
+      this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
       return []
@@ -3485,27 +3488,17 @@ export class FactoryLoop implements Factory {
       return path
     }
 
-    let preferred = cached ?? path
-    for (const root of githubIssueRepoRoots(parts.owner, parts.repo)) {
-      let paths: string[]
-      try {
-        paths = await this.#listRelayfileTree(root, 'GitHub canonical issue resolution')
-      } catch {
-        continue
-      }
-      for (const candidate of paths) {
-        const candidateParts = githubIssuePathParts(candidate)
-        if (
-          !candidateParts ||
-          githubIssueIdentity(candidateParts.owner, candidateParts.repo, candidateParts.number) !== identity
-        ) continue
-        if (githubIssuePathPreference(candidate) < githubIssuePathPreference(preferred)) {
-          preferred = candidate
-        }
-      }
+    // Normal discovery has already indexed every configured GitHub issue path.
+    // A dispatch-only replacement owner can reach this method before that
+    // backfill, so build the same shared index once instead of traversing both
+    // repository trees separately for every durable issue it recovers.
+    if (!this.#githubIssuePathIndexReady) {
+      await this.#githubIssuePaths()
     }
-    this.#githubIssuePreferredPaths.set(identity, preferred)
-    return preferred
+    const indexed = this.#githubIssuePreferredPaths.get(identity)
+    return indexed && githubIssuePathPreference(indexed) < githubIssuePathPreference(path)
+      ? indexed
+      : path
   }
 
   async #findGithubIssueMirror(
