@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import readline from 'node:readline/promises'
 import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
@@ -54,6 +55,13 @@ import {
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
 import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
+import {
+  ensureFactoryIntegrations,
+  inspectFactoryIntegration,
+  openIntegrationUrl,
+  type FactoryIntegrationObservation,
+} from '../mount/relayfile-integration-preflight'
+import type { FactoryIntegrationProvider } from '../ports'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -85,6 +93,9 @@ interface FleetCliDeps {
   localClonePathOptions?: LocalClonePathOptions
   reporter?: FactoryEventReporter
   cloudSessionProvider?: (options?: Parameters<typeof ensureCloudSession>[0]) => Promise<CloudSession>
+  isInteractive?: () => boolean
+  confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
+  openIntegrationUrl?: (url: string) => void | Promise<void>
 }
 
 interface GlobalOptions {
@@ -134,12 +145,16 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'factory-close-probe') {
       // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
-      const githubWrite = deps.probeCloser
-        ? undefined
-        : (deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
-            workspaceId: (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId,
-            isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
-          })).githubWrite
+      let githubWrite
+      if (!deps.probeCloser) {
+        const workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
+        mount = deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
+          workspaceId,
+          isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
+        })
+        await prepareFactoryIntegrations(command, mount, undefined, globals, deps, workspaceId, err)
+        githubWrite = mount.githubWrite
+      }
       const result = await (deps.probeCloser ?? closeProbePr)({
         repo: command.repo,
         prNumber: command.prNumber,
@@ -222,6 +237,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
         mount = await buildMount(loaded, deps)
+        await prepareFactoryIntegrations(command, mount, loaded.config, globals, deps, workspaceId, err)
         if (command.kind === 'factory-babysit') {
           return await runStandaloneBabysitCommand(
             command,
@@ -997,6 +1013,111 @@ export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | 
       return undefined
     }
     current = parent
+  }
+}
+
+async function prepareFactoryIntegrations(
+  command: ParsedCommand,
+  mount: MountClient,
+  config: FactoryConfig | undefined,
+  globals: GlobalOptions,
+  deps: FleetCliDeps,
+  workspaceId: string,
+  err: Pick<NodeJS.WriteStream, 'write'>,
+): Promise<void> {
+  const connections = mount.integrationConnections
+  if (!connections) return
+
+  const observed = new Map<FactoryIntegrationProvider, FactoryIntegrationObservation>()
+  if (config && commandUsesIssueSource(command) && !config.issueSource) {
+    autoDetectedIssueSources.add(config)
+    if (shouldAutoDetectGithubSource(config)) {
+      config.issueSource = 'github'
+    } else {
+      const linear = await inspectFactoryIntegration(connections, 'linear')
+      observed.set('linear', linear)
+      if (linear.kind === 'ready') {
+        config.issueSource = 'linear'
+      } else if (linear.kind === 'missing') {
+        config.issueSource = 'github'
+      } else {
+        await ensureFactoryIntegrations({
+          connections,
+          providers: ['linear'],
+          workspaceId,
+          interactive: false,
+          dryRun: globals.dryRun,
+          observed,
+          io: factoryIntegrationIO(deps, err),
+        })
+      }
+    }
+  }
+
+  const providers = requiredIntegrationsForCommand(command, config)
+  if (providers.length === 0) return
+  const dryRun = globals.dryRun || command.kind === 'factory-canary'
+  await ensureFactoryIntegrations({
+    connections,
+    providers,
+    workspaceId,
+    interactive: !dryRun && (deps.isInteractive?.() ?? Boolean(process.stdin.isTTY && process.stderr.isTTY)),
+    dryRun,
+    observed,
+    io: factoryIntegrationIO(deps, err),
+  })
+}
+
+function requiredIntegrationsForCommand(
+  command: ParsedCommand,
+  config: FactoryConfig | undefined,
+): FactoryIntegrationProvider[] {
+  if (command.kind === 'factory-close-probe' || command.kind === 'factory-babysit') {
+    return ['github']
+  }
+  if (
+    command.kind === 'factory-triage' ||
+    command.kind === 'factory-dispatch' ||
+    command.kind === 'factory-canary'
+  ) {
+    return config?.issueSource === 'linear' ? ['linear', 'github'] : ['github']
+  }
+  if (command.kind === 'factory' && (
+    command.action === 'start' || command.action === 'run-once' || command.action === 'loop'
+  )) {
+    return config?.issueSource === 'linear' ? ['linear', 'github'] : ['github']
+  }
+  return []
+}
+
+function commandUsesIssueSource(command: ParsedCommand): boolean {
+  return command.kind === 'factory-triage' ||
+    command.kind === 'factory-dispatch' ||
+    command.kind === 'factory-canary' ||
+    (command.kind === 'factory' && (
+      command.action === 'start' || command.action === 'run-once' || command.action === 'loop'
+    ))
+}
+
+function factoryIntegrationIO(
+  deps: FleetCliDeps,
+  err: Pick<NodeJS.WriteStream, 'write'>,
+) {
+  return {
+    info: (message: string) => err.write(`[factory] ${message}\n`),
+    warn: (message: string) => err.write(`[factory] warning: ${message}\n`),
+    confirm: deps.confirmIntegrationConnect ?? confirmIntegrationConnect,
+    openUrl: deps.openIntegrationUrl ?? openIntegrationUrl,
+  }
+}
+
+async function confirmIntegrationConnect(provider: FactoryIntegrationProvider): Promise<boolean> {
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stderr })
+  try {
+    const answer = (await terminal.question(`Connect ${provider} now? (opens browser) [Y/n] `)).trim().toLowerCase()
+    return answer === '' || answer === 'y' || answer === 'yes'
+  } finally {
+    terminal.close()
   }
 }
 

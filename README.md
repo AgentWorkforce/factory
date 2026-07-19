@@ -58,7 +58,10 @@ From a source checkout instead of an npm install, run
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
    open pull requests; a local `gh` installation or `gh auth login` is not a
-   prerequisite.
+   prerequisite. If a required connection is missing, an interactive Factory
+   command offers to open the Relayfile connection flow and waits for it to
+   finish. Linear-backed operations require both Linear and GitHub; GitHub-native
+   operations require GitHub.
 
 2. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
    repo route are required:
@@ -79,8 +82,10 @@ From a source checkout instead of an npm install, run
    somewhere to make changes.
 
    For a GitHub-only workspace, add `"issueSource": "github"` (or omit it and
-   Factory will select GitHub automatically when `/linear/issues` is not
-   connected). An open issue carrying the configured `safety.requireLabel`
+   Factory will select GitHub when Relayfile authoritatively reports that Linear
+   is not connected). Connection errors and connected-but-still-syncing states
+   stop the command instead of silently selecting the wrong source. An open
+   issue carrying the configured `safety.requireLabel`
    label—`factory` by default—is then dispatched directly, with lifecycle
    updates written back as GitHub comments and `factory:in-progress` /
    `factory:human-review` labels. No Linear mirror is created.
@@ -124,6 +129,13 @@ Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 backend reuses a relay broker that's already running for your workspace, and
 starts one if none is. For self-started brokers, the agent-exit timeout defaults
 to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
+
+Integration connection prompts only run for commands that need provider data or
+GitHub write access. Maintenance commands such as `status`, `loop-status`,
+`kill-loop`, and `reap-orphans` do not preflight connections. `--dry-run`, the
+intrinsically read-only canary, and non-interactive invocations never open an
+OAuth flow; when a required integration is missing they exit with an actionable
+instruction to rerun the Factory command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)

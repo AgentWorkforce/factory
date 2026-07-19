@@ -76,6 +76,15 @@ export {
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
+export {
+  ensureFactoryIntegrations,
+  inspectFactoryIntegration,
+  openIntegrationUrl,
+} from './mount/relayfile-integration-preflight'
+export type {
+  FactoryIntegrationObservation,
+  FactoryIntegrationPreflightIO,
+} from './mount/relayfile-integration-preflight'
 export type {
   ActiveWorkspaceResolver,
   RelayFileClientLike,
@@ -228,6 +237,10 @@ export type {
   Clock,
   EventPage,
   GithubConnectionWrite,
+  FactoryIntegrationConnectionStatus,
+  FactoryIntegrationConnections,
+  FactoryIntegrationConnectResult,
+  FactoryIntegrationProvider,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
   LocalMountOptions,
