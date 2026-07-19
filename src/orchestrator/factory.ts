@@ -2594,7 +2594,7 @@ export class FactoryLoop implements Factory {
       this.#increment('factoryEventReportingFailures')
       this.#logger.warn?.('[factory] progress reporter rejected an event', {
         eventType: input.type,
-        errorClass: error instanceof Error ? error.name : 'Error',
+        errorClass: telemetryErrorClass(error),
       })
     }
   }
@@ -7634,29 +7634,42 @@ export class FactoryLoop implements Factory {
         ? error.code
         : 'factory_error',
     )
-    const failureClass = telemetryCategory(error instanceof Error ? error.name : 'Error')
+    const failureClass = telemetryErrorClass(error)
     void (async () => {
-      const lifecycle = issue
-        ? await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(issue)).catch(() => undefined)
-        : undefined
-      if (lifecycle) {
-        await this.#reportLifecycle(lifecycle, 'factory.failure', {
+      try {
+        const lifecycle = issue
+          ? await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(issue)).catch(() => undefined)
+          : undefined
+        if (lifecycle) {
+          await this.#reportLifecycle(lifecycle, 'factory.failure', {
+            level: 'error',
+            errorCode: failureCode,
+          })
+          return
+        }
+        await this.#report({
+          type: 'factory.failure',
           level: 'error',
-          errorCode: failureCode,
+          attributes: {
+            backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+            component: 'orchestrator',
+            operation: 'error',
+            errorClass: failureClass,
+            errorCode: failureCode,
+          },
         })
-        return
+      } catch (telemetryError) {
+        // This is the terminal guard for the intentionally floating telemetry
+        // task. Never log raw messages or allow a custom logger to turn this
+        // best-effort path into an unhandled rejection.
+        try {
+          this.#logger.warn?.('[factory] failed to report failure telemetry', {
+            errorClass: telemetryErrorClass(telemetryError),
+          })
+        } catch {
+          // Reporting and logging are both non-critical to orchestration.
+        }
       }
-      await this.#report({
-        type: 'factory.failure',
-        level: 'error',
-        attributes: {
-          backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
-          component: 'orchestrator',
-          operation: 'error',
-          errorClass: failureClass,
-          errorCode: failureCode,
-        },
-      })
     })()
     this.#emit('error', { error, ...details, issue })
   }
@@ -11519,6 +11532,11 @@ const telemetryCategory = (value: string | undefined): string | undefined => {
   if (!value) return undefined
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:/-]+/gu, '-')
   return normalized.slice(0, 120) || undefined
+}
+
+const telemetryErrorClass = (error: unknown): string => {
+  const name = error instanceof Error ? error.name : ''
+  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 const isTimeoutError = (error: unknown): boolean =>

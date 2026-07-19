@@ -10,6 +10,14 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
  * hostname, username, local path, or other machine fingerprint.
  */
 export async function loadOrCreateFactoryInstanceId(path: string): Promise<string> {
+  try {
+    const existing = (await readFile(path, 'utf8')).trim()
+    if (!UUID.test(existing)) throw new Error('Factory instance identity file is invalid')
+    return existing
+  } catch (error) {
+    if (!isMissingFileError(error)) throw error
+  }
+
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   const candidatePath = `${path}.${randomUUID()}.tmp`
   let candidateExists = false
@@ -42,3 +50,6 @@ export async function loadOrCreateFactoryInstanceId(path: string): Promise<strin
 
 const isAlreadyExistsError = (error: unknown): boolean =>
   Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST')
+
+const isMissingFileError = (error: unknown): boolean =>
+  Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')

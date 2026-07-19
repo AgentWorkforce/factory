@@ -20,6 +20,7 @@ import {
   reapFactoryOrphansOnce,
   type FactoryConfig,
   type FactoryEventPayload,
+  type FactoryEventReporter,
   type FactoryCloudEventInputV1,
   type TriageDecision,
   type TriageEngine,
@@ -8679,6 +8680,54 @@ describe('FactoryLoop', () => {
         attributes: expect.objectContaining({ errorCode: 'fleet_delivery_failed' }),
       }),
     ])
+  })
+
+  it('contains failure telemetry rejection without leaking its message or creating an unhandled rejection', async () => {
+    const mount = new FakeMountClient({ [issuePath(69)]: issueFile(69) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const warnings: unknown[][] = []
+    const reporter: FactoryEventReporter = {
+      report: async (event) => {
+        if (event.type === 'factory.failure') {
+          throw Object.assign(new Error('private reporter path /customer/repo'), {
+            name: 'Private/customer/reporter',
+          })
+        }
+      },
+      flush: async () => ({ delivered: 0, pending: 0, attempts: 0, stoppedReason: 'empty' }),
+    }
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      reporter,
+      logger: {
+        warn: (...args) => {
+          warnings.push(args)
+          if (args[0] === '[factory] progress reporter rejected an event') {
+            throw new Error('custom logger rejected telemetry warning')
+          }
+        },
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(69), issueFile(69)))
+    await factory.dispatch(decision)
+    await stateStore.recordCritical('factory-test', 'critical-69', {
+      issue: decision.issue,
+      input: { to: 'ar-69-review', from: 'factory', text: 'Review the completed PR.' },
+    })
+
+    fleet.emitDeliveryFailed({ to: 'ar-69-review', msgId: 'critical-69', reason: 'dead-lettered' })
+    await flush()
+    await flush()
+
+    expect(warnings).toContainEqual([
+      '[factory] failed to report failure telemetry',
+      { errorClass: 'Error' },
+    ])
+    expect(JSON.stringify(warnings)).not.toMatch(/private reporter path|\/customer\/repo|Private\/customer/u)
   })
 
   it('delivers the complete implementer and reviewer briefings in their spawn tasks', async () => {

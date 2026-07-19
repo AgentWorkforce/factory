@@ -199,6 +199,42 @@ describe('FactoryCloudReporter', () => {
     expect(await reporter.flush()).toMatchObject({ delivered: 0, pending: 1, stoppedReason: 'rejected' })
   })
 
+  it('durably drops a permanently rejected head and delivers the next healthy event', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cloud-reporter-rejected-'))
+    roots.push(root)
+    const outbox = new FileFactoryCloudEventOutbox({ path: join(root, 'outbox.json') })
+    const warnings: unknown[][] = []
+    const requestIds: string[] = []
+    const fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { events: Array<{ id: string }> }
+      requestIds.push(body.events[0]?.id ?? 'missing')
+      return requestIds.length === 1
+        ? response(422, { error: 'private server rejection detail' })
+        : response(201, { accepted: 1, duplicates: 0 })
+    })
+    const reporter = new FactoryCloudReporter({
+      apiUrl: 'https://cloud.example',
+      instance: { id: 'instance-1', bootId: 'boot-1', version: '0.1.32' },
+      outbox,
+      getAccessToken: async () => 'cloud-token',
+      fetch,
+      logger: { warn: (...args) => warnings.push(args) },
+      batchSize: 1,
+      autoFlush: false,
+    })
+    await reporter.report(progress('event-poisoned'))
+    await reporter.report(progress('event-healthy'))
+
+    expect(await reporter.flush()).toMatchObject({ delivered: 1, pending: 0, attempts: 2 })
+    expect(requestIds).toEqual(['event-poisoned', 'event-healthy'])
+    expect(await outbox.stats()).toMatchObject({ pending: 0, droppedEvents: 1 })
+    expect(warnings).toContainEqual([
+      '[factory] dropped permanently rejected cloud progress events',
+      { status: 422, droppedEvents: 1 },
+    ])
+    expect(JSON.stringify(warnings)).not.toContain('private server rejection detail')
+  })
+
   it('preserves a Cloud deployment base path when resolving the endpoint', async () => {
     const requests: string[] = []
     const reporter = await createReporter({

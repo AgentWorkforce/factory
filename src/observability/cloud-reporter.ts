@@ -58,6 +58,8 @@ type DeliveryResult = {
   attempts: number
   stoppedReason?: FactoryEventReportResult['stoppedReason']
   retryDelayMs?: number
+  discard?: boolean
+  status?: number
 }
 
 /**
@@ -178,6 +180,18 @@ export class FactoryCloudReporter implements FactoryEventReporter {
         attempts += result.attempts
         if (!result.delivered) {
           stoppedReason = result.stoppedReason ?? 'unavailable'
+          if (result.discard) {
+            const ids = batch.events.map((event) => event.id)
+            const discarded = await this.#outbox.discard(ids)
+            if (discarded > 0) {
+              this.#lastKnownPending = Math.max(0, this.#lastKnownPending - discarded)
+              this.#logger?.warn?.('[factory] dropped permanently rejected cloud progress events', {
+                status: result.status,
+                droppedEvents: discarded,
+              })
+              continue
+            }
+          }
           if (this.#autoFlush && !this.#closed) this.#scheduleFlush(result.retryDelayMs ?? this.#retryMaxMs)
           break
         }
@@ -243,9 +257,20 @@ export class FactoryCloudReporter implements FactoryEventReporter {
         continue
       }
 
+      if (response.status === 401) {
+        return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+      }
+
       if (!isRetryableStatus(response.status)) {
         this.#logger?.warn?.('[factory] cloud progress batch rejected', { status: response.status })
-        return { delivered: false, attempts: attempt, stoppedReason: 'rejected', retryDelayMs: this.#retryMaxMs }
+        return {
+          delivered: false,
+          attempts: attempt,
+          stoppedReason: 'rejected',
+          retryDelayMs: this.#retryMaxMs,
+          discard: isPermanentPayloadRejectionStatus(response.status),
+          status: response.status,
+        }
       }
 
       retryDelayMs = retryAfterMs(response, this.#now()) ?? this.#nextRetryDelay(attempt)
@@ -367,6 +392,9 @@ function resolveEndpoint(options: Pick<FactoryCloudReporterOptions, 'apiUrl' | '
 
 const isRetryableStatus = (status: number): boolean =>
   status === 408 || status === 425 || status === 429 || status >= 500
+
+const isPermanentPayloadRejectionStatus = (status: number): boolean =>
+  status === 400 || status === 409 || status === 413 || status === 415 || status === 422
 
 function retryAfterMs(response: Response, nowMs: number): number | undefined {
   const value = response.headers.get('retry-after')?.trim()

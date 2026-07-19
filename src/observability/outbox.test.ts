@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -46,6 +46,51 @@ describe('FileFactoryCloudEventOutbox', () => {
     expect(result.droppedEvents).toBe(1)
     expect((await outbox.peekBatch())?.events.map(({ id }) => id)).toEqual(['failure-1', 'heartbeat-2'])
     expect(await outbox.stats()).toMatchObject({ pending: 2, droppedEvents: 1 })
+  })
+
+  it('enforces exact compact maxBytes accounting across entry commas and sequence growth', async () => {
+    const referencePath = await outboxPath()
+    const reference = new FileFactoryCloudEventOutbox({ path: referencePath })
+    await reference.enqueue(instance('boot-1'), event('event-1', 'instance.heartbeat'))
+    await reference.enqueue(instance('boot-1'), event('event-2', 'instance.heartbeat'))
+    const exactBytes = await compactFileBytes(referencePath)
+
+    const exact = new FileFactoryCloudEventOutbox({ path: await outboxPath(), maxBytes: exactBytes })
+    await exact.enqueue(instance('boot-1'), event('event-1', 'instance.heartbeat'))
+    expect(await exact.enqueue(instance('boot-1'), event('event-2', 'instance.heartbeat')))
+      .toMatchObject({ droppedEvents: 0, pending: 2 })
+
+    const oneByteUnder = new FileFactoryCloudEventOutbox({
+      path: await outboxPath(),
+      maxBytes: exactBytes - 1,
+    })
+    await oneByteUnder.enqueue(instance('boot-1'), event('event-1', 'instance.heartbeat'))
+    expect(await oneByteUnder.enqueue(instance('boot-1'), event('event-2', 'instance.heartbeat')))
+      .toMatchObject({ droppedEvents: 1, pending: 1 })
+    expect((await oneByteUnder.peekBatch())?.events.map(({ id }) => id)).toEqual(['event-2'])
+  })
+
+  it('uses compact maxBytes semantics when migrating a legacy pretty-printed file', async () => {
+    const path = await outboxPath()
+    const reference = new FileFactoryCloudEventOutbox({ path })
+    await reference.enqueue(instance('boot-1'), event('event-1', 'instance.heartbeat'))
+    await reference.enqueue(instance('boot-1'), event('event-2', 'instance.heartbeat'))
+    await reference.enqueue(instance('boot-1'), event('event-3', 'instance.heartbeat'))
+    const exactThreeEventBytes = await compactFileBytes(path)
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown
+
+    const legacyPath = await outboxPath()
+    const legacyTwoEvents = {
+      ...(parsed as Record<string, unknown>),
+      nextSequence: 3,
+      entries: (parsed as { entries: unknown[] }).entries.slice(0, 2),
+    }
+    await writeFile(legacyPath, `${JSON.stringify(legacyTwoEvents, null, 2)}\n`)
+    const migrated = new FileFactoryCloudEventOutbox({ path: legacyPath, maxBytes: exactThreeEventBytes })
+
+    expect(await migrated.enqueue(instance('boot-1'), event('event-3', 'instance.heartbeat')))
+      .toMatchObject({ droppedEvents: 0, pending: 3 })
+    expect(await compactFileBytes(legacyPath)).toBe(exactThreeEventBytes)
   })
 
   it('never mixes persisted boot identities in one request batch', async () => {
@@ -123,4 +168,9 @@ async function outboxPath(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'factory-cloud-outbox-'))
   roots.push(root)
   return join(root, 'events.json')
+}
+
+async function compactFileBytes(path: string): Promise<number> {
+  const content = await readFile(path, 'utf8')
+  return Buffer.byteLength(content.endsWith('\n') ? content.slice(0, -1) : content, 'utf8')
 }

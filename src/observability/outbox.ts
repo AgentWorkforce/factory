@@ -40,6 +40,7 @@ const outboxDocumentSchema = z.object({
 
 type StoredEntry = z.infer<typeof storedEntrySchema>
 type OutboxDocument = z.infer<typeof outboxDocumentSchema>
+type LoadedOutboxDocument = { document: OutboxDocument; compactBytes: number }
 
 export interface FileFactoryCloudEventOutboxOptions {
   path: string
@@ -66,6 +67,8 @@ export interface FactoryCloudEventOutbox {
   enqueue(instance: FactoryCloudInstanceV1, event: FactoryCloudEventInputV1): Promise<FactoryCloudEventEnqueueResult>
   peekBatch(limit?: number, maxPayloadBytes?: number): Promise<FactoryCloudEventBatchV1 | undefined>
   acknowledge(eventIds: readonly string[]): Promise<number>
+  /** Remove undeliverable events and increment the durable dropped counter. */
+  discard(eventIds: readonly string[]): Promise<number>
   stats(): Promise<FactoryCloudEventOutboxStats>
 }
 
@@ -95,7 +98,8 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     const instance = FactoryCloudInstanceV1Schema.parse(rawInstance)
     const input = FactoryCloudEventInputV1Schema.parse(rawEvent)
     return await this.#exclusive(async () => this.#withLock(async () => {
-      const document = await this.#load()
+      const loaded = await this.#load()
+      const { document } = loaded
       const existing = document.entries.find(({ event }) => event.id === input.id)
       if (existing) {
         return {
@@ -107,10 +111,13 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
       }
 
       const event = FactoryCloudEventV1Schema.parse({ ...input, sequence: document.nextSequence })
+      const storedEntry = { instance, event }
+      let compactBytes = loaded.compactBytes
+      compactBytes += integerBytes(document.nextSequence + 1) - integerBytes(document.nextSequence)
+      compactBytes += serializedBytes(storedEntry) + (document.entries.length > 0 ? 1 : 0)
       document.nextSequence += 1
-      document.entries.push({ instance, event })
-      const droppedEvents = compactDocument(document, this.#maxEvents, this.#maxBytes)
-      document.droppedEvents += droppedEvents
+      document.entries.push(storedEntry)
+      const { droppedEvents } = compactDocument(document, this.#maxEvents, this.#maxBytes, compactBytes)
       await this.#persist(document)
       return { event, duplicate: false, droppedEvents, pending: document.entries.length }
     }))
@@ -123,7 +130,7 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     const boundedLimit = Math.min(FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE, positiveInteger(limit, 'limit'))
     const boundedPayloadBytes = positiveInteger(maxPayloadBytes, 'maxPayloadBytes')
     return await this.#exclusive(async () => this.#withLock(async () => {
-      const document = await this.#load()
+      const { document } = await this.#load()
       let mutated = false
       for (;;) {
         const first = document.entries[0]
@@ -160,7 +167,7 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     if (eventIds.length === 0) return 0
     const ids = new Set(eventIds.map((id) => z.string().min(1).max(256).parse(id)))
     return await this.#exclusive(async () => this.#withLock(async () => {
-      const document = await this.#load()
+      const { document } = await this.#load()
       const before = document.entries.length
       document.entries = document.entries.filter(({ event }) => !ids.has(event.id))
       const acknowledged = before - document.entries.length
@@ -169,9 +176,25 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     }))
   }
 
+  async discard(eventIds: readonly string[]): Promise<number> {
+    if (eventIds.length === 0) return 0
+    const ids = new Set(eventIds.map((id) => z.string().min(1).max(256).parse(id)))
+    return await this.#exclusive(async () => this.#withLock(async () => {
+      const { document } = await this.#load()
+      const before = document.entries.length
+      document.entries = document.entries.filter(({ event }) => !ids.has(event.id))
+      const discarded = before - document.entries.length
+      if (discarded > 0) {
+        document.droppedEvents += discarded
+        await this.#persist(document)
+      }
+      return discarded
+    }))
+  }
+
   async stats(): Promise<FactoryCloudEventOutboxStats> {
     return await this.#exclusive(async () => {
-      const document = await this.#load()
+      const { document } = await this.#load()
       return {
         pending: document.entries.length,
         droppedEvents: document.droppedEvents,
@@ -180,11 +203,21 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     })
   }
 
-  async #load(): Promise<OutboxDocument> {
+  async #load(): Promise<LoadedOutboxDocument> {
     try {
-      return outboxDocumentSchema.parse(JSON.parse(await readFile(this.#path, 'utf8')))
+      const content = await readFile(this.#path, 'utf8')
+      const document = outboxDocumentSchema.parse(JSON.parse(content))
+      return {
+        document,
+        compactBytes: isCanonicalCompactDocument(content)
+          ? Buffer.byteLength(content.endsWith('\n') ? content.slice(0, -1) : content, 'utf8')
+          : documentBytes(document),
+      }
     } catch (error) {
-      if (isMissingFileError(error)) return emptyDocument()
+      if (isMissingFileError(error)) {
+        const document = emptyDocument()
+        return { document, compactBytes: documentBytes(document) }
+      }
       throw error
     }
   }
@@ -195,7 +228,7 @@ export class FileFactoryCloudEventOutbox implements FactoryCloudEventOutbox {
     try {
       const handle = await open(temporaryPath, 'wx', 0o600)
       try {
-        await handle.writeFile(`${JSON.stringify(document, null, 2)}\n`)
+        await handle.writeFile(`${JSON.stringify(document)}\n`)
         await handle.sync()
       } finally {
         await handle.close()
@@ -241,18 +274,79 @@ const emptyDocument = (): OutboxDocument => ({
   entries: [],
 })
 
-function compactDocument(document: OutboxDocument, maxEvents: number, maxBytes: number): number {
-  let dropped = 0
-  while (document.entries.length > maxEvents || documentBytes(document) > maxBytes) {
-    if (document.entries.length === 0) break
-    const nonCriticalIndex = document.entries.findIndex(({ event }) => !isCriticalFactoryCloudEvent(event))
-    document.entries.splice(nonCriticalIndex >= 0 ? nonCriticalIndex : 0, 1)
-    dropped += 1
+function compactDocument(
+  document: OutboxDocument,
+  maxEvents: number,
+  maxBytes: number,
+  initialBytes: number,
+): { droppedEvents: number; compactBytes: number } {
+  if (document.entries.length <= maxEvents && initialBytes <= maxBytes) {
+    return { droppedEvents: 0, compactBytes: initialBytes }
   }
-  return dropped
+
+  const ordinary: Array<{ index: number; bytes: number }> = []
+  const critical: Array<{ index: number; bytes: number }> = []
+  document.entries.forEach((entry, index) => {
+    const candidate = { index, bytes: serializedBytes(entry) }
+    if (isCriticalFactoryCloudEvent(entry.event)) critical.push(candidate)
+    else ordinary.push(candidate)
+  })
+
+  const removed = new Set<number>()
+  let compactBytes = initialBytes
+  let remainingEntries = document.entries.length
+  let droppedTotal = document.droppedEvents
+  for (const candidate of [...ordinary, ...critical]) {
+    if (remainingEntries <= maxEvents && compactBytes <= maxBytes) break
+    // A JSON array loses exactly one comma whenever an entry is removed from
+    // an array that still had at least two entries.
+    compactBytes -= candidate.bytes + (remainingEntries > 1 ? 1 : 0)
+    remainingEntries -= 1
+    const previousCounterBytes = integerBytes(droppedTotal)
+    droppedTotal += 1
+    compactBytes += integerBytes(droppedTotal) - previousCounterBytes
+    removed.add(candidate.index)
+  }
+
+  const droppedEvents = removed.size
+  if (droppedEvents > 0) {
+    document.entries = document.entries.filter((_entry, index) => !removed.has(index))
+    document.droppedEvents = droppedTotal
+  }
+  return { droppedEvents, compactBytes }
 }
 
 const documentBytes = (document: OutboxDocument): number => Buffer.byteLength(JSON.stringify(document), 'utf8')
+const serializedBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), 'utf8')
+const integerBytes = (value: number): number => Buffer.byteLength(String(value), 'utf8')
+
+/**
+ * Files written by this version are canonical compact JSON plus one newline.
+ * Legacy pretty-printed files fall back to one exact compact serialization on
+ * first mutation, then are migrated by #persist. The scanner avoids trusting a
+ * raw formatted file size as though it were the maxBytes accounting format.
+ */
+function isCanonicalCompactDocument(content: string): boolean {
+  let inString = false
+  let escaped = false
+  const finalNewline = content.endsWith('\n') ? content.length - 1 : -1
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content[index]
+    if (index === finalNewline) continue
+    if (inString) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') inString = false
+      continue
+    }
+    if (character === '"') {
+      inString = true
+      continue
+    }
+    if (character === ' ' || character === '\t' || character === '\n' || character === '\r') return false
+  }
+  return true
+}
 
 const batch = (
   instance: FactoryCloudInstanceV1,
