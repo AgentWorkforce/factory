@@ -995,6 +995,23 @@ class RegistrationLagBabysitterHarnessClient extends RosterPidHarnessClient {
   }
 }
 
+// Every babysitter wake fails with the registration-lag (agent_not_found)
+// signature and never recovers, modelling an agent that is up (local roster)
+// but whose relay identity never becomes resolvable for cloud DMs.
+class UnreachableBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      throw new Error(
+        `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+      )
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
   resumeAttempts = 0
   shutdownCalls = 0
@@ -14980,6 +14997,72 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.stop()
     }
   }, 10_000)
+
+  it('escalates once and backs off the babysitter wake loop when the target stays unreachable', async () => {
+    const issue = realIssueFile(423, ready, { title: 'Real unreachable babysitter escalation' })
+    const mount = new FakeMountClient({ [issuePath(423)]: issue })
+    const harness = new UnreachableBabysitterHarnessClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    // A clock that starts at a realistic epoch (so dispatch-lifecycle leases
+    // behave) but whose sleeps advance instantly, so the inner injection retry
+    // (6 attempts) does not cost real seconds. Wake re-flushes are still paced
+    // by real setTimeout, so the fast-retry vs backoff cadence is preserved.
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      // Tiny grace window + a slow backoff so the escalation + backoff is
+      // observable without waiting the production 120s/60s.
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 60_000,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' }),
+      readChildPids: async () => [],
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(423), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/423/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 423,
+        state: 'open',
+        head_ref: 'ar-423-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-423-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-423-babysit'))
+
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9423.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 423 },
+        comment: { id: 9423, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9423.json', 'comment-9423'))
+
+      // The wake keeps failing with a registration-lag (agent_not_found) error.
+      // Within the grace window it stays in the fast-retry phase, then once the
+      // window elapses it escalates exactly once and backs off to the slow
+      // cadence instead of spinning every second forever.
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1),
+        { timeout: 8_000 },
+      )
+      const failuresAtEscalation = factory.status().counters.babysitterEventWakeFailures ?? 0
+      expect(failuresAtEscalation).toBeGreaterThanOrEqual(1)
+      await new Promise((resolve) => setTimeout(resolve, 1_500))
+      // Backed off (next retry is ~60s out), so no further failures accrue in
+      // the next second and the escalation is not re-logged.
+      expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAtEscalation)
+      expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  }, 15_000)
 
   it('defers the babysitter wake and PTY submit throughout a declared destructive critical section', async () => {
     const issue = realIssueFile(422, ready, { title: 'Real babysitter critical section' })
