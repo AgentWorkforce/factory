@@ -136,6 +136,14 @@ type BabysitterWakeState = {
   deferredSubmitTargets?: string[]
   cancelled?: boolean
   nextDelayMs?: number
+  // Timestamp of the first of an uninterrupted run of registration-lag wake
+  // failures. Cleared on the next successful delivery. Used to bound the
+  // otherwise-unbounded 1s retry loop when a babysitter never becomes
+  // reachable (see BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS).
+  unreachableSinceMs?: number
+  // Set once the unreachable escalation warning has been emitted, so the
+  // slow-cadence backoff does not re-log on every subsequent retry.
+  unreachableEscalated?: boolean
 }
 type IssueSource = 'linear' | 'github'
 type SlackReply = {
@@ -237,6 +245,17 @@ const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const BABYSITTER_EVENT_COALESCE_MS = 750
 const BABYSITTER_EVENT_RETRY_MS = 1_000
+// A babysitter wake fails with a "registration lag" error (agent_not_found /
+// recipient unavailable) both when a freshly spawned agent has not finished
+// enrolling AND when an agent is up but its relay identity never becomes
+// resolvable (e.g. a resumed agent whose relay enrollment silently dropped).
+// The two are indistinguishable per-attempt, so treating every such failure as
+// transient produced an unbounded 1s retry loop that never recovered. Once the
+// same wake has been failing this long, stop the tight loop: back off to a slow
+// cadence and flag the stuck babysitter once for human attention. Genuine
+// startup lag clears well within this window.
+const BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS = 120_000
+const BABYSITTER_WAKE_UNREACHABLE_RETRY_MS = 60_000
 const CLARIFICATION_WAKE_LEASE_MS = 60_000
 const CLARIFICATION_WAKE_RETRY_MS = 1_000
 const CLARIFICATION_PARK_RETRY_MS = 5_000
@@ -293,6 +312,8 @@ export class FactoryLoop implements Factory {
   readonly #kill: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readonly #readChildPids: ((pid: number) => Promise<number[]>) | undefined
   readonly #terminationGraceMs: number | undefined
+  readonly #babysitterWakeUnreachableEscalateMs: number
+  readonly #babysitterWakeUnreachableRetryMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -442,6 +463,8 @@ export class FactoryLoop implements Factory {
     this.#kill = ports.kill ?? process.kill
     this.#readChildPids = ports.readChildPids
     this.#terminationGraceMs = ports.terminationGraceMs
+    this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
+    this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -6991,6 +7014,8 @@ export class FactoryLoop implements Factory {
       let targets: string[]
       if (!this.#fleet.waitForInjected) {
         await this.#fleet.sendMessage(input)
+        state.unreachableSinceMs = undefined
+        state.unreachableEscalated = false
         if (this.#stopping || state.cancelled) {
           state.deliveringKinds = undefined
           return
@@ -7001,6 +7026,10 @@ export class FactoryLoop implements Factory {
         return
       } else {
         const ack = await this.#waitForInjectedWithRetry(input)
+        // Delivery confirmed: the target is reachable again, so clear any
+        // registration-lag backoff state accumulated by prior failures.
+        state.unreachableSinceMs = undefined
+        state.unreachableEscalated = false
         targets = ack.targets.length > 0 ? [...new Set(ack.targets)] : [input.to]
       }
       if (this.#stopping || state.cancelled) return
@@ -7042,14 +7071,48 @@ export class FactoryLoop implements Factory {
         })
       }
       this.#increment('babysitterEventWakeFailures')
-      this.#logger.warn?.('[factory] babysitter event wake failed; preserving it for retry', {
-        issue: state.issue.key,
-        repo: state.repo,
-        prNumber: state.prNumber,
-        babysitter: state.agentName,
-        error: describeError(error).errorMessage,
-      })
-      state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
+      const registrationLag = isRegistrationLagInjectionError(error)
+      if (registrationLag) {
+        state.unreachableSinceMs ??= this.#clock.now()
+      } else {
+        // A different failure mode (not "target unreachable") resets the
+        // unreachable window so a later genuine registration lag starts fresh.
+        state.unreachableSinceMs = undefined
+        state.unreachableEscalated = false
+      }
+      const unreachableMs = state.unreachableSinceMs !== undefined
+        ? this.#clock.now() - state.unreachableSinceMs
+        : 0
+      if (registrationLag && unreachableMs >= this.#babysitterWakeUnreachableEscalateMs) {
+        // The agent is up but its relay identity never became resolvable. Stop
+        // the tight 1s loop: back off to a slow cadence (still eventually
+        // recovering if the agent finally enrolls) and flag it once so an
+        // operator can intervene (e.g. re-spawn / restart) instead of the
+        // failure spinning silently forever.
+        state.nextDelayMs = this.#babysitterWakeUnreachableRetryMs
+        if (!state.unreachableEscalated) {
+          state.unreachableEscalated = true
+          this.#increment('babysitterEventWakeUnreachableEscalations')
+          this.#logger.warn?.('[factory] babysitter unreachable past grace window; slowing wake retries and flagging for human attention', {
+            issue: state.issue.key,
+            repo: state.repo,
+            prNumber: state.prNumber,
+            babysitter: state.agentName,
+            unreachableMs,
+            retryDelayMs: this.#babysitterWakeUnreachableRetryMs,
+            error: describeError(error).errorMessage,
+          })
+        }
+      } else {
+        state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
+        this.#logger.warn?.('[factory] babysitter event wake failed; preserving it for retry', {
+          issue: state.issue.key,
+          repo: state.repo,
+          prNumber: state.prNumber,
+          babysitter: state.agentName,
+          error: describeError(error).errorMessage,
+        })
+      }
     }
   }
 

@@ -36,6 +36,14 @@ export interface FactoryPorts {
   kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readChildPids?: (pid: number) => Promise<number[]>
   terminationGraceMs?: number
+  /**
+   * How long a babysitter wake may keep failing with a registration-lag
+   * (target-unreachable) error before the tight retry loop escalates once and
+   * backs off. Test-only override of the built-in default.
+   */
+  babysitterWakeUnreachableEscalateMs?: number
+  /** Slow retry cadence applied after an unreachable babysitter escalation. Test-only override. */
+  babysitterWakeUnreachableRetryMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
