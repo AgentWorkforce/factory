@@ -201,9 +201,13 @@ export class FactoryCloudReporter implements FactoryEventReporter {
         this.#lastKnownPending = Math.max(0, this.#lastKnownPending - acknowledged)
       }
     } catch (error) {
-      stoppedReason = 'unavailable'
-      this.#logger?.warn?.('[factory] cloud progress flush unavailable', { errorClass: errorClass(error) })
-      if (this.#autoFlush && !this.#closed) this.#scheduleFlush(this.#retryMaxMs)
+      if (isDeadlineExceeded(error)) {
+        stoppedReason = 'deadline'
+      } else {
+        stoppedReason = 'unavailable'
+        this.#logger?.warn?.('[factory] cloud progress flush unavailable', { errorClass: errorClass(error) })
+        if (this.#autoFlush && !this.#closed) this.#scheduleFlush(this.#retryMaxMs)
+      }
     }
     const stats = await this.#safeStats(deadlineAt)
     return { delivered, pending: stats.pending, attempts, stoppedReason }
