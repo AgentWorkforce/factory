@@ -910,6 +910,33 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('re-adopts tracked workers and synthesizes exits for workers missing after restart', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-1-impl' }]
+    const fleet = new InternalFleetClient({ client: harness })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+
+    fleet.hydrateTracked([
+      { name: 'ar-1-impl', invocationId: 'inv-impl' },
+      { name: 'ar-1-review', invocationId: 'inv-review' },
+    ])
+    await fleet.reconcileTrackedAgents()
+
+    expect(fleet.trackedAgents()).toEqual(new Map([
+      ['ar-1-impl', { invocationId: 'inv-impl', node: undefined }],
+    ]))
+    expect(exits).toEqual([{ name: 'ar-1-review', reason: 'reconciled-missing' }])
+
+    harness.agents = []
+    await fleet.reconcileTrackedAgents()
+    expect(fleet.trackedAgents().size).toBe(0)
+    expect(exits).toEqual([
+      { name: 'ar-1-review', reason: 'reconciled-missing' },
+      { name: 'ar-1-impl', reason: 'reconciled-missing' },
+    ])
+  })
+
   it('clears readiness even when releasing the agent fails', async () => {
     vi.useFakeTimers()
     try {
