@@ -120,6 +120,13 @@ const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
 }).default({})
 
+const reportingSchema = z.object({
+  enabled: z.boolean().default(true),
+  outboxPath: z.string().min(1).optional(),
+  batchSize: z.number().int().min(1).max(100).default(100),
+  requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
+}).default({})
+
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
 // don't hand-configure them. These names let the factory resolve a role from a
 // synced record that carries state.name but no state.id (sparse-sync fallback).
@@ -180,6 +187,10 @@ const WorkspaceConfigObjectSchema = z.object({
   // instead of jumping straight to `done`. Default off preserves the legacy
   // PR-open -> done behavior.
   babysitter: babysitterSchema,
+  // Authenticated run progress is a Cloud product feature, not anonymous
+  // analytics. It defaults on for real CLI sessions and remains no-op when no
+  // Cloud account is available; delivery failure never changes orchestration.
+  reporting: reportingSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the

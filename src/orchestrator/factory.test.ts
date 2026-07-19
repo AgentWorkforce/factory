@@ -20,6 +20,8 @@ import {
   reapFactoryOrphansOnce,
   type FactoryConfig,
   type FactoryEventPayload,
+  type FactoryEventReporter,
+  type FactoryCloudEventInputV1,
   type TriageDecision,
   type TriageEngine,
   type WorkflowRunnerInput,
@@ -271,6 +273,18 @@ class RecordingGithubWriteback implements GithubWriteback {
 
   async closeIssue(issue: LinearIssue, body: string): Promise<void> {
     this.closes.push({ key: issue.key, body })
+  }
+}
+
+class RecordingFactoryEventReporter {
+  readonly events: FactoryCloudEventInputV1[] = []
+
+  async report(event: FactoryCloudEventInputV1): Promise<void> {
+    this.events.push(structuredClone(event))
+  }
+
+  async flush() {
+    return { delivered: this.events.length, pending: 0, attempts: 0, stoppedReason: 'empty' as const }
   }
 }
 
@@ -2491,6 +2505,57 @@ describe('FactoryLoop', () => {
       })
     } finally {
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports durable run phases and worker ownership without exposing task or path content', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 61)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(61, { labels: ['factory', 'pear'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new LocalLifecycleFleetClient()
+    const reporter = new RecordingFactoryEventReporter()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      reporter,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-61-review-pear', 'customer /private/repo crashed')
+      await flush()
+
+      expect(reporter.events.map((event) => event.type)).toEqual(expect.arrayContaining([
+        'run.started',
+        'agent.spawned',
+        'agent.exited',
+        'run.phase_changed',
+      ]))
+      expect(reporter.events.filter((event) => event.type === 'agent.spawned')).toHaveLength(2)
+      const runIds = new Set(reporter.events.flatMap((event) => event.runId ? [event.runId] : []))
+      expect(runIds.size).toBe(1)
+      const runEvents = reporter.events.filter((event) => event.runId)
+      const traceIds = new Set(runEvents.flatMap((event) => event.trace?.traceId ? [event.trace.traceId] : []))
+      expect(traceIds.size).toBe(1)
+      expect(runEvents.every((event) => event.trace && !event.trace.spanId && !event.trace.parentSpanId)).toBe(true)
+      expect(reporter.events.find((event) => event.type === 'run.phase_changed')).toMatchObject({
+        phase: 'running',
+        status: 'running',
+        run: {
+          source: 'github',
+          repository: 'AgentWorkforce/pear',
+          issueKey: '61',
+        },
+      })
+      expect(reporter.events.find((event) => event.type === 'agent.exited')).toMatchObject({
+        attributes: { releaseReason: 'other' },
+      })
+      expect(JSON.stringify(reporter.events)).not.toMatch(/Implement the requested|\/github\/repos|\/work\/pear|customer \/private/u)
+    } finally {
+      await factory.stop()
     }
   })
 
@@ -8588,7 +8653,8 @@ describe('FactoryLoop', () => {
     const mount = new FakeMountClient({ [issuePath(68)]: issueFile(68) })
     const fleet = new FakeFleetClient()
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
-    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), stateStore })
+    const reporter = new RecordingFactoryEventReporter()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), stateStore, reporter })
     const errors: unknown[] = []
     factory.on('error', (payload) => errors.push(payload))
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(68), issueFile(68)))
@@ -8609,6 +8675,59 @@ describe('FactoryLoop', () => {
     expect(errors[0]).toMatchObject({ issue: { key: 'AR-68' } })
     expect(fleet.messages).toEqual([])
     expect(factory.status().counters.criticalDeliveryTerminalFailures).toBe(1)
+    expect(reporter.events.filter((event) => event.type === 'factory.failure')).toEqual([
+      expect.objectContaining({
+        attributes: expect.objectContaining({ errorCode: 'fleet_delivery_failed' }),
+      }),
+    ])
+  })
+
+  it('contains failure telemetry rejection without leaking its message or creating an unhandled rejection', async () => {
+    const mount = new FakeMountClient({ [issuePath(69)]: issueFile(69) })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const warnings: unknown[][] = []
+    const reporter: FactoryEventReporter = {
+      report: async (event) => {
+        if (event.type === 'factory.failure') {
+          throw Object.assign(new Error('private reporter path /customer/repo'), {
+            name: 'Private/customer/reporter',
+          })
+        }
+      },
+      flush: async () => ({ delivered: 0, pending: 0, attempts: 0, stoppedReason: 'empty' }),
+    }
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      reporter,
+      logger: {
+        warn: (...args) => {
+          warnings.push(args)
+          if (args[0] === '[factory] progress reporter rejected an event') {
+            throw new Error('custom logger rejected telemetry warning')
+          }
+        },
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(69), issueFile(69)))
+    await factory.dispatch(decision)
+    await stateStore.recordCritical('factory-test', 'critical-69', {
+      issue: decision.issue,
+      input: { to: 'ar-69-review', from: 'factory', text: 'Review the completed PR.' },
+    })
+
+    fleet.emitDeliveryFailed({ to: 'ar-69-review', msgId: 'critical-69', reason: 'dead-lettered' })
+    await flush()
+    await flush()
+
+    expect(warnings).toContainEqual([
+      '[factory] failed to report failure telemetry',
+      { errorClass: 'Error' },
+    ])
+    expect(JSON.stringify(warnings)).not.toMatch(/private reporter path|\/customer\/repo|Private\/customer/u)
   })
 
   it('delivers the complete implementer and reviewer briefings in their spawn tasks', async () => {

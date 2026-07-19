@@ -36,6 +36,10 @@ export type {
   TelemetrySink,
 } from './system'
 export type {
+  FactoryEventReporter,
+  FactoryEventReportResult,
+} from './observability'
+export type {
   AgentWorktree,
   AgentWorktreeManager,
 } from './worktree'

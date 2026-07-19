@@ -3,7 +3,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '../index'
+import type {
+  CloseProbePrInput,
+  Factory,
+  FactoryCloudEventInputV1,
+  FactoryEventReporter,
+  FactoryPorts,
+  createFactory,
+} from '../index'
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
@@ -471,6 +478,60 @@ describe('fleet CLI runtime', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('passes Cloud reporting into Factory and flushes instance lifecycle events on exit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reporting-'))
+    try {
+      const configPath = await writeConfig(root)
+      const events: FactoryCloudEventInputV1[] = []
+      const close = vi.fn(async () => ({
+        delivered: events.length,
+        pending: 0,
+        attempts: 1,
+        stoppedReason: 'empty' as const,
+      }))
+      const reporter: FactoryEventReporter = {
+        report: async (event) => { events.push(event) },
+        flush: close,
+        close,
+      }
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const createFactorySpy = vi.fn((_config, ports: FactoryPorts) => {
+        expect(ports.reporter).toBe(reporter)
+        return factory
+      }) as typeof createFactory
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        reporter,
+        createFactory: createFactorySpy,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(events.map((event) => event.type)).toEqual([
+        'instance.started',
+        'instance.stopping',
+        'instance.stopped',
+      ])
+      expect(events[0]).toMatchObject({ attributes: { backend: 'internal', mode: 'run-once' } })
+      expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('infers clonePath from cwd for internal dispatch and logs the checkout root', async () => {
@@ -1869,6 +1930,18 @@ describe('fleet CLI runtime', () => {
       const createFactory = vi.fn(() => factory)
       const ensureLocalMount = vi.fn(async () => {})
       const daemonExits: number[] = []
+      const events: FactoryCloudEventInputV1[] = []
+      const closeReporter = vi.fn(async () => ({
+        delivered: events.length,
+        pending: 0,
+        attempts: 0,
+        stoppedReason: 'empty' as const,
+      }))
+      const reporter: FactoryEventReporter = {
+        report: async (event) => { events.push(event) },
+        flush: closeReporter,
+        close: closeReporter,
+      }
 
       const run = runFleetCli([
         'start',
@@ -1881,6 +1954,7 @@ describe('fleet CLI runtime', () => {
         mount: new FakeMountClient(),
         createFactory,
         ensureLocalMount,
+        reporter,
         stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
         flushDaemonOutput: async () => {
           calls.push('flush')
@@ -1899,8 +1973,14 @@ describe('fleet CLI runtime', () => {
 
       await expect(run).resolves.toBe(0)
       expect(factory.stop).toHaveBeenCalledTimes(1)
-      expect(calls).toEqual(['stop', 'flush', 'exit'])
-      expect(daemonExits).toEqual([0])
+      expect(calls).toEqual(['stop', 'flush'])
+      expect(daemonExits).toEqual([])
+      expect(events.map((event) => event.type)).toEqual([
+        'instance.started',
+        'instance.stopping',
+        'instance.stopped',
+      ])
+      expect(closeReporter).toHaveBeenCalledWith({ deadlineMs: 2_000 })
       expect(listeners.size).toBe(0)
     } finally {
       await rm(root, { recursive: true, force: true })

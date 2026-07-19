@@ -14,6 +14,7 @@ import type {
   Capability,
   ChangeEvent,
   FleetClient,
+  FactoryEventReporter,
   GithubIssueStatus,
   GithubPublishPullRequestResult,
   GithubWriteback,
@@ -80,6 +81,11 @@ import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../write
 import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
 import { readFactoryInFlightRegistry, terminatePids } from './reaper'
+import {
+  createFactoryCloudEventV1,
+  factoryCloudReleaseReasonV1,
+  type FactoryCloudEventInputV1,
+} from '../observability/events'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -290,6 +296,7 @@ export class FactoryLoop implements Factory {
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
   readonly #worktrees?: AgentWorktreeManager
+  readonly #reporter?: FactoryEventReporter
   #batchView?: BatchSnapshot
   #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
@@ -435,6 +442,7 @@ export class FactoryLoop implements Factory {
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
+    this.#reporter = ports.reporter
     this.#state = ports.stateStore ?? new InMemoryStateStore({
       batchSize: config.batchSize,
       agentQuestionDedupeLimit: AGENT_QUESTION_DEDUPE_LIMIT,
@@ -1889,7 +1897,11 @@ export class FactoryLoop implements Factory {
       if (adopted.length > 0) {
         this.#fleet.hydrateTracked?.(adopted)
         await this.#saveDispatchLifecycle(record, 'published', publishedPr)
-        for (const _agent of adopted) this.#increment('legacyLocalWorkersAdopted')
+        for (const agent of adopted) {
+          this.#increment('legacyLocalWorkersAdopted')
+          const tracked = record.agents.get(agent.name)
+          if (tracked) await this.#reportAgent(record, tracked, 'agent.adopted')
+        }
       }
     }
     await this.#ensureBabysitter(record, {
@@ -2503,6 +2515,12 @@ export class FactoryLoop implements Factory {
         this.#dispatchLifecycleEpochs.delete(key)
         this.#increment('dispatchLifecycleLeasesLost')
         const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (lifecycle) {
+          await this.#reportLifecycle(lifecycle, 'factory.anomaly', {
+            level: 'error',
+            errorCode: 'lease_lost',
+          })
+        }
         if (lifecycle && !isTerminalDispatchLifecycle(lifecycle) && lifecycle.phase !== 'waiting-for-human') {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(lifecycle))
         }
@@ -2552,11 +2570,99 @@ export class FactoryLoop implements Factory {
     }
     this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
     this.#scheduleDispatchLifecycleRenewal()
+    if (claim.created) {
+      await this.#reportLifecycle(claim.lifecycle, 'run.started')
+    }
     return { created: claim.created, lifecycle: claim.lifecycle }
   }
 
   #usesDurableDispatchLifecycle(): boolean {
     return this.#fleet.durableOwnership ?? this.#fleet.placementLocality === 'remote'
+  }
+
+  async #report(
+    input: Parameters<typeof createFactoryCloudEventV1>[0],
+  ): Promise<void> {
+    if (!this.#reporter) return
+    try {
+      await this.#reporter.report(createFactoryCloudEventV1(input, {
+        now: () => new Date(this.#clock.now()),
+      }))
+    } catch (error) {
+      // A custom reporter is allowed through the public port, so defend the
+      // orchestration path even if it violates the port's no-reject contract.
+      this.#increment('factoryEventReportingFailures')
+      this.#logger.warn?.('[factory] progress reporter rejected an event', {
+        eventType: input.type,
+        errorClass: telemetryErrorClass(error),
+      })
+    }
+  }
+
+  async #reportLifecycle(
+    lifecycle: DispatchLifecycle,
+    type: FactoryCloudEventInputV1['type'],
+    options: {
+      level?: FactoryCloudEventInputV1['level']
+      previousPhase?: DispatchLifecyclePhase
+      errorCode?: string
+    } = {},
+  ): Promise<void> {
+    await this.#report({
+      type,
+      level: options.level ?? (type === 'run.failed' || type === 'factory.anomaly' ? 'error' : 'info'),
+      runId: lifecycle.runId,
+      phase: lifecycle.phase,
+      status: telemetryRunStatus(lifecycle.phase),
+      run: {
+        source: githubIssuePathParts(lifecycle.issue.path) ? 'github' : 'linear',
+        repository: lifecycle.decision.routes[0]?.repo,
+        issueKey: lifecycle.issue.key,
+        recipe: lifecycle.decision.scope,
+      },
+      attributes: {
+        backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+        component: 'orchestrator',
+        operation: 'save_lifecycle',
+        previousPhase: options.previousPhase,
+        errorCode: options.errorCode,
+        dryRun: lifecycle.dryRun,
+        trackedAgents: lifecycle.agents.length,
+      },
+    })
+  }
+
+  async #reportAgent(
+    record: InFlightIssue,
+    tracked: TrackedAgent,
+    type: 'agent.spawned' | 'agent.adopted' | 'agent.resumed' | 'agent.exited' | 'agent.released',
+    options: { releaseReason?: string } = {},
+  ): Promise<void> {
+    const lifecycle = await this.#state
+      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .catch(() => undefined)
+    if (!lifecycle) return
+    await this.#report({
+      type,
+      runId: lifecycle.runId,
+      phase: lifecycle.phase,
+      status: telemetryRunStatus(lifecycle.phase),
+      run: {
+        source: githubIssuePathParts(record.issue.path) ? 'github' : 'linear',
+        repository: tracked.spec.repo,
+        issueKey: record.issue.key,
+        recipe: record.decision.scope,
+      },
+      attributes: {
+        backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+        component: 'fleet',
+        operation: type.slice('agent.'.length),
+        agentRole: tracked.spec.role,
+        invocationId: tracked.spec.invocationId,
+        locality: tracked.result?.locality ?? this.#fleet.placementLocality,
+        releaseReason: factoryCloudReleaseReasonV1(options.releaseReason),
+      },
+    })
   }
 
   async #saveDispatchLifecycle(
@@ -2598,8 +2704,23 @@ export class FactoryLoop implements Factory {
     if (!saved) {
       this.#dispatchLifecycleEpochs.delete(key)
       this.#increment('dispatchLifecycleFencesRejected')
+      await this.#reportLifecycle(lifecycle, 'factory.anomaly', {
+        level: 'error',
+        errorCode: 'fence_rejected',
+      })
       this.#scheduleDispatchLifecycleRetry(record)
       return false
+    }
+    if (previous?.phase !== lifecycle.phase) {
+      await this.#reportLifecycle(
+        lifecycle,
+        lifecycle.phase === 'complete'
+          ? 'run.succeeded'
+          : lifecycle.phase === 'abandoned'
+            ? 'run.cancelled'
+            : 'run.phase_changed',
+        { previousPhase: previous?.phase },
+      )
     }
     if (isTerminalDispatchLifecycle(lifecycle)) {
       this.#dispatchLifecycleEpochs.delete(key)
@@ -3406,6 +3527,19 @@ export class FactoryLoop implements Factory {
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
     await this.#writeInFlightRegistry(registryPath, path)
+    const batch = this.#batchView
+    await this.#report({
+      type: 'instance.heartbeat',
+      attributes: {
+        backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+        mode: status,
+        component: 'orchestrator',
+        operation: 'heartbeat',
+        activeRuns: batch?.inFlight.length,
+        queuedRuns: batch?.queued.length,
+        trackedAgents: batch?.inFlight.reduce((count, record) => count + record.agents.size, 0),
+      },
+    })
   }
 
   async #reapDispatchFailureHandoffsNow(heartbeatPath: string, registryPath: string): Promise<void> {
@@ -3615,7 +3749,9 @@ export class FactoryLoop implements Factory {
   ): Promise<string[]> {
     const failed: string[] = []
     const protectedPids = await this.#protectedPids()
+    const batch = this.#batchView
     for (const [agentName, tracked] of agents) {
+      const record = batch?.getIssueByAgent(agentName)
       if (context === 'stop') {
         await this.#refreshStoppingHeartbeat()
       }
@@ -3649,9 +3785,21 @@ export class FactoryLoop implements Factory {
 
       try {
         await this.#fleet.release(agentName, reason)
+        if (record) await this.#reportAgent(record, tracked, 'agent.released', { releaseReason: reason })
       } catch (error) {
         failed.push(agentName)
         this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
+        if (record) {
+          const lifecycle = await this.#state
+            .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+            .catch(() => undefined)
+          if (lifecycle) {
+            await this.#reportLifecycle(lifecycle, 'factory.failure', {
+              level: 'error',
+              errorCode: 'release_failed',
+            })
+          }
+        }
       }
       if (context === 'stop') {
         await this.#refreshStoppingHeartbeat()
@@ -3911,6 +4059,8 @@ export class FactoryLoop implements Factory {
       if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
         throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
       }
+      const adopted = record.agents.get(spec.name)
+      if (adopted) await this.#reportAgent(record, adopted, 'agent.adopted')
       return { name: spec.name }
     }
 
@@ -3942,6 +4092,8 @@ export class FactoryLoop implements Factory {
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
       throw new Error(`Dispatch lifecycle ownership lost after spawning ${spec.name}`)
     }
+    const spawned = record.agents.get(result.name)
+    if (spawned) await this.#reportAgent(record, spawned, 'agent.spawned')
     return { name: result.name }
   }
 
@@ -3963,6 +4115,19 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const record = batch.getIssueByAgent(name)
     if (!record) {
+      if (/^ar-\d+-/u.test(name)) {
+        await this.#report({
+          type: 'factory.anomaly',
+          level: 'error',
+          attributes: {
+            backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+            component: 'fleet',
+            operation: 'agent_exit',
+            errorCode: 'unowned_agent',
+            count: 1,
+          },
+        })
+      }
       return
     }
     if (!await this.#assertDispatchLifecycleOwner(record)) {
@@ -3983,6 +4148,7 @@ export class FactoryLoop implements Factory {
     }
 
     const exiting = record.agents.get(name)
+    if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })
 
     if (this.#usesDurableDispatchLifecycle()) {
       const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
@@ -4696,6 +4862,7 @@ export class FactoryLoop implements Factory {
         await this.#persistBabysitterSession(record.issue, ref, tracked)
       }
     }
+    await this.#reportAgent(record, tracked, 'agent.resumed')
   }
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
@@ -4706,7 +4873,10 @@ export class FactoryLoop implements Factory {
     }
     const record = (await this.#batch()).getIssueByAgent(info.to)
     const issue = critical.issue ?? record?.issue
-    const error = new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`)
+    const error = Object.assign(
+      new Error(`Critical delivery failed to ${info.to}${info.reason ? `: ${info.reason}` : ''}`),
+      { code: 'fleet_delivery_failed' },
+    )
     this.#error(error, issue)
 
     if (isTerminalDeliveryFailure(info.reason)) {
@@ -7435,7 +7605,15 @@ export class FactoryLoop implements Factory {
 
   #emit(event: FactoryEvent, payload: FactoryEventPayload): void {
     for (const listener of this.#listeners.get(event) ?? []) {
-      listener(payload)
+      try {
+        listener(payload)
+      } catch (error) {
+        this.#increment('factoryEventListenerFailures')
+        this.#logger.warn?.('[factory] event listener failed', {
+          event,
+          errorClass: error instanceof Error ? error.name : 'Error',
+        })
+      }
     }
   }
 
@@ -7451,6 +7629,48 @@ export class FactoryLoop implements Factory {
       ...details,
       ...(issue ? { issue: issue.key } : {}),
     })
+    const failureCode = telemetryCategory(
+      error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : 'factory_error',
+    )
+    const failureClass = telemetryErrorClass(error)
+    void (async () => {
+      try {
+        const lifecycle = issue
+          ? await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(issue)).catch(() => undefined)
+          : undefined
+        if (lifecycle) {
+          await this.#reportLifecycle(lifecycle, 'factory.failure', {
+            level: 'error',
+            errorCode: failureCode,
+          })
+          return
+        }
+        await this.#report({
+          type: 'factory.failure',
+          level: 'error',
+          attributes: {
+            backend: this.#fleet.placementLocality === 'remote' ? 'relay' : 'internal',
+            component: 'orchestrator',
+            operation: 'error',
+            errorClass: failureClass,
+            errorCode: failureCode,
+          },
+        })
+      } catch (telemetryError) {
+        // This is the terminal guard for the intentionally floating telemetry
+        // task. Never log raw messages or allow a custom logger to turn this
+        // best-effort path into an unhandled rejection.
+        try {
+          this.#logger.warn?.('[factory] failed to report failure telemetry', {
+            errorClass: telemetryErrorClass(telemetryError),
+          })
+        } catch {
+          // Reporting and logging are both non-critical to orchestration.
+        }
+      }
+    })()
     this.#emit('error', { error, ...details, issue })
   }
 
@@ -11286,6 +11506,37 @@ const isRegistrationLagInjectionError = (error: unknown): boolean => {
   const { errorMessage } = describeError(error)
   return /agent_not_found|recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
+}
+
+const telemetryRunStatus = (
+  phase: DispatchLifecyclePhase,
+): NonNullable<FactoryCloudEventInputV1['status']> => {
+  switch (phase) {
+    case 'queued':
+      return 'queued'
+    case 'retryable':
+      return 'blocked'
+    case 'parking':
+    case 'waiting-for-human':
+      return 'waiting'
+    case 'complete':
+      return 'succeeded'
+    case 'abandoned':
+      return 'cancelled'
+    default:
+      return 'running'
+  }
+}
+
+const telemetryCategory = (value: string | undefined): string | undefined => {
+  if (!value) return undefined
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:/-]+/gu, '-')
+  return normalized.slice(0, 120) || undefined
+}
+
+const telemetryErrorClass = (error: unknown): string => {
+  const name = error instanceof Error ? error.name : ''
+  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 const isTimeoutError = (error: unknown): boolean =>

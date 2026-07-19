@@ -249,7 +249,49 @@ export type {
   Logger,
   SlackWriteback,
   TelemetrySink,
+  FactoryEventReporter,
+  FactoryEventReportResult,
 } from './ports'
+export {
+  FACTORY_CLOUD_EVENT_CONTRACT_V1,
+  FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE,
+  FACTORY_CLOUD_EVENT_MAX_PAYLOAD_BYTES,
+  FACTORY_CLOUD_EVENT_TYPES,
+  FACTORY_CLOUD_RELEASE_REASONS_V1,
+  FactoryCloudEventAttributesV1Schema,
+  FactoryCloudEventBatchV1Schema,
+  FactoryCloudEventInputV1Schema,
+  FactoryCloudEventV1Schema,
+  FactoryCloudInstanceV1Schema,
+  FactoryCloudSpanIdV1Schema,
+  FactoryCloudTraceIdV1Schema,
+  createFactoryCloudEventV1,
+  factoryCloudReleaseReasonV1,
+  factoryRunTraceIdV1,
+  isCriticalFactoryCloudEvent,
+} from './observability/events'
+export { FileFactoryCloudEventOutbox } from './observability/outbox'
+export type {
+  FactoryCloudEventEnqueueResult,
+  FactoryCloudEventOutbox,
+  FactoryCloudEventOutboxStats,
+  FileFactoryCloudEventOutboxOptions,
+} from './observability/outbox'
+export { FactoryCloudReporter } from './observability/cloud-reporter'
+export type {
+  FactoryCloudAccessTokenProvider,
+  FactoryCloudReporterOptions,
+} from './observability/cloud-reporter'
+export type {
+  CreateFactoryCloudEventV1Options,
+  FactoryCloudEventAttributesV1,
+  FactoryCloudEventBatchV1,
+  FactoryCloudEventInputV1,
+  FactoryCloudEventType,
+  FactoryCloudEventV1,
+  FactoryCloudInstanceV1,
+  FactoryCloudReleaseReasonV1,
+} from './observability/events'
 export type {
   DispatchResult,
   Factory,
