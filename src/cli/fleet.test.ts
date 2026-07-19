@@ -8,6 +8,8 @@ import type {
   Factory,
   FactoryCloudEventInputV1,
   FactoryEventReporter,
+  FactoryIntegrationConnections,
+  FactoryIntegrationProvider,
   FactoryPorts,
   createFactory,
 } from '../index'
@@ -92,6 +94,23 @@ const githubIssueFile = (repo: string, number = 48) => ({
     url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
     repository: { name: repo, owner: { login: 'AgentWorkforce' } },
   },
+})
+
+const mountWithIntegrationConnections = (
+  files: Record<string, unknown>,
+  integrationConnections: FactoryIntegrationConnections,
+): FakeMountClient => Object.assign(new FakeMountClient(files), { integrationConnections })
+
+const fakeIntegrationConnections = (
+  getStatus: (provider: FactoryIntegrationProvider) => ReturnType<FactoryIntegrationConnections['getStatus']>,
+): FactoryIntegrationConnections => ({
+  getStatus: vi.fn(getStatus),
+  connect: vi.fn(async (provider) => ({
+    alreadyConnected: false,
+    connectLink: `https://connect.example/${provider}`,
+    connectionId: `conn-${provider}`,
+  })),
+  waitForConnection: vi.fn(async () => {}),
 })
 
 describe('fleet CLI logging', () => {
@@ -285,6 +304,185 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it('prompts and connects a missing GitHub integration before an interactive triage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-connect-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      let githubChecks = 0
+      const integrations = fakeIntegrationConnections(async () => (
+        githubChecks++ === 0
+          ? { ready: false, state: 'not_connected' }
+          : { ready: true, state: 'ready' }
+      ))
+      const mount = mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations)
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        isInteractive: () => true,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(confirm).toHaveBeenCalledWith('github')
+      expect(integrations.connect).toHaveBeenCalledWith('github')
+      expect(integrations.waitForConnection).toHaveBeenCalledWith('github', 'conn-github')
+      expect(openUrl).toHaveBeenCalledWith('https://connect.example/github')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('requires both Linear and GitHub for a Linear-backed Factory run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-linear-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'linear' })
+      const integrations = fakeIntegrationConnections(async (provider) => provider === 'linear'
+        ? { ready: true, state: 'ready' }
+        : { ready: false, state: 'not_connected' })
+      const errors = buffer()
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(integrations.getStatus).toHaveBeenCalledWith('linear')
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('dry-run will not start an OAuth flow')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not prompt or connect when a missing integration is checked without a TTY', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-headless-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'not_connected',
+      }))
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        isInteractive: () => false,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(confirm).not.toHaveBeenCalled()
+      expect(openUrl).not.toHaveBeenCalled()
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('invocation is non-interactive')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('treats canary as dry-run during integration preflight', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-canary-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'not_connected',
+      }))
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+      const errors = buffer()
+
+      const code = await runFleetCli(['canary', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        isInteractive: () => true,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(confirm).not.toHaveBeenCalled()
+      expect(openUrl).not.toHaveBeenCalled()
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('dry-run will not start an OAuth flow')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('auto-selects GitHub only when Linear is authoritatively not connected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-auto-'))
+    try {
+      const configPath = await writeConfig(root, {
+        stateIds: {},
+        issueSource: undefined,
+      })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      const integrations = fakeIntegrationConnections(async (provider) => provider === 'linear'
+        ? { ready: false, state: 'not_connected' }
+        : { ready: true, state: 'ready' })
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(integrations.getStatus).toHaveBeenNthCalledWith(1, 'linear')
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48' } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not mask an unreadable Linear connection check as a GitHub fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-unknown-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: undefined })
+      const integrations = fakeIntegrationConnections(async () => {
+        throw Object.assign(new Error('invalid connection status payload'), { code: 'malformed_cloud_response' })
+      })
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(integrations.getStatus).toHaveBeenCalledTimes(1)
+      expect(integrations.getStatus).toHaveBeenCalledWith('linear')
+      expect(errors.text()).toContain('refusing to assume it is disconnected')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('prints factory help for -h without requiring config or showing internal fleet as the binary', async () => {
     const output = buffer()
     const errors = buffer()
@@ -729,10 +927,13 @@ describe('fleet CLI runtime', () => {
         status: vi.fn(() => factoryStatus),
       } as unknown as Factory
       const output = buffer()
+      const integrations = fakeIntegrationConnections(async () => {
+        throw new Error('maintenance command must not preflight integrations')
+      })
 
       const code = await runFleetCli(['status', '--config', configPath], {
         fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
         createFactory: () => factory,
         localClonePathOptions: { cwd: '/not/a/checkout', git, validateConfiguredCheckouts: true },
         stdout: output,
@@ -742,6 +943,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toEqual(factoryStatus)
       expect(git).not.toHaveBeenCalled()
+      expect(integrations.getStatus).not.toHaveBeenCalled()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1341,7 +1543,8 @@ describe('fleet CLI runtime', () => {
         babysitter: { enabled: false },
         models: { babysitter: 'claude-sonnet-4-6' },
       })
-      const mount = new FakeMountClient({
+      const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
+      const mount = mountWithIntegrationConnections({
         '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
           payload: {
             number: 10,
@@ -1354,7 +1557,7 @@ describe('fleet CLI runtime', () => {
             base: { ref: 'main' },
           },
         },
-      })
+      }, integrations)
       const fleet = new FakeFleetClient()
       const output = buffer()
       const errors = buffer()
@@ -1372,6 +1575,7 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
       expect(mountCalls).toEqual([process.cwd(), clonePath])
       expect(errors.text()).toContain(`warning: could not start relayfile mount for standalone babysitter at ${clonePath}`)
       expect(fleet.spawns).toHaveLength(1)
@@ -1557,8 +1761,9 @@ describe('fleet CLI runtime', () => {
     const output = buffer()
     const errors = buffer()
     const closes: Array<{ repo: string; number: number }> = []
+    const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
     const cloudMountFromConfig = vi.fn(async (opts) => {
-      const mount = new FakeMountClient()
+      const mount = mountWithIntegrationConnections({}, integrations)
       mount.githubWrite = {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async (input) => {
@@ -1619,6 +1824,7 @@ describe('fleet CLI runtime', () => {
       workspaceId: 'rw_test',
       isAllowedDraft: expect.any(Function),
     }))
+    expect(integrations.getStatus).toHaveBeenCalledWith('github')
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 42 }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
   })

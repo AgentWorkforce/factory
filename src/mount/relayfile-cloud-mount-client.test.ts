@@ -188,6 +188,51 @@ class FakeRelayFileClient implements RelayFileClientLike {
 }
 
 describe('RelayfileCloudMountClient', () => {
+  it('adapts the retained SDK workspace handle for integration status and connect flows', async () => {
+    const fake = new FakeRelayFileClient()
+    const getConnectionStatus = vi.fn(async () => ({ ready: false, state: 'not_connected' }))
+    const connectIntegration = vi.fn(async () => ({
+      alreadyConnected: false,
+      connectLink: 'https://connect.example/github',
+      connectionId: 'conn-github',
+    }))
+    const waitForConnection = vi.fn(async () => {})
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+      getConnectionStatus,
+      connectIntegration,
+      waitForConnection,
+    }
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => handle),
+      })),
+    })
+
+    await expect(mount.integrationConnections?.getStatus('github')).resolves.toEqual({
+      ready: false,
+      state: 'not_connected',
+    })
+    await expect(mount.integrationConnections?.connect('github')).resolves.toMatchObject({
+      connectionId: 'conn-github',
+    })
+    await mount.integrationConnections?.waitForConnection('github', 'conn-github')
+    await mount.integrationConnections?.getStatus('github')
+
+    expect(getConnectionStatus).toHaveBeenNthCalledWith(1, 'github', 'cloud-workspace-uuid')
+    expect(getConnectionStatus).toHaveBeenNthCalledWith(2, 'github', 'conn-github')
+    expect(connectIntegration).toHaveBeenCalledWith('github', { allowedIntegrations: ['github'] })
+    expect(waitForConnection).toHaveBeenCalledWith('github', {
+      connectionId: 'conn-github',
+      timeoutMs: 5 * 60_000,
+    })
+  })
+
   it('starts local mirrors through the authenticated Relayfile SDK mount session', async () => {
     const fake = new FakeRelayFileClient()
     const handle = {

@@ -60,6 +60,27 @@ export interface GithubPublishPullRequestResult {
   headSha?: string
 }
 
+export type FactoryIntegrationProvider = 'github' | 'linear'
+
+export interface FactoryIntegrationConnectionStatus {
+  ready: boolean
+  state?: string
+  initialSyncState?: string
+}
+
+export interface FactoryIntegrationConnectResult {
+  alreadyConnected: boolean
+  connectLink: string | null
+  connectionId: string
+}
+
+/** Relayfile SDK control-plane surface used by the CLI connection preflight. */
+export interface FactoryIntegrationConnections {
+  getStatus(provider: FactoryIntegrationProvider): Promise<FactoryIntegrationConnectionStatus>
+  connect(provider: FactoryIntegrationProvider): Promise<FactoryIntegrationConnectResult>
+  waitForConnection(provider: FactoryIntegrationProvider, connectionId: string): Promise<void>
+}
+
 /**
  * GitHub mutations that require the authenticated workspace connection. The
  * concrete mount translates these operations into file-native Relayfile
@@ -73,6 +94,7 @@ export interface GithubConnectionWrite {
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readonly githubWrite?: GithubConnectionWrite
+  readonly integrationConnections?: FactoryIntegrationConnections
   /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
   ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
   /** Stop SDK-owned local mount processes created by this client. */

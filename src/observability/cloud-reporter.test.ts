@@ -163,7 +163,6 @@ describe('FactoryCloudReporter', () => {
     await reporter.report(progress('event-body-hung'))
 
     await expect(reporter.flush({ deadlineMs: 25 })).resolves.toMatchObject({ stoppedReason: 'deadline' })
-    await new Promise((resolve) => setTimeout(resolve, 0))
     await expect(reporter.flush()).resolves.toMatchObject({ delivered: 1, pending: 0 })
     expect(fetch).toHaveBeenCalledTimes(2)
   })

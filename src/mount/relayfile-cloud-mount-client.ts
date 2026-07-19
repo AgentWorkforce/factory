@@ -23,7 +23,16 @@ import {
 import { RelayfileSetup } from '@relayfile/sdk/cli'
 import { join, resolve } from 'node:path'
 
-import type { EventPage, GithubConnectionWrite, LocalMountOptions, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
+import type {
+  EventPage,
+  FactoryIntegrationConnections,
+  FactoryIntegrationProvider,
+  GithubConnectionWrite,
+  LocalMountOptions,
+  MountClient,
+  ProviderSyncStatus,
+  SubscribeOptions,
+} from '../ports'
 import {
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
@@ -96,6 +105,20 @@ export interface RelayfileWorkspaceHandleLike {
   info: { relayfileUrl: string }
   client(): RelayFileClientLike
   getToken(): Promise<string> | string
+  getConnectionStatus?(provider: FactoryIntegrationProvider, connectionId: string): Promise<{
+    ready: boolean
+    state?: string
+    initialSyncState?: string
+  }>
+  connectIntegration?(provider: FactoryIntegrationProvider, options?: { allowedIntegrations?: string[] }): Promise<{
+    alreadyConnected: boolean
+    connectLink: string | null
+    connectionId: string
+  }>
+  waitForConnection?(provider: FactoryIntegrationProvider, options?: {
+    connectionId?: string
+    timeoutMs?: number
+  }): Promise<void>
 }
 
 export interface MountedWorkspaceHandleLike {
@@ -169,6 +192,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
   readonly githubWrite: GithubConnectionWrite
+  readonly integrationConnections?: FactoryIntegrationConnections
 
   readonly #client: RelayFileClientLike
   readonly #tokenProvider: TokenProvider
@@ -204,6 +228,10 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
+    this.integrationConnections = relayfileIntegrationConnections(
+      config.relayfileWorkspace,
+      this.workspaceId,
+    )
   }
 
   setDefaultAllowedDraftPredicate(
@@ -482,6 +510,38 @@ export class RelayfileCloudMountClient implements MountClient {
       if (isHttpStatus(error, 404)) return 'absent'
       throw error
     }
+  }
+}
+
+function relayfileIntegrationConnections(
+  workspace: RelayfileWorkspaceHandleLike | undefined,
+  fallbackWorkspaceId: string,
+): FactoryIntegrationConnections | undefined {
+  if (!workspace?.getConnectionStatus || !workspace.connectIntegration || !workspace.waitForConnection) {
+    return undefined
+  }
+
+  const connectionId = workspace.workspaceId ?? fallbackWorkspaceId
+  const activeConnectionIds = new Map<FactoryIntegrationProvider, string>()
+  return {
+    getStatus: (provider) => workspace.getConnectionStatus!(
+      provider,
+      activeConnectionIds.get(provider) ?? connectionId,
+    ),
+    connect: async (provider) => {
+      const result = await workspace.connectIntegration!(provider, {
+        allowedIntegrations: [provider],
+      })
+      activeConnectionIds.set(provider, result.connectionId)
+      return result
+    },
+    waitForConnection: async (provider, requestedConnectionId) => {
+      activeConnectionIds.set(provider, requestedConnectionId)
+      await workspace.waitForConnection!(provider, {
+        connectionId: requestedConnectionId,
+        timeoutMs: 5 * 60_000,
+      })
+    },
   }
 }
 

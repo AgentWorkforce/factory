@@ -1,6 +1,10 @@
 export type {
   ChangeEvent,
   EventPage,
+  FactoryIntegrationConnectionStatus,
+  FactoryIntegrationConnections,
+  FactoryIntegrationConnectResult,
+  FactoryIntegrationProvider,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
