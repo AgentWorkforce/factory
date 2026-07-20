@@ -234,6 +234,20 @@ title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
 open issue. Everything else is ignored. Loosen these checks deliberately —
 they're the main guardrail.
 
+To sequence issues, add one exact standalone line to the issue body or Linear
+description:
+
+```text
+Blocked by: #123, owner/other-repo#456
+```
+
+A bare number refers to the issue's routed repository. Factory parks the issue
+and posts a comment naming every open blocker; capacity queuing remains a
+separate hold reason. Closed issues and merged pull requests satisfy blockers,
+and the next discovery cycle promotes newly unblocked work. Dependency cycles
+fail closed and are reported instead of waiting indefinitely. Other prose and
+`Related:` lines are not interpreted as dependencies.
+
 > Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
 > auto-close). For real work you want to keep, use the `[factory]` prefix.
 
