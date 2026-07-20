@@ -2073,7 +2073,7 @@ describe('fleet CLI runtime', () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
     try {
       const clonePaths = Object.fromEntries(
-        Array.from({ length: 9 }, (_, index) => [`AgentWorkforce/repo-${index}`, `/work/repo-${index}`]),
+        Array.from({ length: 9 }, (_, index) => [`AgentWorkforce/repo-${index}`, join(root, `repo-${index}`)]),
       )
       const configPath = await writeConfig(root, {
         repos: {

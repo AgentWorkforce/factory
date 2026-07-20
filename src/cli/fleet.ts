@@ -734,8 +734,7 @@ async function ensureClonePathMounts(
 ): Promise<void> {
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
-  const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}))]
-    .map((clonePath) => resolve(clonePath))
+  const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}).map((clonePath) => resolve(clonePath)))]
     .filter((clonePath) => clonePath !== daemonCwd)
   let nextIndex = 0
   const mountNext = async (): Promise<void> => {
