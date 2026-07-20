@@ -2,9 +2,9 @@ version: '1.0'
 updated: '2026-07-20'
 catalog:
   category_count: 19
-  feature_count: 239
+  feature_count: 241
   tier_counts:
-    1: 22
+    1: 24
     2: 105
     3: 10
     4: 41
@@ -37,6 +37,14 @@ categories:
         cli: factory --help
         description: Print the complete factory command and global option surface without loading config
         location: src/cli/fleet.ts
+        verify_tier: 1
+
+      - id: cli-featuremap-check
+        name: Repository Feature-Map Check
+        cli: factory featuremap check [--base <ref>]
+        api: checkFeatureMap()
+        description: Fail CI on malformed feature manifests, duplicate ids, invalid tiers, catalog drift, or missing locations and advise reviewers when referenced code changes beside unchanged metadata
+        location: src/featuremap/validate.ts, src/featuremap/check.ts, src/cli/fleet.ts
         verify_tier: 1
 
       - id: cli-run-once
@@ -541,7 +549,7 @@ categories:
       - id: dispatch-agent-task-rendering
         name: Agent Task Rendering
         api: renderAgentTask()
-        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, integration, and manifest-derived verification instructions
+        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, integration, manifest-derived verification, and feature-map validation instructions
         location: src/dispatch/templates.ts, src/dispatch/test-guidance.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
@@ -1222,6 +1230,13 @@ categories:
         api: FactoryConfigSchema / WorkspaceConfigSchema / NodeConfigSchema
         description: Parse normalized combined or split workspace, node, and factory configuration with Zod
         location: src/config/schema.ts
+        verify_tier: 1
+
+      - id: api-featuremap-validator
+        name: Feature-Map Validator API
+        api: '@agent-relay/factory/featuremap'
+        description: Parse and validate repository feature manifests and identify advisory location drift from a pull-request diff
+        location: src/featuremap/index.ts, src/featuremap/validate.ts, src/featuremap/check.ts, package.json
         verify_tier: 1
 
       - id: api-linear-state-resolution

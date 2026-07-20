@@ -124,6 +124,7 @@ From a source checkout instead of an npm install, run
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
+| `factory featuremap check [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
@@ -140,6 +141,27 @@ instruction to rerun the Factory command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+### Feature-map validation
+
+Repositories with `.agentworkforce/features/manifest.yaml` can run
+`factory featuremap check` in CI. The command rejects malformed or duplicate
+entries, invalid verification tiers, catalog-summary drift, and locations that
+do not exist. The same checker is published as `@agent-relay/factory/featuremap`
+for programmatic use.
+
+During review, pass the PR base ref with `--base <ref>`. A changed file named by
+an existing manifest entry produces an advisory when that entry's description,
+verification tier, and locations are unchanged. The reviewer must re-confirm
+that metadata; the advisory does not itself fail the command because a covered
+file can change without changing the feature contract.
+
+An hourly per-repository sweep or Slack confirmation bot is explicitly outside
+this feature's scope. Factory's own guardian cycle is useful for tier-5/6 checks
+that need live or human confirmation, but duplicating it for every customer repo
+would add standing noise and infrastructure without evidence that those entries
+rot between PRs. Revisit that only if usage data demonstrates silent tier-5/6
+drift that PR checks do not catch.
 
 ### Cloud progress and trace correlation
 

@@ -276,6 +276,8 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ...questionInstructions,
       '',
       `Read the PR diff via ${mountRoot}/github/repos.`,
+      'Before approving, run `npx --no-install factory featuremap check --base <PR-base-ref>` from the repository root when `.agentworkforce/features/manifest.yaml` is present. Fetch the PR base ref first if needed. A manifest validation failure or an unavailable checker for a present manifest blocks approval.',
+      'The feature-map check may report advisory location-drift entries when changed code is still covered by unchanged manifest metadata. Re-confirm each flagged description and verify_tier against the diff; request a manifest update when either is stale.',
       'Post review comments via the GitHub writeback path.',
       'Check whether the implementation changed or introduced a feature that is missing or stale in `.agentworkforce/features/manifest.yaml`; if so, update the manifest in this same PR so it follows the normal review and merge gate.',
       'DM the implementer with specific feedback if changes needed, or approve if good.',
