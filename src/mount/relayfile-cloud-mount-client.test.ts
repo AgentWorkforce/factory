@@ -428,6 +428,52 @@ describe('RelayfileCloudMountClient', () => {
     expect(stop).toHaveBeenCalledTimes(1)
   })
 
+  it('does not report recovery while a periodic health check still finds a stale mount', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-07-20T12:30:00.000Z')
+    const startDir = await mkdtemp(join(tmpdir(), 'factory-stale-mount-supervision-'))
+    const localDir = join(startDir, '.integrations')
+    await mkdir(join(localDir, '.relay'), { recursive: true })
+    await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+      workspaceId: 'cloud-workspace-uuid',
+      lastReconcileAt: '2026-07-20T12:00:00.000Z',
+    }))
+    const fake = new FakeRelayFileClient()
+    const ensureMountedWorkspace = vi.fn()
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => ({
+          workspaceId: 'cloud-workspace-uuid',
+          client: () => fake,
+          getToken: async () => 'delegated-relayfile-token',
+          info: { relayfileUrl: 'https://relayfile.example' },
+        })),
+        ensureMountedWorkspace,
+      })),
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await mount.ensureLocalMount(startDir, { refreshStaleMount: false })
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_stale',
+        degradedMounts: 1,
+      }])
+    } finally {
+      await mount.dispose()
+      await rm(startDir, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+  })
+
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {
     const fake = new FakeRelayFileClient()
     const auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })

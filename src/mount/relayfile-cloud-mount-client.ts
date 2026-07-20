@@ -545,10 +545,12 @@ export class RelayfileCloudMountClient implements MountClient {
         Date.now() >= supervision.suggestedRefreshAtMs
       ) {
         await this.#replaceLocalMount(localDir, supervision.launch)
+        this.#markLocalMountRecovered(localDir)
       } else {
+        // ensureLocalMount performs the filesystem health check and owns the
+        // resulting degraded/recovered transition.
         await this.ensureLocalMount(supervision.startDir, supervision.options)
       }
-      this.#markLocalMountRecovered(localDir)
     } catch (error) {
       this.#logger?.warn?.('[factory] supervised Relayfile mount refresh failed', {
         errorClass: error instanceof Error ? error.name : 'Error',
