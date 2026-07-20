@@ -128,18 +128,23 @@ function parseManifestFeatures(raw: string): ManifestFeature[] {
 
 function decodeYamlScalar(raw: string | undefined): string {
   const value = raw?.trim() ?? ''
-  if (value.startsWith("'") && value.endsWith("'")) {
-    return value.slice(1, -1).replaceAll("''", "'")
+  if (value.startsWith("'")) {
+    const closing = /^'((?:[^']|'')*)'/u.exec(value)
+    if (closing) return closing[1]!.replaceAll("''", "'")
   }
-  if (value.startsWith('"') && value.endsWith('"')) {
-    try {
-      const parsed = JSON.parse(value) as unknown
-      if (typeof parsed === 'string') return parsed
-    } catch {
-      return value.slice(1, -1)
+  if (value.startsWith('"')) {
+    const closing = /^"((?:[^"\\]|\\.)*)"/u.exec(value)
+    if (closing) {
+      try {
+        const parsed = JSON.parse(closing[0]) as unknown
+        if (typeof parsed === 'string') return parsed
+      } catch {
+        return closing[1]!
+      }
     }
   }
-  return value
+  // Unquoted scalars: a `#` only starts a comment when preceded by whitespace.
+  return value.replace(/\s+#.*$/u, '').trim()
 }
 
 function issueReferencedPaths(

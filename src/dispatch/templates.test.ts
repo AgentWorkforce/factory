@@ -334,6 +334,29 @@ describe('renderAgentTask', () => {
     }
   })
 
+  it('tolerates trailing inline comments on manifest fields', async () => {
+    const repoPath = await featureRepo(`
+      - id: dispatch-prompts # short id
+        name: Dispatch prompts
+        description: Render role-specific agent tasks
+        location: src/dispatch/templates.ts  # not src/dispatch/templates.test.ts
+        verify_tier: 2 # requires config fixture
+    `)
+    try {
+      const testGuidance = await resolveTestGuidance({
+        repoPath,
+        issue,
+        route: { rationale: 'The route covers src/dispatch/templates.ts.' },
+      })
+
+      expect(testGuidance).toContain('Dispatch prompts (`dispatch-prompts`)')
+      expect(testGuidance).toContain('src/dispatch/templates.ts`, verify tier 2')
+      expect(testGuidance).toContain('verify tier 2')
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
   it('does not error or fabricate guidance when the route and diff have no manifest coverage', async () => {
     const repoPath = await featureRepo(`
       - id: unrelated-feature
