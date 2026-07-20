@@ -16,13 +16,15 @@ import {
   resolveAgentRelayMcpCommand,
   type AgentRelayMcpCommand,
 } from '../fleet/internal-fleet-client'
-import type { Capability } from '../ports/fleet'
+import type { PreviewConfig } from '../config/schema'
+import type { Capability, PreviewReference } from '../ports/fleet'
+import { TailscalePreviewManager, type PreviewManager } from './tailscale-preview'
 
 export const FACTORY_NODE_CONFIG_ENV = 'FACTORY_NODE_CONFIG'
 export const AGENT_RELAY_FACTORY_NODE_CONFIG_ENV = 'AGENT_RELAY_FACTORY_NODE_CONFIG'
 export const DEFAULT_FACTORY_NODE_CONFIG_PATH = 'factory.node.json'
 
-const factoryNodeCapabilities = ['spawn:claude', 'spawn:codex', 'workflow:run'] as const
+const factoryNodeCapabilities = ['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'] as const
 type FactoryNodeCapability = (typeof factoryNodeCapabilities)[number]
 
 const knownFactoryNodeCapabilities = new Set<string>(factoryNodeCapabilities)
@@ -92,8 +94,40 @@ const workflowCapabilityInputSchema = z.object({
   invocationId: input.invocationId ?? input.invocation_id,
 }))
 
+const previewReferenceSchema: z.ZodType<PreviewReference> = z.object({
+  id: z.string().min(1),
+  provider: z.literal('tailscale-serve'),
+  owner: z.string().min(1),
+  service: z.string().min(1),
+  repo: z.string().min(1),
+  url: z.string().url(),
+  targetPort: z.number().int().min(1).max(65_535),
+  httpsPort: z.number().int().min(1).max(65_535),
+  access: z.literal('tailnet'),
+  lifetime: z.literal('issue'),
+  createdAt: z.string().min(1),
+  startCommand: z.string().min(1).optional(),
+  node: z.string().min(1).optional(),
+})
+
+const previewCapabilityInputSchema = z.discriminatedUnion('operation', [
+  z.object({
+    operation: z.literal('start'),
+    owner: z.string().min(1),
+    issueKey: z.string().min(1),
+    service: z.string().min(1),
+    repo: z.string().min(1),
+    targetPort: z.number().int().min(1).max(65_535),
+    preferredHttpsPort: z.number().int().min(1).max(65_535).optional(),
+    startCommand: z.string().min(1).optional(),
+  }),
+  z.object({ operation: z.literal('remove'), preview: previewReferenceSchema }),
+  z.object({ operation: z.literal('sweep'), activeOwners: z.array(z.string().min(1)) }),
+])
+
 type SpawnCapabilityInput = z.output<typeof spawnCapabilityInputSchema>
 type WorkflowCapabilityInput = z.output<typeof workflowCapabilityInputSchema>
+type PreviewCapabilityInput = z.output<typeof previewCapabilityInputSchema>
 type CheckoutPathInput = {
   repo?: string
   clonePath?: string
@@ -109,6 +143,7 @@ export interface FactoryNodeDefinitionOptions {
   version?: string
   workflowRunner?: WorkflowRunner
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
+  previewManager?: PreviewManager
 }
 
 export interface WorkflowRunnerInput {
@@ -145,11 +180,27 @@ export interface FactoryNodeInventorySync {
 
 export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOptions): FleetNodeDefinition {
   const config = options.config
-  const capabilities = normalizeCapabilities(config.capabilities)
+  const capabilities = normalizeCapabilities([
+    ...config.capabilities,
+    ...(config.preview ? ['preview:tailscale-serve'] : []),
+  ])
   const metadata = nodeCapabilityMetadata(config)
   const handlers: Record<string, FleetCapabilityValue> = {}
+  const previewManager = config.preview
+    ? options.previewManager ?? new TailscalePreviewManager({ config: config.preview })
+    : undefined
 
   for (const capability of capabilities) {
+    if (capability === 'preview:tailscale-serve') {
+      if (!previewManager) {
+        throw new Error('preview:tailscale-serve requires NodeConfig.preview')
+      }
+      handlers[capability] = action<PreviewCapabilityInput>({
+        input: previewCapabilityInputSchema,
+        metadata: { ...metadata, handler: 'tailscale-serve', access: 'tailnet' },
+      }, async (input, ctx) => runPreviewCapability(input, ctx, previewManager, config.preview!)) as unknown as FleetCapabilityValue
+      continue
+    }
     if (capability === 'workflow:run') {
       handlers[capability] = action<WorkflowCapabilityInput>({
         input: workflowCapabilityInputSchema,
@@ -177,6 +228,34 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
     tags: options.tags ?? defaultFactoryNodeTags(config),
     version: options.version ?? 'factory-node-v1',
   })
+}
+
+async function runPreviewCapability(
+  input: PreviewCapabilityInput,
+  ctx: FleetActionContext,
+  manager: PreviewManager,
+  config: PreviewConfig,
+): Promise<unknown> {
+  if (input.operation === 'start') {
+    const configured = config.services[input.service]
+    if (!configured) {
+      throw new Error(`preview service is not configured on this node: ${input.service}`)
+    }
+    if (
+      input.targetPort !== configured.port ||
+      input.preferredHttpsPort !== configured.httpsPort ||
+      input.startCommand !== configured.startCommand
+    ) {
+      throw new Error(`preview request does not match this node's configuration for ${input.service}`)
+    }
+    const { operation: _operation, ...request } = input
+    const preview = await manager.start({ ...request, node: ctx.node.name })
+    return { operation: input.operation, preview: { ...preview, node: ctx.node.name } }
+  }
+  if (input.operation === 'remove') {
+    return { operation: input.operation, removed: await manager.remove(input.preview) }
+  }
+  return { operation: input.operation, ...await manager.sweep(input.activeOwners) }
 }
 
 export function readFactoryNodeConfigSync(configPath = resolveFactoryNodeConfigPath()): NodeConfig {
@@ -470,6 +549,13 @@ function nodeCapabilityMetadata(config: NodeConfig): Record<string, JsonValue> {
     cloneRoot: config.cloneRoot ?? null,
     clonePaths: jsonRecord(config.clonePaths),
     dryRun: config.dryRun,
+    ...(config.preview ? {
+      preview: {
+        provider: config.preview.provider,
+        access: config.preview.access,
+        httpsPortRange: [...config.preview.httpsPortRange],
+      },
+    } : {}),
   }
 }
 

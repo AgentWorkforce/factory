@@ -304,6 +304,44 @@ describe('FactoryConfigSchema', () => {
     expect(loaded.nodeConfig.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
   })
 
+  it('merges split preview services and enforces a tailnet-only provider', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        preview: {
+          services: { factory: { port: 3_000, startCommand: 'npm run dev' } },
+        },
+      },
+      nodeConfig: {
+        preview: {
+          services: { pear: { port: 4_173 } },
+          registryPath: '~/.factory/test-previews.json',
+        },
+      },
+    })
+
+    expect(loaded.factoryConfig.preview).toEqual({
+      provider: 'tailscale-serve',
+      access: 'tailnet',
+      services: {
+        factory: { port: 3_000, startCommand: 'npm run dev' },
+        pear: { port: 4_173 },
+      },
+      tailscaleBinary: 'tailscale',
+      registryPath: join(homedir(), '.factory/test-previews.json'),
+      httpsPortRange: [10_000, 10_999],
+    })
+    expect(loaded.nodeConfig.preview).toEqual(loaded.factoryConfig.preview)
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { provider: 'tailscale-funnel', access: 'public', services: {} },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { services: {}, httpsPortRange: [11_000, 10_000] },
+    })).toThrow('preview.httpsPortRange start must be less than or equal to end')
+  })
+
   it('does not rewrite embedded tildes', () => {
     const parsed = FactoryConfigSchema.parse({
       cloneRoot: '/work/~shared',

@@ -1523,6 +1523,26 @@ class RecoveringSlackRootMountClient extends CloudWritebackFakeMountClient {
 }
 
 describe('FactoryLoop', () => {
+  it('sweeps preview orphans on daemon startup using durable active issue owners', async () => {
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {},
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(fleet.previewSweeps).toEqual([[]])
+    await factory.stop()
+  })
+
   it('parses wrapped Linear issue records', () => {
     expect(parseLinearIssue(issuePath(1), issueFile(1))).toMatchObject({
       uuid: 'uuid-1',
@@ -8659,7 +8679,22 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
     }, githubWrite)
     const fleet = new FakeFleetClient()
-    const factory = createFactory(config(), {
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {
+          'AgentWorkforce/pear': {
+            port: 3_000,
+            httpsPort: 10_052,
+            startCommand: 'npm run dev -- --host 127.0.0.1',
+          },
+        },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -8668,6 +8703,15 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    expect(fleet.previewStarts).toEqual([expect.objectContaining({
+      issueKey: 'AR-52',
+      repo: 'AgentWorkforce/pear',
+      targetPort: 3_000,
+      preferredHttpsPort: 10_052,
+    })])
+    expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
+    expect(fleet.spawns[0]?.task).toContain('Start the previewed app with `npm run dev -- --host 127.0.0.1`')
+    expect(fleet.spawns[1]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
     fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
@@ -8676,8 +8720,9 @@ describe('FactoryLoop', () => {
       clonePath: '/work/pear',
       baseRef: 'main',
       title: 'AR-52: [factory-e2e] Fix factory issue 52',
-      body: expect.stringContaining('Factory issue AR-52'),
+      body: expect.stringContaining('Live preview: https://factory-node.tailnet.ts.net:10052/'),
     }])
+    await vi.waitFor(() => expect(fleet.previewRemovals).toHaveLength(1))
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
   })
 
@@ -11138,7 +11183,17 @@ describe('FactoryLoop', () => {
     const mount = new SlackSyncStatusMount({ [issuePath(47)]: issueFile(47) })
     mount.slackStatus = { provider: 'slack', lastEventAt: new Date().toISOString() }
     const fleet = new FakeFleetClient()
-    const factory = createFactory(config({ slack: slackConfig() }), {
+    const factory = createFactory(config({
+      slack: slackConfig(),
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { pear: { port: 3_000 } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -11147,10 +11202,16 @@ describe('FactoryLoop', () => {
     const report = await factory.runOnce()
 
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-47'])
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(report.dispatched[0]?.previews).toHaveLength(1)
+    expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(report.slackDegraded).toBe(false)
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-47: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain(
+      'Live preview (AgentWorkforce/pear, tailnet access required): https://factory-node.tailnet.ts.net:10000/',
+    )
     expect(factory.status().slackDegraded).toBe(false)
   })
 

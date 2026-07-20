@@ -2,7 +2,42 @@
 // invokes the Relayflows SDK in that node's repo checkout; the
 // factory only emits the workflow path and inputs through the relay fleet.
 export type Capability = 'spawn:codex' | 'spawn:claude' | 'workflow:run'
+export type PreviewCapability = 'preview:tailscale-serve'
+export type NodeCapability = Capability | PreviewCapability
 export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput['restartPolicy']
+
+export type PreviewReference = {
+  id: string
+  provider: 'tailscale-serve'
+  /** Stable dispatch identity used by guarded teardown and orphan sweeps. */
+  owner: string
+  service: string
+  repo: string
+  url: string
+  targetPort: number
+  httpsPort: number
+  access: 'tailnet'
+  lifetime: 'issue'
+  createdAt: string
+  startCommand?: string
+  node?: string
+}
+
+export type PreviewStartInput = {
+  owner: string
+  issueKey: string
+  service: string
+  repo: string
+  targetPort: number
+  preferredHttpsPort?: number
+  startCommand?: string
+  node?: 'self' | string
+}
+
+export type PreviewSweepResult = {
+  reaped: PreviewReference[]
+  skipped: Array<{ id?: string; reason: string; node?: string }>
+}
 
 export interface SpawnInput {
   name: string
@@ -34,7 +69,7 @@ export interface SpawnResult {
 
 export interface RosterEntry {
   agents: Array<{ name: string; node?: string }>
-  nodes: Array<{ name: string; capabilities: Capability[]; live: boolean }>
+  nodes: Array<{ name: string; capabilities: NodeCapability[]; live: boolean }>
 }
 
 export type AgentPidResolution =
@@ -98,6 +133,12 @@ export interface FleetClient {
   trackedAgents?(): ReadonlyMap<string, FleetTrackedAgent>
   hydrateTracked?(agents: Array<{ name: string; invocationId?: string; node?: string }>): void
   reconcileTrackedAgents?(): Promise<void>
+  /** Create a provider-owned, issue-lifetime route on the placement node. */
+  createPreview?(input: PreviewStartInput): Promise<PreviewReference>
+  /** Remove only the exact provider route described by the reference. */
+  removePreview?(preview: PreviewReference): Promise<boolean>
+  /** Reap Factory-owned routes whose owner is absent from durable in-flight state. */
+  reapPreviews?(activeOwners: string[]): Promise<PreviewSweepResult>
   // A successfully spawned fire-and-forget worker may need infrastructure this
   // client cold-started to outlive the invoking CLI process. Backends that own
   // such infrastructure can relinquish cleanup responsibility after spawn.
@@ -138,4 +179,6 @@ export type AgentSpec = {
   branch?: string
   /** Existing same-repository PR head authorized for isolated legacy-branch adoption. */
   existingPullRequestBranch?: boolean
+  /** Shared live preview owned by the issue lifecycle, not this agent process. */
+  preview?: PreviewReference
 }

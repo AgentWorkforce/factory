@@ -964,7 +964,7 @@ async function buildFleet(
   // real broker bootstrap.
   if (deps.createFleet) {
     return deps.createFleet(
-      { backend: globals.backend, cwd, connectionPath },
+      { backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview },
       { ownedBrokerAgentExitTimeoutMs: globals.agentExitTimeoutMs },
     )
   }
@@ -978,7 +978,7 @@ async function buildFleet(
     const logger = streamLogger(stderr)
     const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
     return createFleet(
-      { backend: 'internal', cwd, connectionPath },
+      { backend: 'internal', cwd, connectionPath, previewConfig: loaded?.config.preview },
       {
         harnessClient: client,
         ownsBroker: started,
@@ -989,7 +989,7 @@ async function buildFleet(
     )
   }
 
-  return createFleet({ backend: globals.backend, cwd, connectionPath }, { env: deps.env })
+  return createFleet({ backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview }, { env: deps.env })
 }
 
 function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {

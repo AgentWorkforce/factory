@@ -21,6 +21,7 @@ import type {
   LinearWriteback,
   MountClient,
   ProviderSyncStatus,
+  PreviewReference,
   SlackWriteback,
   SpawnResult,
   Subscription,
@@ -416,6 +417,7 @@ export class FactoryLoop implements Factory {
   // is active, but the PTY submit must never land in that critical window.
   readonly #babysitterCriticalAgents = new Set<string>()
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
+  readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
@@ -665,6 +667,7 @@ export class FactoryLoop implements Factory {
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
       await this.#restoreBabysitterOwnership()
+      await this.#reapPreviewOrphans()
     } catch (error) {
       this.#startupAgentAdoptionActive = false
       if (live) await this.#stopLiveHeartbeat('stopping')
@@ -2286,6 +2289,9 @@ export class FactoryLoop implements Factory {
         isolateLocalWorktree,
       })
     }
+    if (!dryRun) {
+      dispatchDecision = await this.#withPreviewReferences(dispatchDecision)
+    }
     dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
     if (durableDispatch) {
       const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun, lifecycleRunId)
@@ -2310,6 +2316,10 @@ export class FactoryLoop implements Factory {
     await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = batch.start(dispatchDecision, dryRun)
     if (!record) {
+      if (!dryRun) {
+        await this.#teardownPreviewReferences(dispatchSpecs(dispatchDecision).map((spec) => spec.preview))
+        this.#previewReferences.delete(issueKey(dispatchDecision.issue))
+      }
       await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
@@ -2374,6 +2384,9 @@ export class FactoryLoop implements Factory {
         agents,
         comments: [comment],
         stateId: implementingStateId,
+        ...(this.#previewReferences.get(issueKey(dispatchDecision.issue))?.length
+          ? { previews: this.#previewReferences.get(issueKey(dispatchDecision.issue)) }
+          : {}),
         dryRun,
       }
       record.result = result
@@ -2433,6 +2446,14 @@ export class FactoryLoop implements Factory {
           new Set(),
           { cancellationReason: failedState?.terminal ? cancellationReason : undefined },
         )
+      }
+      if (liveStateChanged || failedState?.terminal) {
+        await this.#teardownPreviews(record).catch((previewError) => {
+          this.#logger.warn?.('[factory] failed to tear down previews after terminal dispatch failure', {
+            issue: record.issue.key,
+            error: describeError(previewError).errorMessage,
+          })
+        })
       }
       batch.abandon(decision.issue)
       if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
@@ -2541,6 +2562,11 @@ export class FactoryLoop implements Factory {
       })
       for (const [key, lifecycle] of durableLifecycles) {
         if (isTerminalDispatchLifecycle(lifecycle)) continue
+        const previews = uniquePreviewReferences([
+          ...dispatchSpecs(lifecycle.decision).map((spec) => spec.preview),
+          ...lifecycle.agents.map((agent) => agent.tracked.spec.preview),
+        ])
+        if (previews.length > 0) this.#previewReferences.set(issueKey(lifecycle.issue), previews)
         hasNonterminalDurableLifecycle = true
         const claim = await this.#state.claimDispatchLifecycle(
           this.#workspaceId,
@@ -3153,6 +3179,8 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    await this.#teardownPreviews(record)
+
     await this.#stopSlackWatcher(record.issue)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
@@ -3191,6 +3219,12 @@ export class FactoryLoop implements Factory {
     await this.#writeInFlightRegistry()
     if (failed.length > 0) {
       this.#increment('dispatchLifecycleReleaseRetries')
+      this.#scheduleReleaseRetry(record, reason)
+      return false
+    }
+    try {
+      await this.#teardownPreviews(record)
+    } catch {
       this.#scheduleReleaseRetry(record, reason)
       return false
     }
@@ -4739,7 +4773,7 @@ export class FactoryLoop implements Factory {
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
       baseRef,
       title: `${issue.key}: ${issue.title}`,
-      body: githubPullRequestBody(issue),
+      body: githubPullRequestBody(issue, implementer.spec.preview),
     })
     if (
       result.repo.toLowerCase() !== repo.toLowerCase() ||
@@ -6801,6 +6835,11 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        ...(spec.preview ? {
+          previewUrl: spec.preview.url,
+          previewTargetPort: spec.preview.targetPort,
+          previewStartCommand: spec.preview.startCommand,
+        } : {}),
         ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       }),
     })
@@ -6809,6 +6848,104 @@ export class FactoryLoop implements Factory {
       ...decision,
       implementers: decision.implementers.map(render),
       reviewer: render(decision.reviewer),
+    }
+  }
+
+  async #withPreviewReferences(decision: TriageDecision): Promise<TriageDecision> {
+    if (!this.#config.preview || decision.scope === 'workflow') return decision
+    if (!this.#fleet.createPreview) {
+      throw new Error('Preview services are configured but the selected fleet backend cannot create previews')
+    }
+
+    const owner = issueKey(decision.issue)
+    const created: PreviewReference[] = []
+    const byRepo = new Map<string, PreviewReference>()
+    try {
+      for (const implementer of decision.implementers) {
+        const service = previewServiceForRepo(this.#config, implementer.repo)
+        if (!service || byRepo.has(implementer.repo)) continue
+        const preview = await this.#fleet.createPreview({
+          owner,
+          issueKey: decision.issue.key,
+          service: service.name,
+          repo: implementer.repo,
+          targetPort: service.config.port,
+          preferredHttpsPort: service.config.httpsPort,
+          startCommand: service.config.startCommand,
+          node: implementer.node,
+        })
+        created.push(preview)
+        if (preview.access !== 'tailnet') {
+          throw new Error(`Refusing insecure preview for ${implementer.repo}: provider did not guarantee tailnet access`)
+        }
+        byRepo.set(implementer.repo, preview)
+      }
+    } catch (error) {
+      if (this.#fleet.removePreview) {
+        await Promise.allSettled(created.map(async (preview) => await this.#fleet.removePreview!(preview)))
+      }
+      throw error
+    }
+
+    this.#previewReferences.set(owner, [...byRepo.values()])
+    return {
+      ...decision,
+      implementers: decision.implementers.map((spec) => specWithPreview(spec, byRepo.get(spec.repo))),
+      reviewer: specWithPreview(decision.reviewer, byRepo.get(decision.reviewer.repo)),
+    }
+  }
+
+  async #teardownPreviews(record: InFlightIssue): Promise<void> {
+    const previews = uniquePreviewReferences([
+      ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+      ...[...record.agents.values()].map((tracked) => tracked.spec.preview),
+      ...(this.#previewReferences.get(issueKey(record.issue)) ?? []),
+    ])
+    if (previews.length === 0) return
+    await this.#teardownPreviewReferences(previews)
+    this.#previewReferences.delete(issueKey(record.issue))
+  }
+
+  async #teardownPreviewReferences(references: Array<PreviewReference | undefined>): Promise<void> {
+    const previews = uniquePreviewReferences(references)
+    if (previews.length === 0) return
+    if (!this.#fleet.removePreview) {
+      throw new Error('Fleet backend cannot remove its configured previews')
+    }
+    const results = await Promise.allSettled(previews.map(async (preview) =>
+      await this.#fleet.removePreview!(preview),
+    ))
+    const failures = results
+      .map((result, index) => ({ result, preview: previews[index]! }))
+      .filter((entry): entry is { result: PromiseRejectedResult; preview: PreviewReference } => entry.result.status === 'rejected')
+    if (failures.length > 0) {
+      this.#logger.warn?.('[factory] preview teardown failed', {
+        owners: [...new Set(failures.map(({ preview }) => preview.owner))],
+        previews: failures.map(({ preview }) => preview.id),
+      })
+      throw new AggregateError(failures.map(({ result }) => result.reason), 'Unable to tear down every issue preview')
+    }
+  }
+
+  async #reapPreviewOrphans(): Promise<void> {
+    if (!this.#config.preview || !this.#fleet.reapPreviews) return
+    const [lifecycles, batch] = await Promise.all([
+      this.#state.listDispatchLifecycles(this.#workspaceId),
+      this.#batch(),
+    ])
+    const activeOwners = new Set(
+      lifecycles
+        .map(([, lifecycle]) => lifecycle)
+        .filter((lifecycle) => !isTerminalDispatchLifecycle(lifecycle))
+        .map((lifecycle) => issueKey(lifecycle.issue)),
+    )
+    for (const record of batch.inFlight) activeOwners.add(issueKey(record.issue))
+    const report = await this.#fleet.reapPreviews([...activeOwners])
+    if (report.reaped.length > 0 || report.skipped.length > 0) {
+      this.#logger.info?.('[factory] preview orphan sweep completed', {
+        reaped: report.reaped.map((preview) => preview.id),
+        skipped: report.skipped,
+      })
     }
   }
 
@@ -7762,6 +7899,7 @@ export class FactoryLoop implements Factory {
             clonePath: sharedCheckout.clonePath,
             ...(implementerBranch ? { branch: implementerBranch } : {}),
             ...(sharedCheckout.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
+            ...(sharedCheckout.preview ? { preview: sharedCheckout.preview } : {}),
           }
         : initialSpec
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
@@ -7785,6 +7923,11 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        ...(spec.preview ? {
+          previewUrl: spec.preview.url,
+          previewTargetPort: spec.preview.targetPort,
+          previewStartCommand: spec.preview.startCommand,
+        } : {}),
         ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       })
 
@@ -8490,12 +8633,17 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    const previews = uniquePreviewReferences(result.previews ?? [])
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
         `${record.issue.key}: factory agents dispatched.`,
-        `State: ${result.stateId ?? 'dispatching'}`,
-        `Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+        `State: ${result.stateId ?? 'dispatching'} · Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+        ...(previews.length > 0
+          ? [previews.map((preview) =>
+              `Live preview (${preview.repo}, tailnet access required): ${preview.url}`,
+            ).join(' · ')]
+          : []),
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
@@ -10191,6 +10339,40 @@ function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
   }
 
   return [...decision.implementers, decision.reviewer]
+}
+
+function previewServiceForRepo(
+  config: FactoryConfig,
+  repo: string,
+): { name: string; config: NonNullable<FactoryConfig['preview']>['services'][string] } | undefined {
+  const services = config.preview?.services
+  if (!services) return undefined
+  const normalizedRepo = repo.replace(/^\/+|\/+$/gu, '').toLowerCase()
+  const basename = normalizedRepo.slice(normalizedRepo.lastIndexOf('/') + 1)
+  const entry = Object.entries(services).find(([name]) => {
+    const normalizedName = name.replace(/^\/+|\/+$/gu, '').toLowerCase()
+    return normalizedName === normalizedRepo || normalizedName === basename
+  })
+  return entry ? { name: entry[0], config: entry[1] } : undefined
+}
+
+function uniquePreviewReferences(previews: Array<PreviewReference | undefined>): PreviewReference[] {
+  const unique = new Map<string, PreviewReference>()
+  for (const preview of previews) {
+    if (preview) unique.set(preview.id, preview)
+  }
+  return [...unique.values()]
+}
+
+function specWithPreview(spec: AgentSpec, preview?: PreviewReference): AgentSpec {
+  if (!preview) return { ...spec }
+  return {
+    ...spec,
+    preview,
+    // The provider route forwards to loopback on its placement node. Pin every
+    // agent using that checkout to the same node so its dev server is reachable.
+    ...(preview.node ? { node: preview.node } : {}),
+  }
 }
 
 type LabelDispatchResolution =
@@ -11961,12 +12143,17 @@ const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
   return `${owner}/${repo}`
 }
 
-const githubPullRequestBody = (issue: LinearIssue): string => [
+const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): string => [
   issue.description,
   '',
   isGithubIssue(issue) && /^\d+$/u.test(issue.key)
     ? `Fixes #${issue.key}`
     : `Factory issue ${issue.key}`,
+  ...(preview ? [
+    '',
+    `Live preview: ${preview.url}`,
+    'Access: Tailscale tailnet membership and the tailnet grants/ACLs are required; this URL is not public.',
+  ] : []),
 ].join('\n').trim()
 
 // The broker rejects re-registering a name it never released on exit

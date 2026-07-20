@@ -242,6 +242,37 @@ The definition reads its node config from `./factory.node.json` (or
 mapped repo is advertised as a `repo:<label>` tag so placement can route
 repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
 
+### Tailnet live previews
+
+Factory can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+route to a repository's local development port. Configure the same service on
+the control plane and execution node (a combined local config needs it only
+once):
+
+```json
+{
+  "preview": {
+    "provider": "tailscale-serve",
+    "access": "tailnet",
+    "services": {
+      "AgentWorkforce/pear": {
+        "port": 3000,
+        "startCommand": "npm run dev"
+      }
+    }
+  }
+}
+```
+
+The node then advertises `preview:tailscale-serve`; Factory places the preview
+first and pins the issue's agents to that node. The URL is included in agent
+tasks, the Slack dispatch root, and the pull-request description. Factory uses
+Serve—not Funnel—so the URL remains inside the configured tailnet and normal
+tailnet grants/ACLs apply. Routes are removed at Human Review or Done, and a
+startup sweep reaps only orphaned routes whose Factory registry identity still
+matches the live upstream. See the [provider evaluation](planning/preview-provider-evaluation.md)
+for the decision and lifecycle contract.
+
 ### Dispatching to nodes (`--backend relay`)
 
 With `--backend relay`, the factory orchestrator dispatches work through the

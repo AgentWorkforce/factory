@@ -16,6 +16,7 @@ import {
   type WorkflowRunnerInput,
 } from './factory-node'
 import type { NodeConfig } from '../config/schema'
+import type { PreviewReference } from '../ports/fleet'
 
 function nodeConfig(overrides: Partial<NodeConfig> = {}): NodeConfig {
   return {
@@ -202,6 +203,79 @@ describe('factory node definition', () => {
       inputs: { issue: 'AR-13', repo: 'relay' },
       invocationId: 'workflow-inv',
     }])
+  })
+
+  it('advertises and invokes the configured Tailscale Serve preview provider', async () => {
+    const { ctx } = fakeContext('preview-inv')
+    const preview: PreviewReference = {
+      id: 'preview-1',
+      provider: 'tailscale-serve',
+      owner: 'AR-129:uuid:/linear/issues/129',
+      service: 'factory',
+      repo: 'AgentWorkforce/factory',
+      url: 'https://factory-node.tailnet.ts.net:10000/',
+      targetPort: 3_000,
+      httpsPort: 10_000,
+      access: 'tailnet',
+      lifetime: 'issue',
+      createdAt: '2026-07-20T12:00:00.000Z',
+    }
+    const starts: unknown[] = []
+    const definition = createFactoryNodeDefinition({
+      config: nodeConfig({
+        capabilities: ['spawn:codex'],
+        preview: {
+          provider: 'tailscale-serve',
+          access: 'tailnet',
+          services: { factory: { port: 3_000 } },
+          tailscaleBinary: 'tailscale',
+          registryPath: '/tmp/factory-previews.json',
+          httpsPortRange: [10_000, 10_999],
+        },
+      }),
+      previewManager: {
+        async start(input) {
+          starts.push(input)
+          return preview
+        },
+        async remove() { return true },
+        async sweep() { return { reaped: [], skipped: [] } },
+      },
+    })
+
+    expect(Object.keys(definition.capabilities)).toEqual(['spawn:codex', 'preview:tailscale-serve'])
+    expect(definition.capabilities['preview:tailscale-serve']?.metadata).toMatchObject({
+      handler: 'tailscale-serve',
+      access: 'tailnet',
+      preview: { provider: 'tailscale-serve', access: 'tailnet' },
+    })
+    await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
+      operation: 'start',
+      owner: preview.owner,
+      issueKey: 'AR-129',
+      service: 'factory',
+      repo: preview.repo,
+      targetPort: preview.targetPort,
+    }, ctx)).resolves.toEqual({
+      operation: 'start',
+      preview: { ...preview, node: 'factory-node' },
+    })
+    expect(starts).toEqual([{
+      owner: preview.owner,
+      issueKey: 'AR-129',
+      service: 'factory',
+      repo: preview.repo,
+      targetPort: preview.targetPort,
+      node: 'factory-node',
+    }])
+    await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
+      operation: 'start',
+      owner: preview.owner,
+      issueKey: 'AR-129',
+      service: 'factory',
+      repo: preview.repo,
+      targetPort: 8_080,
+    }, ctx)).rejects.toThrow("does not match this node's configuration")
   })
 
   it('runs the default Relayflows SDK runner without a CLI binary', async () => {

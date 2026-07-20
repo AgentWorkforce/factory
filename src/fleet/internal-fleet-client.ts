@@ -6,9 +6,11 @@ import { dirname, join } from 'node:path'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
-import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { PreviewConfig } from '../config/schema'
+import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
+import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
 
 const requireForResolve = createRequire(import.meta.url)
@@ -50,6 +52,8 @@ export interface InternalFleetClientOptions {
   resumeCapability?: Capability
   logger?: Logger
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
+  previewConfig?: PreviewConfig
+  previewManager?: PreviewManager
 }
 
 type AgentExitListener = (name: string, reason?: string) => void
@@ -75,11 +79,6 @@ export const capabilityCli: Record<Capability, string> = {
   'workflow:run': 'relayflows',
 }
 
-const selfNode: RosterEntry['nodes'][number] = {
-  name: 'self',
-  capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'],
-  live: true,
-}
 const PID_RESOLVE_ATTEMPTS = 3
 const PID_RESOLVE_BACKOFF_MS = 75
 const READY_RESEND_DELAY_MS = 1_000
@@ -106,6 +105,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
   readonly #resolveAgentRelayMcpCommand: () => AgentRelayMcpCommand | undefined
+  readonly #previewManager?: PreviewManager
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
@@ -138,6 +138,9 @@ export class InternalFleetClient implements FleetClient {
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger ? normalizeLogger(options.logger) : undefined
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
+    this.#previewManager = options.previewManager ?? (options.previewConfig
+      ? new TailscalePreviewManager({ config: options.previewConfig })
+      : undefined)
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
     this.#ownsBroker = options.ownsBroker ?? false
     this.#ownedBrokerAgentExitTimeoutMs = options.ownedBrokerAgentExitTimeoutMs ?? OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS
@@ -281,8 +284,33 @@ export class InternalFleetClient implements FleetClient {
     const agents = await this.#client.listAgents()
     return {
       agents: agents.map((agent) => ({ name: agent.name })),
-      nodes: [selfNode],
+      nodes: [{
+        name: 'self',
+        capabilities: [
+          'spawn:claude',
+          'spawn:codex',
+          'workflow:run',
+          ...(this.#previewManager ? ['preview:tailscale-serve' as const] : []),
+        ],
+        live: true,
+      }],
     }
+  }
+
+  async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    assertSelfNode(input.node)
+    if (!this.#previewManager) throw new Error('Tailscale preview provider is not configured')
+    return await this.#previewManager.start(input)
+  }
+
+  async removePreview(preview: PreviewReference): Promise<boolean> {
+    if (!this.#previewManager) throw new Error('Tailscale preview provider is not configured')
+    return await this.#previewManager.remove(preview)
+  }
+
+  async reapPreviews(activeOwners: string[]): Promise<PreviewSweepResult> {
+    if (!this.#previewManager) return { reaped: [], skipped: [] }
+    return await this.#previewManager.sweep(activeOwners)
   }
 
   trackedAgents(): ReadonlyMap<string, FleetTrackedAgent> {

@@ -59,6 +59,12 @@ export interface RenderAgentTaskInput {
      */
     mountRoot: string
   }
+  /** Tailnet-authenticated live preview owned by the issue lifecycle. */
+  previewUrl?: string
+  /** Local development-server port routed by the preview provider. */
+  previewTargetPort?: number
+  /** Optional repository-specific command that starts the previewed app. */
+  previewStartCommand?: string
   /** Pre-rendered writeback instructions for connected integrations. */
   integrationInstructions?: string
   /** Exact branch Factory will publish after the implementer pushes it. */
@@ -96,6 +102,16 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     `Linear issue: ${input.issue.key} - ${input.issue.title}`,
     'Full Linear issue description:',
     input.issue.description,
+    ...(input.previewUrl ? [
+      '',
+      `Live preview: ${input.previewUrl}`,
+      'Preview access: Tailscale Serve keeps this URL inside the configured tailnet; tailnet grants/ACLs apply.',
+      ...(input.role === 'implementer'
+        ? [input.previewStartCommand
+            ? `Start the previewed app with \`${input.previewStartCommand}\` and keep it running while this issue is in flight.`
+            : `Start the app on local port ${input.previewTargetPort ?? '<configured preview port>'} and keep it running while this issue is in flight.`]
+        : []),
+    ] : []),
   ]
 
   const common = [
