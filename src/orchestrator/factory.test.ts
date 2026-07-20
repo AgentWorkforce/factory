@@ -1984,10 +1984,12 @@ describe('FactoryLoop', () => {
         'ar-26-impl-pear',
         'ar-26-review-pear',
       ])
-      expect((await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort()).toEqual([
+      await vi.waitFor(async () => expect(
+        (await readFactoryInFlightRegistry(registryPath))?.agents.map((agent) => agent.name).sort(),
+      ).toEqual([
         'ar-26-impl-hoopsheet',
         'ar-26-review-hoopsheet',
-      ])
+      ]))
     } finally {
       await rm(temporaryDir, { recursive: true, force: true })
     }
