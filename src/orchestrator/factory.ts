@@ -2645,7 +2645,9 @@ export class FactoryLoop implements Factory {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
       let hasNonterminalDurableLifecycle = false
-      const durableLifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+      const durableLifecycles = await this.#deduplicateQueuedGithubLifecycleAliases(
+        await this.#state.listDispatchLifecycles(this.#workspaceId),
+      )
       this.#logger.info?.('[factory] durable startup adoption loaded', {
         lifecycles: durableLifecycles.length,
       })
@@ -2742,6 +2744,69 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
+  }
+
+  async #deduplicateQueuedGithubLifecycleAliases(
+    lifecycles: Array<[string, DispatchLifecycle]>,
+  ): Promise<Array<[string, DispatchLifecycle]>> {
+    const groups = new Map<string, Array<[string, DispatchLifecycle]>>()
+    for (const entry of lifecycles) {
+      if (isTerminalDispatchLifecycle(entry[1])) continue
+      const identity = githubIssueRefIdentity(entry[1].issue)
+      if (!identity) continue
+      const group = groups.get(identity) ?? []
+      group.push(entry)
+      groups.set(identity, group)
+    }
+
+    const clearedKeys = new Set<string>()
+    for (const [identity, group] of groups) {
+      if (group.length < 2) continue
+      const active = group.filter(([, lifecycle]) => lifecycle.phase !== 'queued')
+      // Two independently active aliases may each own useful work. Preserve
+      // both for operator reconciliation instead of guessing which branch wins.
+      if (active.length > 1) {
+        this.#increment('dispatchLifecycleGithubAliasConflicts')
+        this.#logger.warn?.('[factory] retained conflicting active GitHub lifecycle aliases', {
+          identity,
+          count: group.length,
+        })
+        continue
+      }
+      const nowMs = this.#clock.now()
+      const ownedElsewhere = group.some(([, lifecycle]) =>
+        lifecycle.lease &&
+        lifecycle.lease.owner !== this.#dispatchLifecycleOwner &&
+        lifecycle.lease.leaseUntilMs > nowMs)
+      if (ownedElsewhere) {
+        this.#increment('dispatchLifecycleGithubAliasDedupeDeferred')
+        continue
+      }
+
+      const winner = active[0] ?? [...group].sort(compareQueuedGithubLifecycleAliases)[0]!
+      for (const [key, lifecycle] of group) {
+        if (key === winner[0] || lifecycle.phase !== 'queued') continue
+        const cleared = await this.#state.clearQueuedDispatchLifecycle(
+          this.#workspaceId,
+          key,
+          lifecycle.lease,
+        )
+        if (!cleared) {
+          this.#increment('dispatchLifecycleGithubAliasDedupeDeferred')
+          continue
+        }
+        this.#dispatchLifecycleEpochs.delete(key)
+        const timer = this.#dispatchLifecycleRetryTimers.get(key)
+        if (timer) clearTimeout(timer)
+        this.#dispatchLifecycleRetryTimers.delete(key)
+        this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+        clearedKeys.add(key)
+        this.#increment('dispatchLifecycleGithubAliasesCollapsed')
+      }
+    }
+    return clearedKeys.size > 0
+      ? lifecycles.filter(([key]) => !clearedKeys.has(key))
+      : lifecycles
   }
 
   async #drainAgentExitsInFlight(names?: ReadonlySet<string>, timeoutMs?: number): Promise<boolean> {
@@ -12110,24 +12175,46 @@ const normalizeGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): 
 })
 
 const githubIssueReadCandidatePaths = (path: string): string[] => {
+  const candidates: string[] = []
   if (path.endsWith('/')) {
-    return [`${path}meta.json`, `${path}metadata.json`]
-  }
-  if (path.endsWith('/meta.json')) {
-    return [path, path.replace(/\/meta\.json$/u, '/metadata.json')]
-  }
-  if (path.endsWith('/metadata.json')) {
-    return [path, path.replace(/\/metadata\.json$/u, '/meta.json')]
-  }
-  if (githubIssuePathParts(path)) {
-    return [path]
-  }
-  if (githubIssueDirectoryPathParts(path)) {
+    candidates.push(`${path}meta.json`, `${path}metadata.json`)
+  } else if (path.endsWith('/meta.json')) {
+    candidates.push(path, path.replace(/\/meta\.json$/u, '/metadata.json'))
+  } else if (path.endsWith('/metadata.json')) {
+    candidates.push(path, path.replace(/\/metadata\.json$/u, '/meta.json'))
+  } else if (githubIssuePathParts(path)) {
+    candidates.push(path)
+  } else if (githubIssueDirectoryPathParts(path)) {
     // meta.json is the canonical relayfile GitHub issue basename. metadata.json
     // remains a legacy read fallback for older local mount-state snapshots.
-    return [`${path}/meta.json`, `${path}/metadata.json`]
+    candidates.push(`${path}/meta.json`, `${path}/metadata.json`)
+  } else {
+    candidates.push(path)
   }
-  return [path]
+
+  // Title-derived directories are mutable aliases. A renamed issue may leave
+  // a durable lifecycle pointing at its old slug, while the adapter continues
+  // to expose the stable public by-id aliases. Always include both supported
+  // repository layouts so recovery never hot-loops on an obsolete title path.
+  const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+  if (parts) {
+    candidates.push(
+      `${GITHUB_ISSUE_ROOT}/${parts.owner}__${parts.repo}/issues/by-id/${parts.number}.json`,
+      `${GITHUB_ISSUE_ROOT}/${parts.owner}/${parts.repo}/issues/by-id/${parts.number}.json`,
+    )
+  }
+  return [...new Set(candidates)]
+}
+
+const compareQueuedGithubLifecycleAliases = (
+  left: [string, DispatchLifecycle],
+  right: [string, DispatchLifecycle],
+): number => {
+  const stablePath = (lifecycle: DispatchLifecycle): number =>
+    lifecycle.issue.path.includes('/issues/by-id/') ? 0 : 1
+  return stablePath(left[1]) - stablePath(right[1]) ||
+    (right[1].updatedAtMs ?? 0) - (left[1].updatedAtMs ?? 0) ||
+    left[0].localeCompare(right[0])
 }
 
 const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: string; number: number; slug?: string } | undefined => {
