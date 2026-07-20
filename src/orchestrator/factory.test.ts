@@ -7320,9 +7320,9 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     mount.files.set(path, { content: realIssueFile(25) })
     mount.emit(changeEvent(path, 'event-live-25'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl-pear', 'ar-25-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl-pear', 'ar-25-review'])
+    })
     expect(factory.status().counters.liveEvents).toBe(1)
     expect(factory.status().counters.liveArrivalLatencyMsLast).toBeGreaterThanOrEqual(0)
     await factory.stop()
@@ -7340,9 +7340,9 @@ describe('FactoryLoop', () => {
 
     mount.files.set(path, { content: realIssueFile(33) })
     mount.emit(changeEvent(path, 'event-live-default-33'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
+    })
     await factory.stop()
   })
 
@@ -7688,9 +7688,9 @@ describe('FactoryLoop', () => {
 
     mount.files.set(newPath, { content: realIssueFile(35) })
     mount.emit(changeEvent(newPath, '100'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl-pear', 'ar-35-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl-pear', 'ar-35-review'])
+    })
     await factory.stop()
   })
 
@@ -7799,8 +7799,9 @@ describe('FactoryLoop', () => {
       mount.files.set(path, { content: realIssueFile(32) })
       mount.emit(changeEvent(path, 'event-live-poll-32'))
       await vi.advanceTimersByTimeAsync(10)
-
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
+      await vi.waitFor(() => {
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
+      })
       await factory.stop()
     } finally {
       vi.useRealTimers()
