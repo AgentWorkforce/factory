@@ -19,36 +19,8 @@ npm test
 node bin/factory.mjs --help
 # → exits 0 and lists every top-level command and global option
 
-node --input-type=module <<'NODE'
-import { existsSync, readFileSync } from 'node:fs'
-import { parse } from 'yaml'
-
-const manifest = parse(readFileSync('.agentworkforce/features/manifest.yaml', 'utf8'))
-const categories = Object.values(manifest.categories)
-const features = categories.flatMap((category) => category.features)
-const ids = features.map((feature) => feature.id)
-if (new Set(ids).size !== ids.length) throw new Error('duplicate feature IDs')
-const tierCounts = Object.fromEntries([1, 2, 3, 4, 5, 6].map((tier) => [
-  tier,
-  features.filter((feature) => feature.verify_tier === tier).length,
-]))
-if (manifest.catalog.category_count !== categories.length ||
-    manifest.catalog.feature_count !== features.length ||
-    JSON.stringify(manifest.catalog.tier_counts) !== JSON.stringify(tierCounts)) {
-  throw new Error('catalog summary does not match manifest contents')
-}
-for (const feature of features) {
-  if (!feature.id || !feature.name || (!feature.cli && !feature.api) ||
-      !feature.description || !feature.location ||
-      !Number.isInteger(feature.verify_tier) || feature.verify_tier < 1 || feature.verify_tier > 6) {
-    throw new Error(`invalid feature: ${JSON.stringify(feature)}`)
-  }
-  for (const location of feature.location.split(',').map((value) => value.trim())) {
-    if (!existsSync(location)) throw new Error(`missing location for ${feature.id}: ${location}`)
-  }
-}
-console.log(`${features.length} features in ${categories.length} categories`)
-NODE
+node bin/factory.mjs featuremap check
+# → validates schema, unique ids, catalog totals, tiers, and every location path
 ```
 
 Pass criteria: build and all tests exit 0; both published entrypoints remain importable; the manifest parses with unique, complete entries.

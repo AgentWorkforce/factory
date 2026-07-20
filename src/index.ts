@@ -34,6 +34,7 @@ export type {
   TemplateIssue,
   TemplateRoute,
 } from './dispatch/templates'
+export * from './featuremap/index'
 export {
   createRelayflowPolicyRegistry,
   dispatchRelayflowForChangeEvent,
