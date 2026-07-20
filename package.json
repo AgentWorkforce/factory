@@ -1,6 +1,6 @@
 {
   "name": "@agent-relay/factory",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
   "license": "Apache-2.0",
   "repository": {
@@ -74,7 +74,7 @@
     "@agent-relay/integration-prompts": "^10.6.4",
     "@agent-relay/sdk": "^10.6.4",
     "@relayfile/relay-helpers": "^0.4.2",
-    "@relayfile/sdk": "^0.10.9",
+    "@relayfile/sdk": "^0.10.32",
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",

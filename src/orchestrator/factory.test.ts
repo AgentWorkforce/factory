@@ -1012,6 +1012,46 @@ class UnreachableBabysitterHarnessClient extends RosterPidHarnessClient {
   }
 }
 
+class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+  resumed = false
+
+  override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
+    const result = await super.spawnPty(input)
+    if (input.continueFrom) this.resumed = true
+    return result
+  }
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      if (!this.resumed) {
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
+    }
+    return await super.sendMessage(input)
+  }
+}
+
+class CapabilityMigratingBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      const current = this.spawned.findLast((spawn) => spawn.name === input.to)
+      if (current?.cli !== 'codex') {
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
   resumeAttempts = 0
   shutdownCalls = 0
@@ -2044,6 +2084,47 @@ describe('FactoryLoop', () => {
       reason: 'live state is not ready-for-agent',
     }])
     expect(fleet.spawns).toEqual([])
+  })
+
+  it('filters GitHub startup discovery through the Relayfile issue index', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-index-discovery-'))
+    const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 70)
+    const unrelatedPath = githubIssueCompactPath('AgentWorkforce', 'pear', 71)
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce/pear/issues/_index.json': [
+        { id: '70', number: 70, title: 'Ready', updated: '2026-07-20T12:00:00Z', state: 'open', labels: ['factory'] },
+        { id: '71', number: 71, title: 'Other', updated: '2026-07-20T12:00:00Z', state: 'open', labels: ['triaged'] },
+        { id: '72', number: 72, title: 'Closed', updated: '2026-07-20T12:00:00Z', state: 'closed', labels: ['factory'] },
+      ],
+      [readyPath]: githubIssueFile(70, { labels: ['factory'] }),
+      [unrelatedPath]: githubIssueFile(71, { labels: ['triaged'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const report = await factory.runOnce()
+
+      expect(report.pulled.map((issue) => issue.key)).toEqual(['70'])
+      expect(report.dispatched).toHaveLength(1)
+      expect(mount.reads).toContain('/github/repos/AgentWorkforce/pear/issues/_index.json')
+      expect(mount.reads).toContain(readyPath)
+      expect(mount.reads).not.toContain(unrelatedPath)
+      expect(factory.status().counters.githubIssueIndexReposUsed).toBe(1)
+      expect(factory.status().counters.githubIssueIndexFallbacks).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('recovers an orphaned in-progress GitHub issue with no agents, durable lifecycle, or open PR', async () => {
@@ -4454,6 +4535,78 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('continues live ready-issue discovery when startup exit reconciliation stays slow', async () => {
+    const path = issuePath(87)
+    const issue = issueFile(87)
+    let releasePublish!: () => void
+    let publishStarted!: () => void
+    const publishing = new Promise<void>((resolve) => { releasePublish = resolve })
+    const startedPublishing = new Promise<void>((resolve) => { publishStarted = resolve })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishStarted()
+        await publishing
+        return {
+          repo: input.repo,
+          number: 87,
+          url: 'https://github.com/AgentWorkforce/pear/pull/87',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issue,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const first = createFactory(config(), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restartedFleet.exitImplementerOnReconcile = true
+      restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+        startupAgentExitDrainTimeoutMs: 10,
+      })
+
+      const start = restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await startedPublishing
+      await start
+
+      expect(restarted.status().counters.startupAgentExitDrainTimeouts).toBe(1)
+      expect(restarted.status().counters.liveStartupBackfills).toBe(1)
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'publishing' })
+
+      releasePublish()
+      await vi.waitFor(async () => {
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        expect(lifecycle).toMatchObject({ pullRequest: { number: 87 } })
+        expect(['published', 'complete']).toContain(lifecycle?.phase)
+      })
+    } finally {
+      releasePublish()
+      await restarted?.stop()
+      await first.stop()
+    }
+  })
+
   it.each([
     ['healthy owner', 1091, false],
     ['waiting owner crash', 1092, true],
@@ -4636,8 +4789,9 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.spawns).toEqual([])
+      expect(restarted.status().counters.dispatchLifecycleCapacityWaits).toBe(1)
 
       restartedFleet.emitAgentExit('ar-985-impl-pear', 'exited')
       await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
@@ -4935,6 +5089,68 @@ describe('FactoryLoop', () => {
       await first.stop()
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('persists an existing PR receipt when restart reconciliation finds a missing implementer', async () => {
+    const issue = issueFile(591)
+    const publishPullRequest = vi.fn(async () => {
+      throw new Error('must reconcile the existing PR instead of publishing another')
+    })
+    const mount = new FakeMountClient({
+      [issuePath(591)]: issue,
+      [issuePath(592)]: issueFile(592),
+    }, {
+      publishPullRequest,
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    let branch = ''
+    const factory = createFactory(config({ babysitter: { enabled: true } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: 1591,
+        headRef: branch,
+        state: 'OPEN',
+        url: 'https://github.com/AgentWorkforce/pear/pull/1591',
+      }),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify([{
+          number: 1591,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1591',
+          headRefName: branch,
+          isDraft: false,
+        }]),
+      }),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(591), issue))
+
+    await factory.dispatch(decision)
+    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      .decision.implementers[0]!.branch!
+    fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+        phase: 'running',
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 1591,
+          headRef: branch,
+        },
+      })
+    })
+    expect(publishPullRequest).not.toHaveBeenCalled()
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-591-babysit')
+
+    const nextDecision = await factory.triageIssue(parseLinearIssue(issuePath(592), issueFile(592)))
+    await factory.dispatch(nextDecision)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-592-impl-pear')
+    await factory.stop()
   })
 
   it('adopts a roster-visible remote spawn after crashing across the ack persistence gap', async () => {
@@ -14303,6 +14519,203 @@ describe('FactoryLoop PR babysitter', () => {
     })
   }
 
+  it('releases a weak-match babysitter when exact branch reconciliation proves a different PR', async () => {
+    const issue = realIssueFile(495, ready, { title: 'Real exact PR ownership' })
+    const mount = new FakeMountClient({ [issuePath(495)]: issue }, {
+      publishPullRequest: async () => {
+        throw new Error('must reconcile the existing exact-branch PR')
+      },
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    let branch = ''
+    const factory = createFactory(babysitterConfig({ batchSize: 1 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => branch
+        ? {
+            repo: 'AgentWorkforce/pear',
+            prNumber: 1595,
+            headRef: branch,
+            state: 'OPEN',
+            url: 'https://github.com/AgentWorkforce/pear/pull/1595',
+          }
+        : undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify([{
+          number: 1595,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1595',
+          headRefName: branch,
+          isDraft: false,
+        }]),
+      }),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(495), issue))
+      await factory.dispatch(decision)
+      branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+        .decision.implementers[0]!.branch!
+
+      const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1495/metadata.json'
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1495, {
+        state: 'open',
+        draft: false,
+        head_ref: 'factory/ar-495-stale-match',
+        title: 'Real AR-495 stale match',
+      })
+      mount.emit(changeEvent(stalePrPath, 'stale-pr-1495-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-495-babysit'))
+
+      fleet.emitAgentExit('ar-495-impl-pear', 'reconciled-missing')
+
+      await vi.waitFor(async () => {
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        expect(lifecycle).toMatchObject({
+          phase: 'running',
+          pullRequest: { repo: 'AgentWorkforce/pear', number: 1595, headRef: branch },
+        })
+        expect(lifecycle?.agents.filter((agent) => agent.tracked.spec.role === 'babysitter')).toEqual([
+          expect.objectContaining({
+            tracked: expect.objectContaining({
+              spec: expect.objectContaining({
+                ownedPullRequest: expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 1595 }),
+              }),
+            }),
+          }),
+        ])
+      })
+      expect(fleet.releases).toContainEqual(expect.objectContaining({
+        name: 'ar-495-babysit',
+        reason: 'superseded-pr-receipt',
+      }))
+      expect(factory.status().counters.supersededBabysittersReleased).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('makes a validated babysitter session authoritative before startup roster reconciliation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-receipt-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const issue = realIssueFile(496, ready, { title: 'Real babysitter receipt takeover' })
+    const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1496/metadata.json'
+    const exactPrPath = '/github/repos/AgentWorkforce/pear/pulls/1596/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(496)]: issue })
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const first = createFactory(babysitterConfig({ batchSize: 1 }), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore: state(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(496), issue))
+      await first.dispatch(decision)
+      const key = issueKey(decision.issue)
+      const branch = (await state().getDispatchLifecycle('factory-test', key))!
+        .decision.implementers[0]!.branch!
+
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1496, {
+        state: 'open',
+        draft: false,
+        head_ref: 'factory/ar-496-stale-match',
+        title: 'Real AR-496 stale match',
+      })
+      mount.emit(changeEvent(stalePrPath, 'stale-pr-1496-open'))
+      await vi.waitFor(() => expect(firstFleet.spawns.map((spawn) => spawn.name)).toContain('ar-496-babysit'))
+      await first.stop()
+
+      // Reproduce the durable crash gap observed in the live Factory state:
+      // the lifecycle retained an earlier weak-match babysitter, while the
+      // independently persisted session already identified the exact PR.
+      const persisted = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, {
+          dispatchLifecycles: Record<string, {
+            agents: Array<{
+              name: string
+              tracked: {
+                spec: { name: string; invocationId?: string; ownedPullRequest?: { repo: string; number: number; path?: string } }
+                result?: { name: string }
+              }
+            }>
+            invocationIds: string[]
+          }>
+        }>
+      }
+      const lifecycle = persisted.workspaces['factory-test']!.dispatchLifecycles[key]!
+      const stale = lifecycle.agents.find((agent) => agent.tracked.spec.ownedPullRequest?.number === 1496)!
+      // Also reproduce the live route-drift form of this crash gap: an older
+      // weak match can belong to a repository that is no longer present in the
+      // durable decision at all. Same-repository receipt replacement alone
+      // cannot retire that agent.
+      stale.tracked.spec.ownedPullRequest = { repo: 'AgentWorkforce/relay', number: 1496 }
+      const exact = structuredClone(stale)
+      exact.name = 'ar-496-babysit-exact'
+      exact.tracked.spec.name = exact.name
+      exact.tracked.spec.invocationId = `${exact.tracked.spec.invocationId ?? 'factory:496'}:exact`
+      exact.tracked.spec.ownedPullRequest = { repo: 'AgentWorkforce/pear', number: 1596, path: exactPrPath }
+      if (exact.tracked.result) exact.tracked.result.name = exact.name
+      lifecycle.agents.push(exact)
+      if (exact.tracked.spec.invocationId) lifecycle.invocationIds.push(exact.tracked.spec.invocationId)
+      await writeFile(watchStatePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
+
+      await state().clearBabysitterSession('factory-test', `${key}:agentworkforce/pear#1496`)
+      await state().setBabysitterSession('factory-test', `${key}:agentworkforce/pear#1596`, {
+        issue: decision.issue,
+        repo: 'AgentWorkforce/pear',
+        prNumber: 1596,
+        path: exactPrPath,
+        agentName: exact.name,
+        critical: false,
+        pendingKinds: [],
+      })
+      mount.files.delete(stalePrPath)
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1596, {
+        state: 'open',
+        draft: false,
+        head_ref: branch,
+        title: 'Real AR-496 exact branch',
+      })
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(babysitterConfig({ batchSize: 1 }), {
+        mount,
+        fleet: restartedFleet,
+        triage: new StaticTriage(),
+        stateStore: state(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => {
+        const recovered = await state().getDispatchLifecycle('factory-test', key)
+        expect(recovered).toMatchObject({
+          phase: 'running',
+          pullRequest: { repo: 'AgentWorkforce/pear', number: 1596, headRef: branch },
+        })
+        expect(recovered?.agents.filter((agent) => agent.tracked.spec.role === 'babysitter').map((agent) => ({
+          name: agent.name,
+          pr: agent.tracked.spec.ownedPullRequest?.number,
+        }))).toEqual([{ name: exact.name, pr: 1596 }])
+      })
+      expect(restartedFleet.releases).toContainEqual({
+        name: 'ar-496-babysit',
+        reason: 'superseded-pr-route',
+      })
+      expect(restartedFleet.resumes.map((resume) => resume.name)).not.toContain('ar-496-babysit')
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('recovers a remote babysitter across the spawn-ack crash gap without replaying the original team tasks', async () => {
     class BabysitterAckGapFleet extends RemoteLifecycleFleetClient {
       crashed = false
@@ -15347,7 +15760,150 @@ describe('FactoryLoop PR babysitter', () => {
     }
   }, 10_000)
 
-  it('escalates once and backs off the babysitter wake loop when the target stays unreachable', async () => {
+  it('restarts an unreachable babysitter and delivers the preserved wake', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-recovery-'))
+    const issue = realIssueFile(424, ready, { title: 'Real automatic unreachable babysitter recovery' })
+    const mount = new FakeMountClient({ [issuePath(424)]: issue })
+    const harness = new RecoveringBabysitterHarnessClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 60_000,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' }),
+      readChildPids: async () => [],
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(424), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/424/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 424,
+        state: 'open',
+        head_ref: 'ar-424-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-424-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-424-babysit'))
+
+      const commentPath = '/github/repos/AgentWorkforce/pear/comments/9424.json'
+      mount.files.set(commentPath, { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 424 },
+        comment: { id: 9424, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent(commentPath, 'comment-9424'))
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1),
+        { timeout: 8_000 },
+      )
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1),
+        { timeout: 4_000 },
+      )
+      expect(harness.releases).toContainEqual({
+        name: 'ar-424-babysit',
+        reason: 'babysitter-unreachable',
+      })
+      expect(harness.spawned.filter((spawn) => spawn.continueFrom)).toHaveLength(1)
+      expect(harness.babysitterWakeAttempts).toBeGreaterThan(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('cold-starts an unreachable babysitter when its configured capability changed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-capability-recovery-'))
+    const issue = realIssueFile(425, ready, { title: 'Real babysitter capability migration' })
+    const mount = new FakeMountClient({ [issuePath(425)]: issue })
+    const harness = new CapabilityMigratingBabysitterHarnessClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const ports = {
+      mount,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 60_000,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' as const }),
+      readChildPids: async () => [] as number[],
+    }
+    let factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      ...ports,
+      fleet: new InternalFleetClient({ client: harness, cwd: '/work/pear' }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(425), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/425/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 425,
+        state: 'open',
+        head_ref: 'ar-425-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-425-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-425-babysit'))
+      expect(harness.spawned.findLast((spawn) => spawn.name === 'ar-425-babysit')?.cli).toBe('claude')
+
+      // Model an operator changing the configured harness after the persisted
+      // session became unhealthy. A Claude session ref cannot be resumed by
+      // Codex, so recovery must cold-start from the durable PR task instead.
+      await factory.stop()
+      factory = createFactory(babysitterConfig({
+        loop: { registryPath: join(root, 'registry.json') },
+        agentCapabilities: { babysitter: 'spawn:codex' },
+      }), {
+        ...ports,
+        fleet: new InternalFleetClient({ client: harness, cwd: '/work/pear' }),
+      })
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9425.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 425 },
+        comment: { id: 9425, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9425.json', 'comment-9425'))
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterCapabilityMigrations).toBe(1),
+        { timeout: 8_000 },
+      )
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1),
+        { timeout: 4_000 },
+      )
+      const migrations = harness.spawned.filter((spawn) =>
+        spawn.name === 'ar-425-babysit' && spawn.cli === 'codex')
+      expect(migrations).toHaveLength(1)
+      expect(migrations[0]?.continueFrom).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('restarts once and backs off when the replacement babysitter stays unreachable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-backoff-'))
     const issue = realIssueFile(423, ready, { title: 'Real unreachable babysitter escalation' })
     const mount = new FakeMountClient({ [issuePath(423)]: issue })
     const harness = new UnreachableBabysitterHarnessClient()
@@ -15358,7 +15914,9 @@ describe('FactoryLoop PR babysitter', () => {
     // by real setTimeout, so the fast-retry vs backoff cadence is preserved.
     let clockValue = 1_700_000_000_000
     const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
-    const factory = createFactory(babysitterConfig(), {
+    const factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -15401,16 +15959,26 @@ describe('FactoryLoop PR babysitter', () => {
         () => expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1),
         { timeout: 8_000 },
       )
-      const failuresAtEscalation = factory.status().counters.babysitterEventWakeFailures ?? 0
-      expect(failuresAtEscalation).toBeGreaterThanOrEqual(1)
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1),
+        { timeout: 4_000 },
+      )
+      await vi.waitFor(
+        // Initial miss, escalation miss, then the prompt replacement probe.
+        () => expect(factory.status().counters.babysitterEventWakeFailures).toBeGreaterThanOrEqual(3),
+        { timeout: 4_000 },
+      )
+      const failuresAfterRecoveryProbe = factory.status().counters.babysitterEventWakeFailures ?? 0
       await new Promise((resolve) => setTimeout(resolve, 1_500))
-      // Backed off (next retry is ~60s out), so no further failures accrue in
-      // the next second and the escalation is not re-logged.
-      expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAtEscalation)
+      // The replacement also failed its probe, so the cooldown backs off for
+      // ~60 seconds instead of repeatedly tearing down the session.
+      expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAfterRecoveryProbe)
       expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1)
       expect(factory.status().counters.babysitterEventWakeUnreachableReconciliations).toBe(1)
+      expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1)
     } finally {
       await factory.stop()
+      await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
 
