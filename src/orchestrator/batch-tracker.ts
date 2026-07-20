@@ -23,6 +23,27 @@ export interface QueuedIssue {
   dryRun: boolean
 }
 
+export interface DependencyBlocker {
+  /** Canonical repo+number identity used for dependency graph matching. */
+  identity: string
+  /** Resolved composite issueKey() when the blocker exists in the mounted issue index. */
+  key: string
+  /** Operator-facing owner/repo#number reference. */
+  label: string
+}
+
+export interface DependencyAdmission {
+  blockers: DependencyBlocker[]
+  cycle?: string[]
+}
+
+export interface ParkedIssue extends QueuedIssue {
+  blockers: DependencyBlocker[]
+  cycle?: string[]
+  /** Capacity and dependencies are independent admission predicates. */
+  capacityBlocked: boolean
+}
+
 const stableHash = (input: string): string => {
   let hash = 0x811c9dc5
   for (let index = 0; index < input.length; index += 1) {
@@ -37,6 +58,7 @@ export class BatchTracker {
   readonly #limit: number
   readonly #inFlight = new Map<string, InFlightIssue>()
   readonly #queued = new Map<string, QueuedIssue>()
+  readonly #parked = new Map<string, ParkedIssue>()
   readonly #invocationIds = new Set<string>()
 
   constructor(batchSize: number) {
@@ -55,6 +77,10 @@ export class BatchTracker {
     return [...this.#queued.values()]
   }
 
+  get parked(): ParkedIssue[] {
+    return [...this.#parked.values()]
+  }
+
   getIssue(issue: IssueRef): InFlightIssue | undefined {
     return this.#inFlight.get(issueKey(issue))
   }
@@ -71,19 +97,38 @@ export class BatchTracker {
     return this.#queued.has(issueKey(issue))
   }
 
+  isParked(issue: IssueRef): boolean {
+    return this.#parked.has(issueKey(issue))
+  }
+
+  getParked(issue: IssueRef): ParkedIssue | undefined {
+    return this.#parked.get(issueKey(issue))
+  }
+
   canStart(): boolean {
     return [...this.#inFlight.values()].filter(dispatchOccupiesImplementationSlot).length < this.#limit
   }
 
-  start(decision: TriageDecision, dryRun: boolean): InFlightIssue | undefined {
+  start(
+    decision: TriageDecision,
+    dryRun: boolean,
+    dependencyAdmission: DependencyAdmission = { blockers: [] },
+  ): InFlightIssue | undefined {
     const key = issueKey(decision.issue)
     const existing = this.#inFlight.get(key)
     if (existing) {
       return existing
     }
 
+    if (dependencyAdmission.blockers.length > 0 || (dependencyAdmission.cycle?.length ?? 0) > 0) {
+      this.#park(decision, dryRun, dependencyAdmission)
+      return undefined
+    }
+
+    this.#parked.delete(key)
+
     if (!this.canStart()) {
-      this.queue(decision, dryRun)
+      this.queue(decision, dryRun, dependencyAdmission)
       return undefined
     }
 
@@ -99,14 +144,29 @@ export class BatchTracker {
     return record
   }
 
-  queue(decision: TriageDecision, dryRun: boolean): boolean {
+  queue(
+    decision: TriageDecision,
+    dryRun: boolean,
+    dependencyAdmission: DependencyAdmission = { blockers: [] },
+  ): boolean {
     const key = issueKey(decision.issue)
-    if (this.#inFlight.has(key) || this.#queued.has(key)) {
+    if (this.#inFlight.has(key)) {
       return false
     }
 
+    if (dependencyAdmission.blockers.length > 0 || (dependencyAdmission.cycle?.length ?? 0) > 0) {
+      return this.#park(decision, dryRun, dependencyAdmission)
+    }
+
+    this.#parked.delete(key)
+    if (this.#queued.has(key)) return false
+
     this.#queued.set(key, { issue: decision.issue, decision, dryRun })
     return true
+  }
+
+  clearPark(issue: IssueRef): void {
+    this.#parked.delete(issueKey(issue))
   }
 
   complete(issue: IssueRef): QueuedIssue | undefined {
@@ -118,6 +178,7 @@ export class BatchTracker {
       }
     }
     this.#inFlight.delete(key)
+    this.#parked.delete(key)
 
     if (!this.canStart()) {
       return undefined
@@ -141,6 +202,7 @@ export class BatchTracker {
     }
     this.#inFlight.delete(key)
     this.#queued.delete(key)
+    this.#parked.delete(key)
   }
 
   invocationIdFor(issue: IssueRef, spec: AgentSpec): string {
@@ -194,12 +256,36 @@ export class BatchTracker {
       result: record.result ? structuredClone(record.result) : undefined,
     }
     this.#inFlight.set(key, restored)
+    this.#parked.delete(key)
     for (const invocationId of restored.invocationIds) this.#invocationIds.add(invocationId)
     return restored
+  }
+
+  #park(decision: TriageDecision, dryRun: boolean, admission: DependencyAdmission): boolean {
+    const key = issueKey(decision.issue)
+    const existing = this.#parked.get(key)
+    const parked: ParkedIssue = {
+      issue: decision.issue,
+      decision,
+      dryRun,
+      blockers: admission.blockers.map((blocker) => ({ ...blocker })),
+      cycle: admission.cycle ? [...admission.cycle] : undefined,
+      capacityBlocked: !this.canStart(),
+    }
+    this.#queued.delete(key)
+    this.#parked.set(key, parked)
+    if (!existing) return true
+    return parkedSignature(existing) !== parkedSignature(parked)
   }
 }
 
 export const issueKey = (issue: IssueRef): string => `${issue.key}:${issue.uuid}:${issue.path}`
+
+const parkedSignature = (issue: ParkedIssue): string => JSON.stringify({
+  blockers: issue.blockers.map(({ identity, key }) => ({ identity, key })),
+  cycle: issue.cycle,
+  capacityBlocked: issue.capacityBlocked,
+})
 
 /**
  * Batch size limits active implementation work, not PR stewardship. Once each
