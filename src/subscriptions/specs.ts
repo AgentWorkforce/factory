@@ -1,5 +1,6 @@
 import { dedupeStrings, stringList } from './common'
 import { hasLinearPredicates, linearScopePredicates, type LinearScopePredicates } from './linear-filter'
+import type { SlackThreadScopePredicates } from './slack-filter'
 
 const SLACK_DM_EVENT_GLOBS = [
   '/slack/channels/D*/**',
@@ -46,6 +47,7 @@ export type SubscriptionSpec = {
   targets: DeliveryTargets
   allowHistoricalReplay: boolean
   linearPredicates?: LinearScopePredicates
+  slackThreadPredicates?: SlackThreadScopePredicates
 }
 
 function toRelayfileProvider(provider: string): string {
@@ -56,6 +58,18 @@ function toRelayfileProvider(provider: string): string {
 function isSlackProvider(provider: string): boolean {
   const normalized = toRelayfileProvider(provider)
   return normalized === 'slack' || normalized.startsWith('slack-')
+}
+
+function slackThreadScopePredicates(
+  integration: ConnectedIntegrationLike,
+  mountPaths: string[],
+): SlackThreadScopePredicates | undefined {
+  if (!isSlackProvider(integration.provider)) return undefined
+  const channelDirs = dedupeStrings(mountPaths.flatMap((path) => {
+    const match = path.match(/^\/slack\/channels\/([^/]+)/u)
+    return match?.[1] ? [match[1]] : []
+  }))
+  return channelDirs.length > 0 ? { channelDirs } : undefined
 }
 
 function isLinearProvider(provider: string): boolean {
@@ -233,6 +247,7 @@ export function subscriptionSpecsFor(
   return integrations.map((integration) => {
     const mountPaths = canonicalMountPaths(integration)
     const eventPathGlobs = eventPathGlobsForIntegration(integration)
+    const slackThreadPredicates = slackThreadScopePredicates(integration, mountPaths)
     return {
       integrationId: integration.integrationId,
       provider: integration.provider,
@@ -250,6 +265,7 @@ export function subscriptionSpecsFor(
       ...(isLinearProvider(integration.provider) && hasLinearPredicates(linearScopePredicates(integration.scope))
         ? { linearPredicates: linearScopePredicates(integration.scope) }
         : {}),
+      ...(slackThreadPredicates ? { slackThreadPredicates } : {}),
     }
   }).filter((spec) => spec.watches.length > 0)
 }

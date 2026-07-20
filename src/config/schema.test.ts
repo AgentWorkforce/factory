@@ -53,6 +53,7 @@ describe('FactoryConfigSchema', () => {
       botUserId: 'U0B2596R7EZ',
       stakeholderUserIds: [],
       staleAfterMs: 10 * 60_000,
+      conversationCoalesceMs: 750,
     })
     expect(parsed.mergePolicy).toBe('never')
     // No hardcoded state defaults: omitted stateIds resolve to {} and are filled
@@ -97,6 +98,17 @@ describe('FactoryConfigSchema', () => {
       implementer: 'gpt-5-codex',
       reviewer: 'claude-opus-4-1',
     })
+  })
+
+  it('bounds the Slack conversation coalescing window', () => {
+    expect(FactoryConfigSchema.parse({ repos: {}, slack: { channel: 'C123', conversationCoalesceMs: 0 } })
+      .slack?.conversationCoalesceMs).toBe(0)
+    expect(() => FactoryConfigSchema.parse({
+      repos: {}, slack: { channel: 'C123', conversationCoalesceMs: -1 },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {}, slack: { channel: 'C123', conversationCoalesceMs: 60_001 },
+    })).toThrow()
   })
 
   it('trims and validates an explicit reporting instance name', () => {
