@@ -7734,6 +7734,7 @@ export class FactoryLoop implements Factory {
       })
       this.#babysitterSpawned.add(babysitterKey)
       await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      await this.#retargetSlackConversationToBabysitter(record)
       return
     }
     // Reserve up-front so concurrent PR events in a drain don't double-spawn.
@@ -7813,6 +7814,7 @@ export class FactoryLoop implements Factory {
         agentName: tracked?.result?.name ?? spawned.name,
       })
       await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      await this.#retargetSlackConversationToBabysitter(record)
       await this.#writeInFlightRegistry()
       if (!await this.#saveDispatchLifecycle(record, 'running')) return
       this.#increment('babysittersSpawned')
@@ -8517,17 +8519,38 @@ export class FactoryLoop implements Factory {
     this.#recordSlackWritebackSuccess('dispatch-thread')
   }
 
+  // Once a PR is open, the babysitter is the one driving further conversation
+  // with the human — prefer it over the implementer that originally opened the
+  // Slack thread, matching the pre-conversation-resume routing that sent human
+  // replies to both roles once a PR existed.
+  #slackConversationOwnerCandidate(record: InFlightIssue): { name: string; tracked: TrackedAgent } | undefined {
+    const candidates = [...record.agents.entries()].map(([name, tracked]) => ({ name, tracked }))
+    return candidates.find(({ tracked }) => tracked.spec.role === 'babysitter' && Boolean(tracked.sessionRef))
+      ?? candidates.find(({ tracked }) => tracked.spec.role === 'implementer' && Boolean(tracked.sessionRef))
+  }
+
   async #ensureSlackConversationSession(record: InFlightIssue, threadId: string): Promise<void> {
     const conversationId = slackConversationId(threadId)
+    const owned = this.#slackConversationOwnerCandidate(record)
     const existing = await this.#state.getConversationSession(this.#workspaceId, conversationId)
     if (existing) {
+      const sessionRef = owned?.tracked.sessionRef
+      const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
+      if (owned && sessionRef && (agentName !== existing.agent.name || sessionRef !== existing.agent.sessionRef)) {
+        const rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
+          name: agentName!,
+          sessionRef,
+          node: owned.tracked.result?.node ?? owned.tracked.spec.node,
+          capability: owned.tracked.spec.capability,
+          repo: owned.tracked.spec.repo,
+          clonePath: owned.tracked.spec.clonePath,
+        })
+        if (rebound) this.#increment('slackConversationSessionsRebound')
+      }
       if (existing.pending.length > 0 || existing.delivery) this.#slackConversationTurns.schedule(conversationId)
       return
     }
 
-    const owned = [...record.agents.entries()]
-      .map(([name, tracked]) => ({ name, tracked }))
-      .find(({ tracked }) => tracked.spec.role === 'implementer' && Boolean(tracked.sessionRef))
     const sessionRef = owned?.tracked.sessionRef
     if (!owned || !sessionRef) {
       this.#increment('slackConversationSessionsSkippedMissingSession')
@@ -8554,6 +8577,17 @@ export class FactoryLoop implements Factory {
       pending: [],
     })
     if (reserved) this.#increment('slackConversationSessionsOwned')
+  }
+
+  // Called right after a babysitter is spawned/reattached for an issue's PR so
+  // an already-owned Slack conversation session (reserved earlier by the
+  // implementer) retargets onto the babysitter for the next turn, instead of
+  // resuming a session the babysitter has taken over from.
+  async #retargetSlackConversationToBabysitter(record: InFlightIssue): Promise<void> {
+    if (!this.#slack || !this.#config.slack) return
+    const threadId = await this.#persistedSlackThread(issueKey(record.issue))
+    if (!threadId) return
+    await this.#ensureSlackConversationSession(record, threadId)
   }
 
   async #resumeSlackConversationTurn(conversationId: string): Promise<void> {

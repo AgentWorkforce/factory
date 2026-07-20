@@ -304,6 +304,17 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).conversationSessions.delete(conversationId)
   }
 
+  async rebindConversationSession(
+    workspaceId: string,
+    conversationId: string,
+    agent: ConversationSessionState['agent'],
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session) return false
+    session.agent = structuredClone(agent)
+    return true
+  }
+
   async setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void> {
     this.#workspace(workspaceId).githubIssueCommentWatches.set(key, cloneGithubIssueCommentWatch(watch))
   }

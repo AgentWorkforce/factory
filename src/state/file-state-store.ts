@@ -734,6 +734,18 @@ export class FileStateStore extends InMemoryStateStore {
     }))
   }
 
+  override async rebindConversationSession(
+    workspaceId: string,
+    conversationId: string,
+    agent: ConversationSessionState['agent'],
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      session.agent = structuredClone(agent)
+      return true
+    })
+    return Boolean(result)
+  }
+
   async #mutateConversation(
     workspaceId: string,
     conversationId: string,

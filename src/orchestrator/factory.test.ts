@@ -14720,6 +14720,50 @@ describe('FactoryLoop PR babysitter', () => {
     expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-401'])
   })
 
+  it('retargets an owned Slack conversation session onto the babysitter once it takes over from the implementer', async () => {
+    const issue = realIssueFile(404, ready, { title: 'Real babysitter conversation handoff' })
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(404)]: issue })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-404-impl-pear', 'session-ar-404-impl-pear')
+    const slack = new RecordingSlack()
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const factory = createFactory(babysitterConfig({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 404 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(404), issue)))
+    await vi.waitFor(async () => expect(
+      (await stateStore.getConversationSession('factory-test', `slack:${slack.threadId}`))?.agent.name,
+    ).toBe('ar-404-impl-pear'))
+
+    // The implementer hands off to a babysitter once its PR is ready; the
+    // babysitter — not the exited implementer — should own the next turn of
+    // the same Slack conversation.
+    fleet.setSessionRef('ar-404-babysit', 'session-ar-404-babysit')
+    fleet.emitAgentExit('ar-404-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-404-babysit'))
+    await vi.waitFor(async () => expect(
+      (await stateStore.getConversationSession('factory-test', `slack:${slack.threadId}`))?.agent,
+    ).toMatchObject({ name: 'ar-404-babysit', sessionRef: 'session-ar-404-babysit' }))
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-1'), 'slack-human-1', {
+      text: 'How is the PR looking?',
+      user: 'U123',
+      user_name: 'human',
+      user_is_bot: false,
+    })
+    await expectSlackConversationResume(fleet, ['How is the PR looking?'])
+    expect(fleet.resumes[0]).toMatchObject({
+      name: 'ar-404-babysit',
+      sessionRef: 'session-ar-404-babysit',
+    })
+  })
+
   it('does not attach a numeric GitHub issue to a merged PR whose body only contains a test count', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 52)
     const issueFile = githubIssueFile(52, {

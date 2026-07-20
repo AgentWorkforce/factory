@@ -275,6 +275,12 @@ export interface StateStore {
   completeConversationTurn(workspaceId: string, conversationId: string, owner: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
   releaseConversationTurn(workspaceId: string, conversationId: string, owner: string): Promise<void>
   clearConversationSession(workspaceId: string, conversationId: string): Promise<void>
+  /**
+   * Retarget a durable conversation session onto a different owning agent (e.g.
+   * once a babysitter takes over an issue whose Slack thread was reserved by the
+   * implementer) without disturbing accumulated history/pending turns.
+   */
+  rebindConversationSession(workspaceId: string, conversationId: string, agent: ConversationSessionState['agent']): Promise<boolean>
 
   setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
   listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>
