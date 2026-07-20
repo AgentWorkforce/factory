@@ -27,7 +27,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { AgentWorktree, AgentWorktreeManager, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -1365,6 +1365,8 @@ class CloudWritebackFakeMountClient extends FakeMountClient {
 class RecordingWorktreeManager implements AgentWorktreeManager {
   readonly prepared: AgentWorktree[] = []
   readonly cleaned: AgentWorktree[] = []
+  readonly listed: AgentWorktree[] = []
+  readonly inspections = new Map<string, AgentWorktreeCleanupInspection>()
   cleanupAttempts = 0
   failCleanups = 0
   onCleanup?: () => void
@@ -1381,6 +1383,17 @@ class RecordingWorktreeManager implements AgentWorktreeManager {
       throw new Error('transient worktree cleanup failure')
     }
     this.cleaned.push(structuredClone(worktree))
+  }
+
+  async listWorktrees(repository: AgentWorktreeRepository): Promise<AgentWorktree[]> {
+    return this.listed
+      .filter((worktree) =>
+        worktree.repo === repository.repo && worktree.baseClonePath === repository.baseClonePath)
+      .map((worktree) => structuredClone(worktree))
+  }
+
+  async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
+    return structuredClone(this.inspections.get(worktree.worktreePath) ?? { bytes: 0, retentionReasons: [] })
   }
 }
 
@@ -14805,6 +14818,119 @@ describe('FactoryLoop PR babysitter', () => {
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([3])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('removes every clean worktree run for an issue when completion is fenced', async () => {
+    const issue = realIssueFile(412, ready, { title: 'Real multi-run worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(412)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 412, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 412 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(412), issue)))
+    const current = worktrees.prepared[0]
+    expect(current).toBeDefined()
+    const priorRun: AgentWorktree = {
+      ...current!,
+      worktreePath: '/work/.factory-worktrees/pear/ar-412-pear-11111111',
+      branch: 'factory/ar-412-pear-11111111',
+    }
+    worktrees.listed.push(priorRun)
+    fleet.emitAgentExit('ar-412-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-412-babysit'))
+    fleet.emitAgentMessage({ from: 'ar-412-babysit', target: 'factory', body: '[factory-pr-ready] AR-412' })
+
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+    expect(new Set(worktrees.cleaned.map((worktree) => worktree.worktreePath))).toEqual(new Set([
+      current!.worktreePath,
+      priorRun.worktreePath,
+    ]))
+    expect(factory.status().counters.agentWorktreesCleaned).toBe(2)
+  })
+
+  it('retains and logs a dirty extra run while removing clean completion worktrees', async () => {
+    const issue = realIssueFile(413, ready, { title: 'Real dirty multi-run worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(413)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 413, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      logger,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 413 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(413), issue)))
+    const current = worktrees.prepared[0]
+    expect(current).toBeDefined()
+    const dirtyRun: AgentWorktree = {
+      ...current!,
+      worktreePath: '/work/.factory-worktrees/pear/ar-413-pear-22222222',
+      branch: 'factory/ar-413-pear-22222222',
+    }
+    worktrees.listed.push(dirtyRun)
+    worktrees.inspections.set(dirtyRun.worktreePath, { bytes: 512, retentionReasons: ['uncommitted changes'] })
+    fleet.emitAgentExit('ar-413-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-413-babysit'))
+    fleet.emitAgentMessage({ from: 'ar-413-babysit', target: 'factory', body: '[factory-pr-ready] AR-413' })
+
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+    expect(worktrees.cleaned.map((worktree) => worktree.worktreePath)).toEqual([current!.worktreePath])
+    expect(factory.status().counters.agentWorktreeCleanupRetained).toBe(1)
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[factory] retained completed issue worktree with local state',
+      expect.objectContaining({ worktreePath: dirtyRun.worktreePath, retentionReasons: ['uncommitted changes'] }),
+    )
+  })
+
+  it('reaps clean startup orphans and retains dirty ones with a reclaimed-size summary', async () => {
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const clean: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: 'ar-900',
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-900-pear-11111111',
+      branch: 'factory/ar-900-pear-11111111',
+    }
+    const dirty: AgentWorktree = {
+      ...clean,
+      issueKey: 'ar-901',
+      worktreePath: '/work/.factory-worktrees/pear/ar-901-pear-22222222',
+      branch: 'factory/ar-901-pear-22222222',
+    }
+    worktrees.listed.push(clean, dirty)
+    worktrees.inspections.set(clean.worktreePath, { bytes: 4096, retentionReasons: [] })
+    worktrees.inspections.set(dirty.worktreePath, { bytes: 1024, retentionReasons: ['uncommitted changes'] })
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config(), { mount, fleet, logger, worktrees, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(worktrees.cleaned.map((worktree) => worktree.worktreePath)).toEqual([clean.worktreePath])
+    expect(factory.status().counters.agentWorktreesReapedOnStartup).toBe(1)
+    expect(factory.status().counters.agentWorktreesCleaned).toBe(1)
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[factory] retained startup orphan worktree with local state',
+      expect.objectContaining({ worktreePath: dirty.worktreePath, retentionReasons: ['uncommitted changes'] }),
+    )
+    expect(logger.info).toHaveBeenCalledWith(
+      '[factory] startup worktree reaper completed',
+      { reaped: 1, reclaimedBytes: 4096, reclaimed: '4.00 KiB', retained: 1, failures: 0 },
+    )
+    await factory.stop()
   })
 
   it('releases failed-dispatch agents before cleaning their isolated worktree', async () => {
