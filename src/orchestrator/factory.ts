@@ -2786,7 +2786,15 @@ export class FactoryLoop implements Factory {
       const winner = active[0] ?? [...group].sort(compareQueuedGithubLifecycleAliases)[0]!
       for (const [key, lifecycle] of group) {
         if (key === winner[0] || lifecycle.phase !== 'queued') continue
-        await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
+        const cleared = await this.#state.clearQueuedDispatchLifecycle(
+          this.#workspaceId,
+          key,
+          lifecycle.lease,
+        )
+        if (!cleared) {
+          this.#increment('dispatchLifecycleGithubAliasDedupeDeferred')
+          continue
+        }
         this.#dispatchLifecycleEpochs.delete(key)
         const timer = this.#dispatchLifecycleRetryTimers.get(key)
         if (timer) clearTimeout(timer)

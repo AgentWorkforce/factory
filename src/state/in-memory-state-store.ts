@@ -174,6 +174,20 @@ export class InMemoryStateStore implements StateStore {
       .map(([key, lifecycle]) => [key, cloneDispatchLifecycle(lifecycle)])
   }
 
+  async clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycle['lease'],
+  ): Promise<boolean> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    const lifecycle = lifecycles.get(key)
+    if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+      return false
+    }
+    lifecycles.delete(key)
+    return true
+  }
+
   async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
     this.#workspace(workspaceId).dispatchLifecycles.delete(key)
   }
@@ -647,6 +661,13 @@ export class InMemoryStateStore implements StateStore {
 }
 
 const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)
+
+const dispatchLifecycleLeaseMatches = (
+  current: DispatchLifecycle['lease'],
+  expected: DispatchLifecycle['lease'],
+): boolean => current === undefined
+  ? expected === undefined
+  : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
 
 const CONVERSATION_HISTORY_LIMIT = 50
 
