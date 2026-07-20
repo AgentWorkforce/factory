@@ -665,6 +665,7 @@ export class FileStateStore extends InMemoryStateStore {
   ): Promise<ConversationSessionState | undefined> {
     return await this.#mutateConversation(workspaceId, conversationId, (session) => {
       if (conversationHasMessage(session, message.id)) return false
+      session.processedMessageIds.push(message.id)
       session.pending.push(structuredClone(message))
       return true
     })
@@ -674,6 +675,7 @@ export class FileStateStore extends InMemoryStateStore {
     workspaceId: string,
     conversationId: string,
     owner: string,
+    claimId: string,
     nowMs: number,
     leaseMs: number,
   ): Promise<ConversationSessionState | undefined> {
@@ -683,41 +685,69 @@ export class FileStateStore extends InMemoryStateStore {
       }
       const attempts = session.delivery?.attempts ?? 0
       if (session.delivery) session.pending.unshift(...session.delivery.messages)
+      session.pending.sort(compareConversationMessages)
       if (session.pending.length === 0) {
         session.delivery = undefined
         return false
       }
       session.delivery = {
+        claimId,
         owner,
         claimedAtMs: nowMs,
         attempts: attempts + 1,
         messages: session.pending.splice(0),
+        agent: {
+          name: session.agent.name,
+          sessionRef: session.agent.sessionRef,
+        },
       }
       return true
     })
+  }
+
+  override async renewConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    owner: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (!session.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
+      session.delivery.claimedAtMs = nowMs
+      return true
+    })
+    return Boolean(result)
   }
 
   override async completeConversationTurn(
     workspaceId: string,
     conversationId: string,
     owner: string,
+    claimId: string,
     agent: { name: string; sessionRef?: string },
   ): Promise<boolean> {
     const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
-      if (!session.delivery || session.delivery.owner !== owner) return false
+      if (!session.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
       session.history = [...session.history, ...session.delivery.messages].slice(-CONVERSATION_HISTORY_LIMIT)
-      session.agent.name = agent.name
-      if (agent.sessionRef) session.agent.sessionRef = agent.sessionRef
+      if (
+        session.agent.name === session.delivery.agent.name &&
+        session.agent.sessionRef === session.delivery.agent.sessionRef
+      ) {
+        session.agent.name = agent.name
+        if (agent.sessionRef) session.agent.sessionRef = agent.sessionRef
+      }
       session.delivery = undefined
       return true
     })
     return Boolean(result)
   }
 
-  override async releaseConversationTurn(workspaceId: string, conversationId: string, owner: string): Promise<void> {
+  override async releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void> {
     await this.#mutateConversation(workspaceId, conversationId, (session) => {
-      if (!session.delivery || session.delivery.owner !== owner) return false
+      if (!session.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
       session.pending.unshift(...session.delivery.messages)
+      session.pending.sort(compareConversationMessages)
       session.delivery = undefined
       return true
     })
@@ -902,9 +932,14 @@ const cloneConversationSession = (session: ConversationSessionState): Conversati
 const CONVERSATION_HISTORY_LIMIT = 50
 
 const conversationHasMessage = (session: ConversationSessionState, id: string): boolean =>
+  session.processedMessageIds.includes(id) ||
   session.history.some((message) => message.id === id) ||
   session.pending.some((message) => message.id === id) ||
   Boolean(session.delivery?.messages.some((message) => message.id === id))
+
+const compareConversationMessages = (left: ConversationMessage, right: ConversationMessage): number =>
+  left.receivedAtMs - right.receivedAtMs ||
+  (left.providerSequence ?? left.id).localeCompare(right.providerSequence ?? right.id, undefined, { numeric: true })
 
 const parseConversationSessions = (
   value: Record<string, unknown>,
@@ -916,17 +951,31 @@ const parseConversationSessions = (
     }
     const issue = candidate.issue
     const agent = candidate.agent
+    const delivery = candidate.delivery
     if (
       typeof issue.uuid !== 'string' || typeof issue.key !== 'string' || typeof issue.path !== 'string' ||
       typeof candidate.provider !== 'string' || typeof candidate.externalId !== 'string' ||
       !Object.values(candidate.context).every((value) => typeof value === 'string') ||
       typeof agent.name !== 'string' || typeof agent.sessionRef !== 'string' ||
       !validConversationMessages(candidate.history) || !validConversationMessages(candidate.pending) ||
-      (candidate.delivery !== undefined && !validConversationDelivery(candidate.delivery))
+      (candidate.processedMessageIds !== undefined && !validConversationMessageIds(candidate.processedMessageIds)) ||
+      (delivery !== undefined && !validConversationDelivery(delivery) && !validLegacyConversationDelivery(delivery))
     ) {
       throw new Error('Factory GitHub watch state file is invalid')
     }
-    sessions[conversationId] = structuredClone(candidate) as ConversationSessionState
+    const session = structuredClone(candidate) as unknown as ConversationSessionState
+    if (delivery !== undefined && validLegacyConversationDelivery(delivery)) {
+      session.pending = [...structuredClone(delivery.messages), ...session.pending]
+      delete session.delivery
+    }
+    session.processedMessageIds = candidate.processedMessageIds === undefined
+      ? [...new Set([
+          ...session.history,
+          ...session.pending,
+          ...(session.delivery?.messages ?? []),
+        ].map((message) => message.id))]
+      : [...candidate.processedMessageIds as string[]]
+    sessions[conversationId] = session
   }
   return sessions
 }
@@ -935,11 +984,26 @@ const validConversationMessages = (value: unknown): value is ConversationMessage
   Array.isArray(value) && value.every((message) => isRecord(message) &&
     typeof message.id === 'string' && typeof message.text === 'string' &&
     typeof message.receivedAtMs === 'number' &&
+    (message.providerSequence === undefined || typeof message.providerSequence === 'string') &&
     (message.author === undefined || typeof message.author === 'string'))
 
 const validConversationDelivery = (value: unknown): boolean => isRecord(value) &&
+  typeof value.claimId === 'string' && typeof value.owner === 'string' &&
+  typeof value.claimedAtMs === 'number' && typeof value.attempts === 'number' &&
+  validConversationMessages(value.messages) && isRecord(value.agent) &&
+  typeof value.agent.name === 'string' && typeof value.agent.sessionRef === 'string'
+
+const validLegacyConversationDelivery = (value: unknown): value is {
+  owner: string
+  claimedAtMs: number
+  attempts: number
+  messages: ConversationMessage[]
+} => isRecord(value) && value.claimId === undefined && value.agent === undefined &&
   typeof value.owner === 'string' && typeof value.claimedAtMs === 'number' &&
   typeof value.attempts === 'number' && validConversationMessages(value.messages)
+
+const validConversationMessageIds = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((id) => typeof id === 'string')
 
 const parseBabysitterSessions = (value: Record<string, unknown>): Record<string, BabysitterSessionState> => {
   const sessions: Record<string, BabysitterSessionState> = {}

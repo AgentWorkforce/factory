@@ -36,6 +36,7 @@ import { FileStateStore } from '../state/file-state-store'
 import { githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import type { ConversationMessage, ConversationSessionState } from '../ports/state'
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
@@ -418,6 +419,22 @@ class FailingSlackAnswerFleetClient extends FakeFleetClient {
       throw new Error('resume failed')
     }
     return await super.resume(input)
+  }
+}
+
+class FailOnceConversationAppendStateStore extends InMemoryStateStore {
+  failuresRemaining = 1
+
+  override async appendConversationMessage(
+    workspaceId: string,
+    conversationId: string,
+    message: ConversationMessage,
+  ): Promise<ConversationSessionState | undefined> {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1
+      throw new Error('transient conversation state failure')
+    }
+    return await super.appendConversationMessage(workspaceId, conversationId, message)
   }
 }
 
@@ -12196,6 +12213,56 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toHaveLength(2)
   })
 
+  it('defers rapid clarification follow-ups until the clarification resume has rebound the session', async () => {
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(46)]: issueFile(46) })
+    const fleet = new BlockingFirstClarificationResumeFleetClient()
+    fleet.setSessionRef('ar-46-impl-pear', 'session-ar-46-impl-pear')
+    fleet.setSessionRef('ar-46-review', 'session-ar-46-review')
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(46), issueFile(46))))
+    mount.files.set(issuePath(46), { content: issueFile(46, implementing) })
+    fleet.emitAgentMessage({
+      from: 'ar-46-impl-pear',
+      target: 'factory',
+      body: '[factory-needs-input] Which retry policy?',
+      eventId: 'agent-question-46',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-46'), 'human-answer-46', {
+      text: 'Use bounded exponential backoff.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+    await fleet.resumeStarted
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-followup-46'), 'human-followup-46', {
+      text: 'Also preserve the attempt count.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 850))
+    expect(slackConversationResumes(fleet)).toEqual([])
+    await expect(stateStore.getConversationSession('factory-test', `slack:${mount.threadTs}`)).resolves.toMatchObject({
+      pending: [expect.objectContaining({ text: 'Also preserve the attempt count.' })],
+    })
+
+    fleet.releaseResume()
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    await expectSlackConversationResume(fleet, ['Also preserve the attempt count.'])
+    expect(slackConversationResumes(fleet)[0]).toMatchObject({
+      name: 'ar-46-impl-pear',
+      sessionRef: 'session-ar-46-impl-pear',
+    })
+  })
+
   it('parks an immediately exiting team and retries a failed durable question delivery after restart', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-question-delivery-retry-'))
     try {
@@ -14041,7 +14108,7 @@ describe('FactoryLoop', () => {
     await restarted.stop()
   })
 
-  it('restores durable Slack thread ownership and resumes the same session after a daemon restart', async () => {
+  it('restores durable Slack ownership and replays a reply posted while the daemon was down', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-slack-conversation-restart-'))
     const watchStatePath = join(root, 'factory-state.json')
     const mount = new CloudWritebackFakeMountClient({ [issuePath(130)]: issueFile(130) })
@@ -14072,6 +14139,17 @@ describe('FactoryLoop', () => {
       ])
       await first.stop()
 
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e',
+        firstSlack.threadId,
+        'human-during-daemon-restart',
+      ), 'slack-human-during-daemon-restart', {
+        text: 'Please continue from the same session after restart.',
+        user: 'U130',
+        user_name: 'human',
+        user_is_bot: false,
+      })
+
       const restartedFleet = new RemoteLifecycleFleetClient()
       restarted = createFactory(factoryConfig, {
         mount,
@@ -14083,16 +14161,6 @@ describe('FactoryLoop', () => {
       await restarted.start({ mode: 'dispatch-owner' })
       expect(restarted.status().counters.slackWatchersRearmed).toBe(1)
 
-      emitSlackReply(mount, slackReplyFixturePath(
-        'C0FACTORY__factory-e2e',
-        firstSlack.threadId,
-        'human-after-daemon-restart',
-      ), 'slack-human-after-daemon-restart', {
-        text: 'Please continue from the same session after restart.',
-        user: 'U130',
-        user_name: 'human',
-        user_is_bot: false,
-      })
       await expectSlackConversationResume(restartedFleet, [
         'Please continue from the same session after restart.',
       ])
@@ -14152,6 +14220,32 @@ describe('FactoryLoop', () => {
     mount.emit(changeEvent(replyPath, 'slack-duplicate-human'))
     await expectSlackConversationResume(fleet, ['status?'])
     expect(slackReplyWrites(mount)).toEqual([])
+  })
+
+  it('retries a Slack reply after transient durable routing failure', async () => {
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(29)]: issueFile(29) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-29-impl-pear', 'session-ar-29-impl-pear')
+    const slack = new RecordingSlack()
+    const stateStore = new FailOnceConversationAppendStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      slack,
+      stateStore,
+    })
+    const replyPath = slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-retry')
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(29), issueFile(29))))
+    emitSlackReply(mount, replyPath, 'slack-human-retry', {
+      text: 'Please retry this turn.',
+      user: 'U123',
+      user_is_bot: false,
+    })
+
+    await expectSlackConversationResume(fleet, ['Please retry this turn.'])
+    expect(stateStore.failuresRemaining).toBe(0)
   })
 
   it('dedupes Slack conversation turns by human message ts across poll re-reads with fresh event ids', async () => {

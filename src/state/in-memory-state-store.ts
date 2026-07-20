@@ -246,6 +246,7 @@ export class InMemoryStateStore implements StateStore {
   ): Promise<ConversationSessionState | undefined> {
     const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
     if (!session || conversationHasMessage(session, message.id)) return undefined
+    session.processedMessageIds.push(message.id)
     session.pending.push(structuredClone(message))
     return cloneConversationSession(session)
   }
@@ -254,6 +255,7 @@ export class InMemoryStateStore implements StateStore {
     workspaceId: string,
     conversationId: string,
     owner: string,
+    claimId: string,
     nowMs: number,
     leaseMs: number,
   ): Promise<ConversationSessionState | undefined> {
@@ -265,38 +267,64 @@ export class InMemoryStateStore implements StateStore {
     if (session.delivery) {
       session.pending.unshift(...session.delivery.messages)
     }
+    session.pending.sort(compareConversationMessages)
     if (session.pending.length === 0) {
       session.delivery = undefined
       return undefined
     }
     session.delivery = {
+      claimId,
       owner,
       claimedAtMs: nowMs,
       attempts: (session.delivery?.attempts ?? 0) + 1,
       messages: session.pending.splice(0),
+      agent: {
+        name: session.agent.name,
+        sessionRef: session.agent.sessionRef,
+      },
     }
     return cloneConversationSession(session)
+  }
+
+  async renewConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    owner: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const delivery = this.#workspace(workspaceId).conversationSessions.get(conversationId)?.delivery
+    if (!delivery || delivery.owner !== owner || delivery.claimId !== claimId) return false
+    delivery.claimedAtMs = nowMs
+    return true
   }
 
   async completeConversationTurn(
     workspaceId: string,
     conversationId: string,
     owner: string,
+    claimId: string,
     agent: { name: string; sessionRef?: string },
   ): Promise<boolean> {
     const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
-    if (!session?.delivery || session.delivery.owner !== owner) return false
+    if (!session?.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
     session.history = [...session.history, ...session.delivery.messages].slice(-CONVERSATION_HISTORY_LIMIT)
-    session.agent.name = agent.name
-    if (agent.sessionRef) session.agent.sessionRef = agent.sessionRef
+    if (
+      session.agent.name === session.delivery.agent.name &&
+      session.agent.sessionRef === session.delivery.agent.sessionRef
+    ) {
+      session.agent.name = agent.name
+      if (agent.sessionRef) session.agent.sessionRef = agent.sessionRef
+    }
     session.delivery = undefined
     return true
   }
 
-  async releaseConversationTurn(workspaceId: string, conversationId: string, owner: string): Promise<void> {
+  async releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void> {
     const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
-    if (!session?.delivery || session.delivery.owner !== owner) return
+    if (!session?.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return
     session.pending.unshift(...session.delivery.messages)
+    session.pending.sort(compareConversationMessages)
     session.delivery = undefined
   }
 
@@ -625,9 +653,14 @@ const cloneConversationSession = (session: ConversationSessionState): Conversati
   structuredClone(session)
 
 const conversationHasMessage = (session: ConversationSessionState, id: string): boolean =>
+  session.processedMessageIds.includes(id) ||
   session.history.some((message) => message.id === id) ||
   session.pending.some((message) => message.id === id) ||
   Boolean(session.delivery?.messages.some((message) => message.id === id))
+
+const compareConversationMessages = (left: ConversationMessage, right: ConversationMessage): number =>
+  left.receivedAtMs - right.receivedAtMs ||
+  (left.providerSequence ?? left.id).localeCompare(right.providerSequence ?? right.id, undefined, { numeric: true })
 
 const activeDispatchLifecycleCount = (lifecycles: Map<string, DispatchLifecycle>, exceptKey?: string): number =>
   [...lifecycles].filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length

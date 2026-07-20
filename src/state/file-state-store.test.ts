@@ -99,6 +99,7 @@ describe('FileStateStore', () => {
           repo: 'AgentWorkforce/factory',
         },
         history: [],
+        processedMessageIds: [],
         pending: [],
       }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
@@ -117,11 +118,16 @@ describe('FileStateStore', () => {
         id: '1780751613.000002', text: 'And one more.', receivedAtMs: 1_001, author: 'U123',
       })
 
-      const claimed = await restarted.claimConversationTurn('workspace-1', conversationId, 'owner-a', 2_000, 60_000)
+      const claimed = await restarted.claimConversationTurn(
+        'workspace-1', conversationId, 'owner-a', 'claim-a', 2_000, 60_000,
+      )
       expect(claimed?.delivery?.messages.map((message) => message.text)).toEqual(['First thought.', 'And one more.'])
-      expect(await first.claimConversationTurn('workspace-1', conversationId, 'owner-b', 2_001, 60_000))
+      expect(await first.claimConversationTurn('workspace-1', conversationId, 'owner-b', 'claim-b', 2_001, 60_000))
         .toBeUndefined()
-      expect(await restarted.completeConversationTurn('workspace-1', conversationId, 'owner-a', {
+      expect(await restarted.renewConversationTurn(
+        'workspace-1', conversationId, 'owner-a', 'claim-a', 2_002,
+      )).toBe(true)
+      expect(await restarted.completeConversationTurn('workspace-1', conversationId, 'owner-a', 'claim-a', {
         name: 'ar-130-impl-factory', sessionRef: 'session-ar-130-turn-2',
       })).toBe(true)
 
@@ -131,6 +137,93 @@ describe('FileStateStore', () => {
         history: [{ id: '1780751613.000001' }, { id: '1780751613.000002' }],
         pending: [],
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fences stale claim completion and preserves a conversation owner rebound during resume', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-fencing-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      const conversationId = 'slack:1780751612.176219'
+      await store.reserveConversationSession('workspace-1', conversationId, {
+        provider: 'slack',
+        issue: { uuid: 'uuid-130', key: 'AR-130', path: '/linear/issues/AR-130__uuid-130.json' },
+        externalId: '1780751612.176219',
+        context: { channelDir: 'C0FACTORY__factory-e2e' },
+        agent: { name: 'ar-130-impl-factory', sessionRef: 'session-impl' },
+        history: [],
+        processedMessageIds: [],
+        pending: [],
+      })
+      await store.appendConversationMessage('workspace-1', conversationId, {
+        id: 'message-1', text: 'How is it going?', receivedAtMs: 1_000,
+      })
+      await store.claimConversationTurn(
+        'workspace-1', conversationId, 'owner-a', 'claim-a', 2_000, 60_000,
+      )
+      await store.rebindConversationSession('workspace-1', conversationId, {
+        name: 'ar-130-babysit-factory', sessionRef: 'session-babysitter',
+      })
+
+      expect(await store.completeConversationTurn('workspace-1', conversationId, 'owner-a', 'stale-claim', {
+        name: 'ar-130-impl-factory', sessionRef: 'session-impl-rotated',
+      })).toBe(false)
+      expect(await store.completeConversationTurn('workspace-1', conversationId, 'owner-a', 'claim-a', {
+        name: 'ar-130-impl-factory', sessionRef: 'session-impl-rotated',
+      })).toBe(true)
+      expect(await store.getConversationSession('workspace-1', conversationId)).toMatchObject({
+        agent: { name: 'ar-130-babysit-factory', sessionRef: 'session-babysitter' },
+        history: [{ id: 'message-1' }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a legacy v3 in-flight conversation claim by requeueing its messages', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-v3-migration-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const conversationId = 'slack:1780751612.176219'
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 3,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            babysitterSessions: {},
+            dispatchLifecycles: {},
+            conversationSessions: {
+              [conversationId]: {
+                provider: 'slack',
+                issue: { uuid: 'uuid-130', key: 'AR-130', path: '/linear/issues/AR-130__uuid-130.json' },
+                externalId: '1780751612.176219',
+                context: { channelDir: 'C0FACTORY__factory-e2e' },
+                agent: { name: 'ar-130-impl-factory', sessionRef: 'session-impl' },
+                history: [],
+                pending: [],
+                delivery: {
+                  owner: 'legacy-owner',
+                  claimedAtMs: 1_000,
+                  attempts: 1,
+                  messages: [{ id: 'message-1', text: 'Do not lose me.', receivedAtMs: 900 }],
+                },
+              },
+            },
+          },
+        },
+      }))
+
+      const restored = await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getConversationSession('workspace-1', conversationId)
+      expect(restored).toMatchObject({
+        processedMessageIds: ['message-1'],
+        pending: [{ id: 'message-1', text: 'Do not lose me.' }],
+      })
+      expect(restored?.delivery).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }

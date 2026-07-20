@@ -75,6 +75,8 @@ export type ConversationMessage = {
   id: string
   text: string
   receivedAtMs: number
+  /** Provider-native ordering identity (Slack message ts, Telegram update id, etc.). */
+  providerSequence?: string
   author?: string
 }
 
@@ -95,14 +97,19 @@ export type ConversationSessionState = {
   }
   /** Previously delivered human turns, retained as bounded resume context. */
   history: ConversationMessage[]
+  /** Durable dedupe ledger; unlike rendered history, this is never context-trimmed. */
+  processedMessageIds: string[]
   /** New replies waiting for the short coalescing window. */
   pending: ConversationMessage[]
   /** Claimed batch; new arrivals remain in pending while this resume runs. */
   delivery?: {
+    claimId: string
     owner: string
     claimedAtMs: number
     attempts: number
     messages: ConversationMessage[]
+    /** Binding captured at claim time so a later handoff cannot be overwritten. */
+    agent: Pick<ConversationSessionState['agent'], 'name' | 'sessionRef'>
   }
 }
 
@@ -271,9 +278,10 @@ export interface StateStore {
   getConversationSession(workspaceId: string, conversationId: string): Promise<ConversationSessionState | undefined>
   listConversationSessions(workspaceId: string): Promise<Array<[string, ConversationSessionState]>>
   appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
-  claimConversationTurn(workspaceId: string, conversationId: string, owner: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
-  completeConversationTurn(workspaceId: string, conversationId: string, owner: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
-  releaseConversationTurn(workspaceId: string, conversationId: string, owner: string): Promise<void>
+  claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
+  renewConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number): Promise<boolean>
+  completeConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
+  releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void>
   clearConversationSession(workspaceId: string, conversationId: string): Promise<void>
   /**
    * Retarget a durable conversation session onto a different owning agent (e.g.
