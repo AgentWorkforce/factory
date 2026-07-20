@@ -23,3 +23,8 @@ export {
 export type {
   GhCliGithubWritebackConfig,
 } from './github'
+export {
+  FACTORY_MOUNT_HEALTH_PATH,
+  publishFactoryMountHealth,
+} from './mount-health'
+export type { FactoryMountHealthRecord } from './mount-health'
