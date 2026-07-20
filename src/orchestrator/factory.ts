@@ -330,6 +330,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
+  readonly #githubIssueCommentReplays = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
@@ -2523,7 +2524,11 @@ export class FactoryLoop implements Factory {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
       let hasNonterminalDurableLifecycle = false
-      for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      const durableLifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+      this.#logger.info?.('[factory] durable startup adoption loaded', {
+        lifecycles: durableLifecycles.length,
+      })
+      for (const [key, lifecycle] of durableLifecycles) {
         if (isTerminalDispatchLifecycle(lifecycle)) continue
         hasNonterminalDurableLifecycle = true
         const claim = await this.#state.claimDispatchLifecycle(
@@ -2579,12 +2584,19 @@ export class FactoryLoop implements Factory {
       this.#scheduleDispatchLifecycleRenewal()
       if (this.#fleet.hydrateTracked) {
         this.#startupAgentAdoptionActive = false
+        this.#logger.info?.('[factory] durable startup roster reconciliation started', {
+          agents: agents.map((agent) => agent.name),
+        })
         await this.#fleet.reconcileTrackedAgents?.()
+        this.#logger.info?.('[factory] durable startup roster reconciliation completed', {
+          pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => agents.some((agent) => agent.name === name)),
+        })
         // Fleet callbacks are intentionally synchronous at the port boundary,
         // but recovery work is asynchronous (issue reads, worktree restore,
         // PR publication). Finish exits discovered by the startup reconcile
         // before the full ready-issue backfill can monopolize mount I/O.
         await this.#drainAgentExitsInFlight(new Set(agents.map((agent) => agent.name)))
+        this.#logger.info?.('[factory] durable startup reconciled exits drained')
       }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
@@ -6272,6 +6284,18 @@ export class FactoryLoop implements Factory {
   }
 
   async #replayGithubIssueComments(key: string): Promise<void> {
+    const active = this.#githubIssueCommentReplays.get(key)
+    if (active) return await active
+    const replay = this.#runGithubIssueCommentReplay(key).finally(() => {
+      if (this.#githubIssueCommentReplays.get(key) === replay) {
+        this.#githubIssueCommentReplays.delete(key)
+      }
+    })
+    this.#githubIssueCommentReplays.set(key, replay)
+    return await replay
+  }
+
+  async #runGithubIssueCommentReplay(key: string): Promise<void> {
     const watch = this.#githubIssueCommentWatchStates.get(key)
     if (!watch) return
     const comments: Array<{ path: string; id: number }> = []
