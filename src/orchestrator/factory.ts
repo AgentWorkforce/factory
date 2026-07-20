@@ -271,6 +271,7 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
+const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
@@ -285,6 +286,8 @@ const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
+
+class DispatchLifecycleCapacityError extends Error {}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -318,6 +321,7 @@ export class FactoryLoop implements Factory {
   readonly #terminationGraceMs: number | undefined
   readonly #babysitterWakeUnreachableEscalateMs: number
   readonly #babysitterWakeUnreachableRetryMs: number
+  readonly #startupAgentExitDrainTimeoutMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -364,6 +368,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -475,6 +480,7 @@ export class FactoryLoop implements Factory {
     this.#terminationGraceMs = ports.terminationGraceMs
     this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
+    this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -2609,22 +2615,51 @@ export class FactoryLoop implements Factory {
         // but recovery work is asynchronous (issue reads, worktree restore,
         // PR publication). Finish exits discovered by the startup reconcile
         // before the full ready-issue backfill can monopolize mount I/O.
-        await this.#drainAgentExitsInFlight(new Set(agents.map((agent) => agent.name)))
-        this.#logger.info?.('[factory] durable startup reconciled exits drained')
+        const exitNames = new Set(agents.map((agent) => agent.name))
+        const drained = await this.#drainAgentExitsInFlight(
+          exitNames,
+          this.#startMode === 'live' ? this.#startupAgentExitDrainTimeoutMs : undefined,
+        )
+        if (drained) {
+          this.#logger.info?.('[factory] durable startup reconciled exits drained')
+        } else {
+          this.#increment('startupAgentExitDrainTimeouts')
+          this.#logger.warn?.('[factory] startup agent exit reconciliation is still running; continuing ready-issue discovery', {
+            timeoutMs: this.#startupAgentExitDrainTimeoutMs,
+            pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => exitNames.has(name)),
+          })
+        }
       }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
   }
 
-  async #drainAgentExitsInFlight(names?: ReadonlySet<string>): Promise<void> {
-    for (;;) {
-      const pending = [...this.#agentExitsInFlight]
-        .filter(([name]) => !names || names.has(name))
-        .map(([, handling]) => handling)
-      if (pending.length === 0) return
-      await Promise.allSettled(pending)
+  async #drainAgentExitsInFlight(names?: ReadonlySet<string>, timeoutMs?: number): Promise<boolean> {
+    const drain = async (): Promise<void> => {
+      for (;;) {
+        const pending = [...this.#agentExitsInFlight]
+          .filter(([name]) => !names || names.has(name))
+          .map(([, handling]) => handling)
+        if (pending.length === 0) return
+        await Promise.allSettled(pending)
+      }
     }
+    if (timeoutMs === undefined) {
+      await drain()
+      return true
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const completed = await Promise.race([
+      drain().then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs))
+        timer.unref?.()
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    return completed
   }
 
   #scheduleDispatchLifecycleRenewal(): void {
@@ -2880,11 +2915,26 @@ export class FactoryLoop implements Factory {
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
       const drive = this.#driveDispatchLifecycle(key)
+        .then(() => {
+          this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+        })
         .catch((error) => {
-          this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
-            issue: record.issue.key,
-            error: describeError(error).errorMessage,
-          })
+          if (error instanceof DispatchLifecycleCapacityError) {
+            if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
+              this.#dispatchLifecycleCapacityWaitLogged.add(key)
+              this.#increment('dispatchLifecycleCapacityWaits')
+              this.#logger.warn?.('[factory] durable dispatch is queued for batch capacity; retries remain active', {
+                issue: record.issue.key,
+                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
+              })
+            }
+          } else {
+            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
+              issue: record.issue.key,
+              error: describeError(error).errorMessage,
+            })
+          }
           this.#scheduleDispatchLifecycleRetry(record)
         })
         .finally(() => this.#dispatchLifecycleDrives.delete(drive))
@@ -2954,7 +3004,9 @@ export class FactoryLoop implements Factory {
         epoch,
         this.#clock.now(),
       )) {
-        throw new Error(`durable dispatch ${lifecycle.issue.key} is waiting for batch capacity`)
+        throw new DispatchLifecycleCapacityError(
+          `durable dispatch ${lifecycle.issue.key} is waiting for batch capacity`,
+        )
       }
       const promoted = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
       if (!promoted || promoted.phase !== 'dispatching') {

@@ -4518,6 +4518,78 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('continues live ready-issue discovery when startup exit reconciliation stays slow', async () => {
+    const path = issuePath(87)
+    const issue = issueFile(87)
+    let releasePublish!: () => void
+    let publishStarted!: () => void
+    const publishing = new Promise<void>((resolve) => { releasePublish = resolve })
+    const startedPublishing = new Promise<void>((resolve) => { publishStarted = resolve })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishStarted()
+        await publishing
+        return {
+          repo: input.repo,
+          number: 87,
+          url: 'https://github.com/AgentWorkforce/pear/pull/87',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issue,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const first = createFactory(config(), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restartedFleet.exitImplementerOnReconcile = true
+      restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+        startupAgentExitDrainTimeoutMs: 10,
+      })
+
+      const start = restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await startedPublishing
+      await start
+
+      expect(restarted.status().counters.startupAgentExitDrainTimeouts).toBe(1)
+      expect(restarted.status().counters.liveStartupBackfills).toBe(1)
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'publishing' })
+
+      releasePublish()
+      await vi.waitFor(async () => {
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        expect(lifecycle).toMatchObject({ pullRequest: { number: 87 } })
+        expect(['published', 'complete']).toContain(lifecycle?.phase)
+      })
+    } finally {
+      releasePublish()
+      await restarted?.stop()
+      await first.stop()
+    }
+  })
+
   it.each([
     ['healthy owner', 1091, false],
     ['waiting owner crash', 1092, true],
@@ -4700,8 +4772,9 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.spawns).toEqual([])
+      expect(restarted.status().counters.dispatchLifecycleCapacityWaits).toBe(1)
 
       restartedFleet.emitAgentExit('ar-985-impl-pear', 'exited')
       await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
