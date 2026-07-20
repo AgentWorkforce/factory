@@ -84,6 +84,32 @@ describe('feature manifest validation', () => {
       'Feature location must be inside the repository root for feature-one: ../outside.ts',
     )
   })
+
+  it('rejects a bare ".." location', () => {
+    const rootDir = temporaryDirectory()
+    const raw = manifest({ featureRows: featureRow().replace('src/cli.ts, src/api.ts', '..') })
+
+    expect(() => validateFeatureManifest(raw, { rootDir })).toThrow(
+      'Feature location must be inside the repository root for feature-one: ..',
+    )
+  })
+
+  it('rejects an absolute location outside the repository root', () => {
+    const rootDir = temporaryDirectory()
+    const raw = manifest({ featureRows: featureRow().replace('src/cli.ts, src/api.ts', '/etc/passwd') })
+
+    expect(() => validateFeatureManifest(raw, { rootDir })).toThrow(
+      'Feature location must be inside the repository root for feature-one: /etc/passwd',
+    )
+  })
+
+  it('rejects a manifestPath that escapes the repository root, even called directly', () => {
+    const rootDir = temporaryDirectory()
+
+    expect(() => validateFeatureManifestFile({ rootDir, manifestPath: '../manifest.yaml' })).toThrow(
+      'Feature manifest must be inside the repository root',
+    )
+  })
 })
 
 describe('feature location drift', () => {

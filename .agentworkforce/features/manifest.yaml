@@ -1236,7 +1236,7 @@ categories:
         name: Feature-Map Validator API
         api: '@agent-relay/factory/featuremap'
         description: Parse and validate repository feature manifests and identify advisory location drift from a pull-request diff
-        location: src/featuremap/index.ts, src/featuremap/validate.ts, package.json
+        location: src/featuremap/index.ts, src/featuremap/validate.ts, src/featuremap/check.ts, package.json
         verify_tier: 1
 
       - id: api-linear-state-resolution

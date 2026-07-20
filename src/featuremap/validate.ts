@@ -108,6 +108,14 @@ export function validateFeatureManifestFile(
   const absoluteManifestPath = isAbsolute(manifestPath)
     ? manifestPath
     : resolve(rootDir, manifestPath)
+  const relativeManifestPath = relative(rootDir, absoluteManifestPath).replaceAll('\\', '/')
+  if (
+    relativeManifestPath === '..' ||
+    relativeManifestPath.startsWith('../') ||
+    isAbsolute(relativeManifestPath)
+  ) {
+    throw new Error(`Feature manifest must be inside the repository root: ${absoluteManifestPath}`)
+  }
   const raw = readFileSync(absoluteManifestPath, 'utf8')
   return validateFeatureManifest(raw, {
     rootDir,

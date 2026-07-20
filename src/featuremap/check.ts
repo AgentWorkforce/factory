@@ -39,10 +39,8 @@ export async function checkFeatureMap(
     ? requestedManifestPath
     : resolve(rootDir, requestedManifestPath)
   const manifestPath = toRepositoryPath(relative(rootDir, absoluteManifestPath))
-  if (manifestPath === '..' || manifestPath.startsWith('../') || isAbsolute(manifestPath)) {
-    throw new Error(`Feature manifest must be inside the repository root: ${absoluteManifestPath}`)
-  }
 
+  // validateFeatureManifestFile enforces that manifestPath resolves inside rootDir.
   const validation = validateFeatureManifestFile({
     rootDir,
     manifestPath: absoluteManifestPath,
@@ -84,6 +82,8 @@ async function git(rootDir: string, args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('git', ['-C', rootDir, ...args], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
+    timeout: 30_000,
+    env: { ...process.env, LC_ALL: 'C' },
   })
   return stdout
 }
@@ -93,14 +93,21 @@ async function gitFileAtRevision(
   revision: string,
   path: string,
 ): Promise<string | undefined> {
+  if (!(await objectExistsAtRevision(rootDir, revision, path))) return undefined
+  return git(rootDir, ['show', `${revision}:${path}`])
+}
+
+/** Exit-code probe, avoiding locale/version-fragile stderr matching for a missing object. */
+async function objectExistsAtRevision(rootDir: string, revision: string, path: string): Promise<boolean> {
   try {
-    return await git(rootDir, ['show', `${revision}:${path}`])
-  } catch (error) {
-    const stderr = typeof error === 'object' && error !== null && 'stderr' in error
-      ? String(error.stderr)
-      : ''
-    if (/does not exist in|exists on disk, but not in|path .* not in/iu.test(stderr)) return undefined
-    throw error
+    await execFileAsync('git', ['-C', rootDir, 'cat-file', '-e', `${revision}:${path}`], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, LC_ALL: 'C' },
+    })
+    return true
+  } catch {
+    return false
   }
 }
 
