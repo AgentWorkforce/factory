@@ -52,6 +52,10 @@
     "./featuremap": {
       "types": "./dist/featuremap/index.d.ts",
       "import": "./dist/featuremap/index.js"
+    },
+    "./hosted": {
+      "types": "./dist/hosted/index.d.ts",
+      "import": "./dist/hosted/index.js"
     }
   },
   "publishConfig": {
