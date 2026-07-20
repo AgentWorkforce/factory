@@ -152,7 +152,7 @@ export interface HostedFactoryWriteback {
 
 export type HostedFactoryOptions = {
   workspaceId: string
-  /** Unique per running host/isolate. Each operation adds its own sequence fence. */
+  /** Unique per running host/isolate; store-issued epochs fence every new claim. */
   ownerId: string
   config: FactoryConfig
   leaseTtlMs?: number

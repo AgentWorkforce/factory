@@ -135,20 +135,34 @@ export class HostedFactoryLoop implements HostedFactory {
             continue
           }
 
+          const invocations = dispatchSpecs(decision).map((spec) => ({
+            invocationId: hostedFactoryInvocationId(this.#options.workspaceId, decision, spec),
+            spec: structuredClone(spec),
+            status: 'pending' as const,
+          }))
+          if (invocations.length === 0) {
+            record = {
+              ...record,
+              decision: structuredClone(decision),
+              phase: 'awaiting-clarification',
+              clarificationReason: 'Factory triage produced no dispatchable agent or workflow.',
+              invocations,
+              updatedAt: this.#timestamp(),
+            }
+            await this.#save(record, lease)
+            lease = await this.#ensureWriteback(record, lease, 'clarification')
+            report.awaitingClarification.push(issue.key)
+            records = replaceRecord(records, record)
+            continue
+          }
+
           record = {
             ...record,
             decision: structuredClone(decision),
             phase: 'dispatching',
             clarificationReason: undefined,
-            invocations: dispatchSpecs(decision).map((spec) => ({
-              invocationId: hostedFactoryInvocationId(this.#options.workspaceId, decision, spec),
-              spec: structuredClone(spec),
-              status: 'pending',
-            })),
+            invocations,
             updatedAt: this.#timestamp(),
-          }
-          if (record.invocations.length === 0) {
-            throw new Error(`triage produced no dispatchable specs for ${issue.key}`)
           }
           await this.#save(record, lease)
           activeCount += 1
@@ -172,7 +186,7 @@ export class HostedFactoryLoop implements HostedFactory {
       report.errors.push({ message: errorMessage(error) })
       return report
     } finally {
-      await this.#ports.state.releaseRunLease(lease)
+      await this.#release(lease)
     }
   }
 
@@ -213,7 +227,7 @@ export class HostedFactoryLoop implements HostedFactory {
       }
       throw error
     } finally {
-      await this.#ports.state.releaseRunLease(lease)
+      await this.#release(lease)
     }
   }
 
@@ -399,6 +413,17 @@ export class HostedFactoryLoop implements HostedFactory {
   async #save(record: HostedFactoryIssueRecord, lease: HostedFactoryLease): Promise<void> {
     if (!await this.#ports.state.saveIssue(record, lease)) {
       throw new HostedFactoryLeaseLostError()
+    }
+  }
+
+  async #release(lease: HostedFactoryLease): Promise<void> {
+    try {
+      await this.#ports.state.releaseRunLease(lease)
+    } catch (error) {
+      this.#ports.logger?.warn?.('[factory:hosted] workspace lease release failed', {
+        workspaceId: this.#options.workspaceId,
+        error: errorMessage(error),
+      })
     }
   }
 

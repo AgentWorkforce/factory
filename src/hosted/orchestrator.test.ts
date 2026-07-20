@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import type { SpawnInput, SpawnResult } from '../ports/fleet'
-import type { LinearIssue } from '../types'
+import type { LinearIssue, TriageEngine } from '../types'
 import { createHostedFactory } from './orchestrator'
 import { InMemoryHostedFactoryStateStore } from './state-store'
 import type {
@@ -116,6 +116,7 @@ function harness(input: {
   writeback?: Writeback
   state?: InMemoryHostedFactoryStateStore
   ownerId?: string
+  triage?: TriageEngine
 } = {}) {
   const discovery = input.discovery ?? new Discovery([issue()])
   const fleet = input.fleet ?? new Fleet()
@@ -132,6 +133,7 @@ function harness(input: {
     completions,
     writeback,
     state,
+    triage: input.triage,
     now: () => new Date('2026-07-19T12:00:00.000Z'),
   })
   return { factory, discovery, fleet, completions, writeback, state }
@@ -279,6 +281,66 @@ describe('HostedFactoryLoop', () => {
     expect(resumed.dispatched).toEqual(['AR-2778'])
     expect((fleet as Fleet).calls).toHaveLength(2)
     expect(writeback.clarifications).toHaveLength(1)
+  })
+
+  it('persists an undispatchable custom triage decision for human clarification', async () => {
+    const triage: TriageEngine = {
+      triage: async (candidate) => ({
+        issue: { uuid: candidate.uuid, key: candidate.key, path: candidate.path },
+        routes: [],
+        scope: 'workflow',
+        implementers: [],
+        reviewer: {
+          name: 'unused-reviewer',
+          role: 'reviewer',
+          capability: 'spawn:codex',
+          task: 'unused',
+          repo: 'AgentWorkforce/factory',
+        },
+        thin: false,
+        confidence: 'high',
+        rationale: 'No workflow matched.',
+      }),
+    }
+    const { factory, fleet, state, writeback } = harness({ triage })
+
+    const report = await factory.runOnce()
+
+    expect(report.errors).toEqual([])
+    expect(report.awaitingClarification).toEqual(['AR-2778'])
+    expect((fleet as Fleet).calls).toEqual([])
+    expect(writeback.clarifications).toHaveLength(1)
+    expect(writeback.clarifications[0]?.reason).toContain('no dispatchable agent or workflow')
+    expect(await state.getIssue(workspaceId, 'issue-2778')).toMatchObject({
+      phase: 'awaiting-clarification',
+      invocations: [],
+      clarificationWriteback: { status: 'posted' },
+    })
+  })
+
+  it('does not let lease release failures mask run or completion results', async () => {
+    class ReleaseFailingState extends InMemoryHostedFactoryStateStore {
+      override async releaseRunLease(): Promise<void> {
+        throw new Error('storage unavailable during release')
+      }
+    }
+    const runHarness = harness({
+      discovery: new Discovery([]),
+      state: new ReleaseFailingState(),
+    })
+    await expect(runHarness.factory.runOnce()).resolves.toMatchObject({
+      status: 'completed',
+      discovered: 0,
+    })
+
+    const completionHarness = harness({ state: new ReleaseFailingState() })
+    await expect(completionHarness.factory.ingestCompletion({
+      invocationId: 'missing-invocation',
+      status: 'completed',
+    })).resolves.toEqual({
+      status: 'not-found',
+      invocationId: 'missing-invocation',
+    })
   })
 
   it('fences a second active control plane for the same workspace', async () => {

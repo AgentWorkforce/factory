@@ -102,6 +102,21 @@ describe.each([
     expect(sameOwnerNewClaim.lease.epoch).toBe(second.lease.epoch + 1)
   })
 
+  it('fences a live same-owner claimant with a new epoch', async () => {
+    const store = createStore(() => 1_000)
+    const first = await store.claimRunLease('ws-a', 'reused-owner', 100)
+    expect(first.acquired).toBe(true)
+    if (!first.acquired) throw new Error('expected first lease')
+    expect(await store.saveIssue(record('ws-a', 'issue-a', 'inv-a'), first.lease)).toBe(true)
+
+    const replacement = await store.claimRunLease('ws-a', 'reused-owner', 100)
+    expect(replacement.acquired).toBe(true)
+    if (!replacement.acquired) throw new Error('expected replacement lease')
+    expect(replacement.lease.epoch).toBe(first.lease.epoch + 1)
+    expect(await store.saveIssue(record('ws-a', 'stale', 'inv-stale'), first.lease)).toBe(false)
+    expect(await store.saveIssue(record('ws-a', 'current', 'inv-current'), replacement.lease)).toBe(true)
+  })
+
   it('isolates workspace state and indexes invocation IDs', async () => {
     const store = createStore(() => 1_000)
     const a = await store.claimRunLease('ws-a', 'host-a', 100)

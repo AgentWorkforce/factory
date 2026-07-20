@@ -35,11 +35,12 @@ export class InMemoryHostedFactoryStateStore implements HostedFactoryStateStore 
     if (current && current.expiresAtMs > nowMs && current.ownerId !== ownerId) {
       return { acquired: false, lease: { ...current } }
     }
-    const continuingLiveClaim = current?.ownerId === ownerId && current.expiresAtMs > nowMs
     const lease: HostedFactoryLease = {
       workspaceId,
       ownerId,
-      epoch: continuingLiveClaim ? current.epoch : (current?.epoch ?? 0) + 1,
+      // A claim is a new fencing operation even when the caller reuses an
+      // owner ID. Renew is the only operation that preserves an epoch.
+      epoch: (current?.epoch ?? 0) + 1,
       expiresAtMs: nowMs + validTtl(ttlMs),
     }
     workspace.lease = lease
@@ -153,11 +154,12 @@ export class DurableObjectHostedFactoryStateStore implements HostedFactoryStateS
       if (current && current.expiresAtMs > nowMs && current.ownerId !== ownerId) {
         return { acquired: false, lease: current }
       }
-      const continuingLiveClaim = current?.ownerId === ownerId && current.expiresAtMs > nowMs
       const lease: HostedFactoryLease = {
         workspaceId,
         ownerId,
-        epoch: continuingLiveClaim ? current.epoch : (current?.epoch ?? 0) + 1,
+        // A claim is a new fencing operation even when the caller reuses an
+        // owner ID. Renew is the only operation that preserves an epoch.
+        epoch: (current?.epoch ?? 0) + 1,
         expiresAtMs: nowMs + validTtl(ttlMs),
       }
       await transaction.put(key, lease)
