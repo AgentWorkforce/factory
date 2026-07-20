@@ -1,4 +1,4 @@
-import type { SendInput, SpawnResult } from './fleet'
+import type { Capability, SendInput, SpawnResult } from './fleet'
 import type { AgentWorktree } from './worktree'
 import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
@@ -69,6 +69,48 @@ export type BabysitterSessionState = {
   path?: string
   critical: boolean
   pendingKinds: string[]
+}
+
+export type ConversationMessage = {
+  id: string
+  text: string
+  receivedAtMs: number
+  /** Provider-native ordering identity (Slack message ts, Telegram update id, etc.). */
+  providerSequence?: string
+  author?: string
+}
+
+export type ConversationSessionState = {
+  provider: string
+  issue: IssueRef
+  /** Provider-native conversation/thread identifier. */
+  externalId: string
+  /** Provider-specific routing metadata; continuity itself stays provider-neutral. */
+  context: Record<string, string>
+  agent: {
+    name: string
+    sessionRef: string
+    node?: string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }
+  /** Previously delivered human turns, retained as bounded resume context. */
+  history: ConversationMessage[]
+  /** Durable dedupe ledger; unlike rendered history, this is never context-trimmed. */
+  processedMessageIds: string[]
+  /** New replies waiting for the short coalescing window. */
+  pending: ConversationMessage[]
+  /** Claimed batch; new arrivals remain in pending while this resume runs. */
+  delivery?: {
+    claimId: string
+    owner: string
+    claimedAtMs: number
+    attempts: number
+    messages: ConversationMessage[]
+    /** Binding captured at claim time so a later handoff cannot be overwritten. */
+    agent: Pick<ConversationSessionState['agent'], 'name' | 'sessionRef'>
+  }
 }
 
 export type DispatchAttemptState = {
@@ -231,6 +273,22 @@ export interface StateStore {
   getSlackThread(workspaceId: string, issueKey: string): Promise<string | undefined>
   clearSlackThread(workspaceId: string, issueKey: string): Promise<void>
   clearSlackThreads(workspaceId: string): Promise<void>
+
+  reserveConversationSession(workspaceId: string, conversationId: string, session: ConversationSessionState): Promise<boolean>
+  getConversationSession(workspaceId: string, conversationId: string): Promise<ConversationSessionState | undefined>
+  listConversationSessions(workspaceId: string): Promise<Array<[string, ConversationSessionState]>>
+  appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
+  claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
+  renewConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number): Promise<boolean>
+  completeConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
+  releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void>
+  clearConversationSession(workspaceId: string, conversationId: string): Promise<void>
+  /**
+   * Retarget a durable conversation session onto a different owning agent (e.g.
+   * once a babysitter takes over an issue whose Slack thread was reserved by the
+   * implementer) without disturbing accumulated history/pending turns.
+   */
+  rebindConversationSession(workspaceId: string, conversationId: string, agent: ConversationSessionState['agent']): Promise<boolean>
 
   setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
   listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>

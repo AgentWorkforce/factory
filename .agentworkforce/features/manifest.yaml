@@ -2,10 +2,10 @@ version: '1.0'
 updated: '2026-07-20'
 catalog:
   category_count: 19
-  feature_count: 240
+  feature_count: 241
   tier_counts:
     1: 24
-    2: 104
+    2: 105
     3: 10
     4: 41
     5: 47
@@ -673,8 +673,8 @@ categories:
       - id: human-slack-reply-watch
         name: Slack Reply Watch and Replay
         api: Factory.start()
-        description: Subscribe and poll for new thread replies, deduplicate them, and re-arm persisted watchers after restart
-        location: src/orchestrator/factory.ts
+        description: Subscribe and poll for arbitrary non-bot replies in explicitly allowed Slack threads, deduplicate them, and re-arm persisted watchers after restart
+        location: src/orchestrator/factory.ts, src/subscriptions/specs.ts, src/subscriptions/slack-filter.ts
         verify_tier: 5
 
       - id: human-durable-clarification-wake
@@ -691,11 +691,11 @@ categories:
         location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
         verify_tier: 5
 
-      - id: human-answer-injection
-        name: Human Answer Injection
-        api: FleetClient.sendInput()
-        description: Inject Slack or GitHub answers into implementer and babysitter sessions as integration events
-        location: src/orchestrator/factory.ts
+      - id: human-slack-conversation-resume
+        name: Durable Slack Conversation Resume
+        api: FleetClient.resume() / StateStore.claimConversationTurn()
+        description: Persist one Slack thread owner, coalesce rapid human replies, and deliver each turn only as a fresh resume task with bounded prior context and no live session injection
+        location: src/orchestrator/factory.ts, src/orchestrator/coalesced-task-queue.ts, src/ports/state.ts, src/state/file-state-store.ts
         verify_tier: 4
 
       - id: human-clarified-redispatch
@@ -1649,6 +1649,13 @@ categories:
         api: factory.config.json#slack.staleAfterMs
         description: Set the provider-sync freshness threshold that activates Slack degraded mode
         location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-slack-conversation-coalesce
+        name: Slack Conversation Coalescing Window
+        api: factory.config.json#slack.conversationCoalesceMs
+        description: Set the short bounded window used to fold rapid thread replies into one resumed agent turn
+        location: src/config/schema.ts, src/orchestrator/coalesced-task-queue.ts
         verify_tier: 2
 
   config-linear-states:

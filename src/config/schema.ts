@@ -114,6 +114,7 @@ const slackSchema = z.object({
   // identity, while still making parked questions immediately actionable.
   stakeholderUserIds: z.array(z.string().min(1)).default([]),
   staleAfterMs: z.number().int().min(1_000).default(10 * 60_000),
+  conversationCoalesceMs: z.number().int().min(0).max(60_000).default(750),
 }).optional()
 
 const babysitterSchema = z.object({

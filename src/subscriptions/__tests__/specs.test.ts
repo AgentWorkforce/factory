@@ -63,6 +63,9 @@ describe('subscription specs', () => {
       '/slack/channels/D*/**',
       '/slack/users/*/messages/**',
     ])
+    expect(subscriptionSpecsFor([slackIntegration])[0]?.slackThreadPredicates).toEqual({
+      channelDirs: ['C123', 'C123__general'],
+    })
   })
 
   it('dedupes delivery targets across integrations', () => {
