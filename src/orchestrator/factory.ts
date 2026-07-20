@@ -304,6 +304,7 @@ export class FactoryLoop implements Factory {
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
+  readonly #hasProbePrGhRunner: boolean
   readonly #probePrGhRunner: GhRunner
   readonly #logger: Logger
   readonly #clock: Clock
@@ -454,6 +455,7 @@ export class FactoryLoop implements Factory {
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
+    this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
     this.#probePrGhRunner = ports.probePrGhRunner ?? failClosedGhRunner
     this.#probePrResolver = ports.probePrResolver ?? ((issue) => this.#resolveIssuePr(issue))
     this.#logger = normalizeLogger(ports.logger ?? console)
@@ -4385,6 +4387,13 @@ export class FactoryLoop implements Factory {
       }
       return
     }
+    const tracingReconciledExit = reason === 'reconciled-missing'
+    if (tracingReconciledExit) {
+      this.#logger.info?.('[factory] reconciled agent exit recovery started', {
+        issue: record.issue.key,
+        name,
+      })
+    }
     if (!await this.#assertDispatchLifecycleOwner(record)) {
       this.#logger.warn?.('[factory] ignored agent exit after durable lifecycle ownership was lost', {
         issue: record.issue.key,
@@ -4392,6 +4401,7 @@ export class FactoryLoop implements Factory {
       })
       return
     }
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit ownership confirmed', { issue: record.issue.key, name })
 
     // The issue-comment subscription and the fleet exit callback are separate
     // event streams. Reconcile comments that are already durable in the mount
@@ -4401,9 +4411,11 @@ export class FactoryLoop implements Factory {
       this.#increment('githubQuestionExitsSuppressed')
       return
     }
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit question replay completed', { issue: record.issue.key, name })
 
     const exiting = record.agents.get(name)
     if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
     if (this.#usesDurableDispatchLifecycle()) {
       const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
@@ -4466,9 +4478,19 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
-        openOnly: this.#config.babysitter.enabled,
-      }, tracked)) {
+      const hasCompletionPr = tracked.spec.role === 'implementer'
+        ? await this.#issueHasCompletionPr(record, {
+            openOnly: this.#config.babysitter.enabled,
+          }, tracked)
+        : false
+      if (tracingReconciledExit) {
+        this.#logger.info?.('[factory] reconciled agent exit completion PR lookup completed', {
+          issue: record.issue.key,
+          name,
+          hasCompletionPr,
+        })
+      }
+      if (hasCompletionPr) {
         if (this.#config.babysitter.enabled) {
           await this.#ensureBabysitterForIssue(record)
           return
@@ -4487,6 +4509,7 @@ export class FactoryLoop implements Factory {
       // ahead of base, clone gone) it returns undefined and we fall through.
       if (tracked.spec.role === 'implementer') {
         await this.#saveDispatchLifecycle(record, 'publishing')
+        if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit PR publication started', { issue: record.issue.key, name })
         const publishedPr = await this.#tryPublishImplementerPr(record, tracked)
         if (publishedPr) {
           await this.#saveDispatchLifecycle(record, 'published', publishedPr)
@@ -4728,6 +4751,42 @@ export class FactoryLoop implements Factory {
     repo: string,
     expectedHeadRef: string,
   ): Promise<GithubPublishPullRequestResult | undefined> {
+    if (this.#hasProbePrGhRunner) {
+      try {
+        const result = await this.#probePrGhRunner([
+          'pr',
+          'list',
+          '--repo',
+          repo,
+          '--head',
+          expectedHeadRef,
+          '--state',
+          'open',
+          '--json',
+          'number,url,headRefName,isDraft',
+          '--limit',
+          '10',
+        ])
+        const payload = parseJsonContent(result.stdout)
+        if (Array.isArray(payload)) {
+          const candidates = payload.flatMap((entry): GithubPublishPullRequestResult[] => {
+            const candidate = asRecord(entry)
+            const number = numberValue(candidate?.number)
+            const url = stringValue(candidate?.url)
+            const headRef = stringValue(candidate?.headRefName)
+            if (!number || !url || headRef !== expectedHeadRef || candidate?.isDraft !== false) return []
+            return [{ repo, number, url, headRef }]
+          })
+          return candidates.sort((a, b) => b.number - a.number)[0]
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] exact-head gh PR lookup failed; falling back to mounted metadata', {
+          repo,
+          headRef: expectedHeadRef,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
     const parts = githubRepoParts(repo)
     if (!parts) return undefined
     const roots = [

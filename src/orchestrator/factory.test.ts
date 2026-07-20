@@ -4433,6 +4433,7 @@ describe('FactoryLoop', () => {
         stateStore,
         triage: new StaticTriage(),
         probePrResolver: async () => undefined,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
       })
       let startSettled = false
       const start = restarted.start({ mode: 'dispatch-owner' }).then(() => { startSettled = true })
