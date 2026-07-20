@@ -58,6 +58,8 @@ export interface GithubPublishPullRequestResult {
   url: string
   headRef: string
   headSha?: string
+  /** Provider-confirmed login or identity label used to author the PR. */
+  author?: string
 }
 
 export type FactoryIntegrationProvider = 'github' | 'linear'

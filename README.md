@@ -57,11 +57,12 @@ From a source checkout instead of an npm install, run
 
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
-   open pull requests; a local `gh` installation or `gh auth login` is not a
-   prerequisite. If a required connection is missing, an interactive Factory
-   command offers to open the Relayfile connection flow and waits for it to
-   finish. Linear-backed operations require both Linear and GitHub; GitHub-native
-   operations require GitHub.
+   open pull requests by default. A local `gh` installation and `gh auth login`
+   are required only when `github.identity` selects the user path (or for the
+   existing GitHub issue lifecycle writeback described below). If a required
+   connection is missing, an interactive Factory command offers to open the
+   Relayfile connection flow and waits for it to finish. Linear-backed operations
+   require both Linear and GitHub; GitHub-native operations require GitHub.
 
 2. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
    repo route are required:
@@ -349,6 +350,30 @@ an invalid config fails fast with a field-level error. See
 [`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
+
+Factory PR authorship is controlled explicitly with `github.identity`:
+
+```jsonc
+{
+  "github": {
+    "identity": "app"
+  }
+}
+```
+
+- `"app"` always publishes through the connected workspace GitHub App. If that
+  write path is unavailable, Factory fails loudly and never falls back to a
+  personal account.
+- `"user"` always publishes with the account authenticated by the local `gh`
+  CLI, even when the app path is available.
+- `"auto"` is the default and preserves compatibility: prefer the app path,
+  then fall back to the local `gh` user when the app writer is unavailable.
+
+Each successful publication log includes `identity` (`app` or `user`) and the
+confirmed `author`. This setting currently controls PR creation only. GitHub
+issue comments and lifecycle status labels still use the existing local `gh`
+writeback; extending the identity policy to those operations requires a
+connected-app issue writeback surface.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,
