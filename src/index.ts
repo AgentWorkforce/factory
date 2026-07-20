@@ -152,12 +152,15 @@ export type {
 } from './triage'
 export {
   GhCliGithubWriteback,
+  FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
   MountGithubRead,
   MountLinearWriteback,
   MountSlackWriteback,
+  publishFactoryMountHealth,
 } from './writeback'
 export type {
+  FactoryMountHealthRecord,
   GhCliGithubWritebackConfig,
   LinearCommentPayload,
   LinearCreateIssuePayload,

@@ -60,6 +60,8 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
+  'relayfile:fs:read:/factory/observability/**',
+  'relayfile:fs:write:/factory/observability/**',
 ] as const
 
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
@@ -149,6 +151,7 @@ export interface RelayfileSetupLike {
     agentName?: string
     scopes?: string[]
     verifyProvider?: boolean
+    supervise?: boolean
     readyTimeoutMs?: number
   }): Promise<MountedWorkspaceHandleLike>
 }
@@ -342,6 +345,10 @@ export class RelayfileCloudMountClient implements MountClient {
       // Factory mirrors the whole workspace across several integrations,
       // so there is no single provider to verify before mounting.
       verifyProvider: false,
+      // Factory owns the outer, telemetry-aware supervisor. Newer Relayfile
+      // SDKs also supervise by default, so opt out here to avoid two refresh
+      // loops racing over the same local directory.
+      supervise: false,
       ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
     })
     this.#localMountSupervisions.set(localDir, {

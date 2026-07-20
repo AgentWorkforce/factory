@@ -313,6 +313,7 @@ describe('RelayfileCloudMountClient', () => {
       agentName: 'agent-relay-factory',
       scopes: [...FACTORY_RELAYFILE_SCOPES],
       verifyProvider: false,
+      supervise: false,
       readyTimeoutMs: 3210,
     })
 
@@ -516,6 +517,7 @@ describe('RelayfileCloudMountClient', () => {
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/linear/states/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:write:/github/repos/**')
+    expect(joinOptions.scopes).toContain('relayfile:fs:write:/factory/observability/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')
     expect(mount.githubWrite).toBeDefined()
     expect(factoryReadScopeCovers('/linear/states/_index.json')).toBe(true)

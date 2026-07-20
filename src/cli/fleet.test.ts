@@ -748,6 +748,19 @@ describe('fleet CLI runtime', () => {
         logger: expect.any(Object),
         onLocalMountHealth: expect.any(Function),
       }))
+      const cloudMount = await cloudMountFromConfig.mock.results[0]?.value
+      expect(cloudMount?.writes).toContainEqual({
+        path: '/factory/observability/mount-health/current.json',
+        content: expect.objectContaining({
+          schemaVersion: 'factory.mount-health.v1',
+          type: 'factory.mount-health',
+          workspaceId: 'factory-cli-test',
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+          occurredAt: expect.any(String),
+        }),
+      })
       expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
     } finally {
       await rm(root, { recursive: true, force: true })

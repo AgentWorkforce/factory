@@ -25,6 +25,7 @@ import {
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
+  publishFactoryMountHealth,
   parseOwnedBrokerAgentExitTimeoutMs,
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
@@ -241,20 +242,29 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const logger = streamLogger(err)
         const pendingMountHealthEvents: LocalMountHealthEvent[] = []
         const reportMountHealth = async (event: LocalMountHealthEvent): Promise<void> => {
-          if (!reporter) {
+          if (!mount) {
             pendingMountHealthEvents.push(event)
             return
           }
-          await reporter.report(createFactoryCloudEventV1({
-            type: event.state === 'degraded' ? 'factory.anomaly' : 'factory.snapshot',
-            level: event.state === 'degraded' ? 'error' : 'info',
-            attributes: {
-              component: 'relayfile_mount',
-              operation: 'supervise',
-              errorCode: event.reason,
-              count: event.degradedMounts,
-            },
-          }))
+          if (reporter) {
+            await reporter.report(createFactoryCloudEventV1({
+              type: event.state === 'degraded' ? 'factory.anomaly' : 'factory.snapshot',
+              level: event.state === 'degraded' ? 'error' : 'info',
+              attributes: {
+                component: 'relayfile_mount',
+                operation: 'supervise',
+                errorCode: event.reason,
+                count: event.degradedMounts,
+              },
+            }))
+          }
+          try {
+            await publishFactoryMountHealth(mount, workspaceId, event)
+          } catch (error) {
+            logger.warn?.('[factory] unable to publish Relayfile mount health signal', {
+              errorClass: error instanceof Error ? error.name : 'Error',
+            })
+          }
         }
         mount = await buildMount(loaded, deps, {
           logger,
@@ -299,9 +309,9 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
               operation: 'start',
             },
           }))
-          for (const event of pendingMountHealthEvents.splice(0)) {
-            await reportMountHealth(event)
-          }
+        }
+        for (const event of pendingMountHealthEvents.splice(0)) {
+          await reportMountHealth(event)
         }
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
