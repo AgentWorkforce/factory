@@ -827,6 +827,66 @@ describe('GhCliGithubWriteback', () => {
     },
   }
 
+  it('pushes a local branch and returns the gh-authenticated PR author', async () => {
+    const ghCalls: string[][] = []
+    const gitCalls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        ghCalls.push(args)
+        if (args[1] === 'create') {
+          return { stdout: 'https://github.com/AgentWorkforce/factory/pull/124\n' }
+        }
+        return {
+          stdout: JSON.stringify({
+            number: 124,
+            url: 'https://github.com/AgentWorkforce/factory/pull/124',
+            headRefName: 'factory/124-configurable-pr-author',
+            headRefOid: 'commit-124',
+            author: { login: 'operator-user' },
+          }),
+        }
+      },
+      gitRunner: async (args) => {
+        gitCalls.push(args)
+        if (args.includes('symbolic-ref')) return { stdout: 'factory/124-configurable-pr-author\n' }
+        if (args.includes('rev-parse')) return { stdout: 'commit-124\n' }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: '124: configurable PR author',
+      body: 'Factory issue 124',
+    })).resolves.toEqual({
+      repo: 'AgentWorkforce/factory',
+      number: 124,
+      url: 'https://github.com/AgentWorkforce/factory/pull/124',
+      headRef: 'factory/124-configurable-pr-author',
+      headSha: 'commit-124',
+      author: 'operator-user',
+    })
+    expect(gitCalls).toEqual([
+      ['-C', '/work/factory', 'symbolic-ref', '--short', 'HEAD'],
+      ['-C', '/work/factory', 'rev-parse', 'HEAD'],
+      ['-C', '/work/factory', 'push', 'origin', 'HEAD:refs/heads/factory/124-configurable-pr-author'],
+    ])
+    expect(ghCalls).toEqual([
+      [
+        'pr', 'create', '--repo', 'AgentWorkforce/factory',
+        '--head', 'factory/124-configurable-pr-author', '--base', 'main',
+        '--title', '124: configurable PR author', '--body', 'Factory issue 124',
+      ],
+      [
+        'pr', 'view', 'https://github.com/AgentWorkforce/factory/pull/124',
+        '--repo', 'AgentWorkforce/factory', '--json',
+        'number,url,headRefName,headRefOid,author',
+      ],
+    ])
+  })
+
   it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
     const calls: string[][] = []
     const github = new GhCliGithubWriteback({

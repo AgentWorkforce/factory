@@ -15,6 +15,7 @@ import type {
   ChangeEvent,
   FleetClient,
   FactoryEventReporter,
+  GithubConnectionWrite,
   GithubIssueStatus,
   GithubPublishPullRequestResult,
   GithubWriteback,
@@ -122,6 +123,8 @@ type ResolvedIssuePr = {
 }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
+type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullRequest'>
+type GithubPullRequestIdentity = 'app' | 'user'
 type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
@@ -315,6 +318,7 @@ export class FactoryLoop implements Factory {
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
   readonly #githubWriteback: GithubWriteback
+  readonly #githubWritebackProvided: boolean
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
   readonly #probeCloser: ProbeCloser
@@ -478,6 +482,7 @@ export class FactoryLoop implements Factory {
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
       safety: config.safety,
     })
+    this.#githubWritebackProvided = Boolean(ports.githubWriteback)
     this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     void (ports.github ?? MountGithubRead(ports.mount))
@@ -4924,7 +4929,7 @@ export class FactoryLoop implements Factory {
       if (
         exiting?.spec.role === 'implementer' &&
         !record.dryRun &&
-        (this.#mount.githubWrite || this.#mount.writebackTransport === 'relayfile-cloud')
+        this.#shouldAttemptPullRequestPublication()
       ) {
         try {
           await this.#saveDispatchLifecycle(record, 'publishing')
@@ -5148,14 +5153,19 @@ export class FactoryLoop implements Factory {
 
   // Publish a PR from the implementer's committed branch when it exited without
   // opening one. Best-effort and idempotent: returns undefined when there is no
-  // GitHub write path, no clone, or nothing publishable (no branch / no commits
-  // ahead of base — `#publishImplementerPullRequest` refuses head==base), so the
-  // caller falls back to its normal restart/conclude handling.
+  // clone or nothing publishable (no branch / no commits ahead of base —
+  // `#publishImplementerPullRequest` refuses head==base), so the caller falls
+  // back to its normal restart/conclude handling. Explicit app identity errors
+  // remain fail-closed and propagate to the lifecycle error path.
   async #tryPublishImplementerPr(
     record: InFlightIssue,
     implementer: TrackedAgent,
   ): Promise<GithubPublishPullRequestResult | undefined> {
-    if (record.dryRun || (!implementer.spec.clonePath && !implementer.spec.branch) || !this.#mount.githubWrite) {
+    if (
+      record.dryRun ||
+      (!implementer.spec.clonePath && !implementer.spec.branch) ||
+      !this.#shouldAttemptPullRequestPublication()
+    ) {
       return undefined
     }
     try {
@@ -5174,6 +5184,7 @@ export class FactoryLoop implements Factory {
       }
       return published
     } catch (error) {
+      if (this.#config.github.identity === 'app' && !this.#mount.githubWrite) throw error
       this.#increment('exitPrPublishSkipped')
       this.#logger.warn?.('[factory] could not publish implementer PR on exit; falling back', {
         issue: record.issue.key,
@@ -5194,10 +5205,7 @@ export class FactoryLoop implements Factory {
     const cached = this.#publishedPullRequests.get(key)
     if (cached) return cached
 
-    const githubWrite = this.#mount.githubWrite
-    if (!githubWrite) {
-      throw new Error('GitHub write path not available on this mount — connect GitHub to your workspace')
-    }
+    const { identity, publisher } = this.#githubPullRequestPublisher()
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
       ? implementer.spec.branch
       : undefined
@@ -5239,34 +5247,76 @@ export class FactoryLoop implements Factory {
       }
     }
     const baseRef = await this.#githubDefaultBranch(repo)
-    const result = await githubWrite.publishPullRequest({
+    const result = await publisher.publishPullRequest({
       repo,
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
       baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue),
     })
+    const published = result.author
+      ? result
+      : { ...result, author: identity }
     if (
-      result.repo.toLowerCase() !== repo.toLowerCase() ||
-      result.headRef !== (remoteBranch ?? result.headRef) ||
-      !Number.isInteger(result.number) ||
-      result.number <= 0 ||
-      !result.url
+      published.repo.toLowerCase() !== repo.toLowerCase() ||
+      published.headRef !== (remoteBranch ?? published.headRef) ||
+      !Number.isInteger(published.number) ||
+      published.number <= 0 ||
+      !published.url
     ) {
       throw new Error(`GitHub PR publication returned an unexpected receipt for ${repo}/${remoteBranch ?? 'local HEAD'}`)
     }
     if (remoteBranch && this.#mount.writebackTransport === 'relayfile-cloud') {
-      await this.#confirmPublishedRemotePullRequest(repo, result, remoteBranch)
+      await this.#confirmPublishedRemotePullRequest(repo, published, remoteBranch)
     }
-    this.#publishedPullRequests.set(key, result)
+    this.#publishedPullRequests.set(key, published)
     this.#increment('githubPullRequestsPublished')
-    this.#logger.info?.('[factory] published PR through workspace GitHub connection', {
+    this.#logger.info?.('[factory] published PR', {
       issue: issue.key,
-      repo: result.repo,
-      prNumber: result.number,
-      url: result.url,
+      repo: published.repo,
+      prNumber: published.number,
+      url: published.url,
+      identity,
+      author: published.author,
     })
-    return result
+    return published
+  }
+
+  #githubPullRequestPublisher(): {
+    identity: GithubPullRequestIdentity
+    publisher: GithubPullRequestPublisher
+  } {
+    const configured = this.#config.github.identity
+    if (configured !== 'user' && this.#mount.githubWrite) {
+      return { identity: 'app', publisher: this.#mount.githubWrite }
+    }
+    if (configured === 'app') {
+      throw new Error(
+        'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+      )
+    }
+    const publishPullRequest = this.#githubWriteback.publishPullRequest
+    if (!publishPullRequest) {
+      throw new Error(
+        `GitHub PR identity "${configured}" requires local gh user publication, but the configured GitHub writeback does not support it`,
+      )
+    }
+    return {
+      identity: 'user',
+      publisher: { publishPullRequest: publishPullRequest.bind(this.#githubWriteback) },
+    }
+  }
+
+  #shouldAttemptPullRequestPublication(): boolean {
+    if (this.#config.github.identity !== 'auto') return true
+    if (this.#mount.githubWrite) return true
+    // Fake mounts deliberately avoid invoking the host's real gh binary unless
+    // a publisher was injected. Every production mount (cloud or custom) still
+    // gets the configured auto fallback.
+    if (this.#mount.writebackTransport === 'test') {
+      return Boolean(this.#githubWritebackProvided && this.#githubWriteback.publishPullRequest)
+    }
+    return true
   }
 
   async #openPullRequestByHead(
