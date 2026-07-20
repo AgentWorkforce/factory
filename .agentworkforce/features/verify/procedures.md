@@ -369,7 +369,7 @@ Every feature below maps to the procedure for its manifest tier. This index is i
 
 ### Tier 1 IDs
 
-`cli-help`, `cli-config-option`, `safety-relay-token-types`, `safety-merge-head-sha`, `webhook-hmac-validation`, `webhook-event-routing`, `webhook-event-deduplication`, `subscription-canonical-paths`, `subscription-delivery-targets`, `subscription-linear-predicates`, `api-config-schemas`, `api-triage-engines`, `api-fleet-ports`, `api-mount-ports`, `api-writeback-ports`, `api-state-stores`, `api-reaper`, `api-relayflow-policy`, `api-testing`, `api-safe-log-serialization`, `config-node-path-env`, `config-node-name-env`.
+`cli-help`, `cli-featuremap-check`, `cli-config-option`, `safety-relay-token-types`, `safety-merge-head-sha`, `webhook-hmac-validation`, `webhook-event-routing`, `webhook-event-deduplication`, `subscription-canonical-paths`, `subscription-delivery-targets`, `subscription-linear-predicates`, `api-config-schemas`, `api-featuremap-validator`, `api-triage-engines`, `api-fleet-ports`, `api-mount-ports`, `api-writeback-ports`, `api-state-stores`, `api-reaper`, `api-relayflow-policy`, `api-testing`, `api-safe-log-serialization`, `config-node-path-env`, `config-node-name-env`.
 
 ### Tier 2 IDs
 

@@ -62,6 +62,16 @@ describe('feature manifest validation', () => {
     )
   })
 
+  it('rejects a missing or invalid category criticality with the category ID', () => {
+    for (const criticality of ['', 'urgent']) {
+      const raw = manifest().replace('criticality: critical', `criticality: ${criticality}`)
+
+      expect(() => validateFeatureManifest(raw)).toThrow(
+        'Manifest category core has invalid criticality',
+      )
+    }
+  })
+
   it('rejects a deleted location with the feature ID and repository path', () => {
     const rootDir = temporaryDirectory()
 

@@ -14,6 +14,7 @@ import { defineAgent, type WorkforceCtx } from '@agentworkforce/runtime'
 import { slackClient } from '@relayfile/relay-helpers'
 import {
   parseManifestFeatures,
+  type FeatureCriticality as Criticality,
   type ManifestFeature as Feature,
 } from '../../../src/featuremap/validate'
 
