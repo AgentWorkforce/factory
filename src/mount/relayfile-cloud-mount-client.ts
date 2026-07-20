@@ -331,7 +331,7 @@ export class RelayfileCloudMountClient implements MountClient {
     if (workspace.workspaceId && workspace.workspaceId !== this.workspaceId) {
       acceptableWorkspaceIds.add(workspace.workspaceId)
     }
-    const launch = async (): Promise<MountedWorkspaceHandleLike> => await ensureMountedWorkspace({
+    const launch = (): Promise<MountedWorkspaceHandleLike> => ensureMountedWorkspace({
       workspace,
       localDir,
       remotePath: '/',
@@ -505,6 +505,10 @@ export class RelayfileCloudMountClient implements MountClient {
       await previous.stop()
     }
     const mounted = await launch()
+    if (this.#disposed) {
+      await mounted.stop()
+      return
+    }
     this.#localMounts.set(localDir, mounted)
     const supervision = this.#localMountSupervisions.get(localDir)
     if (supervision) {

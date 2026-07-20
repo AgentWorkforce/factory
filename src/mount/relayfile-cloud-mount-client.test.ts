@@ -392,6 +392,42 @@ describe('RelayfileCloudMountClient', () => {
     expect(recoveredStop).toHaveBeenCalledTimes(1)
   })
 
+  it('stops a mount whose launch finishes after disposal begins', async () => {
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    let finishLaunch: ((mounted: { stop: () => Promise<void> }) => void) | undefined
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => await new Promise<{ stop: () => Promise<void> }>((resolve) => {
+      finishLaunch = resolve
+    }))
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => handle),
+        ensureMountedWorkspace,
+      })),
+      localMountPreflight: async (
+        _workspaceId,
+        _startDir,
+        options: { startMount: () => Promise<void> },
+      ) => options.startMount(),
+    })
+
+    const mounting = mount.ensureLocalMount('/work/repo')
+    await vi.waitFor(() => expect(ensureMountedWorkspace).toHaveBeenCalledTimes(1))
+    await mount.dispose()
+    finishLaunch?.({ stop })
+    await mounting
+
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {
     const fake = new FakeRelayFileClient()
     const auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })
