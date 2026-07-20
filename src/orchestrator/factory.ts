@@ -7241,33 +7241,56 @@ export class FactoryLoop implements Factory {
     const records = onlyRecord ? [onlyRecord] : (await this.#batch()).inFlight
     for (const record of records) {
       if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
       // Babysitter sessions are independently durable and restore only after
       // their mounted PR metadata passes the open/draft/issue-identity guard.
       // Fold those validated receipts back into the lifecycle on takeover.
       // This closes the crash gap where the babysitter session persisted but
       // the lifecycle PR receipt did not, and lets exact ownership retire any
-      // earlier weak-match babysitter for the same repository.
+      // earlier weak-match babysitter for the same repository. The lifecycle's
+      // own exact receipts are authoritative independently of the session
+      // index: session restoration can legitimately be delayed or skipped
+      // while mounted PR metadata converges, but that must never preserve a
+      // superseded weak-match babysitter already disproved by publication.
+      const authoritative = new Map<string, {
+        repo: string
+        number: number
+        url: string
+        headRef: string
+        path?: string
+      }>()
+      for (const receipt of lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])) {
+        if (!receipt.repo || !validPrNumber(receipt.number) || !receipt.url || !receipt.headRef) continue
+        const identity = githubPrIdentity(receipt.repo, receipt.number)
+        if (identity) authoritative.set(identity, { ...receipt })
+      }
       const restored = [...this.#babysitterPr.entries()]
         .filter(([ownershipKey, ref]) =>
           ref.agentName && issueKey(this.#babysitterIssueRefs.get(ownershipKey) ?? record.issue) === issueKey(record.issue))
         .map(([, ref]) => ref)
       for (const receipt of restored) {
+        if (!receipt.repo || !validPrNumber(receipt.prNumber)) continue
         const snapshot = await this.#readPrSnapshot(receipt)
         const headRef = snapshot?.headRef ?? record.decision.implementers
           .find((implementer) => implementer.repo.toLowerCase() === receipt.repo.toLowerCase())?.branch
         if (!headRef) continue
-        const published = {
+        const identity = githubPrIdentity(receipt.repo, receipt.prNumber)
+        if (!identity) continue
+        authoritative.set(identity, {
           repo: receipt.repo,
           number: receipt.prNumber,
           url: snapshot?.url ?? `https://github.com/${receipt.repo}/pull/${receipt.prNumber}`,
           headRef,
-        }
+          ...(receipt.path ? { path: receipt.path } : {}),
+        })
+      }
+      for (const published of authoritative.values()) {
         if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
         await this.#ensureBabysitter(record, {
           repo: published.repo,
           prNumber: published.number,
           url: published.url,
-          path: receipt.path,
+          path: published.path,
           authoritative: true,
         })
       }
