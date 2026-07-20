@@ -433,6 +433,20 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().get('ar-9-impl')).toMatchObject({ invocationId: 'inv-9', node: 'mac-mini' })
   })
 
+  it('forgets a terminal tracked agent before an intentional replacement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([{ name: 'ar-9-babysit', invocationId: 'inv-9' }])
+
+    fleet.markAgentTerminal('ar-9-babysit', 'babysitter-unreachable')
+    await fleet.reconcileTrackedAgents()
+
+    expect(fleet.trackedAgents().has('ar-9-babysit')).toBe(false)
+    expect(exits).toEqual([])
+  })
+
   it('synthesizes exits for tracked agents that left the roster after the registration grace', async () => {
     const messaging = new FakeMessaging()
     messaging.agentRows = [{ name: 'ar-2-review', status: 'online' }]

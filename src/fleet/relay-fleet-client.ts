@@ -225,6 +225,11 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  markAgentTerminal(name: string, _reason?: string): void {
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
+  }
+
   async roster(): Promise<RosterEntry> {
     const messaging = await this.#ensureMessaging()
     const [agents, nodes] = await Promise.all([

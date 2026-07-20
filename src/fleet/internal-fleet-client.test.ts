@@ -1034,6 +1034,32 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('confirms a mismatched-id injection that races the sendMessage response', async () => {
+    class InjectionDuringSendHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        this.emit({
+          kind: 'delivery_injected',
+          name: input.to,
+          delivery_id: 'broker-delivery-1',
+          event_id: 'broker-snowflake-1',
+        })
+        return { event_id: 'http_1', targets: [input.to] }
+      }
+    }
+    const harness = new InjectionDuringSendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    await expect(fleet.waitForInjected(
+      { to: 'ar-1-impl', text: 'do work' },
+      { timeoutMs: 100 },
+    )).resolves.toEqual({
+      eventId: 'broker-snowflake-1',
+      targets: ['ar-1-impl'],
+    })
+    expect(harness.sent).toHaveLength(1)
+  })
+
   it('re-sends a pending injection when its target registers through a fresh spawn', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness })
