@@ -1,8 +1,14 @@
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
 import type { MountClient } from '../ports'
+import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
+
+const execFileAsync = promisify(execFile)
 
 const STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
   'in-progress': {
@@ -54,6 +60,7 @@ export const MountGithubRead = (mount: MountClient) => ({
 
 export interface GhCliGithubWritebackConfig {
   runner?: GhRunner
+  gitRunner?: GhRunner
 }
 
 /**
@@ -66,9 +73,86 @@ export interface GhCliGithubWritebackConfig {
  */
 export class GhCliGithubWriteback implements GithubWriteback {
   readonly #run: GhRunner
+  readonly #git: GhRunner
 
   constructor(config: GhCliGithubWritebackConfig = {}) {
     this.#run = config.runner ?? defaultGhRunner
+    this.#git = config.gitRunner ?? defaultGitRunner
+  }
+
+  /** Publish a PR as the GitHub user authenticated by the local `gh` CLI. */
+  async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
+    const headRef = input.headRef ?? (input.clonePath
+      ? await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
+      : undefined)
+    if (!headRef) {
+      throw new Error('GitHub user PR publication requires headRef or clonePath')
+    }
+    if (headRef === input.baseRef) {
+      throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
+    }
+    const headSha = input.headSha ?? (input.clonePath
+      ? await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
+      : undefined)
+
+    // A local exit-recovery branch may only exist in Factory's checkout. Push
+    // it without force before asking GitHub to create the PR as the gh user.
+    if (input.clonePath && !input.headRef) {
+      await this.#git([
+        '-C',
+        input.clonePath,
+        'push',
+        'origin',
+        `HEAD:refs/heads/${headRef}`,
+      ])
+    }
+
+    const created = await this.#run([
+      'pr',
+      'create',
+      '--repo',
+      input.repo,
+      '--head',
+      headRef,
+      '--base',
+      input.baseRef,
+      '--title',
+      input.title,
+      '--body',
+      input.body,
+    ])
+    const createdUrl = githubPullRequestUrl(`${created.stdout}\n${created.stderr ?? ''}`, input.repo)
+    if (!createdUrl) {
+      throw new Error(`gh PR publication returned no pull request URL for ${input.repo}/${headRef}`)
+    }
+
+    const viewed = await this.#run([
+      'pr',
+      'view',
+      createdUrl,
+      '--repo',
+      input.repo,
+      '--json',
+      'number,url,headRefName,headRefOid,author',
+    ])
+    const receipt = asRecord(JSON.parse(viewed.stdout))
+    const number = numberValue(receipt?.number)
+    const url = stringValue(receipt?.url)
+    const confirmedHeadRef = stringValue(receipt?.headRefName)
+    const confirmedHeadSha = stringValue(receipt?.headRefOid)
+    const author = stringValue(asRecord(receipt?.author)?.login) ?? stringValue(receipt?.author)
+    if (!number || !url || confirmedHeadRef !== headRef || !author) {
+      throw new Error(`gh PR publication returned an incomplete receipt for ${input.repo}/${headRef}`)
+    }
+
+    return {
+      repo: input.repo,
+      number,
+      url,
+      headRef: confirmedHeadRef,
+      ...(confirmedHeadSha ?? headSha ? { headSha: confirmedHeadSha ?? headSha } : {}),
+      author,
+    }
   }
 
   async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
@@ -200,6 +284,26 @@ export class GhCliGithubWriteback implements GithubWriteback {
       'completed',
     ])
   }
+
+  async #gitValue(args: string[], description: string): Promise<string> {
+    try {
+      const value = (await this.#git(args)).stdout.trim()
+      if (value) return value
+    } catch (error) {
+      throw new Error(`Unable to resolve ${description} for GitHub user PR publication: ${errorMessage(error)}`)
+    }
+    throw new Error(`Unable to resolve ${description} for GitHub user PR publication`)
+  }
+}
+
+const defaultGitRunner: GhRunner = async (args) => {
+  const { stdout, stderr } = await execFileAsync('git', args, { maxBuffer: 1024 * 1024 })
+  return { stdout, stderr }
+}
+
+const githubPullRequestUrl = (value: string, repo: string): string | undefined => {
+  const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  return new RegExp(`https://github\\.com/${escapedRepo}/pull/[1-9][0-9]*`, 'iu').exec(value)?.[0]
 }
 
 const githubIssueRef = (issue: LinearIssue): { repo: string; number: number; url: string } => {
@@ -244,6 +348,8 @@ const refName = (value: unknown): string | undefined => {
   const record = asRecord(value)
   return stringValue(record?.name) ?? stringValue(record?.ref) ?? stringValue(record?.login)
 }
+
+const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
 
 const filesChanged = (value: unknown): string[] | undefined => {
   if (!Array.isArray(value)) {

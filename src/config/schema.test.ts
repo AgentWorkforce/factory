@@ -46,6 +46,7 @@ describe('FactoryConfigSchema', () => {
       batchSize: 100,
       requestTimeoutMs: 15_000,
     })
+    expect(parsed.github).toEqual({ identity: 'auto' })
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',
@@ -185,6 +186,22 @@ describe('FactoryConfigSchema', () => {
 
     expect(auto.issueSource).toBeUndefined()
     expect(github.issueSource).toBe('github')
+  })
+
+  it.each(['app', 'user', 'auto'] as const)('accepts github.identity %s', (identity) => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      github: { identity },
+    })
+
+    expect(parsed.github.identity).toBe(identity)
+  })
+
+  it('rejects an unsupported GitHub PR identity', () => {
+    expect(() => FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      github: { identity: 'installation-owner' },
+    })).toThrow()
   })
 
   it('parses dynamic per-team Linear state name mappings', () => {
