@@ -31,6 +31,17 @@ export type {
   LinearScopePredicates,
 } from './linear-filter'
 export {
+  filterSlackThreadReplySpecs,
+  isSlackMessageEventPath,
+  parseSlackThreadReply,
+  slackThreadReplyGlob,
+} from './slack-filter'
+export type {
+  SlackThreadPredicateSubscriptionSpec,
+  SlackThreadReply,
+  SlackThreadScopePredicates,
+} from './slack-filter'
+export {
   createWorkspaceScopedEventClient,
   filesystemEventToChangeEvent,
   integrationRelayFileSyncOptions,
