@@ -172,6 +172,24 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses feature-map validation and base-drift options', () => {
+    expect(parseFleetCommand([
+      'featuremap',
+      'check',
+      '--manifest',
+      'custom/manifest.yaml',
+      '--base',
+      'origin/main',
+    ])).toEqual({
+      kind: 'featuremap-check',
+      manifestPath: 'custom/manifest.yaml',
+      baseRef: 'origin/main',
+    })
+    expect(() => parseFleetCommand(['featuremap', 'sweep'])).toThrow(
+      'factory featuremap requires the check command',
+    )
+  })
+
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
     expect(parseGlobalOptions([
       'run-once',
@@ -304,6 +322,32 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it('runs the feature-map checker without loading config or constructing a fleet', async () => {
+    const output = buffer()
+    const featureMapCheck = vi.fn(async () => ({
+      ok: true as const,
+      manifestPath: '.agentworkforce/features/manifest.yaml',
+      categoryCount: 2,
+      featureCount: 8,
+      baseRef: 'origin/main',
+      mergeBase: 'abc123',
+      advisories: [],
+    }))
+
+    const code = await runFleetCli(['featuremap', 'check', '--base', 'origin/main'], {
+      createFleet: () => {
+        throw new Error('featuremap check should not construct a fleet')
+      },
+      featureMapCheck,
+      stdout: output,
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(featureMapCheck).toHaveBeenCalledWith({ baseRef: 'origin/main' })
+    expect(JSON.parse(output.text())).toMatchObject({ ok: true, featureCount: 8 })
+  })
+
   it('prompts and connects a missing GitHub integration before an interactive triage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-connect-'))
     try {

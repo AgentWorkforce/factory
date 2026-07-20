@@ -56,6 +56,7 @@ import {
 } from '../index'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
+import { checkFeatureMap, type CheckFeatureMapOptions, type FeatureMapCheckReport } from '../featuremap'
 import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
 import {
   ensureFactoryIntegrations,
@@ -98,6 +99,7 @@ interface FleetCliDeps {
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
+  featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
 }
 
 interface GlobalOptions {
@@ -126,6 +128,7 @@ type ParsedCommand =
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
+  | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -145,6 +148,15 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     }
     const { globals, args } = parseGlobalOptions(argv)
     const command = parseFleetCommand(args)
+
+    if (command.kind === 'featuremap-check') {
+      const report = await (deps.featureMapCheck ?? checkFeatureMap)({
+        ...(command.manifestPath ? { manifestPath: command.manifestPath } : {}),
+        ...(command.baseRef ? { baseRef: command.baseRef } : {}),
+      })
+      writeJson(out, report)
+      return 0
+    }
 
     if (command.kind === 'factory-close-probe') {
       // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
@@ -383,7 +395,26 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     return parseFleetSubcommand(rest)
   }
 
+  if (verb === 'featuremap') {
+    return parseFeatureMapCommand(rest)
+  }
+
   throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseFeatureMapCommand(args: string[]): ParsedCommand {
+  const [action, ...flags] = args
+  if (action !== 'check') {
+    throw new Error('factory featuremap requires the check command')
+  }
+  const parsed = parseFlags(flags)
+  const unexpected = Object.keys(parsed).find((key) => key !== 'manifest' && key !== 'base')
+  if (unexpected) throw new Error(`Unknown factory featuremap option: --${unexpected}`)
+  return {
+    kind: 'featuremap-check',
+    ...(parsed.manifest ? { manifestPath: parsed.manifest } : {}),
+    ...(parsed.base ? { baseRef: parsed.base } : {}),
+  }
 }
 
 function parseFleetSubcommand(args: string[]): ParsedCommand {
@@ -1601,6 +1632,7 @@ Commands:
   dispatch <KEY|path>   Triage and dispatch one issue
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
+  featuremap check      Validate .agentworkforce/features/manifest.yaml
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:

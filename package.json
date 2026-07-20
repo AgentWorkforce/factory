@@ -49,6 +49,10 @@
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
     },
+    "./featuremap": {
+      "types": "./dist/featuremap/index.d.ts",
+      "import": "./dist/featuremap/index.js"
+    },
     "./hosted": {
       "types": "./dist/hosted/index.d.ts",
       "import": "./dist/hosted/index.js"
@@ -59,6 +63,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
     "verify:e2e": "node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
@@ -74,6 +79,7 @@
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",
+    "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "overrides": {
