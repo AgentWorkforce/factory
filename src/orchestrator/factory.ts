@@ -673,6 +673,12 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
+      if (this.#config.babysitter.enabled) {
+        // Re-run the idempotent receipt fold after adoption returns. This
+        // catches records restored by lifecycle work that completed while the
+        // startup roster drain was in progress.
+        await this.#reconcileRestoredBabysitterReceipts()
+      }
     } catch (error) {
       this.#startupAgentAdoptionActive = false
       if (live) await this.#stopLiveHeartbeat('stopping')
