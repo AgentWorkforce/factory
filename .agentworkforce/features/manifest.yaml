@@ -135,7 +135,7 @@ categories:
       - id: cli-babysit
         name: Standalone Pull Request Babysitter
         cli: factory babysit <PR-number|GitHub-PR-URL>
-        description: Spawn a one-shot task-exit babysitter for an existing open non-draft same-repository PR
+        description: Spawn a one-shot task-exit babysitter for an existing open non-draft same-repository PR with manifest-derived verification guidance scoped to its changed files
         location: src/cli/fleet.ts, src/github/standalone-babysitter.ts
         verify_tier: 6
 
@@ -549,8 +549,8 @@ categories:
       - id: dispatch-agent-task-rendering
         name: Agent Task Rendering
         api: renderAgentTask()
-        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, integration, and feature-map validation instructions
-        location: src/dispatch/templates.ts
+        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, integration, manifest-derived verification, and feature-map validation instructions
+        location: src/dispatch/templates.ts, src/dispatch/test-guidance.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
       - id: dispatch-confirmed-task-injection

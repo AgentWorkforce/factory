@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
@@ -7872,9 +7872,9 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     mount.files.set(path, { content: realIssueFile(25) })
     mount.emit(changeEvent(path, 'event-live-25'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl-pear', 'ar-25-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-25-impl-pear', 'ar-25-review'])
+    })
     expect(factory.status().counters.liveEvents).toBe(1)
     expect(factory.status().counters.liveArrivalLatencyMsLast).toBeGreaterThanOrEqual(0)
     await factory.stop()
@@ -7892,9 +7892,9 @@ describe('FactoryLoop', () => {
 
     mount.files.set(path, { content: realIssueFile(33) })
     mount.emit(changeEvent(path, 'event-live-default-33'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-33-impl-pear', 'ar-33-review'])
+    })
     await factory.stop()
   })
 
@@ -8207,11 +8207,11 @@ describe('FactoryLoop', () => {
     mount.onFirstListTree = () => mount.emit(changeEvent(arrivedPath, 'arrived-during-pull-51'))
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
-    await flush()
-
-    const names = fleet.spawns.map((spawn) => spawn.name)
-    expect(names).toContain('ar-50-impl-pear') // dispatched by the startup full pull
-    expect(names).toContain('ar-51-impl-pear') // captured via the buffered live event during the pull
+    await vi.waitFor(() => {
+      const names = fleet.spawns.map((spawn) => spawn.name)
+      expect(names).toContain('ar-50-impl-pear') // dispatched by the startup full pull
+      expect(names).toContain('ar-51-impl-pear') // captured via the buffered live event during the pull
+    })
     await factory.stop()
   })
 
@@ -8240,9 +8240,9 @@ describe('FactoryLoop', () => {
 
     mount.files.set(newPath, { content: realIssueFile(35) })
     mount.emit(changeEvent(newPath, '100'))
-    await flush()
-
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl-pear', 'ar-35-review'])
+    await vi.waitFor(() => {
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-35-impl-pear', 'ar-35-review'])
+    })
     await factory.stop()
   })
 
@@ -8326,12 +8326,14 @@ describe('FactoryLoop', () => {
       mount.emit(changeEvent(newPath, 'event-after-start-31'))
       await vi.advanceTimersByTimeAsync(10)
 
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-        'ar-30-impl-pear',
-        'ar-30-review',
-        'ar-31-impl-pear',
-        'ar-31-review',
-      ])
+      await vi.waitFor(() => {
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+          'ar-30-impl-pear',
+          'ar-30-review',
+          'ar-31-impl-pear',
+          'ar-31-review',
+        ])
+      })
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -8351,8 +8353,9 @@ describe('FactoryLoop', () => {
       mount.files.set(path, { content: realIssueFile(32) })
       mount.emit(changeEvent(path, 'event-live-poll-32'))
       await vi.advanceTimersByTimeAsync(10)
-
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
+      await vi.waitFor(() => {
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-32-impl-pear', 'ar-32-review'])
+      })
       await factory.stop()
     } finally {
       vi.useRealTimers()
@@ -9990,6 +9993,45 @@ describe('FactoryLoop', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(fleet.deliveryEvents).toEqual([])
+  })
+
+  it('populates dispatched tasks from the route repository feature manifest', async () => {
+    const repoPath = await mkdtemp(join(tmpdir(), 'factory-dispatch-guidance-'))
+    await mkdir(join(repoPath, '.agentworkforce/features'), { recursive: true })
+    await writeFile(join(repoPath, '.agentworkforce/features/manifest.yaml'), [
+      'categories:',
+      '  dispatch:',
+      '    features:',
+      '      - id: orchestrator-dispatch',
+      '        name: Orchestrator dispatch',
+      '        location: src/orchestrator/factory.ts',
+      '        verify_tier: 2',
+      '',
+    ].join('\n'))
+    const mount = new FakeMountClient({ [issuePath(621)]: issueFile(621) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        clonePaths: { 'AgentWorkforce/pear': repoPath },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(621), issueFile(621)))
+
+      await factory.dispatch(decision)
+
+      expect(fleet.spawns).toHaveLength(2)
+      for (const spawn of fleet.spawns) {
+        expect(spawn.task).toContain('Feature-specific verification guidance:')
+        expect(spawn.task).toContain('Orchestrator dispatch (`orchestrator-dispatch`)')
+        expect(spawn.task).toContain('verify tier 2')
+      }
+    } finally {
+      await factory.stop()
+      await rm(repoPath, { recursive: true, force: true })
+    }
   })
 
   it('does not depend on live task injection when registration lags', async () => {

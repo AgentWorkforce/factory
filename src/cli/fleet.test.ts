@@ -1612,6 +1612,24 @@ describe('fleet CLI runtime', () => {
     try {
       const clonePath = join(root, 'hoopsheet')
       await mkdir(clonePath)
+      await mkdir(join(clonePath, '.agentworkforce/features/verify'), { recursive: true })
+      await writeFile(join(clonePath, '.agentworkforce/features/manifest.yaml'), [
+        'categories:',
+        '  public-sites:',
+        '    features:',
+        '      - id: league-routing',
+        '        name: League routing',
+        '        location: src/routes/league.ts',
+        '        verify_tier: 2',
+        '',
+      ].join('\n'))
+      await writeFile(join(clonePath, '.agentworkforce/features/verify/procedures.md'), [
+        '## Tier 2 — Config',
+        '```bash',
+        'npm run test:league-routing',
+        '```',
+        '',
+      ].join('\n'))
       const configPath = await writeConfig(root, {
         repos: {
           org: 'AgentWorkforce',
@@ -1634,6 +1652,7 @@ describe('fleet CLI runtime', () => {
             html_url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
             head: { ref: 'codex/league-public-sites', sha: 'abc123', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
             base: { ref: 'main' },
+            files: [{ filename: 'src/routes/league.ts' }],
           },
         },
       }, integrations)
@@ -1669,6 +1688,8 @@ describe('fleet CLI runtime', () => {
       })
       expect(fleet.spawns[0]?.task).toContain('standalone PR babysitter')
       expect(fleet.spawns[0]?.task).toContain('Full PR definition of done')
+      expect(fleet.spawns[0]?.task).toContain('League routing (`league-routing`)')
+      expect(fleet.spawns[0]?.task).toContain('npm run test:league-routing')
       expect(fleet.spawns[0]?.task).not.toContain('[factory-pr-ready]')
       expect(JSON.parse(output.text())).toMatchObject({
         status: 'spawned',

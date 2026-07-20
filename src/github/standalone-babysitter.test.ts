@@ -86,6 +86,7 @@ describe('standalone PR babysitter helpers', () => {
           headRefOid: 'live-sha',
           baseRefName: 'main',
           headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
+          files: [{ path: 'src/routes/league.ts' }, { path: 'src/pages/league.tsx' }],
         }),
       }),
     )
@@ -96,6 +97,7 @@ describe('standalone PR babysitter helpers', () => {
       body: 'Live body',
       headRef: 'codex/league-public-sites',
       headSha: 'live-sha',
+      filesChanged: ['src/routes/league.ts', 'src/pages/league.tsx'],
     })
   })
 
