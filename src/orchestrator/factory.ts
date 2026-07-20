@@ -304,6 +304,7 @@ export class FactoryLoop implements Factory {
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
+  readonly #hasProbePrGhRunner: boolean
   readonly #probePrGhRunner: GhRunner
   readonly #logger: Logger
   readonly #clock: Clock
@@ -330,6 +331,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
+  readonly #githubIssueCommentReplays = new Map<string, Promise<void>>()
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
@@ -395,15 +397,19 @@ export class FactoryLoop implements Factory {
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
+  readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
-  // Composite issue identities for which a babysitter has already been spawned, so repeated PR
-  // webhooks / agent-exit safety nets don't respawn it.
+  #startupAgentAdoptionActive = false
+  // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
+  // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
+  // owner per PR.
   readonly #babysitterSpawned = new Set<string>()
   readonly #babysitterSpawnInFlight = new Map<string, Promise<void>>()
-  // Composite issue identity -> the open PR the babysitter is shepherding, including the
+  // Composite issue + PR identity -> the open PR the babysitter is shepherding, including the
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, BabysitterPrRef>()
   readonly #babysitterIssueRefs = new Map<string, IssueRef>()
+  readonly #babysitterReady = new Set<string>()
   readonly #babysitterWakeStates = new Map<string, BabysitterWakeState>()
   // A babysitter announces this fence before invoking destructive git tooling
   // and clears it afterward. Event text can be broker-delivered while a prompt
@@ -451,6 +457,7 @@ export class FactoryLoop implements Factory {
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
+    this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
     this.#probePrGhRunner = ports.probePrGhRunner ?? failClosedGhRunner
     this.#probePrResolver = ports.probePrResolver ?? ((issue) => this.#resolveIssuePr(issue))
     this.#logger = normalizeLogger(ports.logger ?? console)
@@ -644,9 +651,25 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    this.#wireFleetEvents()
-    await this.#adoptInFlightAgents()
-    await this.#restoreBabysitterOwnership()
+    const live = (opts.mode ?? 'live') === 'live'
+    // Capture the legacy registry before the first live heartbeat rewrites it.
+    // Durable lifecycle rows are authoritative, but this fallback is still
+    // required to adopt workers started by pre-lifecycle Factory versions.
+    const legacyRegistry = live
+      ? await readFactoryInFlightRegistry(this.#config.loop.registryPath)
+      : undefined
+    if (live) await this.#startLiveHeartbeat()
+    this.#startupAgentAdoptionActive = true
+    try {
+      this.#wireFleetEvents()
+      await this.#adoptInFlightAgents(legacyRegistry)
+      this.#startupAgentAdoptionActive = false
+      await this.#restoreBabysitterOwnership()
+    } catch (error) {
+      this.#startupAgentAdoptionActive = false
+      if (live) await this.#stopLiveHeartbeat('stopping')
+      throw error
+    }
 
     if (opts.mode === 'dispatch-owner') {
       this.#started = true
@@ -660,7 +683,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    if ((opts.mode ?? 'live') === 'live') {
+    if (live) {
       this.#started = true
       try {
         await this.#startLiveSubscription(issueSource, opts.liveSubscription)
@@ -733,6 +756,7 @@ export class FactoryLoop implements Factory {
       this.#clarificationIntents.clear()
 
       await this.#drainBabysitterWakesForStop()
+      await this.#drainAgentExitsInFlight()
 
       // Durable relay placements must survive an owner restart so a successor
       // can adopt them. The one-shot/daemon stop path releases only
@@ -756,6 +780,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
+      this.#babysitterReady.clear()
       this.#babysitterCriticalAgents.clear()
       const subscription = this.#subscription
       this.#subscription = undefined
@@ -837,7 +862,6 @@ export class FactoryLoop implements Factory {
     overrides: Partial<FactoryLiveSubscriptionOptions> = {},
   ): Promise<void> {
     const options = this.#liveOptions(overrides)
-    await this.#startLiveHeartbeat()
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -1313,6 +1337,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #sweepPrStateCompletions(reason: 'live-timer' | 'run-loop'): Promise<void> {
+    // This timer is also the durable safety net for fleet exit events missed
+    // while the event loop was busy (for example during a large startup pull).
+    // Keep reconciliation active even when babysitters own PR completion.
+    await this.#fleet.reconcileTrackedAgents?.()
     // When the babysitter owns PR-open, completion is driven by PR webhooks +
     // the babysitter's readiness signal (see #handlePrChange / #handleAgentExit),
     // not this polling sweep. Disabling it here is what makes the babysitter path
@@ -1348,6 +1376,10 @@ export class FactoryLoop implements Factory {
             if (pr.draft) {
               this.#increment('completionSweepDraftPr')
               this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
+              return undefined
+            }
+            if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
+              this.#increment('completionSweepMissingPr')
               return undefined
             }
             return { record, pr }
@@ -1485,6 +1517,7 @@ export class FactoryLoop implements Factory {
           await this.#recordCanonicalIssueState(issue)
         }
         issueEntries.push({ path, issue })
+        await this.#refreshLiveHeartbeatIfDue()
       }
       if (issueSource === 'github') {
         // New ready work must not sit behind a long sequence of stale
@@ -1502,6 +1535,7 @@ export class FactoryLoop implements Factory {
       }
 
       for (const { issue } of issueEntries) {
+        await this.#refreshLiveHeartbeatIfDue()
         if (!issue) {
           continue
         }
@@ -2134,7 +2168,7 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  async dispatch(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
+  async dispatch(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
     const key = `${issueStateKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
@@ -2155,7 +2189,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean } = {}): Promise<DispatchResult> {
+  async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const batch = await this.#batch()
     const existingRecord = batch.getIssue(decision.issue)
@@ -2200,16 +2234,9 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    const escalationReason = triageEscalationReason(decision)
-    if (escalationReason) {
-      const replayedResult = await this.#escalateTriage(decision, escalationReason, dryRun)
-      this.#recordTriageEscalation(decision, escalationReason)
-      return replayedResult ?? { issue: decision.issue, agents: [], dryRun }
-    }
-
-    // TODO(AR-274 follow-up): short-circuit LLM triage once label-derived
-    // routes are authoritative for dispatch identity.
-    const labelDispatch = labelDerivedDispatchDecision(liveIssue, decision, this.#config)
+    const labelDispatch = opts.labelsValidated
+      ? { ok: true as const, decision }
+      : labelDerivedDispatchDecision(liveIssue, decision, this.#config)
     if (!labelDispatch.ok) {
       const comment = labelDispatchFailureComment(decision.issue, labelDispatch)
       this.#logger.warn?.('[factory] skipped dispatch due to invalid repo labels', {
@@ -2235,10 +2262,16 @@ export class FactoryLoop implements Factory {
       return { issue: decision.issue, agents: [], comments: [comment], dryRun }
     }
 
-    let dispatchDecision = labelDispatch.decision
+    let dispatchDecision = authoritativeRoutedDecision(decision, labelDispatch.decision)
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
+    const escalationReason = triageEscalationReason(dispatchDecision)
+    if (escalationReason) {
+      const replayedResult = await this.#escalateTriage(dispatchDecision, escalationReason, dryRun)
+      this.#recordTriageEscalation(dispatchDecision, escalationReason)
+      return replayedResult ?? { issue: dispatchDecision.issue, agents: [], dryRun }
+    }
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
@@ -2447,7 +2480,24 @@ export class FactoryLoop implements Factory {
   #wireFleetEvents(): void {
     if (!this.#offAgentExit) {
       this.#offAgentExit = this.#fleet.onAgentExit((name, reason) => {
-        void this.#handleAgentExit(name, reason)
+        // Internal broker subscriptions replay historical exits immediately.
+        // Ignore that pre-hydration history; the roster reconcile below runs
+        // after durable records are restored and is the authoritative signal.
+        if (this.#startupAgentAdoptionActive) return
+        // Broker replay can deliver an old exit immediately when the listener
+        // is installed, before durable agents are restored. Queue a later
+        // roster-reconciled exit behind it instead of dropping the newer event.
+        const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
+        const handling = previous
+          .catch(() => undefined)
+          .then(async () => await this.#handleAgentExit(name, reason))
+          .catch((error) => this.#error(error))
+          .finally(() => {
+            if (this.#agentExitsInFlight.get(name) === handling) {
+              this.#agentExitsInFlight.delete(name)
+            }
+          })
+        this.#agentExitsInFlight.set(name, handling)
       })
     }
     if (!this.#offDeliveryFailed) {
@@ -2480,12 +2530,16 @@ export class FactoryLoop implements Factory {
   // in the durable lifecycle store, restore their full batch/spec association,
   // then reconcile once so exits that happened while this process was down are
   // handled instead of being dropped as unknown agents.
-  async #adoptInFlightAgents(): Promise<void> {
+  async #adoptInFlightAgents(legacyRegistry?: FactoryInFlightRegistry): Promise<void> {
     try {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
       let hasNonterminalDurableLifecycle = false
-      for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      const durableLifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+      this.#logger.info?.('[factory] durable startup adoption loaded', {
+        lifecycles: durableLifecycles.length,
+      })
+      for (const [key, lifecycle] of durableLifecycles) {
         if (isTerminalDispatchLifecycle(lifecycle)) continue
         hasNonterminalDurableLifecycle = true
         const claim = await this.#state.claimDispatchLifecycle(
@@ -2530,7 +2584,7 @@ export class FactoryLoop implements Factory {
       // records existed. It preserves observation, but only new lifecycle rows
       // carry enough decision/spec state to process the reconciled exit.
       if (agents.length === 0 && !hasNonterminalDurableLifecycle) {
-        const registry = await readFactoryInFlightRegistry(this.#config.loop.registryPath)
+        const registry = legacyRegistry ?? await readFactoryInFlightRegistry(this.#config.loop.registryPath)
         agents.push(...(registry?.agents ?? [])
           .filter((agent) => agent.invocationId || agent.node)
           .map((agent) => ({ name: agent.name, invocationId: agent.invocationId, node: agent.node })))
@@ -2539,9 +2593,34 @@ export class FactoryLoop implements Factory {
         this.#fleet.hydrateTracked(agents)
       }
       this.#scheduleDispatchLifecycleRenewal()
-      if (this.#fleet.hydrateTracked) await this.#fleet.reconcileTrackedAgents?.()
+      if (this.#fleet.hydrateTracked) {
+        this.#startupAgentAdoptionActive = false
+        this.#logger.info?.('[factory] durable startup roster reconciliation started', {
+          agents: agents.map((agent) => agent.name),
+        })
+        await this.#fleet.reconcileTrackedAgents?.()
+        this.#logger.info?.('[factory] durable startup roster reconciliation completed', {
+          pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => agents.some((agent) => agent.name === name)),
+        })
+        // Fleet callbacks are intentionally synchronous at the port boundary,
+        // but recovery work is asynchronous (issue reads, worktree restore,
+        // PR publication). Finish exits discovered by the startup reconcile
+        // before the full ready-issue backfill can monopolize mount I/O.
+        await this.#drainAgentExitsInFlight(new Set(agents.map((agent) => agent.name)))
+        this.#logger.info?.('[factory] durable startup reconciled exits drained')
+      }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
+    }
+  }
+
+  async #drainAgentExitsInFlight(names?: ReadonlySet<string>): Promise<void> {
+    for (;;) {
+      const pending = [...this.#agentExitsInFlight]
+        .filter(([name]) => !names || names.has(name))
+        .map(([, handling]) => handling)
+      if (pending.length === 0) return
+      await Promise.allSettled(pending)
     }
   }
 
@@ -2735,12 +2814,15 @@ export class FactoryLoop implements Factory {
       return false
     }
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    const pullRequests = mergePublishedPullRequests(previous, pullRequest)
+    const primaryPullRequest = previous?.pullRequest ?? pullRequest ?? pullRequests[0]
     const lifecycle = lifecycleFromInFlightRecord(
       record,
       previous?.runId ?? randomUUID(),
       phase,
       this.#clock.now(),
-      pullRequest ?? previous?.pullRequest,
+      primaryPullRequest,
+      pullRequests,
       releaseReason ?? previous?.releaseReason,
     )
     for (const agent of lifecycle.agents) {
@@ -2918,28 +3000,42 @@ export class FactoryLoop implements Factory {
       return
     }
     if (lifecycle.phase === 'publishing') {
-      const implementer = [...record.agents.values()].find((agent) => agent.spec.role === 'implementer')
-      if (!implementer) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
-      const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
-      if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request`)
-      if (!await this.#saveDispatchLifecycle(record, 'published', published)) return
+      const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
+      if (implementers.length === 0) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
+      const publishedReceipts: GithubPublishPullRequestResult[] = []
+      for (const implementer of implementers) {
+        const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
+        if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request for ${implementer.spec.repo}`)
+        publishedReceipts.push(published)
+        if (!await this.#saveDispatchLifecycle(record, 'publishing', published)) return
+      }
+      if (!await this.#saveDispatchLifecycle(record, 'published')) return
       if (this.#config.babysitter.enabled) {
-        await this.#ensureBabysitter(record, {
-          repo: published.repo,
-          prNumber: published.number,
-          url: published.url,
-        })
+        for (const receipt of publishedReceipts) {
+          await this.#ensureBabysitter(record, {
+            repo: receipt.repo,
+            prNumber: receipt.number,
+            url: receipt.url,
+            headRef: receipt.headRef,
+          })
+        }
         return
       }
       await this.#completeIssue(record)
       return
     }
     if (lifecycle.phase === 'published' && this.#config.babysitter.enabled && lifecycle.pullRequest) {
-      await this.#ensureBabysitter(record, {
-        repo: lifecycle.pullRequest.repo,
-        prNumber: lifecycle.pullRequest.number,
-        url: lifecycle.pullRequest.url,
-      })
+      for (const receipt of lifecycle.pullRequests ?? [lifecycle.pullRequest]) {
+        await this.#ensureBabysitter(record, {
+          repo: receipt.repo,
+          prNumber: receipt.number,
+          url: receipt.url,
+          headRef: receipt.headRef,
+        })
+      }
+      return
+    }
+    if (lifecycle.phase === 'published' && !await this.#allImplementersHaveCompletionPr(record)) {
       return
     }
     if (lifecycle.phase === 'published' || lifecycle.phase === 'writeback-applied') {
@@ -3117,7 +3213,7 @@ export class FactoryLoop implements Factory {
     // the babysitter's durable ownership/wake/critical state while that epoch
     // is still valid so a later reopened issue cannot inherit a stale PR owner.
     if (this.#usesDurableDispatchLifecycle() && this.#config.babysitter.enabled) {
-      await this.#cancelBabysitterWake(issueKey(record.issue))
+      await this.#cancelBabysittersForIssue(record.issue)
     }
     if (!await this.#saveDispatchLifecycle(record, 'complete')) return false
     this.#increment(releaseReason === 'issue-human-review' ? 'humanReview' : 'done')
@@ -3202,18 +3298,20 @@ export class FactoryLoop implements Factory {
       }
 
       const decision = await this.triageIssue(issue)
-      const escalationReason = triageEscalationReason(decision)
+      const routed = labelDerivedDispatchDecision(issue, decision, this.#config)
+      const escalationDecision = routed.ok ? authoritativeRoutedDecision(decision, routed.decision) : decision
+      const escalationReason = triageEscalationReason(escalationDecision)
       if (escalationReason) {
-        await this.#escalateTriage(decision, escalationReason, this.#config.dryRun)
-        this.#recordTriageEscalation(decision, escalationReason)
+        await this.#escalateTriage(escalationDecision, escalationReason, this.#config.dryRun)
+        this.#recordTriageEscalation(escalationDecision, escalationReason)
         return
       }
 
       if (batch.canStart()) {
-        await this.dispatch(decision, { dryRun: this.#config.dryRun })
+        await this.dispatch(escalationDecision, { dryRun: this.#config.dryRun, labelsValidated: routed.ok })
       } else {
-        if (batch.queue(decision, this.#config.dryRun)) {
-          this.#emit('issue-queued', { issue: decision.issue })
+        if (batch.queue(escalationDecision, this.#config.dryRun)) {
+          this.#emit('issue-queued', { issue: escalationDecision.issue })
         }
       }
     } catch (error) {
@@ -3307,6 +3405,7 @@ export class FactoryLoop implements Factory {
         lastProgressAtMs,
         { processed, total: paths.length, path },
       )
+      await this.#refreshLiveHeartbeatIfDue()
     }
     this.#logger.info?.('[factory] GitHub issue ingestion completed', {
       dryRun: opts.dryRun ?? false,
@@ -3336,6 +3435,7 @@ export class FactoryLoop implements Factory {
     let scanned = 0
     let lastProgressAtMs = startedAtMs
     for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading')) {
+      await this.#refreshLiveHeartbeatIfDue()
       if (!isLinearIssueMirrorCandidatePath(path)) {
         continue
       }
@@ -3364,7 +3464,8 @@ export class FactoryLoop implements Factory {
       const issuePaths = new Map<string, string>()
       for (const root of githubIssueScanRoots(this.#config)) {
         const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
-        for (const path of paths) {
+        for (let index = 0; index < paths.length; index += 1) {
+          const path = paths[index]!
           const parts = githubIssuePathParts(path)
           if (parts) {
             const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
@@ -3385,7 +3486,12 @@ export class FactoryLoop implements Factory {
           } else if (isGithubIssueTreePath(path)) {
             this.#increment('githubIssuesIgnoredByPathRegex')
           }
+          if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+            await this.#refreshLiveHeartbeatIfDue()
+            await liveEventYield()
+          }
         }
+        await this.#refreshLiveHeartbeatIfDue()
       }
       for (const [identity, path] of issuePaths) {
         this.#githubIssuePreferredPaths.set(identity, path)
@@ -4298,6 +4404,13 @@ export class FactoryLoop implements Factory {
       }
       return
     }
+    const tracingReconciledExit = reason === 'reconciled-missing'
+    if (tracingReconciledExit) {
+      this.#logger.info?.('[factory] reconciled agent exit recovery started', {
+        issue: record.issue.key,
+        name,
+      })
+    }
     if (!await this.#assertDispatchLifecycleOwner(record)) {
       this.#logger.warn?.('[factory] ignored agent exit after durable lifecycle ownership was lost', {
         issue: record.issue.key,
@@ -4305,6 +4418,7 @@ export class FactoryLoop implements Factory {
       })
       return
     }
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit ownership confirmed', { issue: record.issue.key, name })
 
     // The issue-comment subscription and the fleet exit callback are separate
     // event streams. Reconcile comments that are already durable in the mount
@@ -4314,9 +4428,11 @@ export class FactoryLoop implements Factory {
       this.#increment('githubQuestionExitsSuppressed')
       return
     }
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit question replay completed', { issue: record.issue.key, name })
 
     const exiting = record.agents.get(name)
     if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })
+    if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
     if (this.#usesDurableDispatchLifecycle()) {
       const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
@@ -4329,9 +4445,9 @@ export class FactoryLoop implements Factory {
     if (isCompletionReason(reason)) {
       if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,
-      })) {
+      }, exiting)) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
-        else await this.#completeIssue(record)
+        else if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
         return
       }
       let publishedPr: GithubPublishPullRequestResult | undefined
@@ -4357,7 +4473,7 @@ export class FactoryLoop implements Factory {
         // itself finishing means it believes the PR is ready, so re-check and
         // advance to Human Review.
         if (exiting?.spec.role === 'babysitter') {
-          await this.#maybeAdvanceToHumanReview(record)
+          await this.#maybeAdvanceToHumanReview(record, name)
         } else if (publishedPr) {
           await this.#ensureBabysitter(record, {
             repo: publishedPr.repo,
@@ -4369,7 +4485,7 @@ export class FactoryLoop implements Factory {
         }
         return
       }
-      await this.#completeIssue(record)
+      if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
       return
     }
 
@@ -4379,14 +4495,24 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
-        openOnly: this.#config.babysitter.enabled,
-      })) {
+      const hasCompletionPr = tracked.spec.role === 'implementer'
+        ? await this.#issueHasCompletionPr(record, {
+            openOnly: this.#config.babysitter.enabled,
+          }, tracked)
+        : false
+      if (tracingReconciledExit) {
+        this.#logger.info?.('[factory] reconciled agent exit completion PR lookup completed', {
+          issue: record.issue.key,
+          name,
+          hasCompletionPr,
+        })
+      }
+      if (hasCompletionPr) {
         if (this.#config.babysitter.enabled) {
           await this.#ensureBabysitterForIssue(record)
           return
         }
-        await this.#completeIssue(record)
+        if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
         return
       }
 
@@ -4400,6 +4526,7 @@ export class FactoryLoop implements Factory {
       // ahead of base, clone gone) it returns undefined and we fall through.
       if (tracked.spec.role === 'implementer') {
         await this.#saveDispatchLifecycle(record, 'publishing')
+        if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit PR publication started', { issue: record.issue.key, name })
         const publishedPr = await this.#tryPublishImplementerPr(record, tracked)
         if (publishedPr) {
           await this.#saveDispatchLifecycle(record, 'published', publishedPr)
@@ -4410,7 +4537,7 @@ export class FactoryLoop implements Factory {
               url: publishedPr.url,
             })
           } else {
-            await this.#completeIssue(record)
+            if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
           }
           return
         }
@@ -4530,6 +4657,10 @@ export class FactoryLoop implements Factory {
       return undefined
     }
     try {
+      // A missed exit can be reconciled after the worker checkout was pruned.
+      // Re-create its deterministic worktree from the retained local branch so
+      // publication can still push/read the completed commit.
+      await this.#prepareAgentWorktree(record, implementer.spec)
       const published = await this.#publishImplementerPullRequest(record, implementer)
       if (published) {
         this.#increment('implementerPrsPublishedOnExit')
@@ -4558,7 +4689,6 @@ export class FactoryLoop implements Factory {
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
-    if (durable?.pullRequest) return durable.pullRequest
     const cached = this.#publishedPullRequests.get(key)
     if (cached) return cached
 
@@ -4584,6 +4714,10 @@ export class FactoryLoop implements Factory {
       ? sourceRepoParts.owner
       : undefined
     const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+    const durableReceipt = publishedPullRequests(durable).find((receipt) =>
+      receipt.repo.toLowerCase() === repo.toLowerCase()
+    )
+    if (durableReceipt) return durableReceipt
     const expectedHeadRef = implementer.spec.branch ?? remoteBranch
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
@@ -4634,6 +4768,42 @@ export class FactoryLoop implements Factory {
     repo: string,
     expectedHeadRef: string,
   ): Promise<GithubPublishPullRequestResult | undefined> {
+    if (this.#hasProbePrGhRunner) {
+      try {
+        const result = await this.#probePrGhRunner([
+          'pr',
+          'list',
+          '--repo',
+          repo,
+          '--head',
+          expectedHeadRef,
+          '--state',
+          'open',
+          '--json',
+          'number,url,headRefName,isDraft',
+          '--limit',
+          '10',
+        ])
+        const payload = parseJsonContent(result.stdout)
+        if (Array.isArray(payload)) {
+          const candidates = payload.flatMap((entry): GithubPublishPullRequestResult[] => {
+            const candidate = asRecord(entry)
+            const number = numberValue(candidate?.number)
+            const url = stringValue(candidate?.url)
+            const headRef = stringValue(candidate?.headRefName)
+            if (!number || !url || headRef !== expectedHeadRef || candidate?.isDraft !== false) return []
+            return [{ repo, number, url, headRef }]
+          })
+          return candidates.sort((a, b) => b.number - a.number)[0]
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] exact-head gh PR lookup failed; falling back to mounted metadata', {
+          repo,
+          headRef: expectedHeadRef,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
     const parts = githubRepoParts(repo)
     if (!parts) return undefined
     const roots = [
@@ -4956,11 +5126,26 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
 
-  async #issueHasCompletionPr(record: InFlightIssue, opts: { openOnly?: boolean } = {}): Promise<boolean> {
+  async #issueHasCompletionPr(
+    record: InFlightIssue,
+    opts: { openOnly?: boolean } = {},
+    implementer?: TrackedAgent,
+  ): Promise<boolean> {
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
         return false
+      }
+      if (implementer?.spec.branch && record.decision.implementers.length > 1) {
+        const sourceOwner = record.issue.path
+          ? githubIssuePathParts(record.issue.path)?.owner
+          : undefined
+        const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+        if (publishedPullRequests(lifecycle).some((receipt) =>
+          receipt.repo.toLowerCase() === repo.toLowerCase()
+        )) return true
+        return Boolean(await this.#openPullRequestByHead(repo, implementer.spec.branch))
       }
       // Only a NON-DRAFT (ready) PR counts as completion. A draft PR means the
       // work isn't review-ready, so an implementer exiting with only a draft PR
@@ -4978,6 +5163,18 @@ export class FactoryLoop implements Factory {
       this.#increment('exitPrProbeFailures')
       return false
     }
+  }
+
+  async #allImplementersHaveCompletionPr(
+    record: InFlightIssue,
+    opts: { openOnly?: boolean } = {},
+  ): Promise<boolean> {
+    const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
+    if (implementers.length === 0) return false
+    if (implementers.length === 1) return true
+    const completed = await Promise.all(implementers.map(async (implementer) =>
+      this.#issueHasCompletionPr(record, opts, implementer)))
+    return completed.every(Boolean)
   }
 
   async #resumeTrackedAgent(
@@ -5008,11 +5205,12 @@ export class FactoryLoop implements Factory {
     record.agents.set(result.name, tracked)
     if (tracked.spec.role === 'babysitter') {
       this.#babysitterCriticalAgents.delete(name)
-      const ref = this.#babysitterPr.get(issueKey(record.issue))
+      const ownership = [...this.#babysitterPr.entries()].find(([, candidate]) => candidate.agentName === name)
+      const [ownershipKey, ref] = ownership ?? []
       if (ref) {
         ref.agentName = result.name
         for (const [wakeKey, state] of this.#babysitterWakeStates) {
-          if (issueKey(state.issue) !== issueKey(record.issue)) continue
+          if (state.agentName !== name) continue
           if (state.timer) clearTimeout(state.timer)
           this.#babysitterWakeStates.delete(wakeKey)
           state.timer = undefined
@@ -5027,7 +5225,7 @@ export class FactoryLoop implements Factory {
           this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
           if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
         }
-        await this.#persistBabysitterSession(record.issue, ref, tracked)
+        await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
       }
     }
     await this.#reportAgent(record, tracked, 'agent.resumed')
@@ -5102,7 +5300,7 @@ export class FactoryLoop implements Factory {
         return
       }
       this.#increment('agentLifecycleReadySignals')
-      await this.#maybeAdvanceToHumanReview(record)
+      await this.#maybeAdvanceToHumanReview(record, signal.name)
       return
     }
 
@@ -5203,7 +5401,7 @@ export class FactoryLoop implements Factory {
           this.#increment('prReadySignalsIgnoredIssueMismatch')
           return
         }
-        await this.#maybeAdvanceToHumanReview(record)
+        await this.#maybeAdvanceToHumanReview(record, ready.agentName)
         return
       }
     }
@@ -6175,12 +6373,24 @@ export class FactoryLoop implements Factory {
   }
 
   async #replayGithubIssueComments(key: string): Promise<void> {
+    const active = this.#githubIssueCommentReplays.get(key)
+    if (active) return await active
+    const replay = this.#runGithubIssueCommentReplay(key).finally(() => {
+      if (this.#githubIssueCommentReplays.get(key) === replay) {
+        this.#githubIssueCommentReplays.delete(key)
+      }
+    })
+    this.#githubIssueCommentReplays.set(key, replay)
+    return await replay
+  }
+
+  async #runGithubIssueCommentReplay(key: string): Promise<void> {
     const watch = this.#githubIssueCommentWatchStates.get(key)
     if (!watch) return
     const comments: Array<{ path: string; id: number }> = []
     const sinceCommentId = githubCommentNumericId(watch.sinceCommentId ?? watch.lastSeenCommentId)
     const processedCommentIds = new Set(watch.processedCommentIds ?? [])
-    for (const path of await this.#githubIssueCommentPaths(watch.source)) {
+    for (const path of await this.#githubIssueCommentPaths(watch.source, watch.issue.path)) {
       const parts = githubIssueCommentPathParts(path)
       const id = parts ? githubCommentNumericId(parts.commentId) : undefined
       if (id !== undefined && id > sinceCommentId && !processedCommentIds.has(String(id))) {
@@ -6208,14 +6418,25 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #githubIssueCommentPaths(source: GithubIssueSourceRef): Promise<string[]> {
+  async #githubIssueCommentPaths(source: GithubIssueSourceRef, issuePath?: string): Promise<string[]> {
     const paths = new Set<string>()
     const owner = encodeURIComponent(source.owner)
     const repo = encodeURIComponent(source.repo)
-    for (const prefix of [
-      `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
-      `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
-    ]) {
+    const issueParts = issuePath ? githubIssuePathParts(issuePath) : undefined
+    const canonicalIssueRoot = issuePath
+      && issueParts?.owner.toLowerCase() === source.owner.toLowerCase()
+      && issueParts.repo.toLowerCase() === source.repo.toLowerCase()
+      && issueParts.number === source.number
+      && /\/(?:meta|metadata)\.json$/u.test(issuePath)
+      ? dirname(issuePath)
+      : undefined
+    const prefixes = canonicalIssueRoot
+      ? [canonicalIssueRoot]
+      : [
+          `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+          `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+        ]
+    for (const prefix of prefixes) {
       try {
         for (const path of await this.#mount.listTree(prefix)) {
           const parts = githubIssueCommentPathParts(path)
@@ -6666,8 +6887,9 @@ export class FactoryLoop implements Factory {
   async #restoreBabysitterOwnership(): Promise<void> {
     const batch = await this.#batch()
     for (const [persistedKey, session] of await this.#state.listBabysitterSessions(this.#workspaceId)) {
+      const ownershipKey = babysitterOwnershipKey(session.issue, session)
       if (
-        persistedKey !== issueKey(session.issue) ||
+        (persistedKey !== issueKey(session.issue) && persistedKey !== ownershipKey) ||
         !validGithubRepo(session.repo) ||
         !validPrNumber(session.prNumber) ||
         !session.agentName
@@ -6698,7 +6920,10 @@ export class FactoryLoop implements Factory {
       }
       const record = batch.getIssue(session.issue)
       const tracked = record?.agents.get(session.agentName)
-        ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        ?? [...(record?.agents.values() ?? [])].find((agent) =>
+          agent.spec.role === 'babysitter' &&
+          githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) ===
+            githubPrIdentity(session.repo, session.prNumber))
         ?? durableBabysitterTrackedAgent(session, this.#config.agentCapabilities.babysitter)
       const ref: BabysitterPrRef = {
         repo: session.repo,
@@ -6706,10 +6931,14 @@ export class FactoryLoop implements Factory {
         path: session.path,
         agentName: session.agentName,
       }
-      this.#babysitterPr.set(persistedKey, ref)
-      this.#babysitterIssueRefs.set(persistedKey, { ...session.issue })
-      this.#babysitterSpawned.add(persistedKey)
+      this.#babysitterPr.set(ownershipKey, ref)
+      this.#babysitterIssueRefs.set(ownershipKey, { ...session.issue })
+      this.#babysitterSpawned.add(ownershipKey)
       if (session.critical) this.#babysitterCriticalAgents.add(session.agentName)
+      if (persistedKey !== ownershipKey) {
+        await this.#state.setBabysitterSession(this.#workspaceId, ownershipKey, session)
+        await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
+      }
       this.#increment('babysitterOwnershipRestored')
       const pendingKinds = session.pendingKinds.filter(isBabysitterWakeKind)
       if (pendingKinds.length > 0) {
@@ -6735,22 +6964,32 @@ export class FactoryLoop implements Factory {
     this.#babysitterWakeStates.clear()
   }
 
-  async #cancelBabysitterWake(issueIdentity: string): Promise<void> {
-    const issue = this.#babysitterIssueRefs.get(issueIdentity)
+  async #cancelBabysitterWake(ownershipKey: string): Promise<void> {
+    const issue = this.#babysitterIssueRefs.get(ownershipKey)
+    const ref = this.#babysitterPr.get(ownershipKey)
     const mayClearDurable = !this.#usesDurableDispatchLifecycle()
       || Boolean(issue && await this.#assertIssueDispatchLifecycleOwner(issue))
     for (const [key, state] of this.#babysitterWakeStates) {
-      if (issueKey(state.issue) !== issueIdentity) continue
+      if (!ref || babysitterOwnershipKey(state.issue, state) !== ownershipKey) continue
       state.cancelled = true
       delete state.tracked.spec.pendingPullRequestWake
       if (state.timer) clearTimeout(state.timer)
       this.#babysitterWakeStates.delete(key)
       this.#babysitterCriticalAgents.delete(state.agentName)
     }
-    this.#babysitterPr.delete(issueIdentity)
-    this.#babysitterIssueRefs.delete(issueIdentity)
-    this.#babysitterSpawned.delete(issueIdentity)
-    if (mayClearDurable) await this.#state.clearBabysitterSession(this.#workspaceId, issueIdentity)
+    this.#babysitterPr.delete(ownershipKey)
+    this.#babysitterIssueRefs.delete(ownershipKey)
+    this.#babysitterSpawned.delete(ownershipKey)
+    this.#babysitterReady.delete(ownershipKey)
+    if (mayClearDurable) await this.#state.clearBabysitterSession(this.#workspaceId, ownershipKey)
+  }
+
+  async #cancelBabysittersForIssue(issue: IssueRef): Promise<void> {
+    const wanted = issueKey(issue)
+    const keys = [...this.#babysitterIssueRefs.entries()]
+      .filter(([, candidate]) => issueKey(candidate) === wanted)
+      .map(([key]) => key)
+    await Promise.all(keys.map(async (key) => this.#cancelBabysitterWake(key)))
   }
 
   async #routeBabysitterEvent(path: string, extraKinds: Iterable<BabysitterWakeKind> = []): Promise<void> {
@@ -6796,7 +7035,7 @@ export class FactoryLoop implements Factory {
   async #babysitterOwnerFor(
     repo: string,
     prNumber: number,
-  ): Promise<{ issue: IssueRef; record?: InFlightIssue; ref: BabysitterPrRef; tracked: TrackedAgent } | undefined> {
+  ): Promise<{ key: string; issue: IssueRef; record?: InFlightIssue; ref: BabysitterPrRef; tracked: TrackedAgent } | undefined> {
     const wanted = githubPrIdentity(repo, prNumber)
     if (!wanted) return undefined
     const batch = await this.#batch()
@@ -6813,7 +7052,7 @@ export class FactoryLoop implements Factory {
         const tracked = record?.agents.get(ref.agentName)
           ?? [...(record?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
           ?? durableBabysitterTrackedAgent({ issue, repo: ref.repo, prNumber: ref.prNumber, path: ref.path, agentName: ref.agentName, critical: false, pendingKinds: [] }, this.#config.agentCapabilities.babysitter)
-        return { issue, record, ref, tracked }
+        return { key, issue, record, ref, tracked }
       }
     }
     return undefined
@@ -6856,7 +7095,8 @@ export class FactoryLoop implements Factory {
     // Owner lookup and queueing straddle async mount/state reads. Revalidate
     // the exact composite owner so a concurrent close/merge cancellation can
     // never recreate durable state from a stale child event.
-    const current = this.#babysitterPr.get(issueKey(issue))
+    const ownershipKey = babysitterOwnershipKey(issue, ref)
+    const current = this.#babysitterPr.get(ownershipKey)
     if (
       !current ||
       current.agentName !== ref.agentName ||
@@ -6865,6 +7105,8 @@ export class FactoryLoop implements Factory {
       this.#increment('babysitterEventsIgnoredStaleOwner')
       return
     }
+    // Any new event invalidates a prior readiness assertion for this exact PR.
+    this.#babysitterReady.delete(ownershipKey)
     const key = babysitterWakeKey(issue, ref)
     let state = this.#babysitterWakeStates.get(key)
     if (!state) {
@@ -6912,7 +7154,7 @@ export class FactoryLoop implements Factory {
     }
     await this.#persistBabysitterSession(
       state.issue,
-      this.#babysitterPr.get(issueKey(state.issue)) ?? {
+      this.#babysitterPr.get(babysitterOwnershipKey(state.issue, state)) ?? {
         repo: state.repo,
         prNumber: state.prNumber,
         agentName: state.agentName,
@@ -6925,12 +7167,13 @@ export class FactoryLoop implements Factory {
     issue: IssueRef,
     ref: BabysitterPrRef,
     tracked?: TrackedAgent,
+    ownershipKey = babysitterOwnershipKey(issue, ref),
   ): Promise<void> {
     if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
       throw new Error(`Babysitter lifecycle ownership lost for ${issue.key}`)
     }
     const pending = tracked?.spec.pendingPullRequestWake
-    await this.#state.setBabysitterSession(this.#workspaceId, issueKey(issue), {
+    await this.#state.setBabysitterSession(this.#workspaceId, ownershipKey, {
       issue: { ...issue },
       repo: ref.repo,
       prNumber: ref.prNumber,
@@ -7092,6 +7335,8 @@ export class FactoryLoop implements Factory {
         state.nextDelayMs = this.#babysitterWakeUnreachableRetryMs
         if (!state.unreachableEscalated) {
           state.unreachableEscalated = true
+          await this.#fleet.reconcileTrackedAgents?.()
+          this.#increment('babysitterEventWakeUnreachableReconciliations')
           this.#increment('babysitterEventWakeUnreachableEscalations')
           this.#logger.warn?.('[factory] babysitter unreachable past grace window; slowing wake retries and flagging for human attention', {
             issue: state.issue.key,
@@ -7188,15 +7433,14 @@ export class FactoryLoop implements Factory {
     // only and can never redirect a live babysitter.
     const owned = await this.#babysitterOwnerFor(repo, snapshot.number)
     if (owned) {
-      const ownedKey = issueKey(owned.issue)
       if (prMetaShowsMerged(snapshot)) {
         if (owned.record) await this.#advanceMergedPrToDone(snapshot, owned.record)
-        else await this.#cancelBabysitterWake(ownedKey)
+        else await this.#cancelBabysitterWake(owned.key)
         return
       }
       if (!this.#config.babysitter.enabled) return
       if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
-        await this.#cancelBabysitterWake(ownedKey)
+        await this.#cancelBabysitterWake(owned.key)
         return
       }
       if (snapshot.draft) this.#increment('babysitterDraftPrSkipped')
@@ -7205,8 +7449,24 @@ export class FactoryLoop implements Factory {
     }
 
     const record = this.#inFlightIssueForPrSnapshot(snapshot, await this.#batch(), repo)
-    const babysitterKey = record ? issueKey(record.issue) : undefined
+    const babysitterKey = record ? babysitterOwnershipKey(record.issue, { repo, prNumber: snapshot.number }) : undefined
     const existing = babysitterKey ? this.#babysitterPr.get(babysitterKey) : undefined
+    const sameRepoOwner = record
+      ? [...this.#babysitterPr.entries()].find(([key, candidate]) =>
+          issueKey(this.#babysitterIssueRefs.get(key) ?? record.issue) === issueKey(record.issue) &&
+          candidate.repo.toLowerCase() === repo.toLowerCase())?.[1]
+      : undefined
+    if (sameRepoOwner && githubPrIdentity(sameRepoOwner.repo, sameRepoOwner.prNumber) !== githubPrIdentity(repo, snapshot.number)) {
+      this.#increment('babysitterEventsIgnoredOwnershipMismatch')
+      this.#logger.warn?.('[factory] ignored PR event that conflicts with established babysitter ownership', {
+        issue: record?.issue.key,
+        ownedRepo: sameRepoOwner.repo,
+        ownedPrNumber: sameRepoOwner.prNumber,
+        eventRepo: repo,
+        eventPrNumber: snapshot.number,
+      })
+      return
+    }
     if (existing && githubPrIdentity(existing.repo, existing.prNumber) !== githubPrIdentity(repo, snapshot.number)) {
       this.#increment('babysitterEventsIgnoredOwnershipMismatch')
       this.#logger.warn?.('[factory] ignored PR event that conflicts with established babysitter ownership', {
@@ -7381,8 +7641,20 @@ export class FactoryLoop implements Factory {
   // probe resolver and spawn the babysitter. Triggered by an implementer exiting
   // after opening its PR (an event, not a poll).
   async #ensureBabysitterForIssue(record: InFlightIssue): Promise<void> {
-    if (this.#babysitterSpawned.has(issueKey(record.issue))) {
-      return
+    if (this.#usesDurableDispatchLifecycle()) {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
+      if (receipts.length > 0) {
+        for (const receipt of receipts) {
+          await this.#ensureBabysitter(record, {
+            repo: receipt.repo,
+            prNumber: receipt.number,
+            url: receipt.url,
+            headRef: receipt.headRef,
+          })
+        }
+        return
+      }
     }
     const issue = await this.#readIssue(record.issue.path)
     if (!issue) {
@@ -7402,7 +7674,7 @@ export class FactoryLoop implements Factory {
     path?: string
     headRef?: string
   }): Promise<void> {
-    const babysitterKey = issueKey(record.issue)
+    const babysitterKey = babysitterOwnershipKey(record.issue, prRef)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
       return
@@ -7430,7 +7702,10 @@ export class FactoryLoop implements Factory {
       if (settled && prRef.path) settled.path = prRef.path
       return
     }
-    const trackedBabysitter = [...record.agents.entries()].find(([, agent]) => agent.spec.role === 'babysitter')
+    const wantedPr = githubPrIdentity(prRef.repo, prRef.prNumber)
+    const trackedBabysitter = [...record.agents.entries()].find(([, agent]) =>
+      agent.spec.role === 'babysitter' &&
+      githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) === wantedPr)
     if (trackedBabysitter) {
       const [trackedName, tracked] = trackedBabysitter
       const owned = tracked.spec.ownedPullRequest
@@ -7466,6 +7741,13 @@ export class FactoryLoop implements Factory {
       const route = record.decision.routes.find((candidate) => candidate.repo === prRef.repo)
         ?? record.decision.routes[0]
       const initialSpec = babysitterSpec(issue, this.#config, route)
+      if ([...this.#babysitterIssueRefs.entries()].some(([key, candidate]) =>
+        key !== babysitterKey && issueKey(candidate) === issueKey(record.issue))) {
+        initialSpec.name = agentNameForRole(issue, 'babysit', {
+          repo: prRef.repo,
+          discriminator: `${sanitizeAgentSlug(prRef.repo)}-${prRef.prNumber}`,
+        })
+      }
       const sharedCheckout = [...record.agents.values()]
         .map((agent) => agent.spec)
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
@@ -7568,19 +7850,23 @@ export class FactoryLoop implements Factory {
   // invoking the lifecycle action with `kind: ready`. The orchestrator trusts that signal and only
   // guards on the PR's OWN webhook-fed meta (still open, not a draft, not already
   // merged) before flipping the issue to Human Review. No `gh` call.
-  async #maybeAdvanceToHumanReview(record: InFlightIssue): Promise<void> {
+  async #maybeAdvanceToHumanReview(record: InFlightIssue, agentName: string): Promise<void> {
     if (this.#completionInFlight.has(issueKey(record.issue))) {
       return
     }
 
-    if (!this.#babysitterPr.has(issueKey(record.issue))) {
+    const ownership = [...this.#babysitterPr.entries()].find(([key, ref]) =>
+      ref.agentName === agentName && issueKey(this.#babysitterIssueRefs.get(key) ?? record.issue) === issueKey(record.issue))
+    if (!ownership) {
       this.#increment('babysitterReadinessGuardBlocked')
       this.#logger.info?.('[factory] babysitter ready signal ignored; PR ownership is no longer active', {
         issue: record.issue.key,
+        babysitter: agentName,
       })
       return
     }
-    const snapshot = await this.#readBabysatPrSnapshot(record)
+    const [ownershipKey, ref] = ownership
+    const snapshot = await this.#readPrSnapshot(ref)
     if (!snapshot) {
       this.#increment('babysitterReadinessGuardBlocked')
       this.#logger.info?.('[factory] babysitter ready signal ignored; authoritative PR meta is unavailable', {
@@ -7598,6 +7884,26 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    this.#babysitterReady.add(ownershipKey)
+    await this.#ensureBabysitterForIssue(record)
+    const owners = [...this.#babysitterIssueRefs.entries()]
+      .filter(([, issue]) => issueKey(issue) === issueKey(record.issue))
+      .map(([key]) => key)
+    const expectedPrOwners = new Set(record.decision.implementers.map((implementer) => implementer.repo)).size
+    if (owners.length < expectedPrOwners) {
+      this.#increment('babysitterReadinessWaitingForPeers')
+      this.#logger.info?.('[factory] babysitter ready; waiting for remaining repository PRs', {
+        issue: record.issue.key,
+        repo: ref.repo,
+        prNumber: ref.prNumber,
+      })
+      return
+    }
+    if (owners.length === 0 || owners.some((key) => !this.#babysitterReady.has(key))) {
+      this.#increment('babysitterReadinessWaitingForPeers')
+      return
+    }
+
     this.#increment('babysitterReadinessReady')
     this.#logger.info?.('[factory] babysitter signalled PR ready; advancing to human review', {
       issue: record.issue.key,
@@ -7610,7 +7916,8 @@ export class FactoryLoop implements Factory {
   // exact path captured when the babysitter was spawned; otherwise scans the
   // repo's pulls subtree for the PR number across known layout shapes.
   async #readBabysatPrSnapshot(record: InFlightIssue): Promise<PullSnapshot | undefined> {
-    const ref = this.#babysitterPr.get(issueKey(record.issue))
+    const ref = [...this.#babysitterPr.entries()]
+      .find(([key]) => issueKey(this.#babysitterIssueRefs.get(key) ?? record.issue) === issueKey(record.issue))?.[1]
     if (!ref) {
       return undefined
     }
@@ -7662,7 +7969,9 @@ export class FactoryLoop implements Factory {
       return true
     }
 
-    const pr = this.#babysitterPr.get(issueKey(record.issue)) ?? await this.#completionPrForIssue(issue)
+    const pr = [...this.#babysitterPr.entries()]
+      .find(([key]) => issueKey(this.#babysitterIssueRefs.get(key) ?? record.issue) === issueKey(record.issue))?.[1]
+      ?? await this.#completionPrForIssue(issue)
     if (!pr) {
       return false
     }
@@ -7799,9 +8108,7 @@ export class FactoryLoop implements Factory {
       const stateKey = issueStateKey(record.issue)
       this.#probePrGhBackoffUntilMs.delete(stateKey)
       this.#probePrResolvedCache.delete(stateKey)
-      this.#babysitterSpawned.delete(completionKey)
-      this.#babysitterPr.delete(completionKey)
-      await this.#cancelBabysitterWake(completionKey)
+      await this.#cancelBabysittersForIssue(record.issue)
       const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
       if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
         for (const publishedKey of this.#publishedPullRequests.keys()) {
@@ -9895,6 +10202,23 @@ type LabelDispatchResolution =
     maxImplementers?: number
   }
 
+function authoritativeRoutedDecision(
+  triaged: TriageDecision,
+  routed: TriageDecision,
+): TriageDecision {
+  if (triaged.confidence !== 'low' || triaged.routes.length > 0 || routed.routes.length === 0) {
+    return routed
+  }
+  return {
+    ...routed,
+    confidence: 'high',
+    rationale: [
+      routed.routes.map((route) => route.rationale).filter(Boolean).join(' '),
+      'Repository identity was resolved authoritatively from the live issue labels or GitHub source repository.',
+    ].filter(Boolean).join(' '),
+  }
+}
+
 function labelDerivedDispatchDecision(
   liveIssue: LinearIssue,
   decision: TriageDecision,
@@ -11236,6 +11560,11 @@ const validPrNumber = (value: number): boolean => Number.isInteger(value) && val
 const githubPrIdentity = (repo: string, prNumber: number): string | undefined =>
   validGithubRepo(repo) && validPrNumber(prNumber) ? `${repo.toLowerCase()}#${prNumber}` : undefined
 
+const babysitterOwnershipKey = (
+  issue: IssueRef,
+  ref: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
+): string => `${issueKey(issue)}:${githubPrIdentity(ref.repo, ref.prNumber) ?? 'invalid'}`
+
 const recordMatchesGithubRepo = (record: InFlightIssue, eventRepo: string, defaultOwner?: string): boolean => {
   if (!validGithubRepo(eventRepo)) return false
   const wanted = eventRepo.toLowerCase()
@@ -11251,7 +11580,7 @@ const recordMatchesGithubRepo = (record: InFlightIssue, eventRepo: string, defau
 }
 
 const babysitterWakeKey = (issue: IssueRef, ref: BabysitterPrRef): string =>
-  `${issueKey(issue)}:${githubPrIdentity(ref.repo, ref.prNumber) ?? 'invalid'}:${ref.agentName}`
+  `${babysitterOwnershipKey(issue, ref)}:${ref.agentName}`
 
 const BABYSITTER_WAKE_KIND_ORDER: readonly BabysitterWakeKind[] = [
   'changes-requested',
@@ -11866,12 +12195,36 @@ const durableBabysitterTrackedAgent = (
 const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
+const publishedPullRequests = (lifecycle: DispatchLifecycle | undefined): GithubPublishPullRequestResult[] => {
+  const receipts = [
+    ...(lifecycle?.pullRequests ?? []).filter(Boolean),
+    ...(lifecycle?.pullRequest ? [lifecycle.pullRequest] : []),
+  ]
+  return [...new Map(receipts.map((receipt) => [
+    `${receipt.repo.toLowerCase()}#${receipt.number}`,
+    { ...receipt },
+  ])).values()]
+}
+
+const mergePublishedPullRequests = (
+  lifecycle: DispatchLifecycle | undefined,
+  receipt: GithubPublishPullRequestResult | undefined,
+): GithubPublishPullRequestResult[] => {
+  const receipts = publishedPullRequests(lifecycle)
+  if (receipt) receipts.push(receipt)
+  return [...new Map(receipts.map((candidate) => [
+    candidate.repo.toLowerCase(),
+    { ...candidate },
+  ])).values()]
+}
+
 const lifecycleFromInFlightRecord = (
   record: InFlightIssue,
   runId: string,
   phase: DispatchLifecyclePhase,
   updatedAtMs: number,
   pullRequest?: GithubPublishPullRequestResult,
+  pullRequests: GithubPublishPullRequestResult[] = [],
   releaseReason?: string,
 ): DispatchLifecycle => ({
   runId,
@@ -11882,6 +12235,7 @@ const lifecycleFromInFlightRecord = (
   agents: [...record.agents].map(([name, tracked]) => ({ name, tracked: cloneTrackedAgent(tracked) })),
   invocationIds: [...record.invocationIds],
   result: record.result ? structuredClone(record.result) : undefined,
+  ...(pullRequests.length > 0 ? { pullRequests: pullRequests.map((receipt) => ({ ...receipt })) } : {}),
   ...(pullRequest ? { pullRequest: { ...pullRequest } } : {}),
   ...(releaseReason ? { releaseReason } : {}),
   updatedAtMs,

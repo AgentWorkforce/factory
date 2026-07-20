@@ -108,6 +108,8 @@ export type DispatchLifecycle = {
   agents: Array<{ name: string; tracked: TrackedAgent; releasedAtMs?: number }>
   invocationIds: string[]
   result?: import('../types').DispatchResult
+  /** All repository-specific PR receipts for team dispatches. `pullRequest` remains the primary receipt for compatibility. */
+  pullRequests?: import('./mount').GithubPublishPullRequestResult[]
   pullRequest?: import('./mount').GithubPublishPullRequestResult
   releaseReason?: string
   lease?: DispatchLifecycleLease

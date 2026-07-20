@@ -2069,6 +2069,60 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('preflights configured clone mounts with bounded concurrency before live start', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
+    try {
+      const clonePaths = Object.fromEntries(
+        Array.from({ length: 9 }, (_, index) => [`AgentWorkforce/repo-${index}`, join(root, `repo-${index}`)]),
+      )
+      const configPath = await writeConfig(root, {
+        repos: {
+          byLabel: Object.fromEntries(Object.keys(clonePaths).map((repo) => [repo.split('/')[1], repo])),
+          clonePaths,
+          default: 'AgentWorkforce/repo-0',
+        },
+      })
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      let active = 0
+      let maxActive = 0
+      const mounted: string[] = []
+      const ensureLocalMount = vi.fn(async (_workspaceId: string, startDir: string) => {
+        if (startDir === process.cwd()) return
+        mounted.push(startDir)
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        active -= 1
+      })
+
+      await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(maxActive).toBe(4)
+      expect(mounted.sort()).toEqual(Object.values(clonePaths).sort())
+      expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('uses ./factory.config.json by default for factory commands', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-default-config-'))
     const previousCwd = process.cwd()

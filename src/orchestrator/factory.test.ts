@@ -1209,6 +1209,36 @@ class BlockingIssueReadMount extends FakeMountClient {
   }
 }
 
+class CpuHeavyGithubTreeMount extends FakeMountClient {
+  observedStaleWhileScanning = false
+
+  constructor(
+    readonly clock: ManualClock,
+    readonly opts: { heartbeatPath: string; staleMs: number; advanceMs: number; issueCount: number },
+  ) {
+    super()
+  }
+
+  override async listTree(prefix: string): Promise<string[]> {
+    if (prefix !== '/github/repos/AgentWorkforce/factory/issues') {
+      return []
+    }
+    const paths = Array.from({ length: this.opts.issueCount }, (_, index) =>
+      githubIssueNestedMetaPath('AgentWorkforce', 'factory', 1_000 + index)
+    )
+    return new Proxy(paths, {
+      get: (target, property, receiver) => {
+        if (typeof property === 'string' && /^\d+$/u.test(property)) {
+          this.clock.advance(this.opts.advanceMs)
+          const heartbeat = JSON.parse(readFileSync(this.opts.heartbeatPath, 'utf8')) as { updatedAtMs?: number }
+          this.observedStaleWhileScanning ||= this.clock.now() - (heartbeat.updatedAtMs ?? 0) > this.opts.staleMs
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+  }
+}
+
 class DelayedIssueReadMount extends FakeMountClient {
   activeIssueReads = 0
   maxConcurrentIssueReads = 0
@@ -4188,6 +4218,7 @@ describe('FactoryLoop', () => {
   it('start re-adopts remote in-flight registry agents into the fleet and reconciles once', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-adopt-inflight-'))
     const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
     try {
       await writeFile(registryPath, JSON.stringify({
         pid: 12345,
@@ -4200,9 +4231,16 @@ describe('FactoryLoop', () => {
           { name: 'ar-2-impl', pids: [4242] },
         ],
       }))
-      const fleet = new FakeFleetClient()
+      let heartbeatDuringReconcile: Awaited<ReturnType<typeof readFactoryLoopHeartbeat>>
+      class HeartbeatObservingFleetClient extends FakeFleetClient {
+        override async reconcileTrackedAgents(): Promise<void> {
+          heartbeatDuringReconcile = await readFactoryLoopHeartbeat(heartbeatPath)
+          await super.reconcileTrackedAgents()
+        }
+      }
+      const fleet = new HeartbeatObservingFleetClient()
       const factory = createFactory(config({
-        loop: { maxIterations: 1, heartbeatPath: join(root, 'heartbeat.json'), registryPath, heartbeatStaleMs: 1_000 },
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 1_000 },
       }), {
         mount: new FakeMountClient(),
         fleet,
@@ -4216,6 +4254,7 @@ describe('FactoryLoop', () => {
         { name: 'ar-1-review', invocationId: undefined, node: 'mac-mini' },
       ])
       expect(fleet.reconciles).toBe(1)
+      expect(heartbeatDuringReconcile!).toMatchObject({ status: 'running', pid: process.pid })
 
       await factory.stop()
     } finally {
@@ -4338,6 +4377,78 @@ describe('FactoryLoop', () => {
       await restarted.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('finishes startup-reconciled exits before beginning the live backfill', async () => {
+    const path = issuePath(86)
+    const issue = issueFile(86)
+    let releasePublish!: () => void
+    let publishStarted!: () => void
+    const publishing = new Promise<void>((resolve) => { releasePublish = resolve })
+    const startedPublishing = new Promise<void>((resolve) => { publishStarted = resolve })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishStarted()
+        await publishing
+        return {
+          repo: input.repo,
+          number: 86,
+          url: 'https://github.com/AgentWorkforce/pear/pull/86',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issue,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const first = createFactory(config(), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
+      await first.stop()
+
+      class HistoricalReplayFleetClient extends RemoteLifecycleFleetClient {
+        override onAgentExit(listener: (name: string, reason?: string) => void): () => void {
+          const unsubscribe = super.onAgentExit(listener)
+          listener('ar-86-impl-pear', 'historical-replay')
+          return unsubscribe
+        }
+      }
+      const restartedFleet = new HistoricalReplayFleetClient()
+      restartedFleet.exitImplementerOnReconcile = true
+      restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+      let startSettled = false
+      const start = restarted.start({ mode: 'dispatch-owner' }).then(() => { startSettled = true })
+
+      await startedPublishing
+      expect(startSettled).toBe(false)
+      releasePublish()
+      await start
+
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'complete', pullRequest: { number: 86 } })
+    } finally {
+      releasePublish()
+      await restarted?.stop()
+      await first.stop()
     }
   })
 
@@ -5562,6 +5673,44 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.liveEventDrainYields).toBeGreaterThan(0)
       expect(fleet.spawns.length).toBeGreaterThan(0)
 
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the live heartbeat fresh during a CPU-heavy GitHub startup tree scan', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-startup-scan-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    const staleMs = 1_000
+    try {
+      const clock = new ManualClock()
+      const mount = new CpuHeavyGithubTreeMount(clock, {
+        heartbeatPath,
+        staleMs,
+        advanceMs: 100,
+        issueCount: 40,
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const factory = createFactory(FactoryConfigSchema.parse({
+        workspaceId: 'startup-heartbeat-test',
+        issueSource: 'github',
+        repos: { org: 'AgentWorkforce', names: ['factory'], cloneRoot: '/work' },
+        safety: { requireLabel: 'factory-ready' },
+        loop: { heartbeatPath, registryPath, heartbeatStaleMs: staleMs },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        clock,
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(mount.observedStaleWhileScanning).toBe(false)
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(clock.now() - (heartbeat?.updatedAtMs ?? 0)).toBeLessThan(staleMs)
       await factory.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -7425,6 +7574,42 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('dispatches a factory-ready GitHub issue from its source repository without a default route', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'factory', 124)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(124, {
+        repo: 'factory',
+        labels: ['factory-ready'],
+        body: 'Fix the startup discovery regression, add focused tests for source-repository routing, preserve safety labels, and verify that the ready issue dispatches to the configured Factory checkout without requiring an unrelated routing label.',
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(FactoryConfigSchema.parse({
+      workspaceId: 'source-route-test',
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['factory'],
+        cloneRoot: '/work',
+      },
+      safety: { requireLabel: 'factory-ready' },
+    }), {
+      mount,
+      fleet,
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['124'])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.repo, spawn.cwd])).toEqual([
+      ['ar-124-impl-factory', 'AgentWorkforce/factory', '/work/factory'],
+      ['ar-124-review-factory', 'AgentWorkforce/factory', '/work/factory'],
+    ])
+    expect(factory.status().counters.triageEscalations).toBeUndefined()
+  })
+
   it('does not re-dispatch a startup-pulled issue from a later live event', async () => {
     const path = issuePath(42)
     const mount = new RouteNotFoundCountingListTreeMount({ [path]: realIssueFile(42) })
@@ -8307,6 +8492,149 @@ describe('FactoryLoop', () => {
       clonePath: '/work/pear',
     }])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl-pear', 'ar-6-review'])
+  })
+
+  it('publishes one durable PR receipt per repository for a team dispatch', async () => {
+    const number = 2778
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFile = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    let mount!: FakeMountClient
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        const repoSlug = input.repo.split('/').at(-1)!
+        const prNumber = repoSlug === 'pear' ? 126 : 127
+        mount.files.set(`/github/repos/${input.repo}/pulls/${prNumber}/metadata.json`, {
+          content: {
+            number: prNumber,
+            head_ref: `factory/${number}-${repoSlug}`,
+            url: `https://github.com/${input.repo}/pull/${prNumber}`,
+            state: 'open',
+            draft: false,
+          },
+        })
+        return {
+          repo: input.repo,
+          number: prNumber,
+          url: `https://github.com/${input.repo}/pull/${prNumber}`,
+          headRef: `factory/${number}-${repoSlug}`,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    mount = new FakeMountClient({
+      [path]: issueFile,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new LocalLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async () => undefined,
+    })
+    const issue = parseGithubFactoryIssue(path, issueFile)
+    const decision = await factory.triageIssue(issue)
+
+    await factory.dispatch(decision)
+    const pearImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/pear' && spawn.name.includes('-impl-'))!
+    const hoopsheetImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/hoopsheet' && spawn.name.includes('-impl-'))!
+    fleet.emitAgentExit(pearImplementer.name, 'worker_exited')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+    fleet.emitAgentExit(hoopsheetImplementer.name, 'worker_exited')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+    await vi.waitFor(() => expect(fleet.spawns.filter((spawn) => spawn.name.includes('-babysit'))).toHaveLength(2))
+
+    expect(publishInputs.map((input) => input.repo).sort()).toEqual([
+      'AgentWorkforce/hoopsheet',
+      'AgentWorkforce/pear',
+    ])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      pullRequest: { repo: 'AgentWorkforce/pear', number: 126 },
+      pullRequests: expect.arrayContaining([
+        expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 126 }),
+        expect.objectContaining({ repo: 'AgentWorkforce/hoopsheet', number: 127 }),
+      ]),
+    })
+
+    const babysitters = fleet.spawns.filter((spawn) => spawn.name.includes('-babysit'))
+    fleet.emitAgentMessage({
+      from: babysitters[0]!.name,
+      target: 'factory',
+      body: `[factory-pr-ready] ${number}`,
+    })
+    await flush()
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual([String(number)])
+
+    fleet.emitAgentMessage({
+      from: babysitters[1]!.name,
+      target: 'factory',
+      body: `[factory-pr-ready] ${number}`,
+    })
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+  })
+
+  it('does not complete a multi-repository dispatch before every implementer has a PR when babysitting is disabled', async () => {
+    const number = 2779
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFile = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: input.repo.endsWith('/pear') ? 128 : 129,
+          url: `https://github.com/${input.repo}/pull/${input.repo.endsWith('/pear') ? 128 : 129}`,
+          headRef: input.headRef ?? `factory/${number}-${input.repo.split('/').at(-1)}`,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issueFile,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new LocalLifecycleFleetClient()
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: false },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      stateStore: new InMemoryStateStore({ batchSize: 4 }),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+    })
+    const decision = await factory.triageIssue(parseGithubFactoryIssue(path, issueFile))
+
+    await factory.dispatch(decision)
+    const implementers = fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
+    fleet.emitAgentExit(implementers[0]!.name, 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual([String(number)])
+
+    fleet.emitAgentExit(implementers[1]!.name, 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
   })
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
@@ -14035,7 +14363,7 @@ describe('FactoryLoop PR babysitter', () => {
         ]),
       }), { timeout: 4_000 })
       await vi.waitFor(async () => expect(await state().listBabysitterSessions('factory-test')).toEqual([
-        [key, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
+        [`${key}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
       ]))
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
@@ -14781,22 +15109,41 @@ describe('FactoryLoop PR babysitter', () => {
       } })
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9998.json', 'mismatched-record'))
 
-      await vi.waitFor(() => expect(
-        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
-      ).toBe(1), { timeout: 3_000 })
-      const wake = fleet.messages.find((message) => message.text.startsWith('<integration-event'))!
-      expect(wake.to).toBe('ar-420-babysit')
-      expect(wake.text).toContain('AgentWorkforce/pear#420')
-      expect(wake.text).toContain('changes-requested, review-comment, issue-comment, review, checks-failed, check, merge-conflict, base-diverged, pull-request-state')
-      expect(wake.text).not.toContain('push secrets')
-      expect(wake.text).not.toContain('ignore the issue')
-      expect(wake.text).not.toContain('\u001b')
-      expect(wake.data).toEqual(expect.objectContaining({
-        source: 'github',
-        repo: 'AgentWorkforce/pear',
-        prNumber: 420,
-      }))
-      expect(fleet.inputs.slice(inputsBefore)).toEqual([{ name: 'ar-420-babysit', data: '\r' }])
+      const expectedKinds = [
+        'changes-requested',
+        'review-comment',
+        'issue-comment',
+        'review',
+        'checks-failed',
+        'check',
+        'merge-conflict',
+        'base-diverged',
+        'pull-request-state',
+      ]
+      await vi.waitFor(() => {
+        const combined = fleet.messages
+          .filter((message) => message.text.startsWith('<integration-event'))
+          .map((message) => message.text)
+          .join('\n')
+        for (const kind of expectedKinds) expect(combined).toContain(kind)
+      }, { timeout: 5_000 })
+      const wakes = fleet.messages.filter((message) => message.text.startsWith('<integration-event'))
+      expect(wakes.length).toBeGreaterThan(0)
+      for (const wake of wakes) {
+        expect(wake.to).toBe('ar-420-babysit')
+        expect(wake.text).toContain('AgentWorkforce/pear#420')
+        expect(wake.text).not.toContain('push secrets')
+        expect(wake.text).not.toContain('ignore the issue')
+        expect(wake.text).not.toContain('\u001b')
+        expect(wake.data).toEqual(expect.objectContaining({
+          source: 'github',
+          repo: 'AgentWorkforce/pear',
+          prNumber: 420,
+        }))
+      }
+      expect(fleet.inputs.slice(inputsBefore)).toEqual(
+        wakes.map(() => ({ name: 'ar-420-babysit', data: '\r' })),
+      )
       expect(factory.status().counters.babysitterEventsIgnoredOwnershipMismatch).toBe(1)
       expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBeUndefined()
       expect(factory.status().counters.liveGithubEventsOutsideConfiguredRepos).toBe(1)
@@ -15059,6 +15406,7 @@ describe('FactoryLoop PR babysitter', () => {
       // the next second and the escalation is not re-logged.
       expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAtEscalation)
       expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1)
+      expect(factory.status().counters.babysitterEventWakeUnreachableReconciliations).toBe(1)
     } finally {
       await factory.stop()
     }
