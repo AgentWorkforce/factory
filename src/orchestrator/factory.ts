@@ -397,6 +397,7 @@ export class FactoryLoop implements Factory {
   readonly #completionInFlight = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
+  #startupAgentAdoptionActive = false
   // Composite issue identities for which a babysitter has already been spawned, so repeated PR
   // webhooks / agent-exit safety nets don't respawn it.
   readonly #babysitterSpawned = new Set<string>()
@@ -653,11 +654,14 @@ export class FactoryLoop implements Factory {
       ? await readFactoryInFlightRegistry(this.#config.loop.registryPath)
       : undefined
     if (live) await this.#startLiveHeartbeat()
+    this.#startupAgentAdoptionActive = true
     try {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
+      this.#startupAgentAdoptionActive = false
       await this.#restoreBabysitterOwnership()
     } catch (error) {
+      this.#startupAgentAdoptionActive = false
       if (live) await this.#stopLiveHeartbeat('stopping')
       throw error
     }
@@ -2464,6 +2468,10 @@ export class FactoryLoop implements Factory {
   #wireFleetEvents(): void {
     if (!this.#offAgentExit) {
       this.#offAgentExit = this.#fleet.onAgentExit((name, reason) => {
+        // Internal broker subscriptions replay historical exits immediately.
+        // Ignore that pre-hydration history; the roster reconcile below runs
+        // after durable records are restored and is the authoritative signal.
+        if (this.#startupAgentAdoptionActive) return
         // Broker replay can deliver an old exit immediately when the listener
         // is installed, before durable agents are restored. Queue a later
         // roster-reconciled exit behind it instead of dropping the newer event.
@@ -2570,6 +2578,7 @@ export class FactoryLoop implements Factory {
       }
       this.#scheduleDispatchLifecycleRenewal()
       if (this.#fleet.hydrateTracked) {
+        this.#startupAgentAdoptionActive = false
         await this.#fleet.reconcileTrackedAgents?.()
         // Fleet callbacks are intentionally synchronous at the port boundary,
         // but recovery work is asynchronous (issue reads, worktree restore,
