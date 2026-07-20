@@ -174,11 +174,22 @@ export interface DispatchResult {
   comments?: string[]
   stateId?: string
   dryRun: boolean
+  hold?: {
+    kind: 'capacity' | 'dependency' | 'dependency-cycle'
+    blockers?: string[]
+    cycle?: string[]
+  }
 }
 
 export interface FactoryStatus {
   inFlight: IssueRef[]
   queued: IssueRef[]
+  parked?: Array<{
+    issue: IssueRef
+    blockers: string[]
+    cycle?: string[]
+    capacityBlocked: boolean
+  }>
   counters: Record<string, number>
   slackDegraded?: boolean
   slackDegradedReason?: string

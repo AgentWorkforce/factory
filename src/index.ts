@@ -127,18 +127,30 @@ export {
   checkFactoryLoopLiveness,
   createFactory,
   FactoryLoop,
+  dependencyIdentity,
+  findDependencyCycle,
   issueKey,
   isDispatchableIssue,
   isRealLinearIssue,
   githubIssuePathParts,
   parseGithubFactoryIssue,
+  parseBlockedBy,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
   reapFactoryOrphansOnce,
 } from './orchestrator'
-export type { InFlightIssue, QueuedIssue, TrackedAgent } from './orchestrator'
+export type {
+  DeclaredDependency,
+  DependencyAdmission,
+  DependencyBlocker,
+  InFlightIssue,
+  ParkedIssue,
+  QueuedIssue,
+  ResolvedDependency,
+  TrackedAgent,
+} from './orchestrator'
 export {
   HeuristicTriage,
   LlmTriage,

@@ -1,6 +1,12 @@
 import type { SendInput, SpawnResult } from './fleet'
 import type { AgentWorktree } from './worktree'
-import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
+import type {
+  DependencyAdmission,
+  InFlightIssue,
+  ParkedIssue,
+  QueuedIssue,
+  TrackedAgent,
+} from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
 
 export type CriticalRecord = { issue: IssueRef; input: SendInput }
@@ -153,13 +159,17 @@ export interface BatchSnapshot {
   readonly size: number
   readonly inFlight: InFlightIssue[]
   readonly queued: QueuedIssue[]
+  readonly parked: ParkedIssue[]
   getIssue(issue: IssueRef): InFlightIssue | undefined
   getIssueByAgent(name: string): InFlightIssue | undefined
   isInFlight(issue: IssueRef): boolean
   isQueued(issue: IssueRef): boolean
+  isParked(issue: IssueRef): boolean
+  getParked(issue: IssueRef): ParkedIssue | undefined
   canStart(): boolean
-  start(decision: TriageDecision, dryRun: boolean): InFlightIssue | undefined
-  queue(decision: TriageDecision, dryRun: boolean): boolean
+  start(decision: TriageDecision, dryRun: boolean, dependencyAdmission?: DependencyAdmission): InFlightIssue | undefined
+  queue(decision: TriageDecision, dryRun: boolean, dependencyAdmission?: DependencyAdmission): boolean
+  clearPark(issue: IssueRef): void
   complete(issue: IssueRef): QueuedIssue | undefined
   abandon(issue: IssueRef): void
   invocationIdFor(issue: IssueRef, spec: InFlightIssue['decision']['reviewer']): string

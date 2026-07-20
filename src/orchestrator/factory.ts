@@ -78,7 +78,20 @@ import type {
 } from '../types'
 import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
-import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
+import {
+  type DependencyAdmission,
+  type InFlightIssue,
+  issueKey,
+  type ParkedIssue,
+  type TrackedAgent,
+} from './batch-tracker'
+import {
+  dependencyIdentity,
+  findDependencyCycle,
+  parseBlockedBy,
+  resolveDependency,
+  type ResolvedDependency,
+} from './dependencies'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
 import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
@@ -349,6 +362,11 @@ export class FactoryLoop implements Factory {
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
   readonly #labelDispatchFailures = new Map<string, string>()
+  // Provider snapshots loaded during discovery, keyed by collision-safe
+  // owner/repo#number identity. GitHub-native records outrank Linear mirrors.
+  readonly #dependencyIssues = new Map<string, { issue: LinearIssue; rank: number }>()
+  readonly #terminalDependencyIdentities = new Set<string>()
+  readonly #dependencyParkNotices = new Map<string, string>()
   readonly #pendingSlackClarifications = new Map<string, string>()
   readonly #pendingGithubClarifications = new Map<string, string>()
   readonly #clarificationIntents = new Map<string, number>()
@@ -1484,6 +1502,7 @@ export class FactoryLoop implements Factory {
     this.#logger.info?.('[factory] run-once started', { dryRun })
     let report: IterationReport | undefined
     try {
+      this.#dependencyIssues.clear()
       const issueSource = await this.#issueSource()
       if (issueSource === 'linear') {
         await this.#ingestGithubIssues({ dryRun })
@@ -1615,7 +1634,12 @@ export class FactoryLoop implements Factory {
             continue
           }
           if (result.agents.length === 0 && !dryRun) {
-            skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
+            const reason = result.hold?.kind === 'dependency-cycle'
+              ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
+              : result.hold?.kind === 'dependency'
+                ? `parked on dependencies: ${result.hold.blockers?.join(', ') ?? 'unresolved dependency'}`
+                : 'queued or escalated'
+            skipped.push({ issue: decision.issue, reason })
           } else {
             dispatched.push(result)
           }
@@ -2272,6 +2296,25 @@ export class FactoryLoop implements Factory {
       this.#recordTriageEscalation(dispatchDecision, escalationReason)
       return replayedResult ?? { issue: dispatchDecision.issue, agents: [], dryRun }
     }
+    const dependencyAdmission = await this.#dependencyAdmission(liveIssue, dispatchDecision)
+    if (dependencyAdmission.blockers.length > 0 || dependencyAdmission.cycle) {
+      batch.queue(dispatchDecision, dryRun, dependencyAdmission)
+      const parked = batch.getParked(dispatchDecision.issue)
+      if (!parked) throw new Error(`dependency admission failed to park ${dispatchDecision.issue.key}`)
+      const comment = await this.#reportDependencyPark(liveIssue, parked, dryRun)
+      return {
+        issue: dispatchDecision.issue,
+        agents: [],
+        comments: [comment],
+        dryRun,
+        hold: {
+          kind: parked.cycle ? 'dependency-cycle' : 'dependency',
+          blockers: parked.blockers.map((blocker) => blocker.label),
+          cycle: parked.cycle ? [...parked.cycle] : undefined,
+        },
+      }
+    }
+    batch.clearPark(dispatchDecision.issue)
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
@@ -2299,7 +2342,12 @@ export class FactoryLoop implements Factory {
         this.#scheduleDispatchLifecycleRetry(queuedRecord)
         this.#increment('queued')
         this.#emit('issue-queued', { issue: dispatchDecision.issue })
-        return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
+        return lifecycleClaim.lifecycle.result ?? {
+          issue: dispatchDecision.issue,
+          agents: [],
+          dryRun,
+          hold: { kind: 'capacity' },
+        }
       }
       if (!lifecycleClaim.created) {
         const restored = batch.restore(inFlightRecordFromLifecycle(lifecycleClaim.lifecycle))
@@ -2308,12 +2356,12 @@ export class FactoryLoop implements Factory {
     }
     if (!durableDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
-    const record = batch.start(dispatchDecision, dryRun)
+    const record = batch.start(dispatchDecision, dryRun, dependencyAdmission)
     if (!record) {
       await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
-      return { issue: dispatchDecision.issue, agents: [], dryRun }
+      return { issue: dispatchDecision.issue, agents: [], dryRun, hold: { kind: 'capacity' } }
     }
 
     if (record.result) {
@@ -2459,6 +2507,12 @@ export class FactoryLoop implements Factory {
     return {
       inFlight: batch?.inFlight.map((record) => record.issue) ?? [],
       queued: batch?.queued.map((queued) => queued.issue) ?? [],
+      parked: batch?.parked.map((parked) => ({
+        issue: parked.issue,
+        blockers: parked.blockers.map((blocker) => blocker.label),
+        cycle: parked.cycle ? [...parked.cycle] : undefined,
+        capacityBlocked: parked.capacityBlocked,
+      })) ?? [],
       counters: { ...this.#counters },
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
@@ -2943,6 +2997,19 @@ export class FactoryLoop implements Factory {
       acquiredNow = true
     }
     if (lifecycle.phase === 'queued') {
+      const liveIssue = await this.#readIssue(lifecycle.issue.path)
+      if (liveIssue) {
+        const dependencyAdmission = await this.#dependencyAdmission(liveIssue, lifecycle.decision)
+        if (dependencyAdmission.blockers.length > 0 || dependencyAdmission.cycle) {
+          const batch = await this.#batch()
+          batch.queue(lifecycle.decision, lifecycle.dryRun, dependencyAdmission)
+          const parked = batch.getParked(lifecycle.issue)
+          if (parked) await this.#reportDependencyPark(liveIssue, parked, lifecycle.dryRun)
+          return
+        }
+        const batch = await this.#batch()
+        batch.clearPark(lifecycle.issue)
+      }
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined || !await this.#state.promoteDispatchLifecycle(
         this.#workspaceId,
@@ -3272,6 +3339,9 @@ export class FactoryLoop implements Factory {
       if (issue && !isGithubIssue(issue)) {
         await this.#recordCanonicalIssueState(issue)
       }
+      if (issue && this.#dependencyIssueIsTerminal(issue)) {
+        await this.#markDependencyTerminalAndReconcile(issue)
+      }
       if (!issue || !this.#isIssueReady(issue)) {
         return
       }
@@ -3307,13 +3377,7 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (batch.canStart()) {
-        await this.dispatch(escalationDecision, { dryRun: this.#config.dryRun, labelsValidated: routed.ok })
-      } else {
-        if (batch.queue(escalationDecision, this.#config.dryRun)) {
-          this.#emit('issue-queued', { issue: escalationDecision.issue })
-        }
-      }
+      await this.dispatch(escalationDecision, { dryRun: this.#config.dryRun, labelsValidated: routed.ok })
     } catch (error) {
       if (error instanceof LiveDispatchStateChangedError) {
         this.#logger.info?.('[factory] ignored issue event whose live state changed during dispatch', {
@@ -3520,14 +3584,19 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      const closed = githubIssueIsClosed(ghIssue)
+      if (closed) {
+        await this.#markDependencyTerminalAndReconcile(githubIssueAsFactoryIssue(ghIssue))
+      }
+
       if (await this.#issueSource() === 'github') {
-        if (!githubIssueIsClosed(ghIssue) && githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
+        if (!closed && githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
           await this.#handleChange(ghIssue.path)
         }
         return
       }
 
-      if (githubIssueIsClosed(ghIssue)) {
+      if (closed) {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
         if (mirror && !this.#states.isRole(mirror.stateId, 'done')) {
           if (!opts.dryRun) {
@@ -3588,7 +3657,9 @@ export class FactoryLoop implements Factory {
       for (const candidatePath of candidatePaths) {
         try {
           const { content } = await this.#readRelayfileFile(candidatePath, 'GitHub issue ingestion')
-          return parseGithubIssue(candidatePath, content)
+          const githubIssue = parseGithubIssue(candidatePath, content)
+          this.#indexDependencyIssue(githubIssueAsFactoryIssue(githubIssue))
+          return githubIssue
         } catch (error) {
           if (isMissingIssueFileError(error) && candidatePath !== candidatePaths.at(-1)) {
             continue
@@ -3680,6 +3751,190 @@ export class FactoryLoop implements Factory {
         return configured === fullName || configured === bareName
       })
     return entry?.[0]
+  }
+
+  #indexDependencyIssue(issue: LinearIssue): void {
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    const identity = dependencyIdentityForIssue(issue, repo)
+    if (!identity) return
+    const rank = isGithubIssueFilePath(issue.path) ? 2 : 1
+    const existing = this.#dependencyIssues.get(identity)
+    if (!existing || rank >= existing.rank) {
+      this.#dependencyIssues.set(identity, { issue, rank })
+    }
+  }
+
+  async #dependencyAdmission(issue: LinearIssue, decision: TriageDecision): Promise<DependencyAdmission> {
+    const declared = parseBlockedBy(issue.description)
+    if (declared.length === 0) return { blockers: [] }
+
+    const currentRepo = dependencyRepoForIssue(issue, decision, this.#config)
+    const resolved = declared
+      .map((dependency) => resolveDependency(dependency, currentRepo))
+      .filter((dependency): dependency is ResolvedDependency => Boolean(dependency))
+    await this.#loadMissingDependencyIssues(resolved.map((dependency) => dependency.identity))
+    const resolvedTerminal = new Set<string>()
+    for (const dependency of resolved) {
+      if (await this.#dependencyIsTerminalOrMerged(dependency.identity)) {
+        resolvedTerminal.add(dependency.identity)
+      }
+    }
+
+    const blockers = resolved
+      .filter((dependency) => !resolvedTerminal.has(dependency.identity))
+      .map((dependency) => {
+        const blocker = this.#dependencyIssues.get(dependency.identity)?.issue
+        return {
+          identity: dependency.identity,
+          key: blocker ? issueKey(issueRef(blocker)) : dependency.identity,
+          label: dependency.label,
+        }
+      })
+
+    // A bare #N without a resolvable single repository is itself unresolved.
+    // Keep it visible and fail closed instead of guessing among routes.
+    for (const dependency of declared) {
+      if (dependency.repo || currentRepo) continue
+      blockers.push({
+        identity: `unresolved:${issueKey(decision.issue)}:${dependency.raw}`,
+        key: `unresolved:${dependency.raw}`,
+        label: `${dependency.raw} (repository unresolved)`,
+      })
+    }
+
+    const currentIdentity = dependencyIdentityForIssue(issue, currentRepo)
+    const cycle = currentIdentity
+      ? findDependencyCycle(currentIdentity, this.#dependencyGraph())
+      : undefined
+    return { blockers, cycle }
+  }
+
+  async #loadMissingDependencyIssues(identities: string[]): Promise<void> {
+    let missing = new Set(identities.filter((identity) => !this.#dependencyIssues.has(identity)))
+    if (missing.size === 0) return
+
+    for (const path of await this.#githubIssuePaths()) {
+      const parts = githubIssuePathParts(path)
+      if (!parts || !missing.has(githubIssueIdentity(parts.owner, parts.repo, parts.number))) continue
+      await this.#readIssue(path)
+    }
+    missing = new Set([...missing].filter((identity) => !this.#dependencyIssues.has(identity)))
+    if (missing.size === 0) return
+
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
+      if (!isIssueFilePath(path)) continue
+      await this.#readIssue(path)
+      missing = new Set([...missing].filter((identity) => !this.#dependencyIssues.has(identity)))
+      if (missing.size === 0) return
+    }
+  }
+
+  #dependencyGraph(): Map<string, string[]> {
+    const graph = new Map<string, string[]>()
+    for (const [identity, { issue }] of this.#dependencyIssues) {
+      if (this.#dependencyIdentityIsTerminal(identity)) {
+        graph.set(identity, [])
+        continue
+      }
+      const repo = identity.slice(0, identity.lastIndexOf('#'))
+      const dependencies = parseBlockedBy(issue.description)
+        .map((dependency) => resolveDependency(dependency, repo))
+        .filter((dependency): dependency is ResolvedDependency => Boolean(dependency))
+        .filter((dependency) => !this.#dependencyIdentityIsTerminal(dependency.identity))
+        .map((dependency) => dependency.identity)
+      graph.set(identity, [...new Set(dependencies)])
+    }
+    return graph
+  }
+
+  #dependencyIdentityIsTerminal(identity: string): boolean {
+    if (this.#terminalDependencyIdentities.has(identity)) return true
+    const issue = this.#dependencyIssues.get(identity)?.issue
+    return Boolean(issue && this.#dependencyIssueIsTerminal(issue))
+  }
+
+  async #dependencyIsTerminalOrMerged(identity: string): Promise<boolean> {
+    if (this.#dependencyIdentityIsTerminal(identity)) return true
+    const issue = this.#dependencyIssues.get(identity)?.issue
+    if (!issue) return false
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    if (!repo) return false
+    const pullRequest = await resolveIssuePrFromMount(this.#mount, this.#config, issue, {
+      allowLegacyGithubBranch: true,
+      repo,
+    })
+    if (normalizePrState(pullRequest?.state) !== 'MERGED') return false
+    this.#terminalDependencyIdentities.add(identity)
+    return true
+  }
+
+  #dependencyIssueIsTerminal(issue: LinearIssue): boolean {
+    return isGithubIssue(issue)
+      ? githubFactoryIssueIsClosed(issue)
+      : this.#states.isRole(issue.stateId, 'done')
+  }
+
+  async #reportDependencyPark(issue: LinearIssue, parked: ParkedIssue, dryRun: boolean): Promise<string> {
+    const cycle = parked.cycle?.join(' -> ')
+    const blockers = parked.blockers.map((blocker) => blocker.label)
+    const signature = JSON.stringify({ blockers, cycle, capacityBlocked: parked.capacityBlocked })
+    const marker = `<!-- factory-dependency-park:${stableHash(signature)} -->`
+    const comment = parked.cycle
+      ? [
+        marker,
+        'Factory refused dispatch because it detected a dependency cycle.',
+        `Cycle: ${cycle}`,
+        blockers.length > 0 ? `Unresolved blockers: ${blockers.join(', ')}` : undefined,
+      ].filter((line): line is string => Boolean(line)).join('\n')
+      : [
+        marker,
+        'Factory parked this issue because declared dependencies are unresolved.',
+        `Blocked by: ${blockers.join(', ')}`,
+        parked.capacityBlocked ? 'Capacity is also currently unavailable.' : undefined,
+      ].filter((line): line is string => Boolean(line)).join('\n')
+
+    const key = issueKey(parked.issue)
+    if (dryRun || this.#dependencyParkNotices.get(key) === signature) return comment
+    this.#increment(parked.cycle ? 'dependencyCycles' : 'dependencyParks')
+    if (parked.cycle) {
+      this.#error(new Error(`Dependency cycle detected: ${cycle}`), parked.issue)
+    }
+    try {
+      await this.#postIssueComment(issue, comment)
+      this.#dependencyParkNotices.set(key, signature)
+    } catch (error) {
+      this.#logger.warn?.('[factory] dependency park writeback skipped', {
+        issue: parked.issue.key,
+        error: describeError(error).errorMessage,
+      })
+    }
+    return comment
+  }
+
+  async #markDependencyTerminalAndReconcile(issue: LinearIssue): Promise<void> {
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    const identity = dependencyIdentityForIssue(issue, repo)
+    if (!identity) return
+    this.#terminalDependencyIdentities.add(identity)
+    this.#indexDependencyIssue(issue)
+    const batch = await this.#batch()
+    batch.clearPark(issueRef(issue))
+    const candidates = batch.parked.filter((parked) =>
+      parked.blockers.some((blocker) => blocker.identity === identity),
+    )
+    for (const parked of candidates) {
+      try {
+        const liveIssue = await this.#readIssue(parked.issue.path)
+        if (!liveIssue || !this.#isIssueReady(liveIssue)) continue
+        await this.dispatch(parked.decision, { dryRun: parked.dryRun })
+      } catch (error) {
+        this.#logger.warn?.('[factory] dependency park reconciliation failed', {
+          blocker: identity,
+          issue: parked.issue.key,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
   }
 
   async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
@@ -3974,11 +4229,13 @@ export class FactoryLoop implements Factory {
       // (relayfile-adapters#205). The factory matches state by UUID, so backfill
       // the id from the name when the payload omitted it — otherwise every issue
       // reads as stateId='' and no role (incl. readyForAgent) ever matches.
+      let resolvedIssue = issue
       if (issue && !issue.stateId && issue.state?.name) {
         const backfilled = this.#states.idForName(issue.state.name, issue.team)
-        if (backfilled) return { ...issue, stateId: backfilled }
+        if (backfilled) resolvedIssue = { ...issue, stateId: backfilled }
       }
-      return issue
+      this.#indexDependencyIssue(resolvedIssue)
+      return resolvedIssue
     } catch (error) {
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
@@ -8050,6 +8307,7 @@ export class FactoryLoop implements Factory {
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
+        if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       }
       if (!await this.#saveDispatchLifecycle(record, 'writeback-applied')) return
 
@@ -10151,6 +10409,60 @@ const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefi
   return { owner, repo, number: number!, url }
 }
 
+function dependencyRepoForIssue(
+  issue: LinearIssue,
+  decision: TriageDecision | undefined,
+  config: FactoryConfig,
+): string | undefined {
+  const source = githubIssueSourceRef(issue)
+  if (source) return `${source.owner}/${source.repo}`
+  const mirroredRepo = githubMirrorRepoForIssue(issue)
+  if (mirroredRepo) return mirroredRepo
+
+  const normalize = (repo: string | undefined): string | undefined => {
+    if (!repo) return undefined
+    try {
+      return normalizeGithubRepo(repo, config.repos.org)
+    } catch {
+      return undefined
+    }
+  }
+  const decisionRepos = new Set(
+    (decision?.routes ?? [])
+      .map((route) => normalize(route.repo))
+      .filter((repo): repo is string => Boolean(repo)),
+  )
+  if (decisionRepos.size === 1) return [...decisionRepos][0]
+  if (decisionRepos.size > 1) return undefined
+
+  const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+  const labelRepos = new Set(
+    Object.entries(config.repos.byLabel)
+      .filter(([label]) => labels.has(label.trim().toLowerCase()))
+      .map(([, repo]) => normalize(repo))
+      .filter((repo): repo is string => Boolean(repo)),
+  )
+  if (labelRepos.size === 1) return [...labelRepos][0]
+  if (labelRepos.size > 1) return undefined
+
+  const projectRepo = issue.project
+    ? Object.entries(config.repos.byProject)
+      .find(([project]) => project.trim().toLowerCase() === issue.project!.trim().toLowerCase())?.[1]
+    : undefined
+  return normalize(projectRepo) ?? normalize(config.repos.default)
+}
+
+function dependencyIdentityForIssue(issue: LinearIssue, repo: string | undefined): string | undefined {
+  const source = githubIssueSourceRef(issue)
+  if (source) return dependencyIdentity(`${source.owner}/${source.repo}`, source.number)
+  const pathParts = githubIssuePathParts(issue.path)
+  if (pathParts) return dependencyIdentity(`${pathParts.owner}/${pathParts.repo}`, pathParts.number)
+  const number = Number(issue.key.match(/(\d+)$/u)?.[1])
+  return repo && Number.isSafeInteger(number) && number > 0
+    ? dependencyIdentity(repo, number)
+    : undefined
+}
+
 const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
@@ -10902,11 +11214,12 @@ const resolveIssuePrFromMount = async (
     openOnly?: boolean
     failOnLookupError?: boolean
     allowLegacyGithubBranch?: boolean
+    repo?: string
   } = {},
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
-  for (const repo of reposFromConfig(config)) {
+  for (const repo of opts.repo ? [opts.repo] : reposFromConfig(config)) {
     const paths = new Set<string>()
     for (const root of githubPullRoots(repo)) {
       try {
@@ -11166,7 +11479,7 @@ const readProbePrCandidate = async (
         booleanValue(payload.crossRepository) ??
         (headRepo && baseRepo ? headRepo.toLowerCase() !== baseRepo.toLowerCase() : undefined),
       draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
-      state: stringValue(payload.state),
+      state: booleanValue(payload.merged) === true ? 'MERGED' : stringValue(payload.state),
       url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
   } catch {

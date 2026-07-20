@@ -1768,6 +1768,148 @@ describe('FactoryLoop', () => {
     expect(mergeGate.merges).toEqual([])
   })
 
+  it('dispatches a dependency chain in order and promotes the next issue after its blocker closes', async () => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 128)
+    const firstDependentPath = githubIssuePath('AgentWorkforce', 'pear', 131)
+    const secondDependentPath = githubIssuePath('AgentWorkforce', 'pear', 132)
+    const mount = new FakeMountClient({
+      [blockerPath]: githubIssueFile(128, { labels: ['factory'] }),
+      [firstDependentPath]: githubIssueFile(131, {
+        labels: ['factory'],
+        body: 'Consume the manifest.\n\nBlocked by: #128',
+      }),
+      [secondDependentPath]: githubIssueFile(132, {
+        labels: ['factory'],
+        body: 'Check the manifest drift.\n\nBlocked by: #131',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const first = await factory.runOnce()
+
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['128'])
+    expect(first.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ issue: expect.objectContaining({ key: '131' }), reason: 'parked on dependencies: AgentWorkforce/pear#128' }),
+      expect.objectContaining({ issue: expect.objectContaining({ key: '132' }), reason: 'parked on dependencies: AgentWorkforce/pear#131' }),
+    ]))
+    expect(factory.status().parked?.map((parked) => parked.issue.key).sort()).toEqual(['131', '132'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-128-impl-pear', 'ar-128-review-pear'])
+    expect(githubWriteback.comments.find((comment) => comment.key === '131')?.body)
+      .toContain('Blocked by: AgentWorkforce/pear#128')
+
+    mount.files.set(blockerPath, { content: githubIssueFile(128, { state: 'closed', labels: ['factory'] }) })
+    const second = await factory.runOnce()
+
+    expect(second.dispatched.map((result) => result.issue.key)).toContain('131')
+    expect(factory.status().parked?.map((parked) => parked.issue.key)).toEqual(['132'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-128-impl-pear',
+      'ar-128-review-pear',
+      'ar-131-impl-pear',
+      'ar-131-review-pear',
+    ])
+  })
+
+  it('extracts dependency declarations from Linear issue descriptions', async () => {
+    const blockerPath = issuePath(140)
+    const dependentPath = issuePath(141)
+    const mount = new FakeMountClient({
+      [blockerPath]: realIssueFile(140, implementing),
+      [dependentPath]: realIssueFile(141, ready, {
+        description: 'Implement after the prerequisite.\n\nBlocked by: #140',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toContainEqual({
+      issue: { uuid: 'uuid-141', key: 'AR-141', path: dependentPath },
+      reason: 'parked on dependencies: AgentWorkforce/pear#140',
+    })
+    expect(factory.status().parked).toEqual([
+      expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-141' }),
+        blockers: ['AgentWorkforce/pear#140'],
+      }),
+    ])
+    expect(fleet.spawns).toEqual([])
+  })
+
+  it('resolves bare and qualified dependencies without cross-repo number collisions', async () => {
+    const pearBlockerPath = githubIssuePath('AgentWorkforce', 'pear', 7)
+    const hoopsheetBlockerPath = githubIssuePath('AgentWorkforce', 'hoopsheet', 7)
+    const bareDependentPath = githubIssuePath('AgentWorkforce', 'pear', 20)
+    const qualifiedDependentPath = githubIssuePath('AgentWorkforce', 'pear', 21)
+    const pearMergedPrPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/70.json'
+    const mount = new FakeMountClient({
+      [pearBlockerPath]: githubIssueFile(7, { labels: ['reference-only'] }),
+      [hoopsheetBlockerPath]: githubIssueFile(7, { repo: 'hoopsheet', labels: ['reference-only'] }),
+      [pearMergedPrPath]: prFile(70, { body: 'Fixes #7', state: 'closed', merged: true }),
+      [bareDependentPath]: githubIssueFile(20, { labels: ['factory'], body: 'Blocked by: #7' }),
+      [qualifiedDependentPath]: githubIssueFile(21, {
+        labels: ['factory'],
+        body: 'Blocked by: AgentWorkforce/hoopsheet#7',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(multiRepoGithubConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['20'])
+    expect(factory.status().parked).toEqual([
+      expect.objectContaining({ issue: expect.objectContaining({ key: '21' }), blockers: ['AgentWorkforce/hoopsheet#7'] }),
+    ])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-20-impl-pear', 'ar-20-review-pear'])
+  })
+
+  it('detects dependency cycles and reports them instead of silently deadlocking', async () => {
+    const firstPath = githubIssuePath('AgentWorkforce', 'pear', 30)
+    const secondPath = githubIssuePath('AgentWorkforce', 'pear', 31)
+    const mount = new FakeMountClient({
+      [firstPath]: githubIssueFile(30, { labels: ['factory'], body: 'Blocked by: #31' }),
+      [secondPath]: githubIssueFile(31, { labels: ['factory'], body: 'Blocked by: #30' }),
+    })
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped.map((entry) => entry.reason)).toEqual([
+      'dependency cycle detected: agentworkforce/pear#30 -> agentworkforce/pear#31 -> agentworkforce/pear#30',
+      'dependency cycle detected: agentworkforce/pear#31 -> agentworkforce/pear#30 -> agentworkforce/pear#31',
+    ])
+    expect(factory.status().parked).toHaveLength(2)
+    expect(githubWriteback.comments.map((comment) => comment.body)).toEqual([
+      expect.stringContaining('Factory refused dispatch because it detected a dependency cycle.'),
+      expect.stringContaining('Factory refused dispatch because it detected a dependency cycle.'),
+    ])
+    expect(fleet.spawns).toEqual([])
+  })
+
   it('spawns the reviewer with maxRestarts:0 so a torn-down reviewer is not re-registered as a broker orphan', async () => {
     // Regression: without an explicit restart policy the reviewer fell through
     // to the broker's default, which re-registers a name on exit. When Factory
