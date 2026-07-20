@@ -75,6 +75,15 @@ describe('feature manifest validation', () => {
       'Manifest catalog mismatch: declared 1 categories/4 features, parsed 1/1',
     )
   })
+
+  it('rejects a location that escapes the repository root', () => {
+    const rootDir = temporaryDirectory()
+    const raw = manifest({ featureRows: featureRow().replace('src/cli.ts, src/api.ts', '../outside.ts') })
+
+    expect(() => validateFeatureManifest(raw, { rootDir })).toThrow(
+      'Feature location must be inside the repository root for feature-one: ../outside.ts',
+    )
+  })
 })
 
 describe('feature location drift', () => {
@@ -115,6 +124,18 @@ describe('feature location drift', () => {
     ])
   })
 
+  it('flags files changed beneath a directory location without a trailing slash', () => {
+    const base = [feature({ location: 'src/featuremap' })]
+    const head = [feature({ location: 'src/featuremap' })]
+
+    expect(findFeatureLocationDrift(base, head, ['src/featuremap/validate.ts'])).toEqual([
+      expect.objectContaining({
+        featureId: 'feature-one',
+        changedLocations: ['src/featuremap'],
+      }),
+    ])
+  })
+
   it('reports advisory drift from a real repository diff without failing validation', async () => {
     const rootDir = temporaryDirectory()
     writeFile(rootDir, 'src/cli.ts', 'export const value = 1\n')
@@ -136,6 +157,14 @@ describe('feature location drift', () => {
         changedLocations: ['src/cli.ts'],
       }),
     ])
+  })
+
+  it('rejects a manifest path that escapes the repository root', async () => {
+    const rootDir = temporaryDirectory()
+
+    await expect(checkFeatureMap({ rootDir, manifestPath: '../manifest.yaml' })).rejects.toThrow(
+      'Feature manifest must be inside the repository root',
+    )
   })
 })
 

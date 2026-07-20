@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, relative, resolve } from 'node:path'
 
 import { parse } from 'yaml'
 
@@ -137,9 +137,8 @@ export function findFeatureLocationDrift(
   for (const baseFeature of baseFeatures) {
     const changedLocations = featureLocations(baseFeature).flatMap((location) => {
       const normalizedLocation = normalizeRepositoryPath(location)
-      const isDirectory = location.trim().replaceAll('\\', '/').endsWith('/')
       const touched = changedPathSet.has(normalizedLocation) ||
-        (isDirectory && normalizedChanges.some((path) => path.startsWith(`${normalizedLocation}/`)))
+        normalizedChanges.some((path) => path.startsWith(`${normalizedLocation}/`))
       return touched ? [normalizedLocation] : []
     })
     if (changedLocations.length === 0) continue
@@ -241,6 +240,10 @@ function validateFeatureLocations(
     }
     for (const location of locations) {
       const absolutePath = isAbsolute(location) ? location : resolve(rootDir, location)
+      const relativePath = relative(rootDir, absolutePath).replaceAll('\\', '/')
+      if (relativePath === '..' || relativePath.startsWith('../') || isAbsolute(relativePath)) {
+        throw new Error(`Feature location must be inside the repository root for ${feature.id}: ${location}`)
+      }
       if (!pathExists(absolutePath)) {
         throw new Error(`Missing location for ${feature.id}: ${location}`)
       }

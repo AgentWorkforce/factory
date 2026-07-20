@@ -39,7 +39,7 @@ export async function checkFeatureMap(
     ? requestedManifestPath
     : resolve(rootDir, requestedManifestPath)
   const manifestPath = toRepositoryPath(relative(rootDir, absoluteManifestPath))
-  if (manifestPath.startsWith('../')) {
+  if (manifestPath === '..' || manifestPath.startsWith('../') || isAbsolute(manifestPath)) {
     throw new Error(`Feature manifest must be inside the repository root: ${absoluteManifestPath}`)
   }
 
