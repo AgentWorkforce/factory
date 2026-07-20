@@ -8502,20 +8502,31 @@ describe('FactoryLoop', () => {
       labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
     })
     const publishInputs: GithubPublishPullRequestInput[] = []
+    let mount!: FakeMountClient
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => {
         publishInputs.push(input)
         const repoSlug = input.repo.split('/').at(-1)!
+        const prNumber = repoSlug === 'pear' ? 126 : 127
+        mount.files.set(`/github/repos/${input.repo}/pulls/${prNumber}/metadata.json`, {
+          content: {
+            number: prNumber,
+            head_ref: `factory/${number}-${repoSlug}`,
+            url: `https://github.com/${input.repo}/pull/${prNumber}`,
+            state: 'open',
+            draft: false,
+          },
+        })
         return {
           repo: input.repo,
-          number: repoSlug === 'pear' ? 126 : 127,
-          url: `https://github.com/${input.repo}/pull/${repoSlug === 'pear' ? 126 : 127}`,
+          number: prNumber,
+          url: `https://github.com/${input.repo}/pull/${prNumber}`,
           headRef: `factory/${number}-${repoSlug}`,
         }
       },
       closePullRequest: async () => undefined,
     }
-    const mount = new FakeMountClient({
+    mount = new FakeMountClient({
       [path]: issueFile,
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
       '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
@@ -8544,6 +8555,7 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
     fleet.emitAgentExit(hoopsheetImplementer.name, 'worker_exited')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+    await vi.waitFor(() => expect(fleet.spawns.filter((spawn) => spawn.name.includes('-babysit'))).toHaveLength(2))
 
     expect(publishInputs.map((input) => input.repo).sort()).toEqual([
       'AgentWorkforce/hoopsheet',
@@ -8556,6 +8568,73 @@ describe('FactoryLoop', () => {
         expect.objectContaining({ repo: 'AgentWorkforce/hoopsheet', number: 127 }),
       ]),
     })
+
+    const babysitters = fleet.spawns.filter((spawn) => spawn.name.includes('-babysit'))
+    fleet.emitAgentMessage({
+      from: babysitters[0]!.name,
+      target: 'factory',
+      body: `[factory-pr-ready] ${number}`,
+    })
+    await flush()
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual([String(number)])
+
+    fleet.emitAgentMessage({
+      from: babysitters[1]!.name,
+      target: 'factory',
+      body: `[factory-pr-ready] ${number}`,
+    })
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+  })
+
+  it('does not complete a multi-repository dispatch before every implementer has a PR when babysitting is disabled', async () => {
+    const number = 2779
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFile = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: input.repo.endsWith('/pear') ? 128 : 129,
+          url: `https://github.com/${input.repo}/pull/${input.repo.endsWith('/pear') ? 128 : 129}`,
+          headRef: input.headRef ?? `factory/${number}-${input.repo.split('/').at(-1)}`,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issueFile,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new LocalLifecycleFleetClient()
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: false },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      stateStore: new InMemoryStateStore({ batchSize: 4 }),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+    })
+    const decision = await factory.triageIssue(parseGithubFactoryIssue(path, issueFile))
+
+    await factory.dispatch(decision)
+    const implementers = fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
+    fleet.emitAgentExit(implementers[0]!.name, 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+    expect(factory.status().inFlight.map((ref) => ref.key)).toEqual([String(number)])
+
+    fleet.emitAgentExit(implementers[1]!.name, 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
   })
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
@@ -14284,7 +14363,7 @@ describe('FactoryLoop PR babysitter', () => {
         ]),
       }), { timeout: 4_000 })
       await vi.waitFor(async () => expect(await state().listBabysitterSessions('factory-test')).toEqual([
-        [key, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
+        [`${key}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
       ]))
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
