@@ -276,6 +276,30 @@ class RecordingGithubWriteback implements GithubWriteback {
   }
 }
 
+class PublishingGithubWriteback extends RecordingGithubWriteback {
+  readonly publishInputs: GithubPublishPullRequestInput[] = []
+
+  constructor(
+    private readonly receipt: {
+      number: number
+      author: string
+    },
+  ) {
+    super()
+  }
+
+  async publishPullRequest(input: GithubPublishPullRequestInput) {
+    this.publishInputs.push(input)
+    return {
+      repo: input.repo,
+      number: this.receipt.number,
+      url: `https://github.com/${input.repo}/pull/${this.receipt.number}`,
+      headRef: input.headRef ?? `factory/${this.receipt.number}-user`,
+      author: this.receipt.author,
+    }
+  }
+}
+
 class RecordingFactoryEventReporter {
   readonly events: FactoryCloudEventInputV1[] = []
 
@@ -8639,6 +8663,66 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
   })
 
+  it.each([
+    { identity: 'app' as const, appAvailable: true, expectedIdentity: 'app' as const },
+    { identity: 'user' as const, appAvailable: true, expectedIdentity: 'user' as const },
+    { identity: 'auto' as const, appAvailable: true, expectedIdentity: 'app' as const },
+    { identity: 'auto' as const, appAvailable: false, expectedIdentity: 'user' as const },
+  ])(
+    'publishes with the $expectedIdentity identity when github.identity=$identity and appAvailable=$appAvailable',
+    async ({ identity, appAvailable, expectedIdentity }) => {
+      const number = identity === 'app' ? 520 : identity === 'user' ? 521 : appAvailable ? 522 : 523
+      const appInputs: GithubPublishPullRequestInput[] = []
+      const appWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => {
+          appInputs.push(input)
+          return {
+            repo: input.repo,
+            number,
+            url: `https://github.com/${input.repo}/pull/${number}`,
+            headRef: `factory/${number}-app`,
+            author: 'relayfile[bot]',
+          }
+        },
+        closePullRequest: async () => undefined,
+      }
+      const mount = new FakeMountClient({
+        [issuePath(number)]: issueFile(number),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, appAvailable ? appWrite : undefined)
+      const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+      const infoLogs: unknown[][] = []
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({ github: { identity } }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: userWriteback,
+        probePrResolver: async () => undefined,
+        logger: {
+          info: (...args: unknown[]) => infoLogs.push(args),
+          warn: () => undefined,
+          error: () => undefined,
+        },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.githubPullRequestsPublished).toBe(1))
+
+      expect(appInputs).toHaveLength(expectedIdentity === 'app' ? 1 : 0)
+      expect(userWriteback.publishInputs).toHaveLength(expectedIdentity === 'user' ? 1 : 0)
+      expect(infoLogs).toContainEqual([
+        '[factory] published PR',
+        expect.objectContaining({
+          issue: `AR-${number}`,
+          identity: expectedIdentity,
+          author: expectedIdentity === 'app' ? 'relayfile[bot]' : 'operator-user',
+        }),
+      ])
+    },
+  )
+
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
     const publishInputs: GithubPublishPullRequestInput[] = []
     const githubWrite: GithubConnectionWrite = {
@@ -8730,7 +8814,11 @@ describe('FactoryLoop', () => {
     Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
     const fleet = new FakeFleetClient()
     const errors: Error[] = []
-    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const factory = createFactory(config({ github: { identity: 'app' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
     factory.on('error', (payload) => {
       if (payload.error instanceof Error) errors.push(payload.error)
     })
@@ -8739,7 +8827,9 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-53-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(errors).toHaveLength(1))
 
-    expect(errors[0]?.message).toBe('GitHub write path not available on this mount — connect GitHub to your workspace')
+    expect(errors[0]?.message).toBe(
+      'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+    )
     expect(factory.status().counters.githubPullRequestPublishFailures).toBe(1)
     expect(fleet.releases).toEqual([])
   })

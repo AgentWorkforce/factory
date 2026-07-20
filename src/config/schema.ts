@@ -128,6 +128,14 @@ const reportingSchema = z.object({
   requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
 }).default({})
 
+const githubSchema = z.object({
+  // Controls the credential identity used when Factory creates pull requests.
+  // `auto` preserves the compatibility behavior: prefer the connected
+  // workspace GitHub App, then use the operator's local `gh` authentication
+  // when the app write path is unavailable.
+  identity: z.enum(['app', 'user', 'auto']).default('auto'),
+}).default({})
+
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
 // don't hand-configure them. These names let the factory resolve a role from a
 // synced record that carries state.name but no state.id (sparse-sync fallback).
@@ -192,6 +200,7 @@ const WorkspaceConfigObjectSchema = z.object({
   // analytics. It defaults on for real CLI sessions and remains no-op when no
   // Cloud account is available; delivery failure never changes orchestration.
   reporting: reportingSchema,
+  github: githubSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the
