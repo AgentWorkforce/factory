@@ -65,6 +65,7 @@
     "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
+    "verify:e2e": "node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
   },
   "dependencies": {
