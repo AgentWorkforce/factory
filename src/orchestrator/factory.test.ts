@@ -14634,6 +14634,11 @@ describe('FactoryLoop PR babysitter', () => {
       }
       const lifecycle = persisted.workspaces['factory-test']!.dispatchLifecycles[key]!
       const stale = lifecycle.agents.find((agent) => agent.tracked.spec.ownedPullRequest?.number === 1496)!
+      // Also reproduce the live route-drift form of this crash gap: an older
+      // weak match can belong to a repository that is no longer present in the
+      // durable decision at all. Same-repository receipt replacement alone
+      // cannot retire that agent.
+      stale.tracked.spec.ownedPullRequest = { repo: 'AgentWorkforce/relay', number: 1496 }
       const exact = structuredClone(stale)
       exact.name = 'ar-496-babysit-exact'
       exact.tracked.spec.name = exact.name
@@ -14684,7 +14689,7 @@ describe('FactoryLoop PR babysitter', () => {
       })
       expect(restartedFleet.releases).toContainEqual({
         name: 'ar-496-babysit',
-        reason: 'superseded-pr-receipt',
+        reason: 'superseded-pr-route',
       })
       expect(restartedFleet.resumes.map((resume) => resume.name)).not.toContain('ar-496-babysit')
     } finally {

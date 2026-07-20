@@ -7284,6 +7284,15 @@ export class FactoryLoop implements Factory {
           ...(receipt.path ? { path: receipt.path } : {}),
         })
       }
+      if (authoritative.size > 0) {
+        this.#logger.debug?.('[factory] reconciling authoritative babysitter receipts', {
+          issue: record.issue.key,
+          lifecycleReceipts: lifecycle?.pullRequests?.map((receipt) => receipt.number) ?? [],
+          restoredReceipts: restored.map((receipt) => receipt.prNumber),
+          authoritativeReceipts: [...authoritative.values()].map((receipt) => receipt.number),
+        })
+        await this.#retireBabysittersOutsideCurrentRoutes(record)
+      }
       for (const published of authoritative.values()) {
         if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
         await this.#ensureBabysitter(record, {
@@ -8275,6 +8284,61 @@ export class FactoryLoop implements Factory {
       }
     }
     return superseded.length > 0
+  }
+
+  async #retireBabysittersOutsideCurrentRoutes(record: InFlightIssue): Promise<void> {
+    const wantedRepos = new Set(record.decision.implementers.map((implementer) => implementer.repo.toLowerCase()))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const trackedAgents = new Map([
+      ...(lifecycle?.agents ?? [])
+        .filter((agent) => agent.releasedAtMs === undefined)
+        .map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)] as const),
+      ...record.agents,
+    ])
+    const unrouted = [...trackedAgents.entries()].filter(([, tracked]) => {
+      const owned = tracked.spec.ownedPullRequest
+      return tracked.spec.role === 'babysitter' &&
+        Boolean(owned) &&
+        !wantedRepos.has(owned!.repo.toLowerCase())
+    })
+    for (const [agentName, tracked] of unrouted) {
+      const owned = tracked.spec.ownedPullRequest
+      const failed = await this.#releaseAndTerminateAgents(
+        [[agentName, tracked]],
+        'superseded-pr-route',
+        'completion',
+      )
+      if (failed.length > 0) {
+        this.#increment('supersededBabysitterReleaseFailures')
+        throw new Error(`Failed to release unrouted babysitter ${agentName}`)
+      }
+      if (owned) {
+        const staleKey = babysitterOwnershipKey(record.issue, {
+          repo: owned.repo,
+          prNumber: owned.number,
+        })
+        await this.#cancelBabysitterWake(staleKey)
+        if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+          await this.#state.clearBabysitterSession(this.#workspaceId, staleKey)
+        }
+      }
+      record.agents.delete(agentName)
+      this.#babysitterCriticalAgents.delete(agentName)
+      this.#increment('supersededBabysittersReleased')
+      this.#logger.info?.('[factory] released babysitter outside the current dispatch routes', {
+        issue: record.issue.key,
+        babysitter: agentName,
+        previousRepo: owned?.repo,
+        previousPrNumber: owned?.number,
+        currentRepos: [...wantedRepos],
+      })
+    }
+    if (unrouted.length > 0) {
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
+        throw new Error(`Failed to persist unrouted babysitter cleanup for ${record.issue.key}`)
+      }
+    }
   }
 
   // The babysitter owns the readiness verdict (CI green + conflicts resolved +
