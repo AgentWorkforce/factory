@@ -12,8 +12,14 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import type { Logger } from '../ports/system'
+import {
+  FEATURE_MAP_MANIFEST_PATH,
+  validateFeatureManifest,
+  type FeatureCriticality,
+  type ManifestFeature,
+} from './validate'
 
-export const FEATURE_MAP_MANIFEST_PATH = '.agentworkforce/features/manifest.yaml'
+export { FEATURE_MAP_MANIFEST_PATH } from './validate'
 
 const GENERATED_CATEGORY_ID = 'generated-touched-surfaces'
 const DEFAULT_TIMEOUT_MS = 2_000
@@ -36,7 +42,7 @@ const SKIPPED_DIRECTORIES = new Set([
   'vendor',
 ])
 
-export type FeatureMapCriticality = 'critical' | 'hot' | 'standard'
+export type FeatureMapCriticality = FeatureCriticality
 export type FeatureMapVerifyTier = 1 | 2 | 3 | 4 | 5 | 6
 
 export interface FeatureMapFeature {
@@ -291,89 +297,26 @@ export async function generateFeatureMap(
   }
 }
 
-/** Parse and validate the same scalar manifest shape consumed by the feature guardian. */
+/** Parse through the shared validator consumed by the feature guardian and CI. */
 export function parseFeatureMapManifest(raw: string): ParsedFeatureMapManifest {
-  if (!/^version:\s*.+$/mu.test(raw)) throw new Error('Feature manifest is missing version')
-  if (!/^catalog:\s*$/mu.test(raw)) throw new Error('Feature manifest is missing catalog')
-  const categoriesStart = /^categories:\s*$/mu.exec(raw)
-  if (!categoriesStart) throw new Error('Feature manifest is missing categories')
-
-  const features: FeatureMapFeature[] = []
-  const categoryIds: string[] = []
-  const seenIds = new Set<string>()
-  let criticality: FeatureMapCriticality | undefined
-  let current: Partial<FeatureMapFeature> | undefined
-
-  const finishCurrent = (): void => {
-    if (!current) return
-    const feature = validateParsedFeature(current)
-    if (seenIds.has(feature.id)) throw new Error(`Duplicate feature id in manifest: ${feature.id}`)
-    seenIds.add(feature.id)
-    features.push(feature)
-    current = undefined
+  const validation = validateFeatureManifest(raw)
+  return {
+    categoryIds: validation.categoryIds,
+    features: validation.features.map(toFeatureMapFeature),
   }
+}
 
-  const categoryLines = raw.slice(categoriesStart.index + categoriesStart[0].length).split(/\r?\n/u)
-  for (const line of categoryLines) {
-    const categoryMatch = /^  ([a-z][a-z0-9-]+):\s*$/u.exec(line)
-    if (categoryMatch) {
-      finishCurrent()
-      categoryIds.push(categoryMatch[1])
-      criticality = undefined
-      continue
-    }
-
-    const criticalityMatch = /^    criticality:\s*(critical|hot|standard)\s*$/u.exec(line)
-    if (criticalityMatch) {
-      finishCurrent()
-      criticality = criticalityMatch[1] as FeatureMapCriticality
-      continue
-    }
-
-    const idMatch = /^      - id:\s*(.+?)\s*$/u.exec(line)
-    if (idMatch) {
-      finishCurrent()
-      if (!criticality) {
-        throw new Error(`Feature ${decodeScalar(idMatch[1])} appears before category criticality`)
-      }
-      current = { id: decodeScalar(idMatch[1]), criticality }
-      continue
-    }
-
-    if (!current) continue
-    const fieldMatch = /^        (name|cli|api|description|location|verify_tier):\s*(.*?)\s*$/u.exec(line)
-    if (!fieldMatch) continue
-    const [, key, rawValue] = fieldMatch
-    const value = decodeScalar(rawValue)
-    if (key === 'name') current.name = value
-    else if (key === 'cli') current.cli = value
-    else if (key === 'api') current.api = value
-    else if (key === 'description') current.description = value
-    else if (key === 'location') current.location = value
-    else if (key === 'verify_tier') current.verifyTier = Number(value) as FeatureMapVerifyTier
+function toFeatureMapFeature(feature: ManifestFeature): FeatureMapFeature {
+  return {
+    id: feature.id,
+    name: feature.name,
+    ...(feature.cli ? { cli: feature.cli } : {}),
+    ...(feature.api ? { api: feature.api } : {}),
+    description: feature.desc,
+    location: feature.location,
+    verifyTier: feature.tier as FeatureMapVerifyTier,
+    criticality: feature.criticality,
   }
-  finishCurrent()
-
-  if (categoryIds.length === 0) throw new Error('Feature manifest contains no categories')
-  if (features.length === 0) throw new Error('Feature manifest contains no features')
-  if (new Set(categoryIds).size !== categoryIds.length) throw new Error('Feature manifest contains duplicate categories')
-
-  const declaredCategoryCount = manifestInteger(raw, /^  category_count:\s*(\d+)\s*$/mu, 'category_count')
-  const declaredFeatureCount = manifestInteger(raw, /^  feature_count:\s*(\d+)\s*$/mu, 'feature_count')
-  if (declaredCategoryCount !== categoryIds.length || declaredFeatureCount !== features.length) {
-    throw new Error(
-      `Manifest catalog mismatch: declared ${declaredCategoryCount} categories/${declaredFeatureCount} features, parsed ${categoryIds.length}/${features.length}`,
-    )
-  }
-  for (let tier = 1; tier <= 6; tier += 1) {
-    const declared = manifestInteger(raw, new RegExp(`^    ${tier}:\\s*(\\d+)\\s*$`, 'mu'), `tier ${tier}`)
-    const actual = features.filter((feature) => feature.verifyTier === tier).length
-    if (declared !== actual) {
-      throw new Error(`Manifest catalog tier ${tier} mismatch: declared ${declared}, parsed ${actual}`)
-    }
-  }
-
-  return { categoryIds, features }
 }
 
 function normalizeInput(
@@ -920,24 +863,6 @@ async function persistManifest(manifestPath: string, content: string, deadline: 
   }
 }
 
-function validateParsedFeature(feature: Partial<FeatureMapFeature>): FeatureMapFeature {
-  if (!feature.id || !feature.name || !feature.description || !feature.location) {
-    throw new Error(`Incomplete manifest feature: ${JSON.stringify(feature)}`)
-  }
-  if (!feature.cli && !feature.api) throw new Error(`Manifest feature ${feature.id} has neither cli nor api`)
-  if (!Number.isInteger(feature.verifyTier) || (feature.verifyTier as number) < 1 || (feature.verifyTier as number) > 6) {
-    throw new Error(`Manifest feature ${feature.id} has invalid verify_tier`)
-  }
-  if (!feature.criticality) throw new Error(`Manifest feature ${feature.id} has no category criticality`)
-  return feature as FeatureMapFeature
-}
-
-function manifestInteger(raw: string, expression: RegExp, label: string): number {
-  const value = Number(expression.exec(raw)?.[1])
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Feature manifest is missing a valid ${label}`)
-  return value
-}
-
 function replaceRequired(raw: string, expression: RegExp, replacement: string, label: string): string {
   if (!expression.test(raw)) throw new Error(`Feature manifest is missing ${label}`)
   expression.lastIndex = 0
@@ -953,23 +878,6 @@ function tierCounts(features: FeatureMapFeature[]): Record<number, number> {
 
 function yamlScalar(value: string): string {
   return JSON.stringify(value)
-}
-
-function decodeScalar(value: string | undefined): string {
-  const trimmed = value?.trim() ?? ''
-  if (trimmed.length < 2) return trimmed
-  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1).replaceAll("''", "'")
-  }
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    try {
-      const parsed = JSON.parse(trimmed) as unknown
-      return typeof parsed === 'string' ? parsed : trimmed
-    } catch {
-      return trimmed.slice(1, -1)
-    }
-  }
-  return trimmed
 }
 
 function splitLocations(value: string): string[] {

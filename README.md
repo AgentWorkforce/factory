@@ -57,11 +57,12 @@ From a source checkout instead of an npm install, run
 
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
-   open pull requests; a local `gh` installation or `gh auth login` is not a
-   prerequisite. If a required connection is missing, an interactive Factory
-   command offers to open the Relayfile connection flow and waits for it to
-   finish. Linear-backed operations require both Linear and GitHub; GitHub-native
-   operations require GitHub.
+   open pull requests by default. A local `gh` installation and `gh auth login`
+   are required only when `github.identity` selects the user path (or for the
+   existing GitHub issue lifecycle writeback described below). If a required
+   connection is missing, an interactive Factory command offers to open the
+   Relayfile connection flow and waits for it to finish. Linear-backed operations
+   require both Linear and GitHub; GitHub-native operations require GitHub.
 
 2. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
    repo route are required:
@@ -123,6 +124,7 @@ From a source checkout instead of an npm install, run
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
+| `factory featuremap check [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
@@ -139,6 +141,27 @@ instruction to rerun the Factory command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+### Feature-map validation
+
+Repositories with `.agentworkforce/features/manifest.yaml` can run
+`factory featuremap check` in CI. The command rejects malformed or duplicate
+entries, invalid verification tiers, catalog-summary drift, and locations that
+do not exist. The same checker is published as `@agent-relay/factory/featuremap`
+for programmatic use.
+
+During review, pass the PR base ref with `--base <ref>`. A changed file named by
+an existing manifest entry produces an advisory when that entry's description,
+verification tier, and locations are unchanged. The reviewer must re-confirm
+that metadata; the advisory does not itself fail the command because a covered
+file can change without changing the feature contract.
+
+An hourly per-repository sweep or Slack confirmation bot is explicitly outside
+this feature's scope. Factory's own guardian cycle is useful for tier-5/6 checks
+that need live or human confirmation, but duplicating it for every customer repo
+would add standing noise and infrastructure without evidence that those entries
+rot between PRs. Revisit that only if usage data demonstrates silent tier-5/6
+drift that PR checks do not catch.
 
 ### Cloud progress and trace correlation
 
@@ -210,6 +233,20 @@ The **safety gate** keeps both flows opt-in. Linear dispatch uses the configured
 title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
 open issue. Everything else is ignored. Loosen these checks deliberately —
 they're the main guardrail.
+
+To sequence issues, add one exact standalone line to the issue body or Linear
+description:
+
+```text
+Blocked by: #123, owner/other-repo#456
+```
+
+A bare number refers to the issue's routed repository. Factory parks the issue
+and posts a comment naming every open blocker; capacity queuing remains a
+separate hold reason. Closed issues and merged pull requests satisfy blockers,
+and the next discovery cycle promotes newly unblocked work. Dependency cycles
+fail closed and are reported instead of waiting indefinitely. Other prose and
+`Related:` lines are not interpreted as dependencies.
 
 > Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
 > auto-close). For real work you want to keep, use the `[factory]` prefix.
@@ -327,6 +364,30 @@ an invalid config fails fast with a field-level error. See
 [`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
+
+Factory PR authorship is controlled explicitly with `github.identity`:
+
+```jsonc
+{
+  "github": {
+    "identity": "app"
+  }
+}
+```
+
+- `"app"` always publishes through the connected workspace GitHub App. If that
+  write path is unavailable, Factory fails loudly and never falls back to a
+  personal account.
+- `"user"` always publishes with the account authenticated by the local `gh`
+  CLI, even when the app path is available.
+- `"auto"` is the default and preserves compatibility: prefer the app path,
+  then fall back to the local `gh` user when the app writer is unavailable.
+
+Each successful publication log includes `identity` (`app` or `user`) and the
+confirmed `author`. This setting currently controls PR creation only. GitHub
+issue comments and lifecycle status labels still use the existing local `gh`
+writeback; extending the identity policy to those operations requires a
+connected-app issue writeback surface.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,

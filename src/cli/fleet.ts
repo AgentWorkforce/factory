@@ -25,6 +25,7 @@ import {
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
+  publishFactoryMountHealth,
   parseOwnedBrokerAgentExitTimeoutMs,
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
@@ -46,14 +47,17 @@ import {
   type GhRunner,
   type FactoryStateResolution,
   type Logger,
+  type LocalMountHealthEvent,
   type LocalMountOptions,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
 } from '../index'
+import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
+import { checkFeatureMap, type CheckFeatureMapOptions, type FeatureMapCheckReport } from '../featuremap'
 import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
 import {
   ensureFactoryIntegrations,
@@ -96,6 +100,7 @@ interface FleetCliDeps {
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
+  featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
 }
 
 interface GlobalOptions {
@@ -124,6 +129,7 @@ type ParsedCommand =
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
+  | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -143,6 +149,15 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     }
     const { globals, args } = parseGlobalOptions(argv)
     const command = parseFleetCommand(args)
+
+    if (command.kind === 'featuremap-check') {
+      const report = await (deps.featureMapCheck ?? checkFeatureMap)({
+        ...(command.manifestPath ? { manifestPath: command.manifestPath } : {}),
+        ...(command.baseRef ? { baseRef: command.baseRef } : {}),
+      })
+      writeJson(out, report)
+      return 0
+    }
 
     if (command.kind === 'factory-close-probe') {
       // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
@@ -237,7 +252,37 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         }
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
-        mount = await buildMount(loaded, deps)
+        const logger = streamLogger(err)
+        const pendingMountHealthEvents: LocalMountHealthEvent[] = []
+        const reportMountHealth = async (event: LocalMountHealthEvent): Promise<void> => {
+          if (!mount) {
+            pendingMountHealthEvents.push(event)
+            return
+          }
+          if (reporter) {
+            await reporter.report(createFactoryCloudEventV1({
+              type: event.state === 'degraded' ? 'factory.anomaly' : 'factory.snapshot',
+              level: event.state === 'degraded' ? 'error' : 'info',
+              attributes: {
+                component: 'relayfile_mount',
+                operation: 'supervise',
+                errorCode: event.reason,
+                count: event.degradedMounts,
+              },
+            }))
+          }
+          try {
+            await publishFactoryMountHealth(mount, workspaceId, event)
+          } catch (error) {
+            logger.warn?.('[factory] unable to publish Relayfile mount health signal', {
+              errorClass: error instanceof Error ? error.name : 'Error',
+            })
+          }
+        }
+        mount = await buildMount(loaded, deps, {
+          logger,
+          onLocalMountHealth: reportMountHealth,
+        })
         await prepareFactoryIntegrations(command, mount, loaded.config, globals, deps, workspaceId, err)
         if (command.kind === 'factory-babysit') {
           return await runStandaloneBabysitCommand(
@@ -256,7 +301,6 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
-        const logger = streamLogger(err)
         const stateStore = new FileStateStore({
           batchSize: loaded.config.batchSize,
           watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
@@ -278,6 +322,9 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
               operation: 'start',
             },
           }))
+        }
+        for (const event of pendingMountHealthEvents.splice(0)) {
+          await reportMountHealth(event)
         }
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
@@ -349,7 +396,26 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     return parseFleetSubcommand(rest)
   }
 
+  if (verb === 'featuremap') {
+    return parseFeatureMapCommand(rest)
+  }
+
   throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseFeatureMapCommand(args: string[]): ParsedCommand {
+  const [action, ...flags] = args
+  if (action !== 'check') {
+    throw new Error('factory featuremap requires the check command')
+  }
+  const parsed = parseFlags(flags)
+  const unexpected = Object.keys(parsed).find((key) => key !== 'manifest' && key !== 'base')
+  if (unexpected) throw new Error(`Unknown factory featuremap option: --${unexpected}`)
+  return {
+    kind: 'featuremap-check',
+    ...(parsed.manifest ? { manifestPath: parsed.manifest } : {}),
+    ...(parsed.base ? { baseRef: parsed.base } : {}),
+  }
 }
 
 function parseFleetSubcommand(args: string[]): ParsedCommand {
@@ -616,6 +682,11 @@ async function runStandaloneBabysitCommand(
   }
 
   const agentName = standaloneBabysitterAgentName(repo, pr.number)
+  const testGuidance = await resolveTestGuidance({
+    repoPath: clonePath,
+    issue,
+    changedFiles: pr.filesChanged,
+  })
   const task = renderAgentTask({
     issue,
     route: { repo, clonePath },
@@ -634,6 +705,7 @@ async function runStandaloneBabysitCommand(
     },
     standaloneBabysitter: { specSource },
     integrationsMountRoot: resolve(process.cwd(), '.integrations'),
+    testGuidance,
   })
   const receiptBase = {
     agent: agentName,
@@ -1180,12 +1252,21 @@ function hasDefaultLinearStateNames(states: FactoryConfig['linear']['states']): 
     states.humanReview === 'In Human Review'
 }
 
-async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
+async function buildMount(
+  loaded: LoadedConfig,
+  deps: FleetCliDeps,
+  observability: {
+    logger?: Logger
+    onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
+  } = {},
+): Promise<MountClient> {
   if (deps.mount) return deps.mount
   if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
   let mount: MountClient
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
+    logger: observability.logger,
+    onLocalMountHealth: observability.onLocalMountHealth,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
   })
   return mount
@@ -1558,6 +1639,7 @@ Commands:
   dispatch <KEY|path>   Triage and dispatch one issue
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
+  featuremap check      Validate .agentworkforce/features/manifest.yaml
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:

@@ -9,6 +9,7 @@ import {
   generateFeatureMap,
   parseFeatureMapManifest,
 } from './generate'
+import { validateFeatureManifest } from './validate'
 
 const roots: string[] = []
 const fixedNow = () => new Date('2026-07-20T12:00:00.000Z')
@@ -47,6 +48,7 @@ describe('generateFeatureMap', () => {
 
     const raw = await readFile(join(root, FEATURE_MAP_MANIFEST_PATH), 'utf8')
     const manifest = parseFeatureMapManifest(raw)
+    expect(validateFeatureManifest(raw, { rootDir: root }).features).toHaveLength(1)
     expect(manifest.categoryIds).toEqual(['generated-touched-surfaces'])
     expect(manifest.features).toEqual(result.added)
     expect(raw).toContain("updated: \"2026-07-20\"")

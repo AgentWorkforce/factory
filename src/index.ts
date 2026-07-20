@@ -1,6 +1,5 @@
 import type { FactoryConfig } from './config/schema'
 
-export * from './featuremap/index.js'
 export * from './webhook/index.js'
 export * from './state/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
@@ -35,6 +34,7 @@ export type {
   TemplateIssue,
   TemplateRoute,
 } from './dispatch/templates'
+export * from './featuremap/index'
 export {
   createRelayflowPolicyRegistry,
   dispatchRelayflowForChangeEvent,
@@ -88,6 +88,7 @@ export type {
 } from './mount/relayfile-integration-preflight'
 export type {
   ActiveWorkspaceResolver,
+  LocalMountHealthEvent,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
   ResolvedFactoryWorkspace,
@@ -128,18 +129,30 @@ export {
   checkFactoryLoopLiveness,
   createFactory,
   FactoryLoop,
+  dependencyIdentity,
+  findDependencyCycle,
   issueKey,
   isDispatchableIssue,
   isRealLinearIssue,
   githubIssuePathParts,
   parseGithubFactoryIssue,
+  parseBlockedBy,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
   reapFactoryOrphansOnce,
 } from './orchestrator'
-export type { InFlightIssue, QueuedIssue, TrackedAgent } from './orchestrator'
+export type {
+  DeclaredDependency,
+  DependencyAdmission,
+  DependencyBlocker,
+  InFlightIssue,
+  ParkedIssue,
+  QueuedIssue,
+  ResolvedDependency,
+  TrackedAgent,
+} from './orchestrator'
 export {
   HeuristicTriage,
   LlmTriage,
@@ -152,12 +165,15 @@ export type {
 } from './triage'
 export {
   GhCliGithubWriteback,
+  FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
   MountGithubRead,
   MountLinearWriteback,
   MountSlackWriteback,
+  publishFactoryMountHealth,
 } from './writeback'
 export type {
+  FactoryMountHealthRecord,
   GhCliGithubWritebackConfig,
   LinearCommentPayload,
   LinearCreateIssuePayload,
@@ -200,16 +216,20 @@ export {
   eventPathGlobsForIntegration,
   filesystemEventToChangeEvent,
   filterLinearPredicateSpecs,
+  filterSlackThreadReplySpecs,
   globMatchesPath,
   globSegmentMatches,
   hasLinearPredicates,
   integrationRelayFileSyncOptions,
   isLinearIssueEventPath,
+  isSlackMessageEventPath,
   linearIssueMatchesPredicates,
   linearRecordCandidates,
   linearScopePredicates,
   normalizeChangePath,
   relayfileSdkPathFiltersFor,
+  parseSlackThreadReply,
+  slackThreadReplyGlob,
   slackListenDms,
   subscriptionSpecsFor,
 } from './subscriptions'
@@ -221,6 +241,9 @@ export type {
   LinearPredicateSubscriptionSpec,
   LinearScopePredicates,
   LocalMountRoot,
+  SlackThreadPredicateSubscriptionSpec,
+  SlackThreadReply,
+  SlackThreadScopePredicates,
   RelayfileEventClient,
   RelayFileSyncFactory,
   RelayFileSyncLike,
