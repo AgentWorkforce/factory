@@ -44,6 +44,12 @@ export interface FactoryPorts {
   babysitterWakeUnreachableEscalateMs?: number
   /** Slow retry cadence applied after an unreachable babysitter escalation. Test-only override. */
   babysitterWakeUnreachableRetryMs?: number
+  /**
+   * Maximum wall-clock time a live daemon waits for startup-reconciled agent
+   * exits before it continues ready-issue discovery. The exit work remains
+   * active in the background. Test-only override of the built-in default.
+   */
+  startupAgentExitDrainTimeoutMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager

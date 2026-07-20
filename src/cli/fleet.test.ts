@@ -709,10 +709,18 @@ describe('fleet CLI runtime', () => {
         expect(ports.reporter).toBe(reporter)
         return factory
       }) as typeof createFactory
+      const cloudMountFromConfig = vi.fn(async (options) => {
+        await options?.onLocalMountHealth?.({
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+        })
+        return new FakeMountClient()
+      })
 
       const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
         fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        cloudMountFromConfig,
         reporter,
         createFactory: createFactorySpy,
         stdout: buffer(),
@@ -722,10 +730,37 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(events.map((event) => event.type)).toEqual([
         'instance.started',
+        'factory.anomaly',
         'instance.stopping',
         'instance.stopped',
       ])
       expect(events[0]).toMatchObject({ attributes: { backend: 'internal', mode: 'run-once' } })
+      expect(events[1]).toMatchObject({
+        level: 'error',
+        attributes: {
+          component: 'relayfile_mount',
+          operation: 'supervise',
+          errorCode: 'mount_stale',
+          count: 1,
+        },
+      })
+      expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
+        logger: expect.any(Object),
+        onLocalMountHealth: expect.any(Function),
+      }))
+      const cloudMount = await cloudMountFromConfig.mock.results[0]?.value
+      expect(cloudMount?.writes).toContainEqual({
+        path: '/factory/observability/mount-health/current.json',
+        content: expect.objectContaining({
+          schemaVersion: 'factory.mount-health.v1',
+          type: 'factory.mount-health',
+          workspaceId: 'factory-cli-test',
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+          occurredAt: expect.any(String),
+        }),
+      })
       expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
     } finally {
       await rm(root, { recursive: true, force: true })

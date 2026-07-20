@@ -87,6 +87,7 @@ export type {
 } from './mount/relayfile-integration-preflight'
 export type {
   ActiveWorkspaceResolver,
+  LocalMountHealthEvent,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
   ResolvedFactoryWorkspace,
@@ -163,12 +164,15 @@ export type {
 } from './triage'
 export {
   GhCliGithubWriteback,
+  FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
   MountGithubRead,
   MountLinearWriteback,
   MountSlackWriteback,
+  publishFactoryMountHealth,
 } from './writeback'
 export type {
+  FactoryMountHealthRecord,
   GhCliGithubWritebackConfig,
   LinearCommentPayload,
   LinearCreateIssuePayload,

@@ -48,6 +48,10 @@
     "./node": {
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
+    },
+    "./hosted": {
+      "types": "./dist/hosted/index.d.ts",
+      "import": "./dist/hosted/index.js"
     }
   },
   "publishConfig": {
@@ -65,7 +69,7 @@
     "@agent-relay/integration-prompts": "^10.6.4",
     "@agent-relay/sdk": "^10.6.4",
     "@relayfile/relay-helpers": "^0.4.2",
-    "@relayfile/sdk": "^0.10.9",
+    "@relayfile/sdk": "^0.10.32",
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",

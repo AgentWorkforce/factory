@@ -274,12 +274,50 @@ process on the same control-plane host can take over after a crash. Execution
 nodes never need access to that state file, and remote PIDs are never signalled
 as local processes.
 
-The supported topology is one Factory control-plane host per workspace, with
-any number of relay execution nodes. Multiple Factory processes on that host
-are fenced through the shared `FileStateStore` lock/lease. Active/active Factory
-control planes on different hosts are intentionally unsupported: the current
-Relayfile and Relay messaging APIs do not expose a shared compare-and-set lease,
-so separate local state files cannot provide a truthful cross-host fence.
+The supported topology for the **CLI control plane** is one Factory host per
+workspace, with any number of relay execution nodes. Multiple Factory processes
+on that host are fenced through the shared `FileStateStore` lock/lease.
+Active/active CLI control planes on different hosts remain intentionally
+unsupported: separate local state files cannot provide a truthful cross-host
+fence.
+
+### Hosting the control plane in Cloud
+
+`@agent-relay/factory/hosted` is the worker-safe control-plane entrypoint. It
+contains no Node filesystem/process dependency and runs the complete sweep:
+
+```text
+reconcile invocation completions → discover ready issues → triage → dispatch
+                              → merge gate → idempotent provider writeback
+```
+
+The Cloud host supplies integration ports for discovery, fleet spawn/status,
+merge-gate evaluation, and Linear/Slack writeback. `runOnce()` polls every
+persisted invocation before discovery, so a dropped completion webhook is
+recovered by the next scheduled sweep. The same lifecycle can accept pushed
+completion events through `ingestCompletion()`.
+
+```ts
+import {
+  createHostedFactory,
+  DurableObjectHostedFactoryStateStore,
+} from '@agent-relay/factory/hosted'
+
+const state = new DurableObjectHostedFactoryStateStore(durableObjectState.storage)
+const factory = createHostedFactory(
+  { workspaceId, ownerId: isolateId, config },
+  { state, discovery, fleet, completions, mergeGate, writeback },
+)
+
+await factory.runOnce() // invoke from cron/alarm and safe webhook wakeups
+```
+
+The Durable Object adapter stores each workspace independently and performs
+lease claims plus lifecycle writes in storage transactions. Every mutation is
+checked against the current owner and monotonically increasing lease epoch; an
+expired host cannot write after takeover. Spawn invocation IDs are deterministic
+and provider writebacks carry stable idempotency keys, making recovery safe when
+an external operation succeeds just before the worker loses its lease.
 
 Tokens involved — set only the first one on the orchestrator host:
 
