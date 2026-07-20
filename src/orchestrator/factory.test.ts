@@ -7990,12 +7990,14 @@ describe('FactoryLoop', () => {
       mount.emit(changeEvent(newPath, 'event-after-start-31'))
       await vi.advanceTimersByTimeAsync(10)
 
-      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
-        'ar-30-impl-pear',
-        'ar-30-review',
-        'ar-31-impl-pear',
-        'ar-31-review',
-      ])
+      await vi.waitFor(() => {
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+          'ar-30-impl-pear',
+          'ar-30-review',
+          'ar-31-impl-pear',
+          'ar-31-review',
+        ])
+      })
       await factory.stop()
     } finally {
       vi.useRealTimers()
