@@ -97,5 +97,10 @@ function git(...args) {
 }
 
 function exec(command, args, cwd = root) {
-  return execFileSync(command, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  const executable = process.platform === 'win32' && command === 'npm' ? 'npm.cmd' : command
+  return execFileSync(executable, args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
 }
