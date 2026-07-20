@@ -6301,7 +6301,7 @@ export class FactoryLoop implements Factory {
     const comments: Array<{ path: string; id: number }> = []
     const sinceCommentId = githubCommentNumericId(watch.sinceCommentId ?? watch.lastSeenCommentId)
     const processedCommentIds = new Set(watch.processedCommentIds ?? [])
-    for (const path of await this.#githubIssueCommentPaths(watch.source)) {
+    for (const path of await this.#githubIssueCommentPaths(watch.source, watch.issue.path)) {
       const parts = githubIssueCommentPathParts(path)
       const id = parts ? githubCommentNumericId(parts.commentId) : undefined
       if (id !== undefined && id > sinceCommentId && !processedCommentIds.has(String(id))) {
@@ -6329,14 +6329,25 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #githubIssueCommentPaths(source: GithubIssueSourceRef): Promise<string[]> {
+  async #githubIssueCommentPaths(source: GithubIssueSourceRef, issuePath?: string): Promise<string[]> {
     const paths = new Set<string>()
     const owner = encodeURIComponent(source.owner)
     const repo = encodeURIComponent(source.repo)
-    for (const prefix of [
-      `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
-      `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
-    ]) {
+    const issueParts = issuePath ? githubIssuePathParts(issuePath) : undefined
+    const canonicalIssueRoot = issuePath
+      && issueParts?.owner.toLowerCase() === source.owner.toLowerCase()
+      && issueParts.repo.toLowerCase() === source.repo.toLowerCase()
+      && issueParts.number === source.number
+      && /\/(?:meta|metadata)\.json$/u.test(issuePath)
+      ? dirname(issuePath)
+      : undefined
+    const prefixes = canonicalIssueRoot
+      ? [canonicalIssueRoot]
+      : [
+          `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues`,
+          `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
+        ]
+    for (const prefix of prefixes) {
       try {
         for (const path of await this.#mount.listTree(prefix)) {
           const parts = githubIssueCommentPathParts(path)
