@@ -111,6 +111,7 @@ interface LoadedConfig {
 }
 
 const autoDetectedIssueSources = new WeakSet<FactoryConfig>()
+const CLONE_MOUNT_PREFLIGHT_CONCURRENCY = 4
 
 type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
@@ -733,9 +734,13 @@ async function ensureClonePathMounts(
 ): Promise<void> {
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
-  for (const clonePath of new Set(Object.values(config.clonePaths ?? {}))) {
-    const resolved = resolve(clonePath)
-    if (resolved !== daemonCwd) {
+  const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}))]
+    .map((clonePath) => resolve(clonePath))
+    .filter((clonePath) => clonePath !== daemonCwd)
+  let nextIndex = 0
+  const mountNext = async (): Promise<void> => {
+    while (nextIndex < clonePaths.length) {
+      const resolved = clonePaths[nextIndex++]!
       try {
         await mountFn(workspaceId, resolved, mountOpts)
       } catch (error) {
@@ -744,6 +749,10 @@ async function ensureClonePathMounts(
       }
     }
   }
+  await Promise.all(Array.from(
+    { length: Math.min(CLONE_MOUNT_PREFLIGHT_CONCURRENCY, clonePaths.length) },
+    mountNext,
+  ))
 }
 
 function resolveLocalMountFn(

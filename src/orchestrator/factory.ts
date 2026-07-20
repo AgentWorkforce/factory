@@ -644,9 +644,22 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    this.#wireFleetEvents()
-    await this.#adoptInFlightAgents()
-    await this.#restoreBabysitterOwnership()
+    const live = (opts.mode ?? 'live') === 'live'
+    // Capture the legacy registry before the first live heartbeat rewrites it.
+    // Durable lifecycle rows are authoritative, but this fallback is still
+    // required to adopt workers started by pre-lifecycle Factory versions.
+    const legacyRegistry = live
+      ? await readFactoryInFlightRegistry(this.#config.loop.registryPath)
+      : undefined
+    if (live) await this.#startLiveHeartbeat()
+    try {
+      this.#wireFleetEvents()
+      await this.#adoptInFlightAgents(legacyRegistry)
+      await this.#restoreBabysitterOwnership()
+    } catch (error) {
+      if (live) await this.#stopLiveHeartbeat('stopping')
+      throw error
+    }
 
     if (opts.mode === 'dispatch-owner') {
       this.#started = true
@@ -660,7 +673,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    if ((opts.mode ?? 'live') === 'live') {
+    if (live) {
       this.#started = true
       try {
         await this.#startLiveSubscription(issueSource, opts.liveSubscription)
@@ -837,7 +850,6 @@ export class FactoryLoop implements Factory {
     overrides: Partial<FactoryLiveSubscriptionOptions> = {},
   ): Promise<void> {
     const options = this.#liveOptions(overrides)
-    await this.#startLiveHeartbeat()
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -2483,7 +2495,7 @@ export class FactoryLoop implements Factory {
   // in the durable lifecycle store, restore their full batch/spec association,
   // then reconcile once so exits that happened while this process was down are
   // handled instead of being dropped as unknown agents.
-  async #adoptInFlightAgents(): Promise<void> {
+  async #adoptInFlightAgents(legacyRegistry?: FactoryInFlightRegistry): Promise<void> {
     try {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
@@ -2533,7 +2545,7 @@ export class FactoryLoop implements Factory {
       // records existed. It preserves observation, but only new lifecycle rows
       // carry enough decision/spec state to process the reconciled exit.
       if (agents.length === 0 && !hasNonterminalDurableLifecycle) {
-        const registry = await readFactoryInFlightRegistry(this.#config.loop.registryPath)
+        const registry = legacyRegistry ?? await readFactoryInFlightRegistry(this.#config.loop.registryPath)
         agents.push(...(registry?.agents ?? [])
           .filter((agent) => agent.invocationId || agent.node)
           .map((agent) => ({ name: agent.name, invocationId: agent.invocationId, node: agent.node })))

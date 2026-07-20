@@ -4218,6 +4218,7 @@ describe('FactoryLoop', () => {
   it('start re-adopts remote in-flight registry agents into the fleet and reconciles once', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-adopt-inflight-'))
     const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
     try {
       await writeFile(registryPath, JSON.stringify({
         pid: 12345,
@@ -4230,9 +4231,16 @@ describe('FactoryLoop', () => {
           { name: 'ar-2-impl', pids: [4242] },
         ],
       }))
-      const fleet = new FakeFleetClient()
+      let heartbeatDuringReconcile: Awaited<ReturnType<typeof readFactoryLoopHeartbeat>>
+      class HeartbeatObservingFleetClient extends FakeFleetClient {
+        override async reconcileTrackedAgents(): Promise<void> {
+          heartbeatDuringReconcile = await readFactoryLoopHeartbeat(heartbeatPath)
+          await super.reconcileTrackedAgents()
+        }
+      }
+      const fleet = new HeartbeatObservingFleetClient()
       const factory = createFactory(config({
-        loop: { maxIterations: 1, heartbeatPath: join(root, 'heartbeat.json'), registryPath, heartbeatStaleMs: 1_000 },
+        loop: { maxIterations: 1, heartbeatPath, registryPath, heartbeatStaleMs: 1_000 },
       }), {
         mount: new FakeMountClient(),
         fleet,
@@ -4246,6 +4254,7 @@ describe('FactoryLoop', () => {
         { name: 'ar-1-review', invocationId: undefined, node: 'mac-mini' },
       ])
       expect(fleet.reconciles).toBe(1)
+      expect(heartbeatDuringReconcile!).toMatchObject({ status: 'running', pid: process.pid })
 
       await factory.stop()
     } finally {
