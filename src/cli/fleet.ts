@@ -52,6 +52,7 @@ import {
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
 } from '../index'
+import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
 import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
@@ -616,6 +617,7 @@ async function runStandaloneBabysitCommand(
   }
 
   const agentName = standaloneBabysitterAgentName(repo, pr.number)
+  const testGuidance = await resolveTestGuidance({ repoPath: clonePath, issue })
   const task = renderAgentTask({
     issue,
     route: { repo, clonePath },
@@ -634,6 +636,7 @@ async function runStandaloneBabysitCommand(
     },
     standaloneBabysitter: { specSource },
     integrationsMountRoot: resolve(process.cwd(), '.integrations'),
+    testGuidance,
   })
   const receiptBase = {
     agent: agentName,

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
@@ -9372,6 +9372,45 @@ describe('FactoryLoop', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(fleet.deliveryEvents).toEqual([])
+  })
+
+  it('populates dispatched tasks from the route repository feature manifest', async () => {
+    const repoPath = await mkdtemp(join(tmpdir(), 'factory-dispatch-guidance-'))
+    await mkdir(join(repoPath, '.agentworkforce/features'), { recursive: true })
+    await writeFile(join(repoPath, '.agentworkforce/features/manifest.yaml'), [
+      'categories:',
+      '  dispatch:',
+      '    features:',
+      '      - id: orchestrator-dispatch',
+      '        name: Orchestrator dispatch',
+      '        location: src/orchestrator/factory.ts',
+      '        verify_tier: 2',
+      '',
+    ].join('\n'))
+    const mount = new FakeMountClient({ [issuePath(621)]: issueFile(621) })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        clonePaths: { 'AgentWorkforce/pear': repoPath },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(621), issueFile(621)))
+
+      await factory.dispatch(decision)
+
+      expect(fleet.spawns).toHaveLength(2)
+      for (const spawn of fleet.spawns) {
+        expect(spawn.task).toContain('Feature-specific verification guidance:')
+        expect(spawn.task).toContain('Orchestrator dispatch (`orchestrator-dispatch`)')
+        expect(spawn.task).toContain('verify tier 2')
+      }
+    } finally {
+      await factory.stop()
+      await rm(repoPath, { recursive: true, force: true })
+    }
   })
 
   it('does not depend on live task injection when registration lags', async () => {

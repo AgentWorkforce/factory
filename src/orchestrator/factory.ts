@@ -17,6 +17,7 @@ import type {
   FactoryEventReporter,
   GithubIssueStatus,
   GithubPublishPullRequestResult,
+  GithubRead,
   GithubWriteback,
   LinearWriteback,
   MountClient,
@@ -53,6 +54,7 @@ import {
   renderAgentTask,
   type GithubHumanInputRequest,
 } from '../dispatch/templates'
+import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
 import type {
@@ -298,6 +300,7 @@ export class FactoryLoop implements Factory {
   readonly #fleet: FleetClient
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
+  readonly #github: GithubRead
   readonly #githubWriteback: GithubWriteback
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
@@ -453,7 +456,7 @@ export class FactoryLoop implements Factory {
     })
     this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
-    void (ports.github ?? MountGithubRead(ports.mount))
+    this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
@@ -6787,28 +6790,39 @@ export class FactoryLoop implements Factory {
     const implementerNames = decision.implementers.map((implementer) => implementer.name)
     const reviewerName = decision.reviewer.name
     const integrationInstructions = await this.#resolveIntegrationInstructions()
-    const render = (spec: AgentSpec): AgentSpec => ({
-      ...spec,
-      task: renderAgentTask({
+    const render = async (spec: AgentSpec): Promise<AgentSpec> => {
+      const route = routeForSpec(decision, spec)
+      const testGuidance = await resolveTestGuidance({
+        repoPath: route.clonePath,
         issue: templateIssue,
-        route: routeForSpec(decision, spec),
-        role: spec.role,
-        config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
-        reviewerName,
-        implementerNames,
-        integrationsMountRoot: this.#integrationsMountRoot(),
-        integrationInstructions,
-        branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
-        branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
-        agentName: spec.name,
-        ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
-      }),
-    })
+        route,
+        previewUrl: previewUrlFromSpec(spec),
+      })
+      return {
+        ...spec,
+        task: renderAgentTask({
+          issue: templateIssue,
+          route,
+          role: spec.role,
+          config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
+          reviewerName,
+          implementerNames,
+          integrationsMountRoot: this.#integrationsMountRoot(),
+          integrationInstructions,
+          testGuidance,
+          branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
+          branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
+          agentName: spec.name,
+          ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
+        }),
+      }
+    }
+    const rendered = await Promise.all([...decision.implementers, decision.reviewer].map(render))
 
     return {
       ...decision,
-      implementers: decision.implementers.map(render),
-      reviewer: render(decision.reviewer),
+      implementers: rendered.slice(0, decision.implementers.length),
+      reviewer: rendered[decision.implementers.length]!,
     }
   }
 
@@ -7771,9 +7785,19 @@ export class FactoryLoop implements Factory {
         .filter((agent) => agent.spec.role === 'implementer')
         .map((agent) => agent.result?.name ?? agent.spec.name)
       const integrationInstructions = await this.#resolveIntegrationInstructions()
+      const templateIssue = templateIssueFromRecord(record, issue)
+      const prSummary = await this.#github.getPr(prRef.repo, prRef.prNumber).catch(() => undefined)
+      const taskRoute = { ...(route ?? { repo: prRef.repo }), clonePath: spec.clonePath ?? route?.clonePath }
+      const testGuidance = await resolveTestGuidance({
+        repoPath: taskRoute.clonePath,
+        issue: templateIssue,
+        route: taskRoute,
+        changedFiles: prSummary?.filesChanged,
+        previewUrl: previewUrlFromSpec(spec),
+      })
       const task = renderAgentTask({
-        issue: templateIssueFromRecord(record, issue),
-        route: { ...(route ?? { repo: prRef.repo }), clonePath: spec.clonePath },
+        issue: templateIssue,
+        route: taskRoute,
         role: 'babysitter',
         config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
         reviewerName,
@@ -7782,6 +7806,7 @@ export class FactoryLoop implements Factory {
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
         integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
+        testGuidance,
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
@@ -10637,9 +10662,14 @@ const routeForSpec = (decision: TriageDecision, spec: AgentSpec) => {
 
   return {
     repo: spec.repo,
-    clonePath: spec.clonePath,
+    clonePath: spec.clonePath ?? route?.clonePath,
     rationale: route?.rationale,
   }
+}
+
+const previewUrlFromSpec = (spec: AgentSpec): string | undefined => {
+  const previewUrl = (spec as AgentSpec & { previewUrl?: unknown }).previewUrl
+  return typeof previewUrl === 'string' && previewUrl.trim() ? previewUrl.trim() : undefined
 }
 
 const repoMapFromConfig = (config: FactoryConfig) => {

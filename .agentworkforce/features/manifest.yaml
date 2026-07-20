@@ -541,8 +541,8 @@ categories:
       - id: dispatch-agent-task-rendering
         name: Agent Task Rendering
         api: renderAgentTask()
-        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, and integration instructions
-        location: src/dispatch/templates.ts
+        description: Give implementers, reviewers, and babysitters role-specific issue, repo, PR, merge-policy, integration, and manifest-derived verification instructions
+        location: src/dispatch/templates.ts, src/dispatch/test-guidance.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
       - id: dispatch-confirmed-task-injection
