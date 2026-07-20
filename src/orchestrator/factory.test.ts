@@ -2286,6 +2286,98 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('recovers a renamed GitHub issue lifecycle through its stable by-id alias', async () => {
+    const number = 593
+    const stalePath = `/github/repos/AgentWorkforce/pear/issues/${number}__old-title/meta.json`
+    const stablePath = githubIssueCompactPath('AgentWorkforce', 'pear', number)
+    const issue = githubIssueFile(number, { title: 'Renamed after dispatch', labels: ['factory'] })
+    const mount = new ListingReadTrackingMount({ [stablePath]: issue })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseGithubFactoryIssue(stalePath, issue))
+
+      await expect(factory.dispatch(decision)).resolves.toMatchObject({
+        issue: { key: String(number) },
+      })
+
+      expect(mount.readPaths).toContain(stalePath)
+      expect(mount.readPaths).toContain(stablePath)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        `ar-${number}-impl-pear`,
+        `ar-${number}-review-pear`,
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('collapses expired queued lifecycle aliases for the same GitHub issue at startup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-lifecycle-alias-'))
+    const watchStatePath = join(root, 'state.json')
+    const number = 594
+    const stalePath = `/github/repos/AgentWorkforce/pear/issues/${number}__old-title/meta.json`
+    const stablePath = githubIssueCompactPath('AgentWorkforce', 'pear', number)
+    const issue = githubIssueFile(number, { labels: ['factory'] })
+    const state = new FileStateStore({ batchSize: 2, watchStatePath })
+    const seedFactory = createFactory(config({ issueSource: 'github' }), {
+      mount: new FakeMountClient({ [stablePath]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state,
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const staleDecision = await seedFactory.triageIssue(parseGithubFactoryIssue(stalePath, issue))
+      const stableDecision: TriageDecision = {
+        ...structuredClone(staleDecision),
+        issue: parseGithubFactoryIssue(stablePath, issue),
+      }
+      const lifecycle = (decision: TriageDecision, runId: string) => ({
+        runId,
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'queued' as const,
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      })
+      await state.claimDispatchLifecycle(
+        'factory-test', issueKey(staleDecision.issue), lifecycle(staleDecision, 'stale-run'), 'expired-owner', 0, 1,
+      )
+      await state.claimDispatchLifecycle(
+        'factory-test', issueKey(stableDecision.issue), lifecycle(stableDecision, 'stable-run'), 'expired-owner', 0, 1,
+      )
+
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount: new FakeMountClient({ [stablePath]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      const lifecycles = await new FileStateStore({ batchSize: 2, watchStatePath })
+        .listDispatchLifecycles('factory-test')
+      expect(lifecycles).toHaveLength(1)
+      expect(lifecycles[0]).toMatchObject([
+        issueKey(stableDecision.issue),
+        { runId: 'stable-run', issue: { path: stablePath } },
+      ])
+      expect(restarted.status().counters.dispatchLifecycleGithubAliasesCollapsed).toBe(1)
+    } finally {
+      await restarted?.stop()
+      await seedFactory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
     const number = 26
     const pearPath = githubIssuePath('AgentWorkforce', 'pear', number)
