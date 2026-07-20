@@ -46,6 +46,7 @@ import {
   type GhRunner,
   type FactoryStateResolution,
   type Logger,
+  type LocalMountHealthEvent,
   type LocalMountOptions,
   type MountClient,
   type ProbeCloser,
@@ -237,7 +238,28 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         }
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
-        mount = await buildMount(loaded, deps)
+        const logger = streamLogger(err)
+        const pendingMountHealthEvents: LocalMountHealthEvent[] = []
+        const reportMountHealth = async (event: LocalMountHealthEvent): Promise<void> => {
+          if (!reporter) {
+            pendingMountHealthEvents.push(event)
+            return
+          }
+          await reporter.report(createFactoryCloudEventV1({
+            type: event.state === 'degraded' ? 'factory.anomaly' : 'factory.snapshot',
+            level: event.state === 'degraded' ? 'error' : 'info',
+            attributes: {
+              component: 'relayfile_mount',
+              operation: 'supervise',
+              errorCode: event.reason,
+              count: event.degradedMounts,
+            },
+          }))
+        }
+        mount = await buildMount(loaded, deps, {
+          logger,
+          onLocalMountHealth: reportMountHealth,
+        })
         await prepareFactoryIntegrations(command, mount, loaded.config, globals, deps, workspaceId, err)
         if (command.kind === 'factory-babysit') {
           return await runStandaloneBabysitCommand(
@@ -256,7 +278,6 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
-        const logger = streamLogger(err)
         const stateStore = new FileStateStore({
           batchSize: loaded.config.batchSize,
           watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
@@ -278,6 +299,9 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
               operation: 'start',
             },
           }))
+          for (const event of pendingMountHealthEvents.splice(0)) {
+            await reportMountHealth(event)
+          }
         }
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
@@ -1180,12 +1204,21 @@ function hasDefaultLinearStateNames(states: FactoryConfig['linear']['states']): 
     states.humanReview === 'In Human Review'
 }
 
-async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
+async function buildMount(
+  loaded: LoadedConfig,
+  deps: FleetCliDeps,
+  observability: {
+    logger?: Logger
+    onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
+  } = {},
+): Promise<MountClient> {
   if (deps.mount) return deps.mount
   if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
   let mount: MountClient
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
+    logger: observability.logger,
+    onLocalMountHealth: observability.onLocalMountHealth,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
   })
   return mount

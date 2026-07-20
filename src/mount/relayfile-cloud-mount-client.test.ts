@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CloudAuthError, type CloudSession, type StoredAuth } from '@agent-relay/cloud'
 import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
+  relayfileWorkspaceTokenProvider,
   type CloudSessionProvider,
   type RelayfileSetupFactory,
   type RelayfileCloudMountClientConfig,
@@ -188,6 +191,38 @@ class FakeRelayFileClient implements RelayFileClientLike {
 }
 
 describe('RelayfileCloudMountClient', () => {
+  it('uses the SDK client token provider so long-lived subscriptions receive rotated tokens', async () => {
+    const fake = new FakeRelayFileClient()
+    const getToken = vi.fn()
+      .mockResolvedValueOnce('rotated-relayfile-token-1')
+      .mockResolvedValueOnce('rotated-relayfile-token-2')
+    fake.getToken = getToken
+    const workspaceGetToken = vi.fn(async () => 'original-relayfile-token')
+    const provider = relayfileWorkspaceTokenProvider(fake, {
+      client: () => fake,
+      getToken: workspaceGetToken,
+      info: { relayfileUrl: 'https://relayfile.example' },
+    })
+
+    await expect(provider()).resolves.toBe('rotated-relayfile-token-1')
+    await expect(provider()).resolves.toBe('rotated-relayfile-token-2')
+    expect(workspaceGetToken).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the original workspace token for older SDK clients', async () => {
+    const fake = new FakeRelayFileClient()
+    const clientWithoutToken = { ...fake, getToken: undefined } as unknown as RelayFileClientLike
+    const workspaceGetToken = vi.fn(async () => 'original-relayfile-token')
+    const provider = relayfileWorkspaceTokenProvider(clientWithoutToken, {
+      client: () => clientWithoutToken,
+      getToken: workspaceGetToken,
+      info: { relayfileUrl: 'https://relayfile.example' },
+    })
+
+    await expect(provider()).resolves.toBe('original-relayfile-token')
+    expect(workspaceGetToken).toHaveBeenCalledTimes(1)
+  })
+
   it('adapts the retained SDK workspace handle for integration status and connect flows', async () => {
     const fake = new FakeRelayFileClient()
     const getConnectionStatus = vi.fn(async () => ({ ready: false, state: 'not_connected' }))
@@ -283,6 +318,78 @@ describe('RelayfileCloudMountClient', () => {
 
     await mount.dispose()
     expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes local mounts before token expiry and reports failure and recovery transitions', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-07-20T12:00:00.000Z')
+    const startDir = await mkdtemp(join(tmpdir(), 'factory-mount-supervision-'))
+    const localDir = join(startDir, '.integrations')
+    await mkdir(join(localDir, '.relay'), { recursive: true })
+    await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+      workspaceId: 'cloud-workspace-uuid',
+      lastReconcileAt: '2026-07-20T12:00:00.000Z',
+    }))
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const firstStop = vi.fn(async () => {})
+    const recoveredStop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn()
+      .mockResolvedValueOnce({
+        stop: firstStop,
+        suggestedRefreshAt: '2026-07-20T12:00:01.000Z',
+      })
+      .mockRejectedValueOnce(new Error('refresh token expired'))
+      .mockResolvedValueOnce({
+        stop: recoveredStop,
+        suggestedRefreshAt: '2026-07-20T13:00:00.000Z',
+      })
+    const setup = {
+      joinWorkspace: vi.fn(async () => handle),
+      ensureMountedWorkspace,
+    }
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => setup),
+      localMountPreflight,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await mount.ensureLocalMount(startDir)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_refresh_failed',
+        degradedMounts: 1,
+      }])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(healthEvents).toEqual([
+        { state: 'degraded', reason: 'mount_refresh_failed', degradedMounts: 1 },
+        { state: 'recovered', reason: 'mount_stale', degradedMounts: 0 },
+      ])
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(3)
+      expect(firstStop).toHaveBeenCalledTimes(1)
+    } finally {
+      await mount.dispose()
+      await rm(startDir, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+    expect(recoveredStop).toHaveBeenCalledTimes(1)
   })
 
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {

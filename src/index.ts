@@ -87,6 +87,7 @@ export type {
 } from './mount/relayfile-integration-preflight'
 export type {
   ActiveWorkspaceResolver,
+  LocalMountHealthEvent,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
   ResolvedFactoryWorkspace,
