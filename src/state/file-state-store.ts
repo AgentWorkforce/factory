@@ -794,7 +794,18 @@ const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase !== 'waiting-for-human' &&
   lifecycle.phase !== 'releasing' &&
   lifecycle.phase !== 'complete' &&
-  lifecycle.phase !== 'abandoned'
+  lifecycle.phase !== 'abandoned' &&
+  !dispatchLifecycleHandedOffToBabysitters(lifecycle)
+
+const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
+  const implementerRepos = new Set(lifecycle.decision.implementers.map((spec) => spec.repo.toLowerCase()))
+  if (implementerRepos.size === 0) return false
+  const babysitterRepos = new Set(lifecycle.agents
+    .filter((agent) => agent.tracked.spec.role === 'babysitter')
+    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo.toLowerCase())
+    .filter((repo): repo is string => Boolean(repo)))
+  return [...implementerRepos].every((repo) => babysitterRepos.has(repo))
+}
 
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},

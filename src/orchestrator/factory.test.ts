@@ -5074,6 +5074,68 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('persists an existing PR receipt when restart reconciliation finds a missing implementer', async () => {
+    const issue = issueFile(591)
+    const publishPullRequest = vi.fn(async () => {
+      throw new Error('must reconcile the existing PR instead of publishing another')
+    })
+    const mount = new FakeMountClient({
+      [issuePath(591)]: issue,
+      [issuePath(592)]: issueFile(592),
+    }, {
+      publishPullRequest,
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    let branch = ''
+    const factory = createFactory(config({ babysitter: { enabled: true } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: 1591,
+        headRef: branch,
+        state: 'OPEN',
+        url: 'https://github.com/AgentWorkforce/pear/pull/1591',
+      }),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify([{
+          number: 1591,
+          url: 'https://github.com/AgentWorkforce/pear/pull/1591',
+          headRefName: branch,
+          isDraft: false,
+        }]),
+      }),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(591), issue))
+
+    await factory.dispatch(decision)
+    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      .decision.implementers[0]!.branch!
+    fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+        phase: 'running',
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 1591,
+          headRef: branch,
+        },
+      })
+    })
+    expect(publishPullRequest).not.toHaveBeenCalled()
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-591-babysit')
+
+    const nextDecision = await factory.triageIssue(parseLinearIssue(issuePath(592), issueFile(592)))
+    await factory.dispatch(nextDecision)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-592-impl-pear')
+    await factory.stop()
+  })
+
   it('adopts a roster-visible remote spawn after crashing across the ack persistence gap', async () => {
     class AckGapFleet extends RemoteLifecycleFleetClient {
       failed = false

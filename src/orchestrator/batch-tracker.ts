@@ -71,7 +71,7 @@ export class BatchTracker {
   }
 
   canStart(): boolean {
-    return this.#inFlight.size < this.#limit
+    return [...this.#inFlight.values()].filter(dispatchOccupiesImplementationSlot).length < this.#limit
   }
 
   start(decision: TriageDecision, dryRun: boolean): InFlightIssue | undefined {
@@ -199,3 +199,18 @@ export class BatchTracker {
 }
 
 export const issueKey = (issue: IssueRef): string => `${issue.key}:${issue.uuid}:${issue.path}`
+
+/**
+ * Batch size limits active implementation work, not PR stewardship. Once each
+ * implementer repository has a dedicated babysitter, the durable lifecycle
+ * remains addressable for review events without starving new ready issues.
+ */
+const dispatchOccupiesImplementationSlot = (record: InFlightIssue): boolean => {
+  const implementerRepos = new Set(record.decision.implementers.map((spec) => spec.repo.toLowerCase()))
+  if (implementerRepos.size === 0) return true
+  const babysitterRepos = new Set([...record.agents.values()]
+    .filter((agent) => agent.spec.role === 'babysitter')
+    .map((agent) => agent.spec.ownedPullRequest?.repo.toLowerCase())
+    .filter((repo): repo is string => Boolean(repo)))
+  return [...implementerRepos].some((repo) => !babysitterRepos.has(repo))
+}

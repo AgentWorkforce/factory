@@ -4613,8 +4613,37 @@ export class FactoryLoop implements Factory {
         })
       }
       if (hasCompletionPr) {
+        let reconciledPr: GithubPublishPullRequestResult | undefined
+        if (tracingReconciledExit && tracked.spec.role === 'implementer') {
+          // A restart can discover that the implementer is gone after its PR
+          // reached GitHub but before the durable receipt was saved. Persist the
+          // exact existing-branch receipt before handing off to a babysitter;
+          // otherwise the lifecycle remains `running` forever and consumes a
+          // batch slot even though useful implementation work has finished.
+          if (!await this.#saveDispatchLifecycle(record, 'publishing')) return
+          try {
+            reconciledPr = await this.#publishImplementerPullRequest(record, tracked, {
+              reconcileExisting: true,
+            })
+            if (reconciledPr && !await this.#saveDispatchLifecycle(record, 'published', reconciledPr)) return
+          } catch (error) {
+            this.#increment('githubPullRequestPublishFailures')
+            this.#error(error, record.issue)
+            this.#scheduleDispatchLifecycleRetry(record)
+            return
+          }
+        }
         if (this.#config.babysitter.enabled) {
-          await this.#ensureBabysitterForIssue(record)
+          if (reconciledPr) {
+            await this.#ensureBabysitter(record, {
+              repo: reconciledPr.repo,
+              prNumber: reconciledPr.number,
+              url: reconciledPr.url,
+              headRef: reconciledPr.headRef,
+            })
+          } else {
+            await this.#ensureBabysitterForIssue(record)
+          }
           return
         }
         if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)

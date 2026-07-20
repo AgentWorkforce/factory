@@ -51,6 +51,7 @@ import { checkMountStaleness } from './relayfile-binary'
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
 const DEFAULT_LOCAL_MOUNT_HEALTH_INTERVAL_MS = 30_000
+const DEFAULT_LOCAL_MOUNT_MAX_CONCURRENCY = 4
 export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/issues/**',
   'relayfile:fs:read:/linear/states/**',
@@ -189,6 +190,8 @@ export interface RelayfileCloudMountClientConfig {
   onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
   /** Internal health cadence override for tests. */
   localMountHealthIntervalMs?: number
+  /** Internal mount-work concurrency override for tests. */
+  localMountMaxConcurrency?: number
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
@@ -231,6 +234,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #logger?: Logger
   readonly #onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
   readonly #localMountHealthIntervalMs: number
+  readonly #localMountMaxConcurrency: number
   readonly #relayfileSetup?: RelayfileSetupLike
   readonly #relayfileWorkspace?: RelayfileWorkspaceHandleLike
   readonly #localMountPreflight: LocalMountPreflight
@@ -244,7 +248,10 @@ export class RelayfileCloudMountClient implements MountClient {
     suggestedRefreshAtMs?: number
   }>()
   readonly #localMountHealthTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #localMountOperations = new Map<string, Promise<void>>()
+  readonly #localMountOperationWaiters: Array<() => void> = []
   readonly #degradedLocalMounts = new Set<string>()
+  #activeLocalMountOperations = 0
   #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
@@ -267,6 +274,10 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountHealthIntervalMs = Math.max(
       1_000,
       Math.floor(config.localMountHealthIntervalMs ?? DEFAULT_LOCAL_MOUNT_HEALTH_INTERVAL_MS),
+    )
+    this.#localMountMaxConcurrency = Math.max(
+      1,
+      Math.floor(config.localMountMaxConcurrency ?? DEFAULT_LOCAL_MOUNT_MAX_CONCURRENCY),
     )
     this.#relayfileSetup = config.relayfileSetup
     this.#relayfileWorkspace = config.relayfileWorkspace
@@ -322,6 +333,11 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async ensureLocalMount(startDir: string, options: LocalMountOptions = {}): Promise<void> {
+    const localDir = join(resolve(startDir), '.integrations')
+    return this.#runLocalMountOperation(localDir, () => this.#ensureLocalMount(startDir, localDir, options))
+  }
+
+  async #ensureLocalMount(startDir: string, localDir: string, options: LocalMountOptions): Promise<void> {
     const setup = this.#relayfileSetup
     const workspace = this.#relayfileWorkspace
     if (!setup?.ensureMountedWorkspace || !workspace) {
@@ -329,7 +345,6 @@ export class RelayfileCloudMountClient implements MountClient {
     }
     const ensureMountedWorkspace = setup.ensureMountedWorkspace.bind(setup)
 
-    const localDir = join(resolve(startDir), '.integrations')
     const acceptableWorkspaceIds = new Set(options.acceptableWorkspaceIds ?? [])
     if (workspace.workspaceId && workspace.workspaceId !== this.workspaceId) {
       acceptableWorkspaceIds.add(workspace.workspaceId)
@@ -375,6 +390,40 @@ export class RelayfileCloudMountClient implements MountClient {
     if (staleAfter.stale) this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
     else this.#markLocalMountRecovered(localDir)
     this.#scheduleLocalMountHealthCheck(localDir)
+  }
+
+  #runLocalMountOperation(localDir: string, operation: () => Promise<void>): Promise<void> {
+    const existing = this.#localMountOperations.get(localDir)
+    if (existing) return existing
+    const running = (async () => {
+      await this.#acquireLocalMountOperation()
+      try {
+        if (!this.#disposed) await operation()
+      } finally {
+        this.#releaseLocalMountOperation()
+      }
+    })()
+    const tracked = running.finally(() => {
+      if (this.#localMountOperations.get(localDir) === tracked) {
+        this.#localMountOperations.delete(localDir)
+      }
+    })
+    this.#localMountOperations.set(localDir, tracked)
+    return tracked
+  }
+
+  async #acquireLocalMountOperation(): Promise<void> {
+    if (this.#activeLocalMountOperations < this.#localMountMaxConcurrency) {
+      this.#activeLocalMountOperations += 1
+      return
+    }
+    await new Promise<void>((resolve) => this.#localMountOperationWaiters.push(resolve))
+  }
+
+  #releaseLocalMountOperation(): void {
+    const next = this.#localMountOperationWaiters.shift()
+    if (next) next()
+    else this.#activeLocalMountOperations -= 1
   }
 
   async dispose(): Promise<void> {
@@ -551,8 +600,10 @@ export class RelayfileCloudMountClient implements MountClient {
         supervision.suggestedRefreshAtMs !== undefined &&
         Date.now() >= supervision.suggestedRefreshAtMs
       ) {
-        await this.#replaceLocalMount(localDir, supervision.launch)
-        this.#markLocalMountRecovered(localDir)
+        await this.#runLocalMountOperation(localDir, async () => {
+          await this.#replaceLocalMount(localDir, supervision.launch)
+          this.#markLocalMountRecovered(localDir)
+        })
       } else {
         // ensureLocalMount performs the filesystem health check and owns the
         // resulting degraded/recovered transition.

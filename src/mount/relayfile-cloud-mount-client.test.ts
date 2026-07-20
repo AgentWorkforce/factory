@@ -321,6 +321,77 @@ describe('RelayfileCloudMountClient', () => {
     expect(stop).toHaveBeenCalledTimes(1)
   })
 
+  it('coalesces concurrent mount checks for the same checkout', async () => {
+    const fake = new FakeRelayFileClient()
+    let releasePreflight!: () => void
+    const preflightReleased = new Promise<void>((resolve) => { releasePreflight = resolve })
+    const localMountPreflight = vi.fn(async () => preflightReleased)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })),
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+    })
+
+    const first = mount.ensureLocalMount('/work/repo')
+    const duplicate = mount.ensureLocalMount('/work/repo')
+    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(1))
+    releasePreflight()
+    await Promise.all([first, duplicate])
+
+    expect(localMountPreflight).toHaveBeenCalledTimes(1)
+    await mount.dispose()
+  })
+
+  it('bounds mount work across checkouts to prevent refresh storms', async () => {
+    const fake = new FakeRelayFileClient()
+    let active = 0
+    let maximumActive = 0
+    let releasePreflights!: () => void
+    const preflightsReleased = new Promise<void>((resolve) => { releasePreflights = resolve })
+    const localMountPreflight = vi.fn(async () => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await preflightsReleased
+      active -= 1
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })),
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+      localMountMaxConcurrency: 2,
+    })
+
+    const checks = Array.from({ length: 6 }, (_, index) => mount.ensureLocalMount(`/work/repo-${index}`))
+    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(2))
+    expect(maximumActive).toBe(2)
+    releasePreflights()
+    await Promise.all(checks)
+
+    expect(localMountPreflight).toHaveBeenCalledTimes(6)
+    expect(maximumActive).toBe(2)
+    await mount.dispose()
+  })
+
   it('refreshes local mounts before token expiry and reports failure and recovery transitions', async () => {
     vi.useFakeTimers()
     vi.setSystemTime('2026-07-20T12:00:00.000Z')
