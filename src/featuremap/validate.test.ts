@@ -195,6 +195,28 @@ describe('feature location drift', () => {
     ])
   })
 
+  it('skips drift advisories when the base revision predates the manifest', async () => {
+    const rootDir = temporaryDirectory()
+    writeFile(rootDir, 'src/cli.ts', 'export const value = 1\n')
+    writeFile(rootDir, 'src/api.ts', 'export {}\n')
+    git(rootDir, ['init'])
+    git(rootDir, ['config', 'user.email', 'factory@example.com'])
+    git(rootDir, ['config', 'user.name', 'Factory Test'])
+    git(rootDir, ['add', '.'])
+    git(rootDir, ['commit', '-m', 'base without manifest'])
+    const baseRef = gitOutput(rootDir, ['rev-parse', 'HEAD']).trim()
+
+    writeFile(rootDir, '.agentworkforce/features/manifest.yaml', manifest())
+    git(rootDir, ['add', '.'])
+    git(rootDir, ['commit', '-m', 'add feature manifest'])
+
+    await expect(checkFeatureMap({ rootDir, baseRef })).resolves.toMatchObject({
+      ok: true,
+      mergeBase: baseRef,
+      advisories: [],
+    })
+  })
+
   it('rejects a manifest path that escapes the repository root', async () => {
     const rootDir = temporaryDirectory()
 
@@ -267,4 +289,8 @@ function writeFile(rootDir: string, path: string, contents: string): void {
 
 function git(rootDir: string, args: string[]): void {
   execFileSync('git', ['-C', rootDir, ...args], { stdio: 'ignore' })
+}
+
+function gitOutput(rootDir: string, args: string[]): string {
+  return execFileSync('git', ['-C', rootDir, ...args], { encoding: 'utf8' })
 }

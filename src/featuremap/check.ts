@@ -106,8 +106,12 @@ async function objectExistsAtRevision(rootDir: string, revision: string, path: s
       env: { ...process.env, LC_ALL: 'C' },
     })
     return true
-  } catch {
-    return false
+  } catch (error) {
+    const exitCode = typeof error === 'object' && error !== null && 'code' in error
+      ? error.code
+      : undefined
+    if (typeof exitCode === 'number') return false
+    throw error
   }
 }
 
