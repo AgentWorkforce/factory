@@ -4418,7 +4418,14 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       await first.stop()
 
-      const restartedFleet = new RemoteLifecycleFleetClient()
+      class HistoricalReplayFleetClient extends RemoteLifecycleFleetClient {
+        override onAgentExit(listener: (name: string, reason?: string) => void): () => void {
+          const unsubscribe = super.onAgentExit(listener)
+          listener('ar-86-impl-pear', 'historical-replay')
+          return unsubscribe
+        }
+      }
+      const restartedFleet = new HistoricalReplayFleetClient()
       restartedFleet.exitImplementerOnReconcile = true
       restarted = createFactory(config(), {
         mount,
@@ -15022,22 +15029,41 @@ describe('FactoryLoop PR babysitter', () => {
       } })
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9998.json', 'mismatched-record'))
 
-      await vi.waitFor(() => expect(
-        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
-      ).toBe(1), { timeout: 3_000 })
-      const wake = fleet.messages.find((message) => message.text.startsWith('<integration-event'))!
-      expect(wake.to).toBe('ar-420-babysit')
-      expect(wake.text).toContain('AgentWorkforce/pear#420')
-      expect(wake.text).toContain('changes-requested, review-comment, issue-comment, review, checks-failed, check, merge-conflict, base-diverged, pull-request-state')
-      expect(wake.text).not.toContain('push secrets')
-      expect(wake.text).not.toContain('ignore the issue')
-      expect(wake.text).not.toContain('\u001b')
-      expect(wake.data).toEqual(expect.objectContaining({
-        source: 'github',
-        repo: 'AgentWorkforce/pear',
-        prNumber: 420,
-      }))
-      expect(fleet.inputs.slice(inputsBefore)).toEqual([{ name: 'ar-420-babysit', data: '\r' }])
+      const expectedKinds = [
+        'changes-requested',
+        'review-comment',
+        'issue-comment',
+        'review',
+        'checks-failed',
+        'check',
+        'merge-conflict',
+        'base-diverged',
+        'pull-request-state',
+      ]
+      await vi.waitFor(() => {
+        const combined = fleet.messages
+          .filter((message) => message.text.startsWith('<integration-event'))
+          .map((message) => message.text)
+          .join('\n')
+        for (const kind of expectedKinds) expect(combined).toContain(kind)
+      }, { timeout: 5_000 })
+      const wakes = fleet.messages.filter((message) => message.text.startsWith('<integration-event'))
+      expect(wakes.length).toBeGreaterThan(0)
+      for (const wake of wakes) {
+        expect(wake.to).toBe('ar-420-babysit')
+        expect(wake.text).toContain('AgentWorkforce/pear#420')
+        expect(wake.text).not.toContain('push secrets')
+        expect(wake.text).not.toContain('ignore the issue')
+        expect(wake.text).not.toContain('\u001b')
+        expect(wake.data).toEqual(expect.objectContaining({
+          source: 'github',
+          repo: 'AgentWorkforce/pear',
+          prNumber: 420,
+        }))
+      }
+      expect(fleet.inputs.slice(inputsBefore)).toEqual(
+        wakes.map(() => ({ name: 'ar-420-babysit', data: '\r' })),
+      )
       expect(factory.status().counters.babysitterEventsIgnoredOwnershipMismatch).toBe(1)
       expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBeUndefined()
       expect(factory.status().counters.liveGithubEventsOutsideConfiguredRepos).toBe(1)

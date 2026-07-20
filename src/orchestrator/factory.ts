@@ -2464,13 +2464,18 @@ export class FactoryLoop implements Factory {
   #wireFleetEvents(): void {
     if (!this.#offAgentExit) {
       this.#offAgentExit = this.#fleet.onAgentExit((name, reason) => {
-        if (this.#agentExitsInFlight.has(name)) return
-        const handling = this.#handleAgentExit(name, reason)
+        // Broker replay can deliver an old exit immediately when the listener
+        // is installed, before durable agents are restored. Queue a later
+        // roster-reconciled exit behind it instead of dropping the newer event.
+        const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
+        const handling = previous
+          .catch(() => undefined)
+          .then(async () => await this.#handleAgentExit(name, reason))
           .catch((error) => this.#error(error))
           .finally(() => {
-          if (this.#agentExitsInFlight.get(name) === handling) {
-            this.#agentExitsInFlight.delete(name)
-          }
+            if (this.#agentExitsInFlight.get(name) === handling) {
+              this.#agentExitsInFlight.delete(name)
+            }
           })
         this.#agentExitsInFlight.set(name, handling)
       })
@@ -2570,16 +2575,20 @@ export class FactoryLoop implements Factory {
         // but recovery work is asynchronous (issue reads, worktree restore,
         // PR publication). Finish exits discovered by the startup reconcile
         // before the full ready-issue backfill can monopolize mount I/O.
-        await this.#drainAgentExitsInFlight()
+        await this.#drainAgentExitsInFlight(new Set(agents.map((agent) => agent.name)))
       }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
   }
 
-  async #drainAgentExitsInFlight(): Promise<void> {
-    while (this.#agentExitsInFlight.size > 0) {
-      await Promise.allSettled([...this.#agentExitsInFlight.values()])
+  async #drainAgentExitsInFlight(names?: ReadonlySet<string>): Promise<void> {
+    for (;;) {
+      const pending = [...this.#agentExitsInFlight]
+        .filter(([name]) => !names || names.has(name))
+        .map(([, handling]) => handling)
+      if (pending.length === 0) return
+      await Promise.allSettled(pending)
     }
   }
 
