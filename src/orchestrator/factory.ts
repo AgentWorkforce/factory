@@ -2759,7 +2759,7 @@ export class FactoryLoop implements Factory {
       groups.set(identity, group)
     }
 
-    let changed = false
+    const clearedKeys = new Set<string>()
     for (const [identity, group] of groups) {
       if (group.length < 2) continue
       const active = group.filter(([, lifecycle]) => lifecycle.phase !== 'queued')
@@ -2792,12 +2792,12 @@ export class FactoryLoop implements Factory {
         if (timer) clearTimeout(timer)
         this.#dispatchLifecycleRetryTimers.delete(key)
         this.#dispatchLifecycleCapacityWaitLogged.delete(key)
-        changed = true
+        clearedKeys.add(key)
         this.#increment('dispatchLifecycleGithubAliasesCollapsed')
       }
     }
-    return changed
-      ? await this.#state.listDispatchLifecycles(this.#workspaceId)
+    return clearedKeys.size > 0
+      ? lifecycles.filter(([key]) => !clearedKeys.has(key))
       : lifecycles
   }
 
@@ -12205,7 +12205,7 @@ const compareQueuedGithubLifecycleAliases = (
   const stablePath = (lifecycle: DispatchLifecycle): number =>
     lifecycle.issue.path.includes('/issues/by-id/') ? 0 : 1
   return stablePath(left[1]) - stablePath(right[1]) ||
-    right[1].updatedAtMs - left[1].updatedAtMs ||
+    (right[1].updatedAtMs ?? 0) - (left[1].updatedAtMs ?? 0) ||
     left[0].localeCompare(right[0])
 }
 
