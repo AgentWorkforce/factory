@@ -1503,6 +1503,10 @@ export class FactoryLoop implements Factory {
     let report: IterationReport | undefined
     try {
       this.#dependencyIssues.clear()
+      // Terminal observations are only a live-cycle cache. Rebuild them from
+      // current provider snapshots (or merged PR metadata) so a reopened issue
+      // cannot remain permanently resolved after an earlier close event.
+      this.#terminalDependencyIdentities.clear()
       const issueSource = await this.#issueSource()
       if (issueSource === 'linear') {
         await this.#ingestGithubIssues({ dryRun })
@@ -3761,6 +3765,11 @@ export class FactoryLoop implements Factory {
     const existing = this.#dependencyIssues.get(identity)
     if (!existing || rank >= existing.rank) {
       this.#dependencyIssues.set(identity, { issue, rank })
+      if (this.#dependencyIssueIsTerminal(issue)) {
+        this.#terminalDependencyIdentities.add(identity)
+      } else {
+        this.#terminalDependencyIdentities.delete(identity)
+      }
     }
   }
 
@@ -3810,22 +3819,47 @@ export class FactoryLoop implements Factory {
   }
 
   async #loadMissingDependencyIssues(identities: string[]): Promise<void> {
-    let missing = new Set(identities.filter((identity) => !this.#dependencyIssues.has(identity)))
-    if (missing.size === 0) return
+    const pending = [...new Set(identities)]
+    const expanded = new Set<string>()
+    let githubPathsByIdentity: Map<string, string> | undefined
+    let linearTreeLoaded = false
 
-    for (const path of await this.#githubIssuePaths()) {
-      const parts = githubIssuePathParts(path)
-      if (!parts || !missing.has(githubIssueIdentity(parts.owner, parts.repo, parts.number))) continue
-      await this.#readIssue(path)
-    }
-    missing = new Set([...missing].filter((identity) => !this.#dependencyIssues.has(identity)))
-    if (missing.size === 0) return
+    while (pending.length > 0) {
+      const identity = pending.shift()!
+      if (expanded.has(identity)) continue
+      expanded.add(identity)
 
-    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
-      if (!isIssueFilePath(path)) continue
-      await this.#readIssue(path)
-      missing = new Set([...missing].filter((identity) => !this.#dependencyIssues.has(identity)))
-      if (missing.size === 0) return
+      if (!this.#dependencyIssues.has(identity)) {
+        if (!githubPathsByIdentity) {
+          githubPathsByIdentity = new Map()
+          for (const path of await this.#githubIssuePaths()) {
+            const parts = githubIssuePathParts(path)
+            if (parts) {
+              githubPathsByIdentity.set(githubIssueIdentity(parts.owner, parts.repo, parts.number), path)
+            }
+          }
+        }
+        const githubPath = githubPathsByIdentity.get(identity)
+        if (githubPath) await this.#readIssue(githubPath)
+      }
+
+      if (!this.#dependencyIssues.has(identity) && !linearTreeLoaded) {
+        // Linear paths do not encode the routed repository identity, so load
+        // the tree once and let #indexDependencyIssue build the composite map.
+        // This is also enough to resolve every later node in this traversal.
+        linearTreeLoaded = true
+        for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
+          if (isIssueFilePath(path)) await this.#readIssue(path)
+        }
+      }
+
+      const blocker = this.#dependencyIssues.get(identity)?.issue
+      if (!blocker) continue
+      const repo = identity.slice(0, identity.lastIndexOf('#'))
+      for (const dependency of parseBlockedBy(blocker.description)) {
+        const resolved = resolveDependency(dependency, repo)
+        if (resolved && !expanded.has(resolved.identity)) pending.push(resolved.identity)
+      }
     }
   }
 
@@ -3915,8 +3949,10 @@ export class FactoryLoop implements Factory {
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     const identity = dependencyIdentityForIssue(issue, repo)
     if (!identity) return
-    this.#terminalDependencyIdentities.add(identity)
     this.#indexDependencyIssue(issue)
+    // A merge event can prove terminality before the issue snapshot reflects
+    // its new state, so apply the explicit observation after indexing it.
+    this.#terminalDependencyIdentities.add(identity)
     const batch = await this.#batch()
     batch.clearPark(issueRef(issue))
     const candidates = batch.parked.filter((parked) =>
@@ -7822,6 +7858,7 @@ export class FactoryLoop implements Factory {
         await this.#recordCanonicalIssueState({ ...issueRef(issue), stateId: doneStateId })
       }
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
+      await this.#markDependencyTerminalAndReconcile(issue)
       this.#increment('mergedPrAdvancedDone')
       this.#increment('done')
       this.#logger.info?.('[factory] merged PR advanced issue to Done', {
