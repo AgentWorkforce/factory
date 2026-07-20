@@ -8193,7 +8193,14 @@ export class FactoryLoop implements Factory {
     prRef: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
   ): Promise<boolean> {
     const wanted = githubPrIdentity(prRef.repo, prRef.prNumber)
-    const superseded = [...record.agents.entries()].filter(([, tracked]) => {
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const trackedAgents = new Map([
+      ...(lifecycle?.agents ?? [])
+        .filter((agent) => agent.releasedAtMs === undefined)
+        .map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)] as const),
+      ...record.agents,
+    ])
+    const superseded = [...trackedAgents.entries()].filter(([, tracked]) => {
       const owned = tracked.spec.ownedPullRequest
       return tracked.spec.role === 'babysitter' &&
         owned?.repo.toLowerCase() === prRef.repo.toLowerCase() &&
@@ -8233,8 +8240,8 @@ export class FactoryLoop implements Factory {
       })
     }
     if (superseded.length > 0) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
-      if (lifecycle && !await this.#saveDispatchLifecycle(record, lifecycle.phase)) {
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
         throw new Error(`Failed to persist superseded babysitter cleanup for ${record.issue.key}`)
       }
     }
