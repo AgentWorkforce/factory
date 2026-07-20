@@ -1012,6 +1012,29 @@ class UnreachableBabysitterHarnessClient extends RosterPidHarnessClient {
   }
 }
 
+class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+  resumed = false
+
+  override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
+    const result = await super.spawnPty(input)
+    if (input.continueFrom) this.resumed = true
+    return result
+  }
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      if (!this.resumed) {
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
   resumeAttempts = 0
   shutdownCalls = 0
@@ -2044,6 +2067,47 @@ describe('FactoryLoop', () => {
       reason: 'live state is not ready-for-agent',
     }])
     expect(fleet.spawns).toEqual([])
+  })
+
+  it('filters GitHub startup discovery through the Relayfile issue index', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-index-discovery-'))
+    const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 70)
+    const unrelatedPath = githubIssueCompactPath('AgentWorkforce', 'pear', 71)
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce/pear/issues/_index.json': [
+        { id: '70', number: 70, title: 'Ready', updated: '2026-07-20T12:00:00Z', state: 'open', labels: ['factory'] },
+        { id: '71', number: 71, title: 'Other', updated: '2026-07-20T12:00:00Z', state: 'open', labels: ['triaged'] },
+        { id: '72', number: 72, title: 'Closed', updated: '2026-07-20T12:00:00Z', state: 'closed', labels: ['factory'] },
+      ],
+      [readyPath]: githubIssueFile(70, { labels: ['factory'] }),
+      [unrelatedPath]: githubIssueFile(71, { labels: ['triaged'] }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const report = await factory.runOnce()
+
+      expect(report.pulled.map((issue) => issue.key)).toEqual(['70'])
+      expect(report.dispatched).toHaveLength(1)
+      expect(mount.reads).toContain('/github/repos/AgentWorkforce/pear/issues/_index.json')
+      expect(mount.reads).toContain(readyPath)
+      expect(mount.reads).not.toContain(unrelatedPath)
+      expect(factory.status().counters.githubIssueIndexReposUsed).toBe(1)
+      expect(factory.status().counters.githubIssueIndexFallbacks).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('recovers an orphaned in-progress GitHub issue with no agents, durable lifecycle, or open PR', async () => {
@@ -15347,7 +15411,72 @@ describe('FactoryLoop PR babysitter', () => {
     }
   }, 10_000)
 
-  it('escalates once and backs off the babysitter wake loop when the target stays unreachable', async () => {
+  it('restarts an unreachable babysitter and delivers the preserved wake', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-recovery-'))
+    const issue = realIssueFile(424, ready, { title: 'Real automatic unreachable babysitter recovery' })
+    const mount = new FakeMountClient({ [issuePath(424)]: issue })
+    const harness = new RecoveringBabysitterHarnessClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 60_000,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' }),
+      readChildPids: async () => [],
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(424), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/424/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 424,
+        state: 'open',
+        head_ref: 'ar-424-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-424-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-424-babysit'))
+
+      const commentPath = '/github/repos/AgentWorkforce/pear/comments/9424.json'
+      mount.files.set(commentPath, { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 424 },
+        comment: { id: 9424, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent(commentPath, 'comment-9424'))
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1),
+        { timeout: 8_000 },
+      )
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1),
+        { timeout: 4_000 },
+      )
+      expect(harness.releases).toContainEqual({
+        name: 'ar-424-babysit',
+        reason: 'babysitter-unreachable',
+      })
+      expect(harness.spawned.filter((spawn) => spawn.continueFrom)).toHaveLength(1)
+      expect(harness.babysitterWakeAttempts).toBeGreaterThan(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('restarts once and backs off when the replacement babysitter stays unreachable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-backoff-'))
     const issue = realIssueFile(423, ready, { title: 'Real unreachable babysitter escalation' })
     const mount = new FakeMountClient({ [issuePath(423)]: issue })
     const harness = new UnreachableBabysitterHarnessClient()
@@ -15358,7 +15487,9 @@ describe('FactoryLoop PR babysitter', () => {
     // by real setTimeout, so the fast-retry vs backoff cadence is preserved.
     let clockValue = 1_700_000_000_000
     const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
-    const factory = createFactory(babysitterConfig(), {
+    const factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -15401,16 +15532,26 @@ describe('FactoryLoop PR babysitter', () => {
         () => expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1),
         { timeout: 8_000 },
       )
-      const failuresAtEscalation = factory.status().counters.babysitterEventWakeFailures ?? 0
-      expect(failuresAtEscalation).toBeGreaterThanOrEqual(1)
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1),
+        { timeout: 4_000 },
+      )
+      await vi.waitFor(
+        // Initial miss, escalation miss, then the prompt replacement probe.
+        () => expect(factory.status().counters.babysitterEventWakeFailures).toBeGreaterThanOrEqual(3),
+        { timeout: 4_000 },
+      )
+      const failuresAfterRecoveryProbe = factory.status().counters.babysitterEventWakeFailures ?? 0
       await new Promise((resolve) => setTimeout(resolve, 1_500))
-      // Backed off (next retry is ~60s out), so no further failures accrue in
-      // the next second and the escalation is not re-logged.
-      expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAtEscalation)
+      // The replacement also failed its probe, so the cooldown backs off for
+      // ~60 seconds instead of repeatedly tearing down the session.
+      expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAfterRecoveryProbe)
       expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1)
       expect(factory.status().counters.babysitterEventWakeUnreachableReconciliations).toBe(1)
+      expect(factory.status().counters.babysitterEventWakeUnreachableRecoveries).toBe(1)
     } finally {
       await factory.stop()
+      await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
 

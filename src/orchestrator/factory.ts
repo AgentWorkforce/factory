@@ -144,6 +144,9 @@ type BabysitterWakeState = {
   // Set once the unreachable escalation warning has been emitted, so the
   // slow-cadence backoff does not re-log on every subsequent retry.
   unreachableEscalated?: boolean
+  // Do not repeatedly tear down and resume the same unreachable session while
+  // Relaycast registration is still converging after an automatic recovery.
+  unreachableRecoveryAfterMs?: number
 }
 type IssueSource = 'linear' | 'github'
 type SlackReply = {
@@ -3462,36 +3465,52 @@ export class FactoryLoop implements Factory {
   async #githubIssuePaths(): Promise<string[]> {
     try {
       const issuePaths = new Map<string, string>()
-      for (const root of githubIssueScanRoots(this.#config)) {
-        const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
-        for (let index = 0; index < paths.length; index += 1) {
-          const path = paths[index]!
-          const parts = githubIssuePathParts(path)
-          if (parts) {
-            const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
-            const existing = issuePaths.get(identity)
-            if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
-              if (existing) this.#increment('githubIssueAliasPathsSuppressed')
-              issuePaths.set(identity, path)
-            } else {
-              this.#increment('githubIssueAliasPathsSuppressed')
-            }
-          } else if (githubIssueDirectoryPathParts(path) !== undefined) {
-            // listTree returns the issue directory entry alongside its
-            // meta.json file; githubIssuePathParts() already collected the
-            // file, so skip the directory to avoid reading the same issue
-            // twice in one backfill pass. Directory paths are only meaningful
-            // for live change events, not the tree scan.
-            continue
-          } else if (isGithubIssueTreePath(path)) {
-            this.#increment('githubIssuesIgnoredByPathRegex')
-          }
-          if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
-            await this.#refreshLiveHeartbeatIfDue()
-            await liveEventYield()
-          }
+      for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+        const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
+        const roots = githubIssueRepoRoots(owner, repo)
+        // Keep the fallback roots as separate batches. Flattening a very large
+        // provider result is synchronous work and can starve the durable loop
+        // heartbeat before the bounded scan below gets a chance to yield.
+        const pathBatches = indexedPaths
+          ? [indexedPaths]
+          : await Promise.all(
+            roots.map(async (root) => await this.#listRelayfileTree(root, 'GitHub issue ingestion')),
+          )
+        if (indexedPaths) {
+          this.#increment('githubIssueIndexReposUsed')
+        } else {
+          this.#increment('githubIssueIndexFallbacks')
         }
-        await this.#refreshLiveHeartbeatIfDue()
+        for (const paths of pathBatches) {
+          for (let index = 0; index < paths.length; index += 1) {
+            const path = paths[index]!
+            const parts = githubIssuePathParts(path)
+            if (parts) {
+              const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+              const existing = issuePaths.get(identity)
+              if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
+                if (existing) this.#increment('githubIssueAliasPathsSuppressed')
+                issuePaths.set(identity, path)
+              } else {
+                this.#increment('githubIssueAliasPathsSuppressed')
+              }
+            } else if (githubIssueDirectoryPathParts(path) !== undefined) {
+              // listTree returns the issue directory entry alongside its
+              // meta.json file; githubIssuePathParts() already collected the
+              // file, so skip the directory to avoid reading the same issue
+              // twice in one backfill pass. Directory paths are only meaningful
+              // for live change events, not the tree scan.
+              continue
+            } else if (isGithubIssueTreePath(path)) {
+              this.#increment('githubIssuesIgnoredByPathRegex')
+            }
+            if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+              await this.#refreshLiveHeartbeatIfDue()
+              await liveEventYield()
+            }
+          }
+          await this.#refreshLiveHeartbeatIfDue()
+        }
       }
       for (const [identity, path] of issuePaths) {
         this.#githubIssuePreferredPaths.set(identity, path)
@@ -3504,6 +3523,40 @@ export class FactoryLoop implements Factory {
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
       return []
     }
+  }
+
+  async #githubIssuePathsFromIndex(owner: string, repo: string): Promise<string[] | undefined> {
+    const indexPath = `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues/_index.json`
+    let parsed: unknown
+    try {
+      const { content } = await this.#readRelayfileFile(indexPath, 'GitHub issue index discovery')
+      parsed = parseJsonContent(content)
+    } catch {
+      return undefined
+    }
+    if (!Array.isArray(parsed)) return undefined
+
+    const requiredLabel = this.#config.safety.requireLabel.trim().toLowerCase()
+    if (!requiredLabel) return undefined
+    const paths: string[] = []
+    for (const entry of parsed) {
+      const row = asRecord(entry)
+      const number = row?.number
+      const state = typeof row?.state === 'string' ? row.state.trim().toLowerCase() : undefined
+      const labels = row?.labels
+      // Labels were added to the public GitHub issue index contract after the
+      // first index version. Fall back for the entire repository if any row is
+      // legacy or malformed so an eligible issue can never be filtered out.
+      if (!Number.isSafeInteger(number) || Number(number) <= 0 || !state || !Array.isArray(labels) ||
+        !labels.every((label) => typeof label === 'string')) {
+        return undefined
+      }
+      if (state !== 'open' || !labels.some((label) => label.trim().toLowerCase() === requiredLabel)) {
+        continue
+      }
+      paths.push(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`)
+    }
+    return paths
   }
 
   async #handleGithubIssueChange(
@@ -5186,7 +5239,17 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    this.#logger.debug?.('[factory] tracked agent resume preparation started', {
+      issue: record.issue.key,
+      name,
+      role: tracked.spec.role,
+    })
     await this.#prepareAgentWorktree(record, tracked.spec)
+    this.#logger.debug?.('[factory] tracked agent resume spawn started', {
+      issue: record.issue.key,
+      name,
+      role: tracked.spec.role,
+    })
     const result = await this.#fleet.resume({
       name,
       sessionRef: tracked.sessionRef,
@@ -5194,6 +5257,12 @@ export class FactoryLoop implements Factory {
       capability: tracked.spec.capability,
       repo: tracked.spec.repo,
       clonePath: tracked.spec.clonePath,
+    })
+    this.#logger.debug?.('[factory] tracked agent resume spawn completed', {
+      issue: record.issue.key,
+      name,
+      resumedName: result.name,
+      role: tracked.spec.role,
     })
     tracked.result = {
       ...result,
@@ -5203,32 +5272,133 @@ export class FactoryLoop implements Factory {
     tracked.sessionRef = result.sessionRef ?? tracked.sessionRef
     record.agents.delete(name)
     record.agents.set(result.name, tracked)
-    if (tracked.spec.role === 'babysitter') {
-      this.#babysitterCriticalAgents.delete(name)
-      const ownership = [...this.#babysitterPr.entries()].find(([, candidate]) => candidate.agentName === name)
-      const [ownershipKey, ref] = ownership ?? []
-      if (ref) {
-        ref.agentName = result.name
-        for (const [wakeKey, state] of this.#babysitterWakeStates) {
-          if (state.agentName !== name) continue
-          if (state.timer) clearTimeout(state.timer)
-          this.#babysitterWakeStates.delete(wakeKey)
-          state.timer = undefined
-          state.agentName = result.name
-          state.tracked = tracked
-          if (state.deferredSubmitTargets) {
-            state.deferredSubmitTargets = undefined
-            state.deliveringKinds = undefined
-            state.kinds.add('pull-request-state')
-            await this.#recordPendingBabysitterWake(state)
-          }
-          this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
-          if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
-        }
-        await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
-      }
-    }
+    await this.#retargetBabysitterAgent(record, name, tracked)
+    this.#logger.debug?.('[factory] tracked agent resume ownership retargeted', {
+      issue: record.issue.key,
+      name,
+      resumedName: result.name,
+      role: tracked.spec.role,
+    })
     await this.#reportAgent(record, tracked, 'agent.resumed')
+  }
+
+  async #retargetBabysitterAgent(
+    record: InFlightIssue,
+    previousName: string,
+    tracked: TrackedAgent,
+  ): Promise<void> {
+    if (tracked.spec.role !== 'babysitter') return
+    const currentName = tracked.result?.name ?? tracked.spec.name
+    this.#babysitterCriticalAgents.delete(previousName)
+    const ownership = [...this.#babysitterPr.entries()]
+      .find(([, candidate]) => candidate.agentName === previousName)
+    const [ownershipKey, ref] = ownership ?? []
+    if (!ref) return
+    ref.agentName = currentName
+    // Resuming a session commonly preserves its Relaycast name. Iterate a
+    // snapshot because deleting and re-inserting that same key while walking
+    // the live Map would append it to the iterator again indefinitely.
+    for (const [wakeKey, state] of [...this.#babysitterWakeStates]) {
+      if (state.agentName !== previousName) continue
+      if (state.timer) clearTimeout(state.timer)
+      this.#babysitterWakeStates.delete(wakeKey)
+      state.timer = undefined
+      state.agentName = currentName
+      state.tracked = tracked
+      if (state.deferredSubmitTargets) {
+        state.deferredSubmitTargets = undefined
+        state.deliveringKinds = undefined
+        state.kinds.add('pull-request-state')
+        await this.#recordPendingBabysitterWake(state)
+      }
+      this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
+      if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+    }
+    await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
+  }
+
+  async #recoverUnreachableBabysitter(state: BabysitterWakeState): Promise<boolean> {
+    const batch = await this.#batch()
+    const record = batch.getIssueByAgent(state.agentName)
+    const tracked = record?.agents.get(state.agentName)
+    if (!record || !tracked || tracked.spec.role !== 'babysitter') return false
+    if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) return false
+
+    const previousName = state.agentName
+    this.#fleet.markAgentTerminal?.(previousName, 'babysitter-unreachable')
+    try {
+      await this.#fleet.release(previousName, 'babysitter-unreachable')
+      this.#logger.debug?.('[factory] unreachable babysitter release completed', {
+        issue: record.issue.key,
+        babysitter: previousName,
+      })
+    } catch (error) {
+      // An unresolvable Relaycast identity is frequently already absent from
+      // placement too. Release is best-effort; the fresh spawn below is the
+      // recovery operation that matters.
+      this.#increment('babysitterUnreachableReleaseFailures')
+      this.#logger.warn?.('[factory] unreachable babysitter release failed; attempting session recovery', {
+        issue: record.issue.key,
+        babysitter: previousName,
+        error: describeError(error).errorMessage,
+      })
+    }
+
+    try {
+      if (tracked.sessionRef) {
+        await this.#resumeTrackedAgent(record, previousName, tracked)
+      } else {
+        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
+        await this.#prepareAgentWorktree(record, tracked.spec)
+        const result = await this.#fleet.spawn({
+          name: tracked.spec.name,
+          capability: tracked.spec.capability,
+          node: tracked.result?.node ?? tracked.spec.node ?? 'self',
+          repo: tracked.spec.repo,
+          task: tracked.spec.task,
+          model: tracked.spec.model,
+          cwd: tracked.spec.clonePath,
+          invocationId,
+          restartPolicy: defaultRestartPolicy(tracked.spec),
+          channel: tracked.spec.channel,
+        })
+        batch.recordSpawn(record, tracked.spec, invocationId, result)
+        const restarted = record.agents.get(result.name)
+        if (!restarted) throw new Error(`Recovered babysitter ${result.name} was not tracked`)
+        await this.#retargetBabysitterAgent(record, previousName, restarted)
+        await this.#reportAgent(record, restarted, 'agent.resumed')
+      }
+      this.#logger.debug?.('[factory] unreachable babysitter replacement started', {
+        issue: record.issue.key,
+        previousBabysitter: previousName,
+        babysitter: state.agentName,
+      })
+      await this.#writeInFlightRegistry()
+      this.#logger.debug?.('[factory] unreachable babysitter registry refreshed', {
+        issue: record.issue.key,
+        babysitter: state.agentName,
+      })
+      if (!await this.#saveDispatchLifecycle(record, 'running')) return false
+      this.#increment('babysitterEventWakeUnreachableRecoveries')
+      this.#logger.info?.('[factory] restarted unreachable babysitter session', {
+        issue: record.issue.key,
+        repo: state.repo,
+        prNumber: state.prNumber,
+        previousBabysitter: previousName,
+        babysitter: state.agentName,
+      })
+      return true
+    } catch (error) {
+      this.#increment('babysitterEventWakeUnreachableRecoveryFailures')
+      this.#logger.warn?.('[factory] failed to restart unreachable babysitter session', {
+        issue: record.issue.key,
+        repo: state.repo,
+        prNumber: state.prNumber,
+        babysitter: previousName,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
   }
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
@@ -7259,6 +7429,7 @@ export class FactoryLoop implements Factory {
         await this.#fleet.sendMessage(input)
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
         if (this.#stopping || state.cancelled) {
           state.deliveringKinds = undefined
           return
@@ -7273,6 +7444,7 @@ export class FactoryLoop implements Factory {
         // registration-lag backoff state accumulated by prior failures.
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
         targets = ack.targets.length > 0 ? [...new Set(ack.targets)] : [input.to]
       }
       if (this.#stopping || state.cancelled) return
@@ -7322,23 +7494,23 @@ export class FactoryLoop implements Factory {
         // unreachable window so a later genuine registration lag starts fresh.
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
       }
       const unreachableMs = state.unreachableSinceMs !== undefined
         ? this.#clock.now() - state.unreachableSinceMs
         : 0
       if (registrationLag && unreachableMs >= this.#babysitterWakeUnreachableEscalateMs) {
         // The agent is up but its relay identity never became resolvable. Stop
-        // the tight 1s loop: back off to a slow cadence (still eventually
-        // recovering if the agent finally enrolls) and flag it once so an
-        // operator can intervene (e.g. re-spawn / restart) instead of the
-        // failure spinning silently forever.
+        // the tight 1s loop, reconcile once, and restart the session. A recovery
+        // cooldown prevents a still-converging Relaycast registration from
+        // turning that restart into another tight loop.
         state.nextDelayMs = this.#babysitterWakeUnreachableRetryMs
         if (!state.unreachableEscalated) {
           state.unreachableEscalated = true
           await this.#fleet.reconcileTrackedAgents?.()
           this.#increment('babysitterEventWakeUnreachableReconciliations')
           this.#increment('babysitterEventWakeUnreachableEscalations')
-          this.#logger.warn?.('[factory] babysitter unreachable past grace window; slowing wake retries and flagging for human attention', {
+          this.#logger.warn?.('[factory] babysitter unreachable past grace window; reconciling and restarting its session', {
             issue: state.issue.key,
             repo: state.repo,
             prNumber: state.prNumber,
@@ -7347,6 +7519,23 @@ export class FactoryLoop implements Factory {
             retryDelayMs: this.#babysitterWakeUnreachableRetryMs,
             error: describeError(error).errorMessage,
           })
+        }
+        if (
+          state.unreachableRecoveryAfterMs === undefined ||
+          this.#clock.now() >= state.unreachableRecoveryAfterMs
+        ) {
+          state.unreachableRecoveryAfterMs = this.#clock.now() + this.#babysitterWakeUnreachableRetryMs
+          if (await this.#recoverUnreachableBabysitter(state)) {
+            // Probe the newly registered identity promptly. If Relaycast still
+            // cannot resolve it, the recovery cooldown above prevents another
+            // teardown loop and the next attempt uses the slow cadence.
+            state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
+          }
+        } else {
+          state.nextDelayMs = Math.max(
+            BABYSITTER_EVENT_RETRY_MS,
+            state.unreachableRecoveryAfterMs - this.#clock.now(),
+          )
         }
       } else {
         state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
