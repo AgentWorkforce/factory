@@ -14581,6 +14581,119 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('makes a validated babysitter session authoritative before startup roster reconciliation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-receipt-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const issue = realIssueFile(496, ready, { title: 'Real babysitter receipt takeover' })
+    const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1496/metadata.json'
+    const exactPrPath = '/github/repos/AgentWorkforce/pear/pulls/1596/metadata.json'
+    const mount = new FakeMountClient({ [issuePath(496)]: issue })
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const first = createFactory(babysitterConfig({ batchSize: 1 }), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore: state(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(496), issue))
+      await first.dispatch(decision)
+      const key = issueKey(decision.issue)
+      const branch = (await state().getDispatchLifecycle('factory-test', key))!
+        .decision.implementers[0]!.branch!
+
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1496, {
+        state: 'open',
+        draft: false,
+        head_ref: 'factory/ar-496-stale-match',
+        title: 'Real AR-496 stale match',
+      })
+      mount.emit(changeEvent(stalePrPath, 'stale-pr-1496-open'))
+      await vi.waitFor(() => expect(firstFleet.spawns.map((spawn) => spawn.name)).toContain('ar-496-babysit'))
+      await first.stop()
+
+      // Reproduce the durable crash gap observed in the live Factory state:
+      // the lifecycle retained an earlier weak-match babysitter, while the
+      // independently persisted session already identified the exact PR.
+      const persisted = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, {
+          dispatchLifecycles: Record<string, {
+            agents: Array<{
+              name: string
+              tracked: {
+                spec: { name: string; invocationId?: string; ownedPullRequest?: { repo: string; number: number; path?: string } }
+                result?: { name: string }
+              }
+            }>
+            invocationIds: string[]
+          }>
+        }>
+      }
+      const lifecycle = persisted.workspaces['factory-test']!.dispatchLifecycles[key]!
+      const stale = lifecycle.agents.find((agent) => agent.tracked.spec.ownedPullRequest?.number === 1496)!
+      const exact = structuredClone(stale)
+      exact.name = 'ar-496-babysit-exact'
+      exact.tracked.spec.name = exact.name
+      exact.tracked.spec.invocationId = `${exact.tracked.spec.invocationId ?? 'factory:496'}:exact`
+      exact.tracked.spec.ownedPullRequest = { repo: 'AgentWorkforce/pear', number: 1596, path: exactPrPath }
+      if (exact.tracked.result) exact.tracked.result.name = exact.name
+      lifecycle.agents.push(exact)
+      if (exact.tracked.spec.invocationId) lifecycle.invocationIds.push(exact.tracked.spec.invocationId)
+      await writeFile(watchStatePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
+
+      await state().clearBabysitterSession('factory-test', `${key}:agentworkforce/pear#1496`)
+      await state().setBabysitterSession('factory-test', `${key}:agentworkforce/pear#1596`, {
+        issue: decision.issue,
+        repo: 'AgentWorkforce/pear',
+        prNumber: 1596,
+        path: exactPrPath,
+        agentName: exact.name,
+        critical: false,
+        pendingKinds: [],
+      })
+      mount.files.delete(stalePrPath)
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1596, {
+        state: 'open',
+        draft: false,
+        head_ref: branch,
+        title: 'Real AR-496 exact branch',
+      })
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(babysitterConfig({ batchSize: 1 }), {
+        mount,
+        fleet: restartedFleet,
+        triage: new StaticTriage(),
+        stateStore: state(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => {
+        const recovered = await state().getDispatchLifecycle('factory-test', key)
+        expect(recovered).toMatchObject({
+          phase: 'running',
+          pullRequest: { repo: 'AgentWorkforce/pear', number: 1596, headRef: branch },
+        })
+        expect(recovered?.agents.filter((agent) => agent.tracked.spec.role === 'babysitter').map((agent) => ({
+          name: agent.name,
+          pr: agent.tracked.spec.ownedPullRequest?.number,
+        }))).toEqual([{ name: exact.name, pr: 1596 }])
+      })
+      expect(restartedFleet.releases).toContainEqual({
+        name: 'ar-496-babysit',
+        reason: 'superseded-pr-receipt',
+      })
+      expect(restartedFleet.resumes.map((resume) => resume.name)).not.toContain('ar-496-babysit')
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('recovers a remote babysitter across the spawn-ack crash gap without replaying the original team tasks', async () => {
     class BabysitterAckGapFleet extends RemoteLifecycleFleetClient {
       crashed = false

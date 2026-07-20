@@ -673,7 +673,6 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
-      await this.#restoreBabysitterOwnership()
     } catch (error) {
       this.#startupAgentAdoptionActive = false
       if (live) await this.#stopLiveHeartbeat('stopping')
@@ -750,6 +749,12 @@ export class FactoryLoop implements Factory {
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
+      // Relinquish durable ownership before waiting on mount-backed lifecycle
+      // drives. A slow Relayfile scan must not consume the shutdown deadline
+      // while every issue remains fenced to a publisher that is already
+      // stopping. The owner/epoch fence makes any late completion from those
+      // drives harmless; a second sweep below catches claims racing this one.
+      await this.#releaseOwnedDispatchLifecycleLeases()
       await Promise.allSettled([...this.#dispatchLifecycleDrives])
       // Fence every source of new clarification work before touching the fleet.
       // A wake already past the fence is allowed to unwind, and is awaited
@@ -772,15 +777,7 @@ export class FactoryLoop implements Factory {
       // non-durable (local/internal) records; terminal completion performs the
       // normal remote release before clearing the lifecycle.
       await this.#releaseInFlightAgents('factory-stopped', { preserveDurable: true })
-      for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
-        await this.#state.releaseDispatchLifecycleLease(
-          this.#workspaceId,
-          key,
-          this.#dispatchLifecycleOwner,
-          epoch,
-        )
-      }
-      this.#dispatchLifecycleEpochs.clear()
+      await this.#releaseOwnedDispatchLifecycleLeases()
       if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
       this.#livePollTimer = undefined
       this.#livePollInFlight = false
@@ -814,6 +811,20 @@ export class FactoryLoop implements Factory {
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
+    }
+  }
+
+  async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
+    for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+      await this.#state.releaseDispatchLifecycleLease(
+        this.#workspaceId,
+        key,
+        this.#dispatchLifecycleOwner,
+        epoch,
+      )
+      if (this.#dispatchLifecycleEpochs.get(key) === epoch) {
+        this.#dispatchLifecycleEpochs.delete(key)
+      }
     }
   }
 
@@ -2602,6 +2613,14 @@ export class FactoryLoop implements Factory {
       if (agents.length > 0 && this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(agents)
       }
+      if (this.#config.babysitter.enabled) {
+        // Restore and reconcile exact PR ownership before asking the fleet to
+        // report missing agents. Otherwise a stale weak-match babysitter from
+        // the lifecycle can be resumed before its independently durable,
+        // metadata-validated replacement session becomes authoritative.
+        await this.#restoreBabysitterOwnership()
+        await this.#reconcileRestoredBabysitterReceipts()
+      }
       this.#scheduleDispatchLifecycleRenewal()
       if (this.#fleet.hydrateTracked) {
         this.#startupAgentAdoptionActive = false
@@ -3040,38 +3059,7 @@ export class FactoryLoop implements Factory {
         })))
         await this.#fleet.reconcileTrackedAgents?.()
       }
-      if (this.#config.babysitter.enabled) {
-        // Babysitter sessions are independently durable and restore only after
-        // their mounted PR metadata passes the open/draft/issue-identity guard.
-        // Fold those validated receipts back into the lifecycle on takeover.
-        // This closes the crash gap where the babysitter session persisted but
-        // the lifecycle PR receipt did not, and lets exact ownership retire any
-        // earlier weak-match babysitter for the same repository.
-        const restored = [...this.#babysitterPr.entries()]
-          .filter(([ownershipKey, ref]) =>
-            ref.agentName && issueKey(this.#babysitterIssueRefs.get(ownershipKey) ?? record.issue) === issueKey(record.issue))
-          .map(([, ref]) => ref)
-        for (const receipt of restored) {
-          const snapshot = await this.#readPrSnapshot(receipt)
-          const headRef = snapshot?.headRef ?? record.decision.implementers
-            .find((implementer) => implementer.repo.toLowerCase() === receipt.repo.toLowerCase())?.branch
-          if (!headRef) continue
-          const published = {
-            repo: receipt.repo,
-            number: receipt.prNumber,
-            url: `https://github.com/${receipt.repo}/pull/${receipt.prNumber}`,
-            headRef,
-          }
-          if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
-          await this.#ensureBabysitter(record, {
-            repo: published.repo,
-            prNumber: published.number,
-            url: published.url,
-            path: receipt.path,
-            authoritative: true,
-          })
-        }
-      }
+      if (this.#config.babysitter.enabled) await this.#reconcileRestoredBabysitterReceipts(record)
       return
     }
 
@@ -7211,12 +7199,15 @@ export class FactoryLoop implements Factory {
         continue
       }
       const record = batch.getIssue(session.issue)
-      const tracked = record?.agents.get(session.agentName)
-        ?? [...(record?.agents.values() ?? [])].find((agent) =>
-          agent.spec.role === 'babysitter' &&
-          githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) ===
-            githubPrIdentity(session.repo, session.prNumber))
+      const trackedEntry = record?.agents.has(session.agentName)
+        ? [session.agentName, record.agents.get(session.agentName)!] as const
+        : [...(record?.agents.entries() ?? [])].find(([, agent]) =>
+            agent.spec.role === 'babysitter' &&
+            githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) ===
+              githubPrIdentity(session.repo, session.prNumber))
+      const tracked = trackedEntry?.[1]
         ?? durableBabysitterTrackedAgent(session, this.#config.agentCapabilities.babysitter)
+      if (record && !trackedEntry) record.agents.set(session.agentName, tracked)
       const ref: BabysitterPrRef = {
         repo: session.repo,
         prNumber: session.prNumber,
@@ -7236,6 +7227,43 @@ export class FactoryLoop implements Factory {
       if (pendingKinds.length > 0) {
         await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked)
         this.#increment('babysitterPendingWakesRestored')
+      }
+    }
+  }
+
+  async #reconcileRestoredBabysitterReceipts(onlyRecord?: InFlightIssue): Promise<void> {
+    const records = onlyRecord ? [onlyRecord] : (await this.#batch()).inFlight
+    for (const record of records) {
+      if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
+      // Babysitter sessions are independently durable and restore only after
+      // their mounted PR metadata passes the open/draft/issue-identity guard.
+      // Fold those validated receipts back into the lifecycle on takeover.
+      // This closes the crash gap where the babysitter session persisted but
+      // the lifecycle PR receipt did not, and lets exact ownership retire any
+      // earlier weak-match babysitter for the same repository.
+      const restored = [...this.#babysitterPr.entries()]
+        .filter(([ownershipKey, ref]) =>
+          ref.agentName && issueKey(this.#babysitterIssueRefs.get(ownershipKey) ?? record.issue) === issueKey(record.issue))
+        .map(([, ref]) => ref)
+      for (const receipt of restored) {
+        const snapshot = await this.#readPrSnapshot(receipt)
+        const headRef = snapshot?.headRef ?? record.decision.implementers
+          .find((implementer) => implementer.repo.toLowerCase() === receipt.repo.toLowerCase())?.branch
+        if (!headRef) continue
+        const published = {
+          repo: receipt.repo,
+          number: receipt.prNumber,
+          url: snapshot?.url ?? `https://github.com/${receipt.repo}/pull/${receipt.prNumber}`,
+          headRef,
+        }
+        if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
+        await this.#ensureBabysitter(record, {
+          repo: published.repo,
+          prNumber: published.number,
+          url: published.url,
+          path: receipt.path,
+          authoritative: true,
+        })
       }
     }
   }
@@ -8203,6 +8231,12 @@ export class FactoryLoop implements Factory {
         repo: prRef.repo,
         prNumber: prRef.prNumber,
       })
+    }
+    if (superseded.length > 0) {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      if (lifecycle && !await this.#saveDispatchLifecycle(record, lifecycle.phase)) {
+        throw new Error(`Failed to persist superseded babysitter cleanup for ${record.issue.key}`)
+      }
     }
     return superseded.length > 0
   }
