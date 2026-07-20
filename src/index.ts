@@ -1,5 +1,6 @@
 import type { FactoryConfig } from './config/schema'
 
+export * from './featuremap/index.js'
 export * from './webhook/index.js'
 export * from './state/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
