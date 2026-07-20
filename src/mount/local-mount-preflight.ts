@@ -56,7 +56,9 @@ export async function ensureLocalMount(
 
   // Self-heal through the same SDK-authenticated launch path used for first
   // start, rather than silently shipping writebacks into a stale mirror.
-  process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+  if (!options.suppressStaleRefreshLogs) {
+    process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+  }
   try {
     await options.startMount()
     await waitForStateFile(
@@ -66,7 +68,9 @@ export async function ensureLocalMount(
       options.stateWaitPollMs,
       options.acceptableWorkspaceIds,
     )
-    process.stderr.write('[factory] local mount refreshed\n')
+    if (!options.suppressStaleRefreshLogs) {
+      process.stderr.write('[factory] local mount refreshed\n')
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)

@@ -65,6 +65,7 @@ import {
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider } from '../ports'
+import { checkMountStaleness } from '../mount/relayfile-binary'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -501,12 +502,21 @@ async function runFactoryCommand(
   acceptableMountIds?: readonly string[],
 ): Promise<number> {
   const mountFn = resolveLocalMountFn(deps, mount)
+  const mountStderr = deps.stderr ?? process.stderr
+  const debugMountRefreshes = (deps.env ?? process.env).FACTORY_LOG_LEVEL?.toLowerCase() === 'debug'
   if (command.kind === 'factory') {
     if (command.action === 'start') {
       await mountFn(workspaceId, process.cwd(), {
         acceptableWorkspaceIds: acceptableMountIds,
       })
-      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
+      await ensureClonePathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
@@ -538,7 +548,14 @@ async function runFactoryCommand(
       }
     }
     if (command.action === 'run-once') {
-      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
+      await ensureClonePathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
     }
@@ -570,7 +587,14 @@ async function runFactoryCommand(
       return 0
     }
 
-    await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
+    await ensureClonePathMounts(
+      mountFn,
+      workspaceId,
+      config,
+      acceptableMountIds,
+      mountStderr,
+      debugMountRefreshes,
+    )
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
@@ -796,20 +820,31 @@ async function ensureClonePathMounts(
   workspaceId: string,
   config: FactoryConfig,
   acceptableMountIds?: readonly string[],
+  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
+  debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
 ): Promise<void> {
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
   const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}).map((clonePath) => resolve(clonePath)))]
     .filter((clonePath) => clonePath !== daemonCwd)
+  const refreshedStaleMounts: Array<{ path: string; reason?: string }> = []
   let nextIndex = 0
   const mountNext = async (): Promise<void> => {
     while (nextIndex < clonePaths.length) {
       const resolved = clonePaths[nextIndex++]!
+      const statePath = join(resolved, '.integrations', '.relay', 'state.json')
+      const staleBefore = checkMountStaleness(statePath, workspaceId, acceptableMountIds)
       try {
-        await mountFn(workspaceId, resolved, mountOpts)
+        await mountFn(workspaceId, resolved, {
+          ...mountOpts,
+          ...(staleBefore.stale ? { suppressStaleRefreshLogs: true } : {}),
+        })
+        if (staleBefore.stale && !checkMountStaleness(statePath, workspaceId, acceptableMountIds).stale) {
+          refreshedStaleMounts.push({ path: resolved, reason: staleBefore.reason })
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        process.stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
+        stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
       }
     }
   }
@@ -817,6 +852,20 @@ async function ensureClonePathMounts(
     { length: Math.min(CLONE_MOUNT_PREFLIGHT_CONCURRENCY, clonePaths.length) },
     mountNext,
   ))
+  if (debug) {
+    for (const mount of refreshedStaleMounts) {
+      const suffix = mount.reason ? ` (${mount.reason})` : ''
+      stderr.write(`[factory] debug: refreshed stale local mount at ${mount.path}${suffix}\n`)
+    }
+  }
+  if (refreshedStaleMounts.length > 0) {
+    const ages = refreshedStaleMounts
+      .map(({ reason }) => reason?.match(/^last reconcile (\d+)m ago$/u)?.[1])
+      .filter((age): age is string => age !== undefined)
+      .map(Number)
+    const ageSuffix = ages.length > 0 ? ` (last reconcile ~${Math.max(...ages)}m ago)` : ''
+    stderr.write(`[factory] refreshed ${refreshedStaleMounts.length} stale local mount(s)${ageSuffix}\n`)
+  }
 }
 
 function resolveLocalMountFn(
@@ -1042,6 +1091,13 @@ async function buildFleet(
     const stderr = deps.stderr ?? process.stderr
     const logger = streamLogger(stderr)
     const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
+    if (started && connectionPath === undefined) {
+      stderr.write(
+        `[factory] no existing relay broker connection found under ${cwd} (.agentworkforce/relay/connection.json);\n` +
+        'starting a NEW broker. If you expected to attach to an already-running Factory, you are likely running\n' +
+        'from the wrong directory — cd to the checkout that owns .agentworkforce/relay/ and retry.\n',
+      )
+    }
     return createFleet(
       { backend: 'internal', cwd, connectionPath },
       {
