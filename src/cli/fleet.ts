@@ -617,7 +617,11 @@ async function runStandaloneBabysitCommand(
   }
 
   const agentName = standaloneBabysitterAgentName(repo, pr.number)
-  const testGuidance = await resolveTestGuidance({ repoPath: clonePath, issue })
+  const testGuidance = await resolveTestGuidance({
+    repoPath: clonePath,
+    issue,
+    changedFiles: pr.filesChanged,
+  })
   const task = renderAgentTask({
     issue,
     route: { repo, clonePath },

@@ -127,7 +127,7 @@ categories:
       - id: cli-babysit
         name: Standalone Pull Request Babysitter
         cli: factory babysit <PR-number|GitHub-PR-URL>
-        description: Spawn a one-shot task-exit babysitter for an existing open non-draft same-repository PR
+        description: Spawn a one-shot task-exit babysitter for an existing open non-draft same-repository PR with manifest-derived verification guidance scoped to its changed files
         location: src/cli/fleet.ts, src/github/standalone-babysitter.ts
         verify_tier: 6
 

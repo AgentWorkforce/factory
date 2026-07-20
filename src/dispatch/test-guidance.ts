@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { parse as parseYaml } from 'yaml'
@@ -42,7 +42,7 @@ export async function resolveTestGuidance(
 
   let rawManifest: string
   try {
-    rawManifest = readFileSync(join(input.repoPath, FEATURE_MANIFEST_PATH), 'utf8')
+    rawManifest = await readFile(join(input.repoPath, FEATURE_MANIFEST_PATH), 'utf8')
   } catch {
     return undefined
   }
@@ -52,7 +52,7 @@ export async function resolveTestGuidance(
 
   let rawProcedures: string | undefined
   try {
-    rawProcedures = readFileSync(join(input.repoPath, VERIFY_PROCEDURES_PATH), 'utf8')
+    rawProcedures = await readFile(join(input.repoPath, VERIFY_PROCEDURES_PATH), 'utf8')
   } catch {
     // Older manifests can still use the documented fallback tier mapping.
   }
