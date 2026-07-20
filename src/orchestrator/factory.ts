@@ -5461,28 +5461,47 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      if (tracked.sessionRef) {
+      const configuredCapability = this.#config.agentCapabilities.babysitter
+      const capabilityChanged = tracked.spec.capability !== configuredCapability
+      if (tracked.sessionRef && !capabilityChanged) {
         await this.#resumeTrackedAgent(record, previousName, tracked)
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
-        await this.#prepareAgentWorktree(record, tracked.spec)
+        const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
+        const replacementSpec = capabilityChanged
+          ? {
+              ...persistedSpec,
+              capability: configuredCapability,
+              model: this.#config.models.babysitter,
+            }
+          : persistedSpec
+        await this.#prepareAgentWorktree(record, replacementSpec)
         const result = await this.#fleet.spawn({
-          name: tracked.spec.name,
-          capability: tracked.spec.capability,
-          node: tracked.result?.node ?? tracked.spec.node ?? 'self',
-          repo: tracked.spec.repo,
-          task: tracked.spec.task,
-          model: tracked.spec.model,
-          cwd: tracked.spec.clonePath,
+          name: replacementSpec.name,
+          capability: replacementSpec.capability,
+          node: tracked.result?.node ?? replacementSpec.node ?? 'self',
+          repo: replacementSpec.repo,
+          task: replacementSpec.task,
+          model: replacementSpec.model,
+          cwd: replacementSpec.clonePath,
           invocationId,
-          restartPolicy: defaultRestartPolicy(tracked.spec),
-          channel: tracked.spec.channel,
+          restartPolicy: defaultRestartPolicy(replacementSpec),
+          channel: replacementSpec.channel,
         })
-        batch.recordSpawn(record, tracked.spec, invocationId, result)
+        batch.recordSpawn(record, replacementSpec, invocationId, result)
         const restarted = record.agents.get(result.name)
         if (!restarted) throw new Error(`Recovered babysitter ${result.name} was not tracked`)
         await this.#retargetBabysitterAgent(record, previousName, restarted)
         await this.#reportAgent(record, restarted, 'agent.resumed')
+        if (capabilityChanged) {
+          this.#increment('babysitterCapabilityMigrations')
+          this.#logger.info?.('[factory] cold-started unreachable babysitter on configured capability', {
+            issue: record.issue.key,
+            babysitter: result.name,
+            previousCapability: tracked.spec.capability,
+            capability: configuredCapability,
+          })
+        }
       }
       this.#logger.debug?.('[factory] unreachable babysitter replacement started', {
         issue: record.issue.key,

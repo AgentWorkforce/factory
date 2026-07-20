@@ -1035,6 +1035,23 @@ class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
   }
 }
 
+class CapabilityMigratingBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      const current = this.spawned.findLast((spawn) => spawn.name === input.to)
+      if (current?.cli !== 'codex') {
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class ResumeCollisionHarnessClient extends RosterPidHarnessClient {
   resumeAttempts = 0
   shutdownCalls = 0
@@ -15801,6 +15818,84 @@ describe('FactoryLoop PR babysitter', () => {
       })
       expect(harness.spawned.filter((spawn) => spawn.continueFrom)).toHaveLength(1)
       expect(harness.babysitterWakeAttempts).toBeGreaterThan(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('cold-starts an unreachable babysitter when its configured capability changed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-capability-recovery-'))
+    const issue = realIssueFile(425, ready, { title: 'Real babysitter capability migration' })
+    const mount = new FakeMountClient({ [issuePath(425)]: issue })
+    const harness = new CapabilityMigratingBabysitterHarnessClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const ports = {
+      mount,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 60_000,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' as const }),
+      readChildPids: async () => [] as number[],
+    }
+    let factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      ...ports,
+      fleet: new InternalFleetClient({ client: harness, cwd: '/work/pear' }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(425), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/425/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 425,
+        state: 'open',
+        head_ref: 'ar-425-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-425-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-425-babysit'))
+      expect(harness.spawned.findLast((spawn) => spawn.name === 'ar-425-babysit')?.cli).toBe('claude')
+
+      // Model an operator changing the configured harness after the persisted
+      // session became unhealthy. A Claude session ref cannot be resumed by
+      // Codex, so recovery must cold-start from the durable PR task instead.
+      await factory.stop()
+      factory = createFactory(babysitterConfig({
+        loop: { registryPath: join(root, 'registry.json') },
+        agentCapabilities: { babysitter: 'spawn:codex' },
+      }), {
+        ...ports,
+        fleet: new InternalFleetClient({ client: harness, cwd: '/work/pear' }),
+      })
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9425.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 425 },
+        comment: { id: 9425, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9425.json', 'comment-9425'))
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterCapabilityMigrations).toBe(1),
+        { timeout: 8_000 },
+      )
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1),
+        { timeout: 4_000 },
+      )
+      const migrations = harness.spawned.filter((spawn) =>
+        spawn.name === 'ar-425-babysit' && spawn.cli === 'codex')
+      expect(migrations).toHaveLength(1)
+      expect(migrations[0]?.continueFrom).toBeUndefined()
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
