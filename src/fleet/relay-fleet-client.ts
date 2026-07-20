@@ -2,7 +2,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -233,6 +233,7 @@ export class RelayFleetClient implements FleetClient {
       repo: input.repo,
       input: {
         operation: 'start',
+        namespace: input.namespace,
         owner: input.owner,
         issueKey: input.issueKey,
         service: input.service,
@@ -253,7 +254,6 @@ export class RelayFleetClient implements FleetClient {
     const ack = await messaging.placement.spawn({
       capability: 'preview:tailscale-serve',
       ...(preview.node ? { node: preview.node } : {}),
-      repo: preview.repo,
       input: { operation: 'remove', preview },
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
       log: this.#log,
@@ -262,7 +262,7 @@ export class RelayFleetClient implements FleetClient {
     return asRecord(invocation.output)?.removed === true
   }
 
-  async reapPreviews(activeOwners: string[]): Promise<PreviewSweepResult> {
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
     const messaging = await this.#ensureMessaging()
     const nodes = (await this.roster()).nodes.filter((node) =>
       node.live && node.capabilities.includes('preview:tailscale-serve'),
@@ -272,7 +272,7 @@ export class RelayFleetClient implements FleetClient {
         const ack = await messaging.placement.spawn({
           capability: 'preview:tailscale-serve',
           node: node.name,
-          input: { operation: 'sweep', activeOwners },
+          input: { operation: 'sweep', namespace: input.namespace, activeOwners: input.activeOwners },
           ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
           log: this.#log,
         })
@@ -301,6 +301,11 @@ export class RelayFleetClient implements FleetClient {
       reaped: reports.flatMap((report) => report.reaped),
       skipped: reports.flatMap((report) => report.skipped),
     }
+  }
+
+  markAgentTerminal(name: string, _reason?: string): void {
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
   }
 
   async roster(): Promise<RosterEntry> {
@@ -806,16 +811,18 @@ function previewReferenceFromInvocation(
 function previewReference(value: unknown, placementNode?: string): PreviewReference | undefined {
   const record = asRecord(value)
   const id = readString(record, 'id')
+  const namespace = readString(record, 'namespace')
   const owner = readString(record, 'owner')
   const service = readString(record, 'service')
   const repo = readString(record, 'repo')
   const url = readString(record, 'url')
+  const configuredTargetPort = readNumber(record, 'configuredTargetPort', 'configured_target_port')
   const targetPort = readNumber(record, 'targetPort', 'target_port')
   const httpsPort = readNumber(record, 'httpsPort', 'https_port')
   const createdAt = readString(record, 'createdAt', 'created_at')
   const node = readString(record, 'node') ?? placementNode
   if (
-    !id || !owner || !service || !repo || !url || !createdAt ||
+    !id || !namespace || !owner || !service || !repo || !url || !createdAt ||
     targetPort === undefined || httpsPort === undefined ||
     record?.provider !== 'tailscale-serve' || record.access !== 'tailnet' || record.lifetime !== 'issue'
   ) return undefined
@@ -823,10 +830,12 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
   return {
     id,
     provider: 'tailscale-serve',
+    namespace,
     owner,
     service,
     repo,
     url,
+    ...(configuredTargetPort !== undefined ? { configuredTargetPort } : {}),
     targetPort,
     httpsPort,
     access: 'tailnet',

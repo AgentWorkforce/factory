@@ -210,6 +210,7 @@ describe('factory node definition', () => {
     const preview: PreviewReference = {
       id: 'preview-1',
       provider: 'tailscale-serve',
+      namespace: 'factory-test',
       owner: 'AR-129:uuid:/linear/issues/129',
       service: 'factory',
       repo: 'AgentWorkforce/factory',
@@ -251,6 +252,7 @@ describe('factory node definition', () => {
     })
     await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
       operation: 'start',
+      namespace: preview.namespace,
       owner: preview.owner,
       issueKey: 'AR-129',
       service: 'factory',
@@ -261,6 +263,7 @@ describe('factory node definition', () => {
       preview: { ...preview, node: 'factory-node' },
     })
     expect(starts).toEqual([{
+      namespace: preview.namespace,
       owner: preview.owner,
       issueKey: 'AR-129',
       service: 'factory',
@@ -270,6 +273,7 @@ describe('factory node definition', () => {
     }])
     await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
       operation: 'start',
+      namespace: preview.namespace,
       owner: preview.owner,
       issueKey: 'AR-129',
       service: 'factory',

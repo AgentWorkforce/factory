@@ -24,6 +24,7 @@ export type {
   PreviewCapability,
   PreviewReference,
   PreviewStartInput,
+  PreviewSweepInput,
   PreviewSweepResult,
   FleetClient,
   RestartPolicy,

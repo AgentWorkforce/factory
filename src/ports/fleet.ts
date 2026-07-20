@@ -9,11 +9,15 @@ export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput[
 export type PreviewReference = {
   id: string
   provider: 'tailscale-serve'
+  /** Factory workspace namespace that fences startup sweeps. */
+  namespace: string
   /** Stable dispatch identity used by guarded teardown and orphan sweeps. */
   owner: string
   service: string
   repo: string
   url: string
+  /** Configured service port before node-local collision-free allocation. */
+  configuredTargetPort?: number
   targetPort: number
   httpsPort: number
   access: 'tailnet'
@@ -24,6 +28,7 @@ export type PreviewReference = {
 }
 
 export type PreviewStartInput = {
+  namespace: string
   owner: string
   issueKey: string
   service: string
@@ -32,6 +37,11 @@ export type PreviewStartInput = {
   preferredHttpsPort?: number
   startCommand?: string
   node?: 'self' | string
+}
+
+export type PreviewSweepInput = {
+  namespace: string
+  activeOwners: string[]
 }
 
 export type PreviewSweepResult = {
@@ -138,7 +148,7 @@ export interface FleetClient {
   /** Remove only the exact provider route described by the reference. */
   removePreview?(preview: PreviewReference): Promise<boolean>
   /** Reap Factory-owned routes whose owner is absent from durable in-flight state. */
-  reapPreviews?(activeOwners: string[]): Promise<PreviewSweepResult>
+  reapPreviews?(input: PreviewSweepInput): Promise<PreviewSweepResult>
   // A successfully spawned fire-and-forget worker may need infrastructure this
   // client cold-started to outlive the invoking CLI process. Backends that own
   // such infrastructure can relinquish cleanup responsibility after spawn.

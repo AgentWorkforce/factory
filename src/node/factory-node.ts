@@ -97,10 +97,12 @@ const workflowCapabilityInputSchema = z.object({
 const previewReferenceSchema: z.ZodType<PreviewReference> = z.object({
   id: z.string().min(1),
   provider: z.literal('tailscale-serve'),
+  namespace: z.string().min(1),
   owner: z.string().min(1),
   service: z.string().min(1),
   repo: z.string().min(1),
   url: z.string().url(),
+  configuredTargetPort: z.number().int().min(1).max(65_535).optional(),
   targetPort: z.number().int().min(1).max(65_535),
   httpsPort: z.number().int().min(1).max(65_535),
   access: z.literal('tailnet'),
@@ -113,6 +115,7 @@ const previewReferenceSchema: z.ZodType<PreviewReference> = z.object({
 const previewCapabilityInputSchema = z.discriminatedUnion('operation', [
   z.object({
     operation: z.literal('start'),
+    namespace: z.string().min(1),
     owner: z.string().min(1),
     issueKey: z.string().min(1),
     service: z.string().min(1),
@@ -122,7 +125,11 @@ const previewCapabilityInputSchema = z.discriminatedUnion('operation', [
     startCommand: z.string().min(1).optional(),
   }),
   z.object({ operation: z.literal('remove'), preview: previewReferenceSchema }),
-  z.object({ operation: z.literal('sweep'), activeOwners: z.array(z.string().min(1)) }),
+  z.object({
+    operation: z.literal('sweep'),
+    namespace: z.string().min(1),
+    activeOwners: z.array(z.string().min(1)),
+  }),
 ])
 
 type SpawnCapabilityInput = z.output<typeof spawnCapabilityInputSchema>
@@ -255,7 +262,10 @@ async function runPreviewCapability(
   if (input.operation === 'remove') {
     return { operation: input.operation, removed: await manager.remove(input.preview) }
   }
-  return { operation: input.operation, ...await manager.sweep(input.activeOwners) }
+  return {
+    operation: input.operation,
+    ...await manager.sweep({ namespace: input.namespace, activeOwners: input.activeOwners }),
+  }
 }
 
 export function readFactoryNodeConfigSync(configPath = resolveFactoryNodeConfigPath()): NodeConfig {

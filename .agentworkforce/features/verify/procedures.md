@@ -19,36 +19,8 @@ npm test
 node bin/factory.mjs --help
 # → exits 0 and lists every top-level command and global option
 
-node --input-type=module <<'NODE'
-import { existsSync, readFileSync } from 'node:fs'
-import { parse } from 'yaml'
-
-const manifest = parse(readFileSync('.agentworkforce/features/manifest.yaml', 'utf8'))
-const categories = Object.values(manifest.categories)
-const features = categories.flatMap((category) => category.features)
-const ids = features.map((feature) => feature.id)
-if (new Set(ids).size !== ids.length) throw new Error('duplicate feature IDs')
-const tierCounts = Object.fromEntries([1, 2, 3, 4, 5, 6].map((tier) => [
-  tier,
-  features.filter((feature) => feature.verify_tier === tier).length,
-]))
-if (manifest.catalog.category_count !== categories.length ||
-    manifest.catalog.feature_count !== features.length ||
-    JSON.stringify(manifest.catalog.tier_counts) !== JSON.stringify(tierCounts)) {
-  throw new Error('catalog summary does not match manifest contents')
-}
-for (const feature of features) {
-  if (!feature.id || !feature.name || (!feature.cli && !feature.api) ||
-      !feature.description || !feature.location ||
-      !Number.isInteger(feature.verify_tier) || feature.verify_tier < 1 || feature.verify_tier > 6) {
-    throw new Error(`invalid feature: ${JSON.stringify(feature)}`)
-  }
-  for (const location of feature.location.split(',').map((value) => value.trim())) {
-    if (!existsSync(location)) throw new Error(`missing location for ${feature.id}: ${location}`)
-  }
-}
-console.log(`${features.length} features in ${categories.length} categories`)
-NODE
+node bin/factory.mjs featuremap check
+# → validates schema, unique ids, catalog totals, tiers, and every location path
 ```
 
 Pass criteria: build and all tests exit 0; both published entrypoints remain importable; the manifest parses with unique, complete entries.
@@ -397,11 +369,11 @@ Every feature below maps to the procedure for its manifest tier. This index is i
 
 ### Tier 1 IDs
 
-`cli-help`, `cli-config-option`, `safety-relay-token-types`, `safety-merge-head-sha`, `webhook-hmac-validation`, `webhook-event-routing`, `webhook-event-deduplication`, `subscription-canonical-paths`, `subscription-delivery-targets`, `subscription-linear-predicates`, `api-config-schemas`, `api-triage-engines`, `api-fleet-ports`, `api-mount-ports`, `api-writeback-ports`, `api-state-stores`, `api-reaper`, `api-relayflow-policy`, `api-testing`, `api-safe-log-serialization`, `config-node-path-env`, `config-node-name-env`.
+`cli-help`, `cli-featuremap-check`, `cli-config-option`, `safety-relay-token-types`, `safety-merge-head-sha`, `webhook-hmac-validation`, `webhook-event-routing`, `webhook-event-deduplication`, `subscription-canonical-paths`, `subscription-delivery-targets`, `subscription-linear-predicates`, `api-config-schemas`, `api-featuremap-validator`, `api-triage-engines`, `api-fleet-ports`, `api-mount-ports`, `api-writeback-ports`, `api-state-stores`, `api-reaper`, `api-relayflow-policy`, `api-testing`, `api-safe-log-serialization`, `config-node-path-env`, `config-node-name-env`.
 
 ### Tier 2 IDs
 
-`cli-run-once`, `cli-status`, `cli-loop`, `cli-loop-status`, `cli-dry-run-option`, `triage-label-routing`, `triage-project-routing`, `triage-keyword-routing`, `triage-default-routing`, `triage-unroutable-escalation`, `triage-single-scope`, `triage-team-scope`, `triage-workflow-scope`, `triage-shape-labels`, `triage-surface-inference`, `triage-thin-issue-detection`, `triage-llm-fallback`, `triage-tiered-fail-safe`, `triage-decision-normalization`, `triage-repo-qualified-agent-identities`, `dispatch-batch-admission`, `dispatch-duplicate-suppression`, `dispatch-composite-issue-identity`, `dispatch-retry-backoff`, `dispatch-retry-limit`, `dispatch-agent-task-rendering`, `dispatch-inflight-registry`, `pr-never-auto-merge`, `safety-title-prefix`, `safety-label-gate`, `safety-team-gate`, `safety-babysit-pr-identity`, `safety-node-checkout-containment`, `node-definition`, `node-inventory-sync`, `api-factory-lifecycle`, `api-factory-events`, `api-linear-state-resolution`, `config-workspace-id`, `config-issue-source`, `config-batch-size`, `config-subscription-teams`, `config-subscription-projects`, `config-subscription-labels`, `config-subscription-assignees`, `config-live-transport`, `config-live-poll-interval`, `config-live-event-limit`, `config-live-replay-skew`, `config-dispatch-cooldown`, `config-dispatch-attempts`, `config-triage-implementers`, `config-repos-org`, `config-repos-names`, `config-repos-overrides`, `config-repos-by-label`, `config-repos-by-project`, `config-repos-keyword-rules`, `config-repos-default`, `config-repos-clone-root`, `config-repos-clone-paths`, `config-clone-root`, `config-clone-paths`, `config-home-clone-expansion`, `config-cwd-clone-inference`, `config-local-checkout-preflight`, `config-loop-max-iterations`, `config-loop-failure-limit`, `config-loop-heartbeat-path`, `config-loop-registry-path`, `config-loop-heartbeat-stale`, `config-loop-heartbeat-alias`, `config-loop-registry-alias`, `config-model-implementer`, `config-model-reviewer`, `config-model-triage`, `config-model-babysitter`, `config-babysitter-enabled`, `config-merge-policy`, `config-terminal-state`, `config-slack-channel`, `config-slack-style`, `config-slack-bot-user`, `config-slack-staleness`, `config-linear-ready-name`, `config-linear-implementing-name`, `config-linear-planning-name`, `config-linear-done-name`, `config-linear-human-review-name`, `config-linear-states-by-team`, `config-linear-team-ids`, `config-state-id-ready`, `config-state-id-implementing`, `config-state-id-planning`, `config-state-id-done`, `config-state-id-human-review`, `config-safety-title-prefix`, `config-safety-label`, `config-safety-team`, `config-node-capabilities`, `config-node-dry-run`, `config-combined-envelope`, `config-split-envelope`, `config-fixture-files`.
+`cli-run-once`, `cli-status`, `cli-loop`, `cli-loop-status`, `cli-dry-run-option`, `triage-label-routing`, `triage-project-routing`, `triage-keyword-routing`, `triage-default-routing`, `triage-unroutable-escalation`, `triage-single-scope`, `triage-team-scope`, `triage-workflow-scope`, `triage-shape-labels`, `triage-surface-inference`, `triage-thin-issue-detection`, `triage-llm-fallback`, `triage-tiered-fail-safe`, `triage-decision-normalization`, `triage-repo-qualified-agent-identities`, `dispatch-batch-admission`, `dispatch-duplicate-suppression`, `dispatch-composite-issue-identity`, `dispatch-retry-backoff`, `dispatch-retry-limit`, `dispatch-agent-task-rendering`, `dispatch-inflight-registry`, `pr-never-auto-merge`, `safety-title-prefix`, `safety-label-gate`, `safety-team-gate`, `safety-babysit-pr-identity`, `safety-node-checkout-containment`, `node-definition`, `node-inventory-sync`, `api-factory-lifecycle`, `api-factory-events`, `api-linear-state-resolution`, `config-workspace-id`, `config-issue-source`, `config-batch-size`, `config-subscription-teams`, `config-subscription-projects`, `config-subscription-labels`, `config-subscription-assignees`, `config-live-transport`, `config-live-poll-interval`, `config-live-event-limit`, `config-live-replay-skew`, `config-dispatch-cooldown`, `config-dispatch-attempts`, `config-triage-implementers`, `config-repos-org`, `config-repos-names`, `config-repos-overrides`, `config-repos-by-label`, `config-repos-by-project`, `config-repos-keyword-rules`, `config-repos-default`, `config-repos-clone-root`, `config-repos-clone-paths`, `config-clone-root`, `config-clone-paths`, `config-home-clone-expansion`, `config-cwd-clone-inference`, `config-local-checkout-preflight`, `config-loop-max-iterations`, `config-loop-failure-limit`, `config-loop-heartbeat-path`, `config-loop-registry-path`, `config-loop-heartbeat-stale`, `config-loop-heartbeat-alias`, `config-loop-registry-alias`, `config-model-implementer`, `config-model-reviewer`, `config-model-triage`, `config-model-babysitter`, `config-babysitter-enabled`, `config-merge-policy`, `config-terminal-state`, `config-slack-channel`, `config-slack-style`, `config-slack-bot-user`, `config-slack-staleness`, `config-slack-conversation-coalesce`, `config-linear-ready-name`, `config-linear-implementing-name`, `config-linear-planning-name`, `config-linear-done-name`, `config-linear-human-review-name`, `config-linear-states-by-team`, `config-linear-team-ids`, `config-state-id-ready`, `config-state-id-implementing`, `config-state-id-planning`, `config-state-id-done`, `config-state-id-human-review`, `config-safety-title-prefix`, `config-safety-label`, `config-safety-team`, `config-node-capabilities`, `config-node-dry-run`, `config-combined-envelope`, `config-split-envelope`, `config-fixture-files`.
 
 ### Tier 3 IDs
 
@@ -409,7 +381,7 @@ Every feature below maps to the procedure for its manifest tier. This index is i
 
 ### Tier 4 IDs
 
-`cli-start-live`, `cli-reap-orphans`, `cli-dispatch`, `cli-backend-option`, `cli-agent-exit-timeout-option`, `fleet-spawn-codex`, `fleet-spawn-claude`, `fleet-spawn-workflow`, `fleet-resume`, `fleet-target-node`, `fleet-spawn-inputs`, `fleet-roster`, `fleet-release`, `dispatch-queue-promotion`, `dispatch-implementers`, `dispatch-reviewer`, `dispatch-workflow-agent`, `dispatch-confirmed-task-injection`, `dispatch-critical-delivery-retry`, `dispatch-agent-resume`, `dispatch-remote-re-adoption`, `dispatch-durable-relay-lifecycle`, `dispatch-same-host-owner-fencing`, `human-agent-questions`, `human-team-release-for-clarification`, `human-durable-clarification-wake`, `human-answer-injection`, `pr-durable-babysitter-sessions`, `pr-babysitter-wake-coalescing`, `pr-babysitter-critical-ack-fence`, `fleet-internal-backend`, `fleet-broker-reuse`, `fleet-broker-autostart`, `fleet-owned-broker-drain`, `fleet-relay-backend`, `fleet-relay-repo-placement`, `fleet-relay-reconciliation`, `fleet-message-events`, `node-spawn-capabilities`, `node-workflow-capability`, `node-relay-mcp-harness`.
+`cli-start-live`, `cli-reap-orphans`, `cli-dispatch`, `cli-backend-option`, `cli-agent-exit-timeout-option`, `fleet-spawn-codex`, `fleet-spawn-claude`, `fleet-spawn-workflow`, `fleet-resume`, `fleet-target-node`, `fleet-spawn-inputs`, `fleet-roster`, `fleet-release`, `dispatch-queue-promotion`, `dispatch-implementers`, `dispatch-reviewer`, `dispatch-workflow-agent`, `dispatch-confirmed-task-injection`, `dispatch-critical-delivery-retry`, `dispatch-agent-resume`, `dispatch-remote-re-adoption`, `dispatch-durable-relay-lifecycle`, `dispatch-same-host-owner-fencing`, `human-agent-questions`, `human-team-release-for-clarification`, `human-durable-clarification-wake`, `human-slack-conversation-resume`, `pr-durable-babysitter-sessions`, `pr-babysitter-wake-coalescing`, `pr-babysitter-critical-ack-fence`, `fleet-internal-backend`, `fleet-broker-reuse`, `fleet-broker-autostart`, `fleet-owned-broker-drain`, `fleet-relay-backend`, `fleet-relay-repo-placement`, `fleet-relay-reconciliation`, `fleet-message-events`, `node-spawn-capabilities`, `node-workflow-capability`, `node-relay-mcp-harness`.
 
 ### Tier 5 IDs
 

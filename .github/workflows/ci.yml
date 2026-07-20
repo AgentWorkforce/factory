@@ -31,8 +31,24 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Validate feature map
+        run: npm run featuremap:check
+
       - name: Test
         run: npm test
+
+      - name: Verify packed end-to-end lifecycle
+        run: npm run verify:e2e
+        env:
+          FACTORY_E2E_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          FACTORY_E2E_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Upload head-bound E2E attestation
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-e2e-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/factory-e2e-attestation.json
+          if-no-files-found: error
 
       - name: Verify package contents
         run: npm pack --dry-run

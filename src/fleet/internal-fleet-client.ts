@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
 import type { PreviewConfig } from '../config/schema'
-import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
@@ -116,6 +116,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #activeInjectedWaits = new Set<PendingInjectedWait>()
   readonly #injectedEventIds: string[] = []
   readonly #injectedEventIdSet = new Set<string>()
+  readonly #injectedByAgent = new Map<string, { sequence: number; eventId: string }>()
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
   readonly #exitedAgentNames = new Set<string>()
@@ -308,9 +309,9 @@ export class InternalFleetClient implements FleetClient {
     return await this.#previewManager.remove(preview)
   }
 
-  async reapPreviews(activeOwners: string[]): Promise<PreviewSweepResult> {
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
     if (!this.#previewManager) return { reaped: [], skipped: [] }
-    return await this.#previewManager.sweep(activeOwners)
+    return await this.#previewManager.sweep(input)
   }
 
   trackedAgents(): ReadonlyMap<string, FleetTrackedAgent> {
@@ -395,12 +396,17 @@ export class InternalFleetClient implements FleetClient {
   async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }> {
     this.#ensureEventSubscription()
     const targetWasReady = this.#readyAgentNames.has(input.to)
+    const injectedSequenceAtSendStart = this.#injectedByAgent.get(input.to)?.sequence ?? 0
     const result = await this.#client.sendMessage(messageInputFrom(input))
     const eventId = result.event_id
     const targets = result.targets ?? []
 
     if (this.#injectedEventIdSet.has(eventId)) {
       return { eventId, targets }
+    }
+    const injectedDuringSend = this.#injectedByAgent.get(input.to)
+    if (injectedDuringSend && injectedDuringSend.sequence > injectedSequenceAtSendStart) {
+      return { eventId: injectedDuringSend.eventId, targets }
     }
 
     return await new Promise((resolve, reject) => {
@@ -634,6 +640,13 @@ export class InternalFleetClient implements FleetClient {
 
   #resolveInjected(eventId: string, name?: string): void {
     rememberRecent(eventId, this.#injectedEventIds, this.#injectedEventIdSet)
+    if (name) {
+      const previous = this.#injectedByAgent.get(name)
+      this.#injectedByAgent.set(name, {
+        sequence: (previous?.sequence ?? 0) + 1,
+        eventId,
+      })
+    }
 
     const pending = this.#pendingInjected.get(eventId)
     if (pending) {

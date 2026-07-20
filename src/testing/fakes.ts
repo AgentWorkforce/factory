@@ -15,6 +15,7 @@ import type {
   Capability,
   PreviewReference,
   PreviewStartInput,
+  PreviewSweepInput,
   PreviewSweepResult,
 } from '../ports'
 
@@ -200,7 +201,7 @@ export class FakeFleetClient implements FleetClient {
   preservedInfrastructure = 0
   readonly previewStarts: PreviewStartInput[] = []
   readonly previewRemovals: PreviewReference[] = []
-  readonly previewSweeps: string[][] = []
+  readonly previewSweeps: PreviewSweepInput[] = []
 
   #agents = new Set<string>()
   #tracked = new Map<string, { invocationId?: string; node?: string }>()
@@ -247,10 +248,12 @@ export class FakeFleetClient implements FleetClient {
     return {
       id: `preview-${this.previewStarts.length}`,
       provider: 'tailscale-serve',
+      namespace: input.namespace,
       owner: input.owner,
       service: input.service,
       repo: input.repo,
       url: `https://factory-node.tailnet.ts.net:${httpsPort}/`,
+      configuredTargetPort: input.targetPort,
       targetPort: input.targetPort,
       httpsPort,
       access: 'tailnet',
@@ -266,8 +269,8 @@ export class FakeFleetClient implements FleetClient {
     return true
   }
 
-  async reapPreviews(activeOwners: string[]): Promise<PreviewSweepResult> {
-    this.previewSweeps.push([...activeOwners])
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
+    this.previewSweeps.push(structuredClone(input))
     return { reaped: [], skipped: [] }
   }
 

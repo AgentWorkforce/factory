@@ -219,6 +219,7 @@ describe('RelayFleetClient', () => {
     const preview = {
       id: 'preview-1',
       provider: 'tailscale-serve',
+      namespace: 'factory-test',
       owner: 'AR-129:uuid:/linear/issues/129',
       service: 'factory',
       repo: 'AgentWorkforce/factory',
@@ -239,6 +240,7 @@ describe('RelayFleetClient', () => {
     const fleet = createClient(messaging)
 
     const reference = await fleet.createPreview({
+      namespace: preview.namespace,
       owner: preview.owner,
       issueKey: 'AR-129',
       service: preview.service,
@@ -254,6 +256,7 @@ describe('RelayFleetClient', () => {
       repo: preview.repo,
       input: {
         operation: 'start',
+        namespace: preview.namespace,
         owner: preview.owner,
         issueKey: 'AR-129',
         service: preview.service,
@@ -299,6 +302,7 @@ describe('RelayFleetClient', () => {
         reaped: [{
           id: 'preview-orphan',
           provider: 'tailscale-serve',
+          namespace: 'factory-test',
           owner: 'owner-orphan',
           service: 'factory',
           repo: 'AgentWorkforce/factory',
@@ -314,14 +318,17 @@ describe('RelayFleetClient', () => {
     }])
     const fleet = createClient(messaging)
 
-    await expect(fleet.reapPreviews(['owner-active'])).resolves.toMatchObject({
+    await expect(fleet.reapPreviews({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+    })).resolves.toMatchObject({
       reaped: [{ id: 'preview-orphan', node: 'mac-mini' }],
       skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch', node: 'mac-mini' }],
     })
     expect(messaging.placements).toEqual([expect.objectContaining({
       capability: 'preview:tailscale-serve',
       node: 'mac-mini',
-      input: { operation: 'sweep', activeOwners: ['owner-active'] },
+      input: { operation: 'sweep', namespace: 'factory-test', activeOwners: ['owner-active'] },
     })])
   })
 
@@ -542,6 +549,20 @@ describe('RelayFleetClient', () => {
     fleet.hydrateTracked([{ name: 'ar-9-impl', invocationId: 'inv-9', node: 'mac-mini' }])
 
     expect(fleet.trackedAgents().get('ar-9-impl')).toMatchObject({ invocationId: 'inv-9', node: 'mac-mini' })
+  })
+
+  it('forgets a terminal tracked agent before an intentional replacement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([{ name: 'ar-9-babysit', invocationId: 'inv-9' }])
+
+    fleet.markAgentTerminal('ar-9-babysit', 'babysitter-unreachable')
+    await fleet.reconcileTrackedAgents()
+
+    expect(fleet.trackedAgents().has('ar-9-babysit')).toBe(false)
+    expect(exits).toEqual([])
   })
 
   it('synthesizes exits for tracked agents that left the roster after the registration grace', async () => {

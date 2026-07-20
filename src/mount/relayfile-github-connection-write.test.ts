@@ -43,6 +43,7 @@ describe('RelayfileGithubConnectionWrite', () => {
       url: 'https://github.com/AgentWorkforce/factory/pull/85',
       headRef: 'factory/ar-85-agentworkforce-factory',
       headSha: undefined,
+      author: 'app',
     })
     expect(git).not.toHaveBeenCalled()
     expect(mount.writes).toEqual([{
@@ -93,6 +94,7 @@ describe('RelayfileGithubConnectionWrite', () => {
       url: 'https://github.com/AgentWorkforce/factory/pull/64',
       headRef: 'fix/issue-52',
       headSha: '1234567890abcdef1234567890abcdef12345678',
+      author: 'app',
     })
 
     expect(git).toHaveBeenNthCalledWith(1, ['-C', '/work/factory', 'symbolic-ref', '--short', 'HEAD'])

@@ -67,6 +67,8 @@ export interface RenderAgentTaskInput {
   previewStartCommand?: string
   /** Pre-rendered writeback instructions for connected integrations. */
   integrationInstructions?: string
+  /** Pre-rendered feature-specific verification instructions from the repository manifest. */
+  testGuidance?: string
   /** Exact branch Factory will publish after the implementer pushes it. */
   branchName?: string
   /** Factory has already attached the exact branch in an isolated local worktree. */
@@ -108,8 +110,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       'Preview access: Tailscale Serve keeps this URL inside the configured tailnet; tailnet grants/ACLs apply.',
       ...(input.role === 'implementer'
         ? [input.previewStartCommand
-            ? `Start the previewed app with \`${input.previewStartCommand}\` and keep it running while this issue is in flight.`
+            ? `Start the previewed app with \`${input.previewStartCommand}\`, make it listen on local port ${input.previewTargetPort ?? '<allocated preview port>'} (for commands that honor it, set \`PORT=${input.previewTargetPort ?? '<allocated preview port>'}\`), and keep it running while this issue is in flight.`
             : `Start the app on local port ${input.previewTargetPort ?? '<configured preview port>'} and keep it running while this issue is in flight.`]
+        : []),
+      ...(input.role === 'implementer'
+        ? ['Before reporting completion, confirm the live preview URL responds and shows this issue\'s checkout.']
         : []),
     ] : []),
   ]
@@ -242,6 +247,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         standaloneFinishLine,
         standaloneMergePolicy,
         ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
+        ...(input.testGuidance ? ['', input.testGuidance] : []),
       ].join('\n')
     }
     return [
@@ -272,6 +278,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       mergePolicyLine(input.config.mergePolicy),
       ...questionInstructions,
       ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
+      ...(input.testGuidance ? ['', input.testGuidance] : []),
     ].join('\n')
   }
 
@@ -288,12 +295,16 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ...questionInstructions,
       '',
       `Read the PR diff via ${mountRoot}/github/repos.`,
+      'Before approving, run `npx --no-install factory featuremap check --base <PR-base-ref>` from the repository root when `.agentworkforce/features/manifest.yaml` is present. Fetch the PR base ref first if needed. A manifest validation failure or an unavailable checker for a present manifest blocks approval.',
+      'The feature-map check may report advisory location-drift entries when changed code is still covered by unchanged manifest metadata. Re-confirm each flagged description and verify_tier against the diff; request a manifest update when either is stale.',
       'Post review comments via the GitHub writeback path.',
+      'Check whether the implementation changed or introduced a feature that is missing or stale in `.agentworkforce/features/manifest.yaml`; if so, update the manifest in this same PR so it follows the normal review and merge gate.',
       'DM the implementer with specific feedback if changes needed, or approve if good.',
       ...lifecycleInstructions(input, 'completed'),
       'Do NOT auto-merge.',
       mergePolicyLine(input.config.mergePolicy),
       ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
+      ...(input.testGuidance ? ['', input.testGuidance] : []),
     ].join('\n')
   }
 
@@ -301,6 +312,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ...common,
     ...questionInstructions,
     ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
+    ...(input.testGuidance ? ['', input.testGuidance] : []),
   ].join('\n')
 }
 

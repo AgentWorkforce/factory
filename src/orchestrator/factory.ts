@@ -15,8 +15,10 @@ import type {
   ChangeEvent,
   FleetClient,
   FactoryEventReporter,
+  GithubConnectionWrite,
   GithubIssueStatus,
   GithubPublishPullRequestResult,
+  GithubRead,
   GithubWriteback,
   LinearWriteback,
   MountClient,
@@ -34,6 +36,7 @@ import type {
   GithubIssueCommentWatchPending,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
+  ConversationSessionState,
   StateStore,
   WaitingClarification,
 } from '../ports/state'
@@ -54,6 +57,7 @@ import {
   renderAgentTask,
   type GithubHumanInputRequest,
 } from '../dispatch/templates'
+import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
 import type {
@@ -78,8 +82,23 @@ import type {
   TriageEngine,
 } from '../types'
 import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
+import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
-import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
+import {
+  type DependencyAdmission,
+  type InFlightIssue,
+  issueKey,
+  type ParkedIssue,
+  type TrackedAgent,
+} from './batch-tracker'
+import {
+  dependencyIdentity,
+  findDependencyCycle,
+  parseBlockedBy,
+  resolveDependency,
+  type ResolvedDependency,
+} from './dependencies'
+import { CoalescedTaskQueue } from './coalesced-task-queue'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
 import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
@@ -107,6 +126,8 @@ type ResolvedIssuePr = {
 }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
+type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullRequest'>
+type GithubPullRequestIdentity = 'app' | 'user'
 type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
@@ -145,17 +166,11 @@ type BabysitterWakeState = {
   // Set once the unreachable escalation warning has been emitted, so the
   // slow-cadence backoff does not re-log on every subsequent retry.
   unreachableEscalated?: boolean
+  // Do not repeatedly tear down and resume the same unreachable session while
+  // Relaycast registration is still converging after an automatic recovery.
+  unreachableRecoveryAfterMs?: number
 }
 type IssueSource = 'linear' | 'github'
-type SlackReply = {
-  channelDir: string
-  threadTs: string
-  messageTs: string
-  text: string
-  isThreadReply: boolean
-  isBot: boolean
-  raw: Record<string, unknown>
-}
 type AgentQuestion = {
   agentName: string
   issueKey?: string
@@ -269,7 +284,11 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
+const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
+const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
+const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
+const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
@@ -283,6 +302,8 @@ const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
+
+class DispatchLifecycleCapacityError extends Error {}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -299,7 +320,9 @@ export class FactoryLoop implements Factory {
   readonly #fleet: FleetClient
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
+  readonly #github: GithubRead
   readonly #githubWriteback: GithubWriteback
+  readonly #githubWritebackProvided: boolean
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
   readonly #probeCloser: ProbeCloser
@@ -316,6 +339,7 @@ export class FactoryLoop implements Factory {
   readonly #terminationGraceMs: number | undefined
   readonly #babysitterWakeUnreachableEscalateMs: number
   readonly #babysitterWakeUnreachableRetryMs: number
+  readonly #startupAgentExitDrainTimeoutMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -329,6 +353,8 @@ export class FactoryLoop implements Factory {
   readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
+  readonly #slackConversationTurns: CoalescedTaskQueue<string>
+  readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
@@ -350,6 +376,13 @@ export class FactoryLoop implements Factory {
   // issue (or the comment writeback's own change event) does not re-post the
   // same notice every cycle. Cleared once the issue dispatches successfully.
   readonly #labelDispatchFailures = new Map<string, string>()
+  // Provider snapshots loaded during discovery, keyed by collision-safe
+  // owner/repo#number identity. GitHub-native records outrank Linear mirrors.
+  readonly #dependencyIssues = new Map<string, { issue: LinearIssue; rank: number }>()
+  readonly #terminalDependencyIdentities = new Set<string>()
+  readonly #dependencyParkNotices = new Map<string, string>()
+  #dependencyGithubPathsByIdentity?: Map<string, string>
+  #dependencyLinearTreeLoaded = false
   readonly #pendingSlackClarifications = new Map<string, string>()
   readonly #pendingGithubClarifications = new Map<string, string>()
   readonly #clarificationIntents = new Map<string, number>()
@@ -362,6 +395,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -453,9 +487,10 @@ export class FactoryLoop implements Factory {
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
       safety: config.safety,
     })
+    this.#githubWritebackProvided = Boolean(ports.githubWriteback)
     this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
-    void (ports.github ?? MountGithubRead(ports.mount))
+    this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
@@ -474,6 +509,7 @@ export class FactoryLoop implements Factory {
     this.#terminationGraceMs = ports.terminationGraceMs
     this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
+    this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -485,6 +521,19 @@ export class FactoryLoop implements Factory {
     this.#batchReady = this.#state.getBatch(this.#workspaceId).then((batch) => {
       this.#batchView = batch
       return batch
+    })
+    this.#slackConversationTurns = new CoalescedTaskQueue({
+      delayMs: config.slack?.conversationCoalesceMs ?? 750,
+      run: async (conversationId) => this.#resumeSlackConversationTurn(conversationId),
+      onError: (error, conversationId) => {
+        this.#logger.warn?.('[factory] Slack conversation turn failed', {
+          conversationId,
+          error: describeError(error).errorMessage,
+        })
+        if (!this.#stopping) {
+          this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+        }
+      },
     })
     this.#wireFleetEvents()
   }
@@ -666,7 +715,12 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
-      await this.#restoreBabysitterOwnership()
+      if (this.#config.babysitter.enabled) {
+        // Re-run the idempotent receipt fold after adoption returns. This
+        // catches records restored by lifecycle work that completed while the
+        // startup roster drain was in progress.
+        await this.#reconcileRestoredBabysitterReceipts()
+      }
       await this.#reapPreviewOrphans()
     } catch (error) {
       this.#startupAgentAdoptionActive = false
@@ -744,6 +798,12 @@ export class FactoryLoop implements Factory {
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
+      // Relinquish durable ownership before waiting on mount-backed lifecycle
+      // drives. A slow Relayfile scan must not consume the shutdown deadline
+      // while every issue remains fenced to a publisher that is already
+      // stopping. The owner/epoch fence makes any late completion from those
+      // drives harmless; a second sweep below catches claims racing this one.
+      await this.#releaseOwnedDispatchLifecycleLeases()
       await Promise.allSettled([...this.#dispatchLifecycleDrives])
       // Fence every source of new clarification work before touching the fleet.
       // A wake already past the fence is allowed to unwind, and is awaited
@@ -766,15 +826,7 @@ export class FactoryLoop implements Factory {
       // non-durable (local/internal) records; terminal completion performs the
       // normal remote release before clearing the lifecycle.
       await this.#releaseInFlightAgents('factory-stopped', { preserveDurable: true })
-      for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
-        await this.#state.releaseDispatchLifecycleLease(
-          this.#workspaceId,
-          key,
-          this.#dispatchLifecycleOwner,
-          epoch,
-        )
-      }
-      this.#dispatchLifecycleEpochs.clear()
+      await this.#releaseOwnedDispatchLifecycleLeases()
       if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
       this.#livePollTimer = undefined
       this.#livePollInFlight = false
@@ -801,6 +853,7 @@ export class FactoryLoop implements Factory {
       this.#offAgentMessage?.()
       this.#offAgentLifecycleSignal?.()
       await Promise.allSettled([...this.#agentLifecycleSignalsInFlight.values()])
+      await this.#slackConversationTurns.stop()
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
       this.#offAgentMessage = undefined
@@ -808,6 +861,20 @@ export class FactoryLoop implements Factory {
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
+    }
+  }
+
+  async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
+    for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+      await this.#state.releaseDispatchLifecycleLease(
+        this.#workspaceId,
+        key,
+        this.#dispatchLifecycleOwner,
+        epoch,
+      )
+      if (this.#dispatchLifecycleEpochs.get(key) === epoch) {
+        this.#dispatchLifecycleEpochs.delete(key)
+      }
     }
   }
 
@@ -1487,6 +1554,13 @@ export class FactoryLoop implements Factory {
     this.#logger.info?.('[factory] run-once started', { dryRun })
     let report: IterationReport | undefined
     try {
+      this.#dependencyIssues.clear()
+      // Terminal observations are only a live-cycle cache. Rebuild them from
+      // current provider snapshots (or merged PR metadata) so a reopened issue
+      // cannot remain permanently resolved after an earlier close event.
+      this.#terminalDependencyIdentities.clear()
+      this.#dependencyGithubPathsByIdentity = undefined
+      this.#dependencyLinearTreeLoaded = false
       const issueSource = await this.#issueSource()
       if (issueSource === 'linear') {
         await this.#ingestGithubIssues({ dryRun })
@@ -1618,7 +1692,12 @@ export class FactoryLoop implements Factory {
             continue
           }
           if (result.agents.length === 0 && !dryRun) {
-            skipped.push({ issue: decision.issue, reason: 'queued or escalated' })
+            const reason = result.hold?.kind === 'dependency-cycle'
+              ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
+              : result.hold?.kind === 'dependency'
+                ? `parked on dependencies: ${result.hold.blockers?.join(', ') ?? 'unresolved dependency'}`
+                : 'queued or escalated'
+            skipped.push({ issue: decision.issue, reason })
           } else {
             dispatched.push(result)
           }
@@ -1973,6 +2052,7 @@ export class FactoryLoop implements Factory {
       url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
       path: pr.path,
       headRef,
+      authoritative: true,
     })
     const babysitter = [...record.agents.values()].find((tracked) => tracked.spec.role === 'babysitter')
     if (!babysitter) {
@@ -2275,6 +2355,25 @@ export class FactoryLoop implements Factory {
       this.#recordTriageEscalation(dispatchDecision, escalationReason)
       return replayedResult ?? { issue: dispatchDecision.issue, agents: [], dryRun }
     }
+    const dependencyAdmission = await this.#dependencyAdmission(liveIssue, dispatchDecision)
+    if (dependencyAdmission.blockers.length > 0 || dependencyAdmission.cycle) {
+      batch.queue(dispatchDecision, dryRun, dependencyAdmission)
+      const parked = batch.getParked(dispatchDecision.issue)
+      if (!parked) throw new Error(`dependency admission failed to park ${dispatchDecision.issue.key}`)
+      const comment = await this.#reportDependencyPark(liveIssue, parked, dryRun)
+      return {
+        issue: dispatchDecision.issue,
+        agents: [],
+        comments: [comment],
+        dryRun,
+        hold: {
+          kind: parked.cycle ? 'dependency-cycle' : 'dependency',
+          blockers: parked.blockers.map((blocker) => blocker.label),
+          cycle: parked.cycle ? [...parked.cycle] : undefined,
+        },
+      }
+    }
+    this.#clearDependencyPark(batch, dispatchDecision.issue)
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
@@ -2305,7 +2404,12 @@ export class FactoryLoop implements Factory {
         this.#scheduleDispatchLifecycleRetry(queuedRecord)
         this.#increment('queued')
         this.#emit('issue-queued', { issue: dispatchDecision.issue })
-        return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
+        return lifecycleClaim.lifecycle.result ?? {
+          issue: dispatchDecision.issue,
+          agents: [],
+          dryRun,
+          hold: { kind: 'capacity' },
+        }
       }
       if (!lifecycleClaim.created) {
         const restored = batch.restore(inFlightRecordFromLifecycle(lifecycleClaim.lifecycle))
@@ -2314,7 +2418,7 @@ export class FactoryLoop implements Factory {
     }
     if (!durableDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
-    const record = batch.start(dispatchDecision, dryRun)
+    const record = batch.start(dispatchDecision, dryRun, dependencyAdmission)
     if (!record) {
       if (!dryRun) {
         await this.#teardownPreviewReferences(dispatchSpecs(dispatchDecision).map((spec) => spec.preview))
@@ -2323,7 +2427,7 @@ export class FactoryLoop implements Factory {
       await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
-      return { issue: dispatchDecision.issue, agents: [], dryRun }
+      return { issue: dispatchDecision.issue, agents: [], dryRun, hold: { kind: 'capacity' } }
     }
 
     if (record.result) {
@@ -2480,6 +2584,12 @@ export class FactoryLoop implements Factory {
     return {
       inFlight: batch?.inFlight.map((record) => record.issue) ?? [],
       queued: batch?.queued.map((queued) => queued.issue) ?? [],
+      parked: batch?.parked.map((parked) => ({
+        issue: parked.issue,
+        blockers: parked.blockers.map((blocker) => blocker.label),
+        cycle: parked.cycle ? [...parked.cycle] : undefined,
+        capacityBlocked: parked.capacityBlocked,
+      })) ?? [],
       counters: { ...this.#counters },
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
@@ -2618,6 +2728,14 @@ export class FactoryLoop implements Factory {
       if (agents.length > 0 && this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(agents)
       }
+      if (this.#config.babysitter.enabled) {
+        // Restore and reconcile exact PR ownership before asking the fleet to
+        // report missing agents. Otherwise a stale weak-match babysitter from
+        // the lifecycle can be resumed before its independently durable,
+        // metadata-validated replacement session becomes authoritative.
+        await this.#restoreBabysitterOwnership()
+        await this.#reconcileRestoredBabysitterReceipts()
+      }
       this.#scheduleDispatchLifecycleRenewal()
       if (this.#fleet.hydrateTracked) {
         this.#startupAgentAdoptionActive = false
@@ -2632,22 +2750,51 @@ export class FactoryLoop implements Factory {
         // but recovery work is asynchronous (issue reads, worktree restore,
         // PR publication). Finish exits discovered by the startup reconcile
         // before the full ready-issue backfill can monopolize mount I/O.
-        await this.#drainAgentExitsInFlight(new Set(agents.map((agent) => agent.name)))
-        this.#logger.info?.('[factory] durable startup reconciled exits drained')
+        const exitNames = new Set(agents.map((agent) => agent.name))
+        const drained = await this.#drainAgentExitsInFlight(
+          exitNames,
+          this.#startMode === 'live' ? this.#startupAgentExitDrainTimeoutMs : undefined,
+        )
+        if (drained) {
+          this.#logger.info?.('[factory] durable startup reconciled exits drained')
+        } else {
+          this.#increment('startupAgentExitDrainTimeouts')
+          this.#logger.warn?.('[factory] startup agent exit reconciliation is still running; continuing ready-issue discovery', {
+            timeoutMs: this.#startupAgentExitDrainTimeoutMs,
+            pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => exitNames.has(name)),
+          })
+        }
       }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
   }
 
-  async #drainAgentExitsInFlight(names?: ReadonlySet<string>): Promise<void> {
-    for (;;) {
-      const pending = [...this.#agentExitsInFlight]
-        .filter(([name]) => !names || names.has(name))
-        .map(([, handling]) => handling)
-      if (pending.length === 0) return
-      await Promise.allSettled(pending)
+  async #drainAgentExitsInFlight(names?: ReadonlySet<string>, timeoutMs?: number): Promise<boolean> {
+    const drain = async (): Promise<void> => {
+      for (;;) {
+        const pending = [...this.#agentExitsInFlight]
+          .filter(([name]) => !names || names.has(name))
+          .map(([, handling]) => handling)
+        if (pending.length === 0) return
+        await Promise.allSettled(pending)
+      }
     }
+    if (timeoutMs === undefined) {
+      await drain()
+      return true
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const completed = await Promise.race([
+      drain().then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs))
+        timer.unref?.()
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    return completed
   }
 
   #scheduleDispatchLifecycleRenewal(): void {
@@ -2841,7 +2988,7 @@ export class FactoryLoop implements Factory {
     }
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     const pullRequests = mergePublishedPullRequests(previous, pullRequest)
-    const primaryPullRequest = previous?.pullRequest ?? pullRequest ?? pullRequests[0]
+    const primaryPullRequest = primaryPublishedPullRequest(previous, pullRequest, pullRequests)
     const lifecycle = lifecycleFromInFlightRecord(
       record,
       previous?.runId ?? randomUUID(),
@@ -2903,11 +3050,26 @@ export class FactoryLoop implements Factory {
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
       const drive = this.#driveDispatchLifecycle(key)
+        .then(() => {
+          this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+        })
         .catch((error) => {
-          this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
-            issue: record.issue.key,
-            error: describeError(error).errorMessage,
-          })
+          if (error instanceof DispatchLifecycleCapacityError) {
+            if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
+              this.#dispatchLifecycleCapacityWaitLogged.add(key)
+              this.#increment('dispatchLifecycleCapacityWaits')
+              this.#logger.warn?.('[factory] durable dispatch is queued for batch capacity; retries remain active', {
+                issue: record.issue.key,
+                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
+              })
+            }
+          } else {
+            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
+              issue: record.issue.key,
+              error: describeError(error).errorMessage,
+            })
+          }
           this.#scheduleDispatchLifecycleRetry(record)
         })
         .finally(() => this.#dispatchLifecycleDrives.delete(drive))
@@ -2969,6 +3131,18 @@ export class FactoryLoop implements Factory {
       acquiredNow = true
     }
     if (lifecycle.phase === 'queued') {
+      const liveIssue = await this.#readIssue(lifecycle.issue.path)
+      if (liveIssue) {
+        const dependencyAdmission = await this.#dependencyAdmission(liveIssue, lifecycle.decision)
+        const batch = await this.#batch()
+        if (dependencyAdmission.blockers.length > 0 || dependencyAdmission.cycle) {
+          batch.queue(lifecycle.decision, lifecycle.dryRun, dependencyAdmission)
+          const parked = batch.getParked(lifecycle.issue)
+          if (parked) await this.#reportDependencyPark(liveIssue, parked, lifecycle.dryRun)
+          return
+        }
+        this.#clearDependencyPark(batch, lifecycle.issue)
+      }
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined || !await this.#state.promoteDispatchLifecycle(
         this.#workspaceId,
@@ -2977,7 +3151,9 @@ export class FactoryLoop implements Factory {
         epoch,
         this.#clock.now(),
       )) {
-        throw new Error(`durable dispatch ${lifecycle.issue.key} is waiting for batch capacity`)
+        throw new DispatchLifecycleCapacityError(
+          `durable dispatch ${lifecycle.issue.key} is waiting for batch capacity`,
+        )
       }
       const promoted = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
       if (!promoted || promoted.phase !== 'dispatching') {
@@ -3010,6 +3186,7 @@ export class FactoryLoop implements Factory {
         })))
         await this.#fleet.reconcileTrackedAgents?.()
       }
+      if (this.#config.babysitter.enabled) await this.#reconcileRestoredBabysitterReceipts(record)
       return
     }
 
@@ -3043,6 +3220,7 @@ export class FactoryLoop implements Factory {
             prNumber: receipt.number,
             url: receipt.url,
             headRef: receipt.headRef,
+            authoritative: true,
           })
         }
         return
@@ -3057,6 +3235,7 @@ export class FactoryLoop implements Factory {
           prNumber: receipt.number,
           url: receipt.url,
           headRef: receipt.headRef,
+          authoritative: true,
         })
       }
       return
@@ -3107,14 +3286,23 @@ export class FactoryLoop implements Factory {
         await this.#linear.setState(issue, this.#states.idFor(issue.team, 'agentImplementing'))
       }
     }
+    const recoveredPreviews = uniquePreviewReferences([
+      ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+      ...[...record.agents.values()].map((tracked) => tracked.spec.preview),
+    ])
     record.result ??= {
       issue: record.issue,
       agents,
       comments: [dispatchComment(record.decision, agents)],
+      ...(recoveredPreviews.length > 0 ? { previews: recoveredPreviews } : {}),
       dryRun: record.dryRun,
+    }
+    if (recoveredPreviews.length > 0 && !record.result.previews?.length) {
+      record.result = { ...record.result, previews: recoveredPreviews }
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
     if (!record.dryRun) {
+      await this.#ensureSlackDispatchThread(record, record.result)
       for (const tracked of record.agents.values()) {
         const owned = tracked.spec.ownedPullRequest
         if (tracked.spec.role !== 'babysitter' || !owned) continue
@@ -3196,6 +3384,15 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
     const releaseKey = issueKey(record.issue)
+    // Terminal writeback has already been acknowledged before this method is
+    // entered. Remove externally reachable routes first so a stuck agent
+    // release cannot leave a preview live after Human Review or Done.
+    try {
+      await this.#teardownPreviews(record)
+    } catch {
+      this.#scheduleReleaseRetry(record, reason)
+      return false
+    }
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, releaseKey)
     const released = new Set(lifecycle?.agents
       .filter((agent) => agent.releasedAtMs !== undefined)
@@ -3219,12 +3416,6 @@ export class FactoryLoop implements Factory {
     await this.#writeInFlightRegistry()
     if (failed.length > 0) {
       this.#increment('dispatchLifecycleReleaseRetries')
-      this.#scheduleReleaseRetry(record, reason)
-      return false
-    }
-    try {
-      await this.#teardownPreviews(record)
-    } catch {
       this.#scheduleReleaseRetry(record, reason)
       return false
     }
@@ -3306,6 +3497,9 @@ export class FactoryLoop implements Factory {
       if (issue && !isGithubIssue(issue)) {
         await this.#recordCanonicalIssueState(issue)
       }
+      if (issue && this.#dependencyIssueIsTerminal(issue)) {
+        await this.#markDependencyTerminalAndReconcile(issue)
+      }
       if (!issue || !this.#isIssueReady(issue)) {
         return
       }
@@ -3341,13 +3535,7 @@ export class FactoryLoop implements Factory {
         return
       }
 
-      if (batch.canStart()) {
-        await this.dispatch(escalationDecision, { dryRun: this.#config.dryRun, labelsValidated: routed.ok })
-      } else {
-        if (batch.queue(escalationDecision, this.#config.dryRun)) {
-          this.#emit('issue-queued', { issue: escalationDecision.issue })
-        }
-      }
+      await this.dispatch(escalationDecision, { dryRun: this.#config.dryRun, labelsValidated: routed.ok })
     } catch (error) {
       if (error instanceof LiveDispatchStateChangedError) {
         this.#logger.info?.('[factory] ignored issue event whose live state changed during dispatch', {
@@ -3496,36 +3684,52 @@ export class FactoryLoop implements Factory {
   async #githubIssuePaths(): Promise<string[]> {
     try {
       const issuePaths = new Map<string, string>()
-      for (const root of githubIssueScanRoots(this.#config)) {
-        const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
-        for (let index = 0; index < paths.length; index += 1) {
-          const path = paths[index]!
-          const parts = githubIssuePathParts(path)
-          if (parts) {
-            const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
-            const existing = issuePaths.get(identity)
-            if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
-              if (existing) this.#increment('githubIssueAliasPathsSuppressed')
-              issuePaths.set(identity, path)
-            } else {
-              this.#increment('githubIssueAliasPathsSuppressed')
-            }
-          } else if (githubIssueDirectoryPathParts(path) !== undefined) {
-            // listTree returns the issue directory entry alongside its
-            // meta.json file; githubIssuePathParts() already collected the
-            // file, so skip the directory to avoid reading the same issue
-            // twice in one backfill pass. Directory paths are only meaningful
-            // for live change events, not the tree scan.
-            continue
-          } else if (isGithubIssueTreePath(path)) {
-            this.#increment('githubIssuesIgnoredByPathRegex')
-          }
-          if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
-            await this.#refreshLiveHeartbeatIfDue()
-            await liveEventYield()
-          }
+      for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+        const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
+        const roots = githubIssueRepoRoots(owner, repo)
+        // Keep the fallback roots as separate batches. Flattening a very large
+        // provider result is synchronous work and can starve the durable loop
+        // heartbeat before the bounded scan below gets a chance to yield.
+        const pathBatches = indexedPaths
+          ? [indexedPaths]
+          : await Promise.all(
+            roots.map(async (root) => await this.#listRelayfileTree(root, 'GitHub issue ingestion')),
+          )
+        if (indexedPaths) {
+          this.#increment('githubIssueIndexReposUsed')
+        } else {
+          this.#increment('githubIssueIndexFallbacks')
         }
-        await this.#refreshLiveHeartbeatIfDue()
+        for (const paths of pathBatches) {
+          for (let index = 0; index < paths.length; index += 1) {
+            const path = paths[index]!
+            const parts = githubIssuePathParts(path)
+            if (parts) {
+              const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+              const existing = issuePaths.get(identity)
+              if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
+                if (existing) this.#increment('githubIssueAliasPathsSuppressed')
+                issuePaths.set(identity, path)
+              } else {
+                this.#increment('githubIssueAliasPathsSuppressed')
+              }
+            } else if (githubIssueDirectoryPathParts(path) !== undefined) {
+              // listTree returns the issue directory entry alongside its
+              // meta.json file; githubIssuePathParts() already collected the
+              // file, so skip the directory to avoid reading the same issue
+              // twice in one backfill pass. Directory paths are only meaningful
+              // for live change events, not the tree scan.
+              continue
+            } else if (isGithubIssueTreePath(path)) {
+              this.#increment('githubIssuesIgnoredByPathRegex')
+            }
+            if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+              await this.#refreshLiveHeartbeatIfDue()
+              await liveEventYield()
+            }
+          }
+          await this.#refreshLiveHeartbeatIfDue()
+        }
       }
       for (const [identity, path] of issuePaths) {
         this.#githubIssuePreferredPaths.set(identity, path)
@@ -3538,6 +3742,40 @@ export class FactoryLoop implements Factory {
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
       return []
     }
+  }
+
+  async #githubIssuePathsFromIndex(owner: string, repo: string): Promise<string[] | undefined> {
+    const indexPath = `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues/_index.json`
+    let parsed: unknown
+    try {
+      const { content } = await this.#readRelayfileFile(indexPath, 'GitHub issue index discovery')
+      parsed = parseJsonContent(content)
+    } catch {
+      return undefined
+    }
+    if (!Array.isArray(parsed)) return undefined
+
+    const requiredLabel = this.#config.safety.requireLabel.trim().toLowerCase()
+    if (!requiredLabel) return undefined
+    const paths: string[] = []
+    for (const entry of parsed) {
+      const row = asRecord(entry)
+      const number = row?.number
+      const state = typeof row?.state === 'string' ? row.state.trim().toLowerCase() : undefined
+      const labels = row?.labels
+      // Labels were added to the public GitHub issue index contract after the
+      // first index version. Fall back for the entire repository if any row is
+      // legacy or malformed so an eligible issue can never be filtered out.
+      if (!Number.isSafeInteger(number) || Number(number) <= 0 || !state || !Array.isArray(labels) ||
+        !labels.every((label) => typeof label === 'string')) {
+        return undefined
+      }
+      if (state !== 'open' || !labels.some((label) => label.trim().toLowerCase() === requiredLabel)) {
+        continue
+      }
+      paths.push(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`)
+    }
+    return paths
   }
 
   async #handleGithubIssueChange(
@@ -3554,14 +3792,19 @@ export class FactoryLoop implements Factory {
         return
       }
 
+      const closed = githubIssueIsClosed(ghIssue)
+      if (closed) {
+        await this.#markDependencyTerminalAndReconcile(githubIssueAsFactoryIssue(ghIssue))
+      }
+
       if (await this.#issueSource() === 'github') {
-        if (!githubIssueIsClosed(ghIssue) && githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
+        if (!closed && githubIssueHasFactoryLabel(ghIssue, this.#config.safety.requireLabel)) {
           await this.#handleChange(ghIssue.path)
         }
         return
       }
 
-      if (githubIssueIsClosed(ghIssue)) {
+      if (closed) {
         const mirror = await this.#findGithubIssueMirror(ghIssue, opts.candidates)
         if (mirror && !this.#states.isRole(mirror.stateId, 'done')) {
           if (!opts.dryRun) {
@@ -3622,7 +3865,9 @@ export class FactoryLoop implements Factory {
       for (const candidatePath of candidatePaths) {
         try {
           const { content } = await this.#readRelayfileFile(candidatePath, 'GitHub issue ingestion')
-          return parseGithubIssue(candidatePath, content)
+          const githubIssue = parseGithubIssue(candidatePath, content)
+          this.#indexDependencyIssue(githubIssueAsFactoryIssue(githubIssue))
+          return githubIssue
         } catch (error) {
           if (isMissingIssueFileError(error) && candidatePath !== candidatePaths.at(-1)) {
             continue
@@ -3714,6 +3959,249 @@ export class FactoryLoop implements Factory {
         return configured === fullName || configured === bareName
       })
     return entry?.[0]
+  }
+
+  #indexDependencyIssue(issue: LinearIssue | undefined): void {
+    if (!issue) return
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    const identity = dependencyIdentityForIssue(issue, repo)
+    if (!identity) return
+    const rank = isGithubIssueFilePath(issue.path) ? 2 : 1
+    const existing = this.#dependencyIssues.get(identity)
+    if (!existing || rank >= existing.rank) {
+      this.#dependencyIssues.set(identity, { issue, rank })
+      if (this.#dependencyIssueIsTerminal(issue)) {
+        this.#terminalDependencyIdentities.add(identity)
+      } else {
+        this.#terminalDependencyIdentities.delete(identity)
+      }
+    }
+  }
+
+  async #dependencyAdmission(issue: LinearIssue, decision: TriageDecision): Promise<DependencyAdmission> {
+    const declared = parseBlockedBy(issue.description)
+    if (declared.length === 0) return { blockers: [] }
+
+    const currentRepo = dependencyRepoForIssue(issue, decision, this.#config)
+    const resolved = declared
+      .map((dependency) => resolveDependency(dependency, currentRepo))
+      .filter((dependency): dependency is ResolvedDependency => Boolean(dependency))
+    await this.#loadMissingDependencyIssues(resolved.map((dependency) => dependency.identity))
+    const resolvedTerminal = new Set<string>()
+    for (const dependency of resolved) {
+      if (await this.#dependencyIsTerminalOrMerged(dependency.identity)) {
+        resolvedTerminal.add(dependency.identity)
+      }
+    }
+
+    const blockers = resolved
+      .filter((dependency) => !resolvedTerminal.has(dependency.identity))
+      .map((dependency) => {
+        const blocker = this.#dependencyIssues.get(dependency.identity)?.issue
+        return {
+          identity: dependency.identity,
+          key: blocker ? issueKey(issueRef(blocker)) : dependency.identity,
+          label: dependency.label,
+        }
+      })
+
+    // A bare #N without a resolvable single repository is itself unresolved.
+    // Keep it visible and fail closed instead of guessing among routes.
+    for (const dependency of declared) {
+      if (dependency.repo || currentRepo) continue
+      blockers.push({
+        identity: `unresolved:${issueKey(decision.issue)}:${dependency.raw}`,
+        key: `unresolved:${dependency.raw}`,
+        label: `${dependency.raw} (repository unresolved)`,
+      })
+    }
+
+    const currentIdentity = dependencyIdentityForIssue(issue, currentRepo)
+    const cycle = currentIdentity
+      ? findDependencyCycle(currentIdentity, this.#dependencyGraph())
+      : undefined
+    return { blockers, cycle }
+  }
+
+  async #loadMissingDependencyIssues(identities: string[]): Promise<void> {
+    const pending = [...new Set(identities)]
+    const expanded = new Set<string>()
+
+    while (pending.length > 0) {
+      const identity = pending.shift()!
+      if (expanded.has(identity)) continue
+      expanded.add(identity)
+
+      if (!this.#dependencyIssues.has(identity)) {
+        // Startup discovery may use the ready-only GitHub issue index. A
+        // blocker is often closed, in progress, or deliberately unlabeled, so
+        // probe its stable by-id aliases directly before consulting that
+        // filtered discovery set.
+        const separator = identity.lastIndexOf('#')
+        const repoIdentity = identity.slice(0, separator)
+        const number = Number(identity.slice(separator + 1))
+        const configuredRepo = configuredGithubRepoParts(this.#config)
+          .find(({ owner, repo }) => `${owner}/${repo}`.toLowerCase() === repoIdentity)
+        if (configuredRepo && Number.isSafeInteger(number) && number > 0) {
+          const { owner, repo } = configuredRepo
+          for (const path of [
+            `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`,
+            `${GITHUB_ISSUE_ROOT}/${owner}/${repo}/issues/by-id/${number}.json`,
+          ]) {
+            await this.#readIssue(path)
+            if (this.#dependencyIssues.has(identity)) break
+          }
+        }
+      }
+
+      if (!this.#dependencyIssues.has(identity)) {
+        if (!this.#dependencyGithubPathsByIdentity) {
+          this.#dependencyGithubPathsByIdentity = new Map()
+          for (const path of await this.#githubIssuePaths()) {
+            const parts = githubIssuePathParts(path)
+            if (parts) {
+              this.#dependencyGithubPathsByIdentity.set(githubIssueIdentity(parts.owner, parts.repo, parts.number), path)
+            }
+          }
+        }
+        const githubPath = this.#dependencyGithubPathsByIdentity.get(identity)
+        if (githubPath) await this.#readIssue(githubPath)
+      }
+
+      if (!this.#dependencyIssues.has(identity) && !this.#dependencyLinearTreeLoaded) {
+        // Linear paths do not encode the routed repository identity, so load
+        // the tree once and let #indexDependencyIssue build the composite map.
+        // The pass-scoped flag also lets every later blocked issue reuse the
+        // resulting dependency index instead of rescanning the full tree.
+        this.#dependencyLinearTreeLoaded = true
+        for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
+          if (isIssueFilePath(path)) await this.#readIssue(path)
+        }
+      }
+
+      const blocker = this.#dependencyIssues.get(identity)?.issue
+      if (!blocker) continue
+      const repo = identity.slice(0, identity.lastIndexOf('#'))
+      for (const dependency of parseBlockedBy(blocker.description)) {
+        const resolved = resolveDependency(dependency, repo)
+        if (resolved && !expanded.has(resolved.identity)) pending.push(resolved.identity)
+      }
+    }
+  }
+
+  #clearDependencyPark(batch: BatchSnapshot, issue: IssueRef): void {
+    batch.clearPark(issue)
+    this.#dependencyParkNotices.delete(issueKey(issue))
+  }
+
+  #dependencyGraph(): Map<string, string[]> {
+    const graph = new Map<string, string[]>()
+    for (const [identity, { issue }] of this.#dependencyIssues) {
+      if (this.#dependencyIdentityIsTerminal(identity)) {
+        graph.set(identity, [])
+        continue
+      }
+      const repo = identity.slice(0, identity.lastIndexOf('#'))
+      const dependencies = parseBlockedBy(issue.description)
+        .map((dependency) => resolveDependency(dependency, repo))
+        .filter((dependency): dependency is ResolvedDependency => Boolean(dependency))
+        .filter((dependency) => !this.#dependencyIdentityIsTerminal(dependency.identity))
+        .map((dependency) => dependency.identity)
+      graph.set(identity, [...new Set(dependencies)])
+    }
+    return graph
+  }
+
+  #dependencyIdentityIsTerminal(identity: string): boolean {
+    if (this.#terminalDependencyIdentities.has(identity)) return true
+    const issue = this.#dependencyIssues.get(identity)?.issue
+    return Boolean(issue && this.#dependencyIssueIsTerminal(issue))
+  }
+
+  async #dependencyIsTerminalOrMerged(identity: string): Promise<boolean> {
+    if (this.#dependencyIdentityIsTerminal(identity)) return true
+    const issue = this.#dependencyIssues.get(identity)?.issue
+    if (!issue) return false
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    if (!repo) return false
+    const pullRequest = await resolveIssuePrFromMount(this.#mount, this.#config, issue, {
+      allowLegacyGithubBranch: true,
+      repo,
+    })
+    if (normalizePrState(pullRequest?.state) !== 'MERGED') return false
+    this.#terminalDependencyIdentities.add(identity)
+    return true
+  }
+
+  #dependencyIssueIsTerminal(issue: LinearIssue): boolean {
+    return isGithubIssue(issue)
+      ? githubFactoryIssueIsClosed(issue)
+      : this.#states.isRole(issue.stateId, 'done')
+  }
+
+  async #reportDependencyPark(issue: LinearIssue, parked: ParkedIssue, dryRun: boolean): Promise<string> {
+    const cycle = parked.cycle?.join(' -> ')
+    const blockers = parked.blockers.map((blocker) => blocker.label)
+    const signature = JSON.stringify({ blockers, cycle, capacityBlocked: parked.capacityBlocked })
+    const marker = `<!-- factory-dependency-park:${stableHash(signature)} -->`
+    const comment = parked.cycle
+      ? [
+        marker,
+        'Factory refused dispatch because it detected a dependency cycle.',
+        `Cycle: ${cycle}`,
+        blockers.length > 0 ? `Unresolved blockers: ${blockers.join(', ')}` : undefined,
+      ].filter((line): line is string => Boolean(line)).join('\n')
+      : [
+        marker,
+        'Factory parked this issue because declared dependencies are unresolved.',
+        `Blocked by: ${blockers.join(', ')}`,
+        parked.capacityBlocked ? 'Capacity is also currently unavailable.' : undefined,
+      ].filter((line): line is string => Boolean(line)).join('\n')
+
+    const key = issueKey(parked.issue)
+    if (dryRun || this.#dependencyParkNotices.get(key) === signature) return comment
+    this.#increment(parked.cycle ? 'dependencyCycles' : 'dependencyParks')
+    if (parked.cycle) {
+      this.#error(new Error(`Dependency cycle detected: ${cycle}`), parked.issue)
+    }
+    try {
+      await this.#postIssueComment(issue, comment)
+      this.#dependencyParkNotices.set(key, signature)
+    } catch (error) {
+      this.#logger.warn?.('[factory] dependency park writeback skipped', {
+        issue: parked.issue.key,
+        error: describeError(error).errorMessage,
+      })
+    }
+    return comment
+  }
+
+  async #markDependencyTerminalAndReconcile(issue: LinearIssue): Promise<void> {
+    const repo = dependencyRepoForIssue(issue, undefined, this.#config)
+    const identity = dependencyIdentityForIssue(issue, repo)
+    if (!identity) return
+    this.#indexDependencyIssue(issue)
+    // A merge event can prove terminality before the issue snapshot reflects
+    // its new state, so apply the explicit observation after indexing it.
+    this.#terminalDependencyIdentities.add(identity)
+    const batch = await this.#batch()
+    this.#clearDependencyPark(batch, issueRef(issue))
+    const candidates = batch.parked.filter((parked) =>
+      parked.blockers.some((blocker) => blocker.identity === identity),
+    )
+    for (const parked of candidates) {
+      try {
+        const liveIssue = await this.#readIssue(parked.issue.path)
+        if (!liveIssue || !this.#isIssueReady(liveIssue)) continue
+        await this.dispatch(parked.decision, { dryRun: parked.dryRun })
+      } catch (error) {
+        this.#logger.warn?.('[factory] dependency park reconciliation failed', {
+          blocker: identity,
+          issue: parked.issue.key,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
   }
 
   async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
@@ -4008,11 +4496,13 @@ export class FactoryLoop implements Factory {
       // (relayfile-adapters#205). The factory matches state by UUID, so backfill
       // the id from the name when the payload omitted it — otherwise every issue
       // reads as stateId='' and no role (incl. readyForAgent) ever matches.
+      let resolvedIssue = issue
       if (issue && !issue.stateId && issue.state?.name) {
         const backfilled = this.#states.idForName(issue.state.name, issue.team)
-        if (backfilled) return { ...issue, stateId: backfilled }
+        if (backfilled) resolvedIssue = { ...issue, stateId: backfilled }
       }
-      return issue
+      this.#indexDependencyIssue(resolvedIssue)
+      return resolvedIssue
     } catch (error) {
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
@@ -4488,7 +4978,7 @@ export class FactoryLoop implements Factory {
       if (
         exiting?.spec.role === 'implementer' &&
         !record.dryRun &&
-        (this.#mount.githubWrite || this.#mount.writebackTransport === 'relayfile-cloud')
+        this.#shouldAttemptPullRequestPublication()
       ) {
         try {
           await this.#saveDispatchLifecycle(record, 'publishing')
@@ -4513,6 +5003,7 @@ export class FactoryLoop implements Factory {
             repo: publishedPr.repo,
             prNumber: publishedPr.number,
             url: publishedPr.url,
+            authoritative: true,
           })
         } else {
           await this.#ensureBabysitterForIssue(record)
@@ -4542,8 +5033,38 @@ export class FactoryLoop implements Factory {
         })
       }
       if (hasCompletionPr) {
+        let reconciledPr: GithubPublishPullRequestResult | undefined
+        if (tracingReconciledExit && tracked.spec.role === 'implementer') {
+          // A restart can discover that the implementer is gone after its PR
+          // reached GitHub but before the durable receipt was saved. Persist the
+          // exact existing-branch receipt before handing off to a babysitter;
+          // otherwise the lifecycle remains `running` forever and consumes a
+          // batch slot even though useful implementation work has finished.
+          if (!await this.#saveDispatchLifecycle(record, 'publishing')) return
+          try {
+            reconciledPr = await this.#publishImplementerPullRequest(record, tracked, {
+              reconcileExisting: true,
+            })
+            if (reconciledPr && !await this.#saveDispatchLifecycle(record, 'published', reconciledPr)) return
+          } catch (error) {
+            this.#increment('githubPullRequestPublishFailures')
+            this.#error(error, record.issue)
+            this.#scheduleDispatchLifecycleRetry(record)
+            return
+          }
+        }
         if (this.#config.babysitter.enabled) {
-          await this.#ensureBabysitterForIssue(record)
+          if (reconciledPr) {
+            await this.#ensureBabysitter(record, {
+              repo: reconciledPr.repo,
+              prNumber: reconciledPr.number,
+              url: reconciledPr.url,
+              headRef: reconciledPr.headRef,
+              authoritative: true,
+            })
+          } else {
+            await this.#ensureBabysitterForIssue(record)
+          }
           return
         }
         if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
@@ -4569,6 +5090,7 @@ export class FactoryLoop implements Factory {
               repo: publishedPr.repo,
               prNumber: publishedPr.number,
               url: publishedPr.url,
+              authoritative: true,
             })
           } else {
             if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
@@ -4680,14 +5202,19 @@ export class FactoryLoop implements Factory {
 
   // Publish a PR from the implementer's committed branch when it exited without
   // opening one. Best-effort and idempotent: returns undefined when there is no
-  // GitHub write path, no clone, or nothing publishable (no branch / no commits
-  // ahead of base — `#publishImplementerPullRequest` refuses head==base), so the
-  // caller falls back to its normal restart/conclude handling.
+  // clone or nothing publishable (no branch / no commits ahead of base —
+  // `#publishImplementerPullRequest` refuses head==base), so the caller falls
+  // back to its normal restart/conclude handling. Explicit app identity errors
+  // remain fail-closed and propagate to the lifecycle error path.
   async #tryPublishImplementerPr(
     record: InFlightIssue,
     implementer: TrackedAgent,
   ): Promise<GithubPublishPullRequestResult | undefined> {
-    if (record.dryRun || (!implementer.spec.clonePath && !implementer.spec.branch) || !this.#mount.githubWrite) {
+    if (
+      record.dryRun ||
+      (!implementer.spec.clonePath && !implementer.spec.branch) ||
+      !this.#shouldAttemptPullRequestPublication()
+    ) {
       return undefined
     }
     try {
@@ -4706,6 +5233,7 @@ export class FactoryLoop implements Factory {
       }
       return published
     } catch (error) {
+      if (this.#config.github.identity === 'app' && !this.#mount.githubWrite) throw error
       this.#increment('exitPrPublishSkipped')
       this.#logger.warn?.('[factory] could not publish implementer PR on exit; falling back', {
         issue: record.issue.key,
@@ -4726,10 +5254,7 @@ export class FactoryLoop implements Factory {
     const cached = this.#publishedPullRequests.get(key)
     if (cached) return cached
 
-    const githubWrite = this.#mount.githubWrite
-    if (!githubWrite) {
-      throw new Error('GitHub write path not available on this mount — connect GitHub to your workspace')
-    }
+    const { identity, publisher } = this.#githubPullRequestPublisher()
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
       ? implementer.spec.branch
       : undefined
@@ -4751,8 +5276,11 @@ export class FactoryLoop implements Factory {
     const durableReceipt = publishedPullRequests(durable).find((receipt) =>
       receipt.repo.toLowerCase() === repo.toLowerCase()
     )
-    if (durableReceipt) return durableReceipt
     const expectedHeadRef = implementer.spec.branch ?? remoteBranch
+    if (
+      durableReceipt &&
+      (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
+    ) return durableReceipt
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
@@ -4768,34 +5296,76 @@ export class FactoryLoop implements Factory {
       }
     }
     const baseRef = await this.#githubDefaultBranch(repo)
-    const result = await githubWrite.publishPullRequest({
+    const result = await publisher.publishPullRequest({
       repo,
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
       baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue, implementer.spec.preview),
     })
+    const published = result.author
+      ? result
+      : { ...result, author: identity }
     if (
-      result.repo.toLowerCase() !== repo.toLowerCase() ||
-      result.headRef !== (remoteBranch ?? result.headRef) ||
-      !Number.isInteger(result.number) ||
-      result.number <= 0 ||
-      !result.url
+      published.repo.toLowerCase() !== repo.toLowerCase() ||
+      published.headRef !== (remoteBranch ?? published.headRef) ||
+      !Number.isInteger(published.number) ||
+      published.number <= 0 ||
+      !published.url
     ) {
       throw new Error(`GitHub PR publication returned an unexpected receipt for ${repo}/${remoteBranch ?? 'local HEAD'}`)
     }
     if (remoteBranch && this.#mount.writebackTransport === 'relayfile-cloud') {
-      await this.#confirmPublishedRemotePullRequest(repo, result, remoteBranch)
+      await this.#confirmPublishedRemotePullRequest(repo, published, remoteBranch)
     }
-    this.#publishedPullRequests.set(key, result)
+    this.#publishedPullRequests.set(key, published)
     this.#increment('githubPullRequestsPublished')
-    this.#logger.info?.('[factory] published PR through workspace GitHub connection', {
+    this.#logger.info?.('[factory] published PR', {
       issue: issue.key,
-      repo: result.repo,
-      prNumber: result.number,
-      url: result.url,
+      repo: published.repo,
+      prNumber: published.number,
+      url: published.url,
+      identity,
+      author: published.author,
     })
-    return result
+    return published
+  }
+
+  #githubPullRequestPublisher(): {
+    identity: GithubPullRequestIdentity
+    publisher: GithubPullRequestPublisher
+  } {
+    const configured = this.#config.github.identity
+    if (configured !== 'user' && this.#mount.githubWrite) {
+      return { identity: 'app', publisher: this.#mount.githubWrite }
+    }
+    if (configured === 'app') {
+      throw new Error(
+        'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+      )
+    }
+    const publishPullRequest = this.#githubWriteback.publishPullRequest
+    if (!publishPullRequest) {
+      throw new Error(
+        `GitHub PR identity "${configured}" requires local gh user publication, but the configured GitHub writeback does not support it`,
+      )
+    }
+    return {
+      identity: 'user',
+      publisher: { publishPullRequest: publishPullRequest.bind(this.#githubWriteback) },
+    }
+  }
+
+  #shouldAttemptPullRequestPublication(): boolean {
+    if (this.#config.github.identity !== 'auto') return true
+    if (this.#mount.githubWrite) return true
+    // Fake mounts deliberately avoid invoking the host's real gh binary unless
+    // a publisher was injected. Every production mount (cloud or custom) still
+    // gets the configured auto fallback.
+    if (this.#mount.writebackTransport === 'test') {
+      return Boolean(this.#githubWritebackProvided && this.#githubWriteback.publishPullRequest)
+    }
+    return true
   }
 
   async #openPullRequestByHead(
@@ -5220,7 +5790,17 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    this.#logger.debug?.('[factory] tracked agent resume preparation started', {
+      issue: record.issue.key,
+      name,
+      role: tracked.spec.role,
+    })
     await this.#prepareAgentWorktree(record, tracked.spec)
+    this.#logger.debug?.('[factory] tracked agent resume spawn started', {
+      issue: record.issue.key,
+      name,
+      role: tracked.spec.role,
+    })
     const result = await this.#fleet.resume({
       name,
       sessionRef: tracked.sessionRef,
@@ -5228,6 +5808,12 @@ export class FactoryLoop implements Factory {
       capability: tracked.spec.capability,
       repo: tracked.spec.repo,
       clonePath: tracked.spec.clonePath,
+    })
+    this.#logger.debug?.('[factory] tracked agent resume spawn completed', {
+      issue: record.issue.key,
+      name,
+      resumedName: result.name,
+      role: tracked.spec.role,
     })
     tracked.result = {
       ...result,
@@ -5237,32 +5823,152 @@ export class FactoryLoop implements Factory {
     tracked.sessionRef = result.sessionRef ?? tracked.sessionRef
     record.agents.delete(name)
     record.agents.set(result.name, tracked)
-    if (tracked.spec.role === 'babysitter') {
-      this.#babysitterCriticalAgents.delete(name)
-      const ownership = [...this.#babysitterPr.entries()].find(([, candidate]) => candidate.agentName === name)
-      const [ownershipKey, ref] = ownership ?? []
-      if (ref) {
-        ref.agentName = result.name
-        for (const [wakeKey, state] of this.#babysitterWakeStates) {
-          if (state.agentName !== name) continue
-          if (state.timer) clearTimeout(state.timer)
-          this.#babysitterWakeStates.delete(wakeKey)
-          state.timer = undefined
-          state.agentName = result.name
-          state.tracked = tracked
-          if (state.deferredSubmitTargets) {
-            state.deferredSubmitTargets = undefined
-            state.deliveringKinds = undefined
-            state.kinds.add('pull-request-state')
-            await this.#recordPendingBabysitterWake(state)
-          }
-          this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
-          if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
-        }
-        await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
-      }
-    }
+    await this.#retargetBabysitterAgent(record, name, tracked)
+    this.#logger.debug?.('[factory] tracked agent resume ownership retargeted', {
+      issue: record.issue.key,
+      name,
+      resumedName: result.name,
+      role: tracked.spec.role,
+    })
     await this.#reportAgent(record, tracked, 'agent.resumed')
+  }
+
+  async #retargetBabysitterAgent(
+    record: InFlightIssue,
+    previousName: string,
+    tracked: TrackedAgent,
+  ): Promise<void> {
+    if (tracked.spec.role !== 'babysitter') return
+    const currentName = tracked.result?.name ?? tracked.spec.name
+    this.#babysitterCriticalAgents.delete(previousName)
+    const ownership = [...this.#babysitterPr.entries()]
+      .find(([, candidate]) => candidate.agentName === previousName)
+    const [ownershipKey, ref] = ownership ?? []
+    if (!ref) return
+    ref.agentName = currentName
+    // Resuming a session commonly preserves its Relaycast name. Iterate a
+    // snapshot because deleting and re-inserting that same key while walking
+    // the live Map would append it to the iterator again indefinitely.
+    for (const [wakeKey, state] of [...this.#babysitterWakeStates]) {
+      if (state.agentName !== previousName) continue
+      if (state.timer) clearTimeout(state.timer)
+      this.#babysitterWakeStates.delete(wakeKey)
+      state.timer = undefined
+      state.agentName = currentName
+      state.tracked = tracked
+      if (state.deferredSubmitTargets) {
+        state.deferredSubmitTargets = undefined
+        state.deliveringKinds = undefined
+        state.kinds.add('pull-request-state')
+        await this.#recordPendingBabysitterWake(state)
+      }
+      this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
+      if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+    }
+    await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
+  }
+
+  async #recoverUnreachableBabysitter(state: BabysitterWakeState): Promise<boolean> {
+    const batch = await this.#batch()
+    const record = batch.getIssueByAgent(state.agentName)
+    const tracked = record?.agents.get(state.agentName)
+    if (!record || !tracked || tracked.spec.role !== 'babysitter') return false
+    if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) return false
+
+    const previousName = state.agentName
+    this.#fleet.markAgentTerminal?.(previousName, 'babysitter-unreachable')
+    try {
+      await this.#fleet.release(previousName, 'babysitter-unreachable')
+      this.#logger.debug?.('[factory] unreachable babysitter release completed', {
+        issue: record.issue.key,
+        babysitter: previousName,
+      })
+    } catch (error) {
+      // An unresolvable Relaycast identity is frequently already absent from
+      // placement too. Release is best-effort; the fresh spawn below is the
+      // recovery operation that matters.
+      this.#increment('babysitterUnreachableReleaseFailures')
+      this.#logger.warn?.('[factory] unreachable babysitter release failed; attempting session recovery', {
+        issue: record.issue.key,
+        babysitter: previousName,
+        error: describeError(error).errorMessage,
+      })
+    }
+
+    try {
+      const configuredCapability = this.#config.agentCapabilities.babysitter
+      const capabilityChanged = tracked.spec.capability !== configuredCapability
+      if (tracked.sessionRef && !capabilityChanged) {
+        await this.#resumeTrackedAgent(record, previousName, tracked)
+      } else {
+        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
+        const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
+        const replacementSpec = capabilityChanged
+          ? {
+              ...persistedSpec,
+              capability: configuredCapability,
+              model: this.#config.models.babysitter,
+            }
+          : persistedSpec
+        await this.#prepareAgentWorktree(record, replacementSpec)
+        const result = await this.#fleet.spawn({
+          name: replacementSpec.name,
+          capability: replacementSpec.capability,
+          node: tracked.result?.node ?? replacementSpec.node ?? 'self',
+          repo: replacementSpec.repo,
+          task: replacementSpec.task,
+          model: replacementSpec.model,
+          cwd: replacementSpec.clonePath,
+          invocationId,
+          restartPolicy: defaultRestartPolicy(replacementSpec),
+          channel: replacementSpec.channel,
+        })
+        batch.recordSpawn(record, replacementSpec, invocationId, result)
+        const restarted = record.agents.get(result.name)
+        if (!restarted) throw new Error(`Recovered babysitter ${result.name} was not tracked`)
+        await this.#retargetBabysitterAgent(record, previousName, restarted)
+        await this.#reportAgent(record, restarted, 'agent.resumed')
+        if (capabilityChanged) {
+          this.#increment('babysitterCapabilityMigrations')
+          this.#logger.info?.('[factory] cold-started unreachable babysitter on configured capability', {
+            issue: record.issue.key,
+            babysitter: result.name,
+            previousCapability: tracked.spec.capability,
+            capability: configuredCapability,
+          })
+        }
+      }
+      this.#logger.debug?.('[factory] unreachable babysitter replacement started', {
+        issue: record.issue.key,
+        previousBabysitter: previousName,
+        babysitter: state.agentName,
+      })
+      await this.#writeInFlightRegistry()
+      this.#logger.debug?.('[factory] unreachable babysitter registry refreshed', {
+        issue: record.issue.key,
+        babysitter: state.agentName,
+      })
+      if (!await this.#saveDispatchLifecycle(record, 'running')) return false
+      this.#increment('babysitterEventWakeUnreachableRecoveries')
+      this.#logger.info?.('[factory] restarted unreachable babysitter session', {
+        issue: record.issue.key,
+        repo: state.repo,
+        prNumber: state.prNumber,
+        previousBabysitter: previousName,
+        babysitter: state.agentName,
+      })
+      return true
+    } catch (error) {
+      this.#increment('babysitterEventWakeUnreachableRecoveryFailures')
+      this.#logger.warn?.('[factory] failed to restart unreachable babysitter session', {
+        issue: record.issue.key,
+        repo: state.repo,
+        prNumber: state.prNumber,
+        babysitter: previousName,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
   }
 
   async #handleDeliveryFailed(info: { to: string; msgId?: string; reason?: string }): Promise<void> {
@@ -6821,33 +7527,45 @@ export class FactoryLoop implements Factory {
     const implementerNames = decision.implementers.map((implementer) => implementer.name)
     const reviewerName = decision.reviewer.name
     const integrationInstructions = await this.#resolveIntegrationInstructions()
-    const render = (spec: AgentSpec): AgentSpec => ({
-      ...spec,
-      task: renderAgentTask({
+    const render = async (spec: AgentSpec): Promise<AgentSpec> => {
+      const route = routeForSpec(decision, spec)
+      const previewUrl = previewUrlFromSpec(spec)
+      const testGuidance = await resolveTestGuidance({
+        repoPath: route.clonePath,
         issue: templateIssue,
-        route: routeForSpec(decision, spec),
-        role: spec.role,
-        config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
-        reviewerName,
-        implementerNames,
-        integrationsMountRoot: this.#integrationsMountRoot(),
-        integrationInstructions,
-        branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
-        branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
-        agentName: spec.name,
-        ...(spec.preview ? {
-          previewUrl: spec.preview.url,
-          previewTargetPort: spec.preview.targetPort,
-          previewStartCommand: spec.preview.startCommand,
-        } : {}),
-        ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
-      }),
-    })
+        route,
+        previewUrl,
+      })
+      return {
+        ...spec,
+        task: renderAgentTask({
+          issue: templateIssue,
+          route,
+          role: spec.role,
+          config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
+          reviewerName,
+          implementerNames,
+          integrationsMountRoot: this.#integrationsMountRoot(),
+          integrationInstructions,
+          testGuidance,
+          branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
+          branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
+          agentName: spec.name,
+          ...(previewUrl ? {
+            previewUrl,
+            previewTargetPort: spec.preview?.targetPort,
+            previewStartCommand: spec.preview?.startCommand,
+          } : {}),
+          ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
+        }),
+      }
+    }
+    const rendered = await Promise.all([...decision.implementers, decision.reviewer].map(render))
 
     return {
       ...decision,
-      implementers: decision.implementers.map(render),
-      reviewer: render(decision.reviewer),
+      implementers: rendered.slice(0, decision.implementers.length),
+      reviewer: rendered[decision.implementers.length]!,
     }
   }
 
@@ -6865,6 +7583,7 @@ export class FactoryLoop implements Factory {
         const service = previewServiceForRepo(this.#config, implementer.repo)
         if (!service || byRepo.has(implementer.repo)) continue
         const preview = await this.#fleet.createPreview({
+          namespace: this.#workspaceId,
           owner,
           issueKey: decision.issue.key,
           service: service.name,
@@ -6875,9 +7594,16 @@ export class FactoryLoop implements Factory {
           node: implementer.node,
         })
         created.push(preview)
-        if (preview.access !== 'tailnet') {
-          throw new Error(`Refusing insecure preview for ${implementer.repo}: provider did not guarantee tailnet access`)
-        }
+        assertPublishablePreview(preview, {
+          namespace: this.#workspaceId,
+          owner,
+          service: service.name,
+          repo: implementer.repo,
+          targetPort: service.config.port,
+          portSpan: service.config.portSpan ?? 100,
+          preferredHttpsPort: service.config.httpsPort,
+          requireNode: this.#fleet.placementLocality === 'remote',
+        })
         byRepo.set(implementer.repo, preview)
       }
     } catch (error) {
@@ -6940,7 +7666,10 @@ export class FactoryLoop implements Factory {
         .map((lifecycle) => issueKey(lifecycle.issue)),
     )
     for (const record of batch.inFlight) activeOwners.add(issueKey(record.issue))
-    const report = await this.#fleet.reapPreviews([...activeOwners])
+    const report = await this.#fleet.reapPreviews({
+      namespace: this.#workspaceId,
+      activeOwners: [...activeOwners],
+    })
     if (report.reaped.length > 0 || report.skipped.length > 0) {
       this.#logger.info?.('[factory] preview orphan sweep completed', {
         reaped: report.reaped.map((preview) => preview.id),
@@ -7056,12 +7785,15 @@ export class FactoryLoop implements Factory {
         continue
       }
       const record = batch.getIssue(session.issue)
-      const tracked = record?.agents.get(session.agentName)
-        ?? [...(record?.agents.values() ?? [])].find((agent) =>
-          agent.spec.role === 'babysitter' &&
-          githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) ===
-            githubPrIdentity(session.repo, session.prNumber))
+      const trackedEntry = record?.agents.has(session.agentName)
+        ? [session.agentName, record.agents.get(session.agentName)!] as const
+        : [...(record?.agents.entries() ?? [])].find(([, agent]) =>
+            agent.spec.role === 'babysitter' &&
+            githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) ===
+              githubPrIdentity(session.repo, session.prNumber))
+      const tracked = trackedEntry?.[1]
         ?? durableBabysitterTrackedAgent(session, this.#config.agentCapabilities.babysitter)
+      if (record && !trackedEntry) record.agents.set(session.agentName, tracked)
       const ref: BabysitterPrRef = {
         repo: session.repo,
         prNumber: session.prNumber,
@@ -7081,6 +7813,75 @@ export class FactoryLoop implements Factory {
       if (pendingKinds.length > 0) {
         await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked)
         this.#increment('babysitterPendingWakesRestored')
+      }
+    }
+  }
+
+  async #reconcileRestoredBabysitterReceipts(onlyRecord?: InFlightIssue): Promise<void> {
+    const records = onlyRecord ? [onlyRecord] : (await this.#batch()).inFlight
+    for (const record of records) {
+      if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      // Babysitter sessions are independently durable and restore only after
+      // their mounted PR metadata passes the open/draft/issue-identity guard.
+      // Fold those validated receipts back into the lifecycle on takeover.
+      // This closes the crash gap where the babysitter session persisted but
+      // the lifecycle PR receipt did not, and lets exact ownership retire any
+      // earlier weak-match babysitter for the same repository. The lifecycle's
+      // own exact receipts are authoritative independently of the session
+      // index: session restoration can legitimately be delayed or skipped
+      // while mounted PR metadata converges, but that must never preserve a
+      // superseded weak-match babysitter already disproved by publication.
+      const authoritative = new Map<string, {
+        repo: string
+        number: number
+        url: string
+        headRef: string
+        path?: string
+      }>()
+      for (const receipt of lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])) {
+        if (!receipt.repo || !validPrNumber(receipt.number) || !receipt.url || !receipt.headRef) continue
+        const identity = githubPrIdentity(receipt.repo, receipt.number)
+        if (identity) authoritative.set(identity, { ...receipt })
+      }
+      const restored = [...this.#babysitterPr.entries()]
+        .filter(([ownershipKey, ref]) =>
+          ref.agentName && issueKey(this.#babysitterIssueRefs.get(ownershipKey) ?? record.issue) === issueKey(record.issue))
+        .map(([, ref]) => ref)
+      for (const receipt of restored) {
+        if (!receipt.repo || !validPrNumber(receipt.prNumber)) continue
+        const snapshot = await this.#readPrSnapshot(receipt)
+        const headRef = snapshot?.headRef ?? record.decision.implementers
+          .find((implementer) => implementer.repo.toLowerCase() === receipt.repo.toLowerCase())?.branch
+        if (!headRef) continue
+        const identity = githubPrIdentity(receipt.repo, receipt.prNumber)
+        if (!identity) continue
+        authoritative.set(identity, {
+          repo: receipt.repo,
+          number: receipt.prNumber,
+          url: snapshot?.url ?? `https://github.com/${receipt.repo}/pull/${receipt.prNumber}`,
+          headRef,
+          ...(receipt.path ? { path: receipt.path } : {}),
+        })
+      }
+      if (authoritative.size > 0) {
+        this.#logger.debug?.('[factory] reconciling authoritative babysitter receipts', {
+          issue: record.issue.key,
+          lifecycleReceipts: lifecycle?.pullRequests?.map((receipt) => receipt.number) ?? [],
+          restoredReceipts: restored.map((receipt) => receipt.prNumber),
+          authoritativeReceipts: [...authoritative.values()].map((receipt) => receipt.number),
+        })
+        await this.#retireBabysittersOutsideCurrentRoutes(record)
+      }
+      for (const published of authoritative.values()) {
+        if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
+        await this.#ensureBabysitter(record, {
+          repo: published.repo,
+          prNumber: published.number,
+          url: published.url,
+          path: published.path,
+          authoritative: true,
+        })
       }
     }
   }
@@ -7396,6 +8197,7 @@ export class FactoryLoop implements Factory {
         await this.#fleet.sendMessage(input)
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
         if (this.#stopping || state.cancelled) {
           state.deliveringKinds = undefined
           return
@@ -7410,6 +8212,7 @@ export class FactoryLoop implements Factory {
         // registration-lag backoff state accumulated by prior failures.
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
         targets = ack.targets.length > 0 ? [...new Set(ack.targets)] : [input.to]
       }
       if (this.#stopping || state.cancelled) return
@@ -7459,23 +8262,23 @@ export class FactoryLoop implements Factory {
         // unreachable window so a later genuine registration lag starts fresh.
         state.unreachableSinceMs = undefined
         state.unreachableEscalated = false
+        state.unreachableRecoveryAfterMs = undefined
       }
       const unreachableMs = state.unreachableSinceMs !== undefined
         ? this.#clock.now() - state.unreachableSinceMs
         : 0
       if (registrationLag && unreachableMs >= this.#babysitterWakeUnreachableEscalateMs) {
         // The agent is up but its relay identity never became resolvable. Stop
-        // the tight 1s loop: back off to a slow cadence (still eventually
-        // recovering if the agent finally enrolls) and flag it once so an
-        // operator can intervene (e.g. re-spawn / restart) instead of the
-        // failure spinning silently forever.
+        // the tight 1s loop, reconcile once, and restart the session. A recovery
+        // cooldown prevents a still-converging Relaycast registration from
+        // turning that restart into another tight loop.
         state.nextDelayMs = this.#babysitterWakeUnreachableRetryMs
         if (!state.unreachableEscalated) {
           state.unreachableEscalated = true
           await this.#fleet.reconcileTrackedAgents?.()
           this.#increment('babysitterEventWakeUnreachableReconciliations')
           this.#increment('babysitterEventWakeUnreachableEscalations')
-          this.#logger.warn?.('[factory] babysitter unreachable past grace window; slowing wake retries and flagging for human attention', {
+          this.#logger.warn?.('[factory] babysitter unreachable past grace window; reconciling and restarting its session', {
             issue: state.issue.key,
             repo: state.repo,
             prNumber: state.prNumber,
@@ -7484,6 +8287,23 @@ export class FactoryLoop implements Factory {
             retryDelayMs: this.#babysitterWakeUnreachableRetryMs,
             error: describeError(error).errorMessage,
           })
+        }
+        if (
+          state.unreachableRecoveryAfterMs === undefined ||
+          this.#clock.now() >= state.unreachableRecoveryAfterMs
+        ) {
+          state.unreachableRecoveryAfterMs = this.#clock.now() + this.#babysitterWakeUnreachableRetryMs
+          if (await this.#recoverUnreachableBabysitter(state)) {
+            // Probe the newly registered identity promptly. If Relaycast still
+            // cannot resolve it, the recovery cooldown above prevents another
+            // teardown loop and the next attempt uses the slow cadence.
+            state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
+          }
+        } else {
+          state.nextDelayMs = Math.max(
+            BABYSITTER_EVENT_RETRY_MS,
+            state.unreachableRecoveryAfterMs - this.#clock.now(),
+          )
         }
       } else {
         state.nextDelayMs = BABYSITTER_EVENT_RETRY_MS
@@ -7702,6 +8522,7 @@ export class FactoryLoop implements Factory {
         await this.#recordCanonicalIssueState({ ...issueRef(issue), stateId: doneStateId })
       }
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
+      await this.#markDependencyTerminalAndReconcile(issue)
       this.#increment('mergedPrAdvancedDone')
       this.#increment('done')
       this.#logger.info?.('[factory] merged PR advanced issue to Done', {
@@ -7788,6 +8609,7 @@ export class FactoryLoop implements Factory {
             prNumber: receipt.number,
             url: receipt.url,
             headRef: receipt.headRef,
+            authoritative: true,
           })
         }
         return
@@ -7810,12 +8632,16 @@ export class FactoryLoop implements Factory {
     url?: string
     path?: string
     headRef?: string
+    authoritative?: boolean
   }): Promise<void> {
     const babysitterKey = babysitterOwnershipKey(record.issue, prRef)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
       return
     }
+    const replacedSuperseded = prRef.authoritative
+      ? await this.#retireSupersededBabysitters(record, prRef)
+      : false
     this.#babysitterIssueRefs.set(babysitterKey, { ...record.issue })
     const existing = this.#babysitterPr.get(babysitterKey)
     if (existing && githubPrIdentity(existing.repo, existing.prNumber) !== githubPrIdentity(prRef.repo, prRef.prNumber)) {
@@ -7859,6 +8685,7 @@ export class FactoryLoop implements Factory {
       })
       this.#babysitterSpawned.add(babysitterKey)
       await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      await this.#retargetSlackConversationToBabysitter(record)
       return
     }
     // Reserve up-front so concurrent PR events in a drain don't double-spawn.
@@ -7878,7 +8705,7 @@ export class FactoryLoop implements Factory {
       const route = record.decision.routes.find((candidate) => candidate.repo === prRef.repo)
         ?? record.decision.routes[0]
       const initialSpec = babysitterSpec(issue, this.#config, route)
-      if ([...this.#babysitterIssueRefs.entries()].some(([key, candidate]) =>
+      if (replacedSuperseded || [...this.#babysitterIssueRefs.entries()].some(([key, candidate]) =>
         key !== babysitterKey && issueKey(candidate) === issueKey(record.issue))) {
         initialSpec.name = agentNameForRole(issue, 'babysit', {
           repo: prRef.repo,
@@ -7890,18 +8717,22 @@ export class FactoryLoop implements Factory {
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
         ?? record.decision.implementers
           .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
+      const preview = [...record.agents.values()]
+        .map((agent) => agent.spec)
+        .find((candidate) => candidate.repo === initialSpec.repo && candidate.preview)?.preview
+        ?? record.decision.implementers.find((candidate) => candidate.repo === initialSpec.repo)?.preview
       const implementerBranch = prRef.headRef ?? record.decision.implementers
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
-      const spec: AgentSpec = sharedCheckout
+      const checkoutSpec: AgentSpec = sharedCheckout
         ? {
             ...initialSpec,
             baseClonePath: sharedCheckout.baseClonePath,
             clonePath: sharedCheckout.clonePath,
             ...(implementerBranch ? { branch: implementerBranch } : {}),
             ...(sharedCheckout.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
-            ...(sharedCheckout.preview ? { preview: sharedCheckout.preview } : {}),
           }
         : initialSpec
+      const spec = specWithPreview(checkoutSpec, preview)
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
       const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name
         ?? agentNameForRole(issue, 'review', { repo: route?.repo ?? prRef.repo })
@@ -7909,9 +8740,19 @@ export class FactoryLoop implements Factory {
         .filter((agent) => agent.spec.role === 'implementer')
         .map((agent) => agent.result?.name ?? agent.spec.name)
       const integrationInstructions = await this.#resolveIntegrationInstructions()
+      const templateIssue = templateIssueFromRecord(record, issue)
+      const prSummary = await this.#github.getPr(prRef.repo, prRef.prNumber).catch(() => undefined)
+      const taskRoute = { ...(route ?? { repo: prRef.repo }), clonePath: spec.clonePath ?? route?.clonePath }
+      const testGuidance = await resolveTestGuidance({
+        repoPath: taskRoute.clonePath,
+        issue: templateIssue,
+        route: taskRoute,
+        changedFiles: prSummary?.filesChanged,
+        previewUrl: previewUrlFromSpec(spec),
+      })
       const task = renderAgentTask({
-        issue: templateIssueFromRecord(record, issue),
-        route: { ...(route ?? { repo: prRef.repo }), clonePath: spec.clonePath },
+        issue: templateIssue,
+        route: taskRoute,
         role: 'babysitter',
         config: { mergePolicy: this.#config.mergePolicy, terminalState: this.#config.terminalState },
         reviewerName,
@@ -7920,6 +8761,7 @@ export class FactoryLoop implements Factory {
         slackDispatchThread: await this.#slackDispatchThreadFor(record),
         integrationsMountRoot: this.#integrationsMountRoot(),
         integrationInstructions,
+        testGuidance,
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
@@ -7944,6 +8786,7 @@ export class FactoryLoop implements Factory {
         agentName: tracked?.result?.name ?? spawned.name,
       })
       await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      await this.#retargetSlackConversationToBabysitter(record)
       await this.#writeInFlightRegistry()
       if (!await this.#saveDispatchLifecycle(record, 'running')) return
       this.#increment('babysittersSpawned')
@@ -7983,6 +8826,121 @@ export class FactoryLoop implements Factory {
       finishSpawn()
       if (this.#babysitterSpawnInFlight.get(babysitterKey) === spawnFinished) {
         this.#babysitterSpawnInFlight.delete(babysitterKey)
+      }
+    }
+  }
+
+  async #retireSupersededBabysitters(
+    record: InFlightIssue,
+    prRef: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
+  ): Promise<boolean> {
+    const wanted = githubPrIdentity(prRef.repo, prRef.prNumber)
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const trackedAgents = new Map([
+      ...(lifecycle?.agents ?? [])
+        .filter((agent) => agent.releasedAtMs === undefined)
+        .map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)] as const),
+      ...record.agents,
+    ])
+    const superseded = [...trackedAgents.entries()].filter(([, tracked]) => {
+      const owned = tracked.spec.ownedPullRequest
+      return tracked.spec.role === 'babysitter' &&
+        owned?.repo.toLowerCase() === prRef.repo.toLowerCase() &&
+        githubPrIdentity(owned.repo, owned.number) !== wanted
+    })
+    for (const [agentName, tracked] of superseded) {
+      const owned = tracked.spec.ownedPullRequest
+      const failed = await this.#releaseAndTerminateAgents(
+        [[agentName, tracked]],
+        'superseded-pr-receipt',
+        'completion',
+      )
+      if (failed.length > 0) {
+        this.#increment('supersededBabysitterReleaseFailures')
+        throw new Error(`Failed to release superseded babysitter ${agentName}`)
+      }
+      if (owned) {
+        const staleKey = babysitterOwnershipKey(record.issue, {
+          repo: owned.repo,
+          prNumber: owned.number,
+        })
+        await this.#cancelBabysitterWake(staleKey)
+        if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+          await this.#state.clearBabysitterSession(this.#workspaceId, staleKey)
+        }
+      }
+      record.agents.delete(agentName)
+      this.#babysitterCriticalAgents.delete(agentName)
+      this.#increment('supersededBabysittersReleased')
+      this.#logger.info?.('[factory] released babysitter superseded by exact PR receipt', {
+        issue: record.issue.key,
+        babysitter: agentName,
+        previousRepo: owned?.repo,
+        previousPrNumber: owned?.number,
+        repo: prRef.repo,
+        prNumber: prRef.prNumber,
+      })
+    }
+    if (superseded.length > 0) {
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
+        throw new Error(`Failed to persist superseded babysitter cleanup for ${record.issue.key}`)
+      }
+    }
+    return superseded.length > 0
+  }
+
+  async #retireBabysittersOutsideCurrentRoutes(record: InFlightIssue): Promise<void> {
+    const wantedRepos = new Set(record.decision.implementers.map((implementer) => implementer.repo.toLowerCase()))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const trackedAgents = new Map([
+      ...(lifecycle?.agents ?? [])
+        .filter((agent) => agent.releasedAtMs === undefined)
+        .map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)] as const),
+      ...record.agents,
+    ])
+    const unrouted = [...trackedAgents.entries()].filter(([, tracked]) => {
+      const owned = tracked.spec.ownedPullRequest
+      return tracked.spec.role === 'babysitter' &&
+        Boolean(owned) &&
+        !wantedRepos.has(owned!.repo.toLowerCase())
+    })
+    for (const [agentName, tracked] of unrouted) {
+      const owned = tracked.spec.ownedPullRequest
+      const failed = await this.#releaseAndTerminateAgents(
+        [[agentName, tracked]],
+        'superseded-pr-route',
+        'completion',
+      )
+      if (failed.length > 0) {
+        this.#increment('supersededBabysitterReleaseFailures')
+        throw new Error(`Failed to release unrouted babysitter ${agentName}`)
+      }
+      if (owned) {
+        const staleKey = babysitterOwnershipKey(record.issue, {
+          repo: owned.repo,
+          prNumber: owned.number,
+        })
+        await this.#cancelBabysitterWake(staleKey)
+        if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+          await this.#state.clearBabysitterSession(this.#workspaceId, staleKey)
+        }
+      }
+      record.agents.delete(agentName)
+      this.#babysitterCriticalAgents.delete(agentName)
+      this.#increment('supersededBabysittersReleased')
+      this.#logger.info?.('[factory] released babysitter outside the current dispatch routes', {
+        issue: record.issue.key,
+        babysitter: agentName,
+        previousRepo: owned?.repo,
+        previousPrNumber: owned?.number,
+        currentRepos: [...wantedRepos],
+      })
+    }
+    if (unrouted.length > 0) {
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
+        throw new Error(`Failed to persist unrouted babysitter cleanup for ${record.issue.key}`)
       }
     }
   }
@@ -8193,6 +9151,7 @@ export class FactoryLoop implements Factory {
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
+        if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       }
       if (!await this.#saveDispatchLifecycle(record, 'writeback-applied')) return
 
@@ -8355,8 +9314,8 @@ export class FactoryLoop implements Factory {
     this.#emit('error', { error, ...describeError(error), issue })
   }
 
-  #increment(name: string): void {
-    this.#counters[name] = (this.#counters[name] ?? 0) + 1
+  #increment(name: string, amount = 1): void {
+    this.#counters[name] = (this.#counters[name] ?? 0) + amount
   }
 
   #recordTriageEscalation(decision: TriageDecision, reason: string): void {
@@ -8611,7 +9570,20 @@ export class FactoryLoop implements Factory {
       // the reply watcher instead of returning early, otherwise human replies in
       // the existing thread are watched by nobody and silently dropped.
       if (existingThread) {
-        await this.#rearmSlackWatcher(record, existingThread)
+        const durableConversation = await this.#state.getConversationSession(
+          this.#workspaceId,
+          slackConversationId(existingThread),
+        )
+        await this.#ensureSlackConversationSession(record, existingThread)
+        await this.#rearmSlackWatcher(record, existingThread, {
+          replayConversationReplies: Boolean(durableConversation),
+        })
+        const previews = uniquePreviewReferences(result.previews ?? [])
+        if (previews.length > 0) {
+          await this.#slack.reply(existingThread, previews.map((preview) =>
+            `Live preview (${preview.repo}, tailnet access required): ${preview.url}`,
+          ).join('\n'))
+        }
       }
       return
     }
@@ -8647,8 +9619,261 @@ export class FactoryLoop implements Factory {
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
+    await this.#ensureSlackConversationSession(record, root.threadId)
     await this.#watchSlackThread(record, root.threadId)
     this.#recordSlackWritebackSuccess('dispatch-thread')
+  }
+
+  // Once a PR is open, the babysitter is the one driving further conversation
+  // with the human — prefer it over the implementer that originally opened the
+  // Slack thread, matching the pre-conversation-resume routing that sent human
+  // replies to both roles once a PR existed.
+  #slackConversationOwnerCandidate(record: InFlightIssue): { name: string; tracked: TrackedAgent } | undefined {
+    const candidates = [...record.agents.entries()].map(([name, tracked]) => ({ name, tracked }))
+    return candidates.find(({ tracked }) => tracked.spec.role === 'babysitter' && Boolean(tracked.sessionRef))
+      ?? candidates.find(({ tracked }) => tracked.spec.role === 'implementer' && Boolean(tracked.sessionRef))
+  }
+
+  async #ensureSlackConversationSession(
+    record: InFlightIssue,
+    threadId: string,
+    options: { forceAgentRebind?: boolean } = {},
+  ): Promise<void> {
+    const conversationId = slackConversationId(threadId)
+    const owned = this.#slackConversationOwnerCandidate(record)
+    const existing = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (existing) {
+      const sessionRef = owned?.tracked.sessionRef
+      const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
+      if (
+        owned && sessionRef &&
+        (agentName !== existing.agent.name || (
+          options.forceAgentRebind === true && sessionRef !== existing.agent.sessionRef
+        ))
+      ) {
+        const rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
+          name: agentName!,
+          sessionRef,
+          node: owned.tracked.result?.node ?? owned.tracked.spec.node,
+          capability: owned.tracked.spec.capability,
+          repo: owned.tracked.spec.repo,
+          clonePath: owned.tracked.spec.clonePath,
+        })
+        if (rebound) this.#increment('slackConversationSessionsRebound')
+      }
+      if (existing.pending.length > 0 || existing.delivery) {
+        const waiting = await this.#state.getWaitingClarification(
+          this.#workspaceId,
+          issueKey(existing.issue),
+        )
+        if (!waiting) this.#slackConversationTurns.schedule(conversationId)
+      }
+      return
+    }
+
+    const sessionRef = owned?.tracked.sessionRef
+    if (!owned || !sessionRef) {
+      this.#increment('slackConversationSessionsSkippedMissingSession')
+      return
+    }
+
+    const channelDir = await this.#slackChannelDir() ?? this.#config.slack?.channel
+    if (!channelDir) return
+    const agentName = owned.tracked.result?.name ?? owned.name
+    const reserved = await this.#state.reserveConversationSession(this.#workspaceId, conversationId, {
+      provider: 'slack',
+      issue: { ...record.issue },
+      externalId: threadId,
+      context: { channelDir },
+      agent: {
+        name: agentName,
+        sessionRef,
+        node: owned.tracked.result?.node ?? owned.tracked.spec.node,
+        capability: owned.tracked.spec.capability,
+        repo: owned.tracked.spec.repo,
+        clonePath: owned.tracked.spec.clonePath,
+      },
+      history: [],
+      processedMessageIds: [],
+      pending: [],
+    })
+    if (reserved) this.#increment('slackConversationSessionsOwned')
+  }
+
+  // Called right after a babysitter is spawned/reattached for an issue's PR so
+  // an already-owned Slack conversation session (reserved earlier by the
+  // implementer) retargets onto the babysitter for the next turn, instead of
+  // resuming a session the babysitter has taken over from.
+  async #retargetSlackConversationToBabysitter(record: InFlightIssue): Promise<void> {
+    if (!this.#slack || !this.#config.slack) return
+    const threadId = await this.#persistedSlackThread(issueKey(record.issue))
+    if (!threadId) return
+    await this.#ensureSlackConversationSession(record, threadId, { forceAgentRebind: true })
+  }
+
+  async #scheduleSlackConversationIfPending(threadId: string): Promise<void> {
+    const conversationId = slackConversationId(threadId)
+    const session = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (session && (session.pending.length > 0 || session.delivery)) {
+      this.#slackConversationTurns.schedule(conversationId)
+    }
+  }
+
+  async #resumeSlackConversationTurn(conversationId: string): Promise<void> {
+    if (this.#stopping) return
+    const claimId = randomUUID()
+    const claimed = await this.#state.claimConversationTurn(
+      this.#workspaceId,
+      conversationId,
+      this.#slackConversationOwner,
+      claimId,
+      this.#clock.now(),
+      SLACK_CONVERSATION_TURN_LEASE_MS,
+    )
+    if (!claimed?.delivery) {
+      const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (current && (current.pending.length > 0 || current.delivery)) {
+        this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+      }
+      return
+    }
+
+    if (!await this.#ownsActiveSlackConversationIssue(claimed.issue)) {
+      await this.#state.releaseConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        claimId,
+      )
+      this.#increment('slackConversationTurnsSuppressedStaleOwner')
+      return
+    }
+
+    let leaseLost = false
+    let renewalInFlight = false
+    const heartbeat = setInterval(() => {
+      if (renewalInFlight || leaseLost || this.#stopping) return
+      renewalInFlight = true
+      void this.#state.renewConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        claimId,
+        this.#clock.now(),
+      ).then((renewed) => { leaseLost = !renewed })
+        .catch((error) => this.#logger.warn?.('[factory] Slack conversation lease renewal failed', {
+          conversationId,
+          error: describeError(error).errorMessage,
+        }))
+        .finally(() => { renewalInFlight = false })
+    }, Math.max(1_000, Math.floor(SLACK_CONVERSATION_TURN_LEASE_MS / 3)))
+    heartbeat.unref?.()
+
+    try {
+      const result = await this.#fleet.resume({
+        name: claimed.agent.name,
+        sessionRef: claimed.agent.sessionRef,
+        node: claimed.agent.node ?? 'self',
+        capability: claimed.agent.capability,
+        repo: claimed.agent.repo,
+        clonePath: claimed.agent.clonePath,
+        task: slackConversationResumeTask(claimed),
+      })
+      const completed = await this.#state.completeConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        claimId,
+        { name: result.name, sessionRef: result.sessionRef },
+      )
+      // The token-fenced state mutation is authoritative. A renewal already
+      // queued behind this completion can observe the cleared delivery and set
+      // leaseLost even though completion committed successfully.
+      if (!completed) {
+        this.#increment('slackConversationTurnOwnershipLost')
+        return
+      }
+      await this.#recordSlackConversationResume(claimed, result)
+      this.#increment('slackConversationTurnsResumed')
+      if (claimed.delivery.messages.length > 1) {
+        this.#increment('slackConversationRepliesCoalesced', claimed.delivery.messages.length - 1)
+      }
+    } catch (error) {
+      try {
+        await this.#state.releaseConversationTurn(
+          this.#workspaceId,
+          conversationId,
+          this.#slackConversationOwner,
+          claimId,
+        )
+      } catch (releaseError) {
+        this.#logger.warn?.('[factory] Slack conversation claim release failed; waiting for lease recovery', {
+          conversationId,
+          error: describeError(releaseError).errorMessage,
+        })
+      }
+      this.#increment('slackConversationTurnResumeFailures')
+      this.#logger.warn?.('[factory] Slack conversation resume failed; retaining the turn for retry', {
+        issue: claimed.issue.key,
+        threadId: claimed.externalId,
+        sessionRef: claimed.agent.sessionRef,
+        error: describeError(error).errorMessage,
+      })
+      this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+      return
+    } finally {
+      clearInterval(heartbeat)
+    }
+
+    const remaining = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (remaining && (remaining.pending.length > 0 || remaining.delivery)) {
+      this.#slackConversationTurns.schedule(conversationId)
+    }
+  }
+
+  async #recordSlackConversationResume(
+    session: ConversationSessionState,
+    result: SpawnResult,
+  ): Promise<void> {
+    const record = (await this.#batch()).getIssue(session.issue)
+    if (!record) return
+    const entry = [...record.agents.entries()].find(([name, tracked]) =>
+      name === session.agent.name || tracked.result?.name === session.agent.name)
+    if (!entry) return
+    const [previousName, tracked] = entry
+    tracked.result = {
+      ...tracked.result,
+      ...result,
+      node: result.node ?? tracked.result?.node,
+      locality: result.locality ?? tracked.result?.locality,
+    }
+    tracked.sessionRef = result.sessionRef ?? tracked.sessionRef
+    if (result.name !== previousName) {
+      record.agents.delete(previousName)
+      record.agents.set(result.name, tracked)
+    }
+    try {
+      await this.#writeInFlightRegistry()
+      await this.#saveDispatchLifecycle(record, 'running')
+    } catch (error) {
+      this.#logger.warn?.('[factory] Slack conversation resume bookkeeping failed', {
+        issue: session.issue.key,
+        agent: result.name,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
+  async #ownsActiveSlackConversationIssue(issue: IssueRef): Promise<boolean> {
+    if (!(await this.#batch()).getIssue(issue)) return false
+    const key = issueKey(issue)
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    if (!lifecycle) return true
+    if (lifecycle.phase === 'releasing' || isTerminalDispatchLifecycle(lifecycle)) return false
+    if (!lifecycle.lease) return false
+    return lifecycle.lease.owner === this.#dispatchLifecycleOwner &&
+      lifecycle.lease.epoch === this.#dispatchLifecycleEpochs.get(key) &&
+      lifecycle.lease.leaseUntilMs > this.#clock.now()
   }
 
   async #escalateTriage(decision: TriageDecision, reason: string, dryRun: boolean): Promise<DispatchResult | undefined> {
@@ -8958,7 +10183,11 @@ export class FactoryLoop implements Factory {
     return replayedResult
   }
 
-  async #watchSlackThread(record: InFlightIssue, threadId: string): Promise<DispatchResult | undefined> {
+  async #watchSlackThread(
+    record: InFlightIssue,
+    threadId: string,
+    options: { replayConversationReplies?: boolean } = {},
+  ): Promise<DispatchResult | undefined> {
     if (!this.#config.slack) {
       return
     }
@@ -8972,12 +10201,14 @@ export class FactoryLoop implements Factory {
     const messagesPrefix = slackChannelMessagesPrefix(channelDir)
     const preExistingPaths = new Set<string>()
     const preExistingPathOrder: string[] = []
+    const preExistingEvents: ChangeEvent[] = []
     const seenReplies = new Set<string>()
     const seenReplyMessages = new Set<string>()
     let missingIdentityLogged = false
     let cursor: string | undefined
     let stopped = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
+    const routeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
     const markPreExisting = async (): Promise<void> => {
       try {
@@ -8988,6 +10219,7 @@ export class FactoryLoop implements Factory {
           if (path && path.startsWith(messagesPrefix)) {
             preExistingPaths.add(path)
             preExistingPathOrder.push(path)
+            preExistingEvents.push(event)
           }
         }
       } catch (error) {
@@ -8995,7 +10227,8 @@ export class FactoryLoop implements Factory {
       }
     }
 
-    const handle = async (event: ChangeEvent): Promise<void> => {
+    const handle = async (event: ChangeEvent, allowPreExisting = false): Promise<void> => {
+      const routeRetryKey = eventIdentity(event) ?? changeEventPath(event) ?? randomUUID()
       try {
         // Polling-fallback / degraded-sync events can lack `resource.path`
         // despite the SDK type. Skip them quietly so one malformed event never
@@ -9013,7 +10246,7 @@ export class FactoryLoop implements Factory {
           }
         }
 
-        if (preExistingPaths.has(path)) {
+        if (!allowPreExisting && preExistingPaths.has(path)) {
           return
         }
 
@@ -9033,16 +10266,27 @@ export class FactoryLoop implements Factory {
           this.#logger.debug?.('[factory] suppressed duplicate Slack reply payload', { issue: record.issue.key, path })
           return
         }
-        seenReplies.add(replyKey)
-
         if (reply.isBot) {
+          seenReplies.add(replyKey)
+          seenReplyMessages.add(replyMessageKey)
           return
         }
-        seenReplyMessages.add(replyMessageKey)
 
         await this.#routeSlackAnswerToImplementers(record, reply)
+        // Acknowledge in memory only after the durable route succeeds. A read or
+        // state-store failure must remain replayable by the poll/subscription.
+        seenReplies.add(replyKey)
+        seenReplyMessages.add(replyMessageKey)
       } catch (error) {
         this.#logger.error?.('[factory] failed to handle Slack reply event', error)
+        if (!stopped && !routeRetryTimers.has(routeRetryKey)) {
+          const retryTimer = setTimeout(() => {
+            routeRetryTimers.delete(routeRetryKey)
+            if (!stopped) void handle(event, true)
+          }, SLACK_REPLY_ROUTE_RETRY_MS)
+          retryTimer.unref?.()
+          routeRetryTimers.set(routeRetryKey, retryTimer)
+        }
       }
     }
 
@@ -9050,7 +10294,7 @@ export class FactoryLoop implements Factory {
 
     let subscription: Subscription | undefined
     try {
-      subscription = this.#mount.subscribe([`${messagesPrefix}**`], (event) => {
+      subscription = this.#mount.subscribe([slackThreadReplyGlob(channelDir)], (event) => {
         // Receipt time is independent of the provider-authored sync timestamp.
         // A healthy webhook can therefore override a frozen advisory status
         // without trusting the same field that declared the provider stale.
@@ -9090,9 +10334,15 @@ export class FactoryLoop implements Factory {
           clearTimeout(pollTimer)
           pollTimer = undefined
         }
+        for (const retryTimer of routeRetryTimers.values()) clearTimeout(retryTimer)
+        routeRetryTimers.clear()
         await this.#boundedStopTeardown('Slack reply subscription unsubscribe', () => subscription?.unsubscribe())
       },
     })
+
+    if (options.replayConversationReplies) {
+      for (const event of preExistingEvents) await handle(event, true)
+    }
 
     return await this.#replayLatestSlackTriageAnswer(record, threadId, channelDir, preExistingPathOrder)
   }
@@ -9108,7 +10358,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    let latest: SlackReply | undefined
+    let latest: SlackThreadReply | undefined
     for (const path of preExistingPaths) {
       const reply = await this.#readSlackReply(path)
       if (
@@ -9134,13 +10384,17 @@ export class FactoryLoop implements Factory {
   // exists (persisted thread id) but has no in-process watcher. #watchSlackThread
   // is itself idempotent on #slackWatchers; the guard here keeps the counter (and
   // the seeding getEvents call) limited to genuine re-arms.
-  async #rearmSlackWatcher(record: InFlightIssue, threadId: string): Promise<void> {
+  async #rearmSlackWatcher(
+    record: InFlightIssue,
+    threadId: string,
+    options: { replayConversationReplies?: boolean } = {},
+  ): Promise<void> {
     const key = issueKey(record.issue)
     if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) {
       return
     }
     try {
-      await this.#watchSlackThread(record, threadId)
+      await this.#watchSlackThread(record, threadId, options)
       this.#increment('slackWatchersRearmed')
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-arm Slack reply watcher', { issue: record.issue.key, error })
@@ -9155,7 +10409,8 @@ export class FactoryLoop implements Factory {
     if (!this.#slack || !this.#config.slack) {
       return
     }
-    for (const record of (await this.#batch()).inFlight) {
+    const batch = await this.#batch()
+    for (const record of batch.inFlight) {
       if (record.dryRun) {
         continue
       }
@@ -9173,7 +10428,29 @@ export class FactoryLoop implements Factory {
       if (!threadId) {
         continue
       }
-      await this.#rearmSlackWatcher(record, threadId)
+      const durableConversation = await this.#state.getConversationSession(
+        this.#workspaceId,
+        slackConversationId(threadId),
+      )
+      await this.#ensureSlackConversationSession(record, threadId)
+      await this.#rearmSlackWatcher(record, threadId, {
+        replayConversationReplies: Boolean(durableConversation),
+      })
+    }
+    for (const [conversationId, session] of await this.#state.listConversationSessions(this.#workspaceId)) {
+      if (session.provider !== 'slack') continue
+      const threadId = session.externalId
+      const record = batch.getIssue(session.issue)
+      const key = issueKey(session.issue)
+      if (record && !record.dryRun && !this.#slackWatchers.has(key) && !this.#slackWatcherStarts.has(key)) {
+        await this.#state.setSlackThread(this.#workspaceId, key, threadId)
+        await this.#ensureSlackConversationSession(record, threadId)
+        await this.#rearmSlackWatcher(record, threadId, { replayConversationReplies: true })
+      }
+      const waiting = await this.#state.getWaitingClarification(this.#workspaceId, key)
+      if (record && !waiting && (session.pending.length > 0 || session.delivery)) {
+        this.#slackConversationTurns.schedule(conversationId)
+      }
     }
     await this.#sweepWaitingClarifications()
     for (const [, waiting] of await this.#state.listWaitingClarifications(this.#workspaceId)) {
@@ -9345,21 +10622,27 @@ export class FactoryLoop implements Factory {
     const key = issueKey(issue)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
-    await this.#state.clearSlackThread(this.#workspaceId, key)
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
     await watcher?.stop()
+    if (threadId) {
+      const conversationId = slackConversationId(threadId)
+      await this.#slackConversationTurns.cancel(conversationId)
+      await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+    }
+    await this.#state.clearSlackThread(this.#workspaceId, key)
   }
 
-  async #readSlackReply(path: string): Promise<SlackReply | undefined> {
+  async #readSlackReply(path: string): Promise<SlackThreadReply | undefined> {
     try {
       const { content } = await this.#mount.readFile(path)
-      return parseSlackReply(path, content, this.#config.slack?.botUserId ?? 'U0B2596R7EZ')
+      return parseSlackThreadReply(path, content, this.#config.slack?.botUserId ?? 'U0B2596R7EZ')
     } catch (error) {
       this.#logger.warn?.(`Unable to read Slack reply ${path}`, error)
       return undefined
     }
   }
 
-  async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackReply): Promise<DispatchResult | undefined> {
+  async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackThreadReply): Promise<DispatchResult | undefined> {
     if (!this.#config.slack) {
       return
     }
@@ -9377,18 +10660,59 @@ export class FactoryLoop implements Factory {
       return
     }
     if (waiting?.threadId === reply.threadTs) {
+      const replyId = `${reply.threadTs}:${reply.messageTs}`
       const claimed = await this.#state.claimClarificationReply(this.#workspaceId, clarificationKey, {
-        id: `${reply.threadTs}:${reply.messageTs}`,
+        id: replyId,
         text,
-        receivedAtMs: this.#clock.now(),
+        receivedAtMs: slackMessageReceivedAtMs(reply.messageTs, this.#clock.now()),
         source: 'slack',
+        author: reply.author,
       })
       if (!claimed) {
-        this.#increment('clarificationDuplicateWakesSuppressed')
+        const currentWaiting = await this.#state.getWaitingClarification(this.#workspaceId, clarificationKey)
+        if (currentWaiting?.reply?.id === replyId) {
+          this.#increment('clarificationDuplicateWakesSuppressed')
+          return
+        }
+        // The first reply wakes the parked clarification team. Additional
+        // rapid-fire replies are ordinary conversation turns and must not be
+        // discarded merely because the one-shot clarification slot is full.
+        const conversationId = slackConversationId(reply.threadTs)
+        const queued = await this.#state.appendConversationMessage(this.#workspaceId, conversationId, {
+          id: replyId,
+          text,
+          receivedAtMs: slackMessageReceivedAtMs(reply.messageTs, this.#clock.now()),
+          providerSequence: reply.messageTs,
+          author: reply.author,
+        })
+        if (queued) {
+          this.#increment('slackConversationRepliesQueued')
+        } else {
+          this.#increment('slackConversationDuplicateRepliesSuppressed')
+        }
         return
       }
       this.#increment('clarificationRepliesClaimed')
       await this.#wakeWaitingClarification(clarificationKey, claimed)
+      return
+    }
+
+    const conversationId = slackConversationId(reply.threadTs)
+    const conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (conversation && issueKey(conversation.issue) === clarificationKey) {
+      const queued = await this.#state.appendConversationMessage(this.#workspaceId, conversationId, {
+        id: `${reply.threadTs}:${reply.messageTs}`,
+        text,
+        receivedAtMs: slackMessageReceivedAtMs(reply.messageTs, this.#clock.now()),
+        providerSequence: reply.messageTs,
+        author: reply.author,
+      })
+      if (!queued) {
+        this.#increment('slackConversationDuplicateRepliesSuppressed')
+        return
+      }
+      this.#increment('slackConversationRepliesQueued')
+      this.#slackConversationTurns.schedule(conversationId)
       return
     }
 
@@ -9400,27 +10724,7 @@ export class FactoryLoop implements Factory {
       this.#increment('slackAnswersIgnoredNoInFlight')
       return
     }
-
-    if (!this.#fleet.sendInput) {
-      return
-    }
-
-    // Route human replies to the implementers AND the babysitter — once a PR is
-    // open the babysitter is the one chatting with the human about it.
-    const recipients = [...liveRecord.agents.values()]
-      .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
-      .map((agent) => agent.result?.name ?? agent.spec.name)
-      .filter((name): name is string => Boolean(name))
-
-    if (recipients.length === 0) {
-      this.#increment('slackAnswersIgnoredNoImplementer')
-      return
-    }
-
-    for (const recipient of new Set(recipients)) {
-      await this.#injectSlackReplyEvent(recipient, liveRecord.issue, text)
-      this.#increment('slackAnswersInjected')
-    }
+    this.#increment('slackAnswersIgnoredNoConversationSession')
   }
 
   async #wakeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
@@ -9600,9 +10904,13 @@ export class FactoryLoop implements Factory {
         await renewLease()
         await this.#writeInFlightRegistry()
         await this.#saveDispatchLifecycle(record, 'running')
+        if (waiting.threadId) {
+          await this.#ensureSlackConversationSession(record, waiting.threadId, { forceAgentRebind: true })
+        }
         await renewLease()
         const completed = await this.#state.completeClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
         if (!completed) throw new ClarificationWakeLeaseLostError('clarification wake completion lost ownership')
+        if (waiting.threadId) await this.#scheduleSlackConversationIfPending(waiting.threadId)
         this.#increment('clarificationTeamsWoken')
         this.#logger.info?.('[factory] restarted team after human clarification', {
           issue: waiting.issue.key,
@@ -9845,15 +11153,6 @@ export class FactoryLoop implements Factory {
       this.#increment('slackTriageAnswersQueued')
       this.#emit('issue-queued', { issue: decision.issue })
     }
-  }
-
-  // Route ordinary Slack conversation into a live agent framed as the
-  // <integration-event> the spawn prompt tells it to expect (not an ambiguous
-  // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
-  // event. (A broker confirmed-delivery path via waitForInjected is a possible
-  // robustness follow-up.)
-  async #injectSlackReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
-    await this.#fleet.sendInput?.(recipient, slackReplyEvent(issue, text))
   }
 
   // Absolute path to the local .integrations mount the daemon manages. The mount
@@ -10299,6 +11598,60 @@ const githubIssueSourceRef = (issue: LinearIssue): GithubIssueSourceRef | undefi
   return { owner, repo, number: number!, url }
 }
 
+function dependencyRepoForIssue(
+  issue: LinearIssue,
+  decision: TriageDecision | undefined,
+  config: FactoryConfig,
+): string | undefined {
+  const source = githubIssueSourceRef(issue)
+  if (source) return `${source.owner}/${source.repo}`
+  const mirroredRepo = githubMirrorRepoForIssue(issue)
+  if (mirroredRepo) return mirroredRepo
+
+  const normalize = (repo: string | undefined): string | undefined => {
+    if (!repo) return undefined
+    try {
+      return normalizeGithubRepo(repo, config.repos.org)
+    } catch {
+      return undefined
+    }
+  }
+  const decisionRepos = new Set(
+    (decision?.routes ?? [])
+      .map((route) => normalize(route.repo))
+      .filter((repo): repo is string => Boolean(repo)),
+  )
+  if (decisionRepos.size === 1) return [...decisionRepos][0]
+  if (decisionRepos.size > 1) return undefined
+
+  const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+  const labelRepos = new Set(
+    Object.entries(config.repos.byLabel)
+      .filter(([label]) => labels.has(label.trim().toLowerCase()))
+      .map(([, repo]) => normalize(repo))
+      .filter((repo): repo is string => Boolean(repo)),
+  )
+  if (labelRepos.size === 1) return [...labelRepos][0]
+  if (labelRepos.size > 1) return undefined
+
+  const projectRepo = issue.project
+    ? Object.entries(config.repos.byProject)
+      .find(([project]) => project.trim().toLowerCase() === issue.project!.trim().toLowerCase())?.[1]
+    : undefined
+  return normalize(projectRepo) ?? normalize(config.repos.default)
+}
+
+function dependencyIdentityForIssue(issue: LinearIssue, repo: string | undefined): string | undefined {
+  const source = githubIssueSourceRef(issue)
+  if (source) return dependencyIdentity(`${source.owner}/${source.repo}`, source.number)
+  const pathParts = githubIssuePathParts(issue.path)
+  if (pathParts) return dependencyIdentity(`${pathParts.owner}/${pathParts.repo}`, pathParts.number)
+  const number = Number(issue.key.match(/(\d+)$/u)?.[1])
+  return repo && Number.isSafeInteger(number) && number > 0
+    ? dependencyIdentity(repo, number)
+    : undefined
+}
+
 const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
   const payload = wrappedPayload(issue.raw)
   const source = asRecord(payload.source)
@@ -10362,6 +11715,60 @@ function uniquePreviewReferences(previews: Array<PreviewReference | undefined>):
     if (preview) unique.set(preview.id, preview)
   }
   return [...unique.values()]
+}
+
+function assertPublishablePreview(
+  preview: PreviewReference,
+  expected: {
+    namespace: string
+    owner: string
+    service: string
+    repo: string
+    targetPort: number
+    portSpan: number
+    preferredHttpsPort?: number
+    requireNode: boolean
+  },
+): void {
+  const refuse = (reason: string): never => {
+    throw new Error(`Refusing insecure preview for ${expected.repo}: ${reason}`)
+  }
+  if (preview.provider !== 'tailscale-serve') refuse('unexpected provider')
+  if (preview.access !== 'tailnet') refuse('provider did not guarantee tailnet access')
+  if (preview.lifetime !== 'issue') refuse('provider did not guarantee issue-scoped lifetime')
+  if (
+    preview.namespace !== expected.namespace ||
+    preview.owner !== expected.owner ||
+    preview.service !== expected.service ||
+    preview.repo !== expected.repo ||
+    (preview.configuredTargetPort ?? preview.targetPort) !== expected.targetPort ||
+    preview.targetPort < expected.targetPort ||
+    preview.targetPort >= expected.targetPort + expected.portSpan
+  ) {
+    refuse('provider returned a reference for a different dispatch identity')
+  }
+  if (expected.preferredHttpsPort !== undefined && preview.httpsPort !== expected.preferredHttpsPort) {
+    refuse('provider ignored the configured HTTPS port')
+  }
+  if (expected.requireNode && (!preview.node || preview.node === 'self')) {
+    refuse('remote provider did not identify the placement node')
+  }
+
+  const url = (() => {
+    try {
+      return new URL(preview.url)
+    } catch {
+      return refuse('provider returned an invalid URL')
+    }
+  })()
+  if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) {
+    refuse('provider URL is not credential-free HTTPS')
+  }
+  if (!url.hostname.endsWith('.ts.net')) {
+    refuse('provider URL is not a Tailscale HTTPS name')
+  }
+  const urlPort = url.port ? Number(url.port) : 443
+  if (urlPort !== preview.httpsPort) refuse('provider URL does not match its guarded HTTPS route')
 }
 
 function specWithPreview(spec: AgentSpec, preview?: PreviewReference): AgentSpec {
@@ -10819,9 +12226,15 @@ const routeForSpec = (decision: TriageDecision, spec: AgentSpec) => {
 
   return {
     repo: spec.repo,
-    clonePath: spec.clonePath,
+    clonePath: spec.clonePath ?? route?.clonePath,
     rationale: route?.rationale,
   }
+}
+
+const previewUrlFromSpec = (spec: AgentSpec): string | undefined => {
+  if (spec.preview?.url.trim()) return spec.preview.url.trim()
+  const previewUrl = (spec as AgentSpec & { previewUrl?: unknown }).previewUrl
+  return typeof previewUrl === 'string' && previewUrl.trim() ? previewUrl.trim() : undefined
 }
 
 const repoMapFromConfig = (config: FactoryConfig) => {
@@ -11084,11 +12497,12 @@ const resolveIssuePrFromMount = async (
     openOnly?: boolean
     failOnLookupError?: boolean
     allowLegacyGithubBranch?: boolean
+    repo?: string
   } = {},
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
-  for (const repo of reposFromConfig(config)) {
+  for (const repo of opts.repo ? [opts.repo] : reposFromConfig(config)) {
     const paths = new Set<string>()
     for (const root of githubPullRoots(repo)) {
       try {
@@ -11348,7 +12762,7 @@ const readProbePrCandidate = async (
         booleanValue(payload.crossRepository) ??
         (headRepo && baseRepo ? headRepo.toLowerCase() !== baseRepo.toLowerCase() : undefined),
       draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
-      state: stringValue(payload.state),
+      state: booleanValue(payload.merged) === true ? 'MERGED' : stringValue(payload.state),
       url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
   } catch {
@@ -12180,9 +13594,14 @@ const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | und
     ? { maxRestarts: 0 } as AgentSpec['restartPolicy']
     : spec.restartPolicy
 
-const slackPayloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
-
 const slackChannelMessagesPrefix = (channelDir: string): string => `/slack/channels/${channelDir}/messages/`
+
+const slackConversationId = (threadId: string): string => `slack:${threadId}`
+
+const slackMessageReceivedAtMs = (messageTs: string, fallback: number): number => {
+  const seconds = Number(messageTs)
+  return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds * 1_000) : fallback
+}
 
 const eventIdentity = (event: ChangeEvent): string | undefined => {
   const record = event as unknown as Record<string, unknown>
@@ -12405,6 +13824,18 @@ const mergePublishedPullRequests = (
   ])).values()]
 }
 
+const primaryPublishedPullRequest = (
+  previous: DispatchLifecycle | undefined,
+  receipt: GithubPublishPullRequestResult | undefined,
+  receipts: GithubPublishPullRequestResult[],
+): GithubPublishPullRequestResult | undefined => {
+  if (
+    receipt &&
+    (!previous?.pullRequest || previous.pullRequest.repo.toLowerCase() === receipt.repo.toLowerCase())
+  ) return receipt
+  return previous?.pullRequest ?? receipt ?? receipts[0]
+}
+
 const lifecycleFromInFlightRecord = (
   record: InFlightIssue,
   runId: string,
@@ -12443,30 +13874,6 @@ const dispatchResultFromLifecycle = (lifecycle: DispatchLifecycle): DispatchResu
     agents: lifecycle.agents.map(({ name, tracked }) => ({ name, role: tracked.spec.role })),
     dryRun: lifecycle.dryRun,
   }
-
-const parseSlackReply = (path: string, content: unknown, botUserId: string): SlackReply | undefined => {
-  const raw = asRecord(parseJsonContent(content)) ?? {}
-  const payload = wrappedPayload(raw)
-  const channelDir = path.match(/^\/slack\/channels\/([^/]+)\//u)?.[1] ?? ''
-  const pathMatch = path.match(/^\/slack\/channels\/[^/]+\/messages\/([^/]+)(?:\/replies\/([^/]+))?/u)
-  const parentFromPath = pathMatch?.[2] ? slackPayloadTs(pathMatch[1]) : undefined
-  const messageFromPath = slackPayloadTs(pathMatch?.[2] ?? pathMatch?.[1] ?? '')
-  const messageTs = stringValue(payload.ts) ?? messageFromPath
-  const threadTs = stringValue(payload.thread_ts) ?? parentFromPath
-  if (!channelDir || !threadTs || !messageTs) {
-    return undefined
-  }
-
-  return {
-    channelDir,
-    threadTs,
-    messageTs,
-    text: stringValue(payload.text) ?? '',
-    isThreadReply: Boolean(parentFromPath) || threadTs !== messageTs,
-    isBot: isOwnSlackBotReply(payload, botUserId),
-    raw,
-  }
-}
 
 const triageEscalationReason = (decision: TriageDecision): string | undefined => {
   const reasons: string[] = []
@@ -12554,15 +13961,6 @@ const issueWithGithubClarification = (issue: LinearIssue, text: string): LinearI
   ].join('\n'),
 })
 
-const slackAnswerInput = (issue: IssueRef, text: string): string =>
-  `Slack reply for ${issue.key}:\n${text}\r`
-
-// The human's Slack-thread reply, framed as an <integration-event> the agent is
-// told (at spawn) to expect — a recognizable injected event, not an ambiguous
-// keystroke. Trailing CR submits it to the agent's PTY.
-const slackReplyEvent = (issue: IssueRef, text: string): string =>
-  `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
-
 const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification): string => {
   const reply = waiting.reply
   return [
@@ -12572,6 +13970,28 @@ const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification
     `The blocked question was: ${waiting.question}`,
     `The human answered${reply?.author ? ` as @${reply.author}` : ''}: ${reply?.text ?? ''}`,
     'Re-hydrate from the issue, branch, worktree, and any open PR, then continue the task. Do not repeat completed work.',
+  ].join('\n')
+}
+
+const slackConversationResumeTask = (session: ConversationSessionState): string => {
+  const delivered = session.delivery?.messages ?? []
+  const renderMessages = (messages: ConversationSessionState['history']): string => messages
+    .map((message, index) => `${index + 1}. ${message.author ? `${message.author}: ` : ''}${message.text}`)
+    .join('\n')
+  return [
+    `Continue the existing ${session.issue.key} session for one turn in its Factory-owned Slack thread.`,
+    `Slack channel mount: /slack/channels/${session.context.channelDir ?? 'unknown'}`,
+    `Slack thread timestamp: ${session.externalId}`,
+    'The session history, issue, branch, worktree, and open PR remain authoritative. Re-hydrate current repository state before changing code and do not repeat completed work.',
+    ...(session.history.length > 0
+      ? ['', 'Earlier human messages in this Slack conversation:', renderMessages(session.history.slice(-20))]
+      : []),
+    '',
+    'New human messages coalesced into this turn, in order:',
+    renderMessages(delivered),
+    '',
+    'Address every new message. Reply in the same Slack thread through the connected Slack mount/writeback surface, then continue or report the issue work as appropriate.',
+    'This input was supplied atomically as a fresh resume task. Do not request or depend on live PTY/session injection.',
   ].join('\n')
 }
 
@@ -12698,10 +14118,6 @@ const clarificationStaleSlackText = (
 ].filter((line): line is string => Boolean(line)).join('\n')
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
-
-const isOwnSlackBotReply = (payload: Record<string, unknown>, botUserId: string): boolean =>
-  payload.user_is_bot === true ||
-  stringValue(payload.user) === botUserId
 
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)

@@ -114,6 +114,7 @@ const slackSchema = z.object({
   // identity, while still making parked questions immediately actionable.
   stakeholderUserIds: z.array(z.string().min(1)).default([]),
   staleAfterMs: z.number().int().min(1_000).default(10 * 60_000),
+  conversationCoalesceMs: z.number().int().min(0).max(60_000).default(750),
 }).optional()
 
 const babysitterSchema = z.object({
@@ -131,10 +132,20 @@ const reportingSchema = z.object({
 const previewServiceSchema = z.object({
   /** Local HTTP port the repository's development server listens on. */
   port: z.number().int().min(1).max(65_535),
+  /** Consecutive node-local ports Factory may allocate for concurrent issues. */
+  portSpan: z.number().int().min(1).max(1_000).optional(),
   /** Optional stable tailnet HTTPS port; otherwise Factory allocates one. */
   httpsPort: z.number().int().min(1).max(65_535).optional(),
   /** Optional command rendered into the agent task; Factory does not supervise the app process. */
   startCommand: z.string().trim().min(1).optional(),
+}).superRefine((service, ctx) => {
+  if (service.port + (service.portSpan ?? 100) - 1 > 65_535) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['portSpan'],
+      message: 'preview service port range must end at or below 65535',
+    })
+  }
 })
 
 // Tailscale Serve is deliberately the only initial provider. Unlike Funnel,
@@ -160,6 +171,14 @@ const previewSchema = z.object({
     })
   }
 }).optional()
+
+const githubSchema = z.object({
+  // Controls the credential identity used when Factory creates pull requests.
+  // `auto` preserves the compatibility behavior: prefer the connected
+  // workspace GitHub App, then use the operator's local `gh` authentication
+  // when the app write path is unavailable.
+  identity: z.enum(['app', 'user', 'auto']).default('auto'),
+}).default({})
 
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
 // don't hand-configure them. These names let the factory resolve a role from a
@@ -226,6 +245,7 @@ const WorkspaceConfigObjectSchema = z.object({
   // Cloud account is available; delivery failure never changes orchestration.
   reporting: reportingSchema,
   preview: previewSchema,
+  github: githubSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the

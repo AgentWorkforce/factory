@@ -172,6 +172,24 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses feature-map validation and base-drift options', () => {
+    expect(parseFleetCommand([
+      'featuremap',
+      'check',
+      '--manifest',
+      'custom/manifest.yaml',
+      '--base',
+      'origin/main',
+    ])).toEqual({
+      kind: 'featuremap-check',
+      manifestPath: 'custom/manifest.yaml',
+      baseRef: 'origin/main',
+    })
+    expect(() => parseFleetCommand(['featuremap', 'sweep'])).toThrow(
+      'factory featuremap requires the check command',
+    )
+  })
+
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
     expect(parseGlobalOptions([
       'run-once',
@@ -304,6 +322,32 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it('runs the feature-map checker without loading config or constructing a fleet', async () => {
+    const output = buffer()
+    const featureMapCheck = vi.fn(async () => ({
+      ok: true as const,
+      manifestPath: '.agentworkforce/features/manifest.yaml',
+      categoryCount: 2,
+      featureCount: 8,
+      baseRef: 'origin/main',
+      mergeBase: 'abc123',
+      advisories: [],
+    }))
+
+    const code = await runFleetCli(['featuremap', 'check', '--base', 'origin/main'], {
+      createFleet: () => {
+        throw new Error('featuremap check should not construct a fleet')
+      },
+      featureMapCheck,
+      stdout: output,
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(featureMapCheck).toHaveBeenCalledWith({ baseRef: 'origin/main' })
+    expect(JSON.parse(output.text())).toMatchObject({ ok: true, featureCount: 8 })
+  })
+
   it('prompts and connects a missing GitHub integration before an interactive triage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-connect-'))
     try {
@@ -709,10 +753,18 @@ describe('fleet CLI runtime', () => {
         expect(ports.reporter).toBe(reporter)
         return factory
       }) as typeof createFactory
+      const cloudMountFromConfig = vi.fn(async (options) => {
+        await options?.onLocalMountHealth?.({
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+        })
+        return new FakeMountClient()
+      })
 
       const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
         fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        cloudMountFromConfig,
         reporter,
         createFactory: createFactorySpy,
         stdout: buffer(),
@@ -722,10 +774,37 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(events.map((event) => event.type)).toEqual([
         'instance.started',
+        'factory.anomaly',
         'instance.stopping',
         'instance.stopped',
       ])
       expect(events[0]).toMatchObject({ attributes: { backend: 'internal', mode: 'run-once' } })
+      expect(events[1]).toMatchObject({
+        level: 'error',
+        attributes: {
+          component: 'relayfile_mount',
+          operation: 'supervise',
+          errorCode: 'mount_stale',
+          count: 1,
+        },
+      })
+      expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
+        logger: expect.any(Object),
+        onLocalMountHealth: expect.any(Function),
+      }))
+      const cloudMount = await cloudMountFromConfig.mock.results[0]?.value
+      expect(cloudMount?.writes).toContainEqual({
+        path: '/factory/observability/mount-health/current.json',
+        content: expect.objectContaining({
+          schemaVersion: 'factory.mount-health.v1',
+          type: 'factory.mount-health',
+          workspaceId: 'factory-cli-test',
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+          occurredAt: expect.any(String),
+        }),
+      })
       expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -1533,6 +1612,24 @@ describe('fleet CLI runtime', () => {
     try {
       const clonePath = join(root, 'hoopsheet')
       await mkdir(clonePath)
+      await mkdir(join(clonePath, '.agentworkforce/features/verify'), { recursive: true })
+      await writeFile(join(clonePath, '.agentworkforce/features/manifest.yaml'), [
+        'categories:',
+        '  public-sites:',
+        '    features:',
+        '      - id: league-routing',
+        '        name: League routing',
+        '        location: src/routes/league.ts',
+        '        verify_tier: 2',
+        '',
+      ].join('\n'))
+      await writeFile(join(clonePath, '.agentworkforce/features/verify/procedures.md'), [
+        '## Tier 2 — Config',
+        '```bash',
+        'npm run test:league-routing',
+        '```',
+        '',
+      ].join('\n'))
       const configPath = await writeConfig(root, {
         repos: {
           org: 'AgentWorkforce',
@@ -1555,6 +1652,7 @@ describe('fleet CLI runtime', () => {
             html_url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
             head: { ref: 'codex/league-public-sites', sha: 'abc123', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
             base: { ref: 'main' },
+            files: [{ filename: 'src/routes/league.ts' }],
           },
         },
       }, integrations)
@@ -1590,6 +1688,8 @@ describe('fleet CLI runtime', () => {
       })
       expect(fleet.spawns[0]?.task).toContain('standalone PR babysitter')
       expect(fleet.spawns[0]?.task).toContain('Full PR definition of done')
+      expect(fleet.spawns[0]?.task).toContain('League routing (`league-routing`)')
+      expect(fleet.spawns[0]?.task).toContain('npm run test:league-routing')
       expect(fleet.spawns[0]?.task).not.toContain('[factory-pr-ready]')
       expect(JSON.parse(output.text())).toMatchObject({
         status: 'spawned',

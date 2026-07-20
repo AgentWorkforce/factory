@@ -8,6 +8,7 @@ const SDK_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const ALLOWED_WRITEBACK_CALLSITES = new Set([
   'mount/relayfile-github-connection-write.ts',
   'writeback/linear.ts',
+  'writeback/mount-health.ts',
   'writeback/slack.ts',
 ])
 

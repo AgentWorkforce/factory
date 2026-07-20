@@ -1,34 +1,43 @@
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { dirname } from 'node:path'
 import { promisify } from 'node:util'
+import lockfile from 'proper-lockfile'
 
 import type { PreviewConfig } from '../config/schema'
 import type {
   PreviewReference,
   PreviewStartInput,
+  PreviewSweepInput,
   PreviewSweepResult,
 } from '../ports/fleet'
 
 const execFileAsync = promisify(execFile)
 const REGISTRY_VERSION = 1
 const MANAGED_BY = '@agent-relay/factory'
+const PREVIEW_LOCK_STALE_MS = 30_000
 
-type PersistedPreview = PreviewReference & { managedBy: typeof MANAGED_BY }
-type PreviewRegistry = { version: typeof REGISTRY_VERSION; previews: PersistedPreview[] }
+type PreviewIdentity = Omit<PreviewReference, 'url'> & { managedBy: typeof MANAGED_BY }
+type PendingPreview = PreviewIdentity & { state: 'pending' }
+type PersistedPreview = PreviewIdentity & { state: 'active'; url: string }
+type RegistryPreview = PendingPreview | PersistedPreview
+type PreviewRegistry = { version: typeof REGISTRY_VERSION; previews: RegistryPreview[] }
 type CommandResult = { stdout: string; stderr: string }
 export type PreviewCommandRunner = (file: string, args: string[]) => Promise<CommandResult>
+export type PreviewPortProbe = (port: number) => Promise<boolean>
 
 export interface PreviewManager {
   start(input: PreviewStartInput): Promise<PreviewReference>
   remove(preview: PreviewReference): Promise<boolean>
-  sweep(activeOwners: string[]): Promise<PreviewSweepResult>
+  sweep(input: PreviewSweepInput): Promise<PreviewSweepResult>
 }
 
 export interface TailscalePreviewManagerOptions {
   config: PreviewConfig
   run?: PreviewCommandRunner
+  isPortAvailable?: PreviewPortProbe
   now?: () => Date
 }
 
@@ -41,6 +50,7 @@ export interface TailscalePreviewManagerOptions {
 export class TailscalePreviewManager implements PreviewManager {
   readonly #config: PreviewConfig
   readonly #run: PreviewCommandRunner
+  readonly #isPortAvailable: PreviewPortProbe
   readonly #now: () => Date
   #operation: Promise<unknown> = Promise.resolve()
 
@@ -50,6 +60,7 @@ export class TailscalePreviewManager implements PreviewManager {
       const result = await execFileAsync(file, args, { encoding: 'utf8' })
       return { stdout: result.stdout, stderr: result.stderr }
     })
+    this.#isPortAvailable = options.isPortAvailable ?? portAvailable
     this.#now = options.now ?? (() => new Date())
   }
 
@@ -58,15 +69,26 @@ export class TailscalePreviewManager implements PreviewManager {
       const registry = await this.#readRegistry()
       let status = await this.#serveStatus()
       const existing = registry.previews.find((preview) =>
-        preview.owner === input.owner && preview.service === input.service,
+        preview.namespace === input.namespace &&
+        preview.owner === input.owner &&
+        preview.service === input.service,
       )
       const existingMatchesRequest = existing &&
         existing.repo === input.repo &&
-        existing.targetPort === input.targetPort &&
+        (existing.configuredTargetPort ?? existing.targetPort) === input.targetPort &&
         (input.preferredHttpsPort === undefined || existing.httpsPort === input.preferredHttpsPort) &&
         existing.startCommand === input.startCommand
-      if (existingMatchesRequest && liveRouteMatches(status, existing)) {
-        return referenceFrom(existing)
+      const existingRoute = existing
+        ? liveRoute(status, existing.httpsPort, existing.targetPort)
+        : undefined
+      if (existingMatchesRequest && existingRoute && !existingRoute.funnel) {
+        const liveUrl = previewUrl(existingRoute.host, existing.httpsPort)
+        const active = activatePreview(existing, liveUrl)
+        if (existing.state === 'pending' || existing.url !== liveUrl) {
+          registry.previews = registry.previews.map((preview) => preview.id === existing.id ? active : preview)
+          await this.#writeRegistry(registry)
+        }
+        return referenceFrom(active)
       }
       if (existing) {
         // A changed service declaration replaces only the old route whose live
@@ -78,45 +100,74 @@ export class TailscalePreviewManager implements PreviewManager {
         registry.previews = registry.previews.filter((preview) => preview.id !== existing.id)
       }
 
+      const serviceConfig = this.#config.services[input.service]
+      const lastTargetPort = Math.min(65_535, input.targetPort + (serviceConfig?.portSpan ?? 100) - 1)
+      const occupiedTargetPorts = new Set(registry.previews.map((preview) => preview.targetPort))
+      let targetPort: number | undefined
+      for (const candidate of portRange(input.targetPort, lastTargetPort)) {
+        if (occupiedTargetPorts.has(candidate)) continue
+        if (await this.#isPortAvailable(candidate)) {
+          targetPort = candidate
+          break
+        }
+      }
+      if (targetPort === undefined) {
+        throw new Error(`Unable to allocate a local target port for ${input.service}`)
+      }
+
       const occupied = new Set(registry.previews.map((preview) => preview.httpsPort))
       const candidates = input.preferredHttpsPort !== undefined
         ? [input.preferredHttpsPort]
         : portRange(this.#config.httpsPortRange[0], this.#config.httpsPortRange[1])
       let lastError: unknown
       for (const httpsPort of candidates) {
-        if (occupied.has(httpsPort) || liveHttpsPortConfigured(status, httpsPort)) continue
+        if (occupied.has(httpsPort) || livePortConfigured(status, httpsPort)) continue
+        const pending: PendingPreview = {
+          id: randomUUID(),
+          provider: 'tailscale-serve',
+          namespace: input.namespace,
+          owner: input.owner,
+          service: input.service,
+          repo: input.repo,
+          configuredTargetPort: input.targetPort,
+          targetPort,
+          httpsPort,
+          access: 'tailnet',
+          lifetime: 'issue',
+          createdAt: this.#now().toISOString(),
+          ...(input.startCommand ? { startCommand: input.startCommand } : {}),
+          ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+          managedBy: MANAGED_BY,
+          state: 'pending',
+        }
+        registry.previews.push(pending)
+        // Persist intent before mutating Tailscale. If this process dies after
+        // Serve accepts the route, startup sweeping can still identify it.
+        await this.#writeRegistry(registry)
         let commandSucceeded = false
+        let rollbackCompleted = false
         try {
           await this.#run(this.#config.tailscaleBinary, [
             'serve',
             '--bg',
             '--yes',
             `--https=${httpsPort}`,
-            `http://127.0.0.1:${input.targetPort}`,
+            `http://127.0.0.1:${targetPort}`,
           ])
           commandSucceeded = true
           const configured = await this.#serveStatus()
-          const route = liveRoute(configured, httpsPort, input.targetPort)
-          if (!route) {
-            throw new Error(`tailscale serve did not report the configured route on HTTPS port ${httpsPort}`)
+          const route = liveRoute(configured, httpsPort, targetPort)
+          if (!route || route.funnel) {
+            throw new Error(
+              route?.funnel
+                ? `tailscale serve reported public Funnel access on HTTPS port ${httpsPort}`
+                : `tailscale serve did not report the configured route on HTTPS port ${httpsPort}`,
+            )
           }
-          const preview: PersistedPreview = {
-            id: randomUUID(),
-            provider: 'tailscale-serve',
-            owner: input.owner,
-            service: input.service,
-            repo: input.repo,
-            url: `https://${route.host}${httpsPort === 443 ? '' : `:${httpsPort}`}/`,
-            targetPort: input.targetPort,
-            httpsPort,
-            access: 'tailnet',
-            lifetime: 'issue',
-            createdAt: this.#now().toISOString(),
-            ...(input.startCommand ? { startCommand: input.startCommand } : {}),
-            ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
-            managedBy: MANAGED_BY,
-          }
-          registry.previews.push(preview)
+          const preview = activatePreview(pending, previewUrl(route.host, httpsPort))
+          registry.previews = registry.previews.map((candidate) =>
+            candidate.id === pending.id ? preview : candidate,
+          )
           await this.#writeRegistry(registry)
           return referenceFrom(preview)
         } catch (error) {
@@ -124,13 +175,27 @@ export class TailscalePreviewManager implements PreviewManager {
           if (commandSucceeded) {
             try {
               const cleanupStatus = await this.#serveStatus()
-              if (liveRoute(cleanupStatus, httpsPort, input.targetPort)) {
+              if (liveRoute(cleanupStatus, httpsPort, targetPort)) {
                 await this.#disable({ httpsPort })
+                rollbackCompleted = true
               }
             } catch (cleanupError) {
               lastError = new AggregateError(
                 [error, cleanupError],
                 `Preview route setup and guarded rollback both failed on HTTPS port ${httpsPort}`,
+              )
+            }
+          } else {
+            rollbackCompleted = true
+          }
+          if (rollbackCompleted) {
+            registry.previews = registry.previews.filter((candidate) => candidate.id !== pending.id)
+            try {
+              await this.#writeRegistry(registry)
+            } catch (registryError) {
+              lastError = new AggregateError(
+                [lastError, registryError],
+                `Preview route rollback succeeded but its pending registry entry could not be cleared on HTTPS port ${httpsPort}`,
               )
             }
           }
@@ -152,6 +217,7 @@ export class TailscalePreviewManager implements PreviewManager {
       const preview = registry.previews.find((candidate) =>
         candidate.managedBy === MANAGED_BY &&
         candidate.id === reference.id &&
+        candidate.namespace === reference.namespace &&
         candidate.owner === reference.owner &&
         candidate.httpsPort === reference.httpsPort &&
         candidate.targetPort === reference.targetPort,
@@ -173,27 +239,32 @@ export class TailscalePreviewManager implements PreviewManager {
     })
   }
 
-  async sweep(activeOwners: string[]): Promise<PreviewSweepResult> {
+  async sweep(input: PreviewSweepInput): Promise<PreviewSweepResult> {
     return await this.#exclusive(async () => {
-      const active = new Set(activeOwners)
+      const active = new Set(input.activeOwners)
       const registry = await this.#readRegistry()
       const status = await this.#serveStatus()
       const reaped: PreviewReference[] = []
       const skipped: PreviewSweepResult['skipped'] = []
-      const retained: PersistedPreview[] = []
+      const retained: RegistryPreview[] = []
 
       for (const preview of registry.previews) {
-        if (preview.managedBy !== MANAGED_BY || active.has(preview.owner)) {
+        if (
+          preview.managedBy !== MANAGED_BY ||
+          preview.namespace !== input.namespace ||
+          active.has(preview.owner)
+        ) {
           retained.push(preview)
           continue
         }
-        if (!liveRouteMatches(status, preview)) {
+        const route = liveRoute(status, preview.httpsPort, preview.targetPort)
+        if (!route) {
           skipped.push({ id: preview.id, reason: 'live route identity mismatch', node: preview.node })
           continue
         }
         try {
           await this.#disable(preview)
-          reaped.push(referenceFrom(preview))
+          reaped.push(referenceFrom(activatePreview(preview, previewUrl(route.host, preview.httpsPort))))
         } catch (error) {
           retained.push(preview)
           skipped.push({
@@ -236,7 +307,7 @@ export class TailscalePreviewManager implements PreviewManager {
       }
       return {
         version: REGISTRY_VERSION,
-        previews: value.previews.filter(isPersistedPreview),
+        previews: value.previews.filter(isRegistryPreview),
       }
     } catch (error) {
       if (isMissingFileError(error)) return { version: REGISTRY_VERSION, previews: [] }
@@ -262,36 +333,64 @@ export class TailscalePreviewManager implements PreviewManager {
   }
 
   async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#operation.then(operation, operation)
+    const withLock = async () => {
+      await mkdir(dirname(this.#config.registryPath), { recursive: true, mode: 0o700 })
+      const release = await lockfile.lock(this.#config.registryPath, {
+        realpath: false,
+        stale: PREVIEW_LOCK_STALE_MS,
+        update: PREVIEW_LOCK_STALE_MS / 2,
+        retries: {
+          forever: true,
+          factor: 1.2,
+          minTimeout: 10,
+          maxTimeout: 100,
+          randomize: true,
+        },
+      })
+      try {
+        return await operation()
+      } finally {
+        await release()
+      }
+    }
+    const result = this.#operation.then(withLock, withLock)
     this.#operation = result.then(() => undefined, () => undefined)
     return await result
   }
 }
 
-const referenceFrom = ({ managedBy: _managedBy, ...preview }: PersistedPreview): PreviewReference => preview
+const activatePreview = (preview: RegistryPreview, url: string): PersistedPreview => ({
+  ...preview,
+  state: 'active',
+  url,
+})
+
+const referenceFrom = (
+  { managedBy: _managedBy, state: _state, ...preview }: PersistedPreview,
+): PreviewReference => preview
 
 const portRange = (start: number, end: number): number[] =>
   Array.from({ length: end - start + 1 }, (_, index) => start + index)
 
-const liveHttpsPortConfigured = (status: unknown, httpsPort: number): boolean => {
+const livePortConfigured = (status: unknown, httpsPort: number): boolean => {
   for (const config of serveConfigs(status)) {
     const tcp = isRecord(config.TCP) ? config.TCP : undefined
-    const handler: Record<string, unknown> | undefined = tcp && isRecord(tcp[String(httpsPort)])
-      ? tcp[String(httpsPort)] as Record<string, unknown>
-      : undefined
-    if (handler?.HTTPS === true) return true
+    if (tcp && Object.hasOwn(tcp, String(httpsPort))) return true
   }
   return false
 }
 
-const liveRouteMatches = (status: unknown, preview: PreviewReference): boolean =>
+const liveRouteMatches = (
+  status: unknown,
+  preview: Pick<PreviewReference, 'httpsPort' | 'targetPort'>,
+): boolean =>
   Boolean(liveRoute(status, preview.httpsPort, preview.targetPort))
 
 const liveRoute = (
   status: unknown,
   httpsPort: number,
   targetPort: number,
-): { host: string } | undefined => {
+): { host: string; funnel: boolean } | undefined => {
   const expectedProxy = `http://127.0.0.1:${targetPort}`
   for (const config of serveConfigs(status)) {
     const tcp = isRecord(config.TCP) ? config.TCP : undefined
@@ -305,7 +404,11 @@ const liveRoute = (
       const handlers = isRecord(rawServer.Handlers) ? rawServer.Handlers : undefined
       const root = handlers && isRecord(handlers['/']) ? handlers['/'] : undefined
       if (root?.Proxy === expectedProxy) {
-        return { host: hostPort.slice(0, -String(httpsPort).length - 1) }
+        const allowFunnel = isRecord(config.AllowFunnel) ? config.AllowFunnel : undefined
+        return {
+          host: hostPort.slice(0, -String(httpsPort).length - 1),
+          funnel: allowFunnel?.[hostPort] === true,
+        }
       }
     }
   }
@@ -314,27 +417,38 @@ const liveRoute = (
 
 const serveConfigs = (status: unknown): Record<string, unknown>[] => {
   if (!isRecord(status)) return []
-  const configs = [status]
-  if (isRecord(status.Services)) {
-    configs.push(...Object.values(status.Services).filter(isRecord))
+  const configs: Record<string, unknown>[] = []
+  const visit = (config: Record<string, unknown>) => {
+    configs.push(config)
+    for (const nestedKey of ['Services', 'Foreground']) {
+      const nested = isRecord(config[nestedKey]) ? config[nestedKey] : undefined
+      for (const child of Object.values(nested ?? {}).filter(isRecord)) visit(child)
+    }
   }
+  visit(status)
   return configs
 }
 
-const isPersistedPreview = (value: unknown): value is PersistedPreview => {
+const previewUrl = (host: string, httpsPort: number): string =>
+  `https://${host}${httpsPort === 443 ? '' : `:${httpsPort}`}/`
+
+const isRegistryPreview = (value: unknown): value is RegistryPreview => {
   if (!isRecord(value)) return false
-  return value.managedBy === MANAGED_BY &&
+  const identity = value.managedBy === MANAGED_BY &&
     value.provider === 'tailscale-serve' &&
     value.access === 'tailnet' &&
     value.lifetime === 'issue' &&
     typeof value.id === 'string' &&
+    typeof value.namespace === 'string' &&
     typeof value.owner === 'string' &&
     typeof value.service === 'string' &&
     typeof value.repo === 'string' &&
-    typeof value.url === 'string' &&
     typeof value.targetPort === 'number' &&
     typeof value.httpsPort === 'number' &&
     typeof value.createdAt === 'string'
+  if (!identity) return false
+  if (value.configuredTargetPort !== undefined && typeof value.configuredTargetPort !== 'number') return false
+  return value.state === 'pending' || (value.state === 'active' && typeof value.url === 'string')
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -342,3 +456,18 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isMissingFileError = (error: unknown): boolean =>
   isRecord(error) && error.code === 'ENOENT'
+
+const portAvailable: PreviewPortProbe = async (port) => await new Promise<boolean>((resolve) => {
+  const server = createServer()
+  let settled = false
+  const finish = (available: boolean) => {
+    if (settled) return
+    settled = true
+    resolve(available)
+  }
+  server.once('error', () => finish(false))
+  server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+    server.close((error) => finish(!error))
+  })
+  server.unref()
+})

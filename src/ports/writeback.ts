@@ -1,3 +1,4 @@
+import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from './mount'
 import type { LinearIssue, PrSummary } from '../types'
 
 export interface LinearWriteback {
@@ -19,6 +20,8 @@ export interface GithubRead {
 export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
 
 export interface GithubWriteback {
+  /** Optional local-user PR publisher, implemented by the default `gh` writeback. */
+  publishPullRequest?(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   /** Provider-authoritative fallback when the mounted issue record omits its reporter. */
   getIssueAuthor?(issue: LinearIssue): Promise<string | undefined>
   /** Provider-authoritative lifecycle lookup used before recovering stale mounted labels. */
