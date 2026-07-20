@@ -395,6 +395,7 @@ export class FactoryLoop implements Factory {
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
+  readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   // Composite issue identities for which a babysitter has already been spawned, so repeated PR
   // webhooks / agent-exit safety nets don't respawn it.
@@ -746,6 +747,7 @@ export class FactoryLoop implements Factory {
       this.#clarificationIntents.clear()
 
       await this.#drainBabysitterWakesForStop()
+      await this.#drainAgentExitsInFlight()
 
       // Durable relay placements must survive an owner restart so a successor
       // can adopt them. The one-shot/daemon stop path releases only
@@ -2462,7 +2464,15 @@ export class FactoryLoop implements Factory {
   #wireFleetEvents(): void {
     if (!this.#offAgentExit) {
       this.#offAgentExit = this.#fleet.onAgentExit((name, reason) => {
-        void this.#handleAgentExit(name, reason)
+        if (this.#agentExitsInFlight.has(name)) return
+        const handling = this.#handleAgentExit(name, reason)
+          .catch((error) => this.#error(error))
+          .finally(() => {
+          if (this.#agentExitsInFlight.get(name) === handling) {
+            this.#agentExitsInFlight.delete(name)
+          }
+          })
+        this.#agentExitsInFlight.set(name, handling)
       })
     }
     if (!this.#offDeliveryFailed) {
@@ -2554,9 +2564,22 @@ export class FactoryLoop implements Factory {
         this.#fleet.hydrateTracked(agents)
       }
       this.#scheduleDispatchLifecycleRenewal()
-      if (this.#fleet.hydrateTracked) await this.#fleet.reconcileTrackedAgents?.()
+      if (this.#fleet.hydrateTracked) {
+        await this.#fleet.reconcileTrackedAgents?.()
+        // Fleet callbacks are intentionally synchronous at the port boundary,
+        // but recovery work is asynchronous (issue reads, worktree restore,
+        // PR publication). Finish exits discovered by the startup reconcile
+        // before the full ready-issue backfill can monopolize mount I/O.
+        await this.#drainAgentExitsInFlight()
+      }
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
+    }
+  }
+
+  async #drainAgentExitsInFlight(): Promise<void> {
+    while (this.#agentExitsInFlight.size > 0) {
+      await Promise.allSettled([...this.#agentExitsInFlight.values()])
     }
   }
 
@@ -2938,14 +2961,14 @@ export class FactoryLoop implements Factory {
     if (lifecycle.phase === 'publishing') {
       const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
       if (implementers.length === 0) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
-      const publishedPullRequests: GithubPublishPullRequestResult[] = []
+      const publishedReceipts: GithubPublishPullRequestResult[] = []
       for (const implementer of implementers) {
         const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
         if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request for ${implementer.spec.repo}`)
-        publishedPullRequests.push(published)
+        publishedReceipts.push(published)
         if (!await this.#saveDispatchLifecycle(record, 'publishing', published)) return
       }
-      const published = publishedPullRequests[0]!
+      const published = publishedReceipts[0]!
       if (!await this.#saveDispatchLifecycle(record, 'published')) return
       if (this.#config.babysitter.enabled) {
         await this.#ensureBabysitter(record, {
@@ -5008,7 +5031,10 @@ export class FactoryLoop implements Factory {
         return false
       }
       if (implementer?.spec.branch && record.decision.implementers.length > 1) {
-        const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
+        const sourceOwner = record.issue.path
+          ? githubIssuePathParts(record.issue.path)?.owner
+          : undefined
+        const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
         const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
         if (publishedPullRequests(lifecycle).some((receipt) =>
           receipt.repo.toLowerCase() === repo.toLowerCase() && receipt.headRef === implementer.spec.branch
@@ -11939,7 +11965,10 @@ const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
 const publishedPullRequests = (lifecycle: DispatchLifecycle | undefined): GithubPublishPullRequestResult[] => {
-  const receipts = [...(lifecycle?.pullRequests ?? []), ...(lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])]
+  const receipts = [
+    ...(lifecycle?.pullRequests ?? []).filter(Boolean),
+    ...(lifecycle?.pullRequest ? [lifecycle.pullRequest] : []),
+  ]
   return [...new Map(receipts.map((receipt) => [
     `${receipt.repo.toLowerCase()}#${receipt.number}`,
     { ...receipt },

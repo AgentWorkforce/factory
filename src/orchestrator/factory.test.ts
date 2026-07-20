@@ -4380,6 +4380,70 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('finishes startup-reconciled exits before beginning the live backfill', async () => {
+    const path = issuePath(86)
+    const issue = issueFile(86)
+    let releasePublish!: () => void
+    let publishStarted!: () => void
+    const publishing = new Promise<void>((resolve) => { releasePublish = resolve })
+    const startedPublishing = new Promise<void>((resolve) => { publishStarted = resolve })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishStarted()
+        await publishing
+        return {
+          repo: input.repo,
+          number: 86,
+          url: 'https://github.com/AgentWorkforce/pear/pull/86',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issue,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const first = createFactory(config(), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restartedFleet.exitImplementerOnReconcile = true
+      restarted = createFactory(config(), {
+        mount,
+        fleet: restartedFleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+      })
+      let startSettled = false
+      const start = restarted.start({ mode: 'dispatch-owner' }).then(() => { startSettled = true })
+
+      await startedPublishing
+      expect(startSettled).toBe(false)
+      releasePublish()
+      await start
+
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'complete', pullRequest: { number: 86 } })
+    } finally {
+      releasePublish()
+      await restarted?.stop()
+      await first.stop()
+    }
+  })
+
   it.each([
     ['healthy owner', 1091, false],
     ['waiting owner crash', 1092, true],
