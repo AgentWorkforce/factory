@@ -68,6 +68,18 @@ jobs:
           fi
           echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
+      - name: Verify packed end-to-end lifecycle
+        run: npm run verify:e2e
+        env:
+          FACTORY_E2E_HEAD_SHA: ${{ github.sha }}
+
+      - name: Upload release E2E attestation
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-release-e2e-${{ github.sha }}
+          path: artifacts/factory-e2e-attestation.json
+          if-no-files-found: error
+
       - name: Verify version is unpublished
         run: |
           V='${{ steps.bump.outputs.version }}'
