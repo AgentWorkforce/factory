@@ -1209,6 +1209,36 @@ class BlockingIssueReadMount extends FakeMountClient {
   }
 }
 
+class CpuHeavyGithubTreeMount extends FakeMountClient {
+  observedStaleWhileScanning = false
+
+  constructor(
+    readonly clock: ManualClock,
+    readonly opts: { heartbeatPath: string; staleMs: number; advanceMs: number; issueCount: number },
+  ) {
+    super()
+  }
+
+  override async listTree(prefix: string): Promise<string[]> {
+    if (prefix !== '/github/repos/AgentWorkforce/factory/issues') {
+      return []
+    }
+    const paths = Array.from({ length: this.opts.issueCount }, (_, index) =>
+      githubIssueNestedMetaPath('AgentWorkforce', 'factory', 1_000 + index)
+    )
+    return new Proxy(paths, {
+      get: (target, property, receiver) => {
+        if (typeof property === 'string' && /^\d+$/u.test(property)) {
+          this.clock.advance(this.opts.advanceMs)
+          const heartbeat = JSON.parse(readFileSync(this.opts.heartbeatPath, 'utf8')) as { updatedAtMs?: number }
+          this.observedStaleWhileScanning ||= this.clock.now() - (heartbeat.updatedAtMs ?? 0) > this.opts.staleMs
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+  }
+}
+
 class DelayedIssueReadMount extends FakeMountClient {
   activeIssueReads = 0
   maxConcurrentIssueReads = 0
@@ -5568,6 +5598,44 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('keeps the live heartbeat fresh during a CPU-heavy GitHub startup tree scan', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-startup-scan-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    const staleMs = 1_000
+    try {
+      const clock = new ManualClock()
+      const mount = new CpuHeavyGithubTreeMount(clock, {
+        heartbeatPath,
+        staleMs,
+        advanceMs: 100,
+        issueCount: 40,
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const factory = createFactory(FactoryConfigSchema.parse({
+        workspaceId: 'startup-heartbeat-test',
+        issueSource: 'github',
+        repos: { org: 'AgentWorkforce', names: ['factory'], cloneRoot: '/work' },
+        safety: { requireLabel: 'factory-ready' },
+        loop: { heartbeatPath, registryPath, heartbeatStaleMs: staleMs },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        clock,
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(mount.observedStaleWhileScanning).toBe(false)
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(clock.now() - (heartbeat?.updatedAtMs ?? 0)).toBeLessThan(staleMs)
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('drains live issue reads with bounded parallelism before yielding to the next batch', async () => {
     const issueCount = 6
     const files = Object.fromEntries(
@@ -7425,6 +7493,42 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('dispatches a factory-ready GitHub issue from its source repository without a default route', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'factory', 124)
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(124, {
+        repo: 'factory',
+        labels: ['factory-ready'],
+        body: 'Fix the startup discovery regression, add focused tests for source-repository routing, preserve safety labels, and verify that the ready issue dispatches to the configured Factory checkout without requiring an unrelated routing label.',
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(FactoryConfigSchema.parse({
+      workspaceId: 'source-route-test',
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['factory'],
+        cloneRoot: '/work',
+      },
+      safety: { requireLabel: 'factory-ready' },
+    }), {
+      mount,
+      fleet,
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched.map((result) => result.issue.key)).toEqual(['124'])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.repo, spawn.cwd])).toEqual([
+      ['ar-124-impl-factory', 'AgentWorkforce/factory', '/work/factory'],
+      ['ar-124-review-factory', 'AgentWorkforce/factory', '/work/factory'],
+    ])
+    expect(factory.status().counters.triageEscalations).toBeUndefined()
+  })
+
   it('does not re-dispatch a startup-pulled issue from a later live event', async () => {
     const path = issuePath(42)
     const mount = new RouteNotFoundCountingListTreeMount({ [path]: realIssueFile(42) })
@@ -8307,6 +8411,70 @@ describe('FactoryLoop', () => {
       clonePath: '/work/pear',
     }])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-6-impl-pear', 'ar-6-review'])
+  })
+
+  it('publishes one durable PR receipt per repository for a team dispatch', async () => {
+    const number = 2778
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFile = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        const repoSlug = input.repo.split('/').at(-1)!
+        return {
+          repo: input.repo,
+          number: repoSlug === 'pear' ? 126 : 127,
+          url: `https://github.com/${input.repo}/pull/${repoSlug === 'pear' ? 126 : 127}`,
+          headRef: `factory/${number}-${repoSlug}`,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [path]: issueFile,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new LocalLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: true },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async () => undefined,
+    })
+    const issue = parseGithubFactoryIssue(path, issueFile)
+    const decision = await factory.triageIssue(issue)
+
+    await factory.dispatch(decision)
+    const pearImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/pear' && spawn.name.includes('-impl-'))!
+    const hoopsheetImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/hoopsheet' && spawn.name.includes('-impl-'))!
+    fleet.emitAgentExit(pearImplementer.name, 'worker_exited')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+    fleet.emitAgentExit(hoopsheetImplementer.name, 'worker_exited')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(2))
+
+    expect(publishInputs.map((input) => input.repo).sort()).toEqual([
+      'AgentWorkforce/hoopsheet',
+      'AgentWorkforce/pear',
+    ])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      pullRequest: { repo: 'AgentWorkforce/pear', number: 126 },
+      pullRequests: expect.arrayContaining([
+        expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 126 }),
+        expect.objectContaining({ repo: 'AgentWorkforce/hoopsheet', number: 127 }),
+      ]),
+    })
   })
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
@@ -15059,6 +15227,7 @@ describe('FactoryLoop PR babysitter', () => {
       // the next second and the escalation is not re-logged.
       expect(factory.status().counters.babysitterEventWakeFailures ?? 0).toBe(failuresAtEscalation)
       expect(factory.status().counters.babysitterEventWakeUnreachableEscalations).toBe(1)
+      expect(factory.status().counters.babysitterEventWakeUnreachableReconciliations).toBe(1)
     } finally {
       await factory.stop()
     }

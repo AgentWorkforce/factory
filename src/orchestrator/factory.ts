@@ -1313,6 +1313,10 @@ export class FactoryLoop implements Factory {
   }
 
   async #sweepPrStateCompletions(reason: 'live-timer' | 'run-loop'): Promise<void> {
+    // This timer is also the durable safety net for fleet exit events missed
+    // while the event loop was busy (for example during a large startup pull).
+    // Keep reconciliation active even when babysitters own PR completion.
+    await this.#fleet.reconcileTrackedAgents?.()
     // When the babysitter owns PR-open, completion is driven by PR webhooks +
     // the babysitter's readiness signal (see #handlePrChange / #handleAgentExit),
     // not this polling sweep. Disabling it here is what makes the babysitter path
@@ -1485,6 +1489,7 @@ export class FactoryLoop implements Factory {
           await this.#recordCanonicalIssueState(issue)
         }
         issueEntries.push({ path, issue })
+        await this.#refreshLiveHeartbeatIfDue()
       }
       if (issueSource === 'github') {
         // New ready work must not sit behind a long sequence of stale
@@ -1502,6 +1507,7 @@ export class FactoryLoop implements Factory {
       }
 
       for (const { issue } of issueEntries) {
+        await this.#refreshLiveHeartbeatIfDue()
         if (!issue) {
           continue
         }
@@ -2200,15 +2206,6 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    const escalationReason = triageEscalationReason(decision)
-    if (escalationReason) {
-      const replayedResult = await this.#escalateTriage(decision, escalationReason, dryRun)
-      this.#recordTriageEscalation(decision, escalationReason)
-      return replayedResult ?? { issue: decision.issue, agents: [], dryRun }
-    }
-
-    // TODO(AR-274 follow-up): short-circuit LLM triage once label-derived
-    // routes are authoritative for dispatch identity.
     const labelDispatch = labelDerivedDispatchDecision(liveIssue, decision, this.#config)
     if (!labelDispatch.ok) {
       const comment = labelDispatchFailureComment(decision.issue, labelDispatch)
@@ -2235,10 +2232,16 @@ export class FactoryLoop implements Factory {
       return { issue: decision.issue, agents: [], comments: [comment], dryRun }
     }
 
-    let dispatchDecision = labelDispatch.decision
+    let dispatchDecision = authoritativeRoutedDecision(decision, labelDispatch.decision)
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
+    const escalationReason = triageEscalationReason(dispatchDecision)
+    if (escalationReason) {
+      const replayedResult = await this.#escalateTriage(dispatchDecision, escalationReason, dryRun)
+      this.#recordTriageEscalation(dispatchDecision, escalationReason)
+      return replayedResult ?? { issue: dispatchDecision.issue, agents: [], dryRun }
+    }
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
@@ -2735,12 +2738,15 @@ export class FactoryLoop implements Factory {
       return false
     }
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    const pullRequests = mergePublishedPullRequests(previous, pullRequest)
+    const primaryPullRequest = previous?.pullRequest ?? pullRequest ?? pullRequests[0]
     const lifecycle = lifecycleFromInFlightRecord(
       record,
       previous?.runId ?? randomUUID(),
       phase,
       this.#clock.now(),
-      pullRequest ?? previous?.pullRequest,
+      primaryPullRequest,
+      pullRequests,
       releaseReason ?? previous?.releaseReason,
     )
     for (const agent of lifecycle.agents) {
@@ -2918,11 +2924,17 @@ export class FactoryLoop implements Factory {
       return
     }
     if (lifecycle.phase === 'publishing') {
-      const implementer = [...record.agents.values()].find((agent) => agent.spec.role === 'implementer')
-      if (!implementer) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
-      const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
-      if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request`)
-      if (!await this.#saveDispatchLifecycle(record, 'published', published)) return
+      const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
+      if (implementers.length === 0) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
+      const publishedPullRequests: GithubPublishPullRequestResult[] = []
+      for (const implementer of implementers) {
+        const published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
+        if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request for ${implementer.spec.repo}`)
+        publishedPullRequests.push(published)
+        if (!await this.#saveDispatchLifecycle(record, 'publishing', published)) return
+      }
+      const published = publishedPullRequests[0]!
+      if (!await this.#saveDispatchLifecycle(record, 'published')) return
       if (this.#config.babysitter.enabled) {
         await this.#ensureBabysitter(record, {
           repo: published.repo,
@@ -3202,10 +3214,12 @@ export class FactoryLoop implements Factory {
       }
 
       const decision = await this.triageIssue(issue)
-      const escalationReason = triageEscalationReason(decision)
+      const routed = labelDerivedDispatchDecision(issue, decision, this.#config)
+      const escalationDecision = routed.ok ? authoritativeRoutedDecision(decision, routed.decision) : decision
+      const escalationReason = triageEscalationReason(escalationDecision)
       if (escalationReason) {
-        await this.#escalateTriage(decision, escalationReason, this.#config.dryRun)
-        this.#recordTriageEscalation(decision, escalationReason)
+        await this.#escalateTriage(escalationDecision, escalationReason, this.#config.dryRun)
+        this.#recordTriageEscalation(escalationDecision, escalationReason)
         return
       }
 
@@ -3307,6 +3321,7 @@ export class FactoryLoop implements Factory {
         lastProgressAtMs,
         { processed, total: paths.length, path },
       )
+      await this.#refreshLiveHeartbeatIfDue()
     }
     this.#logger.info?.('[factory] GitHub issue ingestion completed', {
       dryRun: opts.dryRun ?? false,
@@ -3336,6 +3351,7 @@ export class FactoryLoop implements Factory {
     let scanned = 0
     let lastProgressAtMs = startedAtMs
     for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading')) {
+      await this.#refreshLiveHeartbeatIfDue()
       if (!isLinearIssueMirrorCandidatePath(path)) {
         continue
       }
@@ -3364,7 +3380,8 @@ export class FactoryLoop implements Factory {
       const issuePaths = new Map<string, string>()
       for (const root of githubIssueScanRoots(this.#config)) {
         const paths = await this.#listRelayfileTree(root, 'GitHub issue ingestion')
-        for (const path of paths) {
+        for (let index = 0; index < paths.length; index += 1) {
+          const path = paths[index]!
           const parts = githubIssuePathParts(path)
           if (parts) {
             const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
@@ -3385,7 +3402,12 @@ export class FactoryLoop implements Factory {
           } else if (isGithubIssueTreePath(path)) {
             this.#increment('githubIssuesIgnoredByPathRegex')
           }
+          if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+            await this.#refreshLiveHeartbeatIfDue()
+            await liveEventYield()
+          }
         }
+        await this.#refreshLiveHeartbeatIfDue()
       }
       for (const [identity, path] of issuePaths) {
         this.#githubIssuePreferredPaths.set(identity, path)
@@ -4329,7 +4351,7 @@ export class FactoryLoop implements Factory {
     if (isCompletionReason(reason)) {
       if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,
-      })) {
+      }, exiting)) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
         else await this.#completeIssue(record)
         return
@@ -4381,7 +4403,7 @@ export class FactoryLoop implements Factory {
     try {
       if (tracked.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,
-      })) {
+      }, tracked)) {
         if (this.#config.babysitter.enabled) {
           await this.#ensureBabysitterForIssue(record)
           return
@@ -4530,6 +4552,10 @@ export class FactoryLoop implements Factory {
       return undefined
     }
     try {
+      // A missed exit can be reconciled after the worker checkout was pruned.
+      // Re-create its deterministic worktree from the retained local branch so
+      // publication can still push/read the completed commit.
+      await this.#prepareAgentWorktree(record, implementer.spec)
       const published = await this.#publishImplementerPullRequest(record, implementer)
       if (published) {
         this.#increment('implementerPrsPublishedOnExit')
@@ -4558,7 +4584,6 @@ export class FactoryLoop implements Factory {
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
-    if (durable?.pullRequest) return durable.pullRequest
     const cached = this.#publishedPullRequests.get(key)
     if (cached) return cached
 
@@ -4584,6 +4609,10 @@ export class FactoryLoop implements Factory {
       ? sourceRepoParts.owner
       : undefined
     const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
+    const durableReceipt = publishedPullRequests(durable).find((receipt) =>
+      receipt.repo.toLowerCase() === repo.toLowerCase()
+    )
+    if (durableReceipt) return durableReceipt
     const expectedHeadRef = implementer.spec.branch ?? remoteBranch
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
@@ -4956,11 +4985,23 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
 
-  async #issueHasCompletionPr(record: InFlightIssue, opts: { openOnly?: boolean } = {}): Promise<boolean> {
+  async #issueHasCompletionPr(
+    record: InFlightIssue,
+    opts: { openOnly?: boolean } = {},
+    implementer?: TrackedAgent,
+  ): Promise<boolean> {
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
         return false
+      }
+      if (implementer?.spec.branch && record.decision.implementers.length > 1) {
+        const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
+        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+        if (publishedPullRequests(lifecycle).some((receipt) =>
+          receipt.repo.toLowerCase() === repo.toLowerCase() && receipt.headRef === implementer.spec.branch
+        )) return true
+        return Boolean(await this.#openPullRequestByHead(repo, implementer.spec.branch))
       }
       // Only a NON-DRAFT (ready) PR counts as completion. A draft PR means the
       // work isn't review-ready, so an implementer exiting with only a draft PR
@@ -7092,6 +7133,8 @@ export class FactoryLoop implements Factory {
         state.nextDelayMs = this.#babysitterWakeUnreachableRetryMs
         if (!state.unreachableEscalated) {
           state.unreachableEscalated = true
+          await this.#fleet.reconcileTrackedAgents?.()
+          this.#increment('babysitterEventWakeUnreachableReconciliations')
           this.#increment('babysitterEventWakeUnreachableEscalations')
           this.#logger.warn?.('[factory] babysitter unreachable past grace window; slowing wake retries and flagging for human attention', {
             issue: state.issue.key,
@@ -9895,6 +9938,23 @@ type LabelDispatchResolution =
     maxImplementers?: number
   }
 
+function authoritativeRoutedDecision(
+  triaged: TriageDecision,
+  routed: TriageDecision,
+): TriageDecision {
+  if (triaged.confidence !== 'low' || triaged.routes.length > 0 || routed.routes.length === 0) {
+    return routed
+  }
+  return {
+    ...routed,
+    confidence: 'high',
+    rationale: [
+      routed.routes.map((route) => route.rationale).filter(Boolean).join(' '),
+      'Repository identity was resolved authoritatively from the live issue labels or GitHub source repository.',
+    ].filter(Boolean).join(' '),
+  }
+}
+
 function labelDerivedDispatchDecision(
   liveIssue: LinearIssue,
   decision: TriageDecision,
@@ -11866,12 +11926,33 @@ const durableBabysitterTrackedAgent = (
 const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
+const publishedPullRequests = (lifecycle: DispatchLifecycle | undefined): GithubPublishPullRequestResult[] => {
+  const receipts = [...(lifecycle?.pullRequests ?? []), ...(lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])]
+  return [...new Map(receipts.map((receipt) => [
+    `${receipt.repo.toLowerCase()}#${receipt.number}`,
+    { ...receipt },
+  ])).values()]
+}
+
+const mergePublishedPullRequests = (
+  lifecycle: DispatchLifecycle | undefined,
+  receipt: GithubPublishPullRequestResult | undefined,
+): GithubPublishPullRequestResult[] => {
+  const receipts = publishedPullRequests(lifecycle)
+  if (receipt) receipts.push(receipt)
+  return [...new Map(receipts.map((candidate) => [
+    candidate.repo.toLowerCase(),
+    { ...candidate },
+  ])).values()]
+}
+
 const lifecycleFromInFlightRecord = (
   record: InFlightIssue,
   runId: string,
   phase: DispatchLifecyclePhase,
   updatedAtMs: number,
   pullRequest?: GithubPublishPullRequestResult,
+  pullRequests: GithubPublishPullRequestResult[] = [],
   releaseReason?: string,
 ): DispatchLifecycle => ({
   runId,
@@ -11882,6 +11963,7 @@ const lifecycleFromInFlightRecord = (
   agents: [...record.agents].map(([name, tracked]) => ({ name, tracked: cloneTrackedAgent(tracked) })),
   invocationIds: [...record.invocationIds],
   result: record.result ? structuredClone(record.result) : undefined,
+  ...(pullRequests.length > 0 ? { pullRequests: pullRequests.map((receipt) => ({ ...receipt })) } : {}),
   ...(pullRequest ? { pullRequest: { ...pullRequest } } : {}),
   ...(releaseReason ? { releaseReason } : {}),
   updatedAtMs,
