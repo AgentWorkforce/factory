@@ -374,6 +374,8 @@ export class FactoryLoop implements Factory {
   readonly #dependencyIssues = new Map<string, { issue: LinearIssue; rank: number }>()
   readonly #terminalDependencyIdentities = new Set<string>()
   readonly #dependencyParkNotices = new Map<string, string>()
+  #dependencyGithubPathsByIdentity?: Map<string, string>
+  #dependencyLinearTreeLoaded = false
   readonly #pendingSlackClarifications = new Map<string, string>()
   readonly #pendingGithubClarifications = new Map<string, string>()
   readonly #clarificationIntents = new Map<string, number>()
@@ -1533,6 +1535,8 @@ export class FactoryLoop implements Factory {
       // current provider snapshots (or merged PR metadata) so a reopened issue
       // cannot remain permanently resolved after an earlier close event.
       this.#terminalDependencyIdentities.clear()
+      this.#dependencyGithubPathsByIdentity = undefined
+      this.#dependencyLinearTreeLoaded = false
       const issueSource = await this.#issueSource()
       if (issueSource === 'linear') {
         await this.#ingestGithubIssues({ dryRun })
@@ -2345,7 +2349,7 @@ export class FactoryLoop implements Factory {
         },
       }
     }
-    batch.clearPark(dispatchDecision.issue)
+    this.#clearDependencyPark(batch, dispatchDecision.issue)
     // Full task rendering is part of the durable spawn specification. It must
     // happen before a remote lifecycle is first claimed so takeover cannot
     // recover a persisted minimal triage task after a crash in this gap.
@@ -3090,7 +3094,7 @@ export class FactoryLoop implements Factory {
           if (parked) await this.#reportDependencyPark(liveIssue, parked, lifecycle.dryRun)
           return
         }
-        batch.clearPark(lifecycle.issue)
+        this.#clearDependencyPark(batch, lifecycle.issue)
       }
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined || !await this.#state.promoteDispatchLifecycle(
@@ -3955,8 +3959,6 @@ export class FactoryLoop implements Factory {
   async #loadMissingDependencyIssues(identities: string[]): Promise<void> {
     const pending = [...new Set(identities)]
     const expanded = new Set<string>()
-    let githubPathsByIdentity: Map<string, string> | undefined
-    let linearTreeLoaded = false
 
     while (pending.length > 0) {
       const identity = pending.shift()!
@@ -3986,24 +3988,25 @@ export class FactoryLoop implements Factory {
       }
 
       if (!this.#dependencyIssues.has(identity)) {
-        if (!githubPathsByIdentity) {
-          githubPathsByIdentity = new Map()
+        if (!this.#dependencyGithubPathsByIdentity) {
+          this.#dependencyGithubPathsByIdentity = new Map()
           for (const path of await this.#githubIssuePaths()) {
             const parts = githubIssuePathParts(path)
             if (parts) {
-              githubPathsByIdentity.set(githubIssueIdentity(parts.owner, parts.repo, parts.number), path)
+              this.#dependencyGithubPathsByIdentity.set(githubIssueIdentity(parts.owner, parts.repo, parts.number), path)
             }
           }
         }
-        const githubPath = githubPathsByIdentity.get(identity)
+        const githubPath = this.#dependencyGithubPathsByIdentity.get(identity)
         if (githubPath) await this.#readIssue(githubPath)
       }
 
-      if (!this.#dependencyIssues.has(identity) && !linearTreeLoaded) {
+      if (!this.#dependencyIssues.has(identity) && !this.#dependencyLinearTreeLoaded) {
         // Linear paths do not encode the routed repository identity, so load
         // the tree once and let #indexDependencyIssue build the composite map.
-        // This is also enough to resolve every later node in this traversal.
-        linearTreeLoaded = true
+        // The pass-scoped flag also lets every later blocked issue reuse the
+        // resulting dependency index instead of rescanning the full tree.
+        this.#dependencyLinearTreeLoaded = true
         for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
           if (isIssueFilePath(path)) await this.#readIssue(path)
         }
@@ -4017,6 +4020,11 @@ export class FactoryLoop implements Factory {
         if (resolved && !expanded.has(resolved.identity)) pending.push(resolved.identity)
       }
     }
+  }
+
+  #clearDependencyPark(batch: BatchSnapshot, issue: IssueRef): void {
+    batch.clearPark(issue)
+    this.#dependencyParkNotices.delete(issueKey(issue))
   }
 
   #dependencyGraph(): Map<string, string[]> {
@@ -4110,7 +4118,7 @@ export class FactoryLoop implements Factory {
     // its new state, so apply the explicit observation after indexing it.
     this.#terminalDependencyIdentities.add(identity)
     const batch = await this.#batch()
-    batch.clearPark(issueRef(issue))
+    this.#clearDependencyPark(batch, issueRef(issue))
     const candidates = batch.parked.filter((parked) =>
       parked.blockers.some((blocker) => blocker.identity === identity),
     )

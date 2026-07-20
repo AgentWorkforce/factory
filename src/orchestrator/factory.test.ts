@@ -2031,6 +2031,76 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('shares missing-blocker tree scans across one discovery pass', async () => {
+    const firstPath = githubIssuePath('AgentWorkforce', 'pear', 37)
+    const secondPath = githubIssuePath('AgentWorkforce', 'pear', 38)
+    const mount = new CountingListTreeMount({
+      [firstPath]: githubIssueFile(37, { labels: ['factory'], body: 'Blocked by: #937' }),
+      [secondPath]: githubIssueFile(38, { labels: ['factory'], body: 'Blocked by: #938' }),
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(factory.status().parked).toHaveLength(2)
+    expect(mount.listTreePrefixes.filter((prefix) => prefix === '/linear/issues')).toHaveLength(1)
+  })
+
+  it('posts the same dependency notice again after an issue successfully unparks and later re-parks', async () => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 39)
+    const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 40)
+    const blockedDependent = githubIssueFile(40, { labels: ['factory'], body: 'Blocked by: #39' })
+    class DependencyReparkRaceMount extends FakeMountClient {
+      failBeforeSpawn = false
+      dependentReads = 0
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        const result = await super.readFile(path)
+        if (path === dependentPath && this.failBeforeSpawn) {
+          this.dependentReads += 1
+          if (this.dependentReads === 2) {
+            this.failBeforeSpawn = false
+            return { content: githubIssueFile(40, { labels: [], body: '' }) }
+          }
+        }
+        return result
+      }
+    }
+    const mount = new DependencyReparkRaceMount({
+      [blockerPath]: githubIssueFile(39, { labels: ['reference-only'] }),
+      [dependentPath]: blockedDependent,
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    const issue = parseGithubFactoryIssue(dependentPath, blockedDependent)
+    const decision = await factory.triageIssue(issue)
+
+    expect((await factory.dispatch(decision)).hold?.kind).toBe('dependency')
+
+    mount.files.set(dependentPath, {
+      content: githubIssueFile(40, { labels: ['factory'], body: 'No blockers remain.' }),
+    })
+    mount.failBeforeSpawn = true
+    mount.dependentReads = 0
+    await expect(factory.dispatch(decision)).rejects.toThrow()
+
+    mount.files.set(dependentPath, { content: blockedDependent })
+    expect((await factory.dispatch(decision)).hold?.kind).toBe('dependency')
+    expect(githubWriteback.comments.filter((comment) =>
+      comment.key === '40' && comment.body.includes('Factory parked this issue'))).toHaveLength(2)
+  })
+
   it('spawns the reviewer with maxRestarts:0 so a torn-down reviewer is not re-registered as a broker orphan', async () => {
     // Regression: without an explicit restart policy the reviewer fell through
     // to the broker's default, which re-registers a name on exit. When Factory
