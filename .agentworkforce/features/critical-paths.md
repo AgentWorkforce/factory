@@ -175,10 +175,11 @@ thin/low-confidence triage OR [factory-needs-input] agent DM
   → deduplicate the reply
   → lease exactly one wake
   → resume saved sessions, or cold-start from persisted issue/question/answer context
-  → re-triage or inject the answer into implementer/babysitter session
+  → for ordinary thread conversation, durably coalesce replies and resume the thread-owned session with a fresh task
+  → never inject ordinary Slack conversation input into a running agent session
 ```
 
-If Slack is not configured, Factory must use a correlated GitHub issue comment and accept a reply only from the original issue reporter. Watchers, release/parking phases, pending replies, wake progress, and seven-day stakeholder escalations must survive restart; failed escalation attempts retry, and work that loses Factory scope cancels rather than waking.
+If Slack is not configured, Factory must use a correlated GitHub issue comment and accept a reply only from the original issue reporter. Watchers, thread-to-session ownership, coalesced pending turns, release/parking phases, pending replies, wake progress, and seven-day stakeholder escalations must survive restart; failed resume/escalation attempts retry, and work that loses Factory scope cancels rather than waking.
 
 **What breaks if this fails:** ambiguous work is guessed, agents wait forever, or an unauthorized commenter can steer execution.
 

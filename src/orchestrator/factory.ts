@@ -33,6 +33,7 @@ import type {
   GithubIssueCommentWatchPending,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
+  ConversationSessionState,
   StateStore,
   WaitingClarification,
 } from '../ports/state'
@@ -78,7 +79,9 @@ import type {
 } from '../types'
 import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
+import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { type InFlightIssue, issueKey, type TrackedAgent } from './batch-tracker'
+import { CoalescedTaskQueue } from './coalesced-task-queue'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
 import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
@@ -146,15 +149,6 @@ type BabysitterWakeState = {
   unreachableEscalated?: boolean
 }
 type IssueSource = 'linear' | 'github'
-type SlackReply = {
-  channelDir: string
-  threadTs: string
-  messageTs: string
-  text: string
-  isThreadReply: boolean
-  isBot: boolean
-  raw: Record<string, unknown>
-}
 type AgentQuestion = {
   agentName: string
   issueKey?: string
@@ -269,6 +263,8 @@ const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
+const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
+const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
@@ -328,6 +324,8 @@ export class FactoryLoop implements Factory {
   readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
+  readonly #slackConversationTurns: CoalescedTaskQueue<string>
+  readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
   readonly #githubIssueCommentWatchStates = new Map<string, GithubIssueCommentWatchState>()
   readonly #githubIssueCommentQueues = new Map<string, Promise<void>>()
@@ -483,6 +481,19 @@ export class FactoryLoop implements Factory {
     this.#batchReady = this.#state.getBatch(this.#workspaceId).then((batch) => {
       this.#batchView = batch
       return batch
+    })
+    this.#slackConversationTurns = new CoalescedTaskQueue({
+      delayMs: config.slack?.conversationCoalesceMs ?? 750,
+      run: async (conversationId) => this.#resumeSlackConversationTurn(conversationId),
+      onError: (error, conversationId) => {
+        this.#logger.warn?.('[factory] Slack conversation turn failed', {
+          conversationId,
+          error: describeError(error).errorMessage,
+        })
+        if (!this.#stopping) {
+          this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+        }
+      },
     })
     this.#wireFleetEvents()
   }
@@ -798,6 +809,7 @@ export class FactoryLoop implements Factory {
       this.#offAgentMessage?.()
       this.#offAgentLifecycleSignal?.()
       await Promise.allSettled([...this.#agentLifecycleSignalsInFlight.values()])
+      await this.#slackConversationTurns.stop()
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
       this.#offAgentMessage = undefined
@@ -8212,8 +8224,8 @@ export class FactoryLoop implements Factory {
     this.#emit('error', { error, ...describeError(error), issue })
   }
 
-  #increment(name: string): void {
-    this.#counters[name] = (this.#counters[name] ?? 0) + 1
+  #increment(name: string, amount = 1): void {
+    this.#counters[name] = (this.#counters[name] ?? 0) + amount
   }
 
   #recordTriageEscalation(decision: TriageDecision, reason: string): void {
@@ -8468,6 +8480,7 @@ export class FactoryLoop implements Factory {
       // the reply watcher instead of returning early, otherwise human replies in
       // the existing thread are watched by nobody and silently dropped.
       if (existingThread) {
+        await this.#ensureSlackConversationSession(record, existingThread)
         await this.#rearmSlackWatcher(record, existingThread)
       }
       return
@@ -8499,8 +8512,119 @@ export class FactoryLoop implements Factory {
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
+    await this.#ensureSlackConversationSession(record, root.threadId)
     await this.#watchSlackThread(record, root.threadId)
     this.#recordSlackWritebackSuccess('dispatch-thread')
+  }
+
+  async #ensureSlackConversationSession(record: InFlightIssue, threadId: string): Promise<void> {
+    const conversationId = slackConversationId(threadId)
+    const existing = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (existing) {
+      if (existing.pending.length > 0 || existing.delivery) this.#slackConversationTurns.schedule(conversationId)
+      return
+    }
+
+    const owned = [...record.agents.entries()]
+      .map(([name, tracked]) => ({ name, tracked }))
+      .find(({ tracked }) => tracked.spec.role === 'implementer' && Boolean(tracked.sessionRef))
+    const sessionRef = owned?.tracked.sessionRef
+    if (!owned || !sessionRef) {
+      this.#increment('slackConversationSessionsSkippedMissingSession')
+      return
+    }
+
+    const channelDir = await this.#slackChannelDir() ?? this.#config.slack?.channel
+    if (!channelDir) return
+    const agentName = owned.tracked.result?.name ?? owned.name
+    const reserved = await this.#state.reserveConversationSession(this.#workspaceId, conversationId, {
+      provider: 'slack',
+      issue: { ...record.issue },
+      externalId: threadId,
+      context: { channelDir },
+      agent: {
+        name: agentName,
+        sessionRef,
+        node: owned.tracked.result?.node ?? owned.tracked.spec.node,
+        capability: owned.tracked.spec.capability,
+        repo: owned.tracked.spec.repo,
+        clonePath: owned.tracked.spec.clonePath,
+      },
+      history: [],
+      pending: [],
+    })
+    if (reserved) this.#increment('slackConversationSessionsOwned')
+  }
+
+  async #resumeSlackConversationTurn(conversationId: string): Promise<void> {
+    if (this.#stopping) return
+    const claimed = await this.#state.claimConversationTurn(
+      this.#workspaceId,
+      conversationId,
+      this.#slackConversationOwner,
+      this.#clock.now(),
+      SLACK_CONVERSATION_TURN_LEASE_MS,
+    )
+    if (!claimed?.delivery) {
+      const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (current && (current.pending.length > 0 || current.delivery)) {
+        this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+      }
+      return
+    }
+
+    try {
+      const result = await this.#fleet.resume({
+        name: claimed.agent.name,
+        sessionRef: claimed.agent.sessionRef,
+        node: claimed.agent.node ?? 'self',
+        capability: claimed.agent.capability,
+        repo: claimed.agent.repo,
+        clonePath: claimed.agent.clonePath,
+        task: slackConversationResumeTask(claimed),
+      })
+      const completed = await this.#state.completeConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        { name: result.name, sessionRef: result.sessionRef },
+      )
+      if (!completed) {
+        this.#increment('slackConversationTurnOwnershipLost')
+        return
+      }
+      this.#increment('slackConversationTurnsResumed')
+      if (claimed.delivery.messages.length > 1) {
+        this.#increment('slackConversationRepliesCoalesced', claimed.delivery.messages.length - 1)
+      }
+    } catch (error) {
+      try {
+        await this.#state.releaseConversationTurn(
+          this.#workspaceId,
+          conversationId,
+          this.#slackConversationOwner,
+        )
+      } catch (releaseError) {
+        this.#logger.warn?.('[factory] Slack conversation claim release failed; waiting for lease recovery', {
+          conversationId,
+          error: describeError(releaseError).errorMessage,
+        })
+      }
+      this.#increment('slackConversationTurnResumeFailures')
+      this.#logger.warn?.('[factory] Slack conversation resume failed; retaining the turn for retry', {
+        issue: claimed.issue.key,
+        threadId: claimed.externalId,
+        sessionRef: claimed.agent.sessionRef,
+        error: describeError(error).errorMessage,
+      })
+      this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
+      return
+    }
+
+    const remaining = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (remaining && (remaining.pending.length > 0 || remaining.delivery)) {
+      this.#slackConversationTurns.schedule(conversationId)
+    }
   }
 
   async #escalateTriage(decision: TriageDecision, reason: string, dryRun: boolean): Promise<DispatchResult | undefined> {
@@ -8902,7 +9026,7 @@ export class FactoryLoop implements Factory {
 
     let subscription: Subscription | undefined
     try {
-      subscription = this.#mount.subscribe([`${messagesPrefix}**`], (event) => {
+      subscription = this.#mount.subscribe([slackThreadReplyGlob(channelDir)], (event) => {
         // Receipt time is independent of the provider-authored sync timestamp.
         // A healthy webhook can therefore override a frozen advisory status
         // without trusting the same field that declared the provider stale.
@@ -8960,7 +9084,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    let latest: SlackReply | undefined
+    let latest: SlackThreadReply | undefined
     for (const path of preExistingPaths) {
       const reply = await this.#readSlackReply(path)
       if (
@@ -9007,7 +9131,8 @@ export class FactoryLoop implements Factory {
     if (!this.#slack || !this.#config.slack) {
       return
     }
-    for (const record of (await this.#batch()).inFlight) {
+    const batch = await this.#batch()
+    for (const record of batch.inFlight) {
       if (record.dryRun) {
         continue
       }
@@ -9025,7 +9150,19 @@ export class FactoryLoop implements Factory {
       if (!threadId) {
         continue
       }
+      await this.#ensureSlackConversationSession(record, threadId)
       await this.#rearmSlackWatcher(record, threadId)
+    }
+    for (const [conversationId, session] of await this.#state.listConversationSessions(this.#workspaceId)) {
+      if (session.provider !== 'slack') continue
+      const threadId = session.externalId
+      const record = batch.getIssue(session.issue)
+      const key = issueKey(session.issue)
+      if (record && !record.dryRun && !this.#slackWatchers.has(key) && !this.#slackWatcherStarts.has(key)) {
+        await this.#state.setSlackThread(this.#workspaceId, key, threadId)
+        await this.#rearmSlackWatcher(record, threadId)
+      }
+      if (session.pending.length > 0 || session.delivery) this.#slackConversationTurns.schedule(conversationId)
     }
     await this.#sweepWaitingClarifications()
     for (const [, waiting] of await this.#state.listWaitingClarifications(this.#workspaceId)) {
@@ -9197,21 +9334,23 @@ export class FactoryLoop implements Factory {
     const key = issueKey(issue)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
     await this.#state.clearSlackThread(this.#workspaceId, key)
+    if (threadId) await this.#state.clearConversationSession(this.#workspaceId, slackConversationId(threadId))
     await watcher?.stop()
   }
 
-  async #readSlackReply(path: string): Promise<SlackReply | undefined> {
+  async #readSlackReply(path: string): Promise<SlackThreadReply | undefined> {
     try {
       const { content } = await this.#mount.readFile(path)
-      return parseSlackReply(path, content, this.#config.slack?.botUserId ?? 'U0B2596R7EZ')
+      return parseSlackThreadReply(path, content, this.#config.slack?.botUserId ?? 'U0B2596R7EZ')
     } catch (error) {
       this.#logger.warn?.(`Unable to read Slack reply ${path}`, error)
       return undefined
     }
   }
 
-  async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackReply): Promise<DispatchResult | undefined> {
+  async #routeSlackAnswerToImplementers(record: InFlightIssue, reply: SlackThreadReply): Promise<DispatchResult | undefined> {
     if (!this.#config.slack) {
       return
     }
@@ -9234,6 +9373,7 @@ export class FactoryLoop implements Factory {
         text,
         receivedAtMs: this.#clock.now(),
         source: 'slack',
+        author: reply.author,
       })
       if (!claimed) {
         this.#increment('clarificationDuplicateWakesSuppressed')
@@ -9241,6 +9381,24 @@ export class FactoryLoop implements Factory {
       }
       this.#increment('clarificationRepliesClaimed')
       await this.#wakeWaitingClarification(clarificationKey, claimed)
+      return
+    }
+
+    const conversationId = slackConversationId(reply.threadTs)
+    const conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    if (conversation && issueKey(conversation.issue) === clarificationKey) {
+      const queued = await this.#state.appendConversationMessage(this.#workspaceId, conversationId, {
+        id: `${reply.threadTs}:${reply.messageTs}`,
+        text,
+        receivedAtMs: this.#clock.now(),
+        author: reply.author,
+      })
+      if (!queued) {
+        this.#increment('slackConversationDuplicateRepliesSuppressed')
+        return
+      }
+      this.#increment('slackConversationRepliesQueued')
+      this.#slackConversationTurns.schedule(conversationId)
       return
     }
 
@@ -9252,27 +9410,7 @@ export class FactoryLoop implements Factory {
       this.#increment('slackAnswersIgnoredNoInFlight')
       return
     }
-
-    if (!this.#fleet.sendInput) {
-      return
-    }
-
-    // Route human replies to the implementers AND the babysitter — once a PR is
-    // open the babysitter is the one chatting with the human about it.
-    const recipients = [...liveRecord.agents.values()]
-      .filter((agent) => agent.spec.role === 'implementer' || agent.spec.role === 'babysitter')
-      .map((agent) => agent.result?.name ?? agent.spec.name)
-      .filter((name): name is string => Boolean(name))
-
-    if (recipients.length === 0) {
-      this.#increment('slackAnswersIgnoredNoImplementer')
-      return
-    }
-
-    for (const recipient of new Set(recipients)) {
-      await this.#injectSlackReplyEvent(recipient, liveRecord.issue, text)
-      this.#increment('slackAnswersInjected')
-    }
+    this.#increment('slackAnswersIgnoredNoConversationSession')
   }
 
   async #wakeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
@@ -9697,15 +9835,6 @@ export class FactoryLoop implements Factory {
       this.#increment('slackTriageAnswersQueued')
       this.#emit('issue-queued', { issue: decision.issue })
     }
-  }
-
-  // Route ordinary Slack conversation into a live agent framed as the
-  // <integration-event> the spawn prompt tells it to expect (not an ambiguous
-  // "Slack reply for ..." keystroke), so the agent recognizes it as the awaited
-  // event. (A broker confirmed-delivery path via waitForInjected is a possible
-  // robustness follow-up.)
-  async #injectSlackReplyEvent(recipient: string, issue: IssueRef, text: string): Promise<void> {
-    await this.#fleet.sendInput?.(recipient, slackReplyEvent(issue, text))
   }
 
   // Absolute path to the local .integrations mount the daemon manages. The mount
@@ -11993,9 +12122,9 @@ const defaultRestartPolicy = (spec: AgentSpec): AgentSpec['restartPolicy'] | und
     ? { maxRestarts: 0 } as AgentSpec['restartPolicy']
     : spec.restartPolicy
 
-const slackPayloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
-
 const slackChannelMessagesPrefix = (channelDir: string): string => `/slack/channels/${channelDir}/messages/`
+
+const slackConversationId = (threadId: string): string => `slack:${threadId}`
 
 const eventIdentity = (event: ChangeEvent): string | undefined => {
   const record = event as unknown as Record<string, unknown>
@@ -12257,30 +12386,6 @@ const dispatchResultFromLifecycle = (lifecycle: DispatchLifecycle): DispatchResu
     dryRun: lifecycle.dryRun,
   }
 
-const parseSlackReply = (path: string, content: unknown, botUserId: string): SlackReply | undefined => {
-  const raw = asRecord(parseJsonContent(content)) ?? {}
-  const payload = wrappedPayload(raw)
-  const channelDir = path.match(/^\/slack\/channels\/([^/]+)\//u)?.[1] ?? ''
-  const pathMatch = path.match(/^\/slack\/channels\/[^/]+\/messages\/([^/]+)(?:\/replies\/([^/]+))?/u)
-  const parentFromPath = pathMatch?.[2] ? slackPayloadTs(pathMatch[1]) : undefined
-  const messageFromPath = slackPayloadTs(pathMatch?.[2] ?? pathMatch?.[1] ?? '')
-  const messageTs = stringValue(payload.ts) ?? messageFromPath
-  const threadTs = stringValue(payload.thread_ts) ?? parentFromPath
-  if (!channelDir || !threadTs || !messageTs) {
-    return undefined
-  }
-
-  return {
-    channelDir,
-    threadTs,
-    messageTs,
-    text: stringValue(payload.text) ?? '',
-    isThreadReply: Boolean(parentFromPath) || threadTs !== messageTs,
-    isBot: isOwnSlackBotReply(payload, botUserId),
-    raw,
-  }
-}
-
 const triageEscalationReason = (decision: TriageDecision): string | undefined => {
   const reasons: string[] = []
   if (decision.confidence === 'low') {
@@ -12367,15 +12472,6 @@ const issueWithGithubClarification = (issue: LinearIssue, text: string): LinearI
   ].join('\n'),
 })
 
-const slackAnswerInput = (issue: IssueRef, text: string): string =>
-  `Slack reply for ${issue.key}:\n${text}\r`
-
-// The human's Slack-thread reply, framed as an <integration-event> the agent is
-// told (at spawn) to expect — a recognizable injected event, not an ambiguous
-// keystroke. Trailing CR submits it to the agent's PTY.
-const slackReplyEvent = (issue: IssueRef, text: string): string =>
-  `<integration-event source="slack" issue="${issue.key}">\nHuman reply in the Slack thread:\n${text}\n</integration-event>\r`
-
 const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification): string => {
   const reply = waiting.reply
   return [
@@ -12385,6 +12481,28 @@ const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification
     `The blocked question was: ${waiting.question}`,
     `The human answered${reply?.author ? ` as @${reply.author}` : ''}: ${reply?.text ?? ''}`,
     'Re-hydrate from the issue, branch, worktree, and any open PR, then continue the task. Do not repeat completed work.',
+  ].join('\n')
+}
+
+const slackConversationResumeTask = (session: ConversationSessionState): string => {
+  const delivered = session.delivery?.messages ?? []
+  const renderMessages = (messages: ConversationSessionState['history']): string => messages
+    .map((message, index) => `${index + 1}. ${message.author ? `${message.author}: ` : ''}${message.text}`)
+    .join('\n')
+  return [
+    `Continue the existing ${session.issue.key} session for one turn in its Factory-owned Slack thread.`,
+    `Slack channel mount: /slack/channels/${session.context.channelDir ?? 'unknown'}`,
+    `Slack thread timestamp: ${session.externalId}`,
+    'The session history, issue, branch, worktree, and open PR remain authoritative. Re-hydrate current repository state before changing code and do not repeat completed work.',
+    ...(session.history.length > 0
+      ? ['', 'Earlier human messages in this Slack conversation:', renderMessages(session.history.slice(-20))]
+      : []),
+    '',
+    'New human messages coalesced into this turn, in order:',
+    renderMessages(delivered),
+    '',
+    'Address every new message. Reply in the same Slack thread through the connected Slack mount/writeback surface, then continue or report the issue work as appropriate.',
+    'This input was supplied atomically as a fresh resume task. Do not request or depend on live PTY/session injection.',
   ].join('\n')
 }
 
@@ -12511,10 +12629,6 @@ const clarificationStaleSlackText = (
 ].filter((line): line is string => Boolean(line)).join('\n')
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
-
-const isOwnSlackBotReply = (payload: Record<string, unknown>, botUserId: string): boolean =>
-  payload.user_is_bot === true ||
-  stringValue(payload.user) === botUserId
 
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)

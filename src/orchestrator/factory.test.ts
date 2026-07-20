@@ -199,6 +199,7 @@ const slackConfig = (channel = 'C0FACTORY__factory-e2e') => ({
   botUserId: 'U0B2596R7EZ',
   stakeholderUserIds: [] as string[],
   staleAfterMs: 10 * 60_000,
+  conversationCoalesceMs: 10,
 })
 
 const flush = async () => {
@@ -410,12 +411,13 @@ class CountingTriage extends StaticTriage {
 class FailingSlackAnswerFleetClient extends FakeFleetClient {
   failuresRemaining = 1
 
-  override async sendInput(name: string, data: string): Promise<void> {
-    if (data.startsWith('<integration-event source="slack"') && this.failuresRemaining > 0) {
+  override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
+    if (input.task?.startsWith('Continue the existing ') && this.failuresRemaining > 0) {
       this.failuresRemaining -= 1
-      throw new Error('sendInput failed')
+      this.resumes.push(input)
+      throw new Error('resume failed')
     }
-    await super.sendInput(name, data)
+    return await super.resume(input)
   }
 }
 
@@ -12034,9 +12036,10 @@ describe('FactoryLoop', () => {
     expect(slackAnswerInputs(fleet)).toEqual([])
   })
 
-  it('watches the in-flight factory Slack thread and routes a human reply to the implementer', async () => {
+  it('coalesces rapid Slack replies into one resumed session turn with continued context and zero injection', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(24)]: issueFile(24) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-24-impl-pear', 'session-ar-24-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -12052,15 +12055,42 @@ describe('FactoryLoop', () => {
       user_name: 'human',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-2'), 'slack-human-2', {
+      text: 'Also cover the restart case.',
+      user: 'U123',
+      user_name: 'human',
+      user_is_bot: false,
+    })
 
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-24-impl-pear', data: '<integration-event source="slack" issue="AR-24">\nHuman reply in the Slack thread:\nPlease use the existing retry helper.\n</integration-event>\r' },
+    await expectSlackConversationResume(fleet, [
+      'Please use the existing retry helper.',
+      'Also cover the restart case.',
+      `Slack thread timestamp: ${slack.threadId}`,
     ])
+    expect(fleet.resumes[0]).toMatchObject({
+      name: 'ar-24-impl-pear',
+      sessionRef: 'session-ar-24-impl-pear',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/pear',
+      clonePath: '/work/pear',
+    })
+    expect(factory.status().counters.slackConversationRepliesCoalesced).toBe(1)
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
     expect(mount.confirmedPaths.filter((path) => path.includes('/replies/'))).toEqual([])
+
+    emitSlackReply(mount, slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'human-3'), 'slack-human-3', {
+      text: 'What did you decide?',
+      user: 'U123',
+      user_name: 'human',
+      user_is_bot: false,
+    })
+    await expectSlackConversationResume(fleet, [
+      'Earlier human messages in this Slack conversation:',
+      'Please use the existing retry helper.',
+      'Also cover the restart case.',
+      'What did you decide?',
+    ], 2)
   })
 
   it('resolves a configured Slack channel name to the mounted channel directory', async () => {
@@ -12070,6 +12100,7 @@ describe('FactoryLoop', () => {
       [`/slack/channels/${channelDir}/meta.json`]: {},
     })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-35-impl-pear', 'session-ar-35-impl-pear')
     const factory = createFactory(config({ slack: slackConfig('factory-e2e') }), {
       mount,
       fleet,
@@ -12087,15 +12118,10 @@ describe('FactoryLoop', () => {
       user: 'U123',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-35-impl-pear', data: '<integration-event source="slack" issue="AR-35">\nHuman reply in the Slack thread:\nUse the mounted channel directory.\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['Use the mounted channel directory.'])
   })
 
-  it('routes a mid-task agent question to the Slack dispatch thread and returns the human answer via sendInput', async () => {
+  it('routes a mid-task agent question to the Slack dispatch thread and resumes with the human answer', async () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(36)]: issueFile(36) })
     const fleet = new FakeFleetClient()
     fleet.setSessionRef('ar-36-impl-pear', 'session-ar-36-impl-pear')
@@ -12155,7 +12181,7 @@ describe('FactoryLoop', () => {
     ])
     for (const resume of fleet.resumes) {
       expect(resume.task).toContain('The blocked question was: Which retry helper should I use?')
-      expect(resume.task).toContain('The human answered: Use the shared retry helper in factory.ts.')
+      expect(resume.task).toContain('The human answered as @U123: Use the shared retry helper in factory.ts.')
     }
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-36'])
     expect(fleet.messages).toEqual([])
@@ -13736,6 +13762,7 @@ describe('FactoryLoop', () => {
   it('watches top-level inbound Slack thread replies keyed by real reply ts', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(32)]: issueFile(32) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-32-impl-pear', 'session-ar-32-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -13751,12 +13778,7 @@ describe('FactoryLoop', () => {
       user: 'U123',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-32-impl-pear', data: '<integration-event source="slack" issue="AR-32">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?'])
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount)).toEqual([])
   })
@@ -13827,6 +13849,7 @@ describe('FactoryLoop', () => {
   it('degraded positive control: genuine human reply in the watched thread is answered', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(35)]: issueFile(35) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-35-impl-pear', 'session-ar-35-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -13842,12 +13865,7 @@ describe('FactoryLoop', () => {
       user: 'U-HUMAN',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-35-impl-pear', data: '<integration-event source="slack" issue="AR-35">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?'])
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
@@ -13913,6 +13931,7 @@ describe('FactoryLoop', () => {
   it('connects Slack reply watchers from now and does not reprocess pre-existing thread replies', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(27)]: issueFile(27) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-27-impl-pear', 'session-ar-27-impl-pear')
     const slack = new RecordingSlack()
     const oldPath = slackReplyFixturePath('C0FACTORY__factory-e2e', slack.threadId, 'old-human')
     emitSlackReply(mount, oldPath, 'slack-old-human', {
@@ -13938,12 +13957,7 @@ describe('FactoryLoop', () => {
       user: 'U456',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-27-impl-pear', data: '<integration-event source="slack" issue="AR-27">\nHuman reply in the Slack thread:\nnew status?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['new status?'])
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
@@ -13956,6 +13970,7 @@ describe('FactoryLoop', () => {
     await state.setSlackThread('factory-test', issueKey(parseLinearIssue(issuePath(80), issueFile(80))), persistedThread)
     const mount = new CloudWritebackFakeMountClient({ [issuePath(80)]: issueFile(80) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-80-impl-pear', 'session-ar-80-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -13979,18 +13994,14 @@ describe('FactoryLoop', () => {
       user: 'U123',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-80-impl-pear', data: '<integration-event source="slack" issue="AR-80">\nHuman reply in the Slack thread:\nhow is it going?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['how is it going?'])
   })
 
   it('rehydrates Slack reply watchers on start() for in-flight issues that persist across a restart', async () => {
     const state = new InMemoryStateStore({ batchSize: 2 })
     const mount = new CloudWritebackFakeMountClient({ [issuePath(81)]: issueFile(81) })
     const dispatchFleet = new FakeFleetClient()
+    dispatchFleet.setSessionRef('ar-81-impl-pear', 'session-ar-81-impl-pear')
     const dispatchSlack = new RecordingSlack()
     const dispatcher = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -14003,6 +14014,7 @@ describe('FactoryLoop', () => {
     await flush()
     await flush()
     const persistedThread = dispatchSlack.threadId
+    await dispatcher.stop()
 
     // Simulate a restart: a fresh factory instance over the same persisted state
     // and mount, with its own fleet and an empty in-process watcher map.
@@ -14023,15 +14035,76 @@ describe('FactoryLoop', () => {
       user: 'U777',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(restartFleet)).toEqual([
-      { name: 'ar-81-impl-pear', data: '<integration-event source="slack" issue="AR-81">\nHuman reply in the Slack thread:\nany update?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(restartFleet, ['any update?'])
+    expect(restartFleet.resumes[0]?.sessionRef).toBe('session-ar-81-impl-pear')
 
     await restarted.stop()
-    await dispatcher.stop()
+  })
+
+  it('restores durable Slack thread ownership and resumes the same session after a daemon restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-slack-conversation-restart-'))
+    const watchStatePath = join(root, 'factory-state.json')
+    const mount = new CloudWritebackFakeMountClient({ [issuePath(130)]: issueFile(130) })
+    const factoryConfig = config({ slack: slackConfig() })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    firstFleet.setSessionRef('ar-130-impl-pear', 'session-ar-130-impl-pear')
+    const firstSlack = new RecordingSlack()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      slack: firstSlack,
+      stateStore: state(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(130), issueFile(130))))
+      await expect(state().listConversationSessions('factory-test')).resolves.toEqual([
+        [`slack:${firstSlack.threadId}`, expect.objectContaining({
+          provider: 'slack',
+          issue: expect.objectContaining({ key: 'AR-130' }),
+          agent: expect.objectContaining({
+            name: 'ar-130-impl-pear',
+            sessionRef: 'session-ar-130-impl-pear',
+          }),
+        })],
+      ])
+      await first.stop()
+
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        triage: new StaticTriage(),
+        slack: new RecordingSlack(),
+        stateStore: state(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      expect(restarted.status().counters.slackWatchersRearmed).toBe(1)
+
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e',
+        firstSlack.threadId,
+        'human-after-daemon-restart',
+      ), 'slack-human-after-daemon-restart', {
+        text: 'Please continue from the same session after restart.',
+        user: 'U130',
+        user_name: 'human',
+        user_is_bot: false,
+      })
+      await expectSlackConversationResume(restartedFleet, [
+        'Please continue from the same session after restart.',
+      ])
+      expect(restartedFleet.resumes[0]).toMatchObject({
+        name: 'ar-130-impl-pear',
+        sessionRef: 'session-ar-130-impl-pear',
+      })
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('does not re-arm a Slack watcher on start() when no dispatch thread persists', async () => {
@@ -14060,6 +14133,7 @@ describe('FactoryLoop', () => {
   it('dedupes duplicate inbound Slack reply delivery by event identity and content', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(28)]: issueFile(28) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-28-impl-pear', 'session-ar-28-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -14076,18 +14150,14 @@ describe('FactoryLoop', () => {
       user_is_bot: false,
     })
     mount.emit(changeEvent(replyPath, 'slack-duplicate-human'))
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-28-impl-pear', data: '<integration-event source="slack" issue="AR-28">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?'])
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
-  it('dedupes Slack answer injections by human message ts across poll re-reads with fresh event ids', async () => {
+  it('dedupes Slack conversation turns by human message ts across poll re-reads with fresh event ids', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(42)]: issueFile(42) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-42-impl-pear', 'session-ar-42-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -14116,12 +14186,7 @@ describe('FactoryLoop', () => {
     })
     mount.emit(changeEvent(path, 'slack-human-reread-1'))
     mount.emit(changeEvent(path, 'slack-human-reread-2'))
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-42-impl-pear', data: '<integration-event source="slack" issue="AR-42">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?'])
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
@@ -14193,9 +14258,10 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.invalidSlackThreadsCleared).toBe(1)
   })
 
-  it('continues processing Slack reply events after one answer injection fails', async () => {
+  it('retains and retries a coalesced Slack turn after resume fails', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(30)]: issueFile(30) })
     const fleet = new FailingSlackAnswerFleetClient()
+    fleet.setSessionRef('ar-30-impl-pear', 'session-ar-30-impl-pear')
     const slack = new RecordingSlack()
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -14215,18 +14281,16 @@ describe('FactoryLoop', () => {
       user: 'U456',
       user_is_bot: false,
     })
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-30-impl-pear', data: '<integration-event source="slack" issue="AR-30">\nHuman reply in the Slack thread:\nstatus again?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?', 'status again?'], 2)
+    expect(factory.status().counters.slackConversationTurnResumeFailures).toBe(1)
+    expect(factory.status().counters.slackConversationTurnsResumed).toBe(1)
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
   it('uses numeric Slack reply event ids without dropping fresh low-seq replies', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(31)]: issueFile(31) })
     const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-31-impl-pear', 'session-ar-31-impl-pear')
     const slack = new RecordingSlack()
     const warnings: unknown[][] = []
     const logger = {
@@ -14263,12 +14327,7 @@ describe('FactoryLoop', () => {
       },
     })
     mount.emit(changeEvent(replyPath, 1))
-    await flush()
-    await flush()
-
-    expect(slackAnswerInputs(fleet)).toEqual([
-      { name: 'ar-31-impl-pear', data: '<integration-event source="slack" issue="AR-31">\nHuman reply in the Slack thread:\nstatus?\n</integration-event>\r' },
-    ])
+    await expectSlackConversationResume(fleet, ['status?'])
     expect(slackReplyWrites(mount)).toEqual([])
     expect(warnings.flat()).not.toContain('[factory] Slack reply event missing stable identity; falling back to path/content dedupe')
   })
@@ -16453,6 +16512,21 @@ const slackReplyWrites = (mount: FakeMountClient): Array<{ path: string; content
 
 const slackAnswerInputs = (fleet: FakeFleetClient): Array<{ name: string; data: string }> =>
   fleet.inputs.filter((input) => input.data !== '\r')
+
+const slackConversationResumes = (fleet: FakeFleetClient) =>
+  fleet.resumes.filter((resume) => resume.task?.startsWith('Continue the existing '))
+
+const expectSlackConversationResume = async (
+  fleet: FakeFleetClient,
+  expectedMessages: string[],
+  count = 1,
+) => {
+  await vi.waitFor(() => expect(slackConversationResumes(fleet)).toHaveLength(count), { timeout: 3_000 })
+  const task = slackConversationResumes(fleet).at(-1)?.task ?? ''
+  for (const message of expectedMessages) expect(task).toContain(message)
+  expect(fleet.inputs).toEqual([])
+  expect(fleet.messages).toEqual([])
+}
 
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}

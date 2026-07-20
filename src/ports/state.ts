@@ -1,4 +1,4 @@
-import type { SendInput, SpawnResult } from './fleet'
+import type { Capability, SendInput, SpawnResult } from './fleet'
 import type { AgentWorktree } from './worktree'
 import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
@@ -69,6 +69,41 @@ export type BabysitterSessionState = {
   path?: string
   critical: boolean
   pendingKinds: string[]
+}
+
+export type ConversationMessage = {
+  id: string
+  text: string
+  receivedAtMs: number
+  author?: string
+}
+
+export type ConversationSessionState = {
+  provider: string
+  issue: IssueRef
+  /** Provider-native conversation/thread identifier. */
+  externalId: string
+  /** Provider-specific routing metadata; continuity itself stays provider-neutral. */
+  context: Record<string, string>
+  agent: {
+    name: string
+    sessionRef: string
+    node?: string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }
+  /** Previously delivered human turns, retained as bounded resume context. */
+  history: ConversationMessage[]
+  /** New replies waiting for the short coalescing window. */
+  pending: ConversationMessage[]
+  /** Claimed batch; new arrivals remain in pending while this resume runs. */
+  delivery?: {
+    owner: string
+    claimedAtMs: number
+    attempts: number
+    messages: ConversationMessage[]
+  }
 }
 
 export type DispatchAttemptState = {
@@ -231,6 +266,15 @@ export interface StateStore {
   getSlackThread(workspaceId: string, issueKey: string): Promise<string | undefined>
   clearSlackThread(workspaceId: string, issueKey: string): Promise<void>
   clearSlackThreads(workspaceId: string): Promise<void>
+
+  reserveConversationSession(workspaceId: string, conversationId: string, session: ConversationSessionState): Promise<boolean>
+  getConversationSession(workspaceId: string, conversationId: string): Promise<ConversationSessionState | undefined>
+  listConversationSessions(workspaceId: string): Promise<Array<[string, ConversationSessionState]>>
+  appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
+  claimConversationTurn(workspaceId: string, conversationId: string, owner: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
+  completeConversationTurn(workspaceId: string, conversationId: string, owner: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
+  releaseConversationTurn(workspaceId: string, conversationId: string, owner: string): Promise<void>
+  clearConversationSession(workspaceId: string, conversationId: string): Promise<void>
 
   setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
   listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>
