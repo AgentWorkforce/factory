@@ -20,7 +20,8 @@ const REFERENCE_PARTS = new RegExp(`^(?:(${REPO}))?#([1-9]\\d*)$`, 'u')
  * Blocked by line is ignored as a whole so incidental issue prose never gates
  * dispatch.
  */
-export function parseBlockedBy(text: string): DeclaredDependency[] {
+export function parseBlockedBy(text: string | null | undefined): DeclaredDependency[] {
+  if (!text) return []
   const dependencies = new Map<string, DeclaredDependency>()
   for (const line of text.split(/\r?\n/u)) {
     const match = BLOCKED_BY_LINE.exec(line)
@@ -28,8 +29,9 @@ export function parseBlockedBy(text: string): DeclaredDependency[] {
     for (const rawReference of match[1].split(',')) {
       const raw = rawReference.trim()
       const parts = REFERENCE_PARTS.exec(raw)
-      const number = Number(parts?.[2])
-      if (!parts || !Number.isSafeInteger(number) || number <= 0) continue
+      if (!parts) continue
+      const number = Number(parts[2])
+      if (!Number.isSafeInteger(number) || number <= 0) continue
       const repo = parts[1]
       const key = `${repo?.toLowerCase() ?? ''}#${number}`
       dependencies.set(key, { ...(repo ? { repo } : {}), number, raw })

@@ -69,6 +69,12 @@ describe('dependency-aware BatchTracker admission', () => {
     ])
   })
 
+  it('treats a missing or empty description as no declared dependencies', () => {
+    expect(parseBlockedBy(undefined)).toEqual([])
+    expect(parseBlockedBy(null)).toEqual([])
+    expect(parseBlockedBy('')).toEqual([])
+  })
+
   it('finds direct and transitive cycles reachable from an issue', () => {
     const graph = new Map<string, string[]>([
       ['agentworkforce/pear#1', ['agentworkforce/pear#2']],

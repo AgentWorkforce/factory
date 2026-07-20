@@ -3000,14 +3000,13 @@ export class FactoryLoop implements Factory {
       const liveIssue = await this.#readIssue(lifecycle.issue.path)
       if (liveIssue) {
         const dependencyAdmission = await this.#dependencyAdmission(liveIssue, lifecycle.decision)
+        const batch = await this.#batch()
         if (dependencyAdmission.blockers.length > 0 || dependencyAdmission.cycle) {
-          const batch = await this.#batch()
           batch.queue(lifecycle.decision, lifecycle.dryRun, dependencyAdmission)
           const parked = batch.getParked(lifecycle.issue)
           if (parked) await this.#reportDependencyPark(liveIssue, parked, lifecycle.dryRun)
           return
         }
-        const batch = await this.#batch()
         batch.clearPark(lifecycle.issue)
       }
       const epoch = this.#dispatchLifecycleEpochs.get(key)
@@ -3753,7 +3752,8 @@ export class FactoryLoop implements Factory {
     return entry?.[0]
   }
 
-  #indexDependencyIssue(issue: LinearIssue): void {
+  #indexDependencyIssue(issue: LinearIssue | undefined): void {
+    if (!issue) return
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     const identity = dependencyIdentityForIssue(issue, repo)
     if (!identity) return
