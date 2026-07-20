@@ -48,6 +48,10 @@
     "./node": {
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
+    },
+    "./hosted": {
+      "types": "./dist/hosted/index.d.ts",
+      "import": "./dist/hosted/index.js"
     }
   },
   "publishConfig": {
