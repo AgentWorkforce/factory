@@ -129,55 +129,12 @@ else
 fi
 
 if node --input-type=module <<'NODE' >> "$LOG" 2>&1
-import { existsSync, readFileSync } from 'node:fs'
-import { parse } from 'yaml'
+import { readFileSync } from 'node:fs'
+import { validateFeatureManifestFile } from './dist/featuremap/index.js'
 
-const manifest = parse(readFileSync('.agentworkforce/features/manifest.yaml', 'utf8'))
 const procedures = readFileSync('.agentworkforce/features/verify/procedures.md', 'utf8')
-const categories = Object.values(manifest.categories || {})
-const validCriticalities = new Set(['critical', 'hot', 'standard'])
-function validateCategoryCriticalities(categoryMap) {
-  for (const [categoryId, category] of Object.entries(categoryMap || {})) {
-    if (!validCriticalities.has(category?.criticality)) {
-      throw new Error('invalid manifest category criticality for ' + categoryId + ': ' + JSON.stringify(category?.criticality))
-    }
-  }
-}
-validateCategoryCriticalities(manifest.categories)
-for (const invalidCriticality of [undefined, 'urgent']) {
-  let rejected = false
-  try {
-    validateCategoryCriticalities({ regression: { criticality: invalidCriticality } })
-  } catch {
-    rejected = true
-  }
-  if (!rejected) throw new Error('category criticality regression was accepted: ' + JSON.stringify(invalidCriticality))
-}
-const features = categories.flatMap((category) => category.features || [])
-const ids = features.map((feature) => feature.id)
-if (categories.length === 0 || features.length === 0) throw new Error('manifest is empty')
-if (new Set(ids).size !== ids.length) throw new Error('duplicate manifest feature IDs')
-const tierCounts = Object.fromEntries([1, 2, 3, 4, 5, 6].map((tier) => [
-  tier,
-  features.filter((feature) => feature.verify_tier === tier).length,
-]))
-if (manifest.catalog?.category_count !== categories.length ||
-    manifest.catalog?.feature_count !== features.length ||
-    JSON.stringify(manifest.catalog?.tier_counts) !== JSON.stringify(tierCounts)) {
-  throw new Error('manifest catalog summary mismatch: ' + JSON.stringify({
-    catalog: manifest.catalog,
-    actual: { category_count: categories.length, feature_count: features.length, tier_counts: tierCounts },
-  }))
-}
+const { categoryCount, features } = validateFeatureManifestFile({ rootDir: process.cwd() })
 for (const feature of features) {
-  if (!feature.id || !feature.name || (!feature.cli && !feature.api) ||
-      !feature.description || !feature.location ||
-      !Number.isInteger(feature.verify_tier) || feature.verify_tier < 1 || feature.verify_tier > 6) {
-    throw new Error('invalid manifest feature: ' + JSON.stringify(feature))
-  }
-  for (const location of feature.location.split(',').map((value) => value.trim())) {
-    if (!existsSync(location)) throw new Error('manifest location does not exist for ' + feature.id + ': ' + location)
-  }
   const marker = String.fromCharCode(96) + feature.id + String.fromCharCode(96)
   if (!procedures.includes(marker)) throw new Error('feature missing from procedures: ' + feature.id)
 }
@@ -226,7 +183,7 @@ for (const [path, markers] of Object.entries(regressionMarkers)) {
     if (!source.includes(marker)) throw new Error('missing final-main regression marker in ' + path + ': ' + marker)
   }
 }
-console.log(JSON.stringify({ categories: categories.length, features: features.length }))
+console.log(JSON.stringify({ categories: categoryCount, features: features.length }))
 NODE
 then
   echo "PASS  manifest schema and procedure coverage" | tee -a "$LOG"
@@ -302,6 +259,7 @@ if (!fallback.includes('Source: ' + source)) throw new Error('guardian fallback 
 TS
 if npx esbuild .agentworkforce/agents/factory-feature-guardian/agent.ts \
   --bundle --platform=node --format=esm \
+  --external:yaml \
   --alias:@agentworkforce/delivery="$PWD/${ARTIFACTS}/guardian-delivery-stub.mjs" \
   --alias:@agentworkforce/runtime="$PWD/${ARTIFACTS}/guardian-runtime-stub.mjs" \
   --alias:@relayfile/relay-helpers="$PWD/${ARTIFACTS}/guardian-slack-stub.mjs" \

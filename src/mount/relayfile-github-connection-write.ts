@@ -89,8 +89,6 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       head: headRef,
       base: input.baseRef,
       body: input.body,
-      // TODO(issue-52): make workspace PR authorship configurable once Factory
-      // has an explicit user-vs-app identity policy.
       author: 'app',
     })
 
@@ -106,6 +104,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       url,
       headRef,
       headSha,
+      // The workspace adapter contract explicitly requests app authorship.
+      // The concrete bot login is installation-specific and is not included in
+      // every acknowledgement receipt, so retain the stable identity label.
+      author: 'app',
     }
   }
 

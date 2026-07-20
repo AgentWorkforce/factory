@@ -213,6 +213,10 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
 
   async #assertRegisteredCheckout(worktree: AgentWorktree): Promise<void> {
     const wanted = await realpath(worktree.worktreePath)
+    const expectedRoot = await realpath(factoryWorktreeRoot(worktree.baseClonePath))
+    if (wanted === expectedRoot || !wanted.startsWith(`${expectedRoot}/`)) {
+      throw new Error(`Refusing Factory worktree operation outside ${expectedRoot}: resolved target is ${wanted}`)
+    }
     const root = await realpath((await this.#git(worktree.worktreePath, ['rev-parse', '--show-toplevel'])).trim())
     if (root !== wanted) {
       throw new Error(`Refusing Factory worktree operation outside ${wanted}: git root is ${root}`)

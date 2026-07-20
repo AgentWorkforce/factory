@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
@@ -61,6 +61,39 @@ describe('GitAgentWorktreeManager', () => {
     }
     await expect(manager.cleanup(unsafe)).rejects.toThrow(/unsafe Factory worktree path/u)
     await expect(manager.inspectForCleanup(unsafe)).rejects.toThrow(/unsafe Factory worktree path/u)
+  })
+
+  it('refuses a Factory-root symlink that resolves to a registered checkout outside the root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-symlink-safety-'))
+    const base = join(root, 'PearCheckout')
+    const outside = join(root, 'outside-worktree')
+    try {
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      await git(base, ['config', 'user.email', 'factory@example.test'])
+      await git(base, ['config', 'user.name', 'Factory Test'])
+      await writeFile(join(base, 'README.md'), '# pear\n', 'utf8')
+      await git(base, ['add', 'README.md'])
+      await git(base, ['commit', '-m', 'initial'])
+      const worktreePath = factoryWorktreePath(base, 'AR-34', 'AgentWorkforce/pear', 'escape01')
+      await git(base, ['worktree', 'add', '-b', 'factory/ar-34-pear-escape01', outside])
+      await mkdir(dirname(worktreePath), { recursive: true })
+      await symlink(outside, worktreePath, 'dir')
+      const worktree = {
+        repo: 'AgentWorkforce/pear',
+        issueKey: 'AR-34',
+        baseClonePath: base,
+        worktreePath,
+        branch: 'factory/ar-34-pear-escape01',
+      }
+      const manager = new GitAgentWorktreeManager()
+
+      await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/resolved target is/u)
+      await expect(manager.cleanup(worktree)).rejects.toThrow(/resolved target is/u)
+      await expect(stat(outside)).resolves.toMatchObject({})
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('discovers every run and detects dirty, unpushed, and locked worktrees before cleanup', async () => {

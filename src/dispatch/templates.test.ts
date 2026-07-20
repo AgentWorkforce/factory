@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
@@ -6,6 +10,7 @@ import {
   renderAgentTask,
   renderGithubHumanInputRequest,
 } from './templates'
+import { resolveTestGuidance } from './test-guidance'
 
 const baseConfig = FactoryConfigSchema.parse({
   workspaceId: 'workspace',
@@ -81,7 +86,13 @@ describe('renderAgentTask', () => {
     expect(task).toContain('GitHub repo: AgentWorkforce/pear')
     expect(task).toContain('Wait for a DM from the implementer(s): ar-123-impl-ui, ar-123-impl-broker.')
     expect(task).toContain('Read the PR diff via .integrations/github/repos.')
+    expect(task).toContain('factory featuremap check --base <PR-base-ref>')
+    expect(task).toContain('manifest validation failure')
+    expect(task).toContain('advisory location-drift entries')
+    expect(task).toContain('Re-confirm each flagged description and verify_tier')
     expect(task).toContain('Post review comments via the GitHub writeback path.')
+    expect(task).toContain('missing or stale in `.agentworkforce/features/manifest.yaml`')
+    expect(task).toContain('update the manifest in this same PR')
     expect(task).toContain('DM the implementer with specific feedback if changes needed, or approve if good.')
     expect(task).toContain('"kind":"completed","issueKey":"AR-123","role":"reviewer"')
     expect(task).not.toContain('DM `broker` when the review cycle is complete.')
@@ -290,6 +301,147 @@ describe('renderAgentTask', () => {
     expect(task).not.toContain('Connected integrations:')
   })
 
+  it('appends tier-specific manifest guidance to every dispatched code role', async () => {
+    const repoPath = await featureRepo(`
+      - id: dispatch-prompts
+        name: Dispatch prompts
+        description: Render role-specific agent tasks
+        location: src/dispatch/templates.ts
+        verify_tier: 2
+    `)
+    try {
+      const testGuidance = await resolveTestGuidance({
+        repoPath,
+        issue,
+        route: { rationale: 'The route covers src/dispatch/templates.ts.' },
+      })
+
+      expect(testGuidance).toContain('Dispatch prompts (`dispatch-prompts`)')
+      expect(testGuidance).toContain('verify tier 2')
+      expect(testGuidance).toContain('npm run repo-tier-2')
+
+      for (const role of ['implementer', 'reviewer', 'babysitter'] as const) {
+        const task = renderAgentTask({
+          issue,
+          route: { repo: 'pear', clonePath: repoPath },
+          role,
+          config: baseConfig,
+          reviewerName: 'ar-123-review',
+          ...(role === 'babysitter' ? { pr: { number: 482 } } : {}),
+          testGuidance,
+        })
+        expect(task).toContain('Feature-specific verification guidance:')
+        expect(task).toContain('Dispatch prompts (`dispatch-prompts`)')
+      }
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
+  it('tolerates trailing inline comments on manifest fields', async () => {
+    const repoPath = await featureRepo(`
+      - id: dispatch-prompts # short id
+        name: Dispatch prompts
+        description: Render role-specific agent tasks
+        location: src/dispatch/templates.ts  # not src/dispatch/templates.test.ts
+        verify_tier: 2 # requires config fixture
+    `)
+    try {
+      const testGuidance = await resolveTestGuidance({
+        repoPath,
+        issue,
+        route: { rationale: 'The route covers src/dispatch/templates.ts.' },
+      })
+
+      expect(testGuidance).toContain('Dispatch prompts (`dispatch-prompts`)')
+      expect(testGuidance).toContain('src/dispatch/templates.ts`, verify tier 2')
+      expect(testGuidance).toContain('verify tier 2')
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
+  it('does not error or fabricate guidance when the route and diff have no manifest coverage', async () => {
+    const repoPath = await featureRepo(`
+      - id: unrelated-feature
+        name: Unrelated feature
+        description: An unrelated surface
+        location: src/unrelated.ts
+        verify_tier: 1
+    `)
+    try {
+      const testGuidance = await resolveTestGuidance({
+        repoPath,
+        issue,
+        route: { rationale: 'Matched repository from a label.' },
+        changedFiles: ['src/another-file.ts'],
+      })
+
+      expect(testGuidance).toBeUndefined()
+      const task = renderAgentTask({
+        issue,
+        route: { repo: 'pear', clonePath: repoPath },
+        role: 'implementer',
+        config: baseConfig,
+        reviewerName: 'ar-123-review',
+        testGuidance,
+      })
+      expect(task).not.toContain('Feature-specific verification guidance:')
+      expect(task).not.toContain('Unrelated feature')
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
+  it('uses a preview URL for running-instance checks and marks the missing-preview branch unverified', async () => {
+    const repoPath = await featureRepo(`
+      - id: live-preview
+        name: Live preview
+        description: Check the running application
+        location: src/preview/server.ts
+        verify_tier: 6
+        requires_running_instance: true
+    `)
+    const input = {
+      repoPath,
+      issue,
+      changedFiles: ['src/preview/server.ts'],
+    }
+    try {
+      const withoutPreview = await resolveTestGuidance(input)
+      expect(withoutPreview).toContain('a running preview URL is not available')
+      expect(withoutPreview).toContain('verify tier 6 is unverified')
+
+      const withPreview = await resolveTestGuidance({ ...input, previewUrl: 'https://preview.example.test/131' })
+      expect(withPreview).toContain('computer-use/browser tool against https://preview.example.test/131')
+      expect(withPreview).not.toContain('verify tier 6 is unverified')
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
+  it('renders unavailable infrastructure tiers as explicitly unverified', async () => {
+    const repoPath = await featureRepo(`
+      - id: cloud-write
+        name: Cloud write
+        description: Exercise a connected cloud mount
+        location: src/cloud/write.ts
+        verify_tier: 5
+    `)
+    try {
+      const testGuidance = await resolveTestGuidance({
+        repoPath,
+        issue,
+        changedFiles: ['src/cloud/write.ts'],
+      })
+      expect(testGuidance).toContain('cloud auth and a writable Relayfile mount')
+      expect(testGuidance).toContain('not runnable in this environment')
+      expect(testGuidance).toContain('verify tier 5 is unverified')
+    } finally {
+      await rm(repoPath, { recursive: true, force: true })
+    }
+  })
+
   it('makes the source issue comment a durable release boundary', () => {
     const task = renderAgentTask({
       issue,
@@ -338,6 +490,46 @@ describe('renderAgentTask', () => {
     expect(task).not.toContain('exit cleanly')
   })
 })
+
+async function featureRepo(featureYaml: string): Promise<string> {
+  const repoPath = await mkdtemp(join(tmpdir(), 'factory-feature-guidance-'))
+  const featureDir = join(repoPath, '.agentworkforce/features')
+  await mkdir(join(featureDir, 'verify'), { recursive: true })
+  await writeFile(join(featureDir, 'manifest.yaml'), [
+    "version: '1.0'",
+    'categories:',
+    '  dispatch:',
+    '    name: Dispatch',
+    '    description: Dispatch features',
+    '    criticality: hot',
+    '    features:',
+    featureYaml.replace(/^\n/u, '').trimEnd(),
+    '',
+  ].join('\n'))
+  await writeFile(join(featureDir, 'verify/procedures.md'), [
+    '## Tier 1 — Package',
+    '```bash',
+    'npm run repo-tier-1',
+    '```',
+    '',
+    '## Tier 2 — Config',
+    '```bash',
+    'npm run repo-tier-2',
+    '```',
+    '',
+    '## Tier 5 — Cloud',
+    '```bash',
+    'npm run repo-tier-5',
+    '```',
+    '',
+    '## Tier 6 — Live',
+    '```text',
+    'exercise the live preview',
+    '```',
+    '',
+  ].join('\n'))
+  return repoPath
+}
 
 describe('GitHub human input request comments', () => {
   it('round-trips the durable structured comment', () => {
