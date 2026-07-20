@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 
+import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BabysitterSessionState,
   ClarificationReply,
@@ -794,7 +795,19 @@ const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase !== 'waiting-for-human' &&
   lifecycle.phase !== 'releasing' &&
   lifecycle.phase !== 'complete' &&
-  lifecycle.phase !== 'abandoned'
+  lifecycle.phase !== 'abandoned' &&
+  !dispatchLifecycleHandedOffToBabysitters(lifecycle)
+
+const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
+  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
+  if (implementerRepos.length === 0) return false
+  const babysitterRepos = lifecycle.agents
+    .filter((agent) => agent.tracked.spec.role === 'babysitter')
+    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
+    .filter((repo): repo is string => Boolean(repo))
+  return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
+    githubRepositoriesMatch(repo, ownedRepo)))
+}
 
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
