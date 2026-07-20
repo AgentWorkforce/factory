@@ -1979,6 +1979,7 @@ export class FactoryLoop implements Factory {
       url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.prNumber}`,
       path: pr.path,
       headRef,
+      authoritative: true,
     })
     const babysitter = [...record.agents.values()].find((tracked) => tracked.spec.role === 'babysitter')
     if (!babysitter) {
@@ -2853,7 +2854,7 @@ export class FactoryLoop implements Factory {
     }
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     const pullRequests = mergePublishedPullRequests(previous, pullRequest)
-    const primaryPullRequest = previous?.pullRequest ?? pullRequest ?? pullRequests[0]
+    const primaryPullRequest = primaryPublishedPullRequest(previous, pullRequest, pullRequests)
     const lifecycle = lifecycleFromInFlightRecord(
       record,
       previous?.runId ?? randomUUID(),
@@ -3039,6 +3040,38 @@ export class FactoryLoop implements Factory {
         })))
         await this.#fleet.reconcileTrackedAgents?.()
       }
+      if (this.#config.babysitter.enabled) {
+        // Babysitter sessions are independently durable and restore only after
+        // their mounted PR metadata passes the open/draft/issue-identity guard.
+        // Fold those validated receipts back into the lifecycle on takeover.
+        // This closes the crash gap where the babysitter session persisted but
+        // the lifecycle PR receipt did not, and lets exact ownership retire any
+        // earlier weak-match babysitter for the same repository.
+        const restored = [...this.#babysitterPr.entries()]
+          .filter(([ownershipKey, ref]) =>
+            ref.agentName && issueKey(this.#babysitterIssueRefs.get(ownershipKey) ?? record.issue) === issueKey(record.issue))
+          .map(([, ref]) => ref)
+        for (const receipt of restored) {
+          const snapshot = await this.#readPrSnapshot(receipt)
+          const headRef = snapshot?.headRef ?? record.decision.implementers
+            .find((implementer) => implementer.repo.toLowerCase() === receipt.repo.toLowerCase())?.branch
+          if (!headRef) continue
+          const published = {
+            repo: receipt.repo,
+            number: receipt.prNumber,
+            url: `https://github.com/${receipt.repo}/pull/${receipt.prNumber}`,
+            headRef,
+          }
+          if (!await this.#saveDispatchLifecycle(record, 'running', published)) return
+          await this.#ensureBabysitter(record, {
+            repo: published.repo,
+            prNumber: published.number,
+            url: published.url,
+            path: receipt.path,
+            authoritative: true,
+          })
+        }
+      }
       return
     }
 
@@ -3072,6 +3105,7 @@ export class FactoryLoop implements Factory {
             prNumber: receipt.number,
             url: receipt.url,
             headRef: receipt.headRef,
+            authoritative: true,
           })
         }
         return
@@ -3086,6 +3120,7 @@ export class FactoryLoop implements Factory {
           prNumber: receipt.number,
           url: receipt.url,
           headRef: receipt.headRef,
+          authoritative: true,
         })
       }
       return
@@ -4584,6 +4619,7 @@ export class FactoryLoop implements Factory {
             repo: publishedPr.repo,
             prNumber: publishedPr.number,
             url: publishedPr.url,
+            authoritative: true,
           })
         } else {
           await this.#ensureBabysitterForIssue(record)
@@ -4640,6 +4676,7 @@ export class FactoryLoop implements Factory {
               prNumber: reconciledPr.number,
               url: reconciledPr.url,
               headRef: reconciledPr.headRef,
+              authoritative: true,
             })
           } else {
             await this.#ensureBabysitterForIssue(record)
@@ -4669,6 +4706,7 @@ export class FactoryLoop implements Factory {
               repo: publishedPr.repo,
               prNumber: publishedPr.number,
               url: publishedPr.url,
+              authoritative: true,
             })
           } else {
             if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
@@ -4851,8 +4889,11 @@ export class FactoryLoop implements Factory {
     const durableReceipt = publishedPullRequests(durable).find((receipt) =>
       receipt.repo.toLowerCase() === repo.toLowerCase()
     )
-    if (durableReceipt) return durableReceipt
     const expectedHeadRef = implementer.spec.branch ?? remoteBranch
+    if (
+      durableReceipt &&
+      (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
+    ) return durableReceipt
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
@@ -7921,6 +7962,7 @@ export class FactoryLoop implements Factory {
             prNumber: receipt.number,
             url: receipt.url,
             headRef: receipt.headRef,
+            authoritative: true,
           })
         }
         return
@@ -7943,12 +7985,16 @@ export class FactoryLoop implements Factory {
     url?: string
     path?: string
     headRef?: string
+    authoritative?: boolean
   }): Promise<void> {
     const babysitterKey = babysitterOwnershipKey(record.issue, prRef)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
       return
     }
+    const replacedSuperseded = prRef.authoritative
+      ? await this.#retireSupersededBabysitters(record, prRef)
+      : false
     this.#babysitterIssueRefs.set(babysitterKey, { ...record.issue })
     const existing = this.#babysitterPr.get(babysitterKey)
     if (existing && githubPrIdentity(existing.repo, existing.prNumber) !== githubPrIdentity(prRef.repo, prRef.prNumber)) {
@@ -8011,7 +8057,7 @@ export class FactoryLoop implements Factory {
       const route = record.decision.routes.find((candidate) => candidate.repo === prRef.repo)
         ?? record.decision.routes[0]
       const initialSpec = babysitterSpec(issue, this.#config, route)
-      if ([...this.#babysitterIssueRefs.entries()].some(([key, candidate]) =>
+      if (replacedSuperseded || [...this.#babysitterIssueRefs.entries()].some(([key, candidate]) =>
         key !== babysitterKey && issueKey(candidate) === issueKey(record.issue))) {
         initialSpec.name = agentNameForRole(issue, 'babysit', {
           repo: prRef.repo,
@@ -8112,6 +8158,53 @@ export class FactoryLoop implements Factory {
         this.#babysitterSpawnInFlight.delete(babysitterKey)
       }
     }
+  }
+
+  async #retireSupersededBabysitters(
+    record: InFlightIssue,
+    prRef: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
+  ): Promise<boolean> {
+    const wanted = githubPrIdentity(prRef.repo, prRef.prNumber)
+    const superseded = [...record.agents.entries()].filter(([, tracked]) => {
+      const owned = tracked.spec.ownedPullRequest
+      return tracked.spec.role === 'babysitter' &&
+        owned?.repo.toLowerCase() === prRef.repo.toLowerCase() &&
+        githubPrIdentity(owned.repo, owned.number) !== wanted
+    })
+    for (const [agentName, tracked] of superseded) {
+      const owned = tracked.spec.ownedPullRequest
+      const failed = await this.#releaseAndTerminateAgents(
+        [[agentName, tracked]],
+        'superseded-pr-receipt',
+        'completion',
+      )
+      if (failed.length > 0) {
+        this.#increment('supersededBabysitterReleaseFailures')
+        throw new Error(`Failed to release superseded babysitter ${agentName}`)
+      }
+      if (owned) {
+        const staleKey = babysitterOwnershipKey(record.issue, {
+          repo: owned.repo,
+          prNumber: owned.number,
+        })
+        await this.#cancelBabysitterWake(staleKey)
+        if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+          await this.#state.clearBabysitterSession(this.#workspaceId, staleKey)
+        }
+      }
+      record.agents.delete(agentName)
+      this.#babysitterCriticalAgents.delete(agentName)
+      this.#increment('supersededBabysittersReleased')
+      this.#logger.info?.('[factory] released babysitter superseded by exact PR receipt', {
+        issue: record.issue.key,
+        babysitter: agentName,
+        previousRepo: owned?.repo,
+        previousPrNumber: owned?.number,
+        repo: prRef.repo,
+        prNumber: prRef.prNumber,
+      })
+    }
+    return superseded.length > 0
   }
 
   // The babysitter owns the readiness verdict (CI green + conflicts resolved +
@@ -12486,6 +12579,18 @@ const mergePublishedPullRequests = (
     candidate.repo.toLowerCase(),
     { ...candidate },
   ])).values()]
+}
+
+const primaryPublishedPullRequest = (
+  previous: DispatchLifecycle | undefined,
+  receipt: GithubPublishPullRequestResult | undefined,
+  receipts: GithubPublishPullRequestResult[],
+): GithubPublishPullRequestResult | undefined => {
+  if (
+    receipt &&
+    (!previous?.pullRequest || previous.pullRequest.repo.toLowerCase() === receipt.repo.toLowerCase())
+  ) return receipt
+  return previous?.pullRequest ?? receipt ?? receipts[0]
 }
 
 const lifecycleFromInFlightRecord = (
