@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { parse as parseYaml } from 'yaml'
+
 import type { TemplateIssue, TemplateRoute } from './templates'
 
 const FEATURE_MANIFEST_PATH = '.agentworkforce/features/manifest.yaml'
@@ -14,14 +16,6 @@ interface ManifestFeature {
   location: string
   verifyTier: VerifyTier
   requiresRunningInstance: boolean
-}
-
-interface MutableManifestFeature {
-  id?: string
-  name?: string
-  location?: string
-  verifyTier?: number
-  requiresRunningInstance?: boolean
 }
 
 export interface ResolveTestGuidanceInput {
@@ -78,73 +72,52 @@ export async function resolveTestGuidance(
 }
 
 function parseManifestFeatures(raw: string): ManifestFeature[] {
+  let manifest: unknown
+  try {
+    manifest = parseYaml(raw)
+  } catch {
+    return []
+  }
+
+  const categories = isRecord(manifest) ? manifest.categories : undefined
+  if (!isRecord(categories)) return []
+
   const features: ManifestFeature[] = []
-  let current: MutableManifestFeature | undefined
-
-  const finishCurrent = (): void => {
-    if (!current) return
-    const verifyTier = current.verifyTier
-    if (
-      current.id &&
-      current.name &&
-      current.location &&
-      Number.isInteger(verifyTier) &&
-      verifyTier !== undefined &&
-      verifyTier >= 1 &&
-      verifyTier <= 6
-    ) {
-      features.push({
-        id: current.id,
-        name: current.name,
-        location: current.location,
-        verifyTier: verifyTier as VerifyTier,
-        requiresRunningInstance: current.requiresRunningInstance ?? false,
-      })
+  for (const category of Object.values(categories)) {
+    const rawFeatures = isRecord(category) ? category.features : undefined
+    if (!Array.isArray(rawFeatures)) continue
+    for (const rawFeature of rawFeatures) {
+      const feature = parseManifestFeature(rawFeature)
+      if (feature) features.push(feature)
     }
-    current = undefined
   }
-
-  for (const line of raw.split(/\r?\n/u)) {
-    const idMatch = /^      - id:\s*(.+?)\s*$/u.exec(line)
-    if (idMatch) {
-      finishCurrent()
-      current = { id: decodeYamlScalar(idMatch[1]) }
-      continue
-    }
-    if (!current) continue
-
-    const fieldMatch = /^        (name|location|verify_tier|requires_preview|requires_running_instance|running_instance):\s*(.*?)\s*$/u.exec(line)
-    if (!fieldMatch) continue
-    const [, key, rawValue] = fieldMatch
-    const value = decodeYamlScalar(rawValue)
-    if (key === 'name') current.name = value
-    else if (key === 'location') current.location = value
-    else if (key === 'verify_tier') current.verifyTier = Number(value)
-    else current.requiresRunningInstance = value.toLowerCase() === 'true'
-  }
-  finishCurrent()
   return features
 }
 
-function decodeYamlScalar(raw: string | undefined): string {
-  const value = raw?.trim() ?? ''
-  if (value.startsWith("'")) {
-    const closing = /^'((?:[^']|'')*)'/u.exec(value)
-    if (closing) return closing[1]!.replaceAll("''", "'")
+function parseManifestFeature(rawFeature: unknown): ManifestFeature | undefined {
+  if (!isRecord(rawFeature)) return undefined
+  const { id, name, location, verify_tier: verifyTier, requires_running_instance: requiresRunningInstance } = rawFeature
+  if (
+    typeof id !== 'string' ||
+    typeof name !== 'string' ||
+    typeof location !== 'string' ||
+    !Number.isInteger(verifyTier) ||
+    (verifyTier as number) < 1 ||
+    (verifyTier as number) > 6
+  ) {
+    return undefined
   }
-  if (value.startsWith('"')) {
-    const closing = /^"((?:[^"\\]|\\.)*)"/u.exec(value)
-    if (closing) {
-      try {
-        const parsed = JSON.parse(closing[0]) as unknown
-        if (typeof parsed === 'string') return parsed
-      } catch {
-        return closing[1]!
-      }
-    }
+  return {
+    id,
+    name,
+    location,
+    verifyTier: verifyTier as VerifyTier,
+    requiresRunningInstance: requiresRunningInstance === true,
   }
-  // Unquoted scalars: a `#` only starts a comment when preceded by whitespace.
-  return value.replace(/\s+#.*$/u, '').trim()
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function issueReferencedPaths(
