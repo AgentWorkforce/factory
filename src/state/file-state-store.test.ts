@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { BabysitterSessionState, DispatchLifecycle, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
 import { FileStateStore } from './file-state-store'
+import { InMemoryStateStore } from './in-memory-state-store'
 
 describe('FileStateStore', () => {
   it('persists and fences dispatch lifecycle ownership across processes and crash takeover', async () => {
@@ -148,6 +149,40 @@ describe('FileStateStore', () => {
       })).toBe(true)
       expect(await second.promoteDispatchLifecycle('workspace-1', secondKey, 'owner-b', 1, 1_004)).toBe(true)
       expect(await second.getDispatchLifecycle('workspace-1', secondKey)).toMatchObject({ phase: 'dispatching' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not count a bare-repo lifecycle after its canonical PR is handed to a babysitter', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-bare-repo-handoff-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 1, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 1 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const first = await store.claimDispatchLifecycle(
+          workspace,
+          `first-${index}`,
+          handedOffDispatchLifecycle(860 + index),
+          `owner-${index}`,
+          1_000,
+          5_000,
+        )
+        const second = await store.claimDispatchLifecycle(
+          workspace,
+          `second-${index}`,
+          dispatchLifecycle(870 + index),
+          `owner-${index}`,
+          1_001,
+          5_000,
+        )
+
+        expect(first.lifecycle.phase).toBe('dispatching')
+        expect(second.lifecycle.phase).toBe('dispatching')
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -477,6 +512,32 @@ const dispatchLifecycle = (number: number): DispatchLifecycle => ({
   invocationIds: [],
   updatedAtMs: 1_000,
 })
+
+const handedOffDispatchLifecycle = (number: number): DispatchLifecycle => {
+  const lifecycle = dispatchLifecycle(number)
+  const implementer = {
+    name: `ar-${number}-impl-pear`,
+    role: 'implementer' as const,
+    capability: 'spawn:codex' as const,
+    task: 'implement',
+    repo: 'pear',
+  }
+  lifecycle.decision.implementers = [implementer]
+  lifecycle.agents = [{
+    name: `ar-${number}-babysit-pear`,
+    tracked: {
+      spec: {
+        name: `ar-${number}-babysit-pear`,
+        role: 'babysitter',
+        capability: 'spawn:claude',
+        task: 'babysit',
+        repo: 'pear',
+        ownedPullRequest: { repo: 'AgentWorkforce/pear', number },
+      },
+    },
+  }]
+  return lifecycle
+}
 
 const waitingClarification = (number: number): WaitingClarification => {
   const issue = { uuid: `uuid-${number}`, key: `AR-${number}`, path: `path-${number}` }

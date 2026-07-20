@@ -1,4 +1,5 @@
 import { BatchTracker } from '../orchestrator/batch-tracker'
+import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BatchSnapshot,
   BabysitterSessionState,
@@ -525,13 +526,14 @@ const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
   !dispatchLifecycleHandedOffToBabysitters(lifecycle)
 
 const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
-  const implementerRepos = new Set(lifecycle.decision.implementers.map((spec) => spec.repo.toLowerCase()))
-  if (implementerRepos.size === 0) return false
-  const babysitterRepos = new Set(lifecycle.agents
+  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
+  if (implementerRepos.length === 0) return false
+  const babysitterRepos = lifecycle.agents
     .filter((agent) => agent.tracked.spec.role === 'babysitter')
-    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo.toLowerCase())
-    .filter((repo): repo is string => Boolean(repo)))
-  return [...implementerRepos].every((repo) => babysitterRepos.has(repo))
+    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
+    .filter((repo): repo is string => Boolean(repo))
+  return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
+    githubRepositoriesMatch(repo, ownedRepo)))
 }
 
 const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>

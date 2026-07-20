@@ -1,5 +1,6 @@
 import type { AgentSpec, SpawnResult } from '../ports'
 import type { DispatchResult, IssueRef, TriageDecision } from '../types'
+import { githubRepositoriesMatch } from '../github/repo-identity'
 
 export interface TrackedAgent {
   spec: AgentSpec
@@ -206,11 +207,12 @@ export const issueKey = (issue: IssueRef): string => `${issue.key}:${issue.uuid}
  * remains addressable for review events without starving new ready issues.
  */
 const dispatchOccupiesImplementationSlot = (record: InFlightIssue): boolean => {
-  const implementerRepos = new Set(record.decision.implementers.map((spec) => spec.repo.toLowerCase()))
-  if (implementerRepos.size === 0) return true
-  const babysitterRepos = new Set([...record.agents.values()]
+  const implementerRepos = [...new Set(record.decision.implementers.map((spec) => spec.repo))]
+  if (implementerRepos.length === 0) return true
+  const babysitterRepos = [...record.agents.values()]
     .filter((agent) => agent.spec.role === 'babysitter')
-    .map((agent) => agent.spec.ownedPullRequest?.repo.toLowerCase())
-    .filter((repo): repo is string => Boolean(repo)))
-  return [...implementerRepos].some((repo) => !babysitterRepos.has(repo))
+    .map((agent) => agent.spec.ownedPullRequest?.repo)
+    .filter((repo): repo is string => Boolean(repo))
+  return implementerRepos.some((repo) => !babysitterRepos.some((ownedRepo) =>
+    githubRepositoriesMatch(repo, ownedRepo)))
 }
