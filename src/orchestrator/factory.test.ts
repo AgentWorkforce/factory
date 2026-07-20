@@ -7871,11 +7871,11 @@ describe('FactoryLoop', () => {
     mount.onFirstListTree = () => mount.emit(changeEvent(arrivedPath, 'arrived-during-pull-51'))
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
-    await flush()
-
-    const names = fleet.spawns.map((spawn) => spawn.name)
-    expect(names).toContain('ar-50-impl-pear') // dispatched by the startup full pull
-    expect(names).toContain('ar-51-impl-pear') // captured via the buffered live event during the pull
+    await vi.waitFor(() => {
+      const names = fleet.spawns.map((spawn) => spawn.name)
+      expect(names).toContain('ar-50-impl-pear') // dispatched by the startup full pull
+      expect(names).toContain('ar-51-impl-pear') // captured via the buffered live event during the pull
+    })
     await factory.stop()
   })
 
