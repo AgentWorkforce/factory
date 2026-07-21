@@ -707,7 +707,7 @@ describe('InternalFleetClient', () => {
     const fleet = new InternalFleetClient({
       client: harness,
       cwd: '/worktree',
-      connectionPath: '/nonexistent/factory-test-relay-connection.json',
+      connectionPath: '/worktree/.agentworkforce/relay/missing-connection.json',
     })
 
     await expect(fleet.protectedPids()).resolves.toEqual([68009])
