@@ -5921,7 +5921,14 @@ export class FactoryLoop implements Factory {
       if (!issue) {
         return false
       }
-      if (implementer?.spec.branch && record.decision.implementers.length > 1) {
+      // Babysitter handoff only accepts an open, ready PR. The implementer's
+      // deterministic branch is therefore the strongest and cheapest lookup,
+      // even for a single-repository issue. Avoid scanning mounted PR metadata
+      // across every configured repository during startup recovery.
+      if (
+        implementer?.spec.branch &&
+        (opts.openOnly || record.decision.implementers.length > 1)
+      ) {
         const sourceOwner = record.issue.path
           ? githubIssuePathParts(record.issue.path)?.owner
           : undefined

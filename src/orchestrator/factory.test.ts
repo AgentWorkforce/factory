@@ -699,6 +699,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   }
 }
 
+class DurableRemoteLifecycleFleetClient extends RemoteLifecycleFleetClient {
+  override readonly durableOwnership = true
+}
+
 class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
   readonly terminal: Array<{ name: string; reason?: string }> = []
   readonly #hydratedNames = new Set<string>()
@@ -5730,6 +5734,60 @@ describe('FactoryLoop', () => {
     const nextDecision = await factory.triageIssue(parseLinearIssue(issuePath(592), issueFile(592)))
     await factory.dispatch(nextDecision)
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-592-impl-pear')
+    await factory.stop()
+  })
+
+  it('probes the deterministic branch directly for a single implementer during babysitter recovery', async () => {
+    const issue = issueFile(597)
+    const publishPullRequest = vi.fn(async () => {
+      throw new Error('must reconcile the exact existing branch')
+    })
+    const mount = new FakeMountClient({ [issuePath(597)]: issue }, {
+      publishPullRequest,
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new DurableRemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const ghCalls: string[][] = []
+    let branch = ''
+    const factory = createFactory(config({ babysitter: { enabled: true } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: args.includes('--head') && args.includes(branch)
+            ? JSON.stringify([{
+                number: 1597,
+                url: 'https://github.com/AgentWorkforce/pear/pull/1597',
+                headRefName: branch,
+                isDraft: false,
+              }])
+            : '[]',
+        }
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
+
+    await factory.dispatch(decision)
+    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      .decision.implementers[0]!.branch!
+    fleet.emitAgentExit('ar-597-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 1597,
+          headRef: branch,
+        },
+      })
+    })
+    expect(ghCalls.length).toBeGreaterThan(0)
+    expect(ghCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
 
