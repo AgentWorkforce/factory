@@ -1206,6 +1206,32 @@ class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
   }
 }
 
+class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient {
+  babysitterWakeAttempts = 0
+  coldStarted = false
+
+  override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
+    const priorBabysitterSpawns = this.spawned.filter((spawn) => spawn.name.includes('-babysit')).length
+    const result = await super.spawnPty(input)
+    if (input.name.includes('-babysit') && priorBabysitterSpawns > 0 && !input.continueFrom) {
+      this.coldStarted = true
+    }
+    return result
+  }
+
+  override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
+    if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
+      this.babysitterWakeAttempts += 1
+      if (!this.coldStarted) {
+        throw new Error(
+          `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
+        )
+      }
+    }
+    return await super.sendMessage(input)
+  }
+}
+
 class CapabilityMigratingBabysitterHarnessClient extends RosterPidHarnessClient {
   babysitterWakeAttempts = 0
 
@@ -18342,6 +18368,68 @@ describe('FactoryLoop PR babysitter', () => {
       await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
+
+  it('cold-starts after a resumed babysitter session remains unreachable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-resume-cold-start-'))
+    const issue = realIssueFile(426, ready, { title: 'Real unreachable resumed babysitter recovery' })
+    const mount = new FakeMountClient({ [issuePath(426)]: issue })
+    const harness = new ResumeThenColdStartBabysitterHarnessClient()
+    const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    let clockValue = 1_700_000_000_000
+    const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
+    const factory = createFactory(babysitterConfig({
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      babysitterWakeUnreachableEscalateMs: 1_500,
+      babysitterWakeUnreachableRetryMs: 1_500,
+      terminationGraceMs: 0,
+      processFinder: async () => ({ status: 'missing' }),
+      readChildPids: async () => [],
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(426), issue)))
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/426/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 426,
+        state: 'open',
+        head_ref: 'ar-426-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-426-open'))
+      await vi.waitFor(() => expect(harness.spawned.map((spawn) => spawn.name)).toContain('ar-426-babysit'))
+
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9426.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 426 },
+        comment: { id: 9426, body: 'please address review feedback' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9426.json', 'comment-9426'))
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterUnreachableSessionColdStarts).toBe(1),
+        { timeout: 12_000 },
+      )
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1),
+        { timeout: 4_000 },
+      )
+      const babysitterSpawns = harness.spawned.filter((spawn) => spawn.name === 'ar-426-babysit')
+      expect(babysitterSpawns).toHaveLength(3)
+      expect(babysitterSpawns[1]?.continueFrom).toBe('session-ar-426-babysit')
+      expect(babysitterSpawns[2]?.continueFrom).toBeUndefined()
+      expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(2)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
 
   it('cold-starts an unreachable babysitter when its configured capability changed', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-capability-recovery-'))
