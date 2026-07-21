@@ -3582,7 +3582,7 @@ export class FactoryLoop implements Factory {
             this.#logger.warn?.('[factory] durable takeover exit reconciliation is still running', {
               issue: lifecycle.issue.key,
               timeoutMs: this.#startupAgentExitDrainTimeoutMs,
-              pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => exitNames.has(name)),
+              pendingExits: [...exitNames].filter((name) => this.#agentExitsInFlight.has(name)),
             })
           }
         } catch (error) {
