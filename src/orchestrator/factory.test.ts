@@ -36,7 +36,7 @@ import { FileStateStore } from '../state/file-state-store'
 import { githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
-import type { ConversationMessage, ConversationSessionState } from '../ports/state'
+import type { ConversationMessage, ConversationSessionState, DispatchLifecycle } from '../ports/state'
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
@@ -622,7 +622,30 @@ class RotatingSessionResumeFleetClient extends FakeFleetClient {
 
   override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
     const result = await super.resume(input)
-    return { ...result, sessionRef: `rotated-session-${this.resumes.length}` }
+    return {
+      ...result,
+      name: `${result.name}-resumed-${this.resumes.length}`,
+      sessionRef: `rotated-session-${this.resumes.length}`,
+    }
+  }
+}
+
+class FailOnceAbandonedLifecycleStateStore extends InMemoryStateStore {
+  abandonedSaveFailures = 0
+
+  override async saveDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    lifecycle: DispatchLifecycle,
+  ): Promise<boolean> {
+    if (lifecycle.phase === 'abandoned' && this.abandonedSaveFailures === 0) {
+      this.abandonedSaveFailures += 1
+      return false
+    }
+    return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
   }
 }
 
@@ -9734,7 +9757,7 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
   })
 
-  it('bounds recovery when each successful resume returns a new session ref', async () => {
+  it('bounds recovery when each successful resume returns a new name and session ref', async () => {
     const mount = new FakeMountClient({ [issuePath(803)]: issueFile(803) })
     const fleet = new RotatingSessionResumeFleetClient()
     fleet.setSessionRef('ar-803-impl-pear', 'session-impl-803')
@@ -9752,9 +9775,10 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-803-impl-pear', 'crash')
     await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
 
-    // The first recovery rotated the session ref. A second exit still belongs
-    // to the same logical agent and must conclude rather than resume forever.
-    fleet.emitAgentExit('ar-803-impl-pear', 'crash')
+    // The first recovery rotated both broker-facing identifiers. A second exit
+    // still belongs to the same logical agent and must conclude rather than
+    // resume forever.
+    fleet.emitAgentExit('ar-803-impl-pear-resumed-1', 'crash')
     await vi.waitFor(async () => {
       expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
         .toMatchObject({ phase: 'abandoned' })
@@ -9762,6 +9786,43 @@ describe('FactoryLoop', () => {
 
     expect(fleet.resumes).toHaveLength(1)
     expect(factory.status().inFlight).toEqual([])
+    await factory.stop()
+  })
+
+  it('scopes bounded recovery to one dispatch run when an issue is reopened', async () => {
+    const mount = new FakeMountClient({ [issuePath(806)]: issueFile(806) })
+    const fleet = new DurableFakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-806-impl-pear', 'crash')
+    await vi.waitFor(() => expect(
+      fleet.spawns.filter((spawn) => spawn.name === 'ar-806-impl-pear'),
+    ).toHaveLength(2))
+    fleet.emitAgentExit('ar-806-impl-pear', 'crash')
+    await vi.waitFor(async () => expect(
+      await stateStore.getDispatchLifecycle('factory-test', issueKey({
+        uuid: 'uuid-806', key: 'AR-806', path: issuePath(806),
+      })),
+    ).toMatchObject({ phase: 'abandoned' }))
+
+    await mount.writeFile(issuePath(806), issuePayload(806, done))
+    await factory.runOnce()
+    await mount.writeFile(issuePath(806), issuePayload(806, ready))
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-806-impl-pear', 'crash')
+
+    await vi.waitFor(() => expect(
+      fleet.spawns.filter((spawn) => spawn.name === 'ar-806-impl-pear'),
+    ).toHaveLength(4))
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
     await factory.stop()
   })
 
@@ -9804,6 +9865,42 @@ describe('FactoryLoop', () => {
 
     expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-804-impl-pear')).toHaveLength(2)
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-805-impl-pear')
+    await factory.stop()
+  })
+
+  it('re-acquires ownership after an abandoned lifecycle fence rejection and promotes queued work', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(807)]: issueFile(807),
+      [issuePath(808)]: issueFile(808),
+    })
+    const fleet = new DurableFakeFleetClient()
+    const stateStore = new FailOnceAbandonedLifecycleStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const first = await factory.triageIssue(parseLinearIssue(issuePath(807), issueFile(807)))
+    const second = await factory.triageIssue(parseLinearIssue(issuePath(808), issueFile(808)))
+
+    await factory.dispatch(first)
+    await factory.dispatch(second)
+    fleet.emitAgentExit('ar-807-impl-pear', 'crash')
+    await vi.waitFor(() => expect(
+      fleet.spawns.filter((spawn) => spawn.name === 'ar-807-impl-pear'),
+    ).toHaveLength(2))
+    fleet.emitAgentExit('ar-807-impl-pear', 'crash')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+        .toMatchObject({ phase: 'abandoned' })
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+        .toMatchObject({ phase: 'running' })
+    }, { timeout: 4_000 })
+    expect(stateStore.abandonedSaveFailures).toBe(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-808-impl-pear')
     await factory.stop()
   })
 

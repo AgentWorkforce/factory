@@ -401,6 +401,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #abandonedDispatchReasons = new Map<string, string>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
   readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
@@ -800,6 +801,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    this.#abandonedDispatchReasons.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
@@ -3294,6 +3296,12 @@ export class FactoryLoop implements Factory {
     if (!await this.#assertDispatchLifecycleOwner(record)) return
     if (acquiredNow && this.#config.babysitter.enabled) await this.#restoreBabysitterOwnership()
 
+    const abandonedReason = this.#abandonedDispatchReasons.get(key)
+    if (abandonedReason !== undefined) {
+      await this.#abandonStuckDispatch(record, abandonedReason)
+      return
+    }
+
     if (acquiredNow && lifecycle.phase === 'running') {
       if (this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(lifecycle.agents.map((agent) => ({
@@ -5229,7 +5237,14 @@ export class FactoryLoop implements Factory {
       // that exited immediately consume a batch slot forever while Factory
       // continuously recreated it. One successful recovery is enough; a
       // subsequent no-PR implementer exit is terminal and frees the slot.
-      const recoveryKey = `${issueKey(record.issue)}:${name}`
+      const recoveryLifecycle = await this.#state.getDispatchLifecycle(
+        this.#workspaceId,
+        issueKey(record.issue),
+      )
+      const recoveryRunIdentity = recoveryLifecycle?.runId
+        ?? tracked.spec.branch
+        ?? batch.invocationIdFor(record.issue, tracked.spec)
+      const recoveryKey = `${recoveryRunIdentity}:${tracked.spec.name}`
       if (await this.#state.isResumed(this.#workspaceId, recoveryKey)) {
         if (tracked.spec.role === 'implementer') {
           await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
@@ -5844,6 +5859,8 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
+    const key = issueKey(record.issue)
+    this.#abandonedDispatchReasons.set(key, reason)
     const agents = [...record.agents]
     for (const [agentName, tracked] of agents) {
       if (tracked.spec.role === 'implementer') continue
@@ -5881,10 +5898,15 @@ export class FactoryLoop implements Factory {
     // before promoting the next issue.
     if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) {
       this.#increment('abandonedDispatchReleaseRetries')
+      // #saveDispatchLifecycle already schedules the generic durable retry. The
+      // pending reason makes that retry re-acquire ownership and return here,
+      // rather than merely restoring the old running lifecycle and leaking the
+      // slot. The abandoned-specific scheduler remains the non-durable fallback.
       this.#scheduleAbandonedDispatchRetry(record, reason)
       await this.#writeInFlightRegistry()
       return
     }
+    this.#abandonedDispatchReasons.delete(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
