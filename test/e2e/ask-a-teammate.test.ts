@@ -124,12 +124,15 @@ describe('discover -> ask -> reply', () => {
         token: 'rk_live_test',
       }),
     })
+    const teammateFleet = new InternalFleetClient({
+      client: brokerHandle.client,
+    })
     const cannedReply = 'The deploy is healthy; no intervention is needed.'
     const questions: string[] = []
-    const stopStub = workerFleet.onAgentMessage((message) => {
+    const stopStub = teammateFleet.onAgentMessage((message) => {
       if (message.from !== 'factory-worker' || message.target !== 'infra-agent') return
       questions.push(message.body)
-      void workerFleet.sendMessage({
+      void teammateFleet.sendMessage({
         from: 'infra-agent',
         to: 'factory-worker',
         text: cannedReply,
@@ -196,6 +199,7 @@ describe('discover -> ask -> reply', () => {
     })])
 
     stopStub()
+    await teammateFleet.dispose()
     await workerFleet.dispose()
     expect(broker.shutdownCalls).toBe(1)
     await discoveryFleet.dispose()
