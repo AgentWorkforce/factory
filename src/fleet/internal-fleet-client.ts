@@ -305,7 +305,11 @@ export class InternalFleetClient implements FleetClient {
       // broker itself no longer advertises the name.
       let retained: boolean
       try {
-        retained = (await this.#client.listAgents()).some((agent) => agent.name === name)
+        const agents = await this.#client.listAgents()
+        if (!Array.isArray(agents)) {
+          throw new TypeError('Expected Harness Driver listAgents() to return an array')
+        }
+        retained = agents.some((agent) => agent?.name === name)
       } catch (error) {
         if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS) throw error
         this.#logger?.warn?.('[factory-sdk] unable to verify released broker name; retrying release', {
