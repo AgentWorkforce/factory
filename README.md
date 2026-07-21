@@ -130,7 +130,9 @@ Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
 backend reuses a relay broker that's already running for your workspace, and
 starts one if none is. For self-started brokers, the agent-exit timeout defaults
-to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
+to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`. Set
+`FACTORY_LOG_LEVEL=debug` to include per-checkout details for summarized local
+mount refreshes.
 
 Integration connection prompts only run for commands that need provider data or
 GitHub write access. Maintenance commands such as `status`, `loop-status`,
