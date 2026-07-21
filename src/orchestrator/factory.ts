@@ -305,6 +305,11 @@ export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loo
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
 class DispatchLifecycleCapacityError extends Error {}
+class DispatchLifecycleOwnedElsewhereError extends Error {
+  constructor(readonly leaseUntilMs?: number) {
+    super('durable dispatch is still owned by another publisher')
+  }
+}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -397,6 +402,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
+  readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -794,6 +800,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
@@ -865,7 +872,16 @@ export class FactoryLoop implements Factory {
   }
 
   async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
-    for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+    // The epoch cache is an execution optimization, not the durable ownership
+    // authority. Error/fence paths may evict a cached epoch while its persisted
+    // lease is still ours, so enumerate state before shutdown relinquishment.
+    const owned = new Map(this.#dispatchLifecycleEpochs)
+    for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      if (lifecycle.lease?.owner === this.#dispatchLifecycleOwner) {
+        owned.set(key, lifecycle.lease.epoch)
+      }
+    }
+    for (const [key, epoch] of owned) {
       await this.#state.releaseDispatchLifecycleLease(
         this.#workspaceId,
         key,
@@ -3137,9 +3153,11 @@ export class FactoryLoop implements Factory {
       const drive = this.#driveDispatchLifecycle(key)
         .then(() => {
           this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+          this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
         })
         .catch((error) => {
           if (error instanceof DispatchLifecycleCapacityError) {
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
               this.#dispatchLifecycleCapacityWaitLogged.add(key)
               this.#increment('dispatchLifecycleCapacityWaits')
@@ -3148,8 +3166,22 @@ export class FactoryLoop implements Factory {
                 retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
               })
             }
+          } else if (error instanceof DispatchLifecycleOwnedElsewhereError) {
+            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            if (!this.#dispatchLifecycleOwnershipWaitLogged.has(key)) {
+              this.#dispatchLifecycleOwnershipWaitLogged.add(key)
+              this.#increment('dispatchLifecycleOwnershipWaits')
+              this.#logger.warn?.('[factory] durable dispatch is leased by another publisher; waiting for lease release', {
+                issue: record.issue.key,
+                leaseRemainingMs: error.leaseUntilMs === undefined
+                  ? undefined
+                  : Math.max(0, error.leaseUntilMs - this.#clock.now()),
+                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
+              })
+            }
           } else {
             this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
               issue: record.issue.key,
               error: describeError(error).errorMessage,
@@ -3208,7 +3240,7 @@ export class FactoryLoop implements Factory {
         DISPATCH_LIFECYCLE_LEASE_MS,
       )
       if (!claim.acquired || !claim.lease) {
-        throw new Error(`durable dispatch ${lifecycle.issue.key} is still owned by another publisher`)
+        throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
       this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
       this.#scheduleDispatchLifecycleRenewal()

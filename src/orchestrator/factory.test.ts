@@ -4845,6 +4845,43 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('releases persisted owner leases on stop even after the local epoch cache was evicted', async () => {
+    class RejectFirstLifecycleSaveStore extends InMemoryStateStore {
+      rejected = false
+
+      override async saveDispatchLifecycle(
+        ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+      ): Promise<boolean> {
+        if (!this.rejected) {
+          this.rejected = true
+          return false
+        }
+        return await super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const path = issuePath(585)
+    const issue = issueFile(585)
+    const stateStore = new RejectFirstLifecycleSaveStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost before spawning')
+    const key = issueKey(decision.issue)
+    const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
+    expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
+
+    await factory.stop()
+
+    const afterStop = await stateStore.getDispatchLifecycle('factory-test', key)
+    expect(afterStop?.lease?.leaseUntilMs).toBe(Number.MIN_SAFE_INTEGER)
+  })
+
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
     const watchStatePath = join(root, 'state.json')
@@ -4890,21 +4927,29 @@ describe('FactoryLoop', () => {
       // autonomously take over after expiry with no second start or event.
       const restartedFleet = new RemoteLifecycleFleetClient()
       restartedFleet.exitImplementerOnReconcile = true
+      const restartedLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
       const restarted = createFactory(config(), {
         mount,
         fleet: restartedFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
         triage: new StaticTriage(),
         clock,
+        logger: restartedLogger,
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
       await expect(restarted.dispatch(decision)).resolves.toEqual(originalResult)
       const terminal = restarted.waitForDispatchTerminal(decision.issue)
-      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.hydrated).toEqual([])
       expect(restartedFleet.spawns).toEqual([])
       expect(publishInputs).toEqual([])
+      expect(restarted.status().counters.dispatchLifecycleOwnershipWaits).toBe(1)
+      expect(restartedLogger.warn).toHaveBeenCalledTimes(1)
+      expect(restartedLogger.warn).toHaveBeenCalledWith(
+        '[factory] durable dispatch is leased by another publisher; waiting for lease release',
+        expect.objectContaining({ issue: 'AR-85', retryMs: 1_000 }),
+      )
 
       clock.advance(5 * 60_000 + 1)
       await terminal
