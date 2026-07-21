@@ -2,13 +2,13 @@ version: '1.1'
 updated: '2026-07-21'
 catalog:
   category_count: 24
-  feature_count: 300
+  feature_count: 303
   tier_counts:
-    1: 43
-    2: 123
+    1: 44
+    2: 124
     3: 11
     4: 51
-    5: 57
+    5: 58
     6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -1627,6 +1627,13 @@ categories:
         location: src/environments/kubernetes-environment.ts, src/ports/environment.ts, src/orchestrator/reaper.ts
         verify_tier: 4
 
+      - id: verification-cloudflare-environment-provider
+        name: Cloudflare Ephemeral Environment Provider
+        api: EnvironmentProvider / CloudflareEnvironmentProvider / CloudflareEnvironmentReaper
+        description: Provision identity-bound Workers for Platforms dispatch namespaces, per-environment bindings and referenced secrets, Wrangler-backed Workers and Containers, reachable dispatch ingress, idempotent teardown, and TTL or dead-owner reaping
+        location: src/ports/environment.ts, src/environments/cloudflare-provider.ts, src/environments/cloudflare-provider.test.ts
+        verify_tier: 1
+
       - id: verification-stack-deployer
         name: Generic Verification Stack Deployer
         api: VerificationStackDeployer
@@ -1676,6 +1683,13 @@ categories:
         location: test/e2e/kubernetes-provider.e2e.ts, scripts/test-kubernetes-provider-e2e.sh, test/fixtures/kubernetes/, .github/workflows/ci.yml
         verify_tier: 4
 
+      - id: verification-cloudflare-provider-e2e
+        name: Cloudflare Provider Binding E2E
+        cli: npm run test:e2e:cloudflare
+        description: Against a real Cloudflare account, create a dispatch namespace, verify environment bindings and secrets through a reachable Worker, destroy all resources idempotently, and prove a short-TTL environment is reaped
+        location: test/e2e/environment-provider.e2e.ts, src/environments/cloudflare-provider.ts, package.json
+        verify_tier: 5
+
   proactive-health:
     name: Proactive Feature Guardian
     description: Scheduled, exhaustive, durable Slack questions over the live Factory feature manifest
@@ -1719,6 +1733,13 @@ categories:
         api: factory.config.json#environments.kubernetes
         description: Map customers and repositories to BYOC or managed clusters using secret references, protected namespaces, cluster-scope opt-ins, placement constraints, quotas, limits, and a managed-fidelity caveat
         location: src/config/schema.ts, src/environments/connection-registry.ts, factory-test-infra/kubernetes-connections.example.yaml
+        verify_tier: 2
+
+      - id: config-cloudflare-environments
+        name: Cloudflare Environment Credentials and Limits
+        api: factory.config.json#environments.cloudflare
+        description: Resolve Cloudflare account and API-token credentials only through Resource references and bound namespace, Worker, Container, CPU, subrequest, and TTL limits
+        location: src/config/schema.ts, src/environments/cloudflare-config.ts
         verify_tier: 2
 
       - id: config-issue-source

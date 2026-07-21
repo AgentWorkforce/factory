@@ -89,6 +89,43 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.environments).toEqual({})
   })
 
+  it('accepts only Resource.* references for Cloudflare credentials and applies limits', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      environments: {
+        cloudflare: {
+          accountId: 'Resource.CloudflareAccountId',
+          apiToken: 'Resource.CloudflareApiToken',
+        },
+      },
+    })
+
+    expect(parsed.environments.cloudflare).toMatchObject({
+      accountId: 'Resource.CloudflareAccountId',
+      apiToken: 'Resource.CloudflareApiToken',
+      namespacePrefix: 'factory',
+      ttlMs: 15 * 60_000,
+      minTtlMs: 1_000,
+      maxTtlMs: 24 * 60 * 60_000,
+      limits: {
+        maxActiveEnvironments: 5,
+        maxWorkersPerEnvironment: 20,
+        maxContainersPerEnvironment: 5,
+        workerCpuMs: 50,
+        workerSubrequests: 50,
+      },
+    })
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      environments: {
+        cloudflare: {
+          accountId: 'literal-account-id',
+          apiToken: 'literal-token',
+        },
+      },
+    })).toThrow(/Resource\.<name>/u)
+  })
+
   it('accepts secret-reference-only Kubernetes BYOC and managed connections', () => {
     const parsed = FactoryConfigSchema.parse({
       repos: { default: 'AgentWorkforce/factory' },

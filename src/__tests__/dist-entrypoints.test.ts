@@ -27,6 +27,8 @@ describe('published dist entrypoints', () => {
     expect(hosted.createHostedFactory).toBeTypeOf('function')
     expect(hosted.DurableObjectHostedFactoryStateStore).toBeTypeOf('function')
     expect(environments.KubernetesEnvironmentProvider).toBeTypeOf('function')
+    expect(main.CloudflareEnvironmentProvider).toBeTypeOf('function')
+    expect(environments.CloudflareEnvironmentProvider).toBeTypeOf('function')
     expect(environments.KubectlEnvironmentProvider).toBeTypeOf('function')
     expect(environments.VerificationPipeline).toBeTypeOf('function')
     expect(environments.VerificationStackDescriptorSchema).toBeDefined()

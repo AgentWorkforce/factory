@@ -72,6 +72,7 @@
     "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
+    "test:e2e:cloudflare": "tsx test/e2e/environment-provider.e2e.ts",
     "test:e2e:kubernetes": "bash scripts/test-kubernetes-provider-e2e.sh",
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
     "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
@@ -92,12 +93,18 @@
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",
+    "wrangler": "4.86.0",
     "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "overrides": {
     "@scalar/postman-to-openapi": "0.4.10",
-    "listr2": "9.0.5"
+    "listr2": "9.0.5",
+    "undici": "7.28.0",
+    "wrangler": {
+      "esbuild": "0.28.1"
+    },
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

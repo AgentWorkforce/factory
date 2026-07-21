@@ -1,4 +1,45 @@
 export {
+  CloudflareEnvironmentConfigSchema,
+  CloudflareEnvironmentLimitsSchema,
+} from './cloudflare-config.js'
+export type {
+  CloudflareEnvironmentConfig,
+  CloudflareEnvironmentLimits,
+} from './cloudflare-config.js'
+export {
+  CLOUDFLARE_ENVIRONMENT_METADATA_BINDING,
+  CLOUDFLARE_ENVIRONMENT_METADATA_WORKER,
+  CLOUDFLARE_ENVIRONMENT_TAG,
+  CloudflareEnvironmentProvider,
+  CloudflareEnvironmentReaper,
+  CloudflareEnvironmentStackSchema,
+  FetchCloudflareApi,
+  ResourceCloudflareCredentialResolver,
+  WranglerCloudflareRuntime,
+} from './cloudflare-provider.js'
+export type {
+  CloudflareApi,
+  CloudflareContainerApplication,
+  CloudflareCredentialResolver,
+  CloudflareCredentials,
+  CloudflareDispatchNamespace,
+  CloudflareDispatchWorkerUpload,
+  CloudflareEnvironmentProviderOptions,
+  CloudflareEnvironmentStack,
+  CloudflareEnvironmentStackInput,
+  CloudflareProvisionSpec,
+  CloudflareReapReport,
+  CloudflareResourceValue,
+  CloudflareWorkerBinding,
+  CloudflareWorkerSpec,
+  CloudflareWranglerDeployInput,
+  CloudflareWranglerProject,
+  CloudflareWranglerRuntime,
+  WranglerCloudflareRuntimeOptions,
+  WranglerCommandResult,
+  WranglerCommandRunner,
+} from './cloudflare-provider.js'
+export {
   DEFAULT_MANAGED_FIDELITY_CAVEAT,
   EnvironmentKubernetesCredentialResolver,
   KubernetesConnectionRegistry,

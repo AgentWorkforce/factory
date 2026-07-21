@@ -845,14 +845,18 @@ cleanup guard handles a failed assertion without signalling a reused PID.
 **Categories:** `verification-environments`.
 
 **Prerequisites:** tiers 1–2 require only the checkout and fixture config. The
-live scenarios require Docker, `kind`, and `kubectl`; the manual merge decision
-also requires one disposable reviewed pull request and therefore remains tier 6.
+Kubernetes live scenarios require Docker, `kind`, and `kubectl`. The Cloudflare
+live scenario requires a disposable account with Workers for Platforms enabled,
+`CLOUDFLARE_API_TOKEN`, and either `CLOUDFLARE_ACCOUNT_ID` or a token that can
+resolve exactly one account. The manual merge decision also requires one
+disposable reviewed pull request and therefore remains tier 6.
 
 ```bash
 npm run build
 npx vitest run \
   src/environments/verification-stack-descriptor.test.ts \
   src/environments/verification-stack-deployer.test.ts \
+  src/environments/cloudflare-provider.test.ts \
   src/environments/kubernetes-provider.test.ts \
   src/environments/load-harness.test.ts \
   src/environments/verification-pipeline.test.ts \
@@ -861,14 +865,19 @@ npx vitest run \
 kind create cluster --name factory-gate-e2e
 npm run test:e2e:verification
 kind delete cluster --name factory-gate-e2e
+
+npm run test:e2e:cloudflare
 ```
 
-Require the real cluster run to prove one green decision, E2E-red and load-red
-decisions, bounded timeout teardown, hard-kill reaping, namespace absence, and
-Cloud-reporter evidence. Unit coverage must prove that a red verifier never
-reaches the guarded merge operation and that the exact reviewed head is passed
-to the verifier. Always delete the kind cluster in a shell trap. Do not claim
-the tier-6 merge lifecycle without a disposable approved PR.
+Require the real Cloudflare run to prove dispatch namespace identity,
+per-environment binding and secret visibility, reachable ingress, idempotent
+destruction, and TTL reaping. Require the real cluster run to prove one green
+decision, E2E-red and load-red decisions, bounded timeout teardown, hard-kill
+reaping, namespace absence, and Cloud-reporter evidence. Unit coverage must
+prove that a red verifier never reaches the guarded merge operation and that the
+exact reviewed head is passed to the verifier. Always delete the kind cluster
+in a shell trap. Do not claim the tier-6 merge lifecycle without a disposable
+approved PR.
 
 ---
 
