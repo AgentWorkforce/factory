@@ -9,7 +9,7 @@ import type { LoadMeasurements, LoadSloViolation } from './load-harness.js'
 import { runLoad } from './load-harness.js'
 import { loadLoadProfile } from './load-profile.js'
 import { KubectlEnvironmentProvider } from './kubernetes-environment.js'
-import { loadVerificationStack, type ResolvedVerificationStack } from './verification-stack.js'
+import { loadVerificationGateStack, type ResolvedVerificationStack } from './verification-stack.js'
 
 export const VERIFICATION_EVIDENCE_CONTRACT = 'factory.verification.evidence.v1' as const
 export const DEFAULT_VERIFICATION_DESCRIPTOR = '.factory/verification-stack.yaml'
@@ -169,7 +169,7 @@ export class VerificationPipeline implements VerificationGate {
     try {
       const resolveStarted = Date.now()
       try {
-        stack = await loadVerificationStack(input.repositoryPath, descriptorPath)
+        stack = await loadVerificationGateStack(input.repositoryPath, descriptorPath)
         if (input.expectedHeadSha) {
           const checkoutHeadSha = await this.#revisionResolver(stack.repositoryPath)
           if (checkoutHeadSha.toLowerCase() !== input.expectedHeadSha.toLowerCase()) {

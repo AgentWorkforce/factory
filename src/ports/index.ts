@@ -57,4 +57,9 @@ export type {
   ProvisionEnvironmentInput,
   VerificationEnvironment,
   VerificationEnvironmentProvider,
+  Environment,
+  EnvironmentProvider,
+  EnvironmentSpec,
+  EnvironmentStatus,
+  KubernetesEnvironmentTarget,
 } from './environment'

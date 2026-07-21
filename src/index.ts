@@ -292,7 +292,61 @@ export type {
   TelemetrySink,
   FactoryEventReporter,
   FactoryEventReportResult,
+  Environment,
+  EnvironmentProvider,
+  EnvironmentSpec,
+  EnvironmentStatus,
+  KubernetesEnvironmentTarget,
 } from './ports'
+export {
+  DEFAULT_VERIFICATION_STACK_PATH,
+  VERIFICATION_STACK_API_VERSION,
+  VERIFICATION_STACK_JSON_SCHEMA_URL,
+  VERIFICATION_STACK_KIND,
+  VerificationProbeSchema,
+  VerificationStackDescriptorError,
+  VerificationStackDescriptorSchema,
+  VerificationStackSourceSchema,
+  loadVerificationStack,
+  loadVerificationStackFile,
+  parseVerificationStack,
+  resolveVerificationStackAsset,
+  resolveVerificationStackDescriptor,
+} from './environments/stack-descriptor'
+export type {
+  LoadedVerificationStack,
+  ResolveVerificationStackOptions,
+  VerificationProbe,
+  VerificationStackDescriptor,
+  VerificationStackEndpoint,
+  VerificationStackReferenceGroup,
+  VerificationStackSeed,
+  VerificationStackService,
+  VerificationStackSource,
+} from './environments/stack-descriptor'
+export {
+  KubectlPortForwarder,
+  StackDeploymentError,
+  VerificationStackDeployer,
+  deployVerificationStack,
+} from './environments/stack-deployer'
+export type {
+  ManagedPortForward,
+  PortForwarder,
+  ReferenceResolutionContext,
+  StackDeployerOptions,
+  StackDeployment,
+  VerificationStackReferenceResolver,
+} from './environments/stack-deployer'
+export { KubernetesEnvironmentProvider } from './environments/kubernetes-provider'
+export type { KubernetesEnvironmentProviderOptions } from './environments/kubernetes-provider'
+export { CommandExecutionError, ProcessCommandRunner } from './environments/kubernetes-command'
+export type {
+  CommandResult,
+  CommandRunner,
+  KubernetesConnection,
+  RunCommandOptions,
+} from './environments/kubernetes-command'
 export {
   FACTORY_CLOUD_EVENT_CONTRACT_V1,
   FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE,
@@ -433,7 +487,7 @@ export type {
 } from './environments/verification-pipeline'
 export {
   VerificationStackSchema,
-  loadVerificationStack,
+  loadVerificationGateStack,
 } from './environments/verification-stack'
 export type {
   ResolvedVerificationStack,

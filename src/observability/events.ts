@@ -185,7 +185,7 @@ export const FactoryCloudVerificationEvidenceV1Schema = z.object({
     durationMs: nonNegativeInteger,
     measured: verificationMeasurements,
     violations: z.array(z.object({
-      metric: z.enum(['p95LatencyMs', 'p99LatencyMs', 'errorRate', 'throughputRps']),
+      metric: z.enum(['requestCount', 'p95LatencyMs', 'p99LatencyMs', 'errorRate', 'throughputRps']),
       actual: z.number().finite(),
       threshold: z.number().finite(),
       operator: z.enum(['at-most', 'at-least']),

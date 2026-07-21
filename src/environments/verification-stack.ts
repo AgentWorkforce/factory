@@ -90,7 +90,7 @@ export interface ResolvedVerificationStack {
   }
 }
 
-export async function loadVerificationStack(
+export async function loadVerificationGateStack(
   repositoryPath: string,
   descriptor = '.factory/verification-stack.yaml',
 ): Promise<ResolvedVerificationStack> {

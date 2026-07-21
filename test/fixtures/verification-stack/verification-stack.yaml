@@ -1,0 +1,50 @@
+apiVersion: factory.agentworkforce.dev/v1alpha1
+kind: VerificationStack
+name: factory-stack-e2e
+source:
+  type: manifests
+  paths:
+    - test/fixtures/verification-stack/stack.yaml
+secrets:
+  - name: postgres-credentials
+    data:
+      POSTGRES_PASSWORD:
+        ref: fixture://postgres/password
+services:
+  - name: web
+    workload:
+      kind: deployment
+    readiness:
+      type: http
+      port: 5678
+      path: /health
+      timeoutSeconds: 180
+      intervalSeconds: 1
+  - name: postgres
+    workload:
+      kind: deployment
+    readiness:
+      type: exec
+      command: [pg_isready, -U, factory, -d, factory]
+      timeoutSeconds: 180
+      intervalSeconds: 1
+seeds:
+  - type: exec
+    name: seed-postgres
+    service: postgres
+    command:
+      - psql
+      - -U
+      - factory
+      - -d
+      - factory
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "CREATE TABLE verification_seed (id integer PRIMARY KEY, value text NOT NULL); INSERT INTO verification_seed VALUES (1, 'ran');"
+    timeoutSeconds: 30
+endpoints:
+  - name: web
+    service: web
+    port: 5678
+    path: /

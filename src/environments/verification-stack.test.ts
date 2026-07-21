@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { loadVerificationStack } from './verification-stack'
+import { loadVerificationGateStack } from './verification-stack'
 
 const roots: string[] = []
 
@@ -12,7 +12,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
 })
 
-describe('loadVerificationStack', () => {
+describe('loadVerificationGateStack', () => {
   it('resolves repository-relative files and duration safety controls', async () => {
     const root = await repositoryWith(`
 apiVersion: factory.agentworkforce.dev/v1alpha1
@@ -26,7 +26,7 @@ load: { profile: load/profile.yaml, timeout: 1m }
 timeouts: { overall: 10m, teardown: 90s }
 `)
 
-    await expect(loadVerificationStack(root)).resolves.toMatchObject({
+    await expect(loadVerificationGateStack(root)).resolves.toMatchObject({
       repositoryPath: root,
       provision: { namespacePrefix: 'factory-verify', ttlMs: 15 * 60_000 },
       deploy: {
@@ -51,7 +51,7 @@ e2e: { command: npm }
 load: { profile: load.yaml }
 `)
 
-    await expect(loadVerificationStack(root)).rejects.toThrow(/escapes the repository/)
+    await expect(loadVerificationGateStack(root)).rejects.toThrow(/escapes the repository/)
   })
 })
 
