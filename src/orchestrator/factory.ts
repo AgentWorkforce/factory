@@ -434,6 +434,7 @@ export class FactoryLoop implements Factory {
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   #startupAgentAdoptionActive = false
+  #startupRosterExitSignals?: Set<string>
   // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
   // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
   // owner per PR.
@@ -2594,20 +2595,7 @@ export class FactoryLoop implements Factory {
         // Ignore that pre-hydration history; the roster reconcile below runs
         // after durable records are restored and is the authoritative signal.
         if (this.#startupAgentAdoptionActive) return
-        // Broker replay can deliver an old exit immediately when the listener
-        // is installed, before durable agents are restored. Queue a later
-        // roster-reconciled exit behind it instead of dropping the newer event.
-        const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
-        const handling = previous
-          .catch(() => undefined)
-          .then(async () => await this.#handleAgentExit(name, reason))
-          .catch((error) => this.#error(error))
-          .finally(() => {
-            if (this.#agentExitsInFlight.get(name) === handling) {
-              this.#agentExitsInFlight.delete(name)
-            }
-          })
-        this.#agentExitsInFlight.set(name, handling)
+        this.#queueAgentExit(name, reason)
       })
     }
     if (!this.#offDeliveryFailed) {
@@ -2636,6 +2624,24 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  #queueAgentExit(name: string, reason?: string): void {
+    this.#startupRosterExitSignals?.add(name)
+    // Broker replay can deliver an old exit immediately when the listener is
+    // installed, before durable agents are restored. Queue a later
+    // roster-reconciled exit behind it instead of dropping the newer event.
+    const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
+    const handling = previous
+      .catch(() => undefined)
+      .then(async () => await this.#handleAgentExit(name, reason))
+      .catch((error) => this.#error(error))
+      .finally(() => {
+        if (this.#agentExitsInFlight.get(name) === handling) {
+          this.#agentExitsInFlight.delete(name)
+        }
+      })
+    this.#agentExitsInFlight.set(name, handling)
+  }
+
   // Durable backends survive orchestrator restarts: re-adopt the agents recorded
   // in the durable lifecycle store, restore their full batch/spec association,
   // then reconcile once so exits that happened while this process was down are
@@ -2644,6 +2650,7 @@ export class FactoryLoop implements Factory {
     try {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
+      const durableAgentNames = new Set<string>()
       let hasNonterminalDurableLifecycle = false
       const durableLifecycles = await this.#deduplicateQueuedGithubLifecycleAliases(
         await this.#state.listDispatchLifecycles(this.#workspaceId),
@@ -2689,6 +2696,7 @@ export class FactoryLoop implements Factory {
           const node = agent.tracked.result?.node
           if (invocationId || node || agent.tracked.result) {
             agents.push({ name: agent.name, invocationId, node })
+            durableAgentNames.add(agent.name)
           }
         }
       }
@@ -2718,7 +2726,26 @@ export class FactoryLoop implements Factory {
         this.#logger.info?.('[factory] durable startup roster reconciliation started', {
           agents: agents.map((agent) => agent.name),
         })
-        await this.#fleet.reconcileTrackedAgents?.()
+        this.#startupRosterExitSignals = new Set<string>()
+        try {
+          await this.#fleet.reconcileTrackedAgents?.()
+          const signalled = this.#startupRosterExitSignals
+          const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+          const missing = [...durableAgentNames]
+            .filter((name) => !online.has(name) && !signalled?.has(name))
+          for (const name of missing) {
+            this.#fleet.markAgentTerminal?.(name, 'reconciled-missing')
+            this.#queueAgentExit(name, 'reconciled-missing')
+          }
+          if (missing.length > 0) {
+            this.#increment('startupRosterMissingExitsSynthesized', missing.length)
+            this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
+              agents: missing,
+            })
+          }
+        } finally {
+          this.#startupRosterExitSignals = undefined
+        }
         this.#logger.info?.('[factory] durable startup roster reconciliation completed', {
           pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => agents.some((agent) => agent.name === name)),
         })
@@ -5116,12 +5143,18 @@ export class FactoryLoop implements Factory {
           }
           return
         }
-        if (tracked.result?.locality === 'remote' && tracked.spec.branch) {
+        // A normal remote exit can race branch replication, so leave it in the
+        // publishing retry loop briefly. Startup reconciliation is different:
+        // the live roster has already proved the hydrated session is gone. If
+        // its retained branch still has nothing publishable, restart the saved
+        // worker instead of consuming an implementation slot forever.
+        if (!tracingReconciledExit && tracked.result?.locality === 'remote' && tracked.spec.branch) {
           this.#scheduleDispatchLifecycleRetry(record)
           return
         }
       }
 
+      let recovered = false
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
@@ -5147,6 +5180,7 @@ export class FactoryLoop implements Factory {
         try {
           await resume
           await this.#state.markResumed(this.#workspaceId, resumeKey)
+          recovered = true
         } catch (error) {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
@@ -5193,6 +5227,7 @@ export class FactoryLoop implements Factory {
             channel: tracked.spec.channel,
           })
           batch.recordSpawn(record, tracked.spec, invocationId, result)
+          recovered = true
         } catch (error) {
           if (!isAgentAlreadyExistsError(error)) {
             throw error
@@ -5213,6 +5248,10 @@ export class FactoryLoop implements Factory {
             await this.#concludeTerminalImplementer(record, name, 'respawn-already-exists')
           }
         }
+      }
+      if (recovered && tracked.spec.role === 'implementer') {
+        await this.#writeInFlightRegistry()
+        await this.#saveDispatchLifecycle(record, 'running')
       }
     } catch (error) {
       this.#error(error, record.issue)
