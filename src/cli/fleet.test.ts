@@ -367,6 +367,14 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses init with an explicit repository and workspace', () => {
+    expect(parseFleetCommand(['init', 'Acme/widgets', '--workspace', 'rw_widgets'])).toEqual({
+      kind: 'factory-init',
+      repo: 'Acme/widgets',
+      workspaceId: 'rw_widgets',
+    })
+  })
+
   it('defaults factory start to live mode', () => {
     expect(parseFleetCommand(['start'])).toEqual({
       kind: 'factory',

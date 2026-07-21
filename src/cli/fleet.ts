@@ -7,6 +7,7 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
+import { initializeFactory } from './init'
 import {
   FileStateStore,
   RelayfileCloudMountClient,
@@ -134,6 +135,7 @@ type ParsedCommand =
   | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
+  | { kind: 'factory-init'; repo?: string; workspaceId?: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -160,6 +162,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         ...(command.baseRef ? { baseRef: command.baseRef } : {}),
       })
       writeJson(out, report)
+      return 0
+    }
+
+    if (command.kind === 'factory-init') {
+      await initializeFactory({ repo: command.repo, workspaceId: command.workspaceId, stdout: out, stderr: err })
       return 0
     }
 
@@ -948,6 +955,22 @@ function resolveLocalMountFn(
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
+  if (action === 'init') {
+    const values = [issueOrPr, ...flags].filter((value): value is string => Boolean(value))
+    let repo: string | undefined
+    let workspaceId: string | undefined
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index]
+      if (value === '--workspace') {
+        workspaceId = requireValue(values, ++index, '--workspace')
+        continue
+      }
+      if (value.startsWith('-')) throw new Error(`Unknown factory init option: ${value}`)
+      if (repo) throw new Error('factory init accepts at most one owner/repo argument')
+      repo = value
+    }
+    return { kind: 'factory-init', repo, workspaceId }
+  }
   if (action === 'start') {
     return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
   }
@@ -1707,7 +1730,8 @@ function isCapability(value: string | undefined): value is Capability {
 }
 
 function isFactoryAction(value: string): boolean {
-  return value === 'start' ||
+  return value === 'init' ||
+    value === 'start' ||
     value === 'run-once' ||
     value === 'loop' ||
     value === 'status' ||
@@ -1783,6 +1807,7 @@ function helpText(): string {
   return `${usage()}
 
 Commands:
+  init [owner/repo]     Set up this checkout for GitHub-native issue dispatch
   run-once              Run one discovery -> triage -> dispatch cycle
   start                 Run the live factory daemon
   status                Print current factory status as JSON
@@ -1799,6 +1824,7 @@ Commands:
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
+  --workspace <id>      Relay workspace to use with init (otherwise active workspace)
   --config <path>       Factory config JSON path (default: ./factory.config.json)
   --dry-run             Discover and triage without writes or agent spawns
   --backend <backend>   Fleet backend: internal or relay

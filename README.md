@@ -55,6 +55,21 @@ From a source checkout instead of an npm install, run
 
 ## Quick start
 
+From the repository checkout you want Factory to work in, the quickest setup is:
+
+```bash
+factory init
+```
+
+It derives the repository from `origin`, checks for `agent-relay` and
+`relayfile`, finds the active Relay workspace, starts the local mount, verifies
+GitHub access, and creates `factory.config.json` for GitHub-native issues. If
+something is missing, it explains what to do and writes no partial config. Use
+`factory init owner/repo` when the checkout has no GitHub `origin`, or add
+`--workspace <id>` to choose a workspace explicitly.
+
+After init, add the `factory` label to an open issue and run a dry run below.
+
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
    open pull requests by default. A local `gh` installation and `gh auth login`
@@ -116,6 +131,7 @@ From a source checkout instead of an npm install, run
 
 | Command | What it does |
 |---|---|
+| `factory init [owner/repo]` | Verify local Relay prerequisites and GitHub access, then configure the current checkout for GitHub-native issue dispatch. |
 | `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
