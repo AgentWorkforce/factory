@@ -5171,6 +5171,29 @@ export class FactoryLoop implements Factory {
         }
       }
 
+      // The internal broker can retain a historical name after its cloud
+      // presence is authoritatively offline (relay#1116-family). Reclaim that
+      // supported fleet registration before attempting the deterministic
+      // resume/respawn; otherwise recovery immediately collides with the dead
+      // name and concludes useful work as terminal.
+      if (tracingReconciledExit && this.#fleet.placementLocality === 'local') {
+        try {
+          await this.#fleet.release(name, 'reconciled-missing')
+          this.#increment('staleLocalAgentNamesReclaimed')
+          this.#logger.info?.('[factory] reclaimed stale local agent name before recovery', {
+            issue: record.issue.key,
+            name,
+          })
+        } catch (error) {
+          this.#increment('staleLocalAgentNameReclaimFailures')
+          this.#logger.warn?.('[factory] stale local agent name reclaim failed; recovery will still be attempted', {
+            issue: record.issue.key,
+            name,
+            error,
+          })
+        }
+      }
+
       let recovered = false
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`

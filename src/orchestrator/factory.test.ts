@@ -9611,6 +9611,35 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
   })
 
+  it('reclaims a canonically missing local broker name before resuming it', async () => {
+    const mount = new FakeMountClient({ [issuePath(801)]: issueFile(801) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-801-impl-pear', 'session-impl-801')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(801), issueFile(801)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-801-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+    expect(fleet.releases).toContainEqual({
+      name: 'ar-801-impl-pear',
+      reason: 'reconciled-missing',
+    })
+    expect(fleet.resumes[0]).toMatchObject({
+      name: 'ar-801-impl-pear',
+      sessionRef: 'session-impl-801',
+    })
+    expect(factory.status().counters.staleLocalAgentNamesReclaimed).toBe(1)
+    expect(factory.status().counters.resumeNameCollisions ?? 0).toBe(0)
+    await factory.stop()
+  })
+
   it('drains the real internal fleet after an implementer resume collides with a leaked name', async () => {
     const mount = new FakeMountClient({ [issuePath(81)]: issueFile(81) })
     const harness = new ResumeCollisionHarnessClient()
