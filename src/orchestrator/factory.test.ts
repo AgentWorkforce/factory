@@ -18161,6 +18161,107 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('preserves PR activity without waking a released babysitter until human clarification resumes the team', async () => {
+    const issue = realIssueFile(436, ready, { title: 'Real suspended babysitter wake' })
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(436)]: issue })
+    let fleet = new DurableFakeFleetClient()
+    fleet.setSessionRef('ar-436-impl-pear', 'session-ar-436-impl-pear')
+    fleet.setSessionRef('ar-436-review', 'session-ar-436-review')
+    fleet.setSessionRef('ar-436-babysit', 'session-ar-436-babysit')
+    const stateStore = new InMemoryStateStore({ batchSize: 3 })
+    let factory = createFactory(babysitterConfig({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(436), issue)))
+      mount.files.set(issuePath(436), { content: realIssueFile(436, implementing, {
+        title: 'Real suspended babysitter wake',
+      }) })
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/436/metadata.json'
+      mount.files.set(prPath, { content: {
+        number: 436,
+        state: 'open',
+        head_ref: 'ar-436-fix',
+        draft: false,
+        mergeable: 'MERGEABLE',
+      } })
+      mount.emit(changeEvent(prPath, 'pr-436-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-436-babysit'))
+
+      fleet.emitAgentMessage({
+        from: 'ar-436-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Which compatibility contract should this use?',
+        eventId: 'agent-question-436',
+      })
+      await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      expect(fleet.releases).toEqual(expect.arrayContaining([
+        { name: 'ar-436-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-436-review', reason: 'waiting-for-human' },
+        { name: 'ar-436-babysit', reason: 'waiting-for-human' },
+      ]))
+
+      const commentPath = '/github/repos/AgentWorkforce/pear/comments/9436.json'
+      mount.files.set(commentPath, { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 436 },
+        comment: { id: 9436, body: 'provider-authored review activity' },
+      } })
+      mount.emit(changeEvent(commentPath, 'comment-9436'))
+
+      await vi.waitFor(() => expect(
+        factory.status().counters.babysitterEventWakesDeferredWaitingForHuman,
+      ).toBe(1))
+      await new Promise((resolve) => setTimeout(resolve, 750))
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
+      expect(factory.status().counters.babysitterEventWakeFailures).toBeUndefined()
+
+      await factory.stop()
+      fleet = new DurableFakeFleetClient()
+      factory = createFactory(babysitterConfig({ slack: slackConfig() }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+      })
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(
+        factory.status().counters.babysitterEventWakesDeferredWaitingForHuman,
+      ).toBe(1))
+      await new Promise((resolve) => setTimeout(resolve, 750))
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
+      expect(factory.status().counters.babysitterEventWakeFailures).toBeUndefined()
+
+      emitSlackReply(
+        mount,
+        slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'human-answer-436'),
+        'human-answer-436',
+        {
+          text: 'Use the shared canonical contract.',
+          user: 'U123',
+          user_is_bot: false,
+        },
+      )
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
+      ).toBe(1))
+      expect(fleet.resumes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'ar-436-babysit', sessionRef: 'session-ar-436-babysit' }),
+      ]))
+      const wake = fleet.messages.find((message) => message.text.startsWith('<integration-event'))
+      expect(wake?.text).toContain('review-comment')
+      expect(factory.status().counters.babysitterEventWakesDelivered).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('treats wrapped REST conflict metadata as actionable and defers its wake through the critical fence', async () => {
     const issue = realIssueFile(435, ready, { title: 'Real adapter conflict recovery' })
     const mount = new FakeMountClient({ [issuePath(435)]: issue })
