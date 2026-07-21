@@ -617,6 +617,19 @@ class ResumeNameCollisionFleetClient extends FakeFleetClient {
   }
 }
 
+class RotatingSessionResumeFleetClient extends FakeFleetClient {
+  override readonly durableOwnership = true
+
+  override async resume(input: Parameters<FakeFleetClient['resume']>[0]): Promise<SpawnResult> {
+    const result = await super.resume(input)
+    return { ...result, sessionRef: `rotated-session-${this.resumes.length}` }
+  }
+}
+
+class DurableFakeFleetClient extends FakeFleetClient {
+  override readonly durableOwnership = true
+}
+
 // Mimics the broker's own restartPolicy re-registering an exited agent's name
 // before the orchestrator's no-sessionRef RESPAWN runs, so the respawn collides
 // with http 500 "already exists" (the real relay#1116 path exercised in the
@@ -9661,6 +9674,79 @@ describe('FactoryLoop', () => {
     ])
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
+  })
+
+  it('bounds recovery when each successful resume returns a new session ref', async () => {
+    const mount = new FakeMountClient({ [issuePath(803)]: issueFile(803) })
+    const fleet = new RotatingSessionResumeFleetClient()
+    fleet.setSessionRef('ar-803-impl-pear', 'session-impl-803')
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(803), issueFile(803)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-803-impl-pear', 'crash')
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+
+    // The first recovery rotated the session ref. A second exit still belongs
+    // to the same logical agent and must conclude rather than resume forever.
+    fleet.emitAgentExit('ar-803-impl-pear', 'crash')
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'abandoned' })
+    })
+
+    expect(fleet.resumes).toHaveLength(1)
+    expect(factory.status().inFlight).toEqual([])
+    await factory.stop()
+  })
+
+  it('bounds no-session respawns and promotes the next durable queued issue', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(804)]: issueFile(804),
+      [issuePath(805)]: issueFile(805),
+    })
+    const fleet = new DurableFakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const first = await factory.triageIssue(parseLinearIssue(issuePath(804), issueFile(804)))
+    const second = await factory.triageIssue(parseLinearIssue(issuePath(805), issueFile(805)))
+
+    await factory.dispatch(first)
+    await factory.dispatch(second)
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+      .resolves.toMatchObject({ phase: 'queued' })
+
+    fleet.emitAgentExit('ar-804-impl-pear', 'crash')
+    await vi.waitFor(() => {
+      expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-804-impl-pear')).toHaveLength(2)
+    })
+
+    // No-session workers take the respawn path. Its successful recovery must
+    // count exactly like a session resume so the next exit frees capacity.
+    fleet.emitAgentExit('ar-804-impl-pear', 'crash')
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+        .toMatchObject({ phase: 'abandoned' })
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+        .toMatchObject({ phase: 'running' })
+    })
+
+    expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-804-impl-pear')).toHaveLength(2)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-805-impl-pear')
+    await factory.stop()
   })
 
   it('reclaims a canonically missing local broker name before resuming it', async () => {

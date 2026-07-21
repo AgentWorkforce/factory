@@ -5220,43 +5220,45 @@ export class FactoryLoop implements Factory {
         }
       }
 
+      // Bound recovery by the durable logical agent, not by the session ref.
+      // Harnesses may return a fresh session ref from every successful resume,
+      // and no-sessionRef workers use respawn instead. Keying only resumptions
+      // by the changing ref (and not recording respawns at all) let an agent
+      // that exited immediately consume a batch slot forever while Factory
+      // continuously recreated it. One successful recovery is enough; a
+      // subsequent no-PR implementer exit is terminal and frees the slot.
+      const recoveryKey = `${issueKey(record.issue)}:${name}`
+      if (await this.#state.isResumed(this.#workspaceId, recoveryKey)) {
+        if (tracked.spec.role === 'implementer') {
+          await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
+        }
+        return
+      }
+
+      const existing = this.#resumeInFlight.get(recoveryKey)
+      if (existing) {
+        await existing
+        return
+      }
+
       let recovered = false
       if (tracked.sessionRef) {
-        const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
-        if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
-          // Already resumed once and STILL exiting with no completion PR — the
-          // agent isn't making progress. Conclude the dispatch so a human
-          // notices AND the reviewer waiting on the implementer's DM is torn
-          // down, instead of leaving the issue silently in-flight forever with
-          // a live reviewer stalling the owned-broker dispose-wait (#67).
-          if (tracked.spec.role === 'implementer') {
-            await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
-          }
-          return
-        }
-
-        const existing = this.#resumeInFlight.get(resumeKey)
-        if (existing) {
-          await existing
-          return
-        }
-
         const resume = this.#resumeTrackedAgent(record, name, tracked)
-        this.#resumeInFlight.set(resumeKey, resume)
+        this.#resumeInFlight.set(recoveryKey, resume)
         try {
           await resume
-          await this.#state.markResumed(this.#workspaceId, resumeKey)
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           recovered = true
         } catch (error) {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
             // (relay#1116-family), so re-registering collides with the stuck
             // name. Retrying just re-collides forever. Treat it as terminal for
-            // this name: record the resume key so subsequent exit events
+            // this name: record the recovery key so subsequent exit events
             // short-circuit, count it, and warn once. The external reaper / a
             // broker restart reclaims the leaked name.
             this.#fleet.markAgentTerminal?.(name, 'resume-already-exists')
-            await this.#state.markResumed(this.#workspaceId, resumeKey)
+            await this.#state.markResumed(this.#workspaceId, recoveryKey)
             this.#increment('resumeNameCollisions')
             this.#logger.warn?.('[factory] resume skipped: broker still holds agent name (relay#1116); not retrying', {
               issue: record.issue.key,
@@ -5273,11 +5275,11 @@ export class FactoryLoop implements Factory {
             throw error
           }
         } finally {
-          this.#resumeInFlight.delete(resumeKey)
+          this.#resumeInFlight.delete(recoveryKey)
         }
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
-        try {
+        const respawn = (async (): Promise<void> => {
           await this.#prepareAgentWorktree(record, tracked.spec)
           const result = await this.#fleet.spawn({
             name: tracked.spec.name,
@@ -5293,6 +5295,11 @@ export class FactoryLoop implements Factory {
             channel: tracked.spec.channel,
           })
           batch.recordSpawn(record, tracked.spec, invocationId, result)
+        })()
+        this.#resumeInFlight.set(recoveryKey, respawn)
+        try {
+          await respawn
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           recovered = true
         } catch (error) {
           if (!isAgentAlreadyExistsError(error)) {
@@ -5305,6 +5312,7 @@ export class FactoryLoop implements Factory {
           // the dispatch so a reviewer blocked on the implementer's DM does not
           // hang the owned-broker dispose-wait (#67).
           this.#fleet.markAgentTerminal?.(name, 'respawn-already-exists')
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           this.#increment('resumeNameCollisions')
           this.#logger.warn?.('[factory] respawn skipped: broker still holds agent name (relay#1116); not retrying', {
             issue: record.issue.key,
@@ -5313,6 +5321,8 @@ export class FactoryLoop implements Factory {
           if (tracked.spec.role === 'implementer') {
             await this.#concludeTerminalImplementer(record, name, 'respawn-already-exists')
           }
+        } finally {
+          this.#resumeInFlight.delete(recoveryKey)
         }
       }
       if (recovered && tracked.spec.role === 'implementer') {
@@ -5851,6 +5861,17 @@ export class FactoryLoop implements Factory {
       cleanupComplete = failed.length === 0
     }
     if (!cleanupComplete) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      await this.#writeInFlightRegistry()
+      return
+    }
+    // Batch completion alone only frees the process-local slot. Durable
+    // capacity is computed from lifecycle phases, so leaving this row in
+    // `publishing`/`running` makes every queued issue wait forever even though
+    // all agents and worktrees are already gone. Fence the terminal phase
+    // before promoting the next issue.
+    if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) {
       this.#increment('abandonedDispatchReleaseRetries')
       this.#scheduleAbandonedDispatchRetry(record, reason)
       await this.#writeInFlightRegistry()
