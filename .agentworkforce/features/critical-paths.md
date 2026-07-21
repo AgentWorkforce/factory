@@ -223,6 +223,14 @@ factory --backend relay dispatch <KEY>
 
 Internal execution must reuse an operator-owned broker when present, otherwise start a workspace-joined broker and shut down only the infrastructure Factory owns.
 
+When `preview.services.<repo>` is configured, placement must first select a
+`preview:tailscale-serve` node, start the configured foreground command inside
+the authorized issue checkout, wait for its allocated loopback port, and pin
+the issue team to that node. The tailnet-only URL must reach every agent task,
+the Slack dispatch thread, and the pull-request body. Human Review, Done, and
+startup orphan recovery must remove only the exact Factory-owned route and
+process identity while preserving unrelated Serve/Funnel configuration.
+
 **What breaks if this fails:** work runs on the wrong machine or checkout, remote exits disappear, or Factory disrupts an operator's broker.
 
 ---
@@ -251,6 +259,7 @@ Internal execution must reuse an operator-owned broker when present, otherwise s
 | File state + re-adoption | Restart loses live agent ownership | `src/state/`, `src/fleet/relay-fleet-client.ts` |
 | Relay repo placement on spawn/restart | Hosted work lands on a node without the source checkout | `src/ports/fleet.ts`, `src/fleet/relay-fleet-client.ts`, `src/orchestrator/factory.ts` |
 | Reaper PID identity/protection | Healthy broker, node, or unrelated process is killed | `src/orchestrator/reaper.ts`, `src/orchestrator/process-identity.ts` |
+| Preview route/process identity | A tailnet URL leaks past terminal state, an unrelated Serve route/process is removed, or a handoff loses the running app | `src/node/tailscale-preview.ts`, `src/node/preview-process.ts`, `src/orchestrator/factory.ts` |
 | Node checkout containment | Hosted input executes outside advertised repos | `src/node/factory-node.ts` |
 | Relayfile guarded write + confirmation | Writes escape scope or are reported before provider ack | `src/mount/`, `src/writeback/` |
 

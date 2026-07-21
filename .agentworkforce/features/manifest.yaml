@@ -1,13 +1,13 @@
 version: '1.0'
-updated: '2026-07-20'
+updated: '2026-07-21'
 catalog:
   category_count: 19
-  feature_count: 241
+  feature_count: 242
   tier_counts:
     1: 24
     2: 105
     3: 10
-    4: 41
+    4: 42
     5: 47
     6: 14
 
@@ -1094,6 +1094,13 @@ categories:
         api: RelayFleetClient.reconcileTrackedAgents()
         description: Reconcile tracked invocation IDs against hosted action status and roster state to recover missed exits
         location: src/fleet/relay-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-tailnet-live-preview
+        name: Issue-Lifetime Tailnet Live Preview
+        api: preview:tailscale-serve / PreviewReference
+        description: Start a repository dev command in its issue checkout, publish a tailnet-only HTTPS URL to agents, Slack, and pull requests, preserve it across handoffs, and identity-check terminal teardown plus orphan recovery
+        location: src/node/tailscale-preview.ts, src/node/preview-process.ts, src/node/factory-node.ts, src/ports/fleet.ts, src/orchestrator/factory.ts, src/dispatch/templates.ts
         verify_tier: 4
 
       - id: fleet-message-events
