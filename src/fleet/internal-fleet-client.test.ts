@@ -971,6 +971,22 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('fails closed when canonical presence is unavailable instead of reviving stale broker rows', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-stale-impl' }]
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => {
+        throw new Error('presence unavailable')
+      },
+    })
+    fleet.hydrateTracked([{ name: 'ar-stale-impl', invocationId: 'inv-stale' }])
+
+    await expect(fleet.roster()).rejects.toThrow('presence unavailable')
+    await expect(fleet.reconcileTrackedAgents()).rejects.toThrow('presence unavailable')
+    expect(fleet.trackedAgents().has('ar-stale-impl')).toBe(true)
+  })
+
   it('clears readiness even when releasing the agent fails', async () => {
     vi.useFakeTimers()
     try {
