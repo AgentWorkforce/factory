@@ -130,6 +130,18 @@ describe('generateFeatureMap', () => {
     }])
   })
 
+  it('assigns a higher verification tier to a bare HTTP route', async () => {
+    const root = await repository()
+    await put(root, 'src/health.ts', "router.get('/health', () => ({ ok: true }))\n")
+
+    const result = await generateFeatureMap(root, ['src/health.ts'], { now: fixedNow })
+
+    expect(result.added).toMatchObject([{
+      api: 'GET /health',
+      verifyTier: 3,
+    }])
+  })
+
   it('supports bounded brace globs while excluding explicitly negated files', async () => {
     const root = await repository()
     await put(root, 'src/a.ts', 'export const alpha = 1\n')
@@ -208,6 +220,27 @@ describe('generateFeatureMap', () => {
     expect(raw).toContain('        description: Original hand-authored entry\n')
   })
 
+  it('extends a valid manifest when categories are not the final top-level key', async () => {
+    const root = await repository()
+    await put(root, 'src/existing.ts', 'export function existing(): void {}\n')
+    await put(root, 'src/new.ts', 'export function newlyTouched(): void {}\n')
+    await put(root, 'src/newer.ts', 'export function moreNewWork(): void {}\n')
+    await put(root, FEATURE_MAP_MANIFEST_PATH, handAuthoredManifest(true))
+
+    const result = await generateFeatureMap(root, ['src/new.ts'], { now: fixedNow })
+
+    expect(result.status).toBe('updated')
+    const raw = await readFile(result.manifestPath, 'utf8')
+    expect(raw.indexOf('  generated-touched-surfaces:')).toBeLessThan(raw.indexOf('catalog:'))
+    expect(validateFeatureManifest(raw, { rootDir: root }).features).toHaveLength(2)
+
+    const second = await generateFeatureMap(root, ['src/newer.ts'], { now: fixedNow })
+    expect(second.status).toBe('updated')
+    const secondRaw = await readFile(second.manifestPath, 'utf8')
+    expect(secondRaw.indexOf('  generated-touched-surfaces:')).toBeLessThan(secondRaw.indexOf('catalog:'))
+    expect(validateFeatureManifest(secondRaw, { rootDir: root }).features).toHaveLength(3)
+  })
+
   it('returns non-fatal failures and timeouts instead of rejecting', async () => {
     const missing = join(tmpdir(), `factory-feature-map-missing-${Date.now()}`)
     await expect(generateFeatureMap(missing, ['src/a.ts'])).resolves.toMatchObject({
@@ -257,10 +290,12 @@ function featureBlock(raw: string, id: string): string {
   return match[0].trimEnd()
 }
 
-function handAuthoredManifest(): string {
-  return [
+function handAuthoredManifest(catalogAfterCategories = false): string {
+  const header = [
     "version: '1.0'",
     "updated: '2026-07-01'",
+  ]
+  const catalog = [
     'catalog:',
     '  category_count: 1',
     '  feature_count: 1',
@@ -271,6 +306,8 @@ function handAuthoredManifest(): string {
     '    4: 0',
     '    5: 0',
     '    6: 0',
+  ]
+  const categories = [
     'categories:',
     '  core:',
     '    name: Core',
@@ -283,6 +320,10 @@ function handAuthoredManifest(): string {
     '        description: Original hand-authored entry',
     '        location: src/existing.ts',
     '        verify_tier: 1',
+  ]
+  return [
+    ...header,
+    ...(catalogAfterCategories ? [...categories, ...catalog] : [...catalog, ...categories]),
     '',
   ].join('\n')
 }

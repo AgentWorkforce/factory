@@ -698,7 +698,7 @@ async function inferFeature(
     description: surface.description
       ?? `Represent the public behavior implemented in ${candidate.location}.`,
     location: candidate.location,
-    verifyTier: inferVerifyTier(candidate.location, source),
+    verifyTier: inferVerifyTier(candidate.location, source, surface),
     criticality: 'standard',
   }
 }
@@ -802,12 +802,18 @@ function cleanComment(value: string): string | undefined {
   return cleaned || undefined
 }
 
-function inferVerifyTier(location: string, source: string): FeatureMapVerifyTier {
+function inferVerifyTier(
+  location: string,
+  source: string,
+  surface: InferredSurface,
+): FeatureMapVerifyTier {
   const signal = `${location}\n${source}`.toLowerCase()
   if (/\bmanual(?:ly)?\b[\s\S]{0,40}\b(?:issue|pull request|pr)\b|\blive (?:issue|pull request|pr)\b/u.test(signal)) return 6
   if (/\bcloud auth\b|\bwritable (?:relayfile )?mount\b|\bcloud credentials?\b/u.test(signal)) return 5
   if (/\bfleet\b|\bbroker\b|\bdaemon\b|\bspawn(?:ing|ed)?\b|\bchild_process\b/u.test(signal)) return 4
-  if (/\bfetch\s*\(|\baxios\b|\bhttps?:\/\/|\bnetwork\b|\bdatabase\b|\bdb\b|\bpostgres\b|\bmysql\b|\bsqlite\b|\bredis\b|\boauth\b|\bauth(?:entication)?\b|\bauthori[sz]ation\b|\bcredentials?\b/u.test(signal)) return 3
+  const isHttpRoute = /^(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s/u.test(surface.api ?? '')
+  const needsNetworkOrPersistence = /\bfetch\s*\(|\baxios\b|\bhttps?:\/\/|\bnetwork\b|\bdatabase\b|\bdb\b|\bpostgres\b|\bmysql\b|\bsqlite\b|\bredis\b|\boauth\b|\bauth(?:entication)?\b|\bauthori[sz]ation\b|\bcredentials?\b/u.test(signal)
+  if (isHttpRoute || needsNetworkOrPersistence) return 3
   if (/\bprocess\.env\b|\bconfig(?:uration)?\b|\bwritefile\b|\breadfile\b|\bfilesystem\b|\bintegration\b/u.test(signal)) return 2
   return 1
 }
@@ -841,19 +847,26 @@ function extendManifest(
   updated: string,
 ): string {
   const eol = raw.includes('\r\n') ? '\r\n' : '\n'
-  const categoryExpression = /^  ([a-z][a-z0-9-]+):\s*$/gmu
   const categoriesStart = /^categories:\s*$/mu.exec(raw)
   if (!categoriesStart) throw new Error('Feature manifest is missing categories')
   const categoriesOffset = categoriesStart.index + categoriesStart[0].length
-  const matches = [...raw.slice(categoriesOffset).matchAll(categoryExpression)]
-    .map((match) => ({ id: match[1], index: categoriesOffset + (match.index ?? 0) }))
+  const trailingRootKey = /^[^\s#][^:\r\n]*:\s*/gmu.exec(raw.slice(categoriesOffset))
+  const categoriesEnd = trailingRootKey
+    ? categoriesOffset + trailingRootKey.index
+    : raw.length
+  const categoryExpression = /^  (?:(?:"([^"]+)"|'([^']+)'|([^\s"':][^:\r\n]*))):\s*(?:#.*)?$/gmu
+  const matches = [...raw.slice(categoriesOffset, categoriesEnd).matchAll(categoryExpression)]
+    .map((match) => ({
+      id: (match[1] ?? match[2] ?? match[3]).trim(),
+      index: categoriesOffset + (match.index ?? 0),
+    }))
   const generatedIndex = matches.findIndex((match) => match.id === GENERATED_CATEGORY_ID)
   let next = raw
   let addedCategory = false
 
   if (generatedIndex >= 0) {
     const category = matches[generatedIndex]
-    const end = matches[generatedIndex + 1]?.index ?? raw.length
+    const end = matches[generatedIndex + 1]?.index ?? categoriesEnd
     const section = raw.slice(category.index, end)
     if (!/^    features:\s*$/mu.test(section)) {
       throw new Error(`Generated category ${GENERATED_CATEGORY_ID} is missing features`)
@@ -862,6 +875,9 @@ function extendManifest(
     const prefix = raw.slice(0, end)
     next = `${prefix}${prefix.endsWith(eol) ? '' : eol}${insertion}${raw.slice(end)}`
   } else {
+    if (parsed.categoryIds.includes(GENERATED_CATEGORY_ID)) {
+      throw new Error(`Could not safely locate generated category ${GENERATED_CATEGORY_ID}`)
+    }
     addedCategory = true
     const block = [
       `  ${GENERATED_CATEGORY_ID}:`,
@@ -872,7 +888,8 @@ function extendManifest(
       renderFeatureEntries(additions, eol).trimEnd(),
       '',
     ].join(eol)
-    next = `${raw}${raw.endsWith(eol) ? '' : eol}${eol}${block}`
+    const prefix = raw.slice(0, categoriesEnd)
+    next = `${prefix}${prefix.endsWith(eol) ? '' : eol}${block}${raw.slice(categoriesEnd)}`
   }
 
   const allFeatures = [...parsed.features, ...additions]
