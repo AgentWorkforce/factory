@@ -18456,7 +18456,7 @@ describe('FactoryLoop PR babysitter', () => {
       const invocationId = lifecycle?.agents
         .find((agent) => agent.name === 'ar-426-babysit')
         ?.tracked.spec.invocationId
-      expect(invocationId).toMatch(/^factory:426:[a-z0-9]+:unreachable:\d+$/u)
+      expect(invocationId).toMatch(/^factory:AR-426:[a-z0-9]+:unreachable:\d+$/u)
       expect(invocationId?.length).toBeLessThanOrEqual(256)
     } finally {
       await factory.stop()
