@@ -18217,7 +18217,15 @@ describe('FactoryLoop PR babysitter', () => {
       await vi.waitFor(() => expect(
         factory.status().counters.babysitterEventWakesDeferredWaitingForHuman,
       ).toBe(1))
+      const secondCommentPath = '/github/repos/AgentWorkforce/pear/comments/9437.json'
+      mount.files.set(secondCommentPath, { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 436 },
+        comment: { id: 9437, body: 'more provider-authored review activity' },
+      } })
+      mount.emit(changeEvent(secondCommentPath, 'comment-9437'))
       await new Promise((resolve) => setTimeout(resolve, 750))
+      expect(factory.status().counters.babysitterEventWakesDeferredWaitingForHuman).toBe(1)
       expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
       expect(factory.status().counters.babysitterEventWakeFailures).toBeUndefined()
 

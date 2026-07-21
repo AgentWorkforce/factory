@@ -6634,7 +6634,6 @@ export class FactoryLoop implements Factory {
         await this.#recordPendingBabysitterWake(state)
       }
       this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
-      state.suspendedForHuman = false
       if (
         state.kinds.size > 0 &&
         !await this.#suspendBabysitterWakeForHuman(state)
