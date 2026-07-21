@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   DEFAULT_MANAGED_FIDELITY_CAVEAT,
+  EnvironmentKubernetesCredentialResolver,
   KubernetesConnectionRegistry,
   type KubernetesCredentialResolver,
   type ResolvedKubernetesConnection,
@@ -55,6 +56,7 @@ class FakeKubernetesClient implements KubernetesClient {
   readonly forwards: string[] = []
   readonly stoppedForwards: string[] = []
   failForwardFor: string | undefined
+  failClusterCreateAfterPersistFor: string | undefined
   rendered: KubernetesResource[] = [
     {
       apiVersion: 'apps/v1',
@@ -81,6 +83,7 @@ class FakeKubernetesClient implements KubernetesClient {
     const key = clusterResourceKey(resource)
     if (this.clusterResources.has(key)) throw new Error('AlreadyExists')
     this.clusterResources.set(key, structuredClone(resource))
+    if (key === this.failClusterCreateAfterPersistFor) throw new Error('connection dropped after create')
   }
 
   async apply(resources: KubernetesResource[], namespace: string): Promise<void> {
@@ -155,6 +158,17 @@ const stack = (target: 'byoc' | 'managed' = 'byoc') => ({
 })
 
 describe('KubernetesConnectionRegistry', () => {
+  it('resolves a kubeconfig path without returning unrelated process secrets', async () => {
+    const resolver = new EnvironmentKubernetesCredentialResolver({
+      KUBECONFIG_PATH: '/run/secrets/customer-kubeconfig',
+      UNRELATED_SECRET: 'must-not-escape',
+    })
+
+    await expect(resolver.resolve('env:KUBECONFIG_PATH')).resolves.toEqual({
+      kubeconfigPath: '/run/secrets/customer-kubeconfig',
+    })
+  })
+
   it('defaults selection to BYOC and resolves only the referenced credential', async () => {
     const resolver = credentialResolver()
     const connections = registry(resolver)
@@ -345,6 +359,72 @@ describe('KubernetesEnvironmentProvider', () => {
     expect(client.namespaces.has(environment.id)).toBe(false)
   })
 
+  it('cleans up a cluster resource when the create result is ambiguous', async () => {
+    const client = new FakeKubernetesClient()
+    const priorityClass: KubernetesResource = {
+      apiVersion: 'scheduling.k8s.io/v1',
+      kind: 'PriorityClass',
+      metadata: { name: 'factory-e2e-ambiguous-create' },
+      value: -10,
+      globalDefault: false,
+    }
+    client.rendered = [priorityClass]
+    client.failClusterCreateAfterPersistFor = clusterResourceKey(priorityClass)
+    const connections = new KubernetesConnectionRegistry({
+      connections: [{
+        id: 'opted-cluster', credential: { kind: 'kubeconfig', secretRef: 'env:OPTED' },
+        allowClusterScopedResources: true, allowedClusterScopedKinds: ['PriorityClass'],
+      }],
+    }, credentialResolver())
+    const provider = new KubernetesEnvironmentProvider({
+      registry: connections, client, randomId: () => 'ambiguous',
+      secretResolver: { resolve: async () => 'secret' },
+    })
+
+    await expect(provider.provision({
+      customerId: 'customer-a', repository: 'AgentWorkforce/factory', ownerId: 'run',
+      stack: {
+        descriptor: { ...stack().descriptor, allowClusterScopedResources: true },
+        repoRoot: process.cwd(),
+      },
+    })).rejects.toThrow('connection dropped after create')
+
+    expect(client.clusterResources.size).toBe(0)
+    expect(client.namespaces.size).toBe(0)
+  })
+
+  it('deletes owned cluster resources even when the namespace disappeared externally', async () => {
+    const client = new FakeKubernetesClient()
+    client.rendered = [{
+      apiVersion: 'scheduling.k8s.io/v1', kind: 'PriorityClass',
+      metadata: { name: 'factory-e2e-external-namespace-delete' },
+      value: -10, globalDefault: false,
+    }]
+    const connections = new KubernetesConnectionRegistry({
+      connections: [{
+        id: 'opted-cluster', credential: { kind: 'kubeconfig', secretRef: 'env:OPTED' },
+        allowClusterScopedResources: true, allowedClusterScopedKinds: ['PriorityClass'],
+      }],
+    }, credentialResolver())
+    const provider = new KubernetesEnvironmentProvider({
+      registry: connections, client, randomId: () => 'external-delete',
+      secretResolver: { resolve: async () => 'secret' },
+    })
+    const environment = await provider.provision({
+      customerId: 'customer-a', repository: 'AgentWorkforce/factory', ownerId: 'run',
+      stack: {
+        descriptor: { ...stack().descriptor, allowClusterScopedResources: true },
+        repoRoot: process.cwd(),
+      },
+    })
+    client.namespaces.delete(environment.id)
+
+    await provider.destroy(environment.id)
+
+    expect(client.clusterResources.size).toBe(0)
+    expect(await provider.status(environment.id)).toBe('destroyed')
+  })
+
   it('never adopts an existing cluster-scoped resource', async () => {
     const client = new FakeKubernetesClient()
     const priorityClass: KubernetesResource = {
@@ -440,6 +520,20 @@ describe('KubernetesEnvironmentProvider', () => {
         stringData: { password: 'not-allowed-inline' },
       },
       {
+        apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role', metadata: { name: 'token-mint' },
+        rules: [{ apiGroups: [''], resources: ['serviceaccounts/token'], verbs: ['create'] }],
+      },
+      {
+        apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'RoleBinding', metadata: { name: 'deployer-access' },
+        roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: 'factory-guardrail-deployer' },
+        subjects: [{ kind: 'ServiceAccount', name: 'app', namespace: 'factory-factory-unsafe0' }],
+      },
+      {
+        apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'RoleBinding', metadata: { name: 'global-user-access' },
+        roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: 'app' },
+        subjects: [{ kind: 'Group', name: 'system:authenticated' }],
+      },
+      {
         apiVersion: 'v1', kind: 'Pod', metadata: { name: 'deployer-token' },
         spec: {
           serviceAccountName: 'factory-guardrail-deployer',
@@ -456,7 +550,7 @@ describe('KubernetesEnvironmentProvider', () => {
       })
       await expect(provider.provision({
         customerId: 'customer-a', repository: 'AgentWorkforce/factory', ownerId: 'run', stack: stack(),
-      })).rejects.toThrow(/denied|only generated namespace|may not add egress|bypasses namespace isolation|deployer service account/)
+      })).rejects.toThrow(/denied|only generated namespace|may not add egress|bypasses namespace isolation|deployer service account|may bind|escalate privileges/)
       expect(client.deletes).toHaveLength(0)
       expect(client.namespaces.size).toBe(0)
     }

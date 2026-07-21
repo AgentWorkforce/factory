@@ -171,6 +171,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     })
     let namespaceCreated = false
     const createdClusterResources: KubernetesResource[] = []
+    let ambiguousClusterResource: KubernetesResource | undefined
 
     try {
       // `create`, not `apply`, is deliberate: a collision can never reuse an
@@ -188,8 +189,10 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
       for (const resource of clusterResources) {
         // Cluster-scoped resources are always created, never applied, so a
         // customer object with the same name cannot be adopted or overwritten.
+        ambiguousClusterResource = resource
         await this.#client.createClusterResource(resource, connection)
         createdClusterResources.push(resource)
+        ambiguousClusterResource = undefined
       }
       await this.#client.apply(namespacedResources, id, connection)
       await this.#client.waitForReady(
@@ -241,6 +244,12 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
         id,
         connection,
       )
+      cleanupErrors.push(...await this.#deleteOwnedClusterResources(
+        ambiguousClusterResource ? [ambiguousClusterResource] : [],
+        id,
+        connection,
+        { skipUnowned: true },
+      ))
       // Keep the namespace (and its persisted cluster-resource identities) if
       // cluster cleanup failed, so a later reaper can retry without guessing.
       if (namespaceCreated && cleanupErrors.length === 0) {
@@ -306,6 +315,11 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     await this.#stopForwards(record)
     const namespace = await this.#client.getNamespace(id, record.connection)
     if (!namespace) {
+      const cleanupErrors = await this.#deleteOwnedClusterResources(record.clusterResources, id, record.connection)
+      if (cleanupErrors.length > 0) {
+        record.environment.status = 'failed'
+        throw new AggregateError(cleanupErrors, `Could not safely delete cluster-scoped resources for ${id}`)
+      }
       record.environment.status = 'destroyed'
       return
     }
@@ -501,6 +515,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     resources: KubernetesResource[],
     environmentId: string,
     connection: ResolvedKubernetesConnection,
+    options: { skipUnowned?: boolean } = {},
   ): Promise<unknown[]> {
     const errors: unknown[] = []
     for (const resource of [...resources].reverse()) {
@@ -508,6 +523,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
         const current = await this.#client.getClusterResource(resource, connection)
         if (!current) continue
         if (current.metadata?.labels?.[KUBERNETES_ENVIRONMENT_ID_LABEL] !== environmentId) {
+          if (options.skipUnowned) continue
           throw new Error(
             `Refusing to delete cluster-scoped ${resource.kind}/${resource.metadata?.name}: ownership identity does not match`,
           )
@@ -920,7 +936,10 @@ function validateCustomerRbac(
     const rules = Array.isArray((resource as Record<string, unknown>).rules)
       ? (resource as { rules: Array<Record<string, unknown>> }).rules
       : []
-    const protectedResources = new Set(['*', 'networkpolicies', 'resourcequotas', 'limitranges', 'roles', 'rolebindings'])
+    const protectedResources = new Set([
+      '*', 'networkpolicies', 'resourcequotas', 'limitranges', 'roles', 'rolebindings',
+      'serviceaccounts/token',
+    ])
     const protectedClusterResources = new Set([
       ...protectedResources,
       'clusterroles', 'clusterrolebindings', 'namespaces', 'nodes', 'persistentvolumes',
@@ -943,9 +962,20 @@ function validateCustomerRbac(
     }
   }
   if (resource.kind === 'RoleBinding') {
-    const roleRef = objectRecord((resource as Record<string, unknown>).roleRef)
-    if (roleRef.kind === 'ClusterRole') {
-      throw new Error(`RoleBinding/${name} may not bind a cluster role into the verification namespace`)
+    const record = resource as Record<string, unknown>
+    const roleRef = objectRecord(record.roleRef)
+    const subjects = Array.isArray(record.subjects) ? record.subjects as Array<Record<string, unknown>> : []
+    if (roleRef.kind !== 'Role' || roleRef.name === `${RESERVED_RESOURCE_PREFIX}deployer`) {
+      throw new Error(`RoleBinding/${name} may bind only a customer Role in the verification namespace`)
+    }
+    if (
+      subjects.length === 0 ||
+      subjects.some((subject) =>
+        subject.kind !== 'ServiceAccount' ||
+        subject.namespace !== namespace ||
+        subject.name === DEPLOYER_SERVICE_ACCOUNT)
+    ) {
+      throw new Error(`RoleBinding/${name} may bind only customer service accounts in generated namespace ${namespace}`)
     }
   }
   if (resource.kind === 'ClusterRoleBinding') {
@@ -961,7 +991,10 @@ function validateCustomerRbac(
     }
     if (
       subjects.length === 0 ||
-      subjects.some((subject) => subject.kind !== 'ServiceAccount' || subject.namespace !== namespace)
+      subjects.some((subject) =>
+        subject.kind !== 'ServiceAccount' ||
+        subject.namespace !== namespace ||
+        subject.name === DEPLOYER_SERVICE_ACCOUNT)
     ) {
       throw new Error(`ClusterRoleBinding/${name} may bind only service accounts in generated namespace ${namespace}`)
     }

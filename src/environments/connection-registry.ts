@@ -151,7 +151,10 @@ export class EnvironmentKubernetesCredentialResolver implements KubernetesCreden
     if (!kubeconfigPath) {
       throw new Error(`Kubernetes credential reference ${reference} is unavailable`)
     }
-    return { kubeconfigPath, environment: this.#env }
+    // The command client already inherits process.env. Returning the entire
+    // environment here would also expose unrelated process secrets to callers
+    // of the public registry API.
+    return { kubeconfigPath }
   }
 }
 

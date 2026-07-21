@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
 import {
@@ -46,6 +47,11 @@ const apply = async (resources: unknown, namespace?: string): Promise<void> => {
   await mustKubectl(args, JSON.stringify(resources))
 }
 
+const create = async (resources: unknown, namespace?: string): Promise<void> => {
+  const args = [...(namespace ? ['--namespace', namespace] : []), 'create', '--filename', '-']
+  await mustKubectl(args, JSON.stringify(resources))
+}
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
 }
@@ -69,9 +75,29 @@ const eventuallyFetch = async (url: string): Promise<Response> => {
 const namespaceExists = async (name: string): Promise<boolean> =>
   (await kubectl(['get', 'namespace', name, '--output', 'name'])).code === 0
 
-const prodNamespace = 'prod-customer'
-const orphanNamespace = 'factory-orphan-e2e'
+const objectUid = async (kind: string, name: string, namespace?: string): Promise<string | undefined> => {
+  const args = [...(namespace ? ['--namespace', namespace] : []), 'get', `${kind}/${name}`, '--output', 'jsonpath={.metadata.uid}']
+  const result = await kubectl(args)
+  return result.code === 0 ? result.stdout.trim() || undefined : undefined
+}
+
+const deleteFixtureNamespace = async (name: string, expectedUid: string | undefined): Promise<void> => {
+  if (!expectedUid) return
+  const currentUid = await objectUid('namespace', name)
+  if (!currentUid) return
+  assert(currentUid === expectedUid, `refusing to clean up namespace ${name}: fixture identity changed`)
+  await mustKubectl(['delete', 'namespace', name, '--wait=true', '--timeout=3m'])
+}
+
+const suffix = `${process.pid}-${randomUUID().replaceAll('-', '').slice(0, 8)}`
+const prodNamespace = `prod-customer-${suffix}`
+const controlNamespace = `network-control-${suffix}`
+const orphanNamespace = `factory-orphan-${suffix}`
 let environment: Environment | undefined
+let prodNamespaceUid: string | undefined
+let prodDeploymentUid: string | undefined
+let controlNamespaceUid: string | undefined
+let orphanNamespaceUid: string | undefined
 
 const registry = new KubernetesConnectionRegistry({
   connections: [{
@@ -87,10 +113,18 @@ const provider = new KubernetesEnvironmentProvider({ registry })
 const deployer = new StackDeployer({ kubernetes: provider })
 
 try {
-  await apply({
+  await create({
     apiVersion: 'v1', kind: 'Namespace',
     metadata: { name: prodNamespace, labels: { 'factory.agentworkforce.dev/production': 'true' } },
   })
+  prodNamespaceUid = await objectUid('namespace', prodNamespace)
+  assert(prodNamespaceUid, 'production fixture namespace has no UID')
+  await create({
+    apiVersion: 'v1', kind: 'Namespace',
+    metadata: { name: controlNamespace, labels: { 'factory.agentworkforce.dev/network-control': 'true' } },
+  })
+  controlNamespaceUid = await objectUid('namespace', controlNamespace)
+  assert(controlNamespaceUid, 'network control namespace has no UID')
   await apply({
     apiVersion: 'v1', kind: 'List', items: [
       {
@@ -111,6 +145,8 @@ try {
     ],
   }, prodNamespace)
   await mustKubectl(['--namespace', prodNamespace, 'rollout', 'status', 'deployment/prod-api', '--timeout=180s'])
+  prodDeploymentUid = await objectUid('deployment', 'prod-api', prodNamespace)
+  assert(prodDeploymentUid, 'production fixture deployment has no UID')
   const prodServiceIp = (await mustKubectl([
     '--namespace', prodNamespace, 'get', 'service/prod-api', '--output', 'jsonpath={.spec.clusterIP}',
   ])).stdout.trim()
@@ -119,6 +155,30 @@ try {
   ])).stdout.trim()
   assert(/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(prodServiceIp), 'production fixture has no routable ClusterIP')
   assert(/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(prodEndpointIp), 'production fixture has no ready endpoint')
+
+  // Prove the destination is reachable from another namespace before asserting
+  // that Factory's NetworkPolicy blocks the exact same address. Without this
+  // positive control, a broken CNI or dead Service could make isolation green.
+  await create({
+    apiVersion: 'v1', kind: 'Pod', metadata: { name: 'prod-connectivity-control' },
+    spec: {
+      restartPolicy: 'Never',
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: 'RuntimeDefault' } },
+      containers: [{
+        name: 'probe', image: 'curlimages/curl:8.12.1',
+        command: ['curl', '-fsS', '--max-time', '10', `http://${prodServiceIp}:5678/`],
+        securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] } },
+      }],
+    },
+  }, controlNamespace)
+  await mustKubectl([
+    '--namespace', controlNamespace,
+    'wait', 'pod/prod-connectivity-control', '--for=jsonpath={.status.phase}=Succeeded', '--timeout=120s',
+  ])
+  const controlLogs = (await mustKubectl([
+    '--namespace', controlNamespace, 'logs', 'pod/prod-connectivity-control',
+  ])).stdout
+  assert(controlLogs.trim() === 'prod', `positive network control returned unexpected output: ${controlLogs}`)
 
   const descriptor = await loadKubernetesStackDescriptor(
     resolve(repoRoot, 'test/fixtures/kubernetes/verification-stack.yaml'),
@@ -154,6 +214,8 @@ try {
     apiVersion: 'v1', kind: 'Pod', metadata: { name: 'isolation-probe' },
     spec: {
       restartPolicy: 'Never',
+      serviceAccountName: 'factory-guardrail-workload',
+      automountServiceAccountToken: false,
       securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: 'RuntimeDefault' } },
       containers: [{
         name: 'probe', image: 'curlimages/curl:8.12.1',
@@ -229,6 +291,8 @@ export function handleSummary(data) {
             metadata: { labels: { app: 'factory-k6' } },
             spec: {
               restartPolicy: 'Never',
+              serviceAccountName: 'factory-guardrail-workload',
+              automountServiceAccountToken: false,
               securityContext: { runAsNonRoot: true, runAsUser: 12345, seccompProfile: { type: 'RuntimeDefault' } },
               containers: [{
                 name: 'k6', image: 'grafana/k6:1.7.1', args: ['run', '/scripts/script.js'],
@@ -254,7 +318,7 @@ export function handleSummary(data) {
   assert(evidence.p95LatencyMs < 2_000, `k6 p95 SLO failed: ${evidence.p95LatencyMs}ms`)
   console.log(`load: ${evidence.requestCount} requests, errorRate=${evidence.errorRate}, p95=${evidence.p95LatencyMs}ms`)
 
-  await apply({
+  await create({
     apiVersion: 'v1', kind: 'Namespace',
     metadata: {
       name: orphanNamespace,
@@ -266,15 +330,23 @@ export function handleSummary(data) {
       annotations: { [KUBERNETES_CONNECTION_ID_ANNOTATION]: 'customer-eks-sim' },
     },
   })
+  orphanNamespaceUid = await objectUid('namespace', orphanNamespace)
+  assert(orphanNamespaceUid, 'orphan fixture namespace has no UID')
   await provider.destroy(environment.id)
   assert(!await namespaceExists(environment.id), 'destroy left the provisioned namespace behind')
   const reaped = await provider.reap()
   assert(reaped.reaped.some((entry) => entry.id === orphanNamespace), 'TTL reaper did not report the orphan')
   assert(!await namespaceExists(orphanNamespace), 'TTL reaper left the orphaned namespace behind')
-  assert(await namespaceExists(prodNamespace), 'provider teardown or reaper touched the production namespace')
-  console.log('reaper: provisioned and orphaned namespaces deleted; prod namespace untouched')
+  assert(await objectUid('namespace', prodNamespace) === prodNamespaceUid,
+    'provider teardown or reaper deleted/recreated the production namespace')
+  assert(await objectUid('deployment', 'prod-api', prodNamespace) === prodDeploymentUid,
+    'provider teardown or reaper deleted/recreated the production workload')
+  assert(await objectUid('namespace', controlNamespace) === controlNamespaceUid,
+    'provider teardown or reaper touched the network-control namespace')
+  console.log('reaper: provisioned and orphaned namespaces deleted; prod/control identities untouched')
 } finally {
   if (environment) await provider.destroy(environment.id).catch(() => undefined)
-  await kubectl(['delete', 'namespace', orphanNamespace, '--ignore-not-found=true', '--wait=false'])
-  await kubectl(['delete', 'namespace', prodNamespace, '--ignore-not-found=true', '--wait=false'])
+  await deleteFixtureNamespace(orphanNamespace, orphanNamespaceUid)
+  await deleteFixtureNamespace(controlNamespace, controlNamespaceUid)
+  await deleteFixtureNamespace(prodNamespace, prodNamespaceUid)
 }
