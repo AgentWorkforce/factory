@@ -36,11 +36,14 @@ import type {
   SubscribeOptions,
 } from '../ports'
 import {
+  createResourceSubscriptionsSdkClient,
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
+  type ResourceSubscriptionsSdk,
   type TokenProvider,
   type WorkspaceEventClientSource,
 } from '../subscriptions'
+import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 import {
   ensureLocalMount as runLocalMountPreflight,
@@ -186,6 +189,10 @@ export interface RelayfileCloudMountClientConfig {
   tokenProvider?: TokenProvider
   baseUrl?: string
   eventClient?: RelayfileEventClient
+  /** Override the standard Relayfile SDK durable-subscription adapter. */
+  resourceSubscriptions?: ResourceSubscriptionsClient
+  /** Optional lifecycle cancellation forwarded through the Relayfile SDK. */
+  resourceSubscriptionSignal?: AbortSignal
   logger?: Logger
   onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
   /** Internal health cadence override for tests. */
@@ -196,8 +203,7 @@ export interface RelayfileCloudMountClientConfig {
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
 
-export type RelayFileClientLike =
-  {
+export type RelayFileClientLike = {
     readFile(workspaceId: string, path: string): Promise<FileReadResponse>
     writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
     deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
@@ -209,7 +215,15 @@ export type RelayFileClientLike =
     getSyncStatus?(workspaceId: string, options?: { provider?: string }): Promise<unknown>
     getToken?(): Promise<string> | string
     getBaseUrl?(): string
-  }
+  } & Partial<ResourceSubscriptionsSdk>
+
+const hasResourceSubscriptionsSdk = (
+  client: RelayFileClientLike,
+): client is RelayFileClientLike & ResourceSubscriptionsSdk =>
+  typeof client.createOrRenewDurableResourceSubscription === 'function' &&
+  typeof client.claimDurableSubscriptionDeliveries === 'function' &&
+  typeof client.acceptDurableSubscriptionDelivery === 'function' &&
+  typeof client.cancelDurableResourceSubscription === 'function'
 
 export function relayfileWorkspaceTokenProvider(
   client: RelayFileClientLike,
@@ -225,6 +239,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
   readonly githubWrite: GithubConnectionWrite
+  readonly resourceSubscriptions?: ResourceSubscriptionsClient
   readonly integrationConnections?: FactoryIntegrationConnections
 
   readonly #client: RelayFileClientLike
@@ -269,6 +284,13 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
+    this.resourceSubscriptions = config.resourceSubscriptions ?? (
+      hasResourceSubscriptionsSdk(this.#client)
+        ? createResourceSubscriptionsSdkClient(this.#client, {
+          signal: config.resourceSubscriptionSignal,
+        })
+        : undefined
+    )
     this.#logger = config.logger
     this.#onLocalMountHealth = config.onLocalMountHealth
     this.#localMountHealthIntervalMs = Math.max(

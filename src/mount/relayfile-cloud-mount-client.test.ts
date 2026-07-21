@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CloudAuthError, type CloudSession, type StoredAuth } from '@agent-relay/cloud'
-import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
+import type {
+  AcceptDurableSubscriptionDeliveryInput,
+  ChangeEvent,
+  ClaimDurableSubscriptionDeliveriesInput,
+  CreateOrRenewDurableResourceSubscriptionInput,
+  OperationStatusResponse,
+} from '@relayfile/sdk'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -56,6 +62,14 @@ class FakeRelayFileClient implements RelayFileClientLike {
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
+  readonly createSubscriptionCalls: CreateOrRenewDurableResourceSubscriptionInput[] = []
+  readonly claimDeliveryCalls: ClaimDurableSubscriptionDeliveriesInput[] = []
+  readonly acceptDeliveryCalls: AcceptDurableSubscriptionDeliveryInput[] = []
+  readonly cancelSubscriptionCalls: Array<{
+    workspaceId: string
+    subscriptionId: string
+    options?: { signal?: AbortSignal }
+  }> = []
   getSyncStatus?: RelayFileClientLike['getSyncStatus']
   treePageSize?: number
 
@@ -179,6 +193,80 @@ class FakeRelayFileClient implements RelayFileClientLike {
         externalId: 'linear-id',
       },
     }
+  }
+
+  async createOrRenewDurableResourceSubscription(input: CreateOrRenewDurableResourceSubscriptionInput) {
+    this.createSubscriptionCalls.push(input)
+    return {
+      id: 'sub-1',
+      ownerId: 'configured-factory-agent',
+      subscriberId: input.subscriberId,
+      provider: input.provider,
+      resourceRef: input.resourceRef,
+      eventTypes: input.eventTypes,
+      terminalEventTypes: input.terminalEventTypes ?? [],
+      intent: input.intent ?? null,
+      status: 'active' as const,
+      createdAt: '2026-07-21T00:00:00.000Z',
+      updatedAt: '2026-07-21T00:00:00.000Z',
+      expiresAt: '2026-12-31T00:00:00.000Z',
+      retiredAt: null,
+    }
+  }
+
+  async claimDurableSubscriptionDeliveries(input: ClaimDurableSubscriptionDeliveriesInput) {
+    this.claimDeliveryCalls.push(input)
+    return {
+      deliveries: [{
+        id: 'delivery-1',
+        claimToken: 'claim-token-1',
+        subscriptionId: 'sub-1',
+        ownerId: 'configured-factory-agent',
+        subscriberId: 'factory-babysitter:uuid-1',
+        provider: 'github',
+        resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+        event: {
+          id: 'event-1',
+          type: 'pull_request.closed',
+          path: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+          revision: '2',
+          origin: 'github',
+          provider: 'github',
+          correlationId: 'corr-1',
+          timestamp: '2026-07-21T00:00:00.000Z',
+        },
+        terminal: true,
+        status: 'claimed' as const,
+        createdAt: '2026-07-21T00:00:00.000Z',
+        claimedAt: '2026-07-21T00:00:01.000Z',
+        claimLeaseExpiresAt: '2026-07-21T00:01:01.000Z',
+        acceptedAt: null,
+      }],
+    }
+  }
+
+  async acceptDurableSubscriptionDelivery(input: AcceptDurableSubscriptionDeliveryInput) {
+    this.acceptDeliveryCalls.push(input)
+    if (input.claimToken !== 'claim-token-1') {
+      throw Object.assign(new Error('delivery claim mismatch'), { status: 409 })
+    }
+    const claimed = (await this.claimDurableSubscriptionDeliveries({ workspaceId: input.workspaceId })).deliveries[0]!
+    return {
+      delivery: {
+        ...claimed,
+        claimToken: null,
+        status: 'accepted' as const,
+        acceptedAt: '2026-07-21T00:00:02.000Z',
+      },
+    }
+  }
+
+  async cancelDurableResourceSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+    options?: { signal?: AbortSignal },
+  ) {
+    this.cancelSubscriptionCalls.push({ workspaceId, subscriptionId, options })
   }
 
   async getToken() {
@@ -678,6 +766,80 @@ describe('RelayfileCloudMountClient', () => {
     expect(capturedTokenProvider).toBeDefined()
     await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_rotated')
     expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
+  })
+
+  it('adapts durable resource subscriptions through the canonical Relayfile SDK methods', async () => {
+    const fake = new FakeRelayFileClient()
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+    const client = mount.resourceSubscriptions!
+    await expect(client.createOrRenew('rw_test', {
+      provider: 'github',
+      resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+      eventTypes: ['pull_request_review_comment.created'],
+      terminalEventTypes: ['pull_request.closed'],
+      subscriberId: 'factory-babysitter:uuid-1',
+      ttlSeconds: 3600,
+    })).resolves.toMatchObject({ subscriptionId: 'sub-1', ownerId: 'configured-factory-agent' })
+    await expect(client.claimDeliveryClaims('rw_test')).resolves.toEqual([expect.objectContaining({
+      deliveryId: 'delivery-1',
+      claimToken: 'claim-token-1',
+      terminal: true,
+    })])
+    await expect(client.acceptDelivery('rw_test', { deliveryId: 'delivery-1', claimToken: 'wrong-token' }))
+      .rejects.toMatchObject({ status: 409 })
+    await expect(client.acceptDelivery('rw_test', { deliveryId: 'delivery-1', claimToken: 'claim-token-1' }))
+      .resolves.toEqual({ deliveryId: 'delivery-1', subscriptionId: 'sub-1', terminal: true })
+    await client.cancel('rw_test', { subscriptionId: 'sub-1' })
+
+    expect(fake.createSubscriptionCalls).toEqual([expect.objectContaining({
+      workspaceId: 'rw_test',
+      provider: 'github',
+      resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+      eventTypes: ['pull_request_review_comment.created'],
+      terminalEventTypes: ['pull_request.closed'],
+      subscriberId: 'factory-babysitter:uuid-1',
+      ttlSeconds: 3600,
+    })])
+    expect(fake.claimDeliveryCalls[0]).toMatchObject({ workspaceId: 'rw_test' })
+    expect(fake.acceptDeliveryCalls).toEqual([
+      expect.objectContaining({ workspaceId: 'rw_test', deliveryId: 'delivery-1', claimToken: 'wrong-token' }),
+      expect.objectContaining({ workspaceId: 'rw_test', deliveryId: 'delivery-1', claimToken: 'claim-token-1' }),
+    ])
+    expect(fake.cancelSubscriptionCalls).toEqual([
+      expect.objectContaining({ workspaceId: 'rw_test', subscriptionId: 'sub-1' }),
+    ])
+  })
+
+  it('fails closed for non-claimed SDK deliveries and forwards lifecycle cancellation', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.claimDurableSubscriptionDeliveries = vi.fn(async (input) => ({
+      deliveries: [{
+        ...(await new FakeRelayFileClient().claimDurableSubscriptionDeliveries(input)).deliveries[0]!,
+        claimToken: null,
+        status: 'pending' as const,
+      }],
+    }))
+    const malformed = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+    })
+    await expect(malformed.resourceSubscriptions!.claimDeliveryClaims('rw_test'))
+      .rejects.toThrow(/without a live claim/u)
+
+    const controller = new AbortController()
+    const cancelledSdk = new FakeRelayFileClient()
+    const claim = vi.spyOn(cancelledSdk, 'claimDurableSubscriptionDeliveries')
+    const cancelled = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: cancelledSdk,
+      resourceSubscriptionSignal: controller.signal,
+    })
+    await cancelled.resourceSubscriptions!.claimDeliveryClaims('rw_test')
+    expect(claim).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'rw_test',
+      signal: controller.signal,
+    }))
   })
 
   it('coalesces concurrent shared session resolutions for relayfile token refresh', async () => {

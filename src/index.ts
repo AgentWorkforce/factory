@@ -219,6 +219,7 @@ export type {
 } from './safety/factory-scope'
 export {
   canonicalMountPaths,
+  createResourceSubscriptionsSdkClient,
   createWorkspaceScopedEventClient,
   deliveryTargetsFor,
   eventPathGlobsForIntegration,
@@ -236,6 +237,8 @@ export {
   linearScopePredicates,
   normalizeChangePath,
   relayfileSdkPathFiltersFor,
+  ResourceSubscriptionsUnavailableError,
+  isResourceSubscriptionsUnavailable,
   parseSlackThreadReply,
   slackThreadReplyGlob,
   slackListenDms,
@@ -262,6 +265,13 @@ export type {
   WorkspaceScopedEventClientOptions,
   WorkspaceScopedSubscribeOptions,
   ChangeEvent as SubscriptionChangeEvent,
+  AcceptedResourceDelivery,
+  ResourceDeliveryClaim,
+  ResourceSubscription,
+  ResourceSubscriptionInput,
+  ResourceSubscriptionsClient,
+  ResourceSubscriptionsSdk,
+  ResourceSubscriptionsSdkClientOptions,
 } from './subscriptions'
 export type {
   Capability,
