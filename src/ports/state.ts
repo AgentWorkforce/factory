@@ -130,6 +130,7 @@ export type DispatchLifecyclePhase =
   | 'queued'
   | 'dispatching'
   | 'retryable'
+  | 'abandoning'
   | 'running'
   | 'parking'
   | 'waiting-for-human'

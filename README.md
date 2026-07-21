@@ -287,6 +287,78 @@ The definition reads its node config from `./factory.node.json` (or
 mapped repo is advertised as a `repo:<label>` tag so placement can route
 repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
 
+### Tailnet live previews
+
+Factory can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+route to a repository's local development port. Configure the same service on
+the control plane and execution node (a combined local config needs it only
+once):
+
+```json
+{
+  "preview": {
+    "provider": "tailscale-serve",
+    "access": "tailnet",
+    "services": {
+      "AgentWorkforce/pear": {
+        "port": 3000,
+        "portSpan": 25,
+        "startCommand": "npm ci && exec npm run dev"
+      }
+    }
+  }
+}
+```
+
+The node then advertises `preview:tailscale-serve`; Factory places the preview
+first and pins the issue's agents to that node. The URL is included in agent
+tasks, the Slack dispatch root, and the pull-request description. Factory uses
+Serve—not Funnel—so the URL remains inside the configured tailnet and normal
+tailnet grants/ACLs apply. Factory checks the live Serve status and refuses to
+surface a route marked as Funnel.
+
+`port` is the preferred node-local app port. Factory reserves the first free
+port in `port..port + portSpan - 1` (the span defaults to 100), places that
+allocated port in every agent task, and reserves a separate HTTPS port from
+`preview.httpsPortRange`. Keep that HTTPS range dedicated to Factory previews.
+Preview provisioning happens immediately after Factory creates the isolated
+issue worktree, before an agent has had a chance to install ignored dependencies
+such as `node_modules`. `startCommand` must therefore include any bounded,
+non-interactive bootstrap the fresh checkout needs, followed by a foreground
+development command that honors `PORT` (for example,
+`npm ci && exec npm run dev`).
+The node starts it in the issue checkout, waits for the allocated local HTTP
+port to respond, and verifies on Linux or macOS that the listener belongs to the
+supervised process tree before returning the URL. It persists an exact process
+identity so the command survives agent handoffs and can be safely recovered or
+stopped. The command must not daemonize or bind a different port. Active sweeps
+repeat listener ownership verification and disable the exact Factory route if
+the port is taken over by an unrelated process.
+For safety, preview commands receive only `PORT` plus basic shell, locale, home,
+and temporary-directory variables; they do not inherit arbitrary Factory,
+Relay, or provider credentials from the node process. Load intentional
+application settings through a checkout-local environment mechanism. Do not put
+secrets directly in `startCommand`, because lifecycle recovery persists the
+command as metadata.
+
+Terminal lifecycle completion is withheld until routes and their supervised
+commands have been removed at Human Review or Done. If the source-state
+writeback wins a crash race, startup recovery observes that terminal source
+state and finishes preview teardown before terminalizing the durable lifecycle.
+A startup and periodic sweep reaps only orphaned resources in the current
+Factory workspace whose persisted route and process identities still match.
+See the [provider evaluation](planning/preview-provider-evaluation.md)
+for the decision and lifecycle contract.
+
+To exercise the real provider lifecycle on a signed-in node, build first and
+run `TAILSCALE_BIN=/path/to/tailscale node scripts/verify-tailscale-preview-e2e.mjs`.
+The check drives the node's advertised `preview:tailscale-serve` action to start
+a detached HTTP service, reaches it through Serve, recovers it through a fresh
+node-action instance, tears it down, then proves a startup orphan sweep reaps a
+second abandoned route and process while preserving unrelated Serve
+configuration. Override its dedicated ports with
+`FACTORY_PREVIEW_E2E_HTTPS_PORT` and `FACTORY_PREVIEW_E2E_TARGET_PORT`.
+
 ### Dispatching to nodes (`--backend relay`)
 
 With `--backend relay`, the factory orchestrator dispatches work through the
