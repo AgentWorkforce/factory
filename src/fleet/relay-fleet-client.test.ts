@@ -33,18 +33,28 @@ class FakeMessaging {
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
   agentRows: Array<{ name: string; status?: string }> = []
+  agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
   directError: Error | undefined
   connected = 0
   disconnected = 0
   nextInvocationId = 0
   readonly agentListFilters: unknown[] = []
+  agentPresenceCalls = 0
   meName = 'relay-controller'
 
   readonly agents = {
     list: async (filter: unknown) => {
       this.agentListFilters.push(filter)
       return this.agentRows as never[]
+    },
+    presence: async () => {
+      this.agentPresenceCalls += 1
+      return this.agentPresenceRows ?? this.agentRows.map((agent, index) => ({
+        agentId: `agent-${index}`,
+        agentName: agent.name,
+        status: agent.status === 'online' ? 'online' as const : 'offline' as const,
+      }))
     },
     me: async () => ({ name: this.meName }),
   }
@@ -285,12 +295,17 @@ describe('RelayFleetClient', () => {
 
   it('returns the relay agent and node roster', async () => {
     const messaging = new FakeMessaging()
+    // An agent-scoped list can leak status-less rows normalized as `unknown`.
+    // Canonical presence must be the sole liveness authority.
     messaging.agentRows = [
       { name: 'ar-1-impl', status: 'online' },
-      // The Relaycast API has returned rows outside the requested filter in
-      // production, so the fleet adapter must enforce offline exclusion too.
       { name: 'ar-stale-impl', status: 'offline' },
       { name: 'ar-registering-review', status: 'unknown' },
+    ]
+    messaging.agentPresenceRows = [
+      { agentId: 'agent-1', agentName: 'ar-1-impl', status: 'online' },
+      { agentId: 'agent-2', agentName: 'ar-stale-impl', status: 'offline' },
+      { agentId: 'agent-3', agentName: 'ar-registering-review', status: 'offline' },
     ]
     messaging.nodeRows = [
       {
@@ -303,13 +318,14 @@ describe('RelayFleetClient', () => {
     const fleet = createClient(messaging)
 
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }, { name: 'ar-registering-review' }],
+      agents: [{ name: 'ar-1-impl' }],
       nodes: [
         { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run'], live: true },
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
       ],
     })
-    expect(messaging.agentListFilters).toEqual([{ status: 'online' }])
+    expect(messaging.agentListFilters).toEqual([])
+    expect(messaging.agentPresenceCalls).toBe(1)
   })
 
   it('sends DMs and channel messages through the agent-scoped surface', async () => {
