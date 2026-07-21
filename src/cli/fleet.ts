@@ -592,17 +592,6 @@ async function runFactoryCommand(
       writeJson(out, { killed: heartbeat.pid, signal: 'SIGTERM' })
       return 0
     }
-    if (command.action === 'reap-orphans') {
-      const processes = await reapFactoryOrphansOnce({
-        heartbeatPath: config.loop.heartbeatPath,
-        registryPath: config.loop.registryPath,
-        staleMs: config.loop.heartbeatStaleMs,
-        fleet,
-      })
-      writeJson(out, { ...processes, environments: await safeEnvironmentReap(deps.reapEnvironments) })
-      return 0
-    }
-
     await ensureClonePathMounts(
       mountFn,
       workspaceId,

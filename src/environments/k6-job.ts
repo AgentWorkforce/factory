@@ -4,6 +4,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { ResolvedLoadProfile, ResolvedLoadTargetProfile } from './load-profile.js'
 import { durationToMilliseconds } from './load-profile.js'
 
+const MAX_KUBECTL_OUTPUT_BYTES = 1024 * 1024
+
 export const DEFAULT_K6_IMAGE = 'grafana/k6:1.7.1@sha256:4fd3a694926b064d3491d9b02b01cde886583c4931f1223816e3d9a7bdfa7e0f'
 export const K6_EVIDENCE_PREFIX = 'FACTORY_LOAD_EVIDENCE_JSON='
 
@@ -73,13 +75,20 @@ export const defaultKubectlCommandRunner = (
   let stdout = ''
   let stderr = ''
   let settled = false
+  let aborted = false
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined
   const abort = (): void => {
+    aborted = true
     child.kill('SIGTERM')
-    finish(new Error('kubectl command aborted'))
+    forceKillTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, 2_000)
+    forceKillTimer.unref()
   }
   const finish = (error?: Error, result?: KubectlCommandResult): void => {
     if (settled) return
     settled = true
+    if (forceKillTimer) clearTimeout(forceKillTimer)
     signal?.removeEventListener('abort', abort)
     if (error) reject(error)
     else resolve(result!)
@@ -87,10 +96,18 @@ export const defaultKubectlCommandRunner = (
 
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
-  child.stdout.on('data', (chunk: string) => { stdout += chunk })
-  child.stderr.on('data', (chunk: string) => { stderr += chunk })
+  child.stdout.on('data', (chunk: string) => {
+    stdout = `${stdout}${chunk}`.slice(-MAX_KUBECTL_OUTPUT_BYTES)
+  })
+  child.stderr.on('data', (chunk: string) => {
+    stderr = `${stderr}${chunk}`.slice(-MAX_KUBECTL_OUTPUT_BYTES)
+  })
   child.once('error', (error) => finish(error))
   child.once('close', (code) => {
+    if (aborted) {
+      finish(new Error('kubectl command aborted'))
+      return
+    }
     if (code === 0) finish(undefined, { stdout, stderr })
     else finish(commandError(executable, args, code, stderr))
   })
