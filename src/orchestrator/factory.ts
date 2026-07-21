@@ -2743,8 +2743,11 @@ export class FactoryLoop implements Factory {
         } finally {
           this.#startupRosterExitSignals = undefined
         }
+        const fleetTracked = this.#fleet.trackedAgents?.()
         const synthesized = [...durableAgentNames]
-          .filter((name) => !online.has(name) && !signalled.has(name))
+          .filter((name) => (
+            !online.has(name) || (fleetTracked !== undefined && !fleetTracked.has(name))
+          ) && !signalled.has(name))
         for (const name of synthesized) {
           this.#fleet.markAgentTerminal?.(name, 'reconciled-missing')
           signalled.add(name)

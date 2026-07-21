@@ -688,16 +688,26 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 
 class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
   readonly terminal: Array<{ name: string; reason?: string }> = []
+  readonly #hydratedNames = new Set<string>()
 
-  constructor(readonly emitReconciledExits = false) {
+  constructor(readonly exitTiming: 'never' | 'reconcile' | 'hydrate' = 'never') {
     super()
   }
 
   override async roster() {
     return {
-      agents: [],
+      agents: this.exitTiming === 'hydrate'
+        ? [...this.#hydratedNames].map((name) => ({ name, node: 'sf-mini' }))
+        : [],
       nodes: [{ name: 'sf-mini', capabilities: ['spawn:codex' as const, 'spawn:claude' as const], live: true }],
     }
+  }
+
+  override hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
+    super.hydrateTracked(agents)
+    for (const agent of agents) this.#hydratedNames.add(agent.name)
+    if (this.exitTiming !== 'hydrate') return
+    for (const agent of agents) this.emitAgentExit(agent.name, 'offline')
   }
 
   markAgentTerminal(name: string, reason?: string): void {
@@ -706,7 +716,7 @@ class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
 
   override async reconcileTrackedAgents(): Promise<void> {
     await super.reconcileTrackedAgents()
-    if (!this.emitReconciledExits) return
+    if (this.exitTiming !== 'reconcile') return
     for (const agent of [...this.hydrated]) this.emitAgentExit(agent.name, 'exited')
   }
 }
@@ -5545,9 +5555,10 @@ describe('FactoryLoop', () => {
   })
 
   it.each([
-    ['synthesizes exits when fleet reconciliation misses absent agents', false, 2],
-    ['defers fleet reconciliation exits until durable adoption is complete', true, undefined],
-  ])('%s', async (_label, emitReconciledExits, synthesizedCount) => {
+    ['synthesizes exits when fleet reconciliation misses absent agents', 'never', 2],
+    ['defers fleet reconciliation exits until durable adoption is complete', 'reconcile', undefined],
+    ['recovers exits dropped by the pre-adoption guard despite a stale online roster', 'hydrate', 2],
+  ] as const)('%s', async (_label, exitTiming, synthesizedCount) => {
     const root = await mkdtemp(join(tmpdir(), 'factory-missing-startup-roster-'))
     const watchStatePath = join(root, 'state.json')
     const registryPath = join(root, 'registry.json')
@@ -5568,7 +5579,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       await first.stop()
 
-      const restartedFleet = new MissingHydratedRosterFleetClient(emitReconciledExits)
+      const restartedFleet = new MissingHydratedRosterFleetClient(exitTiming)
       restarted = createFactory(factoryConfig, {
         mount,
         fleet: restartedFleet,
@@ -5577,7 +5588,7 @@ describe('FactoryLoop', () => {
       })
       await restarted.start({ mode: 'dispatch-owner' })
 
-      expect(restartedFleet.terminal).toEqual(emitReconciledExits ? [] : [
+      expect(restartedFleet.terminal).toEqual(exitTiming === 'reconcile' ? [] : [
         { name: 'ar-595-impl-pear', reason: 'reconciled-missing' },
         { name: 'ar-595-review', reason: 'reconciled-missing' },
       ])
