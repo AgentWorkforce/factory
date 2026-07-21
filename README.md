@@ -124,7 +124,7 @@ From a source checkout instead of an npm install, run
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
-| `factory featuremap check [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
+| `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
@@ -146,9 +146,9 @@ instruction to rerun the Factory command in an interactive terminal instead.
 
 Repositories with `.agentworkforce/features/manifest.yaml` can run
 `factory featuremap check` in CI. The command rejects malformed or duplicate
-entries, invalid verification tiers, catalog-summary drift, and locations that
-do not exist. The same checker is published as `@agent-relay/factory/featuremap`
-for programmatic use.
+entries, invalid verification tiers, catalog-summary drift, locations that do
+not exist, and incomplete v1.1 category-to-procedure routing. The same checker
+is published as `@agent-relay/factory/featuremap` for programmatic use.
 
 During review, pass the PR base ref with `--base <ref>`. A changed file named by
 an existing manifest entry produces an advisory when that entry's description,
@@ -156,12 +156,20 @@ verification tier, and locations are unchanged. The reviewer must re-confirm
 that metadata; the advisory does not itself fail the command because a covered
 file can change without changing the feature contract.
 
-An hourly per-repository sweep or Slack confirmation bot is explicitly outside
-this feature's scope. Factory's own guardian cycle is useful for tier-5/6 checks
-that need live or human confirmation, but duplicating it for every customer repo
-would add standing noise and infrastructure without evidence that those entries
-rot between PRs. Revisit that only if usage data demonstrates silent tier-5/6
-drift that PR checks do not catch.
+Factory's agent-facing runbook is `.claude/skills/verify-features.md`. It tells
+an agent how to resolve a manifest category to its named end-to-end procedure,
+run the applicable tier with safe fixtures and cleanup, assert provider/fleet
+state, and report unexercised live tiers explicitly. The deterministic full gate
+is `npm run build && npm run featuremap:check && npm test && npm run verify:e2e`;
+`workflows/verify-features.ts` adds opt-in provider, fleet, and cloud checks.
+
+The checked-in `factory-feature-guardian` proactive persona mirrors Relay's
+guardian operating model. Hourly, it reads the catalog from a scoped Factory
+repository mount, selects one unchecked feature from exact revisioned cycle
+state, posts an idempotent Slack question, requires a provider timestamp, and
+only then checkpoints progress. Manifest/state/delivery ambiguity fails closed
+instead of silently skipping a feature. Configure its Slack channel and deploy
+the persona through the normal Agent Workforce proactive-agent path.
 
 ### Cloud progress and trace correlation
 

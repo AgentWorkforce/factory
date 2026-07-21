@@ -119,7 +119,7 @@ const autoDetectedIssueSources = new WeakSet<FactoryConfig>()
 const CLONE_MOUNT_PREFLIGHT_CONCURRENCY = 4
 
 type ParsedCommand =
-  | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
+  | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; workflow?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
   | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
@@ -213,6 +213,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           capability: command.input.capability,
           node: command.input.node ?? 'self',
           task: command.input.task,
+          workflow: command.input.workflow,
           model: command.input.model,
           cwd: command.input.cwd,
         }))
@@ -430,6 +431,9 @@ function parseFleetSubcommand(args: string[]): ParsedCommand {
       throw new Error('factory fleet spawn requires capability spawn:codex, spawn:claude, or workflow:run')
     }
     const parsed = parseFlags(flags)
+    if (capability === 'workflow:run' && !parsed.workflow) {
+      throw new Error('factory fleet spawn workflow:run requires --workflow <path>')
+    }
     return {
       kind: 'spawn',
       input: {
@@ -437,6 +441,7 @@ function parseFleetSubcommand(args: string[]): ParsedCommand {
         name: parsed.name,
         node: parsed.node,
         task: parsed.task,
+        ...(parsed.workflow ? { workflow: parsed.workflow } : {}),
         model: parsed.model,
         sessionRef: parsed.resume,
         cwd: parsed.cwd,
