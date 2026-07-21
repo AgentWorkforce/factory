@@ -1,15 +1,26 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CloudAuthError, type CloudSession, type StoredAuth } from '@agent-relay/cloud'
-import type { ChangeEvent, OperationStatusResponse } from '@relayfile/sdk'
+import type {
+  AcceptDurableSubscriptionDeliveryInput,
+  ChangeEvent,
+  ClaimDurableSubscriptionDeliveriesInput,
+  CreateOrRenewDurableResourceSubscriptionInput,
+  OperationStatusResponse,
+} from '@relayfile/sdk'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
+  relayfileWorkspaceTokenProvider,
   type CloudSessionProvider,
   type RelayfileSetupFactory,
   type RelayfileCloudMountClientConfig,
   type RelayFileClientLike,
 } from './relayfile-cloud-mount-client'
+import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
@@ -51,6 +62,14 @@ class FakeRelayFileClient implements RelayFileClientLike {
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
+  readonly createSubscriptionCalls: CreateOrRenewDurableResourceSubscriptionInput[] = []
+  readonly claimDeliveryCalls: ClaimDurableSubscriptionDeliveriesInput[] = []
+  readonly acceptDeliveryCalls: AcceptDurableSubscriptionDeliveryInput[] = []
+  readonly cancelSubscriptionCalls: Array<{
+    workspaceId: string
+    subscriptionId: string
+    options?: { signal?: AbortSignal }
+  }> = []
   getSyncStatus?: RelayFileClientLike['getSyncStatus']
   treePageSize?: number
 
@@ -176,6 +195,80 @@ class FakeRelayFileClient implements RelayFileClientLike {
     }
   }
 
+  async createOrRenewDurableResourceSubscription(input: CreateOrRenewDurableResourceSubscriptionInput) {
+    this.createSubscriptionCalls.push(input)
+    return {
+      id: 'sub-1',
+      ownerId: 'configured-factory-agent',
+      subscriberId: input.subscriberId,
+      provider: input.provider,
+      resourceRef: input.resourceRef,
+      eventTypes: input.eventTypes,
+      terminalEventTypes: input.terminalEventTypes ?? [],
+      intent: input.intent ?? null,
+      status: 'active' as const,
+      createdAt: '2026-07-21T00:00:00.000Z',
+      updatedAt: '2026-07-21T00:00:00.000Z',
+      expiresAt: '2026-12-31T00:00:00.000Z',
+      retiredAt: null,
+    }
+  }
+
+  async claimDurableSubscriptionDeliveries(input: ClaimDurableSubscriptionDeliveriesInput) {
+    this.claimDeliveryCalls.push(input)
+    return {
+      deliveries: [{
+        id: 'delivery-1',
+        claimToken: 'claim-token-1',
+        subscriptionId: 'sub-1',
+        ownerId: 'configured-factory-agent',
+        subscriberId: 'factory-babysitter:uuid-1',
+        provider: 'github',
+        resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+        event: {
+          id: 'event-1',
+          type: 'pull_request.closed',
+          path: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
+          revision: '2',
+          origin: 'github',
+          provider: 'github',
+          correlationId: 'corr-1',
+          timestamp: '2026-07-21T00:00:00.000Z',
+        },
+        terminal: true,
+        status: 'claimed' as const,
+        createdAt: '2026-07-21T00:00:00.000Z',
+        claimedAt: '2026-07-21T00:00:01.000Z',
+        claimLeaseExpiresAt: '2026-07-21T00:01:01.000Z',
+        acceptedAt: null,
+      }],
+    }
+  }
+
+  async acceptDurableSubscriptionDelivery(input: AcceptDurableSubscriptionDeliveryInput) {
+    this.acceptDeliveryCalls.push(input)
+    if (input.claimToken !== 'claim-token-1') {
+      throw Object.assign(new Error('delivery claim mismatch'), { status: 409 })
+    }
+    const claimed = (await this.claimDurableSubscriptionDeliveries({ workspaceId: input.workspaceId })).deliveries[0]!
+    return {
+      delivery: {
+        ...claimed,
+        claimToken: null,
+        status: 'accepted' as const,
+        acceptedAt: '2026-07-21T00:00:02.000Z',
+      },
+    }
+  }
+
+  async cancelDurableResourceSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+    options?: { signal?: AbortSignal },
+  ) {
+    this.cancelSubscriptionCalls.push({ workspaceId, subscriptionId, options })
+  }
+
   async getToken() {
     return 'relayfile-token'
   }
@@ -186,6 +279,412 @@ class FakeRelayFileClient implements RelayFileClientLike {
 }
 
 describe('RelayfileCloudMountClient', () => {
+  it('uses the SDK client token provider so long-lived subscriptions receive rotated tokens', async () => {
+    const fake = new FakeRelayFileClient()
+    const getToken = vi.fn()
+      .mockResolvedValueOnce('rotated-relayfile-token-1')
+      .mockResolvedValueOnce('rotated-relayfile-token-2')
+    fake.getToken = getToken
+    const workspaceGetToken = vi.fn(async () => 'original-relayfile-token')
+    const provider = relayfileWorkspaceTokenProvider(fake, {
+      client: () => fake,
+      getToken: workspaceGetToken,
+      info: { relayfileUrl: 'https://relayfile.example' },
+    })
+
+    await expect(provider()).resolves.toBe('rotated-relayfile-token-1')
+    await expect(provider()).resolves.toBe('rotated-relayfile-token-2')
+    expect(workspaceGetToken).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the original workspace token for older SDK clients', async () => {
+    const fake = new FakeRelayFileClient()
+    const clientWithoutToken = { ...fake, getToken: undefined } as unknown as RelayFileClientLike
+    const workspaceGetToken = vi.fn(async () => 'original-relayfile-token')
+    const provider = relayfileWorkspaceTokenProvider(clientWithoutToken, {
+      client: () => clientWithoutToken,
+      getToken: workspaceGetToken,
+      info: { relayfileUrl: 'https://relayfile.example' },
+    })
+
+    await expect(provider()).resolves.toBe('original-relayfile-token')
+    expect(workspaceGetToken).toHaveBeenCalledTimes(1)
+  })
+
+  it('adapts the retained SDK workspace handle for integration status and connect flows', async () => {
+    const fake = new FakeRelayFileClient()
+    const getConnectionStatus = vi.fn(async () => ({ ready: false, state: 'not_connected' }))
+    const connectIntegration = vi.fn(async () => ({
+      alreadyConnected: false,
+      connectLink: 'https://connect.example/github',
+      connectionId: 'conn-github',
+    }))
+    const waitForConnection = vi.fn(async () => {})
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+      getConnectionStatus,
+      connectIntegration,
+      waitForConnection,
+    }
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => handle),
+      })),
+    })
+
+    await expect(mount.integrationConnections?.getStatus('github')).resolves.toEqual({
+      ready: false,
+      state: 'not_connected',
+    })
+    await expect(mount.integrationConnections?.connect('github')).resolves.toMatchObject({
+      connectionId: 'conn-github',
+    })
+    await mount.integrationConnections?.waitForConnection('github', 'conn-github')
+    await mount.integrationConnections?.getStatus('github')
+
+    expect(getConnectionStatus).toHaveBeenNthCalledWith(1, 'github', 'cloud-workspace-uuid')
+    expect(getConnectionStatus).toHaveBeenNthCalledWith(2, 'github', 'conn-github')
+    expect(connectIntegration).toHaveBeenCalledWith('github', { allowedIntegrations: ['github'] })
+    expect(waitForConnection).toHaveBeenCalledWith('github', {
+      connectionId: 'conn-github',
+      timeoutMs: 5 * 60_000,
+    })
+  })
+
+  it('starts local mirrors through the authenticated Relayfile SDK mount session', async () => {
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
+    const setup = {
+      joinWorkspace: vi.fn(async () => handle),
+      ensureMountedWorkspace,
+    }
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => setup),
+      localMountPreflight,
+    })
+
+    await expect(mount.ensureLocalMount('/work/repo', {
+      stateWaitTimeoutMs: 3210,
+    })).resolves.toBeUndefined()
+
+    expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/repo', expect.objectContaining({
+      acceptableWorkspaceIds: ['cloud-workspace-uuid'],
+      stateWaitTimeoutMs: 3210,
+      startMount: expect.any(Function),
+    }))
+    expect(ensureMountedWorkspace).toHaveBeenCalledWith({
+      workspace: handle,
+      localDir: join('/work/repo', '.integrations'),
+      remotePath: '/',
+      mode: 'poll',
+      background: true,
+      agentName: 'agent-relay-factory',
+      scopes: [...FACTORY_RELAYFILE_SCOPES],
+      verifyProvider: false,
+      supervise: false,
+      readyTimeoutMs: 3210,
+    })
+
+    await mount.dispose()
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports and supervises an initial SDK mount failure with no prior state file', async () => {
+    vi.useFakeTimers()
+    const fake = new FakeRelayFileClient()
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
+    let preflightCalls = 0
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => {
+      preflightCalls += 1
+      if (preflightCalls === 1) throw new Error('initial mount unavailable')
+      await options.startMount()
+    })
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace,
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await expect(mount.ensureLocalMount('/work/repo')).rejects.toThrow('initial mount unavailable')
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_refresh_failed',
+        degradedMounts: 1,
+      }])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(2))
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(1)
+    } finally {
+      await mount.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('coalesces concurrent mount checks for the same checkout', async () => {
+    const fake = new FakeRelayFileClient()
+    let releasePreflight!: () => void
+    const preflightReleased = new Promise<void>((resolve) => { releasePreflight = resolve })
+    const localMountPreflight = vi.fn(async () => preflightReleased)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })),
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+    })
+
+    const first = mount.ensureLocalMount('/work/repo')
+    const duplicate = mount.ensureLocalMount('/work/repo')
+    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(1))
+    releasePreflight()
+    await Promise.all([first, duplicate])
+
+    expect(localMountPreflight).toHaveBeenCalledTimes(1)
+    await mount.dispose()
+  })
+
+  it('bounds mount work across checkouts to prevent refresh storms', async () => {
+    const fake = new FakeRelayFileClient()
+    let active = 0
+    let maximumActive = 0
+    let releasePreflights!: () => void
+    const preflightsReleased = new Promise<void>((resolve) => { releasePreflights = resolve })
+    const localMountPreflight = vi.fn(async () => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await preflightsReleased
+      active -= 1
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })),
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+      localMountMaxConcurrency: 2,
+    })
+
+    const checks = Array.from({ length: 6 }, (_, index) => mount.ensureLocalMount(`/work/repo-${index}`))
+    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(2))
+    expect(maximumActive).toBe(2)
+    releasePreflights()
+    await Promise.all(checks)
+
+    expect(localMountPreflight).toHaveBeenCalledTimes(6)
+    expect(maximumActive).toBe(2)
+    await mount.dispose()
+  })
+
+  it('refreshes local mounts before token expiry and reports failure and recovery transitions', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-07-20T12:00:00.000Z')
+    const startDir = await mkdtemp(join(tmpdir(), 'factory-mount-supervision-'))
+    const localDir = join(startDir, '.integrations')
+    await mkdir(join(localDir, '.relay'), { recursive: true })
+    await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+      workspaceId: 'cloud-workspace-uuid',
+      lastReconcileAt: '2026-07-20T12:00:00.000Z',
+    }))
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const firstStop = vi.fn(async () => {})
+    const recoveredStop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn()
+      .mockResolvedValueOnce({
+        stop: firstStop,
+        suggestedRefreshAt: '2026-07-20T12:00:01.000Z',
+      })
+      .mockRejectedValueOnce(new Error('refresh token expired'))
+      .mockResolvedValueOnce({
+        stop: recoveredStop,
+        suggestedRefreshAt: '2026-07-20T13:00:00.000Z',
+      })
+    const setup = {
+      joinWorkspace: vi.fn(async () => handle),
+      ensureMountedWorkspace,
+    }
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => setup),
+      localMountPreflight,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await mount.ensureLocalMount(startDir)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_refresh_failed',
+        degradedMounts: 1,
+      }])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(healthEvents).toEqual([
+        { state: 'degraded', reason: 'mount_refresh_failed', degradedMounts: 1 },
+        { state: 'recovered', reason: 'mount_stale', degradedMounts: 0 },
+      ])
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(3)
+      expect(firstStop).toHaveBeenCalledTimes(1)
+    } finally {
+      await mount.dispose()
+      await rm(startDir, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+    expect(recoveredStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops a mount whose launch finishes after disposal begins', async () => {
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    let finishLaunch: ((mounted: { stop: () => Promise<void> }) => void) | undefined
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => await new Promise<{ stop: () => Promise<void> }>((resolve) => {
+      finishLaunch = resolve
+    }))
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => handle),
+        ensureMountedWorkspace,
+      })),
+      localMountPreflight: async (
+        _workspaceId,
+        _startDir,
+        options: { startMount: () => Promise<void> },
+      ) => options.startMount(),
+    })
+
+    const mounting = mount.ensureLocalMount('/work/repo')
+    await vi.waitFor(() => expect(ensureMountedWorkspace).toHaveBeenCalledTimes(1))
+    await mount.dispose()
+    finishLaunch?.({ stop })
+    await mounting
+
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report recovery while a periodic health check still finds a stale mount', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-07-20T12:30:00.000Z')
+    const startDir = await mkdtemp(join(tmpdir(), 'factory-stale-mount-supervision-'))
+    const localDir = join(startDir, '.integrations')
+    await mkdir(join(localDir, '.relay'), { recursive: true })
+    await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+      workspaceId: 'cloud-workspace-uuid',
+      lastReconcileAt: '2026-07-20T12:00:00.000Z',
+    }))
+    const fake = new FakeRelayFileClient()
+    const ensureMountedWorkspace = vi.fn()
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => ({
+          workspaceId: 'cloud-workspace-uuid',
+          client: () => fake,
+          getToken: async () => 'delegated-relayfile-token',
+          info: { relayfileUrl: 'https://relayfile.example' },
+        })),
+        ensureMountedWorkspace,
+      })),
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await mount.ensureLocalMount(startDir, { refreshStaleMount: false })
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_stale',
+        degradedMounts: 1,
+      }])
+    } finally {
+      await mount.dispose()
+      await rm(startDir, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+  })
+
   it('fromConfig delegates through the shared cloud session with least-privilege factory scopes', async () => {
     const fake = new FakeRelayFileClient()
     const auth = storedAuth({ accessToken: 'cld_at_shared', refreshToken: 'cld_rt_shared' })
@@ -228,6 +727,7 @@ describe('RelayfileCloudMountClient', () => {
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/linear/states/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:write:/github/repos/**')
+    expect(joinOptions.scopes).toContain('relayfile:fs:write:/factory/observability/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')
     expect(mount.githubWrite).toBeDefined()
     expect(factoryReadScopeCovers('/linear/states/_index.json')).toBe(true)
@@ -268,54 +768,9 @@ describe('RelayfileCloudMountClient', () => {
     expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
   })
 
-  it('wires the durable resource-subscription API from the configured Relayfile URL and workspace bearer', async () => {
+  it('adapts durable resource subscriptions through the canonical Relayfile SDK methods', async () => {
     const fake = new FakeRelayFileClient()
-    const requests: Array<{ url: string; init?: RequestInit }> = []
-    const resourceSubscriptionFetch: typeof fetch = async (input, init) => {
-      requests.push({ url: String(input), init })
-      if (String(input).endsWith('/subscriptions') && init?.method === 'POST') {
-        return new Response(JSON.stringify({
-          id: 'sub-1',
-          ownerId: 'configured-factory-agent',
-          subscriberId: 'factory-babysitter:uuid-1',
-          provider: 'github',
-          resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
-          eventTypes: ['pull_request_review_comment.created'],
-          terminalEventTypes: ['pull_request.closed'],
-          intent: null,
-          status: 'active',
-          expiresAt: '2026-12-31T00:00:00.000Z',
-        }), { status: 200, headers: { 'content-type': 'application/json' } })
-      }
-      if (String(input).endsWith('/subscriptions/deliveries/claim') && init?.method === 'POST') {
-        return new Response(JSON.stringify({ deliveries: [{
-          id: 'delivery-1',
-          claimToken: 'claim-token-1',
-          subscriptionId: 'sub-1',
-          ownerId: 'configured-factory-agent',
-          subscriberId: 'factory-babysitter:uuid-1',
-          provider: 'github',
-          resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
-          event: { type: 'pull_request.closed' },
-          terminal: true,
-        }] }), { status: 200, headers: { 'content-type': 'application/json' } })
-      }
-      if (String(input).includes('/accept') && init?.method === 'POST') {
-        if (JSON.parse(String(init.body)).claimToken !== 'claim-token-1') {
-          return new Response(JSON.stringify({ error: 'delivery_claim_mismatch' }), { status: 409, headers: { 'content-type': 'application/json' } })
-        }
-        return new Response(JSON.stringify({ deliveryId: 'delivery-1', subscriptionId: 'sub-1', terminal: true }), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        })
-      }
-      return new Response(null, { status: 204 })
-    }
-    const mount = new RelayfileCloudMountClient({
-      workspaceId: 'rw_test',
-      client: fake,
-      resourceSubscriptionFetch,
-    })
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
 
     const client = mount.resourceSubscriptions!
     await expect(client.createOrRenew('rw_test', {
@@ -337,59 +792,54 @@ describe('RelayfileCloudMountClient', () => {
       .resolves.toEqual({ deliveryId: 'delivery-1', subscriptionId: 'sub-1', terminal: true })
     await client.cancel('rw_test', { subscriptionId: 'sub-1' })
 
-    expect(requests.map(({ url, init }) => ({ url, method: init?.method }))).toEqual([
-      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions', method: 'POST' },
-      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/claim', method: 'POST' },
-      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/delivery-1/accept', method: 'POST' },
-      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/deliveries/delivery-1/accept', method: 'POST' },
-      { url: 'https://relayfile.invalid/v1/workspaces/rw_test/subscriptions/sub-1', method: 'DELETE' },
-    ])
-    expect(requests[0]?.init?.headers).toMatchObject({ authorization: 'Bearer relayfile-token' })
-    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+    expect(fake.createSubscriptionCalls).toEqual([expect.objectContaining({
+      workspaceId: 'rw_test',
       provider: 'github',
       resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/1.json',
       eventTypes: ['pull_request_review_comment.created'],
       terminalEventTypes: ['pull_request.closed'],
       subscriberId: 'factory-babysitter:uuid-1',
       ttlSeconds: 3600,
-    })
-    expect(JSON.parse(String(requests[2]?.init?.body))).toEqual({ claimToken: 'wrong-token' })
-    expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({ claimToken: 'claim-token-1' })
+    })])
+    expect(fake.claimDeliveryCalls[0]).toMatchObject({ workspaceId: 'rw_test' })
+    expect(fake.acceptDeliveryCalls).toEqual([
+      expect.objectContaining({ workspaceId: 'rw_test', deliveryId: 'delivery-1', claimToken: 'wrong-token' }),
+      expect.objectContaining({ workspaceId: 'rw_test', deliveryId: 'delivery-1', claimToken: 'claim-token-1' }),
+    ])
+    expect(fake.cancelSubscriptionCalls).toEqual([
+      expect.objectContaining({ workspaceId: 'rw_test', subscriptionId: 'sub-1' }),
+    ])
   })
 
-  it('fails closed for malformed durable claim envelopes and stalled Relayfile requests', async () => {
+  it('fails closed for non-claimed SDK deliveries and forwards lifecycle cancellation', async () => {
     const fake = new FakeRelayFileClient()
+    fake.claimDurableSubscriptionDeliveries = vi.fn(async (input) => ({
+      deliveries: [{
+        ...(await new FakeRelayFileClient().claimDurableSubscriptionDeliveries(input)).deliveries[0]!,
+        claimToken: null,
+        status: 'pending' as const,
+      }],
+    }))
     const malformed = new RelayfileCloudMountClient({
       workspaceId: 'rw_test',
       client: fake,
-      baseUrl: 'https://relayfile.invalid',
-      tokenProvider: () => 'relayfile-token',
-      resourceSubscriptionFetch: async () => new Response(JSON.stringify({ notDeliveries: [] }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }),
     })
     await expect(malformed.resourceSubscriptions!.claimDeliveryClaims('rw_test'))
-      .rejects.toMatchObject({ status: 502 })
+      .rejects.toThrow(/without a live claim/u)
 
-    const stalled = new RelayfileCloudMountClient({
+    const controller = new AbortController()
+    const cancelledSdk = new FakeRelayFileClient()
+    const claim = vi.spyOn(cancelledSdk, 'claimDurableSubscriptionDeliveries')
+    const cancelled = new RelayfileCloudMountClient({
       workspaceId: 'rw_test',
-      client: fake,
-      baseUrl: 'https://relayfile.invalid',
-      tokenProvider: () => 'relayfile-token',
-      resourceSubscriptionRequestTimeoutMs: 10,
-      resourceSubscriptionFetch: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
-        const signal = init?.signal
-        if (!signal) throw new Error('subscription request was not abortable')
-        if (signal.aborted) {
-          reject(signal.reason)
-          return
-        }
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
-      }),
+      client: cancelledSdk,
+      resourceSubscriptionSignal: controller.signal,
     })
-    await expect(stalled.resourceSubscriptions!.claimDeliveryClaims('rw_test'))
-      .rejects.toMatchObject({ status: 504 })
+    await cancelled.resourceSubscriptions!.claimDeliveryClaims('rw_test')
+    expect(claim).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'rw_test',
+      signal: controller.signal,
+    }))
   })
 
   it('coalesces concurrent shared session resolutions for relayfile token refresh', async () => {
@@ -733,6 +1183,7 @@ describe('RelayfileCloudMountClient', () => {
     await mount.writeFile('/github/pull-requests/new.json', { title: 'new' })
 
     await expect(mount.confirmWrite('/github/pull-requests/new.json', { timeoutMs: 5 })).resolves.toBe('acked')
+    await expect(mount.getConfirmedWriteExternalId('/github/pull-requests/new.json')).resolves.toBe('52')
   })
 
   it('fails closed on unpollable write confirmations for legacy clients and restarted instances', async () => {
@@ -1136,6 +1587,51 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 }))
       .rejects.toThrow(/Field "id" is read-only/)
+    await expect(mount.getConfirmedWriteFailureReason('/linear/issues/new.json'))
+      .resolves.toBe('Field "id" is read-only and cannot be written')
+  })
+
+  it('feeds an existing-reference provider failure into the GitHub update-ref fallback', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'GitHub writeback failed with status 422: Reference already exists',
+    })
+    fake.ops.set('op-2', {
+      opId: 'op-2',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: { status: 200, externalId: 'factory/test-existing-ref' },
+    })
+    fake.ops.set('op-3', {
+      opId: 'op-3',
+      status: 'succeeded',
+      attemptCount: 1,
+      providerResult: { status: 201, externalId: '66' },
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    const writer = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(writer.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/test-existing-ref',
+      headSha: '1234567890abcdef1234567890abcdef12345678',
+      baseRef: 'main',
+      title: 'Title',
+      body: 'Body',
+    })).resolves.toMatchObject({ number: 66 })
+
+    expect(fake.writeFileCalls.map((call) => call.path)).toEqual([
+      '/github/repos/AgentWorkforce/factory/refs/factory.json',
+      '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffactory%2Ftest-existing-ref.json',
+      expect.stringMatching(/\/github\/repos\/AgentWorkforce\/factory\/pull-requests\/factory-/u),
+    ])
   })
 
   it('delegates subscribe through the workspace-scoped event client', () => {

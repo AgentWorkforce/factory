@@ -140,10 +140,16 @@ describe('HeuristicTriage routing', () => {
 describe('HeuristicTriage thin and scope detection', () => {
   it.each([
     { name: 'short description is thin', description: 'Fix tests in src/main/broker.ts.', thin: true },
-    { name: 'long description without acceptance signal is thin', description: 'Background '.repeat(30), thin: true },
+    { name: 'long description without acceptance signal is thin', title: 'Background context', description: 'Background '.repeat(30), thin: true },
     { name: 'long description with acceptance signal is not thin', description: richDescription('Add regression tests in src/main/broker.ts and verify the error path.'), thin: false },
-  ])('$name', async ({ description, thin }) => {
-    const decision = await new HeuristicTriage().triage(issue({ description }), ctx)
+    {
+      name: 'bug title makes detailed reproduction steps actionable',
+      title: 'Bug: Creating a new league does not work',
+      description: 'Steps to reproduce: Login, click new league, enter a league name, submit, and observe the broken admin page. '.repeat(2),
+      thin: false,
+    },
+  ])('$name', async ({ title, description, thin }) => {
+    const decision = await new HeuristicTriage().triage(issue({ ...(title ? { title } : {}), description }), ctx)
 
     expect(decision.thin).toBe(thin)
   })
@@ -235,6 +241,20 @@ describe('HeuristicTriage thin and scope detection', () => {
       clonePath: '/work/pear',
       node: 'self',
     })
+  })
+
+  it('routes per-role agent CLI overrides into implementer, reviewer, and babysitter specs', async () => {
+    const overridden = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' }, clonePaths: { 'AgentWorkforce/pear': '/work/pear' }, default: 'AgentWorkforce/pear' },
+      models: { implementer: 'codex-test', reviewer: 'claude-test' },
+      agentCapabilities: { implementer: 'spawn:claude', reviewer: 'spawn:codex', babysitter: 'spawn:codex' },
+    })
+    const decision = await new HeuristicTriage().triage(issue(), { ...ctx, config: overridden })
+
+    expect(decision.implementers[0]).toMatchObject({ capability: 'spawn:claude' })
+    expect(decision.reviewer).toMatchObject({ capability: 'spawn:codex' })
+    expect(babysitterSpec(issue(), overridden, decision.routes[0])).toMatchObject({ capability: 'spawn:codex' })
   })
 
   it('repo-qualifies every collision-prone GitHub-native role while preserving its source repo identity', async () => {

@@ -1,5 +1,12 @@
-import type { SendInput, SpawnResult } from './fleet'
-import type { InFlightIssue, QueuedIssue, TrackedAgent } from '../orchestrator/batch-tracker'
+import type { Capability, SendInput, SpawnResult } from './fleet'
+import type { AgentWorktree } from './worktree'
+import type {
+  DependencyAdmission,
+  InFlightIssue,
+  ParkedIssue,
+  QueuedIssue,
+  TrackedAgent,
+} from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
 
 export type CriticalRecord = { issue: IssueRef; input: SendInput }
@@ -21,7 +28,9 @@ export type WaitingClarification = {
   issue: IssueRef
   decision: TriageDecision
   dryRun: boolean
-  threadId: string
+  /** Optional Slack mirror thread. GitHub remains the durable request/response record. */
+  threadId?: string
+  questionSource?: 'github' | 'slack'
   askerName: string
   question: string
   askedAtMs: number
@@ -54,6 +63,8 @@ export type RegistryHandoffAgent = {
   name: string
   tracked: TrackedAgent
   persistedAtMs: number
+  /** Isolated checkout that must survive until this handoff is fully reaped. */
+  worktree?: AgentWorktree
 }
 
 export type BabysitterSessionState = {
@@ -79,6 +90,48 @@ export type BabysitterSessionState = {
   pendingDeliveryClaims?: Array<{ deliveryId: string; claimToken: string }>
 }
 
+export type ConversationMessage = {
+  id: string
+  text: string
+  receivedAtMs: number
+  /** Provider-native ordering identity (Slack message ts, Telegram update id, etc.). */
+  providerSequence?: string
+  author?: string
+}
+
+export type ConversationSessionState = {
+  provider: string
+  issue: IssueRef
+  /** Provider-native conversation/thread identifier. */
+  externalId: string
+  /** Provider-specific routing metadata; continuity itself stays provider-neutral. */
+  context: Record<string, string>
+  agent: {
+    name: string
+    sessionRef: string
+    node?: string
+    capability?: Capability
+    repo?: string
+    clonePath?: string
+  }
+  /** Previously delivered human turns, retained as bounded resume context. */
+  history: ConversationMessage[]
+  /** Durable dedupe ledger; unlike rendered history, this is never context-trimmed. */
+  processedMessageIds: string[]
+  /** New replies waiting for the short coalescing window. */
+  pending: ConversationMessage[]
+  /** Claimed batch; new arrivals remain in pending while this resume runs. */
+  delivery?: {
+    claimId: string
+    owner: string
+    claimedAtMs: number
+    attempts: number
+    messages: ConversationMessage[]
+    /** Binding captured at claim time so a later handoff cannot be overwritten. */
+    agent: Pick<ConversationSessionState['agent'], 'name' | 'sessionRef'>
+  }
+}
+
 export type DispatchAttemptState = {
   attempts: number
   inFlight: boolean
@@ -90,6 +143,7 @@ export type DispatchLifecyclePhase =
   | 'queued'
   | 'dispatching'
   | 'retryable'
+  | 'abandoning'
   | 'running'
   | 'parking'
   | 'waiting-for-human'
@@ -116,6 +170,8 @@ export type DispatchLifecycle = {
   agents: Array<{ name: string; tracked: TrackedAgent; releasedAtMs?: number }>
   invocationIds: string[]
   result?: import('../types').DispatchResult
+  /** All repository-specific PR receipts for team dispatches. `pullRequest` remains the primary receipt for compatibility. */
+  pullRequests?: import('./mount').GithubPublishPullRequestResult[]
   pullRequest?: import('./mount').GithubPublishPullRequestResult
   releaseReason?: string
   lease?: DispatchLifecycleLease
@@ -123,6 +179,8 @@ export type DispatchLifecycle = {
 }
 
 export type DispatchLifecycleClaim = {
+  /** Actual persisted key. It may be an older GitHub alias adopted atomically. */
+  key?: string
   acquired: boolean
   lifecycle: DispatchLifecycle
   lease?: DispatchLifecycleLease
@@ -135,6 +193,8 @@ export type GithubIssueCommentWatchPending = {
   authorizedAuthor: string
   decision?: TriageDecision
   claimedByCommentId?: string
+  /** Accept the first later authorized issue comment without a correlation prefix. */
+  replyAfterCommentId?: string
 }
 
 export type GithubIssueCommentWatchState = {
@@ -146,6 +206,8 @@ export type GithubIssueCommentWatchState = {
     url: string
   }
   pending: GithubIssueCommentWatchPending[]
+  /** Keep watching this source issue for structured agent question comments. */
+  detectAgentQuestions?: boolean
   sinceCommentId?: string
   lastSeenCommentId?: string
   processedCommentIds?: string[]
@@ -155,13 +217,17 @@ export interface BatchSnapshot {
   readonly size: number
   readonly inFlight: InFlightIssue[]
   readonly queued: QueuedIssue[]
+  readonly parked: ParkedIssue[]
   getIssue(issue: IssueRef): InFlightIssue | undefined
   getIssueByAgent(name: string): InFlightIssue | undefined
   isInFlight(issue: IssueRef): boolean
   isQueued(issue: IssueRef): boolean
+  isParked(issue: IssueRef): boolean
+  getParked(issue: IssueRef): ParkedIssue | undefined
   canStart(): boolean
-  start(decision: TriageDecision, dryRun: boolean): InFlightIssue | undefined
-  queue(decision: TriageDecision, dryRun: boolean): boolean
+  start(decision: TriageDecision, dryRun: boolean, dependencyAdmission?: DependencyAdmission): InFlightIssue | undefined
+  queue(decision: TriageDecision, dryRun: boolean, dependencyAdmission?: DependencyAdmission): boolean
+  clearPark(issue: IssueRef): void
   complete(issue: IssueRef): QueuedIssue | undefined
   abandon(issue: IssueRef): void
   invocationIdFor(issue: IssueRef, spec: InFlightIssue['decision']['reviewer']): string
@@ -222,6 +288,11 @@ export interface StateStore {
   ): Promise<boolean>
   getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined>
   listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>>
+  clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycleLease | undefined,
+  ): Promise<boolean>
   clearDispatchLifecycle(workspaceId: string, key: string): Promise<void>
 
   recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void>
@@ -233,6 +304,22 @@ export interface StateStore {
   getSlackThread(workspaceId: string, issueKey: string): Promise<string | undefined>
   clearSlackThread(workspaceId: string, issueKey: string): Promise<void>
   clearSlackThreads(workspaceId: string): Promise<void>
+
+  reserveConversationSession(workspaceId: string, conversationId: string, session: ConversationSessionState): Promise<boolean>
+  getConversationSession(workspaceId: string, conversationId: string): Promise<ConversationSessionState | undefined>
+  listConversationSessions(workspaceId: string): Promise<Array<[string, ConversationSessionState]>>
+  appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
+  claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
+  renewConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number): Promise<boolean>
+  completeConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
+  releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void>
+  clearConversationSession(workspaceId: string, conversationId: string): Promise<void>
+  /**
+   * Retarget a durable conversation session onto a different owning agent (e.g.
+   * once a babysitter takes over an issue whose Slack thread was reserved by the
+   * implementer) without disturbing accumulated history/pending turns.
+   */
+  rebindConversationSession(workspaceId: string, conversationId: string, agent: ConversationSessionState['agent']): Promise<boolean>
 
   setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
   listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>

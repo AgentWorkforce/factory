@@ -18,6 +18,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # PR checkouts otherwise use GitHub's synthetic merge commit, while
+          # the attestation is required to bind the exact reviewed head SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -31,8 +35,67 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Validate feature map
+        run: npm run featuremap:check
+
       - name: Test
         run: npm test
 
+      - name: Verify packed end-to-end lifecycle
+        run: npm run verify:e2e
+        env:
+          FACTORY_E2E_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          FACTORY_E2E_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Upload head-bound E2E attestation
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-e2e-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/factory-e2e-attestation.json
+          if-no-files-found: error
+
       - name: Verify package contents
         run: npm pack --dry-run
+
+  load-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Keep the load evidence bound to the reviewed head, matching the
+          # package job's head-bound attestation.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  kind' | sha256sum --check
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Run in-cluster load harness E2E
+        run: |
+          trap 'kind delete cluster --name factory-load-e2e' EXIT
+          kind create cluster --name factory-load-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+          npm run test:e2e:load
+
+      - name: Upload load evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-load-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/load-e2e/*.json
+          if-no-files-found: error

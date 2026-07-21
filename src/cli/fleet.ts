@@ -1,9 +1,11 @@
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import readline from 'node:readline/promises'
+import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
-import { ensureLocalMount } from '../mount/local-mount-preflight'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import {
   FileStateStore,
@@ -12,7 +14,10 @@ import {
   closeProbePr,
   createFactory,
   createFleet,
+  createFactoryCloudEventV1,
   ensureRelayBroker,
+  FactoryCloudReporter,
+  FileFactoryCloudEventOutbox,
   defaultGhRunner,
   explicitLinkedIssueKey,
   githubIssuePathParts,
@@ -20,6 +25,7 @@ import {
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
+  publishFactoryMountHealth,
   parseOwnedBrokerAgentExitTimeoutMs,
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
@@ -33,6 +39,7 @@ import {
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
+  type FactoryEventReporter,
   type FactoryConfig,
   type IterationReport,
   type FleetBackend,
@@ -40,12 +47,26 @@ import {
   type GhRunner,
   type FactoryStateResolution,
   type Logger,
+  type LocalMountHealthEvent,
+  type LocalMountOptions,
   type MountClient,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
 } from '../index'
+import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { FakeFleetClient, FakeMountClient } from '../testing'
+import { GitAgentWorktreeManager } from '../git/agent-worktree'
+import { checkFeatureMap, type CheckFeatureMapOptions, type FeatureMapCheckReport } from '../featuremap'
+import { loadOrCreateFactoryInstanceId, resolveFactoryInstanceName } from '../observability/instance-identity'
+import {
+  ensureFactoryIntegrations,
+  inspectFactoryIntegration,
+  openIntegrationUrl,
+  type FactoryIntegrationObservation,
+} from '../mount/relayfile-integration-preflight'
+import type { FactoryIntegrationProvider } from '../ports'
+import { checkMountStaleness } from '../mount/relayfile-binary'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -61,7 +82,7 @@ interface FleetCliDeps {
   ensureLocalMount?: (
     workspaceId: string,
     startDir: string,
-    options?: { acceptableWorkspaceIds?: readonly string[] },
+    options?: LocalMountOptions,
   ) => Promise<void>
   waitForStopSignal?: () => Promise<number | void>
   stdout?: Pick<NodeJS.WriteStream, 'write'>
@@ -75,6 +96,12 @@ interface FleetCliDeps {
   flushDaemonOutput?: () => Promise<void>
   /** Hermetic local-checkout probes for CLI integration tests. */
   localClonePathOptions?: LocalClonePathOptions
+  reporter?: FactoryEventReporter
+  cloudSessionProvider?: (options?: Parameters<typeof ensureCloudSession>[0]) => Promise<CloudSession>
+  isInteractive?: () => boolean
+  confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
+  openIntegrationUrl?: (url: string) => void | Promise<void>
+  featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
 }
 
 interface GlobalOptions {
@@ -90,9 +117,10 @@ interface LoadedConfig {
 }
 
 const autoDetectedIssueSources = new WeakSet<FactoryConfig>()
+const CLONE_MOUNT_PREFLIGHT_CONCURRENCY = 4
 
 type ParsedCommand =
-  | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; model?: string; sessionRef?: string; cwd?: string } }
+  | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; workflow?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
   | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
@@ -102,28 +130,48 @@ type ParsedCommand =
   | { kind: 'factory-dispatch'; issue: string }
   | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
+  | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
   const err = deps.stderr ?? process.stderr
   let fleet: FleetClient | undefined
+  let mount: MountClient | undefined
+  let reporter: FactoryEventReporter | undefined
 
   try {
     if (argv.some(isHelpFlag)) {
       out.write(helpText())
       return 0
     }
+    if (argv.some(isVersionFlag)) {
+      out.write(`${await readFactoryVersion()}\n`)
+      return 0
+    }
     const { globals, args } = parseGlobalOptions(argv)
     const command = parseFleetCommand(args)
 
+    if (command.kind === 'featuremap-check') {
+      const report = await (deps.featureMapCheck ?? checkFeatureMap)({
+        ...(command.manifestPath ? { manifestPath: command.manifestPath } : {}),
+        ...(command.baseRef ? { baseRef: command.baseRef } : {}),
+      })
+      writeJson(out, report)
+      return 0
+    }
+
     if (command.kind === 'factory-close-probe') {
       // Manual close-probe remains strict; the daemon relaxes the title marker only after issue-synthetic classification.
-      const githubWrite = deps.probeCloser
-        ? undefined
-        : (deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
-            workspaceId: (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId,
-            isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
-          })).githubWrite
+      let githubWrite
+      if (!deps.probeCloser) {
+        const workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
+        mount = deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
+          workspaceId,
+          isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
+        })
+        await prepareFactoryIntegrations(command, mount, undefined, globals, deps, workspaceId, err)
+        githubWrite = mount.githubWrite
+      }
       const result = await (deps.probeCloser ?? closeProbePr)({
         repo: command.repo,
         prNumber: command.prNumber,
@@ -166,6 +214,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           capability: command.input.capability,
           node: command.input.node ?? 'self',
           task: command.input.task,
+          workflow: command.input.workflow,
           model: command.input.model,
           cwd: command.input.cwd,
         }))
@@ -205,7 +254,38 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         }
         const workspaceId = loaded.config.workspaceId
         if (!workspaceId) throw new Error('factory command could not resolve a workspaceId')
-        const mount = await buildMount(loaded, deps)
+        const logger = streamLogger(err)
+        const pendingMountHealthEvents: LocalMountHealthEvent[] = []
+        const reportMountHealth = async (event: LocalMountHealthEvent): Promise<void> => {
+          if (!mount) {
+            pendingMountHealthEvents.push(event)
+            return
+          }
+          if (reporter) {
+            await reporter.report(createFactoryCloudEventV1({
+              type: event.state === 'degraded' ? 'factory.anomaly' : 'factory.snapshot',
+              level: event.state === 'degraded' ? 'error' : 'info',
+              attributes: {
+                component: 'relayfile_mount',
+                operation: 'supervise',
+                errorCode: event.reason,
+                count: event.degradedMounts,
+              },
+            }))
+          }
+          try {
+            await publishFactoryMountHealth(mount, workspaceId, event)
+          } catch (error) {
+            logger.warn?.('[factory] unable to publish Relayfile mount health signal', {
+              errorClass: error instanceof Error ? error.name : 'Error',
+            })
+          }
+        }
+        mount = await buildMount(loaded, deps, {
+          logger,
+          onLocalMountHealth: reportMountHealth,
+        })
+        await prepareFactoryIntegrations(command, mount, loaded.config, globals, deps, workspaceId, err)
         if (command.kind === 'factory-babysit') {
           return await runStandaloneBabysitCommand(
             command,
@@ -223,11 +303,31 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
-        const logger = streamLogger(err)
         const stateStore = new FileStateStore({
           batchSize: loaded.config.batchSize,
           watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
         })
+        reporter = deps.reporter ?? await buildFactoryCloudReporter({
+          config: loaded.config,
+          backend: globals.backend,
+          mode: factoryReportingMode(command),
+          logger,
+          deps,
+        })
+        if (reporter) {
+          await reporter.report(createFactoryCloudEventV1({
+            type: 'instance.started',
+            attributes: {
+              backend: globals.backend,
+              mode: factoryReportingMode(command),
+              component: 'cli',
+              operation: 'start',
+            },
+          }))
+        }
+        for (const event of pendingMountHealthEvents.splice(0)) {
+          await reportMountHealth(event)
+        }
         const factory = (deps.createFactory ?? createFactory)(loaded.config, {
           mount,
           fleet,
@@ -235,16 +335,52 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           stateResolution,
           probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
           logger,
+          reporter,
+          worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
         })
         return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
       }
     }
     return 1
   } catch (error) {
+    if (reporter) {
+      try {
+        await reporter.report(createFactoryCloudEventV1({
+          type: 'factory.failure',
+          level: 'error',
+          attributes: { component: 'cli', operation: 'command', errorCode: 'command_failed' },
+        }))
+      } catch {
+        // An injected reporter may violate the no-reject port contract. The
+        // original command failure still determines the CLI result.
+      }
+    }
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 1
   } finally {
-    await fleet?.dispose()
+    try {
+      await mount?.dispose?.()
+    } finally {
+      try {
+        await fleet?.dispose()
+      } finally {
+        if (reporter) {
+          try {
+            await reporter.report(createFactoryCloudEventV1({
+              type: 'instance.stopping',
+              attributes: { component: 'cli', operation: 'stop' },
+            }))
+            await reporter.report(createFactoryCloudEventV1({
+              type: 'instance.stopped',
+              attributes: { component: 'cli', operation: 'stop' },
+            }))
+            await reporter.close?.({ deadlineMs: 2_000 })
+          } catch {
+            err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+          }
+        }
+      }
+    }
   }
 }
 
@@ -262,7 +398,26 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     return parseFleetSubcommand(rest)
   }
 
+  if (verb === 'featuremap') {
+    return parseFeatureMapCommand(rest)
+  }
+
   throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseFeatureMapCommand(args: string[]): ParsedCommand {
+  const [action, ...flags] = args
+  if (action !== 'check') {
+    throw new Error('factory featuremap requires the check command')
+  }
+  const parsed = parseFlags(flags)
+  const unexpected = Object.keys(parsed).find((key) => key !== 'manifest' && key !== 'base')
+  if (unexpected) throw new Error(`Unknown factory featuremap option: --${unexpected}`)
+  return {
+    kind: 'featuremap-check',
+    ...(parsed.manifest ? { manifestPath: parsed.manifest } : {}),
+    ...(parsed.base ? { baseRef: parsed.base } : {}),
+  }
 }
 
 function parseFleetSubcommand(args: string[]): ParsedCommand {
@@ -277,6 +432,9 @@ function parseFleetSubcommand(args: string[]): ParsedCommand {
       throw new Error('factory fleet spawn requires capability spawn:codex, spawn:claude, or workflow:run')
     }
     const parsed = parseFlags(flags)
+    if (capability === 'workflow:run' && !parsed.workflow) {
+      throw new Error('factory fleet spawn workflow:run requires --workflow <path>')
+    }
     return {
       kind: 'spawn',
       input: {
@@ -284,6 +442,7 @@ function parseFleetSubcommand(args: string[]): ParsedCommand {
         name: parsed.name,
         node: parsed.node,
         task: parsed.task,
+        ...(parsed.workflow ? { workflow: parsed.workflow } : {}),
         model: parsed.model,
         sessionRef: parsed.resume,
         cwd: parsed.cwd,
@@ -348,27 +507,43 @@ async function runFactoryCommand(
   workspaceId: string = config.workspaceId ?? '',
   acceptableMountIds?: readonly string[],
 ): Promise<number> {
+  const mountFn = resolveLocalMountFn(deps, mount)
+  const mountStderr = deps.stderr ?? process.stderr
+  const debugMountRefreshes = (deps.env ?? process.env).FACTORY_LOG_LEVEL?.toLowerCase() === 'debug'
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      await (deps.ensureLocalMount ?? ensureLocalMount)(workspaceId, process.cwd(), {
-        acceptableWorkspaceIds: acceptableMountIds,
-      })
-      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+      // Local mirrors are a writeback aid, not the source of truth for remote
+      // issue discovery. Start their SDK-backed supervisors immediately, but
+      // do not serialize durable recovery behind a stale checkout's readiness
+      // timeout. The mount client reports degradation and keeps retrying.
+      void warmStartPathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
-      const flushAndExit = async (code: number): Promise<void> => {
+      const flushAndResolve = async (code: number): Promise<void> => {
         try {
           await (deps.flushDaemonOutput ?? flushProcessOutput)()
         } finally {
-          const daemonExit = deps.daemonExit ?? ((exitCode: number) => process.exit(exitCode))
-          daemonExit(code)
           waiter.resolve(code)
         }
       }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
-          void flushAndExit(code)
+          // Resolve the command instead of calling process.exit here. Returning
+          // through runFleetCli's outer finally gives Cloud lifecycle reporting
+          // its bounded shutdown opportunity before the caller applies `code`.
+          void flushAndResolve(code)
         },
         processLike: deps.stopSignalProcessLike,
       })
@@ -384,7 +559,14 @@ async function runFactoryCommand(
       }
     }
     if (command.action === 'run-once') {
-      await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+      await ensureClonePathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
     }
@@ -416,7 +598,14 @@ async function runFactoryCommand(
       return 0
     }
 
-    await ensureClonePathMounts(deps, workspaceId, config, acceptableMountIds)
+    await ensureClonePathMounts(
+      mountFn,
+      workspaceId,
+      config,
+      acceptableMountIds,
+      mountStderr,
+      debugMountRefreshes,
+    )
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
@@ -463,6 +652,34 @@ async function runFactoryCommand(
   return 0
 }
 
+async function warmStartPathMounts(
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
+  workspaceId: string,
+  config: FactoryConfig,
+  acceptableMountIds?: readonly string[],
+  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
+  debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
+): Promise<void> {
+  const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
+  const [daemonRefresh, cloneRefreshes] = await Promise.all([
+    ensureMountPath(mountFn, workspaceId, process.cwd(), mountOpts, stderr),
+    ensureClonePathMounts(
+      mountFn,
+      workspaceId,
+      config,
+      acceptableMountIds,
+      stderr,
+      debug,
+      false,
+    ),
+  ])
+  writeMountRefreshSummary(
+    [...(daemonRefresh ? [daemonRefresh] : []), ...cloneRefreshes],
+    stderr,
+    debug,
+  )
+}
+
 async function runStandaloneBabysitCommand(
   command: Extract<ParsedCommand, { kind: 'factory-babysit' }>,
   mount: MountClient,
@@ -476,7 +693,7 @@ async function runStandaloneBabysitCommand(
 ): Promise<number> {
   const repo = resolveStandaloneBabysitRepo(command.repo, config)
   const clonePath = standaloneBabysitClonePath(repo, config)
-  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
+  const mountFn = resolveLocalMountFn(deps, mount)
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts, deps.stderr)
   if (clonePath && resolve(clonePath) !== resolve(process.cwd())) {
@@ -527,6 +744,11 @@ async function runStandaloneBabysitCommand(
   }
 
   const agentName = standaloneBabysitterAgentName(repo, pr.number)
+  const testGuidance = await resolveTestGuidance({
+    repoPath: clonePath,
+    issue,
+    changedFiles: pr.filesChanged,
+  })
   const task = renderAgentTask({
     issue,
     route: { repo, clonePath },
@@ -545,6 +767,7 @@ async function runStandaloneBabysitCommand(
     },
     standaloneBabysitter: { specSource },
     integrationsMountRoot: resolve(process.cwd(), '.integrations'),
+    testGuidance,
   })
   const receiptBase = {
     agent: agentName,
@@ -569,7 +792,7 @@ async function runStandaloneBabysitCommand(
 
   const spawned = await fleet.spawn({
     name: agentName,
-    capability: 'spawn:claude',
+    capability: config.agentCapabilities.babysitter,
     node: 'self',
     repo,
     clonePath,
@@ -638,24 +861,94 @@ function standaloneBabysitClonePath(repo: string, config: FactoryConfig): string
  * these paths for integration writebacks (Slack, GitHub, etc.).
  */
 async function ensureClonePathMounts(
-  deps: FleetCliDeps,
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
   workspaceId: string,
   config: FactoryConfig,
   acceptableMountIds?: readonly string[],
-): Promise<void> {
-  const mountFn = deps.ensureLocalMount ?? ensureLocalMount
+  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
+  debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
+  reportSummary = true,
+): Promise<RefreshedStaleMount[]> {
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
   const daemonCwd = resolve(process.cwd())
-  for (const clonePath of new Set(Object.values(config.clonePaths ?? {}))) {
-    const resolved = resolve(clonePath)
-    if (resolved !== daemonCwd) {
-      try {
-        await mountFn(workspaceId, resolved, mountOpts)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        process.stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
-      }
+  const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}).map((clonePath) => resolve(clonePath)))]
+    .filter((clonePath) => clonePath !== daemonCwd)
+  const refreshedStaleMounts: RefreshedStaleMount[] = []
+  let nextIndex = 0
+  const mountNext = async (): Promise<void> => {
+    while (nextIndex < clonePaths.length) {
+      const resolved = clonePaths[nextIndex++]!
+      const refreshed = await ensureMountPath(mountFn, workspaceId, resolved, mountOpts, stderr)
+      if (refreshed) refreshedStaleMounts.push(refreshed)
     }
+  }
+  await Promise.all(Array.from(
+    { length: Math.min(CLONE_MOUNT_PREFLIGHT_CONCURRENCY, clonePaths.length) },
+    mountNext,
+  ))
+  if (reportSummary) writeMountRefreshSummary(refreshedStaleMounts, stderr, debug)
+  return refreshedStaleMounts
+}
+
+type RefreshedStaleMount = { path: string; reason?: string }
+
+async function ensureMountPath(
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
+  workspaceId: string,
+  path: string,
+  mountOpts: { acceptableWorkspaceIds?: readonly string[] },
+  stderr: Pick<NodeJS.WriteStream, 'write'>,
+): Promise<RefreshedStaleMount | undefined> {
+  const resolved = resolve(path)
+  const statePath = join(resolved, '.integrations', '.relay', 'state.json')
+  const staleBefore = checkMountStaleness(statePath, workspaceId, mountOpts.acceptableWorkspaceIds)
+  try {
+    await mountFn(workspaceId, resolved, {
+      ...mountOpts,
+      ...(staleBefore.stale ? { suppressStaleRefreshLogs: true } : {}),
+    })
+    if (staleBefore.stale && !checkMountStaleness(statePath, workspaceId, mountOpts.acceptableWorkspaceIds).stale) {
+      return { path: resolved, reason: staleBefore.reason }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
+  }
+  return undefined
+}
+
+function writeMountRefreshSummary(
+  refreshedStaleMounts: readonly RefreshedStaleMount[],
+  stderr: Pick<NodeJS.WriteStream, 'write'>,
+  debug: boolean,
+): void {
+  if (debug) {
+    for (const mount of [...refreshedStaleMounts].sort((left, right) => left.path.localeCompare(right.path))) {
+      const suffix = mount.reason ? ` (${mount.reason})` : ''
+      stderr.write(`[factory] debug: refreshed stale local mount at ${mount.path}${suffix}\n`)
+    }
+  }
+  if (refreshedStaleMounts.length > 0) {
+    const ages = refreshedStaleMounts
+      .map(({ reason }) => reason?.match(/^last reconcile (\d+)m ago$/u)?.[1])
+      .filter((age): age is string => age !== undefined)
+      .map(Number)
+    const ageSuffix = ages.length > 0 ? ` (last reconcile ~${Math.max(...ages)}m ago)` : ''
+    stderr.write(`[factory] refreshed ${refreshedStaleMounts.length} stale local mount(s)${ageSuffix}\n`)
+  }
+}
+
+function resolveLocalMountFn(
+  deps: FleetCliDeps,
+  mount: MountClient,
+): NonNullable<FleetCliDeps['ensureLocalMount']> {
+  if (deps.ensureLocalMount) return deps.ensureLocalMount
+  if (mount.ensureLocalMount) {
+    const ensureLocalMount = mount.ensureLocalMount.bind(mount)
+    return async (_workspaceId, startDir, options) => ensureLocalMount(startDir, options)
+  }
+  return async () => {
+    throw new Error('Mount client does not provide Relayfile SDK local-mount support')
   }
 }
 
@@ -777,6 +1070,65 @@ function commandUsesLocalCheckout(command: ParsedCommand): boolean {
   }
 }
 
+function factoryReportingMode(command: Extract<ParsedCommand, { kind: `factory${string}` | 'factory' }>): string {
+  return command.kind === 'factory' ? command.action : command.kind.slice('factory-'.length)
+}
+
+async function buildFactoryCloudReporter(input: {
+  config: FactoryConfig
+  backend: FleetBackend
+  mode: string
+  logger: Logger
+  deps: FleetCliDeps
+}): Promise<FactoryEventReporter | undefined> {
+  if (!input.config.reporting.enabled) return undefined
+  if (hasInjectedFactoryRuntime(input.deps) && !input.deps.cloudSessionProvider) return undefined
+
+  try {
+    const activeWorkspace = await (input.deps.resolveWorkspace ?? resolveFactoryWorkspace)()
+    const activeWorkspaceIds = new Set([
+      activeWorkspace.workspaceId,
+      activeWorkspace.cloudWorkspaceId,
+    ].filter((value): value is string => Boolean(value)))
+    if (!input.config.workspaceId || !activeWorkspaceIds.has(input.config.workspaceId)) {
+      input.logger.warn?.('[factory] Cloud progress reporting skipped because the active account workspace differs from Factory config')
+      return undefined
+    }
+    const session = await (input.deps.cloudSessionProvider ?? ensureCloudSession)({ interactive: false })
+    const outboxPath = input.config.reporting.outboxPath
+      ?? join(dirname(input.config.loop.registryPath), 'factory-cloud-events.json')
+    const instanceId = await loadOrCreateFactoryInstanceId(`${outboxPath}.instance-id`)
+    const instanceName = resolveFactoryInstanceName(input.config)
+    const cloudFetch: typeof fetch = async (_request, init) =>
+      session.client.fetch('/api/v1/factory/events', init)
+    return new FactoryCloudReporter({
+      apiUrl: session.auth.apiUrl,
+      instance: {
+        id: instanceId,
+        bootId: randomUUID(),
+        version: await readFactoryVersion(),
+        metadata: {
+          ...(instanceName !== undefined ? { name: instanceName } : {}),
+          backend: input.backend,
+          mode: input.mode,
+          runtime: 'node',
+        },
+      },
+      outbox: new FileFactoryCloudEventOutbox({ path: outboxPath }),
+      getAccessToken: async () => session.client.snapshot().accessToken,
+      fetch: cloudFetch,
+      logger: input.logger,
+      batchSize: input.config.reporting.batchSize,
+      requestTimeoutMs: input.config.reporting.requestTimeoutMs,
+    })
+  } catch (error) {
+    input.logger.warn?.('[factory] Cloud progress reporting is unavailable', {
+      errorClass: error instanceof Error ? error.name : 'Error',
+    })
+    return undefined
+  }
+}
+
 function hasInjectedFactoryRuntime(deps: FleetCliDeps): boolean {
   return Boolean(deps.fleet || deps.mount || deps.createFactory || deps.createFleet || deps.cloudMountFromConfig)
 }
@@ -790,13 +1142,14 @@ async function buildFleet(
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
 
   const cwd = process.cwd()
-  const connectionPath = resolveBrokerConnectionPath(cwd)
+  const env = deps.env ?? process.env
+  const connectionPath = resolveBrokerConnectionPath(cwd, env)
 
   // An injected createFleet owns fleet construction entirely (tests), so skip the
   // real broker bootstrap.
   if (deps.createFleet) {
     return deps.createFleet(
-      { backend: globals.backend, cwd, connectionPath },
+      { backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview },
       { ownedBrokerAgentExitTimeoutMs: globals.agentExitTimeoutMs },
     )
   }
@@ -808,9 +1161,21 @@ async function buildFleet(
   if (globals.backend === 'internal') {
     const stderr = deps.stderr ?? process.stderr
     const logger = streamLogger(stderr)
-    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
+    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({
+      cwd,
+      connectionPath,
+      logger,
+      env,
+    })
+    if (started && connectionPath === undefined) {
+      stderr.write(
+        `[factory] no existing relay broker connection found under ${cwd} (.agentworkforce/relay/connection.json);\n` +
+        'starting a NEW broker. If you expected to attach to an already-running Factory, you are likely running\n' +
+        'from the wrong directory — cd to the checkout that owns .agentworkforce/relay/ and retry.\n',
+      )
+    }
     return createFleet(
-      { backend: 'internal', cwd, connectionPath },
+      { backend: 'internal', cwd, connectionPath, previewConfig: loaded?.config.preview },
       {
         harnessClient: client,
         ownsBroker: started,
@@ -821,7 +1186,7 @@ async function buildFleet(
     )
   }
 
-  return createFleet({ backend: globals.backend, cwd, connectionPath }, { env: deps.env })
+  return createFleet({ backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview }, { env: deps.env })
 }
 
 function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {
@@ -841,7 +1206,15 @@ export function formatLogArgs(args: unknown[]): string {
   return ` ${args.map((arg) => (typeof arg === 'string' ? arg : stringifyLogValue(arg))).join(' ')}`
 }
 
-export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {
+export function resolveBrokerConnectionPath(
+  startCwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const explicitStateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+  if (explicitStateDir) {
+    return join(explicitStateDir, 'connection.json')
+  }
+
   let current = resolve(startCwd)
   for (;;) {
     const candidate = join(current, '.agentworkforce', 'relay', 'connection.json')
@@ -853,6 +1226,111 @@ export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | 
       return undefined
     }
     current = parent
+  }
+}
+
+async function prepareFactoryIntegrations(
+  command: ParsedCommand,
+  mount: MountClient,
+  config: FactoryConfig | undefined,
+  globals: GlobalOptions,
+  deps: FleetCliDeps,
+  workspaceId: string,
+  err: Pick<NodeJS.WriteStream, 'write'>,
+): Promise<void> {
+  const connections = mount.integrationConnections
+  if (!connections) return
+
+  const observed = new Map<FactoryIntegrationProvider, FactoryIntegrationObservation>()
+  if (config && commandUsesIssueSource(command) && !config.issueSource) {
+    autoDetectedIssueSources.add(config)
+    if (shouldAutoDetectGithubSource(config)) {
+      config.issueSource = 'github'
+    } else {
+      const linear = await inspectFactoryIntegration(connections, 'linear')
+      observed.set('linear', linear)
+      if (linear.kind === 'ready') {
+        config.issueSource = 'linear'
+      } else if (linear.kind === 'missing') {
+        config.issueSource = 'github'
+      } else {
+        await ensureFactoryIntegrations({
+          connections,
+          providers: ['linear'],
+          workspaceId,
+          interactive: false,
+          dryRun: globals.dryRun,
+          observed,
+          io: factoryIntegrationIO(deps, err),
+        })
+      }
+    }
+  }
+
+  const providers = requiredIntegrationsForCommand(command, config)
+  if (providers.length === 0) return
+  const dryRun = globals.dryRun || command.kind === 'factory-canary'
+  await ensureFactoryIntegrations({
+    connections,
+    providers,
+    workspaceId,
+    interactive: !dryRun && (deps.isInteractive?.() ?? Boolean(process.stdin.isTTY && process.stderr.isTTY)),
+    dryRun,
+    observed,
+    io: factoryIntegrationIO(deps, err),
+  })
+}
+
+function requiredIntegrationsForCommand(
+  command: ParsedCommand,
+  config: FactoryConfig | undefined,
+): FactoryIntegrationProvider[] {
+  if (command.kind === 'factory-close-probe' || command.kind === 'factory-babysit') {
+    return ['github']
+  }
+  if (
+    command.kind === 'factory-triage' ||
+    command.kind === 'factory-dispatch' ||
+    command.kind === 'factory-canary'
+  ) {
+    return config?.issueSource === 'linear' ? ['linear', 'github'] : ['github']
+  }
+  if (command.kind === 'factory' && (
+    command.action === 'start' || command.action === 'run-once' || command.action === 'loop'
+  )) {
+    return config?.issueSource === 'linear' ? ['linear', 'github'] : ['github']
+  }
+  return []
+}
+
+function commandUsesIssueSource(command: ParsedCommand): boolean {
+  return command.kind === 'factory-triage' ||
+    command.kind === 'factory-dispatch' ||
+    command.kind === 'factory-canary' ||
+    (command.kind === 'factory' && (
+      command.action === 'start' || command.action === 'run-once' || command.action === 'loop'
+    ))
+}
+
+function factoryIntegrationIO(
+  deps: FleetCliDeps,
+  err: Pick<NodeJS.WriteStream, 'write'>,
+) {
+  return {
+    info: (message: string) => err.write(`[factory] ${message}\n`),
+    warn: (message: string) => err.write(`[factory] warning: ${message}\n`),
+    confirm: deps.confirmIntegrationConnect ?? confirmIntegrationConnect,
+    openUrl: deps.openIntegrationUrl ?? openIntegrationUrl,
+  }
+}
+
+async function confirmIntegrationConnect(provider: FactoryIntegrationProvider): Promise<boolean> {
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stderr })
+  try {
+    const answer = (await terminal.question(`Connect ${provider} now? (opens browser) [Y/n] `)).trim().toLowerCase()
+    return answer === '' || answer === 'y' || answer === 'yes'
+  } finally {
+    terminal.close()
   }
 }
 
@@ -907,12 +1385,21 @@ function hasDefaultLinearStateNames(states: FactoryConfig['linear']['states']): 
     states.humanReview === 'In Human Review'
 }
 
-async function buildMount(loaded: LoadedConfig, deps: FleetCliDeps): Promise<MountClient> {
+async function buildMount(
+  loaded: LoadedConfig,
+  deps: FleetCliDeps,
+  observability: {
+    logger?: Logger
+    onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
+  } = {},
+): Promise<MountClient> {
   if (deps.mount) return deps.mount
   if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
   let mount: MountClient
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
+    logger: observability.logger,
+    onLocalMountHealth: observability.onLocalMountHealth,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
   })
   return mount
@@ -965,7 +1452,7 @@ async function isAllowedFactoryDraft(
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/refs%2Fheads%2F[^/]+\.json|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isAllowedFactoryGithubDraft = (
   path: string,
@@ -1285,6 +1772,7 @@ Commands:
   dispatch <KEY|path>   Triage and dispatch one issue
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
+  featuremap check      Validate .agentworkforce/features/manifest.yaml
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
@@ -1294,12 +1782,27 @@ Options:
   --agent-exit-timeout <ms>
                         Max owned-broker wait for task-exit agents (default: 1800000;
                         env: FACTORY_AGENT_EXIT_TIMEOUT_MS)
+  -V, --version         Show the installed Factory version
   -h, --help            Show this help
 `
 }
 
 function isHelpFlag(arg: string): boolean {
   return arg === '-h' || arg === '--help'
+}
+
+function isVersionFlag(arg: string): boolean {
+  return arg === '-V' || arg === '--version'
+}
+
+async function readFactoryVersion(): Promise<string> {
+  const manifest = JSON.parse(
+    await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
+  ) as { version?: unknown }
+  if (typeof manifest.version !== 'string' || manifest.version.length === 0) {
+    throw new Error('Factory package version is missing')
+  }
+  return manifest.version
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {

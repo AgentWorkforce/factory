@@ -2,17 +2,37 @@
   "id": "factory-feature-guardian",
   "intent": "relay-orchestrator",
   "tags": ["factory", "verification", "proactive", "health", "release-safety", "durability"],
-  "description": "Validates the checked-in Factory catalog summary, then cycles through every @agent-relay/factory feature hourly. Each Slack check names the exact source surface, verification tier, and supported safety/topology boundary; progress persists across the exhaustive manifest and resets after a complete cycle.",
+  "description": "Reads the validated Factory feature catalog from a scoped repository clone, then cycles through every @agent-relay/factory feature hourly. Each provider-confirmed, idempotent Slack check names the exact source surface, named end-to-end procedure, verification tier, and supported safety/topology boundary; exact revisioned progress persists across the exhaustive manifest and resets only after a complete cycle.",
   "cloud": true,
-  "useSubscription": true,
+  "harness": "opencode",
+  "model": "deepseek-v4-flash-free",
   "harnessSettings": {
     "reasoning": "low",
     "timeoutSeconds": 300
   },
   "integrations": {
+    "github": {
+      "scope": {
+        "repo": "AgentWorkforce/factory"
+      },
+      "relayfileMount": {
+        "requiredReadPaths": [
+          "/github/repos/AgentWorkforce/factory/.agentworkforce/features/**"
+        ],
+        "writeOnlyPaths": []
+      }
+    },
     "slack": {
+      "optional": true,
+      "enabledByInput": "SLACK_CHANNEL",
       "scope": {
         "paths": "/slack/channels/**"
+      },
+      "relayfileMount": {
+        "requiredReadPaths": [],
+        "writeOnlyPaths": [
+          "/slack/channels/${SLACK_CHANNEL}/**"
+        ]
       }
     }
   },

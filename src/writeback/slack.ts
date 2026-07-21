@@ -59,6 +59,9 @@ const pathTs = (threadTs: string): string => threadTs.replace(/\./g, '_')
 
 const payloadTs = (threadId: string): string => threadId.replace(/_/g, '.')
 
+const isSlackTs = (value: string | undefined): value is string =>
+  typeof value === 'string' && /^\d+\.\d+$/u.test(value)
+
 const rootClientId = (prefix: string, channelDir: string, text: string): string =>
   `${safePathSegment(prefix)}-${safePathSegment(channelIdFromDir(channelDir))}-${stableHash(text)}`
 
@@ -106,26 +109,32 @@ export const MountSlackWriteback = (
 
       await mount.writeFile(path, { channelId, text }, { guarded: true })
       const content = await confirmPath(mount, path)
-      const threadTs = slackTsFromContent(content) ?? clientId
-
-      threads.set(threadTs, { channelDir, channelId, threadTs })
-      if (threadTs !== clientId) {
-        threads.set(clientId, { channelDir, channelId, threadTs })
+      const providerExternalId = await mount.getConfirmedWriteExternalId?.(path)
+      const threadTs = slackTsFromContent(content) ?? (isSlackTs(providerExternalId) ? providerExternalId : undefined)
+      if (!threadTs && mount.writebackTransport === 'relayfile-cloud') {
+        throw new Error(`Slack root writeback for ${path} was acknowledged without a provider thread timestamp`)
       }
-      return { threadId: threadTs }
+      const resolvedThreadTs = threadTs ?? clientId
+
+      threads.set(resolvedThreadTs, { channelDir, channelId, threadTs: resolvedThreadTs })
+      if (resolvedThreadTs !== clientId) {
+        threads.set(clientId, { channelDir, channelId, threadTs: resolvedThreadTs })
+      }
+      return { threadId: resolvedThreadTs }
     },
 
     async reply(threadId: string, text: string): Promise<void> {
       assertCloudWriteback()
       const fallbackChannelDir = slackCfg.channelDir ?? slackCfg.channel
       assertSlackChannelAllowed(slackCfg.channel, fallbackChannelDir, 'reply')
+      const persistedThreadTs = payloadTs(threadId)
       const ref = threads.get(threadId) ?? (
-        fallbackChannelDir
-          ? { channelDir: fallbackChannelDir, channelId: channelIdFromDir(fallbackChannelDir), threadTs: payloadTs(threadId) }
+        fallbackChannelDir && (mount.writebackTransport === 'test' || isSlackTs(persistedThreadTs))
+          ? { channelDir: fallbackChannelDir, channelId: channelIdFromDir(fallbackChannelDir), threadTs: persistedThreadTs }
           : undefined
       )
       if (!ref) {
-        throw new Error(`Unknown Slack thread ${threadId}; provide channelDir in slack config`)
+        throw new Error(`Unknown or invalid Slack thread ${threadId}; a provider thread timestamp is required`)
       }
       assertSlackChannelAllowed(slackCfg.channel, ref.channelDir, 'reply path')
 

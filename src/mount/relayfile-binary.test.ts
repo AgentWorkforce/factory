@@ -1,18 +1,11 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { checkMountStaleness, resolveRelayfileMountBinary } from './relayfile-binary'
-
-const originalRelayfileMountBin = process.env.RELAYFILE_MOUNT_BIN
+import { checkMountStaleness } from './relayfile-binary'
 
 afterEach(() => {
-  if (originalRelayfileMountBin === undefined) {
-    delete process.env.RELAYFILE_MOUNT_BIN
-  } else {
-    process.env.RELAYFILE_MOUNT_BIN = originalRelayfileMountBin
-  }
   vi.restoreAllMocks()
 })
 
@@ -33,57 +26,6 @@ async function writeState(
   await writeFile(statePath, JSON.stringify(state), 'utf8')
   return statePath
 }
-
-describe('resolveRelayfileMountBinary', () => {
-  it('uses RELAYFILE_MOUNT_BIN when it points to an executable file', async () => {
-    await withTempDir(async (dir) => {
-      const binary = join(dir, 'relayfile-mount')
-      await writeFile(binary, '#!/bin/sh\n', 'utf8')
-      await chmod(binary, 0o755)
-      process.env.RELAYFILE_MOUNT_BIN = binary
-
-      expect(resolveRelayfileMountBinary()).toBe(binary)
-    })
-  })
-
-  it('prefers the relayfile SDK optional mount package binary', async () => {
-    await withTempDir(async (dir) => {
-      await writeFile(join(dir, 'factory.config.json'), '{}', 'utf8')
-      const packageBinDir = join(dir, 'node_modules', '@relayfile', 'mount-darwin-arm64', 'bin')
-      await mkdir(packageBinDir, { recursive: true })
-      const packageBinary = join(packageBinDir, 'relayfile-mount')
-      await writeFile(packageBinary, '#!/bin/sh\n', 'utf8')
-      await chmod(packageBinary, 0o755)
-
-      const repoBinDir = join(dir, 'bin')
-      await mkdir(repoBinDir, { recursive: true })
-      const repoBinary = join(repoBinDir, 'relayfile-mount')
-      await writeFile(repoBinary, '#!/bin/sh\n', 'utf8')
-      await chmod(repoBinary, 0o755)
-
-      vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
-      vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64')
-
-      expect(resolveRelayfileMountBinary(dir)).toBe(packageBinary)
-    })
-  })
-
-  it('resolves the repo-root Windows relayfile-mount.exe fallback', async () => {
-    await withTempDir(async (dir) => {
-      await writeFile(join(dir, 'factory.config.json'), '{}', 'utf8')
-      const binDir = join(dir, 'bin')
-      await mkdir(binDir, { recursive: true })
-      const binary = join(binDir, 'relayfile-mount.exe')
-      await writeFile(binary, '#!/bin/sh\n', 'utf8')
-      await chmod(binary, 0o755)
-
-      vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
-      vi.spyOn(process, 'arch', 'get').mockReturnValue('x64')
-
-      expect(resolveRelayfileMountBinary(dir)).toBe(binary)
-    })
-  })
-})
 
 describe('checkMountStaleness', () => {
   it('leaves missing state non-stale so the caller can decide whether to start', async () => {
@@ -170,19 +112,19 @@ describe('checkMountStaleness', () => {
     })
   })
 
-  it('treats a fresh pid-less state as healthy (CLI-daemonized mount records no pid)', async () => {
+  it('treats a fresh pid-less state as healthy', async () => {
     await withTempDir(async (dir) => {
       const statePath = await writeState(dir, {
         workspaceId: 'rw_test',
         lastReconcileAt: new Date().toISOString(),
-        // no pid: relayfile start --background does not always record one
+        // no pid: a fresh reconcile is still proof of liveness
       })
 
       expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false })
     })
   })
 
-  it('uses daemon.pid for liveness when the top-level pid is absent (CLI-daemonized mount)', async () => {
+  it('uses daemon.pid for liveness when the top-level pid is absent', async () => {
     await withTempDir(async (dir) => {
       const statePath = await writeState(dir, {
         workspaceId: 'rw_test',

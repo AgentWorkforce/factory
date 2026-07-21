@@ -16,7 +16,21 @@ export const containsIssueKey = (value: string, issueKey: string): boolean => {
 
 export const containsExplicitIssueReference = (value: string, issueKey: string): boolean => {
   const parts = ISSUE_KEY_PARTS.exec(issueKey)
-  if (!parts) return containsIssueKey(value, issueKey)
+  if (!parts) {
+    if (/^\d+$/u.test(issueKey)) {
+      const number = escapeRegex(issueKey)
+      return new RegExp(
+        [
+          `#${number}(?!\\d)`,
+          `https?://github\\.com/[^\\s/]+/[^\\s/]+/issues/${number}(?!\\d)`,
+          `(?:^|\\n)\\s*(?:github\\s+)?issue\\s*:?[ \\t]*#?${number}(?!\\d)`,
+          `(?:^|\\n)\\s*(?:closes|fixes|resolves)\\s*:?[ \\t]*#?${number}(?!\\d)`,
+        ].join('|'),
+        'i',
+      ).test(value)
+    }
+    return containsIssueKey(value, issueKey)
+  }
 
   const prefix = escapeRegex(parts[1] ?? '')
   const number = escapeRegex(parts[2] ?? '')

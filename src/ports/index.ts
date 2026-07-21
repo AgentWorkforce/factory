@@ -1,19 +1,31 @@
 export type {
   ChangeEvent,
   EventPage,
+  FactoryIntegrationConnectionStatus,
+  FactoryIntegrationConnections,
+  FactoryIntegrationConnectResult,
+  FactoryIntegrationProvider,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  LocalMountOptions,
   MountClient,
   ProviderSyncStatus,
   SubscribeOptions,
   Subscription,
 } from './mount'
 export type {
+  AgentLifecycleSignal,
   AgentMessage,
   AgentPidResolution,
   AgentSpec,
   Capability,
+  NodeCapability,
+  PreviewCapability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
   FleetClient,
   RestartPolicy,
   RosterEntry,
@@ -33,3 +45,13 @@ export type {
   Logger,
   TelemetrySink,
 } from './system'
+export type {
+  FactoryEventReporter,
+  FactoryEventReportResult,
+} from './observability'
+export type {
+  AgentWorktree,
+  AgentWorktreeCleanupInspection,
+  AgentWorktreeManager,
+  AgentWorktreeRepository,
+} from './worktree'

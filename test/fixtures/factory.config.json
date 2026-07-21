@@ -10,6 +10,9 @@
     "default": "AgentWorkforce/pear"
   },
   "batchSize": 1,
+  "github": {
+    "identity": "auto"
+  },
   "mergePolicy": "never",
   "stateIds": {
     "readyForAgent": "state-ready-for-agent",

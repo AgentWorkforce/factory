@@ -1,4 +1,5 @@
 import { BatchTracker } from '../orchestrator/batch-tracker'
+import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BatchSnapshot,
   BabysitterSessionState,
@@ -8,16 +9,20 @@ import type {
   DispatchAttemptState,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
+  ConversationMessage,
+  ConversationSessionState,
   StateStore,
   WaitingClarification,
   ClarificationReply,
 } from '../ports/state'
+import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
 
 type WorkspaceState = {
   batch: BatchTracker
   criticalMessages: Map<string, CriticalRecord>
   resumedExitKeys: Set<string>
   slackThreadIds: Map<string, string>
+  conversationSessions: Map<string, ConversationSessionState>
   githubIssueCommentWatches: Map<string, GithubIssueCommentWatchState>
   seenAgentQuestionKeys: Set<string>
   seenAgentQuestionOrder: string[]
@@ -74,6 +79,10 @@ export class InMemoryStateStore implements StateStore {
   ): Promise<DispatchLifecycleClaim> {
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     let lifecycle = lifecycles.get(key)
+    if (!lifecycle) {
+      const matching = matchingGithubLifecycleEntry(lifecycles, seed)
+      if (matching) [key, lifecycle] = matching
+    }
     const created = !lifecycle
     if (!lifecycle) {
       lifecycle = cloneDispatchLifecycle(seed)
@@ -83,7 +92,7 @@ export class InMemoryStateStore implements StateStore {
     const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
     const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
     if (terminal || activeOtherOwner) {
-      return { acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
+      return { key, acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
     }
     const epoch = lifecycle.lease?.owner === owner
       ? lifecycle.lease.epoch
@@ -91,6 +100,7 @@ export class InMemoryStateStore implements StateStore {
     lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
     lifecycle.updatedAtMs = nowMs
     return {
+      key,
       acquired: true,
       lifecycle: cloneDispatchLifecycle(lifecycle),
       lease: { ...lifecycle.lease },
@@ -170,6 +180,20 @@ export class InMemoryStateStore implements StateStore {
       .map(([key, lifecycle]) => [key, cloneDispatchLifecycle(lifecycle)])
   }
 
+  async clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycle['lease'],
+  ): Promise<boolean> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    const lifecycle = lifecycles.get(key)
+    if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+      return false
+    }
+    lifecycles.delete(key)
+    return true
+  }
+
   async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
     this.#workspace(workspaceId).dispatchLifecycles.delete(key)
   }
@@ -208,6 +232,136 @@ export class InMemoryStateStore implements StateStore {
 
   async clearSlackThreads(workspaceId: string): Promise<void> {
     this.#workspace(workspaceId).slackThreadIds.clear()
+  }
+
+  async reserveConversationSession(
+    workspaceId: string,
+    conversationId: string,
+    session: ConversationSessionState,
+  ): Promise<boolean> {
+    const sessions = this.#workspace(workspaceId).conversationSessions
+    if (sessions.has(conversationId)) return false
+    sessions.set(conversationId, cloneConversationSession(session))
+    return true
+  }
+
+  async getConversationSession(
+    workspaceId: string,
+    conversationId: string,
+  ): Promise<ConversationSessionState | undefined> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    return session ? cloneConversationSession(session) : undefined
+  }
+
+  async listConversationSessions(
+    workspaceId: string,
+  ): Promise<Array<[string, ConversationSessionState]>> {
+    return [...this.#workspace(workspaceId).conversationSessions]
+      .map(([conversationId, session]) => [conversationId, cloneConversationSession(session)])
+  }
+
+  async appendConversationMessage(
+    workspaceId: string,
+    conversationId: string,
+    message: ConversationMessage,
+  ): Promise<ConversationSessionState | undefined> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session || conversationHasMessage(session, message.id)) return undefined
+    session.processedMessageIds.push(message.id)
+    session.pending.push(structuredClone(message))
+    return cloneConversationSession(session)
+  }
+
+  async claimConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    owner: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<ConversationSessionState | undefined> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session) return undefined
+    if (session.delivery && session.delivery.claimedAtMs + leaseMs > nowMs) {
+      return undefined
+    }
+    if (session.delivery) {
+      session.pending.unshift(...session.delivery.messages)
+    }
+    session.pending.sort(compareConversationMessages)
+    if (session.pending.length === 0) {
+      session.delivery = undefined
+      return undefined
+    }
+    session.delivery = {
+      claimId,
+      owner,
+      claimedAtMs: nowMs,
+      attempts: (session.delivery?.attempts ?? 0) + 1,
+      messages: session.pending.splice(0),
+      agent: {
+        name: session.agent.name,
+        sessionRef: session.agent.sessionRef,
+      },
+    }
+    return cloneConversationSession(session)
+  }
+
+  async renewConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    owner: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const delivery = this.#workspace(workspaceId).conversationSessions.get(conversationId)?.delivery
+    if (!delivery || delivery.owner !== owner || delivery.claimId !== claimId) return false
+    delivery.claimedAtMs = nowMs
+    return true
+  }
+
+  async completeConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    owner: string,
+    claimId: string,
+    agent: { name: string; sessionRef?: string },
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session?.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
+    session.history = [...session.history, ...session.delivery.messages].slice(-CONVERSATION_HISTORY_LIMIT)
+    if (
+      session.agent.name === session.delivery.agent.name &&
+      session.agent.sessionRef === session.delivery.agent.sessionRef
+    ) {
+      session.agent.name = agent.name
+      if (agent.sessionRef) session.agent.sessionRef = agent.sessionRef
+    }
+    session.delivery = undefined
+    return true
+  }
+
+  async releaseConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string): Promise<void> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session?.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return
+    session.pending.unshift(...session.delivery.messages)
+    session.pending.sort(compareConversationMessages)
+    session.delivery = undefined
+  }
+
+  async clearConversationSession(workspaceId: string, conversationId: string): Promise<void> {
+    this.#workspace(workspaceId).conversationSessions.delete(conversationId)
+  }
+
+  async rebindConversationSession(
+    workspaceId: string,
+    conversationId: string,
+    agent: ConversationSessionState['agent'],
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session) return false
+    session.agent = structuredClone(agent)
+    return true
   }
 
   async setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void> {
@@ -495,6 +649,7 @@ export class InMemoryStateStore implements StateStore {
         criticalMessages: new Map(),
         resumedExitKeys: new Set(),
         slackThreadIds: new Map(),
+        conversationSessions: new Map(),
         githubIssueCommentWatches: new Map(),
         seenAgentQuestionKeys: new Set(),
         seenAgentQuestionOrder: [],
@@ -513,6 +668,28 @@ export class InMemoryStateStore implements StateStore {
 
 const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)
 
+const dispatchLifecycleLeaseMatches = (
+  current: DispatchLifecycle['lease'],
+  expected: DispatchLifecycle['lease'],
+): boolean => current === undefined
+  ? expected === undefined
+  : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
+
+const CONVERSATION_HISTORY_LIMIT = 50
+
+const cloneConversationSession = (session: ConversationSessionState): ConversationSessionState =>
+  structuredClone(session)
+
+const conversationHasMessage = (session: ConversationSessionState, id: string): boolean =>
+  session.processedMessageIds.includes(id) ||
+  session.history.some((message) => message.id === id) ||
+  session.pending.some((message) => message.id === id) ||
+  Boolean(session.delivery?.messages.some((message) => message.id === id))
+
+const compareConversationMessages = (left: ConversationMessage, right: ConversationMessage): number =>
+  left.receivedAtMs - right.receivedAtMs ||
+  (left.providerSequence ?? left.id).localeCompare(right.providerSequence ?? right.id, undefined, { numeric: true })
+
 const activeDispatchLifecycleCount = (lifecycles: Map<string, DispatchLifecycle>, exceptKey?: string): number =>
   [...lifecycles].filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
 
@@ -521,7 +698,19 @@ const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase !== 'waiting-for-human' &&
   lifecycle.phase !== 'releasing' &&
   lifecycle.phase !== 'complete' &&
-  lifecycle.phase !== 'abandoned'
+  lifecycle.phase !== 'abandoned' &&
+  !dispatchLifecycleHandedOffToBabysitters(lifecycle)
+
+const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
+  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
+  if (implementerRepos.length === 0) return false
+  const babysitterRepos = lifecycle.agents
+    .filter((agent) => agent.tracked.spec.role === 'babysitter')
+    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
+    .filter((repo): repo is string => Boolean(repo))
+  return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
+    githubRepositoriesMatch(repo, ownedRepo)))
+}
 
 const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>
   structuredClone(record)

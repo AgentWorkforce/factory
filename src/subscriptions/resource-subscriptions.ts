@@ -1,3 +1,13 @@
+import type {
+  AcceptDurableSubscriptionDeliveryInput,
+  ClaimDurableSubscriptionDeliveriesInput,
+  CreateOrRenewDurableResourceSubscriptionInput,
+  DurableResourceSubscription,
+  DurableSubscriptionDelivery,
+  DurableSubscriptionDeliveryListResponse,
+  DurableSubscriptionDeliveryResponse,
+} from '@relayfile/sdk'
+
 /**
  * Consumer-facing contract for Relayfile's durable resource-subscription API.
  *
@@ -5,15 +15,10 @@
  * meaning of its opaque IDs and must only accept a claim after it has made the
  * corresponding wake durable on its side.
  */
-export type ResourceSubscriptionInput = {
-  provider: string
-  resourceRef: string
-  eventTypes: string[]
-  terminalEventTypes?: string[]
-  subscriberId: string
-  intent?: string
-  ttlSeconds: number
-}
+export type ResourceSubscriptionInput = Omit<
+  CreateOrRenewDurableResourceSubscriptionInput,
+  'workspaceId' | 'correlationId' | 'signal'
+>
 
 export type ResourceSubscription = {
   subscriptionId: string
@@ -55,21 +60,34 @@ export interface ResourceSubscriptionsClient {
   cancel(workspaceId: string, input: { subscriptionId: string }): Promise<void>
 }
 
+/** The canonical Relayfile SDK surface used by Factory. */
+export interface ResourceSubscriptionsSdk {
+  createOrRenewDurableResourceSubscription(
+    input: CreateOrRenewDurableResourceSubscriptionInput,
+  ): Promise<DurableResourceSubscription>
+  claimDurableSubscriptionDeliveries(
+    input: ClaimDurableSubscriptionDeliveriesInput,
+  ): Promise<DurableSubscriptionDeliveryListResponse>
+  acceptDurableSubscriptionDelivery(
+    input: AcceptDurableSubscriptionDeliveryInput,
+  ): Promise<DurableSubscriptionDeliveryResponse>
+  cancelDurableResourceSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<void>
+}
+
+export type ResourceSubscriptionsSdkClientOptions = {
+  /** Optional lifecycle cancellation forwarded through the SDK on every call. */
+  signal?: AbortSignal
+}
+
 /** The service is absent or too old; callers may retain their legacy route. */
 export class ResourceSubscriptionsUnavailableError extends Error {
   constructor(message = 'Relayfile durable resource subscriptions are unavailable') {
     super(message)
     this.name = 'ResourceSubscriptionsUnavailableError'
-  }
-}
-
-export class ResourceSubscriptionsHttpError extends Error {
-  readonly status: number
-
-  constructor(status: number, message: string) {
-    super(message)
-    this.name = 'ResourceSubscriptionsHttpError'
-    this.status = status
   }
 }
 
@@ -81,182 +99,93 @@ export const isResourceSubscriptionsUnavailable = (error: unknown): boolean => {
   return status === 404
 }
 
-export type ResourceSubscriptionsHttpClientOptions = {
-  baseUrl: string
-  tokenProvider: () => string | undefined | Promise<string | undefined>
-  fetch?: typeof fetch
-  /** Bounds an individual Relayfile API call; defaults to 15 seconds. */
-  requestTimeoutMs?: number
-  /** Optional lifecycle cancellation shared by all requests from this client. */
-  signal?: AbortSignal
-}
-
-const DEFAULT_RESOURCE_SUBSCRIPTION_REQUEST_TIMEOUT_MS = 15_000
-
 /**
- * Minimal REST adapter for Relayfile Cloud's public subscription contract.
- * The SDK can adopt these endpoints later without changing Factory's port.
+ * Adapts Factory's narrow orchestration port to Relayfile's public SDK.
+ * Authentication, request timeouts, retries, URL construction, and response
+ * transport remain owned by RelayFileClient.
  */
-export function createResourceSubscriptionsHttpClient(
-  options: ResourceSubscriptionsHttpClientOptions,
+export function createResourceSubscriptionsSdkClient(
+  sdk: ResourceSubscriptionsSdk,
+  options: ResourceSubscriptionsSdkClientOptions = {},
 ): ResourceSubscriptionsClient {
-  const requestTimeoutMs = options.requestTimeoutMs === undefined
-    ? DEFAULT_RESOURCE_SUBSCRIPTION_REQUEST_TIMEOUT_MS
-    : Math.max(1, Math.trunc(options.requestTimeoutMs))
-
-  const request = async (workspaceId: string, path: string, init: RequestInit = {}): Promise<unknown> => {
-    const token = await options.tokenProvider()
-    if (!token) throw new ResourceSubscriptionsHttpError(401, 'Relayfile workspace bearer token is unavailable')
-    const url = new URL(`/v1/workspaces/${encodeURIComponent(workspaceId)}${path}`, options.baseUrl)
-    const abort = new AbortController()
-    const forwardedSignals = [options.signal, init.signal].filter((signal): signal is AbortSignal => Boolean(signal))
-    const removeAbortListeners: Array<() => void> = []
-    for (const signal of forwardedSignals) {
-      const forwardAbort = () => abort.abort(signal.reason)
-      if (signal.aborted) forwardAbort()
-      else {
-        signal.addEventListener('abort', forwardAbort, { once: true })
-        removeAbortListeners.push(() => signal.removeEventListener('abort', forwardAbort))
-      }
-    }
-    let timedOut = false
-    const timeout = setTimeout(() => {
-      timedOut = true
-      abort.abort(new Error('Relayfile resource-subscription request timed out'))
-    }, requestTimeoutMs)
-    let response: Response
-    try {
-      response = await (options.fetch ?? fetch)(url, {
-        ...init,
-        signal: abort.signal,
-        headers: {
-          accept: 'application/json',
-          authorization: `Bearer ${token}`,
-          ...(init.body ? { 'content-type': 'application/json' } : {}),
-          ...init.headers,
-        },
-      })
-    } catch (error) {
-      if (timedOut) {
-        throw new ResourceSubscriptionsHttpError(504, `Relayfile resource-subscription request timed out after ${requestTimeoutMs}ms`)
-      }
-      throw error
-    } finally {
-      clearTimeout(timeout)
-      for (const remove of removeAbortListeners) remove()
-    }
-    if (!response.ok) {
-      if (response.status === 404) throw new ResourceSubscriptionsUnavailableError()
-      throw new ResourceSubscriptionsHttpError(response.status, `Relayfile resource-subscription request failed (${response.status})`)
-    }
-    if (response.status === 204) return undefined
-    try {
-      return await response.json()
-    } catch {
-      throw new ResourceSubscriptionsHttpError(response.status, 'Relayfile resource-subscription response was not valid JSON')
-    }
-  }
-
   return {
     async createOrRenew(workspaceId, input) {
-      const payload = await request(workspaceId, '/subscriptions', {
-        method: 'POST',
-        body: JSON.stringify(input),
+      const subscription = await sdk.createOrRenewDurableResourceSubscription({
+        workspaceId,
+        ...input,
+        signal: options.signal,
       })
-      return parseSubscription(payload)
+      return toResourceSubscription(subscription)
     },
+
     async claimDeliveryClaims(workspaceId, input) {
-      const payload = await request(workspaceId, '/subscriptions/deliveries/claim', {
-        method: 'POST',
-        body: JSON.stringify(input ?? {}),
+      const { deliveries } = await sdk.claimDurableSubscriptionDeliveries({
+        workspaceId,
+        ...(input?.limit === undefined ? {} : { limit: input.limit }),
+        signal: options.signal,
       })
-      const envelope = record(payload)
-      const deliveries = Array.isArray(payload)
-        ? payload
-        : Array.isArray(envelope?.deliveries)
-          ? envelope.deliveries
-          : undefined
-      if (!deliveries) {
-        throw new ResourceSubscriptionsHttpError(502, 'Relayfile delivery claim response was invalid')
+      if (!Array.isArray(deliveries)) {
+        throw new Error('Relayfile SDK returned an invalid durable-delivery envelope')
       }
-      return deliveries.map(parseDeliveryClaim)
+      return deliveries.map(toResourceDeliveryClaim)
     },
+
     async acceptDelivery(workspaceId, input) {
-      const payload = await request(workspaceId, `/subscriptions/deliveries/${encodeURIComponent(input.deliveryId)}/accept`, {
-        method: 'POST',
-        body: JSON.stringify({ claimToken: input.claimToken }),
+      const { delivery } = await sdk.acceptDurableSubscriptionDelivery({
+        workspaceId,
+        deliveryId: input.deliveryId,
+        claimToken: input.claimToken,
+        signal: options.signal,
       })
-      return parseAcceptedDelivery(payload)
+      if (delivery.status !== 'accepted') {
+        throw new Error(`Relayfile SDK returned delivery ${delivery.id} with non-accepted status ${delivery.status}`)
+      }
+      return {
+        deliveryId: delivery.id,
+        subscriptionId: delivery.subscriptionId,
+        terminal: delivery.terminal,
+      }
     },
+
     async cancel(workspaceId, input) {
-      await request(workspaceId, `/subscriptions/${encodeURIComponent(input.subscriptionId)}`, { method: 'DELETE' })
+      await sdk.cancelDurableResourceSubscription(
+        workspaceId,
+        input.subscriptionId,
+        { signal: options.signal },
+      )
     },
   }
 }
 
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined
+const toResourceSubscription = (
+  subscription: DurableResourceSubscription,
+): ResourceSubscription => ({
+  subscriptionId: subscription.id,
+  ownerId: subscription.ownerId,
+  subscriberId: subscription.subscriberId,
+  provider: subscription.provider,
+  resourceRef: subscription.resourceRef,
+  eventTypes: subscription.eventTypes,
+  terminalEventTypes: subscription.terminalEventTypes,
+  ...(subscription.intent ? { intent: subscription.intent } : {}),
+  expiresAt: subscription.expiresAt,
+})
 
-const string = (value: unknown, field: string): string => {
-  if (typeof value !== 'string' || !value) throw new ResourceSubscriptionsHttpError(502, `Relayfile resource-subscription response omitted ${field}`)
-  return value
-}
-
-const stringArray = (value: unknown, field: string): string[] => {
-  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
-    throw new ResourceSubscriptionsHttpError(502, `Relayfile resource-subscription response omitted ${field}`)
+const toResourceDeliveryClaim = (
+  delivery: DurableSubscriptionDelivery,
+): ResourceDeliveryClaim => {
+  if (delivery.status !== 'claimed' || !delivery.claimToken) {
+    throw new Error(`Relayfile SDK returned delivery ${delivery.id} without a live claim`)
   }
-  return value
-}
-
-const boolean = (value: unknown, field: string): boolean => {
-  if (typeof value !== 'boolean') throw new ResourceSubscriptionsHttpError(502, `Relayfile resource-subscription response omitted ${field}`)
-  return value
-}
-
-const parseSubscription = (value: unknown): ResourceSubscription => {
-  const source = record(record(value)?.subscription) ?? record(value)
-  if (!source) throw new ResourceSubscriptionsHttpError(502, 'Relayfile resource-subscription response was invalid')
   return {
-    subscriptionId: string(source.id ?? source.subscriptionId, 'subscription id'),
-    ownerId: string(source.ownerId, 'ownerId'),
-    subscriberId: string(source.subscriberId, 'subscriberId'),
-    provider: string(source.provider, 'provider'),
-    resourceRef: string(source.resourceRef, 'resourceRef'),
-    eventTypes: stringArray(source.eventTypes, 'eventTypes'),
-    ...(source.terminalEventTypes === undefined ? {} : { terminalEventTypes: stringArray(source.terminalEventTypes, 'terminalEventTypes') }),
-    ...(typeof source.intent === 'string' && source.intent ? { intent: source.intent } : {}),
-    expiresAt: string(source.expiresAt, 'expiresAt'),
-  }
-}
-
-const parseDeliveryClaim = (value: unknown): ResourceDeliveryClaim => {
-  const source = record(value)
-  if (!source) throw new ResourceSubscriptionsHttpError(502, 'Relayfile delivery claim response was invalid')
-  const event = record(source.event)
-  return {
-    deliveryId: string(source.deliveryId ?? source.id, 'deliveryId'),
-    claimToken: string(source.claimToken, 'claimToken'),
-    subscriptionId: string(source.subscriptionId, 'subscriptionId'),
-    ownerId: string(source.ownerId, 'ownerId'),
-    subscriberId: string(source.subscriberId, 'subscriberId'),
-    provider: string(source.provider, 'provider'),
-    resourceRef: string(source.resourceRef, 'resourceRef'),
-    eventType: typeof source.eventType === 'string'
-      ? source.eventType
-      : string(event?.type, 'event.type'),
-    terminal: boolean(source.terminal, 'terminal'),
-  }
-}
-
-const parseAcceptedDelivery = (value: unknown): AcceptedResourceDelivery => {
-  const source = record(record(value)?.delivery) ?? record(value)
-  if (!source) throw new ResourceSubscriptionsHttpError(502, 'Relayfile delivery acceptance response was invalid')
-  return {
-    deliveryId: string(source.deliveryId ?? source.id, 'deliveryId'),
-    subscriptionId: string(source.subscriptionId, 'subscriptionId'),
-    terminal: boolean(source.terminal, 'terminal'),
+    deliveryId: delivery.id,
+    claimToken: delivery.claimToken,
+    subscriptionId: delivery.subscriptionId,
+    ownerId: delivery.ownerId,
+    subscriberId: delivery.subscriberId,
+    provider: delivery.provider,
+    resourceRef: delivery.resourceRef,
+    eventType: delivery.event.type,
+    terminal: delivery.terminal,
   }
 }

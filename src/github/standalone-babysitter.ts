@@ -24,6 +24,7 @@ export interface StandalonePullRequest {
   headRepo?: string
   crossRepository?: boolean
   maintainerCanModify?: boolean
+  filesChanged?: string[]
   source: 'mount' | 'gh' | 'mount+gh'
 }
 
@@ -89,7 +90,7 @@ export async function readStandalonePullRequest(
       '--repo',
       target.repo,
       '--json',
-      'number,title,body,state,isDraft,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,isCrossRepository,maintainerCanModify',
+      'number,title,body,state,isDraft,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,isCrossRepository,maintainerCanModify,files',
     ])
     const parsed = parsePullRequestPayload(JSON.parse(result.stdout), target)
     if (parsed) {
@@ -215,6 +216,7 @@ function parsePullRequestPayload(
     crossRepository: booleanValue(payload.isCrossRepository)
       ?? (headRepo ? headRepo.toLowerCase() !== target.repo.toLowerCase() : undefined),
     maintainerCanModify: booleanValue(payload.maintainerCanModify) ?? booleanValue(payload.maintainer_can_modify),
+    filesChanged: changedFiles(payload.filesChanged ?? payload.files),
   }
 }
 
@@ -248,7 +250,20 @@ function mergePullMetadata(
     headRepo: live.headRepo ?? mounted.headRepo,
     crossRepository: live.crossRepository ?? mounted.crossRepository,
     maintainerCanModify: live.maintainerCanModify ?? mounted.maintainerCanModify,
+    filesChanged: live.filesChanged ?? mounted.filesChanged,
   }
+}
+
+function changedFiles(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const paths = value
+    .map((entry) => {
+      if (typeof entry === 'string') return entry
+      const file = record(entry)
+      return stringValue(file?.path) ?? stringValue(file?.filename)
+    })
+    .filter((path): path is string => Boolean(path))
+  return paths.length > 0 ? paths : undefined
 }
 
 function headRepositoryName(payload: Record<string, unknown>): string | undefined {

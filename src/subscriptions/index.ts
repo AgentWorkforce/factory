@@ -31,14 +31,24 @@ export type {
   LinearScopePredicates,
 } from './linear-filter'
 export {
+  filterSlackThreadReplySpecs,
+  isSlackMessageEventPath,
+  parseSlackThreadReply,
+  slackThreadReplyGlob,
+} from './slack-filter'
+export type {
+  SlackThreadPredicateSubscriptionSpec,
+  SlackThreadReply,
+  SlackThreadScopePredicates,
+} from './slack-filter'
+export {
   createWorkspaceScopedEventClient,
   filesystemEventToChangeEvent,
   integrationRelayFileSyncOptions,
 } from './event-client'
 export {
-  createResourceSubscriptionsHttpClient,
+  createResourceSubscriptionsSdkClient,
   isResourceSubscriptionsUnavailable,
-  ResourceSubscriptionsHttpError,
   ResourceSubscriptionsUnavailableError,
 } from './resource-subscriptions'
 export type {
@@ -47,7 +57,8 @@ export type {
   ResourceSubscription,
   ResourceSubscriptionInput,
   ResourceSubscriptionsClient,
-  ResourceSubscriptionsHttpClientOptions,
+  ResourceSubscriptionsSdk,
+  ResourceSubscriptionsSdkClientOptions,
 } from './resource-subscriptions'
 export type {
   ChangeEvent,

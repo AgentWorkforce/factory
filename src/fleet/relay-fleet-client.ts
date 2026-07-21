@@ -2,7 +2,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentMessage, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
+import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -15,6 +15,7 @@ import type {
 type AgentExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
+type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Promise<void>
 
 export interface TrackedAgent {
   invocationId?: string
@@ -40,6 +41,8 @@ export interface RelayFleetClientOptions {
   agentToken?: string
   /** Workspace agent identity the factory registers/rotates for itself. */
   agentName?: string
+  /** Stable workspace action used for durable agent lifecycle reports. */
+  lifecycleActionName?: string
   /** Engine base URL override. Absent means the SDK default (cast.agentrelay.com). */
   baseUrl?: string
   /** Timeout for a spawn/release invocation to reach a terminal ack status. */
@@ -64,10 +67,11 @@ export interface RelayFleetClientOptions {
   log?: (message: string) => void
 }
 
-const knownCapabilities = new Set<Capability>(['spawn:claude', 'spawn:codex', 'workflow:run'])
+const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'])
 const openStatuses = new Set(['pending', 'dispatched', 'invoked'])
 const terminalStatuses = new Set(['completed', 'failed', 'denied'])
 const DEFAULT_AGENT_NAME = 'factory'
+export const DEFAULT_LIFECYCLE_ACTION_NAME = 'factory.lifecycle'
 const DEFAULT_SPAWN_ACK_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
 const DEFAULT_EXIT_WATCH_INTERVAL_MS = 15_000
@@ -78,6 +82,8 @@ const DEFAULT_REGISTRATION_GRACE_MS = 60_000
 
 export class RelayFleetClient implements FleetClient {
   readonly placementLocality = 'remote' as const
+  readonly durableOwnership = true
+  readonly lifecycleActionName: string
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
   readonly #spawnAckTimeoutMs: number
@@ -92,6 +98,8 @@ export class RelayFleetClient implements FleetClient {
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
+  readonly #agentLifecycleSignalListeners = new Set<AgentLifecycleSignalListener>()
+  readonly #lifecycleInvocationsInFlight = new Set<string>()
   readonly #eventUnsubscribers: Array<() => void> = []
   readonly #tracked = new Map<string, TrackedAgent>()
   // Resolved lazily on first network use so constructing the client (and
@@ -99,6 +107,8 @@ export class RelayFleetClient implements FleetClient {
   // token is configured.
   #messaging: RelayMessaging | undefined
   #messagingReady: Promise<RelayMessaging> | undefined
+  #lifecycleActionReady: Promise<void> | undefined
+  #authenticatedAgentName: string
   #eventsStarted = false
   #disposed = false
   #watchTimer: ReturnType<typeof setInterval> | undefined
@@ -107,6 +117,8 @@ export class RelayFleetClient implements FleetClient {
   constructor(options: RelayFleetClientOptions = {}) {
     this.#options = options
     this.#agentName = options.agentName ?? DEFAULT_AGENT_NAME
+    this.#authenticatedAgentName = this.#agentName
+    this.lifecycleActionName = options.lifecycleActionName ?? DEFAULT_LIFECYCLE_ACTION_NAME
     this.#spawnAckTimeoutMs = options.spawnAckTimeoutMs ?? DEFAULT_SPAWN_ACK_TIMEOUT_MS
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     this.#exitWatchIntervalMs = options.exitWatchIntervalMs ?? DEFAULT_EXIT_WATCH_INTERVAL_MS
@@ -154,6 +166,13 @@ export class RelayFleetClient implements FleetClient {
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
     const messaging = await this.#ensureMessaging()
+    if (input.capability.startsWith('spawn:')) {
+      await this.#ensureLifecycleAction(messaging)
+      // A transient startup registration failure may have torn down the first
+      // subscription attempt. Re-arm it after the required action is durable so
+      // the invocation cannot be accepted without a live Factory consumer.
+      this.#ensureEventSubscription()
+    }
     const ack = await messaging.placement.spawn({
       capability: input.capability,
       // 'self' from the orchestrator means "no placement preference": let the
@@ -177,6 +196,7 @@ export class RelayFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }): Promise<SpawnResult> {
     const name = input.name ?? input.sessionRef
     return await this.spawn({
@@ -186,6 +206,7 @@ export class RelayFleetClient implements FleetClient {
       repo: input.repo,
       clonePath: input.clonePath,
       sessionRef: input.sessionRef,
+      task: input.task,
     })
   }
 
@@ -204,21 +225,116 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    const messaging = await this.#ensureMessaging()
+    const ack = await messaging.placement.spawn({
+      capability: 'preview:tailscale-serve',
+      ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+      repo: input.repo,
+      input: {
+        operation: 'start',
+        namespace: input.namespace,
+        owner: input.owner,
+        issueKey: input.issueKey,
+        service: input.service,
+        repo: input.repo,
+        targetPort: input.targetPort,
+        ...(input.preferredHttpsPort !== undefined ? { preferredHttpsPort: input.preferredHttpsPort } : {}),
+        startCommand: input.startCommand,
+        checkoutPath: input.checkoutPath,
+      },
+      ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+      log: this.#log,
+    })
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId)
+  }
+
+  async removePreview(preview: PreviewReference): Promise<boolean> {
+    const messaging = await this.#ensureMessaging()
+    const ack = await messaging.placement.spawn({
+      capability: 'preview:tailscale-serve',
+      ...(preview.node ? { node: preview.node } : {}),
+      input: { operation: 'remove', preview },
+      ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+      log: this.#log,
+    })
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    return asRecord(invocation.output)?.removed === true
+  }
+
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
+    const messaging = await this.#ensureMessaging()
+    const nodes = (await this.roster()).nodes.filter((node) =>
+      node.live && node.capabilities.includes('preview:tailscale-serve'),
+    )
+    const reports = await Promise.all(nodes.map(async (node): Promise<PreviewSweepResult> => {
+      try {
+        const ack = await messaging.placement.spawn({
+          capability: 'preview:tailscale-serve',
+          node: node.name,
+          input: {
+            operation: 'sweep',
+            namespace: input.namespace,
+            activeOwners: input.activeOwners,
+            ...(input.activePreviewIds ? { activePreviewIds: input.activePreviewIds } : {}),
+          },
+          ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+          log: this.#log,
+        })
+        const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+        const output = asRecord(invocation.output)
+        return {
+          reaped: Array.isArray(output?.reaped)
+            ? output.reaped.map((value) => previewReference(value, node.name)).filter((value): value is PreviewReference => Boolean(value))
+            : [],
+          skipped: Array.isArray(output?.skipped)
+            ? output.skipped.map((value) => {
+                const record = asRecord(value)
+                return {
+                  ...(readString(record, 'id') ? { id: readString(record, 'id') } : {}),
+                  reason: readString(record, 'reason') ?? 'unknown provider result',
+                  node: node.name,
+                }
+              })
+            : [],
+        }
+      } catch (error) {
+        return { reaped: [], skipped: [{ reason: errorMessage(error), node: node.name }] }
+      }
+    }))
+    return {
+      reaped: reports.flatMap((report) => report.reaped),
+      skipped: reports.flatMap((report) => report.skipped),
+    }
+  }
+
+  markAgentTerminal(name: string, _reason?: string): void {
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
+  }
+
   async roster(): Promise<RosterEntry> {
     const messaging = await this.#ensureMessaging()
-    const [agents, nodes] = await Promise.all([
-      // Roster means agents that can currently collide with a spawn. Including
-      // offline task-exit rows makes deterministic one-shot names permanently
-      // sticky and prevents a later review round from spawning a fresh worker.
-      messaging.agents.list({ status: 'online' }),
+    const [presence, agents, nodes] = await Promise.all([
+      // Presence is the SDK's canonical liveness surface. Agent-scoped list
+      // responses can omit status and normalize those rows to `unknown`, which
+      // made dead deterministic names look live and suppressed recovery.
+      messaging.agents.presence(),
+      // List data is supplemental metadata only; its status is never used to
+      // decide liveness.
+      messaging.agents.list({ status: 'all' }),
       messaging.nodes.list(),
     ])
+    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
     return {
-      agents: agents.map((agent) => {
-        const record = asRecord(agent)
-        const node = readString(record, 'node', 'node_id', 'nodeId')
-        return { name: agent.name, ...(node ? { node } : {}) }
-      }),
+      agents: presence
+        .filter((agent) => agent.status === 'online')
+        .map((agent) => {
+          const record = asRecord(agentsByName.get(agent.agentName))
+          const node = readString(record, 'node', 'node_id', 'nodeId')
+          return { name: agent.agentName, ...(node ? { node } : {}) }
+        }),
       nodes: nodes.map((node) => ({
         name: node.name,
         capabilities: normalizeCapabilities(node.capabilities),
@@ -257,6 +373,14 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  onAgentLifecycleSignal(listener: AgentLifecycleSignalListener): () => void {
+    this.#ensureEventSubscription()
+    this.#agentLifecycleSignalListeners.add(listener)
+    return () => {
+      this.#agentLifecycleSignalListeners.delete(listener)
+    }
+  }
+
   onAgentExit(listener: AgentExitListener): () => void {
     this.#ensureEventSubscription()
     this.#agentExitListeners.add(listener)
@@ -280,6 +404,8 @@ export class RelayFleetClient implements FleetClient {
     this.#agentExitListeners.clear()
     this.#deliveryFailedListeners.clear()
     this.#agentMessageListeners.clear()
+    this.#agentLifecycleSignalListeners.clear()
+    this.#lifecycleInvocationsInFlight.clear()
     this.#tracked.clear()
     if (this.#eventsStarted) {
       await this.#messaging?.events.disconnect().catch(() => {})
@@ -290,11 +416,16 @@ export class RelayFleetClient implements FleetClient {
     const messaging = await this.#ensureMessaging()
     try {
       if (input.to.startsWith('#')) {
-        return await messaging.messages.send({ channel: input.to.slice(1), text: input.text })
+        return await messaging.messages.send({
+          channel: input.to.slice(1),
+          text: input.text,
+          ...(input.mode ? { mode: input.mode } : {}),
+        })
       }
       return await messaging.messages.direct({
         to: input.to.startsWith('@') ? input.to.slice(1) : input.to,
         text: input.text,
+        ...(input.mode ? { mode: input.mode } : {}),
       })
     } catch (error) {
       // Keep the orchestrator's registration-lag retry classification working:
@@ -406,17 +537,18 @@ export class RelayFleetClient implements FleetClient {
   async #reconcileTracked(): Promise<void> {
     if (this.#tracked.size === 0) return
     const messaging = await this.#ensureMessaging()
-    const [agents, nodes] = await Promise.all([
-      messaging.agents.list({ status: 'all' }),
+    const [presence, nodes] = await Promise.all([
+      messaging.agents.presence(),
       messaging.nodes.list(),
     ])
-    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
+    const onlineAgentNames = new Set(
+      presence.filter((agent) => agent.status === 'online').map((agent) => agent.agentName),
+    )
     const nodeLive = new Map(nodes.map((node) => [node.name, node.live ?? node.status === 'online']))
     const nowMs = this.#now()
 
     for (const [name, entry] of [...this.#tracked]) {
-      const row = agentsByName.get(name)
-      if (!row || row.status === 'offline') {
+      if (!onlineAgentNames.has(name)) {
         // A just-spawned agent may not have registered with the engine yet;
         // absence only counts as an exit once the grace window has passed.
         if (nowMs - entry.spawnedAtMs < this.#registrationGraceMs) continue
@@ -454,6 +586,7 @@ export class RelayFleetClient implements FleetClient {
 
   async #subscribeEvents(): Promise<void> {
     const messaging = await this.#ensureMessaging()
+    await this.#ensureLifecycleAction(messaging)
     if (this.#disposed) return
     messaging.events.connect()
     this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))
@@ -463,7 +596,7 @@ export class RelayFleetClient implements FleetClient {
     switch (event.type) {
       case 'dmReceived':
       case 'groupDmReceived':
-        this.#emitAgentMessage(event.message, this.#agentName)
+        this.#emitAgentMessage(event.message, this.#authenticatedAgentName)
         break
       case 'messageCreated':
       case 'threadReply':
@@ -472,6 +605,11 @@ export class RelayFleetClient implements FleetClient {
       case 'agentOffline':
         this.#handleAgentOffline(event.agent.name)
         break
+      case 'actionInvoked':
+        if (event.actionName === this.lifecycleActionName) {
+          void this.#handleLifecycleInvocation(event)
+        }
+        break
       default:
         break
     }
@@ -479,7 +617,7 @@ export class RelayFleetClient implements FleetClient {
 
   #emitAgentMessage(message: RelayMessage, fallbackTarget: string): void {
     const from = message.from?.name
-    if (!from || from === this.#agentName) return
+    if (!from || from === this.#authenticatedAgentName || from === this.#agentName) return
     let target: string | undefined
     const messageTarget = message.target
     if (messageTarget?.kind === 'agent' && typeof messageTarget.agentName === 'string') {
@@ -504,6 +642,87 @@ export class RelayFleetClient implements FleetClient {
   #handleAgentOffline(name: string): void {
     if (!this.#tracked.has(name)) return
     this.#emitExit(name, 'offline')
+  }
+
+  async #ensureLifecycleAction(existingMessaging?: RelayMessaging): Promise<void> {
+    if (this.#lifecycleActionReady) return this.#lifecycleActionReady
+    this.#lifecycleActionReady = (async () => {
+      const messaging = existingMessaging ?? await this.#ensureMessaging()
+      if (!messaging.commands.available()) {
+        throw new Error('Relay lifecycle signaling requires the durable action surface')
+      }
+      const identity = await messaging.agents.me()
+      if (!identity.name?.trim()) {
+        throw new Error('Relay lifecycle signaling could not resolve the authenticated handler identity')
+      }
+      this.#authenticatedAgentName = identity.name
+      await messaging.commands.register({
+        command: this.lifecycleActionName,
+        description: 'Report a Factory task lifecycle transition without relying on a named DM recipient.',
+        handlerAgent: identity.name,
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            kind: { type: 'string', enum: ['completed', 'ready', 'blocked'] },
+            issueKey: { type: 'string' },
+            role: { type: 'string', enum: ['implementer', 'reviewer', 'babysitter', 'workflow'] },
+            question: { type: 'string' },
+          },
+          required: ['kind', 'issueKey', 'role'],
+        },
+        outputSchema: {
+          type: 'object',
+          properties: { accepted: { type: 'boolean' } },
+          required: ['accepted'],
+        },
+      })
+    })().catch((error) => {
+      this.#lifecycleActionReady = undefined
+      throw error
+    })
+    return this.#lifecycleActionReady
+  }
+
+  async #handleLifecycleInvocation(
+    event: Extract<RelayMessagingEvent, { type: 'actionInvoked' }>,
+  ): Promise<void> {
+    if (this.#lifecycleInvocationsInFlight.has(event.invocationId)) return
+    this.#lifecycleInvocationsInFlight.add(event.invocationId)
+    let messaging: RelayMessaging | undefined
+    try {
+      messaging = await this.#ensureMessaging()
+      const invocation = await messaging.commands.getInvocation(this.lifecycleActionName, event.invocationId)
+      if (terminalStatuses.has(invocation.status)) return
+      const signal = lifecycleSignalFromInvocation(
+        invocation.input,
+        invocation.callerName ?? event.callerName,
+        event.invocationId,
+      )
+      if (!signal) {
+        throw new Error(`Invalid ${this.lifecycleActionName} input for invocation ${event.invocationId}`)
+      }
+      if (this.#agentLifecycleSignalListeners.size === 0) {
+        throw new Error('Factory lifecycle handler is not active')
+      }
+      for (const listener of this.#agentLifecycleSignalListeners) {
+        await listener(signal)
+      }
+      await messaging.commands.completeInvocation(this.lifecycleActionName, event.invocationId, {
+        output: { accepted: true },
+      })
+    } catch (error) {
+      if (messaging) {
+        await messaging.commands.completeInvocation(this.lifecycleActionName, event.invocationId, {
+          error: errorMessage(error),
+        }).catch((completionError) => {
+          this.#log(`relay lifecycle invocation ${event.invocationId} failed without terminal ack: ${errorMessage(completionError)}`)
+        })
+      }
+      this.#log(`relay lifecycle invocation ${event.invocationId} rejected: ${errorMessage(error)}`)
+    } finally {
+      this.#lifecycleInvocationsInFlight.delete(event.invocationId)
+    }
   }
 }
 
@@ -554,11 +773,107 @@ function spawnResultFromInvocation(
   }
 }
 
-function normalizeCapabilities(capabilities: RelayNodeCapability[] | undefined): Capability[] {
+function lifecycleSignalFromInvocation(
+  input: Record<string, unknown> | undefined,
+  callerName: string | null | undefined,
+  invocationId: string,
+): AgentLifecycleSignal | undefined {
+  const name = callerName?.trim()
+  const kind = readString(input, 'kind')
+  const issueKey = readString(input, 'issueKey', 'issue_key')
+  const role = readString(input, 'role')
+  const question = readString(input, 'question')
+  if (
+    !name ||
+    !issueKey ||
+    !kind ||
+    !['completed', 'ready', 'blocked'].includes(kind) ||
+    !role ||
+    !['implementer', 'reviewer', 'babysitter', 'workflow'].includes(role) ||
+    (kind === 'blocked' && !question)
+  ) {
+    return undefined
+  }
+  return {
+    name,
+    kind: kind as AgentLifecycleSignal['kind'],
+    issueKey,
+    role: role as NonNullable<AgentLifecycleSignal['role']>,
+    ...(question ? { question } : {}),
+    invocationId,
+  }
+}
+
+function normalizeCapabilities(capabilities: RelayNodeCapability[] | undefined): NodeCapability[] {
   const names = (capabilities ?? [])
     .map((capability) => capability.name)
-    .filter((name): name is Capability => knownCapabilities.has(name as Capability))
+    .filter((name): name is NodeCapability => knownCapabilities.has(name as NodeCapability))
   return [...new Set(names)]
+}
+
+function previewReferenceFromInvocation(
+  invocation: RelayActionInvocation,
+  placementNode?: string,
+): PreviewReference {
+  const output = asRecord(invocation.output)
+  const preview = previewReference(output?.preview, placementNode)
+  if (!preview) throw new Error('Preview provider returned an invalid reference')
+  return preview
+}
+
+function previewReference(value: unknown, placementNode?: string): PreviewReference | undefined {
+  const record = asRecord(value)
+  const id = readString(record, 'id')
+  const namespace = readString(record, 'namespace')
+  const owner = readString(record, 'owner')
+  const service = readString(record, 'service')
+  const repo = readString(record, 'repo')
+  const url = readString(record, 'url')
+  const configuredTargetPort = readNumber(record, 'configuredTargetPort', 'configured_target_port')
+  const targetPort = readNumber(record, 'targetPort', 'target_port')
+  const httpsPort = readNumber(record, 'httpsPort', 'https_port')
+  const createdAt = readString(record, 'createdAt', 'created_at')
+  const node = readString(record, 'node') ?? placementNode
+  if (
+    !id || !namespace || !owner || !service || !repo || !url || !createdAt ||
+    targetPort === undefined || httpsPort === undefined ||
+    record?.provider !== 'tailscale-serve' || record.access !== 'tailnet' || record.lifetime !== 'issue'
+  ) return undefined
+  const startCommand = readString(record, 'startCommand', 'start_command')
+  if (!startCommand) return undefined
+  const rawProcess = asRecord(record?.process)
+  const processPid = readNumber(rawProcess, 'pid')
+  const processStartTime = readString(rawProcess, 'startTime', 'start_time')
+  const processCmdline = readString(rawProcess, 'cmdline')
+  const processCwd = readString(rawProcess, 'cwd')
+  const processMarker = readString(rawProcess, 'marker')
+  const process = processPid !== undefined && processStartTime && processCmdline && processCwd && processMarker
+    ? {
+        pid: processPid,
+        startTime: processStartTime,
+        cmdline: processCmdline,
+        cwd: processCwd,
+        marker: processMarker,
+      }
+    : undefined
+  return {
+    id,
+    provider: 'tailscale-serve',
+    namespace,
+    owner,
+    service,
+    repo,
+    url,
+    ...(configuredTargetPort !== undefined ? { configuredTargetPort } : {}),
+    targetPort,
+    httpsPort,
+    access: 'tailnet',
+    lifetime: 'issue',
+    createdAt,
+    startCommand,
+    ...(process ? { process } : {}),
+    ...(node ? { node } : {}),
+  }
 }
 
 function isUnknownRecipientError(error: unknown): boolean {

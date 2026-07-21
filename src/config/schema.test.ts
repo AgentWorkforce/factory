@@ -29,17 +29,31 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.clonePaths).toEqual({})
     expect(parsed.batchSize).toBe(5)
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
+    // Agent CLI per role defaults to today's behavior: codex implements, claude
+    // reviews/babysits — so existing configs are unaffected unless set.
+    expect(parsed.agentCapabilities).toEqual({
+      implementer: 'spawn:codex',
+      reviewer: 'spawn:claude',
+      babysitter: 'spawn:claude',
+    })
     expect(parsed.babysitter).toEqual({ enabled: false })
     expect(parsed.terminalState).toBe('human-review')
     expect(parsed.stateIds.humanReview).toBeUndefined()
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
     expect(parsed.loop.maxConsecutiveFailures).toBe(3)
+    expect(parsed.reporting).toEqual({
+      enabled: true,
+      batchSize: 100,
+      requestTimeoutMs: 15_000,
+    })
+    expect(parsed.github).toEqual({ identity: 'auto' })
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',
       botUserId: 'U0B2596R7EZ',
       stakeholderUserIds: [],
       staleAfterMs: 10 * 60_000,
+      conversationCoalesceMs: 750,
     })
     expect(parsed.mergePolicy).toBe('never')
     // No hardcoded state defaults: omitted stateIds resolve to {} and are filled
@@ -86,6 +100,57 @@ describe('FactoryConfigSchema', () => {
     })
   })
 
+  it('bounds the Slack conversation coalescing window', () => {
+    expect(FactoryConfigSchema.parse({ repos: {}, slack: { channel: 'C123', conversationCoalesceMs: 0 } })
+      .slack?.conversationCoalesceMs).toBe(0)
+    expect(() => FactoryConfigSchema.parse({
+      repos: {}, slack: { channel: 'C123', conversationCoalesceMs: -1 },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {}, slack: { channel: 'C123', conversationCoalesceMs: 60_001 },
+    })).toThrow()
+  })
+
+  it('trims and validates an explicit reporting instance name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: '  Oslo Factory  ' },
+    })
+
+    expect(parsed.reporting.instanceName).toBe('Oslo Factory')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: '   ' },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      reporting: { instanceName: 'x'.repeat(257) },
+    })).toThrow()
+  })
+
+  it('honors an explicit per-role agent CLI override and rejects unwired capabilities', () => {
+    const parsed = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      // Swap the implementer CLI to claude to route around a codex-specific
+      // failure; reviewer/babysitter fall back to their defaults.
+      agentCapabilities: { implementer: 'spawn:claude' },
+    })
+
+    expect(parsed.agentCapabilities).toEqual({
+      implementer: 'spawn:claude',
+      reviewer: 'spawn:claude',
+      babysitter: 'spawn:claude',
+    })
+
+    // spawn:opencode / spawn:gemini have no capabilityCli mapping yet, so the
+    // schema refuses them rather than resolving to an undefined CLI at spawn.
+    expect(() => FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/pear' },
+      agentCapabilities: { implementer: 'spawn:opencode' },
+    })).toThrow()
+  })
+
   it('honors explicit babysitter, terminalState, and humanReview config', () => {
     const parsed = FactoryConfigSchema.parse({
       workspaceId: 'ws_123',
@@ -121,6 +186,22 @@ describe('FactoryConfigSchema', () => {
 
     expect(auto.issueSource).toBeUndefined()
     expect(github.issueSource).toBe('github')
+  })
+
+  it.each(['app', 'user', 'auto'] as const)('accepts github.identity %s', (identity) => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      github: { identity },
+    })
+
+    expect(parsed.github.identity).toBe(identity)
+  })
+
+  it('rejects an unsupported GitHub PR identity', () => {
+    expect(() => FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      github: { identity: 'installation-owner' },
+    })).toThrow()
   })
 
   it('parses dynamic per-team Linear state name mappings', () => {
@@ -166,6 +247,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.subscription.labels).toEqual(['pear', 'cloud', 'agentswarm'])
     expect(parsed.repos.default).toBe('pear')
     expect(parsed.repos.org).toBe('AgentWorkforce')
+    expect(parsed.repos.names).toEqual(['pear', 'cloud', 'agentswarm'])
   })
 
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {
@@ -249,6 +331,48 @@ describe('FactoryConfigSchema', () => {
     expect(loaded.factoryConfig.repos.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
     expect(loaded.nodeConfig.cloneRoot).toBe(join(homedir(), 'Projects/AgentWorkforce'))
     expect(loaded.nodeConfig.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
+  })
+
+  it('merges split preview services and enforces a tailnet-only provider', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        preview: {
+          services: { factory: { port: 3_000, portSpan: 25, startCommand: 'npm run dev' } },
+        },
+      },
+      nodeConfig: {
+        preview: {
+          services: { pear: { port: 4_173, startCommand: 'npm run dev' } },
+          registryPath: '~/.factory/test-previews.json',
+        },
+      },
+    })
+
+    expect(loaded.factoryConfig.preview).toEqual({
+      provider: 'tailscale-serve',
+      access: 'tailnet',
+      services: {
+        factory: { port: 3_000, portSpan: 25, startCommand: 'npm run dev' },
+        pear: { port: 4_173, startCommand: 'npm run dev' },
+      },
+      tailscaleBinary: 'tailscale',
+      registryPath: join(homedir(), '.factory/test-previews.json'),
+      httpsPortRange: [10_000, 10_999],
+    })
+    expect(loaded.nodeConfig.preview).toEqual(loaded.factoryConfig.preview)
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { provider: 'tailscale-funnel', access: 'public', services: {} },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { services: {}, httpsPortRange: [11_000, 10_000] },
+    })).toThrow('preview.httpsPortRange start must be less than or equal to end')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { services: { factory: { port: 65_500, startCommand: 'npm run dev' } } },
+    })).toThrow('preview service port range must end at or below 65535')
   })
 
   it('does not rewrite embedded tildes', () => {

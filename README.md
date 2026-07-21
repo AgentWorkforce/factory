@@ -57,8 +57,12 @@ From a source checkout instead of an npm install, run
 
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
-   open pull requests; a local `gh` installation or `gh auth login` is not a
-   prerequisite.
+   open pull requests by default. A local `gh` installation and `gh auth login`
+   are required only when `github.identity` selects the user path (or for the
+   existing GitHub issue lifecycle writeback described below). If a required
+   connection is missing, an interactive Factory command offers to open the
+   Relayfile connection flow and waits for it to finish. Linear-backed operations
+   require both Linear and GitHub; GitHub-native operations require GitHub.
 
 2. **Write a minimal config** (`factory.config.json`). Only `workspaceId` and a
    repo route are required:
@@ -79,8 +83,10 @@ From a source checkout instead of an npm install, run
    somewhere to make changes.
 
    For a GitHub-only workspace, add `"issueSource": "github"` (or omit it and
-   Factory will select GitHub automatically when `/linear/issues` is not
-   connected). An open issue carrying the configured `safety.requireLabel`
+   Factory will select GitHub when Relayfile authoritatively reports that Linear
+   is not connected). Connection errors and connected-but-still-syncing states
+   stop the command instead of silently selecting the wrong source. An open
+   issue carrying the configured `safety.requireLabel`
    label—`factory` by default—is then dispatched directly, with lifecycle
    updates written back as GitHub comments and `factory:in-progress` /
    `factory:human-review` labels. No Linear mirror is created.
@@ -118,15 +124,80 @@ From a source checkout instead of an npm install, run
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
+| `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
 backend reuses a relay broker that's already running for your workspace, and
 starts one if none is. For self-started brokers, the agent-exit timeout defaults
-to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`.
+to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`. Set
+`FACTORY_LOG_LEVEL=debug` to include per-checkout details for summarized local
+mount refreshes.
+
+Integration connection prompts only run for commands that need provider data or
+GitHub write access. Maintenance commands such as `status`, `loop-status`,
+`kill-loop`, and `reap-orphans` do not preflight connections. `--dry-run`, the
+intrinsically read-only canary, and non-interactive invocations never open an
+OAuth flow; when a required integration is missing they exit with an actionable
+instruction to rerun the Factory command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+### Feature-map validation
+
+Repositories with `.agentworkforce/features/manifest.yaml` can run
+`factory featuremap check` in CI. The command rejects malformed or duplicate
+entries, invalid verification tiers, catalog-summary drift, locations that do
+not exist, and incomplete v1.1 category-to-procedure routing. The same checker
+is published as `@agent-relay/factory/featuremap` for programmatic use.
+
+During review, pass the PR base ref with `--base <ref>`. A changed file named by
+an existing manifest entry produces an advisory when that entry's description,
+verification tier, and locations are unchanged. The reviewer must re-confirm
+that metadata; the advisory does not itself fail the command because a covered
+file can change without changing the feature contract.
+
+Factory's agent-facing runbook is `.claude/skills/verify-features.md`. It tells
+an agent how to resolve a manifest category to its named end-to-end procedure,
+run the applicable tier with safe fixtures and cleanup, assert provider/fleet
+state, and report unexercised live tiers explicitly. The deterministic full gate
+is `npm run build && npm run featuremap:check && npm test && npm run verify:e2e`;
+`workflows/verify-features.ts` adds opt-in provider, fleet, and cloud checks.
+
+The checked-in `factory-feature-guardian` proactive persona mirrors Relay's
+guardian operating model. Hourly, it reads the catalog from a scoped Factory
+repository mount, selects one unchecked feature from exact revisioned cycle
+state, posts an idempotent Slack question, requires a provider timestamp, and
+only then checkpoints progress. Manifest/state/delivery ambiguity fails closed
+instead of silently skipping a feature. Configure its Slack channel and deploy
+the persona through the normal Agent Workforce proactive-agent path.
+
+### Cloud progress and trace correlation
+
+Authenticated Cloud progress reporting is enabled by default. Factory persists
+its bounded lifecycle events to a local outbox before delivery; set
+`reporting.enabled` to `false` only when the Cloud dashboard is intentionally
+not part of the deployment.
+
+Every run-scoped event carries the same deterministic, W3C-valid `traceId`,
+derived from the durable opaque run ID. This is a correlation identifier only:
+Factory does **not** currently create or export OpenTelemetry spans, and it does
+not invent span IDs. No task text, prompt, message, path, command, source code,
+or exception stack is used to derive the identifier or admitted by the event
+contract.
+
+The exporter follow-up should add optional OpenTelemetry SDK initialization,
+short spans around dispatch, spawn, writeback, publish, and release operations,
+and W3C context propagation across Cloud requests and remote fleet delivery.
+Persist or rehydrate the run context so replacement Factory processes keep the
+same trace; do not hold a single span open for the lifetime of a long-running
+run. Export with a batch processor through the standard OTLP environment
+contract (`OTEL_EXPORTER_OTLP_ENDPOINT`, signal-specific overrides, and headers)
+to an OpenTelemetry Collector. Keep the existing bounded attribute allowlist
+and make exporter failure non-fatal. See the official
+[OpenTelemetry JavaScript exporter guidance](https://opentelemetry.io/docs/languages/js/exporters/)
+and [W3C Trace Context specification](https://www.w3.org/TR/trace-context/).
 
 `factory babysit 10` uses `repos.default`; a full URL such as
 `factory babysit https://github.com/org/repo/pull/10` supplies the repository
@@ -173,6 +244,20 @@ title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
 open issue. Everything else is ignored. Loosen these checks deliberately —
 they're the main guardrail.
 
+To sequence issues, add one exact standalone line to the issue body or Linear
+description:
+
+```text
+Blocked by: #123, owner/other-repo#456
+```
+
+A bare number refers to the issue's routed repository. Factory parks the issue
+and posts a comment naming every open blocker; capacity queuing remains a
+separate hold reason. Closed issues and merged pull requests satisfy blockers,
+and the next discovery cycle promotes newly unblocked work. Dependency cycles
+fail closed and are reported instead of waiting indefinitely. Other prose and
+`Related:` lines are not interpreted as dependencies.
+
 > Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
 > auto-close). For real work you want to keep, use the `[factory]` prefix.
 
@@ -204,6 +289,78 @@ The definition reads its node config from `./factory.node.json` (or
 mapped repo is advertised as a `repo:<label>` tag so placement can route
 repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
 
+### Tailnet live previews
+
+Factory can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+route to a repository's local development port. Configure the same service on
+the control plane and execution node (a combined local config needs it only
+once):
+
+```json
+{
+  "preview": {
+    "provider": "tailscale-serve",
+    "access": "tailnet",
+    "services": {
+      "AgentWorkforce/pear": {
+        "port": 3000,
+        "portSpan": 25,
+        "startCommand": "npm ci && exec npm run dev"
+      }
+    }
+  }
+}
+```
+
+The node then advertises `preview:tailscale-serve`; Factory places the preview
+first and pins the issue's agents to that node. The URL is included in agent
+tasks, the Slack dispatch root, and the pull-request description. Factory uses
+Serve—not Funnel—so the URL remains inside the configured tailnet and normal
+tailnet grants/ACLs apply. Factory checks the live Serve status and refuses to
+surface a route marked as Funnel.
+
+`port` is the preferred node-local app port. Factory reserves the first free
+port in `port..port + portSpan - 1` (the span defaults to 100), places that
+allocated port in every agent task, and reserves a separate HTTPS port from
+`preview.httpsPortRange`. Keep that HTTPS range dedicated to Factory previews.
+Preview provisioning happens immediately after Factory creates the isolated
+issue worktree, before an agent has had a chance to install ignored dependencies
+such as `node_modules`. `startCommand` must therefore include any bounded,
+non-interactive bootstrap the fresh checkout needs, followed by a foreground
+development command that honors `PORT` (for example,
+`npm ci && exec npm run dev`).
+The node starts it in the issue checkout, waits for the allocated local HTTP
+port to respond, and verifies on Linux or macOS that the listener belongs to the
+supervised process tree before returning the URL. It persists an exact process
+identity so the command survives agent handoffs and can be safely recovered or
+stopped. The command must not daemonize or bind a different port. Active sweeps
+repeat listener ownership verification and disable the exact Factory route if
+the port is taken over by an unrelated process.
+For safety, preview commands receive only `PORT` plus basic shell, locale, home,
+and temporary-directory variables; they do not inherit arbitrary Factory,
+Relay, or provider credentials from the node process. Load intentional
+application settings through a checkout-local environment mechanism. Do not put
+secrets directly in `startCommand`, because lifecycle recovery persists the
+command as metadata.
+
+Terminal lifecycle completion is withheld until routes and their supervised
+commands have been removed at Human Review or Done. If the source-state
+writeback wins a crash race, startup recovery observes that terminal source
+state and finishes preview teardown before terminalizing the durable lifecycle.
+A startup and periodic sweep reaps only orphaned resources in the current
+Factory workspace whose persisted route and process identities still match.
+See the [provider evaluation](planning/preview-provider-evaluation.md)
+for the decision and lifecycle contract.
+
+To exercise the real provider lifecycle on a signed-in node, build first and
+run `TAILSCALE_BIN=/path/to/tailscale node scripts/verify-tailscale-preview-e2e.mjs`.
+The check drives the node's advertised `preview:tailscale-serve` action to start
+a detached HTTP service, reaches it through Serve, recovers it through a fresh
+node-action instance, tears it down, then proves a startup orphan sweep reaps a
+second abandoned route and process while preserving unrelated Serve
+configuration. Override its dedicated ports with
+`FACTORY_PREVIEW_E2E_HTTPS_PORT` and `FACTORY_PREVIEW_E2E_TARGET_PORT`.
+
 ### Dispatching to nodes (`--backend relay`)
 
 With `--backend relay`, the factory orchestrator dispatches work through the
@@ -222,12 +379,50 @@ process on the same control-plane host can take over after a crash. Execution
 nodes never need access to that state file, and remote PIDs are never signalled
 as local processes.
 
-The supported topology is one Factory control-plane host per workspace, with
-any number of relay execution nodes. Multiple Factory processes on that host
-are fenced through the shared `FileStateStore` lock/lease. Active/active Factory
-control planes on different hosts are intentionally unsupported: the current
-Relayfile and Relay messaging APIs do not expose a shared compare-and-set lease,
-so separate local state files cannot provide a truthful cross-host fence.
+The supported topology for the **CLI control plane** is one Factory host per
+workspace, with any number of relay execution nodes. Multiple Factory processes
+on that host are fenced through the shared `FileStateStore` lock/lease.
+Active/active CLI control planes on different hosts remain intentionally
+unsupported: separate local state files cannot provide a truthful cross-host
+fence.
+
+### Hosting the control plane in Cloud
+
+`@agent-relay/factory/hosted` is the worker-safe control-plane entrypoint. It
+contains no Node filesystem/process dependency and runs the complete sweep:
+
+```text
+reconcile invocation completions → discover ready issues → triage → dispatch
+                              → merge gate → idempotent provider writeback
+```
+
+The Cloud host supplies integration ports for discovery, fleet spawn/status,
+merge-gate evaluation, and Linear/Slack writeback. `runOnce()` polls every
+persisted invocation before discovery, so a dropped completion webhook is
+recovered by the next scheduled sweep. The same lifecycle can accept pushed
+completion events through `ingestCompletion()`.
+
+```ts
+import {
+  createHostedFactory,
+  DurableObjectHostedFactoryStateStore,
+} from '@agent-relay/factory/hosted'
+
+const state = new DurableObjectHostedFactoryStateStore(durableObjectState.storage)
+const factory = createHostedFactory(
+  { workspaceId, ownerId: isolateId, config },
+  { state, discovery, fleet, completions, mergeGate, writeback },
+)
+
+await factory.runOnce() // invoke from cron/alarm and safe webhook wakeups
+```
+
+The Durable Object adapter stores each workspace independently and performs
+lease claims plus lifecycle writes in storage transactions. Every mutation is
+checked against the current owner and monotonically increasing lease epoch; an
+expired host cannot write after takeover. Spawn invocation IDs are deterministic
+and provider writebacks carry stable idempotency keys, making recovery safe when
+an external operation succeeds just before the worker loses its lease.
 
 Tokens involved — set only the first one on the orchestrator host:
 
@@ -251,6 +446,40 @@ an invalid config fails fast with a field-level error. See
 [`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
+
+Factory PR authorship is controlled explicitly with `github.identity`:
+
+```jsonc
+{
+  "github": {
+    "identity": "app"
+  }
+}
+```
+
+- `"app"` always publishes through the connected workspace GitHub App. If that
+  write path is unavailable, Factory fails loudly and never falls back to a
+  personal account.
+- `"user"` always publishes with the account authenticated by the local `gh`
+  CLI, even when the app path is available.
+- `"auto"` is the default and preserves compatibility: prefer the app path,
+  then fall back to the local `gh` user when the app writer is unavailable.
+
+Each successful publication log includes `identity` (`app` or `user`) and the
+confirmed `author`. This setting currently controls PR creation only. GitHub
+issue comments and lifecycle status labels still use the existing local `gh`
+writeback; extending the identity policy to those operations requires a
+connected-app issue writeback surface.
+
+Authenticated Factory progress reporting is enabled by default for real CLI
+sessions. Factory sends privacy-bounded lifecycle events, worker ownership,
+heartbeats, and sanitized failure categories to the active Cloud workspace; it
+never sends task text, prompts, agent output, source code, local paths, command
+lines, tokens, or raw stack traces. Delivery uses a private disk outbox and does
+not interrupt orchestration when Cloud is unavailable. Serialized event batches
+are capped at 240 KiB, below Cloud's 256 KiB ingestion limit. Set
+`reporting.enabled` to `false` to disable it, or use `reporting.outboxPath`,
+`batchSize`, and `requestTimeoutMs` to tune delivery.
 
 `cloneRoot` and every `clonePaths` value accept `~` or a leading `~/`, expanded
 against the current user's home directory. Named-user forms such as `~alice`

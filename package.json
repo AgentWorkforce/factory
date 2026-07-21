@@ -1,6 +1,6 @@
 {
   "name": "@agent-relay/factory",
-  "version": "0.1.19",
+  "version": "0.1.50",
   "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
   "license": "Apache-2.0",
   "repository": {
@@ -33,6 +33,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./observability": {
+      "types": "./dist/observability/index.d.ts",
+      "import": "./dist/observability/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
@@ -44,6 +48,14 @@
     "./node": {
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
+    },
+    "./featuremap": {
+      "types": "./dist/featuremap/index.d.ts",
+      "import": "./dist/featuremap/index.js"
+    },
+    "./hosted": {
+      "types": "./dist/hosted/index.d.ts",
+      "import": "./dist/hosted/index.js"
     }
   },
   "publishConfig": {
@@ -51,20 +63,26 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
+    "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
+    "verify:e2e": "node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
   },
   "dependencies": {
-    "@agent-relay/cloud": "^10.6.0",
-    "@agent-relay/fleet": "^10.6.0",
-    "@agent-relay/harness-driver": "^10.6.0",
-    "@agent-relay/integration-prompts": "^10.6.0",
-    "@agent-relay/sdk": "^10.6.0",
-    "@relayfile/relay-helpers": "^0.4.2",
-    "@relayfile/sdk": "^0.10.9",
+    "@agentworkforce/delivery": "^4.1.23",
+    "@agentworkforce/runtime": "^4.1.23",
+    "@agent-relay/cloud": "^10.6.4",
+    "@agent-relay/fleet": "^10.6.4",
+    "@agent-relay/harness-driver": "^10.6.4",
+    "@agent-relay/integration-prompts": "^10.6.4",
+    "@agent-relay/sdk": "^10.6.4",
+    "@relayfile/relay-helpers": "^0.4.6",
+    "@relayfile/sdk": "0.10.34",
     "@relayflows/core": "^1.0.3",
-    "agent-relay": "^10.6.0",
+    "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",
+    "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "overrides": {
@@ -76,6 +94,7 @@
     "@types/proper-lockfile": "^4.1.4",
     "esbuild": "^0.28.1",
     "tsc-alias": "^1.8.17",
+    "tsx": "4.23.1",
     "typescript": "^5.7.0",
     "vitest": "^4.1.8"
   }

@@ -1,8 +1,10 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
-import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
+import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
+import type { FactoryEventReporter } from './ports/observability'
+import type { AgentWorktreeManager } from './ports/worktree'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
@@ -26,13 +28,31 @@ export interface FactoryPorts {
   probePrResolver?: ProbePrResolver
   probePrGhRunner?: GhRunner
   logger?: Logger
+  /** Optional durable, no-throw progress reporter for the authenticated Cloud dashboard. */
+  reporter?: FactoryEventReporter
   clock?: Clock
   processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
   processFinder?: AgentProcessFinder
   kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readChildPids?: (pid: number) => Promise<number[]>
   terminationGraceMs?: number
+  /**
+   * How long a babysitter wake may keep failing with a registration-lag
+   * (target-unreachable) error before the tight retry loop escalates once and
+   * backs off. Test-only override of the built-in default.
+   */
+  babysitterWakeUnreachableEscalateMs?: number
+  /** Slow retry cadence applied after an unreachable babysitter escalation. Test-only override. */
+  babysitterWakeUnreachableRetryMs?: number
+  /**
+   * Maximum wall-clock time a live daemon waits for startup-reconciled agent
+   * exits before it continues ready-issue discovery. The exit work remains
+   * active in the background. Test-only override of the built-in default.
+   */
+  startupAgentExitDrainTimeoutMs?: number
   relayflows?: FactoryRelayflowDispatchPort
+  /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
+  worktrees?: AgentWorktreeManager
 }
 
 export interface FactoryRelayflowDispatchPort extends Omit<DispatchRelayflowOptions, 'cwd'> {
@@ -159,12 +179,24 @@ export interface DispatchResult {
   agents: Array<{ name: string; role: AgentSpec['role'] }>
   comments?: string[]
   stateId?: string
+  previews?: PreviewReference[]
   dryRun: boolean
+  hold?: {
+    kind: 'capacity' | 'dependency' | 'dependency-cycle'
+    blockers?: string[]
+    cycle?: string[]
+  }
 }
 
 export interface FactoryStatus {
   inFlight: IssueRef[]
   queued: IssueRef[]
+  parked?: Array<{
+    issue: IssueRef
+    blockers: string[]
+    cycle?: string[]
+    capacityBlocked: boolean
+  }>
   counters: Record<string, number>
   slackDegraded?: boolean
   slackDegradedReason?: string
@@ -217,7 +249,15 @@ export interface PrSummary {
   filesChanged?: string[]
 }
 
-export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'> & { draft?: boolean }
+export type ProbePrRef = Pick<CloseProbePrInput, 'repo' | 'prNumber'> & {
+  draft?: boolean
+  headRef?: string
+  headRepo?: string
+  crossRepository?: boolean
+  state?: string
+  url?: string
+  path?: string
+}
 
 export type ProbePrResolver = (issue: LinearIssue) => Promise<ProbePrRef | undefined>
 

@@ -1,39 +1,12 @@
-import { EventEmitter } from 'node:events'
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ensureLocalMount } from './local-mount-preflight'
-import { resolveRelayfileCli } from './relayfile-binary'
-
-const spawnMock = vi.hoisted(() => vi.fn())
-
-vi.mock('node:child_process', () => ({
-  spawn: spawnMock,
-}))
-
-// Default the CLI resolver OFF so the existing tests exercise the raw-binary
-// path deterministically (a real `relayfile` on PATH would otherwise be picked).
-// CLI-path tests opt in by overriding this mock.
-vi.mock('./relayfile-binary', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./relayfile-binary')>()
-  return { ...actual, resolveRelayfileCli: vi.fn(() => undefined) }
-})
-
-const resolveCliMock = vi.mocked(resolveRelayfileCli)
-
-const originalRelayfileMountBin = process.env.RELAYFILE_MOUNT_BIN
 
 afterEach(() => {
-  if (originalRelayfileMountBin === undefined) {
-    delete process.env.RELAYFILE_MOUNT_BIN
-  } else {
-    process.env.RELAYFILE_MOUNT_BIN = originalRelayfileMountBin
-  }
-  spawnMock.mockReset()
-  resolveCliMock.mockReset()
-  resolveCliMock.mockReturnValue(undefined)
+  vi.restoreAllMocks()
 })
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -45,238 +18,189 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-async function installFakeBinary(dir: string): Promise<void> {
-  const binary = join(dir, 'relayfile-mount')
-  await writeFile(binary, '#!/bin/sh\n', 'utf8')
-  await chmod(binary, 0o755)
-  process.env.RELAYFILE_MOUNT_BIN = binary
-}
-
-function mockSuccessfulSpawn(onClose?: () => Promise<void>): void {
-  spawnMock.mockImplementation(() => {
-    const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter }
-    child.stderr = new EventEmitter()
-    setTimeout(() => {
-      void Promise.resolve(onClose?.()).then(() => child.emit('close', 0), () => child.emit('close', 1))
-    }, 0)
-    return child
-  })
+async function writeMountState(
+  dir: string,
+  state: { workspaceId: string; lastReconcileAt: string; pid?: number; daemon?: { pid: number } },
+): Promise<void> {
+  const stateDir = join(dir, '.integrations', '.relay')
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(join(stateDir, 'state.json'), JSON.stringify(state), 'utf8')
 }
 
 describe('ensureLocalMount', () => {
-  it('waits for a well-formed state file after spawning the mount', async () => {
+  it('starts through the injected SDK mount path and waits for a valid state file', async () => {
     await withTempDir(async (dir) => {
-      await installFakeBinary(dir)
-      const stateDir = join(dir, '.integrations', '.relay')
-      const statePath = join(stateDir, 'state.json')
-      mockSuccessfulSpawn(async () => {
-        await mkdir(stateDir, { recursive: true })
-        await writeFile(statePath, JSON.stringify({
+      const startMount = vi.fn(async () => {
+        await writeMountState(dir, {
           workspaceId: 'rw_test',
           lastReconcileAt: new Date().toISOString(),
           pid: process.pid,
-        }), 'utf8')
+        })
       })
 
       await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
         stateWaitTimeoutMs: 100,
         stateWaitPollMs: 1,
       })).resolves.toBeUndefined()
-      expect(spawnMock).toHaveBeenCalledWith(process.env.RELAYFILE_MOUNT_BIN, [
-        'start',
-        'rw_test',
-        '.integrations',
-        '--background',
-        '--rehome',
-      ], {
-        cwd: dir,
-        stdio: ['ignore', 'ignore', 'pipe'],
-      })
+      expect(startMount).toHaveBeenCalledTimes(1)
     })
   })
 
-  it('auto-refreshes a stale mount by re-spawning so writebacks propagate', async () => {
+  it('accepts a fresh SDK mount state that intentionally omits a daemon pid', async () => {
     await withTempDir(async (dir) => {
-      await installFakeBinary(dir)
-      const stateDir = join(dir, '.integrations', '.relay')
-      const statePath = join(stateDir, 'state.json')
-      await mkdir(stateDir, { recursive: true })
-      // stale: last reconcile well past the staleness threshold.
-      await writeFile(statePath, JSON.stringify({
+      const startMount = vi.fn(async () => {
+        await writeMountState(dir, {
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+        })
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+      expect(startMount).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('accepts the cloud UUID alias emitted by an SDK mount session', async () => {
+    await withTempDir(async (dir) => {
+      const startMount = vi.fn(async () => {
+        await writeMountState(dir, {
+          workspaceId: 'cloud-uuid',
+          lastReconcileAt: new Date().toISOString(),
+          daemon: { pid: process.pid },
+        })
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
+        acceptableWorkspaceIds: ['cloud-uuid'],
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+    })
+  })
+
+  it('auto-refreshes a stale mount through the SDK callback', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountState(dir, {
         workspaceId: 'rw_test',
         lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
         pid: process.pid,
-      }), 'utf8')
-      mockSuccessfulSpawn(async () => {
-        await writeFile(statePath, JSON.stringify({
+      })
+      const startMount = vi.fn(async () => {
+        await writeMountState(dir, {
           workspaceId: 'rw_test',
           lastReconcileAt: new Date().toISOString(),
           pid: process.pid,
-        }), 'utf8')
+        })
       })
 
       await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
         stateWaitTimeoutMs: 100,
         stateWaitPollMs: 1,
       })).resolves.toBeUndefined()
-      expect(spawnMock).toHaveBeenCalled()
+      expect(startMount).toHaveBeenCalledTimes(1)
     })
   })
 
-  it('warns without re-spawning a stale mount when refreshStaleMount is false', async () => {
+  it('can suppress routine stale-refresh progress for caller-level summaries', async () => {
     await withTempDir(async (dir) => {
-      await installFakeBinary(dir)
-      const stateDir = join(dir, '.integrations', '.relay')
-      await mkdir(stateDir, { recursive: true })
-      await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+      await writeMountState(dir, {
         workspaceId: 'rw_test',
         lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
         pid: process.pid,
-      }), 'utf8')
-      mockSuccessfulSpawn()
-
-      await expect(ensureLocalMount('rw_test', dir, { refreshStaleMount: false })).resolves.toBeUndefined()
-      expect(spawnMock).not.toHaveBeenCalled()
-    })
-  })
-
-  it('prefers the relayfile CLI when available: stop then start, no token plumbing', async () => {
-    await withTempDir(async (dir) => {
-      const cli = join(dir, 'relayfile')
-      await writeFile(cli, '#!/bin/sh\n', 'utf8')
-      await chmod(cli, 0o755)
-      resolveCliMock.mockReturnValue(cli)
-      const stateDir = join(dir, '.integrations', '.relay')
-      const statePath = join(stateDir, 'state.json')
-
-      // stop -> exit 0 (no state); start -> writes a fresh state then exit 0.
-      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
-        const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter }
-        child.stderr = new EventEmitter()
-        const isStart = args[0] === 'start'
-        setTimeout(() => {
-          const finish = async (): Promise<void> => {
-            if (isStart) {
-              await mkdir(stateDir, { recursive: true })
-              await writeFile(statePath, JSON.stringify({
-                workspaceId: 'rw_test',
-                lastReconcileAt: new Date().toISOString(),
-                pid: process.pid,
-              }), 'utf8')
-            }
-          }
-          void finish().then(() => child.emit('close', 0), () => child.emit('close', 1))
-        }, 0)
-        return child
       })
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
       await expect(ensureLocalMount('rw_test', dir, {
+        startMount: async () => writeMountState(dir, {
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+          pid: process.pid,
+        }),
+        suppressStaleRefreshLogs: true,
         stateWaitTimeoutMs: 100,
         stateWaitPollMs: 1,
       })).resolves.toBeUndefined()
 
-      // raw relayfile-mount binary must NOT be used when the CLI is present.
-      expect(spawnMock).toHaveBeenCalledWith(cli, ['stop'], expect.objectContaining({ cwd: dir }))
-      expect(spawnMock).toHaveBeenCalledWith(
-        cli,
-        ['start', 'rw_test', '.integrations', '--background'],
-        expect.objectContaining({ cwd: dir }),
-      )
-      // no --rehome (that's a raw-binary flag) and no RELAYFILE_MOUNT_BIN reliance.
-      const startCall = spawnMock.mock.calls.find((c) => c[1]?.[0] === 'start')
-      expect(startCall?.[1]).not.toContain('--rehome')
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount is stale'))
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount refreshed'))
     })
   })
 
-  it('tolerates a failing best-effort stop and still starts via the CLI', async () => {
+  it('does not report a stale state file as refreshed when the SDK start leaves it unchanged', async () => {
     await withTempDir(async (dir) => {
-      const cli = join(dir, 'relayfile')
-      await writeFile(cli, '#!/bin/sh\n', 'utf8')
-      await chmod(cli, 0o755)
-      resolveCliMock.mockReturnValue(cli)
-      const stateDir = join(dir, '.integrations', '.relay')
-      const statePath = join(stateDir, 'state.json')
-
-      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
-        const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter }
-        child.stderr = new EventEmitter()
-        const isStart = args[0] === 'start'
-        setTimeout(() => {
-          if (!isStart) {
-            // stop fails (nothing mounted) — must be swallowed.
-            child.stderr.emit('data', Buffer.from('no mount running'))
-            child.emit('close', 1)
-            return
-          }
-          void mkdir(stateDir, { recursive: true })
-            .then(() => writeFile(statePath, JSON.stringify({
-              workspaceId: 'rw_test',
-              lastReconcileAt: new Date().toISOString(),
-              pid: process.pid,
-            }), 'utf8'))
-            .then(() => child.emit('close', 0), () => child.emit('close', 1))
-        }, 0)
-        return child
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
       })
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
       await expect(ensureLocalMount('rw_test', dir, {
-        stateWaitTimeoutMs: 100,
+        startMount: vi.fn(async () => {}),
+        stateWaitTimeoutMs: 5,
         stateWaitPollMs: 1,
       })).resolves.toBeUndefined()
-      expect(spawnMock).toHaveBeenCalledWith(
-        cli,
-        ['start', 'rw_test', '.integrations', '--background'],
-        expect.objectContaining({ cwd: dir }),
-      )
+
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('auto-refresh failed'))
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount refreshed'))
     })
   })
 
-  it('confirms a CLI mount that records its pid under daemon.pid (not top-level pid)', async () => {
+  it('does not restart a healthy existing mount', async () => {
     await withTempDir(async (dir) => {
-      const cli = join(dir, 'relayfile')
-      await writeFile(cli, '#!/bin/sh\n', 'utf8')
-      await chmod(cli, 0o755)
-      resolveCliMock.mockReturnValue(cli)
-      const stateDir = join(dir, '.integrations', '.relay')
-      const statePath = join(stateDir, 'state.json')
-
-      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
-        const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter }
-        child.stderr = new EventEmitter()
-        const isStart = args[0] === 'start'
-        setTimeout(() => {
-          const finish = async (): Promise<void> => {
-            if (isStart) {
-              await mkdir(stateDir, { recursive: true })
-              // CLI-daemonized mount: pid lives under daemon.pid, no top-level pid.
-              await writeFile(statePath, JSON.stringify({
-                workspaceId: 'rw_test',
-                lastReconcileAt: new Date().toISOString(),
-                daemon: { pid: process.pid },
-              }), 'utf8')
-            }
-          }
-          void finish().then(() => child.emit('close', 0), () => child.emit('close', 1))
-        }, 0)
-        return child
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
       })
+      const startMount = vi.fn(async () => {})
 
-      await expect(ensureLocalMount('rw_test', dir, {
-        stateWaitTimeoutMs: 100,
-        stateWaitPollMs: 1,
-      })).resolves.toBeUndefined()
+      await expect(ensureLocalMount('rw_test', dir, { startMount })).resolves.toBeUndefined()
+      expect(startMount).not.toHaveBeenCalled()
     })
   })
 
-  it('rejects a malformed state file instead of silently continuing', async () => {
+  it('does not restart a fresh pidless existing mount', async () => {
     await withTempDir(async (dir) => {
-      await installFakeBinary(dir)
-      const stateDir = join(dir, '.integrations', '.relay')
-      await mkdir(stateDir, { recursive: true })
-      await writeFile(join(stateDir, 'state.json'), '{not-json', 'utf8')
-      mockSuccessfulSpawn()
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+      })
+      const startMount = vi.fn(async () => {})
+
+      await expect(ensureLocalMount('rw_test', dir, { startMount })).resolves.toBeUndefined()
+      expect(startMount).not.toHaveBeenCalled()
+    })
+  })
+
+  it('warns without restarting a stale mount when refreshStaleMount is false', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      })
+      const startMount = vi.fn(async () => {})
 
       await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
+        refreshStaleMount: false,
+      })).resolves.toBeUndefined()
+      expect(startMount).not.toHaveBeenCalled()
+    })
+  })
+
+  it('rejects when the SDK start returns without materializing mount state', async () => {
+    await withTempDir(async (dir) => {
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount: vi.fn(async () => {}),
         stateWaitTimeoutMs: 5,
         stateWaitPollMs: 1,
       })).rejects.toThrow(/relayfile mount did not become ready/u)

@@ -4,7 +4,7 @@ export * from './webhook/index.js'
 export * from './state/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
 export type { FileStateStoreOptions } from './state/file-state-store.js'
-export type { FactoryConfig, FactoryStateRole } from './config/schema'
+export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export {
   resolveFactoryStates,
@@ -34,6 +34,7 @@ export type {
   TemplateIssue,
   TemplateRoute,
 } from './dispatch/templates'
+export * from './featuremap/index'
 export {
   createRelayflowPolicyRegistry,
   dispatchRelayflowForChangeEvent,
@@ -76,8 +77,18 @@ export {
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
+export {
+  ensureFactoryIntegrations,
+  inspectFactoryIntegration,
+  openIntegrationUrl,
+} from './mount/relayfile-integration-preflight'
+export type {
+  FactoryIntegrationObservation,
+  FactoryIntegrationPreflightIO,
+} from './mount/relayfile-integration-preflight'
 export type {
   ActiveWorkspaceResolver,
+  LocalMountHealthEvent,
   RelayFileClientLike,
   RelayfileCloudMountClientConfig,
   ResolvedFactoryWorkspace,
@@ -118,18 +129,30 @@ export {
   checkFactoryLoopLiveness,
   createFactory,
   FactoryLoop,
+  dependencyIdentity,
+  findDependencyCycle,
   issueKey,
   isDispatchableIssue,
   isRealLinearIssue,
   githubIssuePathParts,
   parseGithubFactoryIssue,
+  parseBlockedBy,
   parseLinearIssue,
   readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
   reapFactoryOrphansOnce,
 } from './orchestrator'
-export type { InFlightIssue, QueuedIssue, TrackedAgent } from './orchestrator'
+export type {
+  DeclaredDependency,
+  DependencyAdmission,
+  DependencyBlocker,
+  InFlightIssue,
+  ParkedIssue,
+  QueuedIssue,
+  ResolvedDependency,
+  TrackedAgent,
+} from './orchestrator'
 export {
   HeuristicTriage,
   LlmTriage,
@@ -142,12 +165,15 @@ export type {
 } from './triage'
 export {
   GhCliGithubWriteback,
+  FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
   MountGithubRead,
   MountLinearWriteback,
   MountSlackWriteback,
+  publishFactoryMountHealth,
 } from './writeback'
 export type {
+  FactoryMountHealthRecord,
   GhCliGithubWritebackConfig,
   LinearCommentPayload,
   LinearCreateIssuePayload,
@@ -166,6 +192,13 @@ export {
   resolveFactoryNodeConfigPath,
   runRelayflowsWorkflow,
 } from './node/factory-node'
+export { TailscalePreviewManager } from './node/tailscale-preview'
+export type {
+  PreviewCommandRunner,
+  PreviewPortProbe,
+  PreviewManager,
+  TailscalePreviewManagerOptions,
+} from './node/tailscale-preview'
 export type {
   FactoryNodeDefinitionOptions,
   FactoryNodeInventoryAgent,
@@ -185,25 +218,28 @@ export type {
 } from './safety/factory-scope'
 export {
   canonicalMountPaths,
-  createResourceSubscriptionsHttpClient,
+  createResourceSubscriptionsSdkClient,
   createWorkspaceScopedEventClient,
   deliveryTargetsFor,
   eventPathGlobsForIntegration,
   filesystemEventToChangeEvent,
   filterLinearPredicateSpecs,
+  filterSlackThreadReplySpecs,
   globMatchesPath,
   globSegmentMatches,
   hasLinearPredicates,
   integrationRelayFileSyncOptions,
   isLinearIssueEventPath,
+  isSlackMessageEventPath,
   linearIssueMatchesPredicates,
   linearRecordCandidates,
   linearScopePredicates,
   normalizeChangePath,
   relayfileSdkPathFiltersFor,
-  ResourceSubscriptionsHttpError,
   ResourceSubscriptionsUnavailableError,
   isResourceSubscriptionsUnavailable,
+  parseSlackThreadReply,
+  slackThreadReplyGlob,
   slackListenDms,
   subscriptionSpecsFor,
 } from './subscriptions'
@@ -215,6 +251,9 @@ export type {
   LinearPredicateSubscriptionSpec,
   LinearScopePredicates,
   LocalMountRoot,
+  SlackThreadPredicateSubscriptionSpec,
+  SlackThreadReply,
+  SlackThreadScopePredicates,
   RelayfileEventClient,
   RelayFileSyncFactory,
   RelayFileSyncLike,
@@ -230,16 +269,28 @@ export type {
   ResourceSubscription,
   ResourceSubscriptionInput,
   ResourceSubscriptionsClient,
-  ResourceSubscriptionsHttpClientOptions,
+  ResourceSubscriptionsSdk,
+  ResourceSubscriptionsSdkClientOptions,
 } from './subscriptions'
 export type {
   Capability,
+  NodeCapability,
+  PreviewCapability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
   ChangeEvent,
   Clock,
   EventPage,
   GithubConnectionWrite,
+  FactoryIntegrationConnectionStatus,
+  FactoryIntegrationConnections,
+  FactoryIntegrationConnectResult,
+  FactoryIntegrationProvider,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  LocalMountOptions,
   MountClient,
   ProviderSyncStatus,
   SubscribeOptions,
@@ -258,7 +309,51 @@ export type {
   Logger,
   SlackWriteback,
   TelemetrySink,
+  FactoryEventReporter,
+  FactoryEventReportResult,
 } from './ports'
+export {
+  FACTORY_CLOUD_EVENT_CONTRACT_V1,
+  FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE,
+  FACTORY_CLOUD_EVENT_MAX_PAYLOAD_BYTES,
+  FACTORY_CLOUD_EVENT_TYPES,
+  FACTORY_CLOUD_CANCELLATION_REASONS_V1,
+  FACTORY_CLOUD_RELEASE_REASONS_V1,
+  FactoryCloudEventAttributesV1Schema,
+  FactoryCloudEventBatchV1Schema,
+  FactoryCloudEventInputV1Schema,
+  FactoryCloudEventV1Schema,
+  FactoryCloudInstanceV1Schema,
+  FactoryCloudSpanIdV1Schema,
+  FactoryCloudTraceIdV1Schema,
+  createFactoryCloudEventV1,
+  factoryCloudReleaseReasonV1,
+  factoryRunTraceIdV1,
+  isCriticalFactoryCloudEvent,
+} from './observability/events'
+export { FileFactoryCloudEventOutbox } from './observability/outbox'
+export type {
+  FactoryCloudEventEnqueueResult,
+  FactoryCloudEventOutbox,
+  FactoryCloudEventOutboxStats,
+  FileFactoryCloudEventOutboxOptions,
+} from './observability/outbox'
+export { FactoryCloudReporter } from './observability/cloud-reporter'
+export type {
+  FactoryCloudAccessTokenProvider,
+  FactoryCloudReporterOptions,
+} from './observability/cloud-reporter'
+export type {
+  CreateFactoryCloudEventV1Options,
+  FactoryCloudCancellationReasonV1,
+  FactoryCloudEventAttributesV1,
+  FactoryCloudEventBatchV1,
+  FactoryCloudEventInputV1,
+  FactoryCloudEventType,
+  FactoryCloudEventV1,
+  FactoryCloudInstanceV1,
+  FactoryCloudReleaseReasonV1,
+} from './observability/events'
 export type {
   DispatchResult,
   Factory,
@@ -286,3 +381,55 @@ export type {
   TriageDecision,
   TriageEngine,
 } from './types'
+export {
+  LOAD_EVIDENCE_CONTRACT,
+  LoadMeasurementsSchema,
+  evaluateLoadSlo,
+  parseK6LoadMeasurements,
+  runLoad,
+  serializeLoadEvidence,
+} from './environments/load-harness'
+export type {
+  KubernetesLoadJobClient,
+  LatencyHistogramBucket,
+  LoadEnvironment,
+  LoadEvidence,
+  LoadMeasurements,
+  LoadProfile,
+  LoadResult,
+  LoadSloEvaluation,
+  LoadSloMetric,
+  LoadSloViolation,
+  LoadThresholds,
+  RunLoadOptions,
+} from './environments/load-harness'
+export {
+  LoadProfileSchema,
+  LoadTargetSchema,
+  LoadThresholdsSchema,
+  durationToMilliseconds,
+  loadLoadProfile,
+} from './environments/load-profile'
+export type {
+  LoadTarget,
+  ResolvedLoadProfile,
+  ResolvedLoadTargetProfile,
+} from './environments/load-profile'
+export {
+  DEFAULT_K6_IMAGE,
+  K6_EVIDENCE_PREFIX,
+  KubectlLoadJobClient,
+  createK6LoadJobResources,
+  defaultKubectlCommandRunner,
+  k6ScenarioFor,
+  renderK6Script,
+  resolveLoadTargets,
+} from './environments/k6-job'
+export type {
+  CreateK6LoadJobOptions,
+  K6LoadJobResources,
+  KubectlCommandResult,
+  KubectlCommandRunner,
+  KubectlLoadJobClientOptions,
+  ResolvedLoadTarget,
+} from './environments/k6-job'

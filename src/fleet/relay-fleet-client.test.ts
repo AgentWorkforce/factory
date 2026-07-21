@@ -25,24 +25,38 @@ function relayMessage(overrides: Partial<RelayMessage> & { text: string }): Rela
 class FakeMessaging {
   readonly placements: RelaySpawnPlacementInput[] = []
   readonly invokes: Array<{ name: string; input?: Record<string, unknown> }> = []
-  readonly directs: Array<{ to: string; text: string }> = []
-  readonly channelSends: Array<{ channel: string; text: string }> = []
+  readonly directs: Array<{ to: string; text: string; mode?: 'wait' | 'steer' }> = []
+  readonly channelSends: Array<{ channel: string; text: string; mode?: 'wait' | 'steer' }> = []
+  readonly commandRegistrations: Array<{ command: string; handlerAgent: string }> = []
+  readonly completedInvocations: Array<{ name: string; invocationId: string; data: Record<string, unknown> }> = []
   readonly handlers = new Map<string, Set<EventHandler>>()
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
-  agentRows: Array<{ name: string; status?: string }> = []
+  agentRows: Array<{ name: string; status?: string; node?: string }> = []
+  agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
   directError: Error | undefined
   connected = 0
   disconnected = 0
   nextInvocationId = 0
   readonly agentListFilters: unknown[] = []
+  agentPresenceCalls = 0
+  meName = 'relay-controller'
 
   readonly agents = {
     list: async (filter: unknown) => {
       this.agentListFilters.push(filter)
       return this.agentRows as never[]
     },
+    presence: async () => {
+      this.agentPresenceCalls += 1
+      return this.agentPresenceRows ?? this.agentRows.map((agent, index) => ({
+        agentId: `agent-${index}`,
+        agentName: agent.name,
+        status: agent.status === 'online' ? 'online' as const : 'offline' as const,
+      }))
+    },
+    me: async () => ({ name: this.meName }),
   }
 
   readonly nodes = {
@@ -50,11 +64,11 @@ class FakeMessaging {
   }
 
   readonly messages = {
-    send: async (input: { channel: string; text: string }) => {
+    send: async (input: { channel: string; text: string; mode?: 'wait' | 'steer' }) => {
       this.channelSends.push(input)
       return relayMessage({ id: `sent-${this.channelSends.length}`, text: input.text, from: { name: 'factory' } })
     },
-    direct: async (input: { to: string; text: string }) => {
+    direct: async (input: { to: string; text: string; mode?: 'wait' | 'steer' }) => {
       if (this.directError) throw this.directError
       this.directs.push(input)
       return relayMessage({ id: `dm-${this.directs.length}`, text: input.text, from: { name: 'factory' } })
@@ -62,6 +76,11 @@ class FakeMessaging {
   }
 
   readonly commands = {
+    available: () => true,
+    register: async (input: { command: string; handlerAgent: string }) => {
+      this.commandRegistrations.push(input)
+      return input
+    },
     invoke: async (name: string, input?: Record<string, unknown>): Promise<RelayActionInvocationAck> => {
       this.invokes.push({ name, input })
       const invocationId = `inv-${++this.nextInvocationId}`
@@ -71,6 +90,10 @@ class FakeMessaging {
       const queue = this.invocations.get(invocationId)
       const next = queue?.shift()
       return next ?? { invocationId, actionName: name, status: 'completed', output: {} }
+    },
+    completeInvocation: async (name: string, invocationId: string, data: Record<string, unknown>) => {
+      this.completedInvocations.push({ name, invocationId, data })
+      return { invocationId, actionName: name, status: data.error ? 'failed' : 'completed' }
     },
   }
 
@@ -201,17 +224,155 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.repo).toBe('AgentWorkforce/factory')
   })
 
+  it('creates and removes previews on the owning node', async () => {
+    const messaging = new FakeMessaging()
+    const preview = {
+      id: 'preview-1',
+      provider: 'tailscale-serve',
+      namespace: 'factory-test',
+      owner: 'AR-129:uuid:/linear/issues/129',
+      service: 'factory',
+      repo: 'AgentWorkforce/factory',
+      url: 'https://mac-mini.tailnet.ts.net:10129/',
+      targetPort: 3_000,
+      httpsPort: 10_129,
+      access: 'tailnet',
+      lifetime: 'issue',
+      createdAt: '2026-07-20T12:00:00.000Z',
+      startCommand: 'npm run dev',
+      process: {
+        pid: 12_345,
+        startTime: 'started-12345',
+        cmdline: 'factory-preview preview-1',
+        cwd: '/work/factory',
+        marker: 'factory-preview-1',
+      },
+    }
+    messaging.placementAck = { invocationId: 'preview-start', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-start', [{
+      invocationId: 'preview-start',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: { preview },
+    }])
+    const fleet = createClient(messaging)
+
+    const reference = await fleet.createPreview({
+      namespace: preview.namespace,
+      owner: preview.owner,
+      issueKey: 'AR-129',
+      service: preview.service,
+      repo: preview.repo,
+      targetPort: preview.targetPort,
+      preferredHttpsPort: preview.httpsPort,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
+      node: 'self',
+    })
+
+    expect(reference).toEqual({ ...preview, node: 'mac-mini' })
+    expect(messaging.placements[0]).toMatchObject({
+      capability: 'preview:tailscale-serve',
+      repo: preview.repo,
+      input: {
+        operation: 'start',
+        namespace: preview.namespace,
+        owner: preview.owner,
+        issueKey: 'AR-129',
+        service: preview.service,
+        repo: preview.repo,
+        targetPort: preview.targetPort,
+        preferredHttpsPort: preview.httpsPort,
+        startCommand: preview.startCommand,
+        checkoutPath: '/work/factory',
+      },
+    })
+    expect(messaging.placements[0]).not.toHaveProperty('node')
+
+    messaging.placementAck = { invocationId: 'preview-remove', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-remove', [{
+      invocationId: 'preview-remove',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: { removed: true },
+    }])
+    await expect(fleet.removePreview(reference)).resolves.toBe(true)
+    expect(messaging.placements[1]).toMatchObject({
+      capability: 'preview:tailscale-serve',
+      node: 'mac-mini',
+      input: { operation: 'remove', preview: reference },
+    })
+  })
+
+  it('sweeps previews on every live preview-capable node', async () => {
+    const messaging = new FakeMessaging()
+    messaging.nodeRows = [{
+      name: 'mac-mini',
+      live: true,
+      capabilities: [{ name: 'preview:tailscale-serve' }],
+    }, {
+      name: 'offline-mini',
+      live: false,
+      capabilities: [{ name: 'preview:tailscale-serve' }],
+    }]
+    messaging.placementAck = { invocationId: 'preview-sweep', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-sweep', [{
+      invocationId: 'preview-sweep',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: {
+        reaped: [{
+          id: 'preview-orphan',
+          provider: 'tailscale-serve',
+          namespace: 'factory-test',
+          owner: 'owner-orphan',
+          service: 'factory',
+          repo: 'AgentWorkforce/factory',
+          url: 'https://mac-mini.tailnet.ts.net:10129/',
+          targetPort: 3_000,
+          httpsPort: 10_129,
+          access: 'tailnet',
+          lifetime: 'issue',
+          createdAt: '2026-07-20T12:00:00.000Z',
+          startCommand: 'npm run dev',
+        }],
+        skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch' }],
+      },
+    }])
+    const fleet = createClient(messaging)
+
+    await expect(fleet.reapPreviews({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+    })).resolves.toMatchObject({
+      reaped: [{ id: 'preview-orphan', node: 'mac-mini' }],
+      skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch', node: 'mac-mini' }],
+    })
+    expect(messaging.placements).toEqual([expect.objectContaining({
+      capability: 'preview:tailscale-serve',
+      node: 'mac-mini',
+      input: { operation: 'sweep', namespace: 'factory-test', activeOwners: ['owner-active'] },
+    })])
+  })
+
   it('maps resume onto a placement spawn with session_ref', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
 
-    await fleet.resume({ name: 'ar-3-impl', sessionRef: 'session-3', node: 'origin-node', capability: 'spawn:claude' })
+    await fleet.resume({
+      name: 'ar-3-impl',
+      sessionRef: 'session-3',
+      node: 'origin-node',
+      capability: 'spawn:claude',
+      task: 'Continue with the durable human answer.',
+    })
 
     expect(messaging.placements[0]).toMatchObject({ capability: 'spawn:claude', node: 'origin-node' })
     expect(messaging.placements[0]?.input).toMatchObject({
       name: 'ar-3-impl',
       agent: 'ar-3-impl',
       session_ref: 'session-3',
+      task: 'Continue with the durable human answer.',
       spawn_mode: 'task_exit',
       exit_after_task: true,
     })
@@ -265,36 +426,48 @@ describe('RelayFleetClient', () => {
 
   it('returns the relay agent and node roster', async () => {
     const messaging = new FakeMessaging()
-    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    // An agent-scoped list can leak status-less rows normalized as `unknown`.
+    // Canonical presence must be the sole liveness authority.
+    messaging.agentRows = [
+      { name: 'ar-1-impl', status: 'unknown', node: 'alpha' },
+      { name: 'ar-stale-impl', status: 'offline' },
+      { name: 'ar-registering-review', status: 'unknown', node: 'beta' },
+    ]
+    messaging.agentPresenceRows = [
+      { agentId: 'agent-1', agentName: 'ar-1-impl', status: 'online' },
+      { agentId: 'agent-2', agentName: 'ar-stale-impl', status: 'offline' },
+      { agentId: 'agent-3', agentName: 'ar-registering-review', status: 'offline' },
+    ]
     messaging.nodeRows = [
       {
         name: 'alpha',
         status: 'online',
-        capabilities: [{ name: 'spawn:claude' }, { name: 'workflow:run' }, { name: 'unknown:cap' }],
+        capabilities: [{ name: 'spawn:claude' }, { name: 'workflow:run' }, { name: 'preview:tailscale-serve' }, { name: 'unknown:cap' }],
       },
       { name: 'beta', status: 'offline', live: false, capabilities: [{ name: 'spawn:codex' }] },
     ]
     const fleet = createClient(messaging)
 
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }],
+      agents: [{ name: 'ar-1-impl', node: 'alpha' }],
       nodes: [
-        { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run'], live: true },
+        { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run', 'preview:tailscale-serve'], live: true },
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
       ],
     })
-    expect(messaging.agentListFilters).toEqual([{ status: 'online' }])
+    expect(messaging.agentListFilters).toEqual([{ status: 'all' }])
+    expect(messaging.agentPresenceCalls).toBe(1)
   })
 
   it('sends DMs and channel messages through the agent-scoped surface', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
 
-    await fleet.sendMessage({ to: 'ar-1-impl', text: 'hello' })
-    await fleet.sendMessage({ to: '#wf-factory', text: 'update' })
+    await fleet.sendMessage({ to: 'ar-1-impl', text: 'hello', mode: 'wait' })
+    await fleet.sendMessage({ to: '#wf-factory', text: 'update', mode: 'steer' })
 
-    expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello' }])
-    expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update' }])
+    expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello', mode: 'wait' }])
+    expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update', mode: 'steer' }])
   })
 
   it('confirms injected tasks with the sent message id', async () => {
@@ -358,6 +531,52 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
   })
 
+  it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {
+    const messaging = new FakeMessaging()
+    messaging.meName = 'relay-controller-7'
+    messaging.agentRows = [{ name: 'ar-17-impl', status: 'online' }]
+    messaging.invocations.set('lifecycle-17', [{
+      invocationId: 'lifecycle-17',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-17-impl',
+      status: 'invoked',
+      input: { kind: 'completed', issueKey: 'AR-17', role: 'implementer' },
+    }])
+    const fleet = createClient(messaging)
+    const signals: unknown[] = []
+    fleet.onAgentLifecycleSignal?.((signal) => { signals.push(signal) })
+    await fleet.spawn({ name: 'ar-17-impl', capability: 'spawn:codex' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'actionInvoked',
+      invocationId: 'lifecycle-17',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-17-impl',
+      handlerAgentId: 'controller-id',
+    })
+
+    await vi.waitFor(() => expect(messaging.completedInvocations).toHaveLength(1))
+    expect(messaging.commandRegistrations).toEqual([
+      expect.objectContaining({ command: 'factory.lifecycle', handlerAgent: 'relay-controller-7' }),
+    ])
+    expect(messaging.agentRows.map((agent) => agent.name)).not.toEqual(expect.arrayContaining(['factory', 'broker']))
+    expect(signals).toEqual([{
+      name: 'ar-17-impl',
+      kind: 'completed',
+      issueKey: 'AR-17',
+      role: 'implementer',
+      invocationId: 'lifecycle-17',
+    }])
+    expect(messaging.completedInvocations).toEqual([{
+      name: 'factory.lifecycle',
+      invocationId: 'lifecycle-17',
+      data: { output: { accepted: true } },
+    }])
+    expect(messaging.directs).toEqual([])
+    expect(messaging.channelSends).toEqual([])
+  })
+
   it('hydrates tracked agents for restart recovery', () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
@@ -365,6 +584,20 @@ describe('RelayFleetClient', () => {
     fleet.hydrateTracked([{ name: 'ar-9-impl', invocationId: 'inv-9', node: 'mac-mini' }])
 
     expect(fleet.trackedAgents().get('ar-9-impl')).toMatchObject({ invocationId: 'inv-9', node: 'mac-mini' })
+  })
+
+  it('forgets a terminal tracked agent before an intentional replacement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([{ name: 'ar-9-babysit', invocationId: 'inv-9' }])
+
+    fleet.markAgentTerminal('ar-9-babysit', 'babysitter-unreachable')
+    await fleet.reconcileTrackedAgents()
+
+    expect(fleet.trackedAgents().has('ar-9-babysit')).toBe(false)
+    expect(exits).toEqual([])
   })
 
   it('synthesizes exits for tracked agents that left the roster after the registration grace', async () => {

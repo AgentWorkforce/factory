@@ -1,4 +1,5 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
+import { AgentRelay } from '@agent-relay/sdk'
 import { accessSync, constants } from 'node:fs'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
@@ -6,9 +7,11 @@ import { dirname, join } from 'node:path'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
-import type { AgentMessage, AgentPidResolution, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { PreviewConfig } from '../config/schema'
+import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
+import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
 
 const requireForResolve = createRequire(import.meta.url)
@@ -23,7 +26,7 @@ export interface HarnessDriverClientLike {
   readonly brokerPid?: number
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
-  listAgents(): Promise<Array<Pick<ListAgent, 'name'> & { pid?: number }>>
+  listAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>>
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }>
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
@@ -47,9 +50,16 @@ export interface InternalFleetClientOptions {
   cwd?: string
   connectionPath?: string
   workspaceKey?: string
+  /** Canonical cloud liveness lookup. Injected by tests; derived from workspaceKey in production. */
+  listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
+  /** Local process-liveness probe used to preserve workers that intentionally run without Relay MCP presence. */
+  isProcessAlive?: (pid: number) => boolean
+  now?: () => number
   resumeCapability?: Capability
   logger?: Logger
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
+  previewConfig?: PreviewConfig
+  previewManager?: PreviewManager
 }
 
 type AgentExitListener = (name: string, reason?: string) => void
@@ -75,11 +85,6 @@ export const capabilityCli: Record<Capability, string> = {
   'workflow:run': 'relayflows',
 }
 
-const selfNode: RosterEntry['nodes'][number] = {
-  name: 'self',
-  capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'],
-  live: true,
-}
 const PID_RESOLVE_ATTEMPTS = 3
 const PID_RESOLVE_BACKOFF_MS = 75
 const READY_RESEND_DELAY_MS = 1_000
@@ -93,18 +98,24 @@ const OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 30 * 60 * 1_000
 // broker still falls through to the caller's warn-and-continue path quickly.
 const RELEASE_RETRY_MAX_ATTEMPTS = 3
 const RELEASE_RETRY_BACKOFF_MS = 250
+const CANONICAL_PRESENCE_REGISTRATION_GRACE_MS = 60_000
 
 export class InternalFleetClient implements FleetClient {
   readonly placementLocality = 'local' as const
+  readonly durableOwnership = true
   readonly #client: HarnessDriverClientLike
   #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number
   readonly #cwd?: string
   readonly #connectionPath?: string
   readonly #workspaceKey?: string
+  readonly #listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
+  readonly #isProcessAlive: (pid: number) => boolean
+  readonly #now: () => number
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
   readonly #resolveAgentRelayMcpCommand: () => AgentRelayMcpCommand | undefined
+  readonly #previewManager?: PreviewManager
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
@@ -115,12 +126,15 @@ export class InternalFleetClient implements FleetClient {
   readonly #activeInjectedWaits = new Set<PendingInjectedWait>()
   readonly #injectedEventIds: string[] = []
   readonly #injectedEventIdSet = new Set<string>()
+  readonly #injectedByAgent = new Map<string, { sequence: number; eventId: string }>()
   readonly #failedDeliveries = new Map<string, Error>()
   readonly #failedDeliveryIds: string[] = []
   readonly #exitedAgentNames = new Set<string>()
   readonly #agentExitSequences = new Map<string, number>()
   readonly #readyAgentNames = new Set<string>()
   readonly #activeSpawnedAgentNames = new Set<string>()
+  readonly #locallySpawnedAtMs = new Map<string, number>()
+  readonly #tracked = new Map<string, FleetTrackedAgent>()
   readonly #activeAgentsDrainedListeners = new Set<() => void>()
   #suppressedDuplicateEvents = 0
   #suppressedDuplicateAgentExits = 0
@@ -133,9 +147,22 @@ export class InternalFleetClient implements FleetClient {
     this.#cwd = options.cwd
     this.#connectionPath = options.connectionPath
     this.#workspaceKey = options.workspaceKey
+    if (options.listCanonicalOnlineAgentNames) {
+      this.#listCanonicalOnlineAgentNames = options.listCanonicalOnlineAgentNames
+    } else if (options.workspaceKey) {
+      const presence = new AgentRelay({ workspaceKey: options.workspaceKey }).messaging.agents
+      this.#listCanonicalOnlineAgentNames = async () => (await presence.presence())
+        .filter((agent) => agent.status === 'online')
+        .map((agent) => agent.agentName)
+    }
+    this.#now = options.now ?? Date.now
+    this.#isProcessAlive = options.isProcessAlive ?? isProcessAlive
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger ? normalizeLogger(options.logger) : undefined
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
+    this.#previewManager = options.previewManager ?? (options.previewConfig
+      ? new TailscalePreviewManager({ config: options.previewConfig })
+      : undefined)
     this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
     this.#ownsBroker = options.ownsBroker ?? false
     this.#ownedBrokerAgentExitTimeoutMs = options.ownedBrokerAgentExitTimeoutMs ?? OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS
@@ -162,6 +189,7 @@ export class InternalFleetClient implements FleetClient {
       exitAfterTask: true,
     })
     const exitSequenceAtSpawnStart = this.#trackAgentStart(input.name)
+    this.#tracked.set(input.name, { invocationId: input.invocationId })
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -186,6 +214,7 @@ export class InternalFleetClient implements FleetClient {
     capability?: Capability
     repo?: string
     clonePath?: string
+    task?: string
   }): Promise<SpawnResult> {
     assertSelfNode(input.node)
     this.#ensureEventSubscription()
@@ -195,11 +224,13 @@ export class InternalFleetClient implements FleetClient {
       name: input.name ?? input.sessionRef,
       // followups [fleet→W6]: W6 owns resume-vs-respawn and passes the per-agent capability.
       cli: capabilityCli[input.capability ?? this.#resumeCapability],
-      cwd: this.#cwd,
+      cwd: input.clonePath ?? this.#cwd,
       continueFrom: input.sessionRef,
+      task: input.task,
     })
     const requestedName = input.name ?? input.sessionRef
     const exitSequenceAtSpawnStart = this.#trackAgentStart(requestedName)
+    this.#tracked.set(requestedName, {})
     let handle: SpawnedHandleLike
     try {
       handle = await this.#client.spawnPty(spawnInput)
@@ -255,7 +286,6 @@ export class InternalFleetClient implements FleetClient {
     for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
         await this.#client.release(name, reason)
-        return
       } catch (error) {
         if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS || !isRetryableReleaseError(error)) {
           throw error
@@ -267,15 +297,109 @@ export class InternalFleetClient implements FleetClient {
           error,
         })
         await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
+        continue
       }
+
+      // A successful HTTP acknowledgement is not sufficient proof that the
+      // broker name is reusable. Under concurrent startup reconciliation the
+      // worker can disappear while a stale inventory row remains, making an
+      // immediate same-name resume fail with `agent already exists`. Verify the
+      // raw Harness Driver inventory and repeat the public release until the
+      // broker itself no longer advertises the name.
+      let retained: boolean
+      try {
+        const agents = await this.#client.listAgents()
+        if (!Array.isArray(agents)) {
+          throw new TypeError('Expected Harness Driver listAgents() to return an array')
+        }
+        retained = agents.some((agent) => agent?.name === name)
+      } catch (error) {
+        if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS) throw error
+        this.#logger?.warn?.('[factory-sdk] unable to verify released broker name; retrying release', {
+          name,
+          attempt,
+          maxAttempts: RELEASE_RETRY_MAX_ATTEMPTS,
+          error,
+        })
+        await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
+        continue
+      }
+      if (!retained) return
+
+      const retainedError = Object.assign(
+        new Error(`Broker still reports agent ${name} after a successful release acknowledgement`),
+        { code: 'release_not_observed', retryable: true },
+      )
+      if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS) throw retainedError
+      this.#logger?.warn?.('[factory-sdk] released broker name is still present; retrying release', {
+        name,
+        attempt,
+        maxAttempts: RELEASE_RETRY_MAX_ATTEMPTS,
+        error: retainedError,
+      })
+      await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
     }
   }
 
   async roster(): Promise<RosterEntry> {
-    const agents = await this.#client.listAgents()
+    const agents = await this.#listLiveAgents()
     return {
       agents: agents.map((agent) => ({ name: agent.name })),
-      nodes: [selfNode],
+      nodes: [{
+        name: 'self',
+        capabilities: [
+          'spawn:claude',
+          'spawn:codex',
+          'workflow:run',
+          ...(this.#previewManager ? ['preview:tailscale-serve' as const] : []),
+        ],
+        live: true,
+      }],
+    }
+  }
+
+  async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    assertSelfNode(input.node)
+    if (!this.#previewManager) throw new Error('Tailscale preview provider is not configured')
+    return await this.#previewManager.start(input)
+  }
+
+  async removePreview(preview: PreviewReference): Promise<boolean> {
+    if (!this.#previewManager) throw new Error('Tailscale preview provider is not configured')
+    return await this.#previewManager.remove(preview)
+  }
+
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
+    if (!this.#previewManager) return { reaped: [], skipped: [] }
+    return await this.#previewManager.sweep(input)
+  }
+
+  trackedAgents(): ReadonlyMap<string, FleetTrackedAgent> {
+    return this.#tracked
+  }
+
+  hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
+    this.#ensureEventSubscription()
+    for (const agent of agents) {
+      if (this.#tracked.has(agent.name)) continue
+      this.#clearAgentExitLatch(agent.name)
+      this.#tracked.set(agent.name, {
+        invocationId: agent.invocationId,
+        node: agent.node,
+      })
+      this.#activeSpawnedAgentNames.add(agent.name)
+    }
+  }
+
+  async reconcileTrackedAgents(): Promise<void> {
+    this.#ensureEventSubscription()
+    const online = new Set((await this.#listLiveAgents()).map((agent) => agent.name))
+    for (const name of [...this.#tracked.keys()]) {
+      if (online.has(name)) continue
+      this.#emitAgentExit(name, 'reconciled-missing', {
+        key: `reconciled-missing:${name}`,
+        hasStableId: true,
+      })
     }
   }
 
@@ -332,12 +456,17 @@ export class InternalFleetClient implements FleetClient {
   async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }> {
     this.#ensureEventSubscription()
     const targetWasReady = this.#readyAgentNames.has(input.to)
+    const injectedSequenceAtSendStart = this.#injectedByAgent.get(input.to)?.sequence ?? 0
     const result = await this.#client.sendMessage(messageInputFrom(input))
     const eventId = result.event_id
     const targets = result.targets ?? []
 
     if (this.#injectedEventIdSet.has(eventId)) {
       return { eventId, targets }
+    }
+    const injectedDuringSend = this.#injectedByAgent.get(input.to)
+    if (injectedDuringSend && injectedDuringSend.sequence > injectedSequenceAtSendStart) {
+      return { eventId: injectedDuringSend.eventId, targets }
     }
 
     return await new Promise((resolve, reject) => {
@@ -458,6 +587,9 @@ export class InternalFleetClient implements FleetClient {
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
     this.#readyAgentNames.clear()
+    this.#tracked.clear()
+    this.#activeSpawnedAgentNames.clear()
+    this.#locallySpawnedAtMs.clear()
     // If we started the broker, shut it down so the process can exit cleanly
     // (a spawned broker's owner-lease renewal otherwise keeps the event loop
     // alive). A reused broker is only disconnected — never shut down — so we
@@ -569,6 +701,13 @@ export class InternalFleetClient implements FleetClient {
 
   #resolveInjected(eventId: string, name?: string): void {
     rememberRecent(eventId, this.#injectedEventIds, this.#injectedEventIdSet)
+    if (name) {
+      const previous = this.#injectedByAgent.get(name)
+      this.#injectedByAgent.set(name, {
+        sequence: (previous?.sequence ?? 0) + 1,
+        eventId,
+      })
+    }
 
     const pending = this.#pendingInjected.get(eventId)
     if (pending) {
@@ -763,6 +902,7 @@ export class InternalFleetClient implements FleetClient {
     const exitSequenceAtStart = this.#agentExitSequence
     this.#clearAgentExitLatch(name)
     this.#activeSpawnedAgentNames.add(name)
+    this.#locallySpawnedAtMs.set(name, this.#now())
     return exitSequenceAtStart
   }
 
@@ -770,6 +910,10 @@ export class InternalFleetClient implements FleetClient {
     if (requestedName === actualName) return
 
     this.#activeSpawnedAgentNames.delete(requestedName)
+    const locallySpawnedAtMs = this.#locallySpawnedAtMs.get(requestedName)
+    this.#locallySpawnedAtMs.delete(requestedName)
+    const tracked = this.#tracked.get(requestedName)
+    this.#tracked.delete(requestedName)
     const actualExitSequence = this.#agentExitSequences.get(actualName) ?? 0
     const exitedDuringSpawn = this.#exitedAgentNames.has(actualName) && actualExitSequence > exitSequenceAtSpawnStart
     if (!exitedDuringSpawn) {
@@ -777,13 +921,42 @@ export class InternalFleetClient implements FleetClient {
       // lifetime of the broker-returned name and must not suppress tracking.
       this.#clearAgentExitLatch(actualName)
       this.#activeSpawnedAgentNames.add(actualName)
+      if (locallySpawnedAtMs !== undefined) this.#locallySpawnedAtMs.set(actualName, locallySpawnedAtMs)
+      if (tracked) this.#tracked.set(actualName, tracked)
     }
     this.#notifyIfActiveAgentsDrained()
   }
 
   #trackAgentExit(name: string): void {
+    this.#tracked.delete(name)
+    this.#locallySpawnedAtMs.delete(name)
     if (!this.#activeSpawnedAgentNames.delete(name)) return
     this.#notifyIfActiveAgentsDrained()
+  }
+
+  async #listLiveAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>> {
+    if (!this.#listCanonicalOnlineAgentNames) return this.#client.listAgents()
+
+    const [agents, canonicalOnlineAgentNames] = await Promise.all([
+      this.#client.listAgents(),
+      this.#listCanonicalOnlineAgentNames(),
+    ])
+    const online = new Set(canonicalOnlineAgentNames)
+    const nowMs = this.#now()
+    return agents.filter((agent) => {
+      if (online.has(agent.name)) return true
+      const spawnedAtMs = this.#locallySpawnedAtMs.get(agent.name)
+      if (spawnedAtMs !== undefined && nowMs - spawnedAtMs < CANONICAL_PRESENCE_REGISTRATION_GRACE_MS) {
+        return true
+      }
+      // Relayflows and custom CLIs do not register through the Relay MCP
+      // harness. Codex/Claude can also intentionally use the supported
+      // no-MCP fallback when that command is unavailable. Preserve any such
+      // worker while its broker-reported process is actually alive; only dead
+      // MCP-capable rows are safe to classify as historical inventory.
+      if (agent.cli !== 'codex' && agent.cli !== 'claude') return true
+      return agent.pid !== undefined && this.#isProcessAlive(agent.pid)
+    })
   }
 
   #notifyIfActiveAgentsDrained(): void {
@@ -873,6 +1046,15 @@ function connectionPathForCwd(cwd: string | undefined): string | undefined {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return !(error instanceof Error && 'code' in error && error.code === 'ESRCH')
+  }
+}
 
 function isRetryableReleaseError(error: unknown): boolean {
   // HarnessDriverProtocolError carries a first-class `retryable` flag. Duck-type
@@ -1043,6 +1225,7 @@ function messageInputFrom(input: SendInput): SendMessageInput {
     text: input.text,
     from: input.from,
     data: input.data,
+    ...(input.mode ? { mode: input.mode } : {}),
   }
 }
 

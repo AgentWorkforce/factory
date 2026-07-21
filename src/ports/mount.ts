@@ -31,6 +31,18 @@ export interface ProviderSyncStatus {
   webhookHealthy?: boolean
 }
 
+export interface LocalMountOptions {
+  /** Alternate identifiers for the same workspace as recorded by the mount. */
+  acceptableWorkspaceIds?: readonly string[]
+  /** Refresh a stale mount instead of returning a warning. Defaults to true. */
+  refreshStaleMount?: boolean
+  /** Suppress routine stale-refresh progress lines so a caller can summarize them. */
+  suppressStaleRefreshLogs?: boolean
+  /** Optional readiness controls for constrained environments and tests. */
+  stateWaitTimeoutMs?: number
+  stateWaitPollMs?: number
+}
+
 export interface GithubPublishPullRequestInput {
   repo: string
   /** Local checkout fallback for internal/local dispatches. */
@@ -49,6 +61,29 @@ export interface GithubPublishPullRequestResult {
   url: string
   headRef: string
   headSha?: string
+  /** Provider-confirmed login or identity label used to author the PR. */
+  author?: string
+}
+
+export type FactoryIntegrationProvider = 'github' | 'linear'
+
+export interface FactoryIntegrationConnectionStatus {
+  ready: boolean
+  state?: string
+  initialSyncState?: string
+}
+
+export interface FactoryIntegrationConnectResult {
+  alreadyConnected: boolean
+  connectLink: string | null
+  connectionId: string
+}
+
+/** Relayfile SDK control-plane surface used by the CLI connection preflight. */
+export interface FactoryIntegrationConnections {
+  getStatus(provider: FactoryIntegrationProvider): Promise<FactoryIntegrationConnectionStatus>
+  connect(provider: FactoryIntegrationProvider): Promise<FactoryIntegrationConnectResult>
+  waitForConnection(provider: FactoryIntegrationProvider, connectionId: string): Promise<void>
 }
 
 /**
@@ -70,6 +105,11 @@ export interface MountClient {
    * established local routing behaviour.
    */
   readonly resourceSubscriptions?: ResourceSubscriptionsClient
+  readonly integrationConnections?: FactoryIntegrationConnections
+  /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
+  ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
+  /** Stop SDK-owned local mount processes created by this client. */
+  dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
   deleteFile(path: string): Promise<void>
@@ -82,5 +122,9 @@ export interface MountClient {
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
   confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
+  /** Provider failure detail retained for a completed failed write, when available. */
+  getConfirmedWriteFailureReason?(path: string): Promise<string | undefined>
+  /** Provider object id returned by the acknowledged write operation, when available. */
+  getConfirmedWriteExternalId?(path: string): Promise<string | undefined>
   ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'>
 }

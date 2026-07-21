@@ -3,11 +3,22 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import type { CloseProbePrInput, Factory, FactoryPorts, createFactory } from '../index'
+import type {
+  CloseProbePrInput,
+  Factory,
+  FactoryCloudEventInputV1,
+  FactoryEventReporter,
+  FactoryIntegrationConnections,
+  FactoryIntegrationProvider,
+  FactoryPorts,
+  createFactory,
+} from '../index'
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { GithubConnectionWrite, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionWrite, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
@@ -31,6 +42,24 @@ const config = {
   },
   stateIds: TEST_STATE_IDS,
 }
+
+const fakeHarnessClient = (): HarnessDriverClientLike => ({
+  async spawnPty(input) {
+    return { name: input.name, sessionId: 'session' }
+  },
+  async release(name) {
+    return { name }
+  },
+  async listAgents() {
+    return []
+  },
+  async sendMessage(input) {
+    return { event_id: 'event', targets: [input.to] }
+  },
+  async sendInput() {},
+  async shutdown() {},
+  disconnect() {},
+})
 
 const issueFile = {
   provider: 'linear',
@@ -85,6 +114,23 @@ const githubIssueFile = (repo: string, number = 48) => ({
     url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
     repository: { name: repo, owner: { login: 'AgentWorkforce' } },
   },
+})
+
+const mountWithIntegrationConnections = (
+  files: Record<string, unknown>,
+  integrationConnections: FactoryIntegrationConnections,
+): FakeMountClient => Object.assign(new FakeMountClient(files), { integrationConnections })
+
+const fakeIntegrationConnections = (
+  getStatus: (provider: FactoryIntegrationProvider) => ReturnType<FactoryIntegrationConnections['getStatus']>,
+): FactoryIntegrationConnections => ({
+  getStatus: vi.fn(getStatus),
+  connect: vi.fn(async (provider) => ({
+    alreadyConnected: false,
+    connectLink: `https://connect.example/${provider}`,
+    connectionId: `conn-${provider}`,
+  })),
+  waitForConnection: vi.fn(async () => {}),
 })
 
 describe('fleet CLI logging', () => {
@@ -144,6 +190,78 @@ describe('fleet CLI parsing', () => {
         sessionRef: undefined,
       },
     })
+  })
+
+  it('requires and forwards a workflow path for workflow capability spawns', async () => {
+    expect(() => parseFleetCommand([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+    ])).toThrow('factory fleet spawn workflow:run requires --workflow <path>')
+
+    expect(parseFleetCommand([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+      '--workflow',
+      'workflows/verify-target.ts',
+    ])).toEqual({
+      kind: 'spawn',
+      input: {
+        capability: 'workflow:run',
+        node: undefined,
+        name: 'workflow-a',
+        task: undefined,
+        workflow: 'workflows/verify-target.ts',
+        model: undefined,
+        cwd: undefined,
+        sessionRef: undefined,
+      },
+    })
+
+    const fleet = new FakeFleetClient()
+    const code = await runFleetCli([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+      '--workflow',
+      'workflows/verify-target.ts',
+    ], {
+      fleet,
+      stdout: buffer(),
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(fleet.spawns).toContainEqual(expect.objectContaining({
+      capability: 'workflow:run',
+      name: 'workflow-a',
+      workflow: 'workflows/verify-target.ts',
+    }))
+  })
+
+  it('parses feature-map validation and base-drift options', () => {
+    expect(parseFleetCommand([
+      'featuremap',
+      'check',
+      '--manifest',
+      'custom/manifest.yaml',
+      '--base',
+      'origin/main',
+    ])).toEqual({
+      kind: 'featuremap-check',
+      manifestPath: 'custom/manifest.yaml',
+      baseRef: 'origin/main',
+    })
+    expect(() => parseFleetCommand(['featuremap', 'sweep'])).toThrow(
+      'factory featuremap requires the check command',
+    )
   })
 
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
@@ -270,7 +388,24 @@ describe('fleet CLI parsing', () => {
       await mkdir(nested, { recursive: true })
       await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
 
-      expect(resolveBrokerConnectionPath(nested)).toBe(connectionPath)
+      expect(resolveBrokerConnectionPath(nested, {})).toBe(connectionPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers an explicit relay state directory without falling back to an ancestor broker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-state-'))
+    try {
+      const nested = join(root, 'packages', 'factory-sdk')
+      const stateDir = join(root, 'isolated-relay-state')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(nested, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(resolveBrokerConnectionPath(nested, { AGENT_RELAY_STATE_DIR: stateDir }))
+        .toBe(join(stateDir, 'connection.json'))
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -278,6 +413,252 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it.each([
+    { name: 'warns after spawning without a discovered connection', started: true, connection: false, warns: true },
+    { name: 'stays quiet when reusing a broker', started: false, connection: false, warns: false },
+    { name: 'stays quiet when a connection was discovered', started: true, connection: true, warns: false },
+  ])('$name', async ({ started, connection, warns }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-warning-'))
+    const previousCwd = process.cwd()
+    try {
+      if (connection) {
+        const connectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+        await mkdir(dirname(connectionPath), { recursive: true })
+        await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
+      }
+      process.chdir(root)
+      const cwd = process.cwd()
+      const errors = buffer()
+      const ensureRelayBroker = vi.fn(async () => ({
+        client: fakeHarnessClient(),
+        started,
+      }))
+
+      const code = await runFleetCli(['fleet', 'roster'], {
+        ensureRelayBroker,
+        env: {},
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(ensureRelayBroker).toHaveBeenCalledWith(expect.objectContaining({
+        cwd,
+        connectionPath: connection ? join(cwd, '.agentworkforce', 'relay', 'connection.json') : undefined,
+      }))
+      expect(errors.text().includes('no existing relay broker connection found')).toBe(warns)
+      expect(errors.text().match(/starting a NEW broker/gu) ?? []).toHaveLength(warns ? 1 : 0)
+    } finally {
+      process.chdir(previousCwd)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runs the feature-map checker without loading config or constructing a fleet', async () => {
+    const output = buffer()
+    const featureMapCheck = vi.fn(async () => ({
+      ok: true as const,
+      manifestPath: '.agentworkforce/features/manifest.yaml',
+      categoryCount: 2,
+      featureCount: 8,
+      baseRef: 'origin/main',
+      mergeBase: 'abc123',
+      advisories: [],
+    }))
+
+    const code = await runFleetCli(['featuremap', 'check', '--base', 'origin/main'], {
+      createFleet: () => {
+        throw new Error('featuremap check should not construct a fleet')
+      },
+      featureMapCheck,
+      stdout: output,
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(featureMapCheck).toHaveBeenCalledWith({ baseRef: 'origin/main' })
+    expect(JSON.parse(output.text())).toMatchObject({ ok: true, featureCount: 8 })
+  })
+
+  it('prompts and connects a missing GitHub integration before an interactive triage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-connect-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      let githubChecks = 0
+      const integrations = fakeIntegrationConnections(async () => (
+        githubChecks++ === 0
+          ? { ready: false, state: 'not_connected' }
+          : { ready: true, state: 'ready' }
+      ))
+      const mount = mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations)
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        isInteractive: () => true,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(confirm).toHaveBeenCalledWith('github')
+      expect(integrations.connect).toHaveBeenCalledWith('github')
+      expect(integrations.waitForConnection).toHaveBeenCalledWith('github', 'conn-github')
+      expect(openUrl).toHaveBeenCalledWith('https://connect.example/github')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('requires both Linear and GitHub for a Linear-backed Factory run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-linear-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'linear' })
+      const integrations = fakeIntegrationConnections(async (provider) => provider === 'linear'
+        ? { ready: true, state: 'ready' }
+        : { ready: false, state: 'not_connected' })
+      const errors = buffer()
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(integrations.getStatus).toHaveBeenCalledWith('linear')
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('dry-run will not start an OAuth flow')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not prompt or connect when a missing integration is checked without a TTY', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-headless-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'not_connected',
+      }))
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        isInteractive: () => false,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(confirm).not.toHaveBeenCalled()
+      expect(openUrl).not.toHaveBeenCalled()
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('invocation is non-interactive')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('treats canary as dry-run during integration preflight', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-canary-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'not_connected',
+      }))
+      const confirm = vi.fn(async () => true)
+      const openUrl = vi.fn()
+      const errors = buffer()
+
+      const code = await runFleetCli(['canary', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        isInteractive: () => true,
+        confirmIntegrationConnect: confirm,
+        openIntegrationUrl: openUrl,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(confirm).not.toHaveBeenCalled()
+      expect(openUrl).not.toHaveBeenCalled()
+      expect(integrations.connect).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('dry-run will not start an OAuth flow')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('auto-selects GitHub only when Linear is authoritatively not connected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-auto-'))
+    try {
+      const configPath = await writeConfig(root, {
+        stateIds: {},
+        issueSource: undefined,
+      })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      const integrations = fakeIntegrationConnections(async (provider) => provider === 'linear'
+        ? { ready: false, state: 'not_connected' }
+        : { ready: true, state: 'ready' })
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(integrations.getStatus).toHaveBeenNthCalledWith(1, 'linear')
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
+      expect(JSON.parse(output.text())).toMatchObject({ issue: { key: '48' } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not mask an unreadable Linear connection check as a GitHub fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-unknown-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: undefined })
+      const integrations = fakeIntegrationConnections(async () => {
+        throw Object.assign(new Error('invalid connection status payload'), { code: 'malformed_cloud_response' })
+      })
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(integrations.getStatus).toHaveBeenCalledTimes(1)
+      expect(integrations.getStatus).toHaveBeenCalledWith('linear')
+      expect(errors.text()).toContain('refusing to assume it is disconnected')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('prints factory help for -h without requiring config or showing internal fleet as the binary', async () => {
     const output = buffer()
     const errors = buffer()
@@ -311,6 +692,26 @@ describe('fleet CLI runtime', () => {
     expect(code).toBe(0)
     expect(output.text()).toContain('usage: factory <command> [options]')
     expect(output.text()).not.toContain('usage: fleet')
+  })
+
+  it.each(['--version', '-V'])('prints the installed package version for %s without constructing a fleet', async (flag) => {
+    const output = buffer()
+    const errors = buffer()
+    const manifest = JSON.parse(
+      await readFile(join(process.cwd(), 'package.json'), 'utf8'),
+    ) as { version: string }
+
+    const code = await runFleetCli([flag], {
+      createFleet: () => {
+        throw new Error('version should not construct a fleet')
+      },
+      stdout: output,
+      stderr: errors,
+    })
+
+    expect(code).toBe(0)
+    expect(errors.text()).toBe('')
+    expect(output.text()).toBe(`${manifest.version}\n`)
   })
 
   it('uses real fleet and cloud mount for fixture-less factory configs on the operator path', async () => {
@@ -451,6 +852,95 @@ describe('fleet CLI runtime', () => {
     expect(fleet.messages).toEqual([])
     expect(fleet.inputs).toEqual([])
     expect(mount.writes).toEqual([])
+  })
+
+  it('passes Cloud reporting into Factory and flushes instance lifecycle events on exit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reporting-'))
+    try {
+      const configPath = await writeConfig(root)
+      const events: FactoryCloudEventInputV1[] = []
+      const close = vi.fn(async () => ({
+        delivered: events.length,
+        pending: 0,
+        attempts: 1,
+        stoppedReason: 'empty' as const,
+      }))
+      const reporter: FactoryEventReporter = {
+        report: async (event) => { events.push(event) },
+        flush: close,
+        close,
+      }
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const createFactorySpy = vi.fn((_config, ports: FactoryPorts) => {
+        expect(ports.reporter).toBe(reporter)
+        return factory
+      }) as typeof createFactory
+      const cloudMountFromConfig = vi.fn(async (options) => {
+        await options?.onLocalMountHealth?.({
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+        })
+        return new FakeMountClient()
+      })
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        cloudMountFromConfig,
+        reporter,
+        createFactory: createFactorySpy,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(events.map((event) => event.type)).toEqual([
+        'instance.started',
+        'factory.anomaly',
+        'instance.stopping',
+        'instance.stopped',
+      ])
+      expect(events[0]).toMatchObject({ attributes: { backend: 'internal', mode: 'run-once' } })
+      expect(events[1]).toMatchObject({
+        level: 'error',
+        attributes: {
+          component: 'relayfile_mount',
+          operation: 'supervise',
+          errorCode: 'mount_stale',
+          count: 1,
+        },
+      })
+      expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
+        logger: expect.any(Object),
+        onLocalMountHealth: expect.any(Function),
+      }))
+      const cloudMount = await cloudMountFromConfig.mock.results[0]?.value
+      expect(cloudMount?.writes).toContainEqual({
+        path: '/factory/observability/mount-health/current.json',
+        content: expect.objectContaining({
+          schemaVersion: 'factory.mount-health.v1',
+          type: 'factory.mount-health',
+          workspaceId: 'factory-cli-test',
+          state: 'degraded',
+          reason: 'mount_stale',
+          degradedMounts: 1,
+          occurredAt: expect.any(String),
+        }),
+      })
+      expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('infers clonePath from cwd for internal dispatch and logs the checkout root', async () => {
@@ -648,10 +1138,13 @@ describe('fleet CLI runtime', () => {
         status: vi.fn(() => factoryStatus),
       } as unknown as Factory
       const output = buffer()
+      const integrations = fakeIntegrationConnections(async () => {
+        throw new Error('maintenance command must not preflight integrations')
+      })
 
       const code = await runFleetCli(['status', '--config', configPath], {
         fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        mount: mountWithIntegrationConnections({}, integrations),
         createFactory: () => factory,
         localClonePathOptions: { cwd: '/not/a/checkout', git, validateConfiguredCheckouts: true },
         stdout: output,
@@ -661,6 +1154,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toEqual(factoryStatus)
       expect(git).not.toHaveBeenCalled()
+      expect(integrations.getStatus).not.toHaveBeenCalled()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1250,6 +1744,24 @@ describe('fleet CLI runtime', () => {
     try {
       const clonePath = join(root, 'hoopsheet')
       await mkdir(clonePath)
+      await mkdir(join(clonePath, '.agentworkforce/features/verify'), { recursive: true })
+      await writeFile(join(clonePath, '.agentworkforce/features/manifest.yaml'), [
+        'categories:',
+        '  public-sites:',
+        '    features:',
+        '      - id: league-routing',
+        '        name: League routing',
+        '        location: src/routes/league.ts',
+        '        verify_tier: 2',
+        '',
+      ].join('\n'))
+      await writeFile(join(clonePath, '.agentworkforce/features/verify/procedures.md'), [
+        '## Tier 2 — Config',
+        '```bash',
+        'npm run test:league-routing',
+        '```',
+        '',
+      ].join('\n'))
       const configPath = await writeConfig(root, {
         repos: {
           org: 'AgentWorkforce',
@@ -1260,7 +1772,8 @@ describe('fleet CLI runtime', () => {
         babysitter: { enabled: false },
         models: { babysitter: 'claude-sonnet-4-6' },
       })
-      const mount = new FakeMountClient({
+      const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
+      const mount = mountWithIntegrationConnections({
         '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
           payload: {
             number: 10,
@@ -1271,9 +1784,10 @@ describe('fleet CLI runtime', () => {
             html_url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
             head: { ref: 'codex/league-public-sites', sha: 'abc123', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
             base: { ref: 'main' },
+            files: [{ filename: 'src/routes/league.ts' }],
           },
         },
-      })
+      }, integrations)
       const fleet = new FakeFleetClient()
       const output = buffer()
       const errors = buffer()
@@ -1291,6 +1805,7 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
+      expect(integrations.getStatus).toHaveBeenCalledWith('github')
       expect(mountCalls).toEqual([process.cwd(), clonePath])
       expect(errors.text()).toContain(`warning: could not start relayfile mount for standalone babysitter at ${clonePath}`)
       expect(fleet.spawns).toHaveLength(1)
@@ -1305,6 +1820,8 @@ describe('fleet CLI runtime', () => {
       })
       expect(fleet.spawns[0]?.task).toContain('standalone PR babysitter')
       expect(fleet.spawns[0]?.task).toContain('Full PR definition of done')
+      expect(fleet.spawns[0]?.task).toContain('League routing (`league-routing`)')
+      expect(fleet.spawns[0]?.task).toContain('npm run test:league-routing')
       expect(fleet.spawns[0]?.task).not.toContain('[factory-pr-ready]')
       expect(JSON.parse(output.text())).toMatchObject({
         status: 'spawned',
@@ -1474,15 +1991,37 @@ describe('fleet CLI runtime', () => {
 
   it('configures guarded GitHub writeback when close-probe creates a cloud mount', async () => {
     const output = buffer()
+    const errors = buffer()
     const closes: Array<{ repo: string; number: number }> = []
+    const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
     const cloudMountFromConfig = vi.fn(async (opts) => {
-      const mount = new FakeMountClient()
+      const mount = mountWithIntegrationConnections({}, integrations)
       mount.githubWrite = {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async (input) => {
           const path = `/github/repos/${input.repo}/pulls/${input.number}/close.json`
           const allowed = await opts?.isAllowedDraft?.(path, {}, { guarded: true })
           if (!allowed) throw new Error('GitHub close draft rejected by mount predicate')
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/factory.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Ffactory%2F77.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/refs%2Fheads%2Fmain.json`,
+            { ref: 'refs/heads/main', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/refs/arbitrary.json`,
+            { ref: 'refs/heads/factory/77', sha: 'abc123' },
+            { guarded: true },
+          )).toBe(false)
           closes.push(input)
         },
       }
@@ -1499,7 +2038,7 @@ describe('fleet CLI runtime', () => {
       'AR-77',
     ], {
       stdout: output,
-      stderr: buffer(),
+      stderr: errors,
       resolveWorkspace: async () => ({ workspaceId: 'rw_test' }),
       cloudMountFromConfig,
       probePrGhRunner: async () => ({
@@ -1512,11 +2051,12 @@ describe('fleet CLI runtime', () => {
       }),
     })
 
-    expect(code).toBe(0)
+    expect(code, errors.text()).toBe(0)
     expect(cloudMountFromConfig).toHaveBeenCalledWith(expect.objectContaining({
       workspaceId: 'rw_test',
       isAllowedDraft: expect.any(Function),
     }))
+    expect(integrations.getStatus).toHaveBeenCalledWith('github')
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 42 }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
   })
@@ -1563,6 +2103,94 @@ describe('fleet CLI runtime', () => {
       expect(statusCode).toBe(0)
       expect(JSON.parse(statusOut.text())).toMatchObject({ ok: true, stale: false })
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('summarizes stale clone-path mount refreshes once and keeps path details at debug verbosity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-mounts-'))
+    const previousCwd = process.cwd()
+    try {
+      const clonePaths = [join(root, 'pear'), join(root, 'relay')]
+      await Promise.all(clonePaths.map((clonePath) => mkdir(clonePath)))
+      const configPath = await writeConfig(root, {
+        repos: {
+          ...config.repos,
+          clonePaths: {
+            'AgentWorkforce/pear': clonePaths[0],
+            'AgentWorkforce/relay': clonePaths[1],
+          },
+        },
+      })
+      process.chdir(root)
+
+      const writeMountState = async (startDir: string, lastReconcileAt: string): Promise<void> => {
+        const stateDir = join(startDir, '.integrations', '.relay')
+        await mkdir(stateDir, { recursive: true })
+        await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+          workspaceId: config.workspaceId,
+          lastReconcileAt,
+          pid: process.pid,
+        }))
+      }
+      const ensureLocalMount = async (
+        workspaceId: string,
+        startDir: string,
+        options: LocalMountOptions = {},
+      ): Promise<void> => runLocalMountPreflight(workspaceId, startDir, {
+        ...options,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+        startMount: async () => writeMountState(startDir, new Date().toISOString()),
+      })
+      const runStart = async (debug: boolean) => {
+        const factory = {
+          start: vi.fn(async () => {}),
+          stop: vi.fn(async () => {}),
+          runLoop: vi.fn(async () => []),
+          runOnce: vi.fn(),
+          status: vi.fn(),
+          triageIssue: vi.fn(),
+          dispatch: vi.fn(),
+          on: vi.fn(),
+          dispose: vi.fn(),
+        } as unknown as Factory
+        const errors = buffer()
+        const code = await runFleetCli(['start', '--config', configPath], {
+          fleet: new FakeFleetClient(),
+          mount: new FakeMountClient(),
+          createFactory: vi.fn(() => factory),
+          ensureLocalMount,
+          waitForStopSignal: vi.fn(async () => {
+            await vi.waitFor(() => {
+              expect(errors.text()).toContain('[factory] refreshed 2 stale local mount(s)')
+            })
+          }),
+          env: debug ? { FACTORY_LOG_LEVEL: 'debug' } : {},
+          stdout: buffer(),
+          stderr: errors,
+        })
+        expect(code, errors.text()).toBe(0)
+        return errors.text()
+      }
+
+      const staleAt = Date.now()
+      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
+      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      const normalOutput = await runStart(false)
+      expect(normalOutput).toContain('[factory] refreshed 2 stale local mount(s) (last reconcile ~31m ago)')
+      expect(normalOutput).not.toContain('local mount is stale')
+      expect(normalOutput).not.toContain('[factory] debug:')
+      expect(normalOutput.match(/stale local mount/gu)).toHaveLength(1)
+
+      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
+      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      const debugOutput = await runStart(true)
+      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[0]}`)
+      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[1]}`)
+      expect(debugOutput).toContain('[factory] refreshed 2 stale local mount(s)')
+    } finally {
+      process.chdir(previousCwd)
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -1616,6 +2244,52 @@ describe('fleet CLI runtime', () => {
       expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', '/work/pear', {
         acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the mount client SDK path without requiring a relayfile CLI', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-sdk-mount-'))
+    try {
+      const configPath = await writeConfig(root)
+      const ensureSdkMount = vi.fn(async () => {})
+      const disposeMount = vi.fn(async () => {})
+      const mount = new FakeMountClient() as FakeMountClient & {
+        ensureLocalMount: typeof ensureSdkMount
+        dispose: typeof disposeMount
+      }
+      mount.ensureLocalMount = ensureSdkMount
+      mount.dispose = disposeMount
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(ensureSdkMount).toHaveBeenCalledWith(process.cwd(), {
+        acceptableWorkspaceIds: undefined,
+      })
+      expect(ensureSdkMount).toHaveBeenCalledWith('/work/pear', {
+        acceptableWorkspaceIds: undefined,
+      })
+      expect(disposeMount).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1715,6 +2389,64 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('warms configured clone mounts with bounded concurrency without blocking live start', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
+    try {
+      const clonePaths = Object.fromEntries(
+        Array.from({ length: 9 }, (_, index) => [`AgentWorkforce/repo-${index}`, join(root, `repo-${index}`)]),
+      )
+      const configPath = await writeConfig(root, {
+        repos: {
+          byLabel: Object.fromEntries(Object.keys(clonePaths).map((repo) => [repo.split('/')[1], repo])),
+          clonePaths,
+          default: 'AgentWorkforce/repo-0',
+        },
+      })
+      const mounted: string[] = []
+      let mountedWhenFactoryStarted = -1
+      const factory = {
+        start: vi.fn(async () => { mountedWhenFactoryStarted = mounted.length }),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      let active = 0
+      let maxActive = 0
+      const ensureLocalMount = vi.fn(async (_workspaceId: string, startDir: string) => {
+        if (startDir === process.cwd()) return
+        mounted.push(startDir)
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        active -= 1
+      })
+
+      await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => {
+          await vi.waitFor(() => expect(mounted).toHaveLength(9))
+        }),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(maxActive).toBe(4)
+      expect(mounted.sort()).toEqual(Object.values(clonePaths).sort())
+      expect(mountedWhenFactoryStarted).toBeLessThan(Object.keys(clonePaths).length)
+      expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('uses ./factory.config.json by default for factory commands', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-default-config-'))
     const previousCwd = process.cwd()
@@ -1782,6 +2514,18 @@ describe('fleet CLI runtime', () => {
       const createFactory = vi.fn(() => factory)
       const ensureLocalMount = vi.fn(async () => {})
       const daemonExits: number[] = []
+      const events: FactoryCloudEventInputV1[] = []
+      const closeReporter = vi.fn(async () => ({
+        delivered: events.length,
+        pending: 0,
+        attempts: 0,
+        stoppedReason: 'empty' as const,
+      }))
+      const reporter: FactoryEventReporter = {
+        report: async (event) => { events.push(event) },
+        flush: closeReporter,
+        close: closeReporter,
+      }
 
       const run = runFleetCli([
         'start',
@@ -1794,6 +2538,7 @@ describe('fleet CLI runtime', () => {
         mount: new FakeMountClient(),
         createFactory,
         ensureLocalMount,
+        reporter,
         stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
         flushDaemonOutput: async () => {
           calls.push('flush')
@@ -1812,8 +2557,14 @@ describe('fleet CLI runtime', () => {
 
       await expect(run).resolves.toBe(0)
       expect(factory.stop).toHaveBeenCalledTimes(1)
-      expect(calls).toEqual(['stop', 'flush', 'exit'])
-      expect(daemonExits).toEqual([0])
+      expect(calls).toEqual(['stop', 'flush'])
+      expect(daemonExits).toEqual([])
+      expect(events.map((event) => event.type)).toEqual([
+        'instance.started',
+        'instance.stopping',
+        'instance.stopped',
+      ])
+      expect(closeReporter).toHaveBeenCalledWith({ deadlineMs: 2_000 })
       expect(listeners.size).toBe(0)
     } finally {
       await rm(root, { recursive: true, force: true })

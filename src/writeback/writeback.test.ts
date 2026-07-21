@@ -579,6 +579,59 @@ describe('MountSlackWriteback', () => {
     })
   })
 
+  it('uses the cloud operation external id when the mirrored root has not reconciled yet', async () => {
+    const backing = new FakeMountClient()
+    const cloudMount: MountClient = {
+      writebackTransport: 'relayfile-cloud',
+      readFile: (path) => backing.readFile(path),
+      writeFile: (path, content, opts) => backing.writeFile(path, content, opts),
+      deleteFile: (path) => backing.deleteFile(path),
+      listTree: (prefix) => backing.listTree(prefix),
+      subscribe: (globs, onChange, opts) => backing.subscribe(globs, onChange, opts),
+      getEvents: (opts) => backing.getEvents(opts),
+      confirmWrite: (path, opts) => backing.confirmWrite(path, opts),
+      getConfirmedWriteExternalId: async () => '1780751612.176219',
+      ensureSubRoot: (prefix, opts) => backing.ensureSubRoot(prefix, opts),
+    }
+    const slack = MountSlackWriteback(cloudMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    const root = await slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })
+    await slack.reply(root.threadId, 'Factory reply')
+
+    expect(root.threadId).toBe('1780751612.176219')
+    expect(backing.writes[1]?.content).toMatchObject({ thread_ts: '1780751612.176219' })
+  })
+
+  it('fails closed when an acked cloud root has no provider thread timestamp', async () => {
+    const backing = new FakeMountClient()
+    const cloudMount: MountClient = {
+      writebackTransport: 'relayfile-cloud',
+      readFile: (path) => backing.readFile(path),
+      writeFile: (path, content, opts) => backing.writeFile(path, content, opts),
+      deleteFile: (path) => backing.deleteFile(path),
+      listTree: (prefix) => backing.listTree(prefix),
+      subscribe: (globs, onChange, opts) => backing.subscribe(globs, onChange, opts),
+      getEvents: (opts) => backing.getEvents(opts),
+      confirmWrite: (path, opts) => backing.confirmWrite(path, opts),
+      ensureSubRoot: (prefix, opts) => backing.ensureSubRoot(prefix, opts),
+    }
+    const slack = MountSlackWriteback(cloudMount, {
+      channel: 'C0FACTORY__factory-e2e',
+      channelDir: 'C0FACTORY__factory-e2e',
+    })
+
+    await expect(slack.postThread({
+      channel: 'C0FACTORY__factory-e2e',
+      text: 'Factory update',
+    })).rejects.toThrow(/without a provider thread timestamp/u)
+  })
+
   it('refuses Slack writes over a local mirror mount even if file writes appear acked', async () => {
     const writes: Array<{ path: string; content: unknown }> = []
     const localMirrorMount: MountClient = {
@@ -774,6 +827,87 @@ describe('GhCliGithubWriteback', () => {
     },
   }
 
+  it('pushes a local branch and returns the gh-authenticated PR author', async () => {
+    const ghCalls: string[][] = []
+    const gitCalls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        ghCalls.push(args)
+        if (args[1] === 'create') {
+          return { stdout: 'https://github.com/AgentWorkforce/factory/pull/124\n' }
+        }
+        return {
+          stdout: JSON.stringify({
+            number: 124,
+            url: 'https://github.com/AgentWorkforce/factory/pull/124',
+            headRefName: 'factory/124-configurable-pr-author',
+            headRefOid: 'commit-124',
+            author: { login: 'operator-user' },
+          }),
+        }
+      },
+      gitRunner: async (args) => {
+        gitCalls.push(args)
+        if (args.includes('symbolic-ref')) return { stdout: 'factory/124-configurable-pr-author\n' }
+        if (args.includes('rev-parse')) return { stdout: 'commit-124\n' }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: '124: configurable PR author',
+      body: 'Factory issue 124',
+    })).resolves.toEqual({
+      repo: 'AgentWorkforce/factory',
+      number: 124,
+      url: 'https://github.com/AgentWorkforce/factory/pull/124',
+      headRef: 'factory/124-configurable-pr-author',
+      headSha: 'commit-124',
+      author: 'operator-user',
+    })
+    expect(gitCalls).toEqual([
+      ['-C', '/work/factory', 'symbolic-ref', '--short', 'HEAD'],
+      ['-C', '/work/factory', 'rev-parse', 'HEAD'],
+      ['-C', '/work/factory', 'push', 'origin', 'HEAD:refs/heads/factory/124-configurable-pr-author'],
+    ])
+    expect(ghCalls).toEqual([
+      [
+        'pr', 'create', '--repo', 'AgentWorkforce/factory',
+        '--head', 'factory/124-configurable-pr-author', '--base', 'main',
+        '--title', '124: configurable PR author', '--body', 'Factory issue 124',
+      ],
+      [
+        'pr', 'view', 'https://github.com/AgentWorkforce/factory/pull/124',
+        '--repo', 'AgentWorkforce/factory', '--json',
+        'number,url,headRefName,headRefOid,author',
+      ],
+    ])
+  })
+
+  it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return { stdout: JSON.stringify({ author: { login: 'issue-reporter' } }) }
+      },
+    })
+
+    await expect(github.getIssueAuthor(githubIssue)).resolves.toBe('issue-reporter')
+    expect(calls).toEqual([[
+      'issue',
+      'view',
+      '48',
+      '--repo',
+      'AgentWorkforce/factory',
+      '--json',
+      'author',
+    ]])
+  })
+
   it('sets the first lifecycle status without removing an absent label, then transitions statuses', async () => {
     const calls: string[][] = []
     const labels = new Set<string>()
@@ -806,6 +940,42 @@ describe('GhCliGithubWriteback', () => {
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
     ])
+  })
+
+  it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return {
+            stdout: JSON.stringify({
+              labels: [{ name: 'factory-ready' }, { name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+            }),
+          }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await github.setStatus(githubIssue, 'ready')
+
+    expect(calls).toEqual([
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
+    ])
+  })
+
+  it('treats provider human-review status as authoritative over a stale in-progress label', async () => {
+    const github = new GhCliGithubWriteback({
+      runner: async () => ({
+        stdout: JSON.stringify({
+          labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+        }),
+      }),
+    })
+
+    await expect(github.getIssueStatus(githubIssue)).resolves.toBe('human-review')
   })
 
   it('comments and closes the GitHub issue after merge', async () => {

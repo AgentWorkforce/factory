@@ -7,7 +7,6 @@ import {
   type CloudSessionOptions,
 } from '@agent-relay/cloud'
 import {
-  RelayfileSetup,
   type ChangeEvent,
   type DeleteFileInput,
   type EventFeedResponse,
@@ -21,20 +20,41 @@ import {
   type WriteFileInput,
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
+import { RelayfileSetup } from '@relayfile/sdk/cli'
+import { existsSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
-import type { EventPage, GithubConnectionWrite, MountClient, ProviderSyncStatus, SubscribeOptions } from '../ports'
+import type {
+  EventPage,
+  FactoryIntegrationConnections,
+  FactoryIntegrationProvider,
+  GithubConnectionWrite,
+  LocalMountOptions,
+  Logger,
+  MountClient,
+  ProviderSyncStatus,
+  SubscribeOptions,
+} from '../ports'
 import {
-  createResourceSubscriptionsHttpClient,
+  createResourceSubscriptionsSdkClient,
   createWorkspaceScopedEventClient,
   type RelayfileEventClient,
+  type ResourceSubscriptionsSdk,
   type TokenProvider,
   type WorkspaceEventClientSource,
 } from '../subscriptions'
 import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import {
+  ensureLocalMount as runLocalMountPreflight,
+  type EnsureLocalMountOptions,
+} from './local-mount-preflight'
+import { checkMountStaleness } from './relayfile-binary'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
+const DEFAULT_LOCAL_MOUNT_HEALTH_INTERVAL_MS = 30_000
+const DEFAULT_LOCAL_MOUNT_MAX_CONCURRENCY = 4
 export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/issues/**',
   'relayfile:fs:read:/linear/states/**',
@@ -44,6 +64,8 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
+  'relayfile:fs:read:/factory/observability/**',
+  'relayfile:fs:write:/factory/observability/**',
 ] as const
 
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
@@ -89,17 +111,65 @@ export async function resolveFactoryWorkspace(
 }
 
 export interface RelayfileWorkspaceHandleLike {
+  workspaceId?: string
   info: { relayfileUrl: string }
   client(): RelayFileClientLike
   getToken(): Promise<string> | string
+  getConnectionStatus?(provider: FactoryIntegrationProvider, connectionId: string): Promise<{
+    ready: boolean
+    state?: string
+    initialSyncState?: string
+  }>
+  connectIntegration?(provider: FactoryIntegrationProvider, options?: { allowedIntegrations?: string[] }): Promise<{
+    alreadyConnected: boolean
+    connectLink: string | null
+    connectionId: string
+  }>
+  waitForConnection?(provider: FactoryIntegrationProvider, options?: {
+    connectionId?: string
+    timeoutMs?: number
+  }): Promise<void>
+}
+
+export interface MountedWorkspaceHandleLike {
+  stop(): Promise<void>
+  status?(): Promise<{ ready: boolean }>
+  expiresAt?: string | null
+  suggestedRefreshAt?: string | null
+}
+
+export interface LocalMountHealthEvent {
+  state: 'degraded' | 'recovered'
+  reason: 'mount_stale' | 'mount_refresh_failed'
+  degradedMounts: number
+}
+
+export interface RelayfileSetupLike {
+  joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
+  ensureMountedWorkspace?(input: {
+    workspace: RelayfileWorkspaceHandleLike
+    localDir: string
+    remotePath?: string
+    mode?: 'poll' | 'fuse'
+    background?: boolean
+    agentName?: string
+    scopes?: string[]
+    verifyProvider?: boolean
+    supervise?: boolean
+    readyTimeoutMs?: number
+  }): Promise<MountedWorkspaceHandleLike>
 }
 
 export type RelayfileSetupFactory = (options: {
   cloudApiUrl: string
   tokenProvider: () => Promise<string>
-}) => {
-  joinWorkspace(workspaceId: string, options?: { agentName?: string; scopes?: string[] }): Promise<RelayfileWorkspaceHandleLike>
-}
+}) => RelayfileSetupLike
+
+export type LocalMountPreflight = (
+  workspaceId: string,
+  startDir: string,
+  options: EnsureLocalMountOptions,
+) => Promise<void>
 
 export interface RelayfileCloudMountClientConfig {
   backend?: 'relayfile-cloud'
@@ -109,23 +179,31 @@ export interface RelayfileCloudMountClientConfig {
   cloudSessionRefreshTimeoutMs?: number
   cloudSessionEnv?: NodeJS.ProcessEnv
   relayfileSetupFactory?: RelayfileSetupFactory
+  /** Internal SDK objects retained by fromConfig() for local mount startup. */
+  relayfileSetup?: RelayfileSetupLike
+  relayfileWorkspace?: RelayfileWorkspaceHandleLike
+  localMountPreflight?: LocalMountPreflight
   agentName?: string
   scopes?: string[]
   client?: RelayFileClientLike
   tokenProvider?: TokenProvider
   baseUrl?: string
   eventClient?: RelayfileEventClient
-  /** Override the standard Relayfile Cloud durable-subscription HTTP client. */
+  /** Override the standard Relayfile SDK durable-subscription adapter. */
   resourceSubscriptions?: ResourceSubscriptionsClient
-  resourceSubscriptionFetch?: typeof fetch
-  resourceSubscriptionRequestTimeoutMs?: number
+  /** Optional lifecycle cancellation forwarded through the Relayfile SDK. */
   resourceSubscriptionSignal?: AbortSignal
+  logger?: Logger
+  onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
+  /** Internal health cadence override for tests. */
+  localMountHealthIntervalMs?: number
+  /** Internal mount-work concurrency override for tests. */
+  localMountMaxConcurrency?: number
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
 
-export type RelayFileClientLike =
-  {
+export type RelayFileClientLike = {
     readFile(workspaceId: string, path: string): Promise<FileReadResponse>
     writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
     deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
@@ -137,21 +215,64 @@ export type RelayFileClientLike =
     getSyncStatus?(workspaceId: string, options?: { provider?: string }): Promise<unknown>
     getToken?(): Promise<string> | string
     getBaseUrl?(): string
+  } & Partial<ResourceSubscriptionsSdk>
+
+const hasResourceSubscriptionsSdk = (
+  client: RelayFileClientLike,
+): client is RelayFileClientLike & ResourceSubscriptionsSdk =>
+  typeof client.createOrRenewDurableResourceSubscription === 'function' &&
+  typeof client.claimDurableSubscriptionDeliveries === 'function' &&
+  typeof client.acceptDurableSubscriptionDelivery === 'function' &&
+  typeof client.cancelDurableResourceSubscription === 'function'
+
+export function relayfileWorkspaceTokenProvider(
+  client: RelayFileClientLike,
+  workspace: RelayfileWorkspaceHandleLike,
+): TokenProvider {
+  return async () => {
+    const current = await client.getToken?.()
+    return current ?? await workspace.getToken()
   }
+}
 
 export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
   readonly githubWrite: GithubConnectionWrite
   readonly resourceSubscriptions?: ResourceSubscriptionsClient
+  readonly integrationConnections?: FactoryIntegrationConnections
 
   readonly #client: RelayFileClientLike
   readonly #tokenProvider: TokenProvider
   readonly #baseUrl?: string
   readonly #eventClient?: RelayfileEventClient
+  readonly #logger?: Logger
+  readonly #onLocalMountHealth?: (event: LocalMountHealthEvent) => Promise<void> | void
+  readonly #localMountHealthIntervalMs: number
+  readonly #localMountMaxConcurrency: number
+  readonly #relayfileSetup?: RelayfileSetupLike
+  readonly #relayfileWorkspace?: RelayfileWorkspaceHandleLike
+  readonly #localMountPreflight: LocalMountPreflight
+  readonly #localMountAgentName: string
+  readonly #localMountScopes: string[]
+  readonly #localMounts = new Map<string, MountedWorkspaceHandleLike>()
+  readonly #localMountSupervisions = new Map<string, {
+    startDir: string
+    options: LocalMountOptions
+    launch: () => Promise<MountedWorkspaceHandleLike>
+    suggestedRefreshAtMs?: number
+  }>()
+  readonly #localMountHealthTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #localMountOperations = new Map<string, Promise<void>>()
+  readonly #localMountOperationWaiters: Array<() => void> = []
+  readonly #degradedLocalMounts = new Set<string>()
+  #activeLocalMountOperations = 0
+  #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
+  readonly #confirmedExternalIdByPath = new Map<string, string>()
+  readonly #confirmedFailureReasonByPath = new Map<string, string>()
 
   constructor(config: RelayfileCloudMountClientConfig = {}) {
     if (!config.client) {
@@ -163,18 +284,35 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
     this.#eventClient = config.eventClient
-    this.resourceSubscriptions = config.resourceSubscriptions ?? (this.#baseUrl
-      ? createResourceSubscriptionsHttpClient({
-        baseUrl: this.#baseUrl,
-        tokenProvider: this.#tokenProvider,
-        fetch: config.resourceSubscriptionFetch,
-        requestTimeoutMs: config.resourceSubscriptionRequestTimeoutMs,
-        signal: config.resourceSubscriptionSignal,
-      })
-      : undefined)
+    this.resourceSubscriptions = config.resourceSubscriptions ?? (
+      hasResourceSubscriptionsSdk(this.#client)
+        ? createResourceSubscriptionsSdkClient(this.#client, {
+          signal: config.resourceSubscriptionSignal,
+        })
+        : undefined
+    )
+    this.#logger = config.logger
+    this.#onLocalMountHealth = config.onLocalMountHealth
+    this.#localMountHealthIntervalMs = Math.max(
+      1_000,
+      Math.floor(config.localMountHealthIntervalMs ?? DEFAULT_LOCAL_MOUNT_HEALTH_INTERVAL_MS),
+    )
+    this.#localMountMaxConcurrency = Math.max(
+      1,
+      Math.floor(config.localMountMaxConcurrency ?? DEFAULT_LOCAL_MOUNT_MAX_CONCURRENCY),
+    )
+    this.#relayfileSetup = config.relayfileSetup
+    this.#relayfileWorkspace = config.relayfileWorkspace
+    this.#localMountPreflight = config.localMountPreflight ?? runLocalMountPreflight
+    this.#localMountAgentName = config.agentName ?? DEFAULT_AGENT_NAME
+    this.#localMountScopes = config.scopes ?? [...FACTORY_RELAYFILE_SCOPES]
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
+    this.integrationConnections = relayfileIntegrationConnections(
+      config.relayfileWorkspace,
+      this.workspaceId,
+    )
   }
 
   setDefaultAllowedDraftPredicate(
@@ -200,14 +338,134 @@ export class RelayfileCloudMountClient implements MountClient {
       agentName: config.agentName ?? DEFAULT_AGENT_NAME,
       scopes: config.scopes ?? [...FACTORY_RELAYFILE_SCOPES],
     })
+    const client = handle.client()
 
     return new RelayfileCloudMountClient({
       ...config,
       workspaceId,
-      client: handle.client(),
-      tokenProvider: () => handle.getToken(),
+      client,
+      // WorkspaceHandle.getToken() returns the token originally minted by
+      // joinWorkspace. RelayFileClient.getToken() resolves the SDK's rotating
+      // provider, so long-lived websocket/poll subscriptions must use it.
+      tokenProvider: relayfileWorkspaceTokenProvider(client, handle),
       baseUrl: handle.info.relayfileUrl,
+      relayfileSetup: setup,
+      relayfileWorkspace: handle,
     })
+  }
+
+  async ensureLocalMount(startDir: string, options: LocalMountOptions = {}): Promise<void> {
+    const localDir = join(resolve(startDir), '.integrations')
+    return this.#runLocalMountOperation(localDir, () => this.#ensureLocalMount(startDir, localDir, options))
+  }
+
+  async #ensureLocalMount(startDir: string, localDir: string, options: LocalMountOptions): Promise<void> {
+    const setup = this.#relayfileSetup
+    const workspace = this.#relayfileWorkspace
+    if (!setup?.ensureMountedWorkspace || !workspace) {
+      throw new Error('Relayfile SDK mount setup is unavailable; construct the mount with RelayfileCloudMountClient.fromConfig()')
+    }
+    const ensureMountedWorkspace = setup.ensureMountedWorkspace.bind(setup)
+
+    const acceptableWorkspaceIds = new Set(options.acceptableWorkspaceIds ?? [])
+    if (workspace.workspaceId && workspace.workspaceId !== this.workspaceId) {
+      acceptableWorkspaceIds.add(workspace.workspaceId)
+    }
+    const launch = (): Promise<MountedWorkspaceHandleLike> => ensureMountedWorkspace({
+      workspace,
+      localDir,
+      remotePath: '/',
+      mode: 'poll',
+      background: true,
+      agentName: this.#localMountAgentName,
+      scopes: [...this.#localMountScopes],
+      // Factory mirrors the whole workspace across several integrations,
+      // so there is no single provider to verify before mounting.
+      verifyProvider: false,
+      // Factory owns the outer, telemetry-aware supervisor. Newer Relayfile
+      // SDKs also supervise by default, so opt out here to avoid two refresh
+      // loops racing over the same local directory.
+      supervise: false,
+      ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
+    })
+    this.#localMountSupervisions.set(localDir, {
+      startDir,
+      options: { ...options, acceptableWorkspaceIds: [...acceptableWorkspaceIds] },
+      launch,
+      suggestedRefreshAtMs: this.#localMountSupervisions.get(localDir)?.suggestedRefreshAtMs,
+    })
+
+    const statePath = join(localDir, '.relay', 'state.json')
+    const staleBefore = existsSync(statePath)
+      ? checkMountStaleness(statePath, this.workspaceId, [...acceptableWorkspaceIds])
+      : undefined
+    if (staleBefore?.stale) this.#markLocalMountDegraded(localDir, 'mount_stale')
+
+    try {
+      await this.#localMountPreflight(this.workspaceId, startDir, {
+        ...options,
+        acceptableWorkspaceIds: [...acceptableWorkspaceIds],
+        startMount: async () => {
+          await this.#replaceLocalMount(localDir, launch)
+        },
+      })
+    } catch (error) {
+      // A first-ever mount has no state file from which staleness can be
+      // inferred. Surface the launch failure and arm the same retry supervisor
+      // used for later stale sessions before returning control to startup.
+      this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
+      this.#scheduleLocalMountHealthCheck(localDir)
+      throw error
+    }
+    const staleAfter = checkMountStaleness(statePath, this.workspaceId, [...acceptableWorkspaceIds])
+    if (staleAfter.stale) this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
+    else this.#markLocalMountRecovered(localDir)
+    this.#scheduleLocalMountHealthCheck(localDir)
+  }
+
+  #runLocalMountOperation(localDir: string, operation: () => Promise<void>): Promise<void> {
+    const existing = this.#localMountOperations.get(localDir)
+    if (existing) return existing
+    const running = (async () => {
+      await this.#acquireLocalMountOperation()
+      try {
+        if (!this.#disposed) await operation()
+      } finally {
+        this.#releaseLocalMountOperation()
+      }
+    })()
+    const tracked = running.finally(() => {
+      if (this.#localMountOperations.get(localDir) === tracked) {
+        this.#localMountOperations.delete(localDir)
+      }
+    })
+    this.#localMountOperations.set(localDir, tracked)
+    return tracked
+  }
+
+  async #acquireLocalMountOperation(): Promise<void> {
+    if (this.#activeLocalMountOperations < this.#localMountMaxConcurrency) {
+      this.#activeLocalMountOperations += 1
+      return
+    }
+    await new Promise<void>((resolve) => this.#localMountOperationWaiters.push(resolve))
+  }
+
+  #releaseLocalMountOperation(): void {
+    const next = this.#localMountOperationWaiters.shift()
+    if (next) next()
+    else this.#activeLocalMountOperations -= 1
+  }
+
+  async dispose(): Promise<void> {
+    this.#disposed = true
+    for (const timer of this.#localMountHealthTimers.values()) clearTimeout(timer)
+    this.#localMountHealthTimers.clear()
+    this.#localMountSupervisions.clear()
+    this.#degradedLocalMounts.clear()
+    const mounted = [...this.#localMounts.values()]
+    this.#localMounts.clear()
+    await Promise.allSettled(mounted.map(async (handle) => handle.stop()))
   }
 
   async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
@@ -224,6 +482,8 @@ export class RelayfileCloudMountClient implements MountClient {
     }
 
     const serialized = serializeContent(content)
+    this.#confirmedExternalIdByPath.delete(path)
+    this.#confirmedFailureReasonByPath.delete(path)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
       let baseRevision = '0'
@@ -251,6 +511,8 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async deleteFile(path: string): Promise<void> {
+    this.#confirmedExternalIdByPath.delete(path)
+    this.#confirmedFailureReasonByPath.delete(path)
     const current = await this.#client.readFile(this.workspaceId, path)
     const currentContent = parseRemoteContent(current)
     if (isProviderPath(path)) {
@@ -320,6 +582,102 @@ export class RelayfileCloudMountClient implements MountClient {
     return eventClient.subscribe(globs, onChange as Parameters<RelayfileEventClient['subscribe']>[1], opts)
   }
 
+  async #replaceLocalMount(
+    localDir: string,
+    launch: () => Promise<MountedWorkspaceHandleLike>,
+  ): Promise<void> {
+    const previous = this.#localMounts.get(localDir)
+    if (previous) {
+      this.#localMounts.delete(localDir)
+      await previous.stop()
+    }
+    const mounted = await launch()
+    if (this.#disposed) {
+      await mounted.stop()
+      return
+    }
+    this.#localMounts.set(localDir, mounted)
+    const supervision = this.#localMountSupervisions.get(localDir)
+    if (supervision) {
+      const suggestedRefreshAtMs = Date.parse(mounted.suggestedRefreshAt ?? '')
+      supervision.suggestedRefreshAtMs = Number.isFinite(suggestedRefreshAtMs)
+        ? suggestedRefreshAtMs
+        : undefined
+    }
+  }
+
+  #scheduleLocalMountHealthCheck(localDir: string): void {
+    if (this.#disposed || this.#localMountHealthTimers.has(localDir)) return
+    const supervision = this.#localMountSupervisions.get(localDir)
+    if (!supervision) return
+    const untilRefresh = supervision.suggestedRefreshAtMs === undefined
+      ? this.#localMountHealthIntervalMs
+      : Math.max(0, supervision.suggestedRefreshAtMs - Date.now())
+    const delayMs = Math.max(1_000, Math.min(this.#localMountHealthIntervalMs, untilRefresh))
+    const timer = setTimeout(() => {
+      this.#localMountHealthTimers.delete(localDir)
+      void this.#superviseLocalMount(localDir)
+    }, delayMs)
+    timer.unref?.()
+    this.#localMountHealthTimers.set(localDir, timer)
+  }
+
+  async #superviseLocalMount(localDir: string): Promise<void> {
+    if (this.#disposed) return
+    const supervision = this.#localMountSupervisions.get(localDir)
+    if (!supervision) return
+    try {
+      if (
+        supervision.suggestedRefreshAtMs !== undefined &&
+        Date.now() >= supervision.suggestedRefreshAtMs
+      ) {
+        await this.#runLocalMountOperation(localDir, async () => {
+          await this.#replaceLocalMount(localDir, supervision.launch)
+          this.#markLocalMountRecovered(localDir)
+        })
+      } else {
+        // ensureLocalMount performs the filesystem health check and owns the
+        // resulting degraded/recovered transition.
+        await this.ensureLocalMount(supervision.startDir, supervision.options)
+      }
+    } catch (error) {
+      this.#logger?.warn?.('[factory] supervised Relayfile mount refresh failed', {
+        errorClass: error instanceof Error ? error.name : 'Error',
+      })
+      this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
+    } finally {
+      this.#scheduleLocalMountHealthCheck(localDir)
+    }
+  }
+
+  #markLocalMountDegraded(localDir: string, reason: LocalMountHealthEvent['reason']): void {
+    const wasHealthy = this.#degradedLocalMounts.size === 0
+    this.#degradedLocalMounts.add(localDir)
+    if (!wasHealthy) return
+    this.#emitLocalMountHealth({
+      state: 'degraded',
+      reason,
+      degradedMounts: this.#degradedLocalMounts.size,
+    })
+  }
+
+  #markLocalMountRecovered(localDir: string): void {
+    if (!this.#degradedLocalMounts.delete(localDir) || this.#degradedLocalMounts.size > 0) return
+    this.#emitLocalMountHealth({
+      state: 'recovered',
+      reason: 'mount_stale',
+      degradedMounts: 0,
+    })
+  }
+
+  #emitLocalMountHealth(event: LocalMountHealthEvent): void {
+    void Promise.resolve(this.#onLocalMountHealth?.(event)).catch((error: unknown) => {
+      this.#logger?.warn?.('[factory] unable to report Relayfile mount health', {
+        errorClass: error instanceof Error ? error.name : 'Error',
+      })
+    })
+  }
+
   async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
     if (opts.last !== undefined && this.#client.listLastNChanges) {
       const response = await this.#client.listLastNChanges(opts.last, { workspaceId: this.workspaceId })
@@ -361,11 +719,36 @@ export class RelayfileCloudMountClient implements MountClient {
 
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
     for (;;) {
-      const status = mapOperationStatus(await this.#client.getOp(this.workspaceId, opId))
-      if (status !== 'pending') return status
+      const operation = await this.#client.getOp(this.workspaceId, opId)
+      let status: 'acked' | 'pending' | 'failed'
+      try {
+        status = mapOperationStatus(operation)
+      } catch (error) {
+        this.#confirmedFailureReasonByPath.set(path, providerResultError(operation))
+        throw error
+      }
+      if (status !== 'pending') {
+        const providerId = [
+          operation.providerResult?.externalId,
+          operation.providerResult?.ts,
+          operation.providerResult?.thread_ts,
+        ].find((value): value is string => typeof value === 'string' && value.length > 0)
+        if (status === 'acked' && providerId) {
+          this.#confirmedExternalIdByPath.set(path, providerId)
+        }
+        return status
+      }
       if (Date.now() >= deadline) return 'timeout'
       await sleep(Math.min(500, Math.max(25, deadline - Date.now())))
     }
+  }
+
+  async getConfirmedWriteFailureReason(path: string): Promise<string | undefined> {
+    return this.#confirmedFailureReasonByPath.get(path)
+  }
+
+  async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+    return this.#confirmedExternalIdByPath.get(path)
   }
 
   async ensureSubRoot(prefix: string, _opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
@@ -379,11 +762,43 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 }
 
+function relayfileIntegrationConnections(
+  workspace: RelayfileWorkspaceHandleLike | undefined,
+  fallbackWorkspaceId: string,
+): FactoryIntegrationConnections | undefined {
+  if (!workspace?.getConnectionStatus || !workspace.connectIntegration || !workspace.waitForConnection) {
+    return undefined
+  }
+
+  const connectionId = workspace.workspaceId ?? fallbackWorkspaceId
+  const activeConnectionIds = new Map<FactoryIntegrationProvider, string>()
+  return {
+    getStatus: (provider) => workspace.getConnectionStatus!(
+      provider,
+      activeConnectionIds.get(provider) ?? connectionId,
+    ),
+    connect: async (provider) => {
+      const result = await workspace.connectIntegration!(provider, {
+        allowedIntegrations: [provider],
+      })
+      activeConnectionIds.set(provider, result.connectionId)
+      return result
+    },
+    waitForConnection: async (provider, requestedConnectionId) => {
+      activeConnectionIds.set(provider, requestedConnectionId)
+      await workspace.waitForConnection!(provider, {
+        connectionId: requestedConnectionId,
+        timeoutMs: 5 * 60_000,
+      })
+    },
+  }
+}
+
 const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, tokenProvider }) =>
   new RelayfileSetup({
     cloudApiUrl,
     accessToken: tokenProvider,
-  })
+  }) as unknown as RelayfileSetupLike
 
 const createSharedCloudSessionResolver = (config: RelayfileCloudMountClientConfig): {
   resolve: () => Promise<CloudSession>

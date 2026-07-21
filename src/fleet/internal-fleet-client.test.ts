@@ -21,7 +21,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   throwOnConnect = false
   partiallyConnected = false
 
-  agents: Array<{ name: string; pid?: number }> = []
+  agents: Array<{ name: string; cli?: string; pid?: number }> = []
   nextSessionRef = 'session-1'
   nextHandleName: string | undefined
   nextPid: number | undefined
@@ -29,7 +29,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string; pid?: number }> {
     this.spawned.push(input)
     const name = this.nextHandleName ?? input.name
-    this.agents.push({ name, pid: this.nextPid })
+    this.agents.push({ name, cli: input.cli, pid: this.nextPid })
     return { name, session_ref: this.nextSessionRef }
   }
 
@@ -38,10 +38,11 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
     if (this.throwOnRelease) {
       throw new Error('release failed')
     }
+    this.agents = this.agents.filter((agent) => agent.name !== name)
     return { name }
   }
 
-  async listAgents(): Promise<Array<{ name: string; pid?: number }>> {
+  async listAgents(): Promise<Array<{ name: string; cli?: string; pid?: number }>> {
     return this.agents
   }
 
@@ -532,6 +533,7 @@ describe('InternalFleetClient', () => {
               data: { error: 'internal reply dropped', success: false },
             })
           }
+          this.agents = this.agents.filter((agent) => agent.name !== name)
           return { name }
         }
       }
@@ -702,7 +704,13 @@ describe('InternalFleetClient', () => {
   it('surfaces the broker pid as protected process state', async () => {
     const harness = new FakeHarnessDriverClient()
     harness.brokerPid = 68009
-    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      // Keep the unit isolated from an AGENT_RELAY_STATE_DIR inherited by the
+      // test process; this assertion is specifically about the injected client.
+      connectionPath: '/worktree/.agentworkforce/relay/missing-connection.json',
+    })
 
     await expect(fleet.protectedPids()).resolves.toEqual([68009])
   })
@@ -729,7 +737,13 @@ describe('InternalFleetClient', () => {
     harness.nextSessionRef = 'resumed-session'
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
 
-    await expect(fleet.resume({ name: 'ar-1-impl', sessionRef: 'session-original', node: 'self' })).resolves.toEqual({
+    await expect(fleet.resume({
+      name: 'ar-1-impl',
+      sessionRef: 'session-original',
+      node: 'self',
+      clonePath: '/isolated/ar-1',
+      task: 'Continue with the durable human answer.',
+    })).resolves.toEqual({
       name: 'ar-1-impl',
       sessionRef: 'resumed-session',
     })
@@ -737,8 +751,9 @@ describe('InternalFleetClient', () => {
     expect(harness.spawned[0]).toMatchObject({
       name: 'ar-1-impl',
       cli: 'codex',
-      cwd: '/worktree',
+      cwd: '/isolated/ar-1',
       continueFrom: 'session-original',
+      task: 'Continue with the durable human answer.',
     })
   })
 
@@ -898,9 +913,146 @@ describe('InternalFleetClient', () => {
 
     expect(harness.released).toEqual([{ name: 'ar-1-impl', reason: 'done' }])
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }],
+      agents: [],
       nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
     })
+  })
+
+  it('retries a successful release acknowledgement until the broker name disappears', async () => {
+    vi.useFakeTimers()
+    try {
+      class RetainedFirstReleaseHarnessDriverClient extends FakeHarnessDriverClient {
+        attempts = 0
+
+        override async release(name: string, reason?: string): Promise<{ name: string }> {
+          this.attempts += 1
+          this.released.push({ name, reason })
+          if (this.attempts > 1) {
+            this.agents = this.agents.filter((agent) => agent.name !== name)
+          }
+          return { name }
+        }
+      }
+
+      const harness = new RetainedFirstReleaseHarnessDriverClient()
+      harness.agents = [{ name: 'ar-stale-review', cli: 'codex' }]
+      const logger = { warn: vi.fn() }
+      const fleet = new InternalFleetClient({ client: harness, logger })
+
+      const released = fleet.release('ar-stale-review', 'reconciled-missing')
+      await vi.advanceTimersByTimeAsync(250)
+      await released
+
+      expect(harness.attempts).toBe(2)
+      expect(harness.agents).toEqual([])
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory-sdk] released broker name is still present; retrying release',
+        expect.objectContaining({ name: 'ar-stale-review', attempt: 1, maxAttempts: 3 }),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-adopts tracked workers and synthesizes exits for workers missing after restart', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-1-impl' }]
+    const fleet = new InternalFleetClient({ client: harness })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+
+    fleet.hydrateTracked([
+      { name: 'ar-1-impl', invocationId: 'inv-impl' },
+      { name: 'ar-1-review', invocationId: 'inv-review' },
+    ])
+    await fleet.reconcileTrackedAgents()
+
+    expect(fleet.trackedAgents()).toEqual(new Map([
+      ['ar-1-impl', { invocationId: 'inv-impl', node: undefined }],
+    ]))
+    expect(exits).toEqual([{ name: 'ar-1-review', reason: 'reconciled-missing' }])
+
+    harness.agents = []
+    await fleet.reconcileTrackedAgents()
+    expect(fleet.trackedAgents().size).toBe(0)
+    expect(exits).toEqual([
+      { name: 'ar-1-review', reason: 'reconciled-missing' },
+      { name: 'ar-1-impl', reason: 'reconciled-missing' },
+    ])
+  })
+
+  it('filters stale broker rows through canonical presence while granting fresh local registration grace', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [
+      { name: 'ar-stale-impl', cli: 'codex' },
+      { name: 'ar-live-impl', cli: 'codex' },
+    ]
+    let nowMs = 1_000_000
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => ['ar-live-impl'],
+      now: () => nowMs,
+    })
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([
+      { name: 'ar-stale-impl', invocationId: 'inv-stale' },
+      { name: 'ar-live-impl', invocationId: 'inv-live' },
+    ])
+
+    await expect(fleet.roster()).resolves.toEqual({
+      agents: [{ name: 'ar-live-impl' }],
+      nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
+    })
+    await fleet.reconcileTrackedAgents()
+    expect(exits).toEqual(['ar-stale-impl'])
+
+    await fleet.spawn({ name: 'ar-fresh-impl', capability: 'spawn:codex' })
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }, { name: 'ar-fresh-impl' }],
+    })
+
+    nowMs += 60_000
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }],
+    })
+  })
+
+  it('preserves non-MCP and live no-MCP fallback workers when canonical presence is absent', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [
+      { name: 'ar-workflow', cli: 'relayflows' },
+      { name: 'ar-fallback-live', cli: 'codex', pid: 101 },
+      { name: 'ar-stale-dead', cli: 'claude', pid: 102 },
+    ]
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => [],
+      isProcessAlive: (pid) => pid === 101,
+    })
+
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [
+        { name: 'ar-workflow' },
+        { name: 'ar-fallback-live' },
+      ],
+    })
+  })
+
+  it('fails closed when canonical presence is unavailable instead of reviving stale broker rows', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-stale-impl', cli: 'codex' }]
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => {
+        throw new Error('presence unavailable')
+      },
+    })
+    fleet.hydrateTracked([{ name: 'ar-stale-impl', invocationId: 'inv-stale' }])
+
+    await expect(fleet.roster()).rejects.toThrow('presence unavailable')
+    await expect(fleet.reconcileTrackedAgents()).rejects.toThrow('presence unavailable')
+    expect(fleet.trackedAgents().has('ar-stale-impl')).toBe(true)
   })
 
   it('clears readiness even when releasing the agent fails', async () => {
@@ -942,7 +1094,7 @@ describe('InternalFleetClient', () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness })
 
-    await fleet.sendMessage({ to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } })
+    await fleet.sendMessage({ to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 }, mode: 'wait' })
     const injected = fleet.waitForInjected({ to: 'broker', text: 'done' }, { timeoutMs: 1000 })
     await Promise.resolve()
 
@@ -959,7 +1111,7 @@ describe('InternalFleetClient', () => {
     })
 
     expect(harness.sent).toEqual([
-      { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 } },
+      { to: 'ar-1-review', from: 'ar-1-impl', text: 'PR ready', data: { pr: 1 }, mode: 'wait' },
       { to: 'broker', text: 'done', from: undefined, data: undefined },
     ])
   })
@@ -998,6 +1150,32 @@ describe('InternalFleetClient', () => {
       eventId: 'broker-snowflake-202823817304596480',
       targets: ['ar-1-impl'],
     })
+  })
+
+  it('confirms a mismatched-id injection that races the sendMessage response', async () => {
+    class InjectionDuringSendHarnessDriverClient extends FakeHarnessDriverClient {
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        this.emit({
+          kind: 'delivery_injected',
+          name: input.to,
+          delivery_id: 'broker-delivery-1',
+          event_id: 'broker-snowflake-1',
+        })
+        return { event_id: 'http_1', targets: [input.to] }
+      }
+    }
+    const harness = new InjectionDuringSendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    await expect(fleet.waitForInjected(
+      { to: 'ar-1-impl', text: 'do work' },
+      { timeoutMs: 100 },
+    )).resolves.toEqual({
+      eventId: 'broker-snowflake-1',
+      targets: ['ar-1-impl'],
+    })
+    expect(harness.sent).toHaveLength(1)
   })
 
   it('re-sends a pending injection when its target registers through a fresh spawn', async () => {

@@ -269,7 +269,8 @@ function implementationAssignments(
 }
 
 function hasAcceptanceSignal(issue: LinearIssue): boolean {
-  return ACCEPTANCE_SIGNAL_PATTERNS.some((pattern) => pattern.test(issue.description))
+  const taskText = `${issue.title}\n${issue.description}`
+  return ACCEPTANCE_SIGNAL_PATTERNS.some((pattern) => pattern.test(taskText))
 }
 
 function issueRefFor(issue: LinearIssue): IssueRef {
@@ -290,7 +291,7 @@ function implementerSpec(input: {
   return {
     name,
     role: 'implementer',
-    capability: 'spawn:codex',
+    capability: input.config.agentCapabilities.implementer,
     model: input.config.models.implementer,
     task: taskFor(input.issue, input.route, 'implementer'),
     repo: input.route.repo,
@@ -331,7 +332,7 @@ function reviewerSpec(issue: LinearIssue, config: FactoryConfig, route?: Route):
   return {
     name: agentNameForRole(issue, 'review', { repo }),
     role: 'reviewer',
-    capability: 'spawn:claude',
+    capability: config.agentCapabilities.reviewer,
     model: config.models.reviewer,
     task: taskFor(issue, route ?? { repo, clonePath: config.repos.clonePaths[repo], rationale: 'Review escalated triage decision.' }, 'reviewer'),
     repo,
@@ -351,7 +352,7 @@ export function babysitterSpec(issue: LinearIssue, config: FactoryConfig, route?
   return {
     name: agentNameForRole(issue, 'babysit', { repo }),
     role: 'babysitter',
-    capability: 'spawn:claude',
+    capability: config.agentCapabilities.babysitter,
     model: config.models.babysitter,
     task: taskFor(issue, route ?? { repo, clonePath: config.repos.clonePaths[repo], rationale: 'Babysit the open PR to Human Review.' }, 'babysitter'),
     repo,

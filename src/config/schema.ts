@@ -90,6 +90,21 @@ const modelsSchema = z.object({
   babysitter: z.string().default('sonnet'),
 }).default({})
 
+// Which agent CLI backs each spawn role. `models.*` picks the model; this picks
+// the CLI. Restricted to the two spawn capabilities actually wired into
+// capabilityCli (internal-fleet-client.ts) — spawn:opencode / spawn:gemini would
+// resolve to an undefined CLI and are intentionally excluded until mapped.
+// Defaults preserve today's behavior (codex implements, claude reviews/babysits)
+// so existing configs are unaffected unless a role is set explicitly. The map is
+// named agentCapabilities rather than `capabilities` because the node config
+// already owns a top-level `capabilities` (advertised node capability list).
+const spawnCapabilitySchema = z.enum(['spawn:codex', 'spawn:claude'])
+const agentCapabilitiesSchema = z.object({
+  implementer: spawnCapabilitySchema.default('spawn:codex'),
+  reviewer: spawnCapabilitySchema.default('spawn:claude'),
+  babysitter: spawnCapabilitySchema.default('spawn:claude'),
+}).default({})
+
 const slackSchema = z.object({
   channel: z.string(),
   style: z.literal('threaded-summarized').default('threaded-summarized'),
@@ -99,10 +114,70 @@ const slackSchema = z.object({
   // identity, while still making parked questions immediately actionable.
   stakeholderUserIds: z.array(z.string().min(1)).default([]),
   staleAfterMs: z.number().int().min(1_000).default(10 * 60_000),
+  conversationCoalesceMs: z.number().int().min(0).max(60_000).default(750),
 }).optional()
 
 const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
+}).default({})
+
+const reportingSchema = z.object({
+  enabled: z.boolean().default(true),
+  instanceName: z.string().trim().min(1).max(256).optional(),
+  outboxPath: z.string().min(1).optional(),
+  batchSize: z.number().int().min(1).max(100).default(100),
+  requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
+}).default({})
+
+const previewServiceSchema = z.object({
+  /** Local HTTP port the repository's development server listens on. */
+  port: z.number().int().min(1).max(65_535),
+  /** Consecutive node-local ports Factory may allocate for concurrent issues. */
+  portSpan: z.number().int().min(1).max(1_000).optional(),
+  /** Optional stable tailnet HTTPS port; otherwise Factory allocates one. */
+  httpsPort: z.number().int().min(1).max(65_535).optional(),
+  /** Foreground command Factory supervises for the issue-lifetime preview. */
+  startCommand: z.string().trim().min(1),
+}).superRefine((service, ctx) => {
+  if (service.port + (service.portSpan ?? 100) - 1 > 65_535) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['portSpan'],
+      message: 'preview service port range must end at or below 65535',
+    })
+  }
+})
+
+// Tailscale Serve is deliberately the only initial provider. Unlike Funnel,
+// Serve is tailnet-only and keeps the tailnet's grants/ACLs in the request path.
+// Making the access mode a literal prevents a config typo from silently
+// publishing an unauthenticated URL to Slack or GitHub.
+const previewSchema = z.object({
+  provider: z.literal('tailscale-serve').default('tailscale-serve'),
+  access: z.literal('tailnet').default('tailnet'),
+  services: z.record(z.string(), previewServiceSchema).default({}),
+  tailscaleBinary: z.string().trim().min(1).default('tailscale'),
+  registryPath: z.string().min(1).default('~/.factory/tailscale-previews.json'),
+  httpsPortRange: z.tuple([
+    z.number().int().min(1).max(65_535),
+    z.number().int().min(1).max(65_535),
+  ]).default([10_000, 10_999]),
+}).superRefine((preview, ctx) => {
+  if (preview.httpsPortRange[0] > preview.httpsPortRange[1]) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['httpsPortRange'],
+      message: 'preview.httpsPortRange start must be less than or equal to end',
+    })
+  }
+}).optional()
+
+const githubSchema = z.object({
+  // Controls the credential identity used when Factory creates pull requests.
+  // `auto` preserves the compatibility behavior: prefer the connected
+  // workspace GitHub App, then use the operator's local `gh` authentication
+  // when the app write path is unavailable.
+  identity: z.enum(['app', 'user', 'auto']).default('auto'),
 }).default({})
 
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
@@ -151,6 +226,7 @@ const WorkspaceConfigObjectSchema = z.object({
   repos: workspaceReposSchema,
   batchSize: z.number().int().min(1).max(5).default(5),
   models: modelsSchema,
+  agentCapabilities: agentCapabilitiesSchema,
   slack: slackSchema,
   // Linear remains the default whenever its issue sub-root is connected. When
   // omitted, the orchestrator probes that sub-root once and falls back to
@@ -164,6 +240,12 @@ const WorkspaceConfigObjectSchema = z.object({
   // instead of jumping straight to `done`. Default off preserves the legacy
   // PR-open -> done behavior.
   babysitter: babysitterSchema,
+  // Authenticated run progress is a Cloud product feature, not anonymous
+  // analytics. It defaults on for real CLI sessions and remains no-op when no
+  // Cloud account is available; delivery failure never changes orchestration.
+  reporting: reportingSchema,
+  preview: previewSchema,
+  github: githubSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the
@@ -194,6 +276,7 @@ const NodeConfigObjectSchema = z.object({
   dryRun: z.boolean().default(false),
   factoryLoopHeartbeatPath: z.string().min(1).optional(),
   factoryLoopRegistryPath: z.string().min(1).optional(),
+  preview: previewSchema,
 })
 
 const FactoryConfigObjectSchema = WorkspaceConfigObjectSchema.merge(NodeConfigObjectSchema)
@@ -215,6 +298,7 @@ function normalizeWorkspaceConfig(cfg: z.infer<typeof WorkspaceConfigObjectSchem
   return {
     ...cfg,
     subscription: { ...cfg.subscription, labels },
+    preview: normalizePreviewConfig(cfg.preview),
     repos: {
       ...repos,
       byLabel: resolved.byLabel,
@@ -236,6 +320,7 @@ function normalizeNodeConfig(cfg: z.infer<typeof NodeConfigObjectSchema>) {
     clonePaths: expandClonePaths(cfg.clonePaths),
     factoryLoopHeartbeatPath: cfg.factoryLoopHeartbeatPath,
     factoryLoopRegistryPath: cfg.factoryLoopRegistryPath,
+    preview: normalizePreviewConfig(cfg.preview),
   }
 }
 
@@ -268,8 +353,10 @@ function normalizeFactoryConfig(cfg: z.infer<typeof FactoryConfigObjectSchema>) 
       heartbeatPath,
       registryPath,
     },
+    preview: normalizePreviewConfig(cfg.preview),
     repos: {
       ...(cfg.repos.org !== undefined ? { org: cfg.repos.org } : {}),
+      ...(cfg.repos.names !== undefined ? { names: cfg.repos.names } : {}),
       byLabel: resolved.byLabel,
       byProject: resolved.byProject,
       keywordRules: resolved.keywordRules,
@@ -379,6 +466,7 @@ function normalizeLoadedConfig(input: unknown): LoadedFactoryConfig {
     dryRun: factoryConfig.dryRun,
     factoryLoopHeartbeatPath: factoryConfig.loop.heartbeatPath,
     factoryLoopRegistryPath: factoryConfig.loop.registryPath,
+    preview: factoryConfig.preview,
   })
 
   return { workspaceConfig, nodeConfig, factoryConfig }
@@ -395,15 +483,37 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   validateClonePathSyntax(workspaceRepos, 'workspaceConfig.repos')
   validateClonePathSyntax(node, 'nodeConfig')
 
+  const workspacePreview = asOptionalConfigRecord(workspace.preview)
+  const nodePreview = asOptionalConfigRecord(node.preview)
+  const hasPreview = workspace.preview !== undefined || node.preview !== undefined
+
   return {
     ...workspace,
     ...node,
+    ...(hasPreview ? {
+      preview: {
+        ...workspacePreview,
+        ...nodePreview,
+        services: {
+          ...asOptionalConfigRecord(workspacePreview.services),
+          ...asOptionalConfigRecord(nodePreview.services),
+        },
+      },
+    } : {}),
     repos: {
       ...workspaceRepos,
       cloneRoot: node.cloneRoot ?? workspaceRepos.cloneRoot,
       clonePaths: node.clonePaths ?? workspaceRepos.clonePaths,
     },
   }
+}
+
+function normalizePreviewConfig<T extends z.infer<typeof previewSchema>>(preview: T): T {
+  if (!preview) return preview
+  return {
+    ...preview,
+    registryPath: expandLeadingTilde(preview.registryPath, 'preview.registryPath'),
+  } as T
 }
 
 function validateClonePathSyntax(input: Record<string, unknown>, field: string): void {
@@ -439,3 +549,5 @@ function asOptionalConfigRecord(value: unknown): Record<string, unknown> {
 export type WorkspaceConfig = z.infer<typeof WorkspaceConfigSchema>
 export type NodeConfig = z.infer<typeof NodeConfigSchema>
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>
+export type PreviewConfig = NonNullable<FactoryConfig['preview']>
+export type PreviewServiceConfig = PreviewConfig['services'][string]
