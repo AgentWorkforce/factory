@@ -199,6 +199,25 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
+  override async clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycle['lease'],
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const lifecycle = workspace?.dispatchLifecycles[key]
+      if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+        return false
+      }
+      delete workspace!.dispatchLifecycles[key]
+      if (workspaceIsEmpty(workspace!)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+      return true
+    }))
+  }
+
   override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
@@ -1042,6 +1061,13 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
 }
 
 const cloneLifecycle = (record: DispatchLifecycle): DispatchLifecycle => structuredClone(record)
+
+const dispatchLifecycleLeaseMatches = (
+  current: DispatchLifecycle['lease'],
+  expected: DispatchLifecycle['lease'],
+): boolean => current === undefined
+  ? expected === undefined
+  : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
 
 const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecycle>, exceptKey?: string): number =>
   Object.entries(lifecycles).filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
