@@ -42,6 +42,61 @@ describe('feature manifest validation', () => {
     })
   })
 
+  it('maps every v1.1 category and flattened feature to its verification procedure', () => {
+    const rootDir = temporaryDirectory()
+    writeFile(rootDir, 'src/cli.ts', 'export {}\n')
+    writeFile(rootDir, 'src/api.ts', 'export {}\n')
+    writeFile(rootDir, '.agentworkforce/features/verify/procedures.md', '## core-procedure\n')
+    writeFile(rootDir, '.agentworkforce/features/manifest.yaml', manifestV11())
+
+    expect(validateFeatureManifestFile({ rootDir })).toMatchObject({
+      version: '1.1',
+      verificationDocument: '.agentworkforce/features/verify/procedures.md',
+      categoryProcedures: { core: 'core-procedure' },
+      features: [{ id: 'feature-one', category: 'core', procedure: 'core-procedure' }],
+    })
+  })
+
+  it('requires complete and exact verification routing for v1.1 manifests', () => {
+    expect(() => validateFeatureManifest(manifestV11().replace('verification:\n', 'verification_disabled:\n')))
+      .toThrow('Manifest version 1.1 is missing verification routing')
+    expect(() => validateFeatureManifest(manifestV11().replace('    core: core-procedure', "    core: ''")))
+      .toThrow('Manifest category core has invalid verification procedure')
+    expect(() => validateFeatureManifest(manifestV11().replace(
+      '    core: core-procedure',
+      '    core: core-procedure\n    retired: retired-procedure',
+    ))).toThrow('Manifest verification maps unknown category: retired')
+  })
+
+  it('checks that the verification document exists inside the repository root', () => {
+    const rootDir = temporaryDirectory()
+    writeFile(rootDir, 'src/cli.ts', 'export {}\n')
+    writeFile(rootDir, 'src/api.ts', 'export {}\n')
+
+    expect(() => validateFeatureManifest(manifestV11(), { rootDir })).toThrow(
+      'Missing feature verification document: .agentworkforce/features/verify/procedures.md',
+    )
+    expect(() => validateFeatureManifest(
+      manifestV11().replace(
+        '.agentworkforce/features/verify/procedures.md',
+        '../procedures.md',
+      ),
+      { rootDir },
+    )).toThrow('Feature verification document must be inside the repository root')
+  })
+
+  it('requires every routed procedure heading in file-based validation', () => {
+    const rootDir = temporaryDirectory()
+    writeFile(rootDir, 'src/cli.ts', 'export {}\n')
+    writeFile(rootDir, 'src/api.ts', 'export {}\n')
+    writeFile(rootDir, '.agentworkforce/features/manifest.yaml', manifestV11())
+    writeFile(rootDir, '.agentworkforce/features/verify/procedures.md', '## wrong-procedure\n')
+
+    expect(() => validateFeatureManifestFile({ rootDir })).toThrow(
+      'Missing feature verification procedure heading: ## core-procedure',
+    )
+  })
+
   it('rejects duplicate feature IDs with the offending ID', () => {
     const raw = manifest({
       featureRows: `${featureRow()}\n${featureRow()}`,
@@ -253,6 +308,13 @@ ${options.featureRows ?? featureRow()}
 `
 }
 
+function manifestV11(): string {
+  return manifest().replace(
+    "version: '1.0'\nupdated: '2026-07-20'\n",
+    "version: '1.1'\nupdated: '2026-07-21'\nverification:\n  document: .agentworkforce/features/verify/procedures.md\n  categories:\n    core: core-procedure\n",
+  )
+}
+
 function featureRow(): string {
   return `      - id: feature-one
         name: Feature One
@@ -266,6 +328,7 @@ function feature(overrides: Partial<ManifestFeature> = {}): ManifestFeature {
   return {
     id: 'feature-one',
     name: 'Feature One',
+    category: 'core',
     cli: 'factory one',
     desc: 'Exercise the first feature',
     location: 'src/cli.ts, src/api.ts',

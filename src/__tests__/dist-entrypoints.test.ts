@@ -15,10 +15,12 @@ describe('published dist entrypoints', () => {
     const writeback = await import('../../dist/writeback/index.js')
 
     expect(featuremap.checkFeatureMap).toBeTypeOf('function')
+    expect(featuremap.generateFeatureMap).toBeTypeOf('function')
     expect(featuremap.validateFeatureManifestFile).toBeTypeOf('function')
     expect(main.FactoryConfigSchema).toBeDefined()
     expect(main.createFactory).toBeTypeOf('function')
     expect(main.createFleet).toBeTypeOf('function')
+    expect(main.generateFeatureMap).toBeTypeOf('function')
     expect(hosted.createHostedFactory).toBeTypeOf('function')
     expect(hosted.DurableObjectHostedFactoryStateStore).toBeTypeOf('function')
     expect(environments.KubernetesEnvironmentProvider).toBeTypeOf('function')

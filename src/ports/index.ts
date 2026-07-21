@@ -51,5 +51,7 @@ export type {
 } from './observability'
 export type {
   AgentWorktree,
+  AgentWorktreeCleanupInspection,
   AgentWorktreeManager,
+  AgentWorktreeRepository,
 } from './worktree'
