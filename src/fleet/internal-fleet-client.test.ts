@@ -937,6 +937,40 @@ describe('InternalFleetClient', () => {
     ])
   })
 
+  it('filters stale broker rows through canonical presence while granting fresh local registration grace', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-stale-impl' }, { name: 'ar-live-impl' }]
+    let nowMs = 1_000_000
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => ['ar-live-impl'],
+      now: () => nowMs,
+    })
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([
+      { name: 'ar-stale-impl', invocationId: 'inv-stale' },
+      { name: 'ar-live-impl', invocationId: 'inv-live' },
+    ])
+
+    await expect(fleet.roster()).resolves.toEqual({
+      agents: [{ name: 'ar-live-impl' }],
+      nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
+    })
+    await fleet.reconcileTrackedAgents()
+    expect(exits).toEqual(['ar-stale-impl'])
+
+    await fleet.spawn({ name: 'ar-fresh-impl', capability: 'spawn:codex' })
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }, { name: 'ar-fresh-impl' }],
+    })
+
+    nowMs += 60_000
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }],
+    })
+  })
+
   it('clears readiness even when releasing the agent fails', async () => {
     vi.useFakeTimers()
     try {
