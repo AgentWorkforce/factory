@@ -17347,6 +17347,56 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('completes a restored lifecycle when its exact babysat PR merged while Factory was down', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-merged-restart-'))
+    const watchStatePath = join(root, 'factory-state.json')
+    const issue = realIssueFile(425, ready, { title: 'Real merged PR restart reconciliation' })
+    const mount = new FakeMountClient({ [issuePath(425)]: issue })
+    const stateStore = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const firstFleet = new LocalLifecycleFleetClient()
+    const first = createFactory(babysitterConfig(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore: stateStore(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 425 }),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      seedPrMeta(mount, 'AgentWorkforce/pear', 425, { state: 'open', draft: false })
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(425), issue))
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit('ar-425-impl-pear', 'worker_exited')
+      await vi.waitFor(async () => expect(await stateStore().listBabysitterSessions('factory-test')).toHaveLength(1))
+      await first.stop()
+
+      seedPrMeta(mount, 'AgentWorkforce/pear', 425, { state: 'merged', merged: true, draft: false })
+      mount.files.set(issuePath(425), { content: realIssueFile(425, done, { title: 'Real merged PR restart reconciliation' }) })
+      const states: Array<{ key: string; stateId: string }> = []
+      restarted = createFactory(babysitterConfig(), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        stateStore: stateStore(),
+        linear: recordingLinear(states),
+      })
+
+      await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(async () => expect(await stateStore().getDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+      )).toMatchObject({ phase: 'complete' }))
+      await expect(stateStore().listBabysitterSessions('factory-test')).resolves.toEqual([])
+      expect(states).toContainEqual({ key: 'AR-425', stateId: done })
+      expect(restarted.status().counters.babysitterOwnershipRestoreMerged).toBe(1)
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('discards restored babysitter ownership when the persisted PR is merged and unrelated', async () => {
     const issue = { uuid: 'AgentWorkforce/pear#52', key: '52', path: githubIssuePath('AgentWorkforce', 'pear', 52) }
     const persistedKey = issueKey(issue)
