@@ -65,6 +65,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # Keep the load evidence bound to the reviewed head, matching the
+          # package job's head-bound attestation.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v6

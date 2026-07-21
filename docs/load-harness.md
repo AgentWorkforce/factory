@@ -55,6 +55,8 @@ error rate, throughput, a cumulative latency histogram, thresholds, and every
 violated metric. Request headers and bodies are deliberately omitted from
 evidence. The ephemeral ConfigMap and Job are deleted by default; pass
 `cleanup: false` when a surrounding environment teardown owns cleanup.
+The gate also fails closed with a `requestCount` violation when k6 completes
+without sending any requests, even if the profile omitted a throughput floor.
 
 Run the real kind-cluster proof with:
 

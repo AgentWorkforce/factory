@@ -82,11 +82,14 @@ export const LoadProfileSchema = z.object({
       message: 'maxVus is only used with an rps profile',
     })
   }
-  if (profile.vus !== undefined && profile.maxVus !== undefined && profile.maxVus < profile.vus) {
+  const preAllocatedVus = profile.rps === undefined
+    ? undefined
+    : (profile.vus ?? profile.rps)
+  if (profile.maxVus !== undefined && preAllocatedVus !== undefined && profile.maxVus < preAllocatedVus) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['maxVus'],
-      message: 'maxVus must be greater than or equal to vus',
+      message: 'maxVus must be greater than or equal to the preallocated vus',
     })
   }
   const sortedBuckets = [...profile.histogramBucketsMs].sort((left, right) => left - right)

@@ -140,7 +140,7 @@ const main = async (): Promise<void> => {
     }, null, 2)}\n`)
   } finally {
     if (environment) {
-      await kubectl(['delete', 'namespace', namespace, '--wait=false', '--ignore-not-found=true'])
+      await kubectl(['delete', 'namespace', namespace, '--wait=true', '--ignore-not-found=true'])
     }
   }
 }

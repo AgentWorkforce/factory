@@ -100,11 +100,43 @@ describe('load SLO gate', () => {
     ])
   })
 
-  it('extracts the machine-readable summary and fails closed on missing evidence', () => {
+  it('fails closed when a completed generator emitted no requests', () => {
+    const empty: LoadMeasurements = {
+      requestCount: 0,
+      errorCount: 0,
+      errorRate: 1,
+      throughputRps: 0,
+      durationMs: 1_000,
+      latency: {
+        minMs: 0,
+        averageMs: 0,
+        medianMs: 0,
+        maxMs: 0,
+        p95Ms: 0,
+        p99Ms: 0,
+      },
+      histogram: [
+        { upperBoundMs: 50, count: 0 },
+        { upperBoundMs: null, count: 0 },
+      ],
+    }
+
+    expect(evaluateLoadSlo(empty, { maxP95LatencyMs: 2_000 })).toEqual({
+      passed: false,
+      violations: [
+        { metric: 'requestCount', actual: 0, threshold: 1, operator: 'at-least' },
+      ],
+    })
+  })
+
+  it('extracts valid summaries and rejects missing or internally inconsistent evidence', () => {
     expect(parseK6LoadMeasurements(
       `noise\n${K6_EVIDENCE_PREFIX}${JSON.stringify(measurements)}\n`,
     )).toEqual(measurements)
     expect(() => parseK6LoadMeasurements('ordinary k6 output')).toThrow(/without Factory evidence JSON/u)
+    expect(() => parseK6LoadMeasurements(
+      `${K6_EVIDENCE_PREFIX}${JSON.stringify({ ...measurements, errorCount: 1_001 })}\n`,
+    )).toThrow(/errorCount: must not exceed requestCount/u)
   })
 })
 
@@ -227,5 +259,14 @@ thresholds:
     const loaded = await loadLoadProfile(path)
     expect(loaded.targets[0]).toMatchObject({ method: 'GET', weight: 1 })
     expect(loaded.histogramBucketsMs).toContain(1_000)
+  })
+
+  it('rejects an arrival-rate profile whose maxVus is below its default preallocation', () => {
+    expect(() => LoadProfileSchema.parse({
+      ...profile,
+      vus: undefined,
+      rps: 100,
+      maxVus: 50,
+    })).toThrow(/preallocated vus/u)
   })
 })
