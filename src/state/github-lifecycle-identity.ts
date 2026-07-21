@@ -10,7 +10,9 @@ import type { DispatchLifecycle } from '../ports/state'
 export const githubLifecycleIdentity = (
   lifecycle: Pick<DispatchLifecycle, 'issue'>,
 ): string | undefined => {
-  const match = lifecycle.issue.path.match(
+  const path = lifecycle?.issue?.path
+  if (!path) return undefined
+  const match = path.match(
     /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/issues\/(?:(?:by-id\/)?(\d+)\.json|(\d+)(?:__[^/]*)?\/(?:meta|metadata)\.json)$/u,
   )
   const owner = match?.[1] ?? match?.[3]
@@ -26,16 +28,19 @@ export const matchingGithubLifecycleEntry = <T extends DispatchLifecycle>(
 ): [string, T] | undefined => {
   const identity = githubLifecycleIdentity(seed)
   if (!identity) return undefined
-  return [...lifecycles]
-    .filter(([, lifecycle]) => githubLifecycleIdentity(lifecycle) === identity)
-    .sort(compareLifecycleCandidates)[0]
+  let best: [string, T] | undefined
+  for (const entry of lifecycles) {
+    if (githubLifecycleIdentity(entry[1]) !== identity) continue
+    if (!best || compareLifecycleCandidates(entry, best) < 0) best = entry
+  }
+  return best
 }
 
 const compareLifecycleCandidates = (
   [leftKey, left]: [string, DispatchLifecycle],
   [rightKey, right]: [string, DispatchLifecycle],
 ): number => lifecycleRank(left) - lifecycleRank(right) ||
-  right.updatedAtMs - left.updatedAtMs ||
+  (right.updatedAtMs ?? 0) - (left.updatedAtMs ?? 0) ||
   leftKey.localeCompare(rightKey)
 
 const lifecycleRank = (lifecycle: DispatchLifecycle): number => {
