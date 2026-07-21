@@ -45,6 +45,7 @@ export function resolveManifestPath(workspaceDir: string): string {
   return `${workspaceDir}/${FACTORY_REPO_RELPATH}/${MANIFEST_RELPATH}`;
 }
 
+/** Load and parse features from the Factory checkout mounted in the proactive workspace. */
 async function loadFeatures(ctx: WorkforceCtx): Promise<Feature[]> {
   const absPath = resolveManifestPath(ctx.sandbox.cwd);
   const raw = await ctx.sandbox.readFile(absPath);
@@ -91,6 +92,7 @@ export interface ProgressStore {
 
 type FetchLike = typeof fetch;
 
+/** Signals that the exact Relayfile revision changed before a state write completed. */
 export class ProgressStateConflictError extends Error {
   constructor(message = 'factory-feature-guardian cycle state revision conflict') {
     super(message);
@@ -98,26 +100,31 @@ export class ProgressStateConflictError extends Error {
   }
 }
 
+/** Return whether an unknown value is a non-array object record. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Return whether a value is a canonical ISO-8601 timestamp. */
 function isCanonicalIsoTimestamp(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const parsed = new Date(value);
   return Number.isFinite(parsed.valueOf()) && parsed.toISOString() === value;
 }
 
+/** Return whether a value has Slack's provider timestamp format. */
 function isSlackTs(value: unknown): value is string {
   return typeof value === 'string' && /^\d+\.\d+$/.test(value.trim());
 }
 
+/** Reject cycle state that exceeds the bounded Relayfile record size. */
 function assertStateSize(content: string): void {
   if (UTF8_ENCODER.encode(content).byteLength > MAX_STATE_BYTES) {
     throw new Error('cycle state exceeds size limit');
   }
 }
 
+/** Parse untrusted persisted state into the exact current progress-state contract. */
 function parseProgressState(
   value: unknown,
   features: Feature[],
@@ -193,6 +200,7 @@ function parseProgressState(
   };
 }
 
+/** Return checked feature IDs that no longer exist in the current manifest. */
 function retiredFeatureIds(state: ProgressState, features: Feature[]): string[] {
   const currentIds = new Set(features.map((feature) => feature.id));
   return state.checkedIds.filter((id) => !currentIds.has(id));
@@ -238,6 +246,7 @@ function classifyManifestDelta(state: ProgressState, features: Feature[]): Manif
   };
 }
 
+/** Enforce append-only checkpoints and explicit generation-reset invariants. */
 function assertValidTransition(
   previous: ProgressSnapshot | null,
   next: ProgressState,
@@ -286,6 +295,7 @@ function assertValidTransition(
   }
 }
 
+/** Run an abort-aware asynchronous operation with a hard deadline. */
 async function withDeadline<T>(
   label: string,
   timeoutMs: number,
@@ -306,10 +316,12 @@ async function withDeadline<T>(
   }
 }
 
+/** Normalize weak or quoted HTTP ETags to the Relayfile revision value. */
 function normalizeEtag(value: string | null): string {
   return (value ?? '').trim().replace(/^W\//, '').replace(/^"|"$/g, '');
 }
 
+/** Build the exact Relayfile file endpoint for the guardian cycle state. */
 function relayfileStateUrl(credentials: RelayfileCredentials): URL {
   const url = new URL(
     `/v1/workspaces/${encodeURIComponent(credentials.workspaceId)}/fs/file`,
@@ -319,6 +331,7 @@ function relayfileStateUrl(credentials: RelayfileCredentials): URL {
   return url;
 }
 
+/** Build authenticated headers shared by guardian state requests. */
 function requestHeaders(credentials: RelayfileCredentials, correlationId: string): HeadersInit {
   return {
     Authorization: `Bearer ${credentials.token}`,
@@ -326,6 +339,7 @@ function requestHeaders(credentials: RelayfileCredentials, correlationId: string
   };
 }
 
+/** Read, validate, and revision-bind one guardian state snapshot from Relayfile. */
 async function readHttpSnapshot(
   credentials: RelayfileCredentials,
   features: Feature[],
@@ -366,6 +380,7 @@ async function readHttpSnapshot(
   };
 }
 
+/** Create a compare-and-set progress store backed by the Relayfile HTTP API. */
 export function createHttpProgressStore(
   credentials: RelayfileCredentials,
   options: { fetchImpl?: FetchLike; timeoutMs?: number } = {}
@@ -423,10 +438,12 @@ export function createHttpProgressStore(
   };
 }
 
+/** Derive a deterministic in-preview revision from canonical state. */
 function previewRevision(state: ProgressState): string {
   return `preview:${JSON.stringify(state)}`;
 }
 
+/** Create the simulation-only progress store backed by the preview file API. */
 function createPreviewProgressStore(ctx: WorkforceCtx): ProgressStore {
   const read = async (features: Feature[], allowHistoricalIds = false): Promise<ProgressSnapshot | null> => {
     let content: string;
@@ -464,6 +481,7 @@ function createPreviewProgressStore(ctx: WorkforceCtx): ProgressStore {
   };
 }
 
+/** Select the exact production store or the explicitly constrained simulation store. */
 function createProgressStore(ctx: WorkforceCtx): ProgressStore {
   const credentials = ctx.credentials.tryRequire();
   if (credentials) return createHttpProgressStore(credentials.relayfile);
@@ -473,10 +491,12 @@ function createProgressStore(ctx: WorkforceCtx): ProgressStore {
   throw new Error('exact Relayfile credentials are required for guardian cycle state');
 }
 
+/** Build the stable Slack idempotency key for one feature in one guardian cycle. */
 export function featurePostIdempotencyKey(cycleStartedAt: string, featureId: string): string {
   return `factory-feature-guardian:${cycleStartedAt}:${featureId}`;
 }
 
+/** Extract and validate the delivered Slack timestamp from a writeback receipt. */
 export function deliveredSlackTs(result: WritebackResult | null | undefined): string {
   const receipt = result?.receipt as { externalId?: unknown; ts?: unknown } | undefined;
   const externalId = typeof receipt?.externalId === 'string' ? receipt.externalId.trim() : '';
@@ -487,6 +507,7 @@ export function deliveredSlackTs(result: WritebackResult | null | undefined): st
 
 // ── feature selection ─────────────────────────────────────────────────────────
 
+/** Select the highest-priority unchecked feature using criticality and tier ordering. */
 function pickNextFeature(features: Feature[], checkedIds: Set<string>): Feature | null {
   const critOrder: Record<Criticality, number> = { critical: 0, hot: 1, standard: 2 };
   const ordered = [...features].sort((a, b) => {
@@ -499,6 +520,7 @@ function pickNextFeature(features: Feature[], checkedIds: Set<string>): Feature 
 
 // ── quiz generation ───────────────────────────────────────────────────────────
 
+/** Generate a drift-check question with a deterministic fallback when the LLM is unavailable. */
 async function generateQuizMessage(ctx: WorkforceCtx, feature: Feature): Promise<string> {
   const surface = [
     feature.cli ? `CLI command: ${feature.cli}` : null,
@@ -556,6 +578,7 @@ export interface GuardianDependencies {
   createSlackClient?: typeof slackClient;
 }
 
+/** Execute one fail-closed guardian tick from manifest load through durable Slack checkpoint. */
 export async function runGuardian(
   ctx: WorkforceCtx,
   _event: WorkforceEvent,

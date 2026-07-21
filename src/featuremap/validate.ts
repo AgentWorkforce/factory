@@ -205,6 +205,7 @@ export function findFeatureLocationDrift(
   return advisories.sort((left, right) => left.featureId.localeCompare(right.featureId))
 }
 
+/** Parse YAML while preserving manifest-specific validation errors. */
 function parseManifestYaml(raw: string): Record<string, unknown> {
   try {
     return requireRecord(parse(raw) as unknown, 'Manifest root must be an object')
@@ -215,10 +216,12 @@ function parseManifestYaml(raw: string): Record<string, unknown> {
   }
 }
 
+/** Escape a literal procedure name for use in a regular expression. */
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 }
 
+/** Validate and normalize one feature within its category and procedure route. */
 function validateFeature(
   input: unknown,
   category: string,
@@ -261,6 +264,7 @@ function validateFeature(
   }
 }
 
+/** Validate the v1.1 category-to-procedure routing contract. */
 function validateVerification(
   input: unknown,
   categoryIds: readonly string[],
@@ -297,6 +301,7 @@ function validateVerification(
   return { document, categoryProcedures }
 }
 
+/** Confirm declared catalog and tier totals match parsed features. */
 function validateCatalogSummary(
   inputCatalog: unknown,
   categoryCount: number,
@@ -321,6 +326,7 @@ function validateCatalogSummary(
   }
 }
 
+/** Validate every comma-delimited repository location for every feature. */
 function validateFeatureLocations(
   features: readonly ManifestFeature[],
   rootDir: string,
@@ -337,6 +343,7 @@ function validateFeatureLocations(
   }
 }
 
+/** Require a declared path to stay inside the repository and exist. */
 function validateRepositoryPath(
   path: string,
   rootDir: string,
@@ -360,6 +367,7 @@ function validateRepositoryPath(
   }
 }
 
+/** Return whether a feature was explicitly reconfirmed after its source path changed. */
 function featureConfirmationChanged(base: ManifestFeature, head: ManifestFeature): boolean {
   return base.desc !== head.desc ||
     base.tier !== head.tier ||
@@ -369,10 +377,12 @@ function featureConfirmationChanged(base: ManifestFeature, head: ManifestFeature
       featureLocations(head).map(normalizeRepositoryPath).join('\n')
 }
 
+/** Normalize a repository-relative path for drift comparisons. */
 function normalizeRepositoryPath(path: string): string {
   return path.trim().replaceAll('\\', '/').replace(/^\.\//u, '').replace(/\/$/u, '')
 }
 
+/** Read a non-negative safe integer from the catalog summary. */
 function catalogInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new Error(`Manifest catalog is missing a valid ${label}`)
@@ -380,6 +390,7 @@ function catalogInteger(value: unknown, label: string): number {
   return value as number
 }
 
+/** Narrow an unknown manifest value to a non-array object record. */
 function requireRecord(value: unknown, message: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(message)
@@ -387,10 +398,12 @@ function requireRecord(value: unknown, message: string): Record<string, unknown>
   return value as Record<string, unknown>
 }
 
+/** Return a trimmed string only when it contains content. */
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
+/** Narrow a value to a supported feature criticality. */
 function isCriticality(value: unknown): value is FeatureCriticality {
   return value === 'critical' || value === 'hot' || value === 'standard'
 }
