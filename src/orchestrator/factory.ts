@@ -5066,6 +5066,7 @@ export class FactoryLoop implements Factory {
     if (isCompletionReason(reason)) {
       if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,
+        preferExactBranch: tracingReconciledExit,
       }, exiting)) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
         else if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
@@ -5120,6 +5121,7 @@ export class FactoryLoop implements Factory {
       const hasCompletionPr = tracked.spec.role === 'implementer'
         ? await this.#issueHasCompletionPr(record, {
             openOnly: this.#config.babysitter.enabled,
+            preferExactBranch: tracingReconciledExit,
           }, tracked)
         : false
       if (tracingReconciledExit) {
@@ -5913,7 +5915,7 @@ export class FactoryLoop implements Factory {
 
   async #issueHasCompletionPr(
     record: InFlightIssue,
-    opts: { openOnly?: boolean } = {},
+    opts: { openOnly?: boolean; preferExactBranch?: boolean } = {},
     implementer?: TrackedAgent,
   ): Promise<boolean> {
     try {
@@ -5921,13 +5923,13 @@ export class FactoryLoop implements Factory {
       if (!issue) {
         return false
       }
-      // Babysitter handoff only accepts an open, ready PR. The implementer's
-      // deterministic branch is therefore the strongest and cheapest lookup,
-      // even for a single-repository issue. Avoid scanning mounted PR metadata
-      // across every configured repository during startup recovery.
+      // During startup recovery, the implementer's deterministic branch is the
+      // strongest and cheapest lookup. Avoid scanning mounted PR metadata across
+      // every configured repository. Normal event-driven exits keep using the
+      // webhook-fed mount so they do not introduce a GitHub API dependency.
       if (
         implementer?.spec.branch &&
-        (opts.openOnly || record.decision.implementers.length > 1)
+        (opts.preferExactBranch || record.decision.implementers.length > 1)
       ) {
         const sourceOwner = record.issue.path
           ? githubIssuePathParts(record.issue.path)?.owner
