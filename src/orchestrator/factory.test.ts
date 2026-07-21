@@ -686,6 +686,21 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   }
 }
 
+class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
+  readonly terminal: Array<{ name: string; reason?: string }> = []
+
+  override async roster() {
+    return {
+      agents: [],
+      nodes: [{ name: 'sf-mini', capabilities: ['spawn:codex' as const, 'spawn:claude' as const], live: true }],
+    }
+  }
+
+  markAgentTerminal(name: string, reason?: string): void {
+    this.terminal.push({ name, reason })
+  }
+}
+
 class LocalLifecycleFleetClient extends FakeFleetClient {
   readonly durableOwnership = true
 }
@@ -5512,6 +5527,54 @@ describe('FactoryLoop', () => {
       expect(restarted.status().inFlight.map((entry) => entry.key)).toEqual(['AR-590'])
       expect([...restartedFleet.trackedAgents().keys()].sort()).toEqual(names)
       expect(harness.spawned).toHaveLength(spawnCountBeforeRestart)
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('synthesizes durable exits when fleet reconciliation misses agents absent from the live roster', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-missing-startup-roster-'))
+    const watchStatePath = join(root, 'state.json')
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const path = issuePath(595)
+    const mount = new FakeMountClient({ [path]: issueFile(595) })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const factoryConfig = config({ loop: { registryPath, heartbeatPath } })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issueFile(595)))
+      await first.dispatch(decision)
+      await first.stop()
+
+      const restartedFleet = new MissingHydratedRosterFleetClient()
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      expect(restartedFleet.terminal).toEqual([
+        { name: 'ar-595-impl-pear', reason: 'reconciled-missing' },
+        { name: 'ar-595-review', reason: 'reconciled-missing' },
+      ])
+      expect(restartedFleet.spawns.map((spawn) => spawn.name).sort()).toEqual([
+        'ar-595-impl-pear',
+        'ar-595-review',
+      ])
+      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'running' })
+      expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(2)
     } finally {
       await restarted?.stop()
       await first.stop()
