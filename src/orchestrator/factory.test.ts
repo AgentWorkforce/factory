@@ -5257,8 +5257,10 @@ describe('FactoryLoop', () => {
       // The replacement starts while the crashed owner's nominal lease is
       // still live. It must attach without hydrating/spawning/publishing, then
       // autonomously take over after expiry with no second start or event.
-      const restartedFleet = new RemoteLifecycleFleetClient()
-      restartedFleet.exitImplementerOnReconcile = true
+      // The real relay SDK may suppress a replayed exit before Factory sees
+      // it. Return an empty authoritative roster without emitting any exit to
+      // prove lease takeover synthesizes the missing lifecycle transitions.
+      const restartedFleet = new MissingHydratedRosterFleetClient('never')
       const restartedLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
       const restarted = createFactory(config(), {
         mount,
@@ -5290,6 +5292,11 @@ describe('FactoryLoop', () => {
       })
 
       expect(restartedFleet.hydrated.map((agent) => agent.name).sort()).toEqual(['ar-85-impl-pear', 'ar-85-review'])
+      expect(restartedFleet.terminal).toEqual([
+        { name: 'ar-85-impl-pear', reason: 'reconciled-missing' },
+        { name: 'ar-85-review', reason: 'reconciled-missing' },
+      ])
+      expect(restarted.status().counters.takeoverRosterMissingExitsSynthesized).toBe(2)
       expect(publishInputs).toEqual([expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         headRef: expect.stringMatching(/^factory\/ar-85-agentworkforce-pear-[0-9a-f]{8}$/u),
