@@ -24,7 +24,7 @@ export interface HarnessDriverClientLike {
   readonly brokerPid?: number
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
-  listAgents(): Promise<Array<Pick<ListAgent, 'name'> & { pid?: number }>>
+  listAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>>
   sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }>
   sendInput(name: string, data: string): Promise<unknown>
   connectEvents?(sinceSeq?: number): void
@@ -50,6 +50,8 @@ export interface InternalFleetClientOptions {
   workspaceKey?: string
   /** Canonical cloud liveness lookup. Injected by tests; derived from workspaceKey in production. */
   listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
+  /** Local process-liveness probe used to preserve workers that intentionally run without Relay MCP presence. */
+  isProcessAlive?: (pid: number) => boolean
   now?: () => number
   resumeCapability?: Capability
   logger?: Logger
@@ -109,6 +111,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #connectionPath?: string
   readonly #workspaceKey?: string
   readonly #listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
+  readonly #isProcessAlive: (pid: number) => boolean
   readonly #now: () => number
   readonly #resumeCapability: Capability
   readonly #logger?: Logger
@@ -153,6 +156,7 @@ export class InternalFleetClient implements FleetClient {
         .map((agent) => agent.agentName)
     }
     this.#now = options.now ?? Date.now
+    this.#isProcessAlive = options.isProcessAlive ?? isProcessAlive
     this.#resumeCapability = options.resumeCapability ?? 'spawn:codex'
     this.#logger = options.logger ? normalizeLogger(options.logger) : undefined
     this.#resolveAgentRelayMcpCommand = options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand
@@ -863,7 +867,7 @@ export class InternalFleetClient implements FleetClient {
     this.#notifyIfActiveAgentsDrained()
   }
 
-  async #listLiveAgents(): Promise<Array<Pick<ListAgent, 'name'> & { pid?: number }>> {
+  async #listLiveAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>> {
     if (!this.#listCanonicalOnlineAgentNames) return this.#client.listAgents()
 
     const [agents, canonicalOnlineAgentNames] = await Promise.all([
@@ -875,7 +879,16 @@ export class InternalFleetClient implements FleetClient {
     return agents.filter((agent) => {
       if (online.has(agent.name)) return true
       const spawnedAtMs = this.#locallySpawnedAtMs.get(agent.name)
-      return spawnedAtMs !== undefined && nowMs - spawnedAtMs < CANONICAL_PRESENCE_REGISTRATION_GRACE_MS
+      if (spawnedAtMs !== undefined && nowMs - spawnedAtMs < CANONICAL_PRESENCE_REGISTRATION_GRACE_MS) {
+        return true
+      }
+      // Relayflows and custom CLIs do not register through the Relay MCP
+      // harness. Codex/Claude can also intentionally use the supported
+      // no-MCP fallback when that command is unavailable. Preserve any such
+      // worker while its broker-reported process is actually alive; only dead
+      // MCP-capable rows are safe to classify as historical inventory.
+      if (agent.cli !== 'codex' && agent.cli !== 'claude') return true
+      return agent.pid !== undefined && this.#isProcessAlive(agent.pid)
     })
   }
 
@@ -966,6 +979,15 @@ function connectionPathForCwd(cwd: string | undefined): string | undefined {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return !(error instanceof Error && 'code' in error && error.code === 'ESRCH')
+  }
+}
 
 function isRetryableReleaseError(error: unknown): boolean {
   // HarnessDriverProtocolError carries a first-class `retryable` flag. Duck-type
