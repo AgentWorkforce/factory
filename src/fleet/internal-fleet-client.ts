@@ -864,10 +864,13 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async #listLiveAgents(): Promise<Array<Pick<ListAgent, 'name'> & { pid?: number }>> {
-    const agents = await this.#client.listAgents()
-    if (!this.#listCanonicalOnlineAgentNames) return agents
+    if (!this.#listCanonicalOnlineAgentNames) return this.#client.listAgents()
 
-    const online = new Set(await this.#listCanonicalOnlineAgentNames())
+    const [agents, canonicalOnlineAgentNames] = await Promise.all([
+      this.#client.listAgents(),
+      this.#listCanonicalOnlineAgentNames(),
+    ])
+    const online = new Set(canonicalOnlineAgentNames)
     const nowMs = this.#now()
     return agents.filter((agent) => {
       if (online.has(agent.name)) return true
