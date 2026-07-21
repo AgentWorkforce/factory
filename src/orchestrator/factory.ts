@@ -5730,16 +5730,22 @@ export class FactoryLoop implements Factory {
 
   async #reapOrphanedWorktreesOnStartup(legacyRegistry?: FactoryInFlightRegistry): Promise<void> {
     if (!this.#worktrees) return
+    const legacyAgents = (legacyRegistry?.agents ?? []).filter((agent) => agent.issue)
     let durableLifecycles: Array<[string, DispatchLifecycle]>
     let waitingClarifications: Array<[string, WaitingClarification]>
+    let onlineAgentNames: Set<string>
     try {
-      [durableLifecycles, waitingClarifications] = await Promise.all([
+      const [lifecycles, clarifications, roster] = await Promise.all([
         this.#state.listDispatchLifecycles(this.#workspaceId),
         this.#state.listWaitingClarifications(this.#workspaceId),
+        legacyAgents.length > 0 ? this.#fleet.roster() : undefined,
       ])
+      durableLifecycles = lifecycles
+      waitingClarifications = clarifications
+      onlineAgentNames = new Set((roster?.agents ?? []).map((agent) => agent.name))
     } catch (error) {
       this.#increment('agentWorktreeCleanupFailures')
-      this.#logger.warn?.('[factory] startup worktree reaper skipped because active lifecycle state could not be loaded', {
+      this.#logger.warn?.('[factory] startup worktree reaper skipped because active lifecycle or roster state could not be loaded', {
         error: describeError(error).errorMessage,
       })
       return
@@ -5754,8 +5760,10 @@ export class FactoryLoop implements Factory {
     for (const [, waiting] of waitingClarifications) {
       activeIssueSlugs.add(factoryWorktreeIssueSlug(waiting.issue.key))
     }
-    for (const agent of legacyRegistry?.agents ?? []) {
-      if (agent.issue) activeIssueSlugs.add(factoryWorktreeIssueSlug(agent.issue.key))
+    for (const agent of legacyAgents) {
+      if (agent.issue && onlineAgentNames.has(agent.name)) {
+        activeIssueSlugs.add(factoryWorktreeIssueSlug(agent.issue.key))
+      }
     }
     const candidates = new Map<string, AgentWorktree>()
     let reaped = 0

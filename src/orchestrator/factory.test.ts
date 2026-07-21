@@ -16302,6 +16302,83 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.stop()
   })
 
+  it('reaps a clean startup orphan referenced only by a stale legacy registry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-stale-legacy-worktree-'))
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issue = { uuid: 'uuid-903', key: 'AR-903', path: issuePath(903) }
+    await writeFile(registryPath, JSON.stringify({
+      pid: 99_903,
+      updatedAt: new Date(0).toISOString(),
+      updatedAtMs: 0,
+      agents: [{ name: 'ar-903-impl-pear', role: 'implementer', issue, pids: [] }],
+    }))
+    const worktrees = new RecordingWorktreeManager()
+    const orphan: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: issue.key,
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-903-pear-11111111',
+      branch: 'factory/ar-903-pear-11111111',
+    }
+    worktrees.listed.push(orphan)
+    const factory = createFactory(config({ loop: { registryPath, heartbeatPath } }), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      worktrees,
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(worktrees.cleaned).toEqual([orphan])
+      expect(factory.status().counters.agentWorktreesReapedOnStartup).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retains a clean startup worktree for an online legacy-registry agent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-online-legacy-worktree-'))
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issue = { uuid: 'uuid-904', key: 'AR-904', path: issuePath(904) }
+    const agentName = 'ar-904-impl-pear'
+    await writeFile(registryPath, JSON.stringify({
+      pid: 99_904,
+      updatedAt: new Date().toISOString(),
+      updatedAtMs: Date.now(),
+      agents: [{ name: agentName, role: 'implementer', issue, pids: [] }],
+    }))
+    const fleet = new FakeFleetClient()
+    fleet.hydrateTracked([{ name: agentName }])
+    const worktrees = new RecordingWorktreeManager()
+    const active: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: issue.key,
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-904-pear-11111111',
+      branch: 'factory/ar-904-pear-11111111',
+    }
+    worktrees.listed.push(active)
+    const factory = createFactory(config({ loop: { registryPath, heartbeatPath } }), {
+      mount: new FakeMountClient(),
+      fleet,
+      worktrees,
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(worktrees.cleaned).toEqual([])
+      expect(factory.status().counters.agentWorktreesReapedOnStartup).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('releases failed-dispatch agents before cleaning their isolated worktree', async () => {
     const issue = realIssueFile(408, ready, { title: '[factory-e2e] Failed dispatch worktree cleanup' })
     const mount = new FakeMountClient({ [issuePath(408)]: issue })
