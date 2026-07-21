@@ -232,17 +232,25 @@ export class RelayFleetClient implements FleetClient {
 
   async roster(): Promise<RosterEntry> {
     const messaging = await this.#ensureMessaging()
-    const [presence, nodes] = await Promise.all([
+    const [presence, agents, nodes] = await Promise.all([
       // Presence is the SDK's canonical liveness surface. Agent-scoped list
       // responses can omit status and normalize those rows to `unknown`, which
       // made dead deterministic names look live and suppressed recovery.
       messaging.agents.presence(),
+      // List data is supplemental metadata only; its status is never used to
+      // decide liveness.
+      messaging.agents.list({ status: 'all' }),
       messaging.nodes.list(),
     ])
+    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
     return {
       agents: presence
         .filter((agent) => agent.status === 'online')
-        .map((agent) => ({ name: agent.agentName })),
+        .map((agent) => {
+          const record = asRecord(agentsByName.get(agent.agentName))
+          const node = readString(record, 'node', 'node_id', 'nodeId')
+          return { name: agent.agentName, ...(node ? { node } : {}) }
+        }),
       nodes: nodes.map((node) => ({
         name: node.name,
         capabilities: normalizeCapabilities(node.capabilities),

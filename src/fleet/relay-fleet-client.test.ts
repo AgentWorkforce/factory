@@ -32,7 +32,7 @@ class FakeMessaging {
   readonly handlers = new Map<string, Set<EventHandler>>()
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
-  agentRows: Array<{ name: string; status?: string }> = []
+  agentRows: Array<{ name: string; status?: string; node?: string }> = []
   agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
   directError: Error | undefined
@@ -298,9 +298,9 @@ describe('RelayFleetClient', () => {
     // An agent-scoped list can leak status-less rows normalized as `unknown`.
     // Canonical presence must be the sole liveness authority.
     messaging.agentRows = [
-      { name: 'ar-1-impl', status: 'online' },
+      { name: 'ar-1-impl', status: 'unknown', node: 'alpha' },
       { name: 'ar-stale-impl', status: 'offline' },
-      { name: 'ar-registering-review', status: 'unknown' },
+      { name: 'ar-registering-review', status: 'unknown', node: 'beta' },
     ]
     messaging.agentPresenceRows = [
       { agentId: 'agent-1', agentName: 'ar-1-impl', status: 'online' },
@@ -318,13 +318,13 @@ describe('RelayFleetClient', () => {
     const fleet = createClient(messaging)
 
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }],
+      agents: [{ name: 'ar-1-impl', node: 'alpha' }],
       nodes: [
         { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run'], live: true },
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
       ],
     })
-    expect(messaging.agentListFilters).toEqual([])
+    expect(messaging.agentListFilters).toEqual([{ status: 'all' }])
     expect(messaging.agentPresenceCalls).toBe(1)
   })
 
