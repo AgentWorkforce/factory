@@ -5237,7 +5237,13 @@ export class FactoryLoop implements Factory {
 
       const existing = this.#resumeInFlight.get(recoveryKey)
       if (existing) {
-        await existing
+        try {
+          await existing
+        } catch {
+          // The initiating recovery handler owns classification and logging.
+          // Followers only coalesce onto its lifetime and must not re-report
+          // the same failure.
+        }
         return
       }
 
