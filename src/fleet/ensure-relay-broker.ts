@@ -42,6 +42,30 @@ export interface RelayBrokerHandle {
 const NODE_DELIVERY_TIMEOUT_MS = 45_000
 const NODE_DELIVERY_POLL_MS = 250
 
+function nodeDeliveryTimeoutError(timeoutMs: number): Error {
+  return new Error(
+    `Relay broker is reachable, but its cloud node delivery did not become ready within ${timeoutMs}ms`,
+  )
+}
+
+async function getStatusBeforeDeadline(
+  client: HarnessDriverClientLike,
+  remainingMs: number,
+  timeoutMs: number,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => client.getStatus?.()),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(nodeDeliveryTimeoutError(timeoutMs)), remainingMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function waitForNodeDelivery(
   client: HarnessDriverClientLike,
   options: Pick<EnsureRelayBrokerOptions, 'nodeDeliveryTimeoutMs' | 'nodeDeliveryPollMs' | 'sleep'>,
@@ -54,16 +78,16 @@ async function waitForNodeDelivery(
   const deadline = Date.now() + timeoutMs
 
   for (;;) {
-    const status = await client.getStatus()
+    const status = await getStatusBeforeDeadline(
+      client,
+      Math.max(0, deadline - Date.now()),
+      timeoutMs,
+    )
     // Older brokers do not report node delivery. Preserve compatibility with
     // them; current brokers must confirm their Relaycast node connection before
     // Factory can safely spawn workers whose task delivery depends on it.
     if (!status || !status.node_delivery || status.node_delivery.connected === true) return
-    if (Date.now() >= deadline) {
-      throw new Error(
-        `Relay broker is reachable, but its cloud node delivery did not become ready within ${timeoutMs}ms`,
-      )
-    }
+    if (Date.now() >= deadline) throw nodeDeliveryTimeoutError(timeoutMs)
     await sleep(pollMs)
   }
 }

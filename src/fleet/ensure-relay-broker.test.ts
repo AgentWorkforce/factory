@@ -220,6 +220,23 @@ describe('ensureRelayBroker', () => {
     expect(client.shutdown).toHaveBeenCalledOnce()
   })
 
+  it('bounds a stalled broker status poll by the node-delivery deadline', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(() => new Promise(() => {}))
+    client.shutdown = vi.fn(async () => {})
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 5,
+    })).rejects.toThrow(
+      'Relay broker is reachable, but its cloud node delivery did not become ready within 5ms',
+    )
+
+    expect(client.shutdown).toHaveBeenCalledOnce()
+  })
+
   it('preserves the node-delivery error when spawned-broker cleanup also fails', async () => {
     const client = fakeClient('spawned')
     client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
