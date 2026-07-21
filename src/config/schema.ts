@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 import { z } from 'zod'
 
+import { CloudflareEnvironmentConfigSchema } from '../environments/cloudflare-provider.js'
 import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
 
 // The five workflow-state roles the factory drives an issue through. Each is
@@ -225,6 +226,7 @@ const safetySchema = z.object({
 }).default({})
 
 const environmentsSchema = z.object({
+  cloudflare: CloudflareEnvironmentConfigSchema.optional(),
   kubernetes: KubernetesEnvironmentConfigSchema.optional(),
 }).strict().default({})
 

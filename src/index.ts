@@ -366,6 +366,36 @@ export type {
 } from './environments/verification-stack-deployer'
 export { KubernetesEnvironmentProvider } from './environments/kubernetes-provider'
 export type { KubernetesEnvironmentProviderOptions } from './environments/kubernetes-provider'
+export {
+  CLOUDFLARE_ENVIRONMENT_BINDINGS,
+  CLOUDFLARE_ENVIRONMENT_TAG,
+  CLOUDFLARE_MANAGED_TAG,
+  CLOUDFLARE_METADATA_SCRIPT,
+  CloudflareApiError,
+  CloudflareEnvironmentConfigSchema,
+  CloudflareEnvironmentProvider,
+  CloudflareEnvironmentQuotaError,
+  CloudflareEnvironmentReaper,
+  CloudflareEnvironmentResourceSchema,
+  CloudflareProvisionStackSchema,
+  HttpCloudflareEnvironmentClient,
+  cloudflareEnvironmentName,
+} from './environments/cloudflare-provider'
+export type {
+  CloudflareDispatchNamespace,
+  CloudflareEnvironmentClient,
+  CloudflareEnvironmentConfig,
+  CloudflareEnvironmentConfigInput,
+  CloudflareEnvironmentProviderOptions,
+  CloudflareEnvironmentProviderResourceOptions,
+  CloudflareEnvironmentResource,
+  CloudflareProvisionSpec,
+  CloudflareProvisionStack,
+  CloudflareReapReport,
+  CloudflareWorkerBinding,
+  HttpCloudflareEnvironmentClientOptions,
+  UploadCloudflareWorkerInput,
+} from './environments/cloudflare-provider'
 export { CommandExecutionError, ProcessCommandRunner } from './environments/kubernetes-command'
 export type {
   CommandResult,

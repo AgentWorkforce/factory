@@ -129,6 +129,50 @@ describe('FactoryConfigSchema', () => {
     })).toThrow(/never inline kubeconfig/iu)
   })
 
+  it('accepts source-control-safe Cloudflare policy with only a Resource-style credential reference', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      environments: {
+        cloudflare: {
+          resource: 'FactoryVerificationInfra',
+          dispatchNamespacePrefix: 'factory-ci',
+          maxConcurrentEnvironments: 4,
+          defaultTtlMs: 10 * 60_000,
+          maxTtlMs: 30 * 60_000,
+          maxRunCostUsd: 0.5,
+          workerLimits: { cpuMs: 50, subrequests: 75 },
+          container: { instanceType: 'basic', maxInstances: 2 },
+        },
+      },
+    })
+
+    expect(parsed.environments.cloudflare).toEqual({
+      resource: 'FactoryVerificationInfra',
+      dispatchNamespacePrefix: 'factory-ci',
+      maxConcurrentEnvironments: 4,
+      defaultTtlMs: 10 * 60_000,
+      maxTtlMs: 30 * 60_000,
+      maxRunCostUsd: 0.5,
+      workerLimits: { cpuMs: 50, subrequests: 75 },
+      container: { instanceType: 'basic', maxInstances: 2 },
+    })
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      environments: {
+        cloudflare: {
+          accountId: 'must-not-live-in-config',
+          apiToken: 'must-not-live-in-config',
+        },
+      },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      environments: {
+        cloudflare: { defaultTtlMs: 120_000, maxTtlMs: 60_000 },
+      },
+    })).toThrow('must be less than or equal to maxTtlMs')
+  })
+
   it('preserves explicit model overrides', () => {
     const parsed = FactoryConfigSchema.parse({
       workspaceId: 'ws_123',

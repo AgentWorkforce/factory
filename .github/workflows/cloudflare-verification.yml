@@ -1,0 +1,194 @@
+name: Reusable Cloudflare verification
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        description: Factory commit to verify
+        required: false
+        type: string
+        default: ''
+      infra_repository:
+        description: Dedicated private verification-infra repository
+        required: false
+        type: string
+        default: AgentWorkforce/factory-test-infra
+      infra_ref:
+        description: Verification-infra commit to use
+        required: false
+        type: string
+        default: main
+      run_real:
+        description: Provision a real dispatch namespace and Container
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      infra_repository_token:
+        description: Read token for the private factory-test-infra repository
+        required: true
+      cloudflare_resource_json:
+        description: JSON Resource object containing accountId and apiToken
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-verification-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  miniflare:
+    name: Miniflare Track-C suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Factory
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.factory_ref || github.sha }}
+          path: factory
+          persist-credentials: false
+
+      - name: Checkout factory-test-infra
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.infra_repository }}
+          ref: ${{ inputs.infra_ref }}
+          token: ${{ secrets.infra_repository_token }}
+          path: factory-test-infra
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            factory/package-lock.json
+            factory-test-infra/package-lock.json
+
+      - name: Install Factory
+        working-directory: factory
+        run: npm ci
+
+      - name: Install verification infrastructure
+        working-directory: factory-test-infra
+        run: npm ci
+
+      - name: Start isolated Miniflare environment
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_VERIFICATION_MODE: miniflare
+        run: bash ci/verification-env/up.sh
+
+      - name: Run Track-C suites and guardrail assertions
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_VERIFICATION_MODE: miniflare
+        run: bash ci/verification-env/run-suite.sh
+
+      - name: Tear down Miniflare environment
+        if: always()
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_VERIFICATION_MODE: miniflare
+        run: bash ci/verification-env/down.sh
+
+      - name: Upload Miniflare evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-cloudflare-miniflare-${{ github.sha }}
+          path: factory-test-infra/artifacts/verification-env/
+          if-no-files-found: error
+
+  cloudflare:
+    name: Real dispatch namespace and Container
+    if: inputs.run_real
+    needs: miniflare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require real Cloudflare resource secret
+        env:
+          FACTORY_TEST_INFRA_RESOURCE_JSON: ${{ secrets.cloudflare_resource_json }}
+        run: test -n "$FACTORY_TEST_INFRA_RESOURCE_JSON"
+
+      - name: Checkout Factory
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.factory_ref || github.sha }}
+          path: factory
+          persist-credentials: false
+
+      - name: Checkout factory-test-infra
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.infra_repository }}
+          ref: ${{ inputs.infra_ref }}
+          token: ${{ secrets.infra_repository_token }}
+          path: factory-test-infra
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            factory/package-lock.json
+            factory-test-infra/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm --prefix factory ci
+          npm --prefix factory-test-infra ci
+
+      - name: Materialize linked Cloudflare resource
+        env:
+          FACTORY_TEST_INFRA_RESOURCE_JSON: ${{ secrets.cloudflare_resource_json }}
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/factory-test-infra-resource.json"
+          printf '%s' "$FACTORY_TEST_INFRA_RESOURCE_JSON" > "$RUNNER_TEMP/factory-test-infra-resource.json"
+
+      - name: Provision real verification environment
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_TEST_INFRA_RESOURCE_FILE: ${{ runner.temp }}/factory-test-infra-resource.json
+          FACTORY_VERIFICATION_MODE: cloudflare
+        run: bash ci/verification-env/up.sh
+
+      - name: Run Track-C suites and guardrail assertions
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_TEST_INFRA_RESOURCE_FILE: ${{ runner.temp }}/factory-test-infra-resource.json
+          FACTORY_VERIFICATION_MODE: cloudflare
+        run: bash ci/verification-env/run-suite.sh
+
+      - name: Tear down real verification environment
+        if: always()
+        working-directory: factory-test-infra
+        env:
+          FACTORY_REPO_PATH: ${{ github.workspace }}/factory
+          FACTORY_TEST_INFRA_RESOURCE_FILE: ${{ runner.temp }}/factory-test-infra-resource.json
+          FACTORY_VERIFICATION_MODE: cloudflare
+        run: bash ci/verification-env/down.sh
+
+      - name: Remove linked Cloudflare resource
+        if: always()
+        run: rm -f "$RUNNER_TEMP/factory-test-infra-resource.json"
+
+      - name: Upload real-environment evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-cloudflare-real-${{ github.sha }}
+          path: factory-test-infra/artifacts/verification-env/
+          if-no-files-found: error
