@@ -18,7 +18,13 @@ export {
   readFactoryLoopHeartbeat,
 } from './factory'
 export {
+  FactoryEnvironmentReaper,
   FactoryReaper,
   readFactoryInFlightRegistry,
+  reapFactoryEnvironmentsOnce,
   reapFactoryOrphansOnce,
+} from './reaper'
+export type {
+  FactoryEnvironmentReaperOptions,
+  FactoryEnvironmentReaperReport,
 } from './reaper'

@@ -12,6 +12,7 @@ import {
 } from './load-harness'
 import {
   createK6LoadJobResources,
+  defaultKubectlCommandRunner,
   K6_EVIDENCE_PREFIX,
   k6ScenarioFor,
   type KubernetesLoadJobClient,
@@ -141,6 +142,30 @@ describe('load SLO gate', () => {
 })
 
 describe('k6 in-cluster Job', () => {
+  it('bounds kubectl stdout and stderr retained in memory', async () => {
+    const result = await defaultKubectlCommandRunner(process.execPath)([
+      '-e',
+      "process.stdout.write('x'.repeat(1024 * 1024 + 128)); process.stderr.write('y'.repeat(1024 * 1024 + 128))",
+    ])
+
+    expect(result.stdout).toHaveLength(1024 * 1024)
+    expect(result.stderr).toHaveLength(1024 * 1024)
+  })
+
+  it('waits for an aborted kubectl process to exit and force-kills one that ignores SIGTERM', async () => {
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const running = defaultKubectlCommandRunner(process.execPath)([
+      '-e',
+      "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)",
+    ], undefined, controller.signal)
+
+    setTimeout(() => controller.abort(), 300)
+
+    await expect(running).rejects.toThrow('kubectl command aborted')
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2_000)
+  }, 5_000)
+
   it('renders weighted request shapes, a ramp, and hardened Job resources', () => {
     const resolvedProfile = LoadProfileSchema.parse({
       ...profile,

@@ -2621,6 +2621,7 @@ describe('fleet CLI runtime', () => {
         flushDaemonOutput: async () => {
           daemonFlushes.push('flush')
         },
+        reapEnvironments: async () => ({ reaped: [], retained: [] }),
         stdout: buffer(),
         stderr: buffer(),
       })
@@ -2707,6 +2708,7 @@ describe('fleet CLI runtime', () => {
           return fleet
         },
         cloudMountFromConfig,
+        reapEnvironments: async () => ({ reaped: [], retained: [] }),
         stdout: output,
         stderr: buffer(),
       })

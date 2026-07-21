@@ -1,15 +1,15 @@
 version: '1.1'
 updated: '2026-07-21'
 catalog:
-  category_count: 23
-  feature_count: 292
+  category_count: 24
+  feature_count: 300
   tier_counts:
-    1: 41
-    2: 122
+    1: 43
+    2: 123
     3: 11
-    4: 47
+    4: 51
     5: 57
-    6: 14
+    6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
 #
@@ -48,6 +48,7 @@ verification:
     hosted-control-plane: hosted-control-plane
     cloud-observability: cloud-observability
     release-verification: release-verification
+    verification-environments: verification-environments
     proactive-health: proactive-health
     config-intake: triage-and-configuration
     config-repositories: triage-and-configuration
@@ -1335,9 +1336,9 @@ categories:
 
       - id: api-kubernetes-environments
         name: Kubernetes Environment Provider API
-        api: '@agent-relay/factory/environments / EnvironmentProvider / KubernetesEnvironmentProvider / StackDeployer'
+        api: '@agent-relay/factory/environments / @agent-relay/factory/kubernetes-environment-stack.schema.json / EnvironmentProvider / KubernetesEnvironmentProvider / StackDeployer'
         description: Resolve BYOC or managed cluster references and provision, inspect, expose, destroy, and reap namespace-isolated Kubernetes verification stacks
-        location: src/ports/environment.ts, src/environments/, src/index.ts, package.json
+        location: src/ports/environment.ts, src/environments/, src/index.ts, schemas/kubernetes-environment-stack.schema.json, package.json
         verify_tier: 1
 
       - id: api-featuremap-validator
@@ -1606,6 +1607,67 @@ categories:
         description: Bind the clean-consumer end-to-end evidence to the exact checked-out PR head SHA and reject missing, stale, or base-only attestations
         location: .github/workflows/ci.yml, docs/pr-end-to-end-verification.md, scripts/verify-packed-e2e.mjs
         verify_tier: 1
+
+  verification-environments:
+    name: Live Stack Verification Environments
+    description: Repository-owned stack deployment, E2E and load gates, auditable verdicts, and guaranteed environment cleanup
+    criticality: critical
+    features:
+      - id: verification-stack-descriptor
+        name: Repository-Owned Verification Stack
+        api: loadVerificationStack() / resolveVerificationStackDescriptor() / @agent-relay/factory/verification-stack.schema.json
+        description: Validate and resolve a repository-relative, secret-reference-only deployment contract with services, probes, seeds, endpoints, and optional merge-gate stages
+        location: src/environments/verification-stack-descriptor.ts, schemas/verification-stack.schema.json
+        verify_tier: 1
+
+      - id: verification-environment-provider
+        name: Leased Kubernetes Verification Environment
+        api: KubectlEnvironmentProvider / reapFactoryEnvironmentsOnce()
+        description: Provision concurrency-capped managed namespaces with expiration leases and always destroy them, while the reaper removes expired environments after hard process death
+        location: src/environments/kubernetes-environment.ts, src/ports/environment.ts, src/orchestrator/reaper.ts
+        verify_tier: 4
+
+      - id: verification-stack-deployer
+        name: Generic Verification Stack Deployer
+        api: VerificationStackDeployer
+        description: Materialize referenced secrets and config, deploy manifests, Helm, kustomize, or translated Compose, run bounded probes and seeds, and return disposable live endpoints
+        location: src/environments/verification-stack-deployer.ts, src/environments/kubernetes-command.ts
+        verify_tier: 4
+
+      - id: verification-load-gate
+        name: In-Cluster Load SLO Gate
+        api: runLoad() / evaluateLoadSlo()
+        description: Run a hardened k6 Job against cluster-routable endpoints, reject empty or inconsistent evidence, evaluate latency, error, and throughput SLOs, and retain measured evidence
+        location: src/environments/load-harness.ts, src/environments/load-profile.ts, src/environments/k6-job.ts
+        verify_tier: 4
+
+      - id: verification-gate-pipeline
+        name: Required Live Verification Pipeline
+        api: VerificationPipeline.verify()
+        description: Run resolve, provision, deploy, E2E, load, evaluate, and teardown under bounded cancellation and environment concurrency, returning one structured fail-closed verdict
+        location: src/environments/verification-pipeline.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: verification-merge-block
+        name: Verification-Required Merge Decision
+        api: Factory mergePolicy on-green-with-review + VerificationGate
+        description: Allow the guarded merge operation only after GitHub readiness and a green exact-head live-stack verdict, while every red or thrown verdict leaves the pull request unmerged
+        location: src/orchestrator/factory.ts, src/github/merge-gate.ts
+        verify_tier: 6
+
+      - id: verification-cloud-evidence
+        name: Auditable Verification Verdict Evidence
+        api: FactoryCloudVerificationEvidenceV1Schema
+        description: Persist a bounded verification.completed event with environment identity, stage outcomes, E2E status, load measurements, SLO violations, timeout, and teardown result through the Cloud reporter path
+        location: src/observability/events.ts, src/observability/cloud-reporter.ts
+        verify_tier: 1
+
+      - id: config-verification-gate
+        name: Verification Gate Safety Limits
+        api: factory.config.json#verification.enabled / descriptorPath / maxConcurrentEnvironments / maxRunTimeoutMs / maxEnvironmentTtlMs / maxTeardownTimeoutMs
+        description: Configure default-on verification, descriptor selection, environment admission, overall runtime, lease TTL, and teardown ceilings with bounded schema validation
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
 
       - id: verification-kubernetes-provider-e2e
         name: Kubernetes Provider Binding E2E

@@ -4,6 +4,9 @@
 manifest stack into a newly generated namespace. It supports two explicit
 targets:
 
+The published descriptor schema is
+`@agent-relay/factory/kubernetes-environment-stack.schema.json`.
+
 - `byoc` (the default) uses the customer's scoped EKS/kubeconfig connection.
   This is the high-fidelity path because Kubernetes version, CNI, IAM/IRSA,
   ingress, add-ons, and nodes are the customer's real substrate.

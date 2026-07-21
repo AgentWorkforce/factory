@@ -75,3 +75,88 @@ export type {
 } from './stack-descriptor.js'
 export { StackDeployer } from './stack-deployer.js'
 export type { DeployKubernetesStackInput } from './stack-deployer.js'
+export {
+  DEFAULT_VERIFICATION_E2E_IMAGE,
+  DEFAULT_VERIFICATION_STACK_PATH,
+  VERIFICATION_STACK_API_VERSION,
+  VERIFICATION_STACK_JSON_SCHEMA_URL,
+  VERIFICATION_STACK_KIND,
+  VerificationProbeSchema,
+  VerificationStackDescriptorError,
+  VerificationStackDescriptorSchema,
+  VerificationStackSourceSchema,
+  loadVerificationStack,
+  loadVerificationStackFile,
+  parseVerificationStack,
+  resolveVerificationStackAsset,
+  resolveVerificationStackDescriptor,
+} from './verification-stack-descriptor.js'
+export type {
+  LoadedVerificationStack,
+  ResolveVerificationStackOptions,
+  VerificationGateDescriptor,
+  VerificationProbe,
+  VerificationStackDescriptor,
+  VerificationStackEndpoint,
+  VerificationStackReferenceGroup,
+  VerificationStackSeed,
+  VerificationStackService,
+  VerificationStackSource,
+} from './verification-stack-descriptor.js'
+export {
+  KubectlPortForwarder,
+  StackDeploymentError,
+  VerificationStackDeployer,
+  deployVerificationStack,
+} from './verification-stack-deployer.js'
+export type {
+  ManagedPortForward,
+  PortForwarder,
+  ReferenceResolutionContext,
+  StackDeployOptions,
+  StackDeployerOptions,
+  StackDeployment,
+  VerificationStackReferenceResolver,
+} from './verification-stack-deployer.js'
+export {
+  DEFAULT_VERIFICATION_DESCRIPTOR,
+  VERIFICATION_EVIDENCE_CONTRACT,
+  VerificationPipeline,
+  VerificationTimeoutError,
+  resolveGitHeadRevision,
+  runE2eCommand,
+} from './verification-pipeline.js'
+export type {
+  E2eCommandInput,
+  E2eCommandResult,
+  E2eCommandRunner,
+  VerificationEvidence,
+  VerificationGate,
+  VerificationGateInput,
+  VerificationLeaseProvider,
+  VerificationLoadResult,
+  VerificationLoadRunner,
+  VerificationPipelineOptions,
+  VerificationRevisionResolver,
+  VerificationStackDeployRunner,
+  VerificationStageEvidence,
+  VerificationStageStatus,
+  VerificationVerdict,
+} from './verification-pipeline.js'
+export { loadVerificationGateStack } from './verification-stack.js'
+export type { ResolvedVerificationStack } from './verification-stack.js'
+export {
+  FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION,
+  FACTORY_ENVIRONMENT_ID_LABEL,
+  FACTORY_ENVIRONMENT_MANAGED_LABEL,
+  FACTORY_ENVIRONMENT_REPOSITORY_ANNOTATION,
+  KubectlEnvironmentProvider,
+  VerificationEnvironmentAbortError,
+  defaultKubectlEnvironmentRunner,
+} from './kubernetes-environment.js'
+export type {
+  KubectlEnvironmentCommandOptions,
+  KubectlEnvironmentCommandResult,
+  KubectlEnvironmentCommandRunner,
+  KubectlEnvironmentProviderOptions,
+} from './kubernetes-environment.js'

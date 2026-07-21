@@ -190,6 +190,8 @@ describe('Factory feature manifest contract', () => {
       './node': 'createFactoryNodeDefinition()',
       './featuremap': '@agent-relay/factory/featuremap',
       './hosted': '@agent-relay/factory/hosted',
+      './verification-stack.schema.json': '@agent-relay/factory/verification-stack.schema.json',
+      './kubernetes-environment-stack.schema.json': '@agent-relay/factory/kubernetes-environment-stack.schema.json',
       './environments': '@agent-relay/factory/environments',
     }
     expect(Object.keys(packageJson.exports).sort()).toEqual(Object.keys(expected).sort())

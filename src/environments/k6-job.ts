@@ -4,6 +4,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { ResolvedLoadProfile, ResolvedLoadTargetProfile } from './load-profile.js'
 import { durationToMilliseconds } from './load-profile.js'
 
+const MAX_KUBECTL_OUTPUT_BYTES = 1024 * 1024
+
 export const DEFAULT_K6_IMAGE = 'grafana/k6:1.7.1@sha256:4fd3a694926b064d3491d9b02b01cde886583c4931f1223816e3d9a7bdfa7e0f'
 export const K6_EVIDENCE_PREFIX = 'FACTORY_LOAD_EVIDENCE_JSON='
 
@@ -33,10 +35,10 @@ export interface K6LoadJobResources {
 }
 
 export interface KubernetesLoadJobClient {
-  apply(resources: Array<Record<string, unknown>>, namespace: string): Promise<void>
-  waitForCompletion(jobName: string, namespace: string, timeoutMs: number): Promise<void>
-  logs(jobName: string, namespace: string): Promise<string>
-  delete(jobName: string, configMapName: string, namespace: string): Promise<void>
+  apply(resources: Array<Record<string, unknown>>, namespace: string, signal?: AbortSignal): Promise<void>
+  waitForCompletion(jobName: string, namespace: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  logs(jobName: string, namespace: string, signal?: AbortSignal): Promise<string>
+  delete(jobName: string, configMapName: string, namespace: string, signal?: AbortSignal): Promise<void>
 }
 
 export interface KubectlCommandResult {
@@ -47,6 +49,7 @@ export interface KubectlCommandResult {
 export type KubectlCommandRunner = (
   args: string[],
   input?: string,
+  signal?: AbortSignal,
 ) => Promise<KubectlCommandResult>
 
 export interface KubectlLoadJobClientOptions {
@@ -67,21 +70,53 @@ const commandError = (
 
 export const defaultKubectlCommandRunner = (
   executable = 'kubectl',
-): KubectlCommandRunner => async (args, input) => await new Promise((resolve, reject) => {
+): KubectlCommandRunner => async (args, input, signal) => await new Promise((resolve, reject) => {
   const child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
+  let settled = false
+  let aborted = false
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined
+  const abort = (): void => {
+    aborted = true
+    child.kill('SIGTERM')
+    forceKillTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, 2_000)
+    forceKillTimer.unref()
+  }
+  const finish = (error?: Error, result?: KubectlCommandResult): void => {
+    if (settled) return
+    settled = true
+    if (forceKillTimer) clearTimeout(forceKillTimer)
+    signal?.removeEventListener('abort', abort)
+    if (error) reject(error)
+    else resolve(result!)
+  }
 
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
-  child.stdout.on('data', (chunk: string) => { stdout += chunk })
-  child.stderr.on('data', (chunk: string) => { stderr += chunk })
-  child.once('error', reject)
-  child.once('close', (code) => {
-    if (code === 0) resolve({ stdout, stderr })
-    else reject(commandError(executable, args, code, stderr))
+  child.stdout.on('data', (chunk: string) => {
+    stdout = `${stdout}${chunk}`.slice(-MAX_KUBECTL_OUTPUT_BYTES)
   })
-  child.stdin.end(input)
+  child.stderr.on('data', (chunk: string) => {
+    stderr = `${stderr}${chunk}`.slice(-MAX_KUBECTL_OUTPUT_BYTES)
+  })
+  child.once('error', (error) => finish(error))
+  child.once('close', (code) => {
+    if (aborted) {
+      finish(new Error('kubectl command aborted'))
+      return
+    }
+    if (code === 0) finish(undefined, { stdout, stderr })
+    else finish(commandError(executable, args, code, stderr))
+  })
+  signal?.addEventListener('abort', abort, { once: true })
+  if (signal?.aborted) {
+    abort()
+  } else {
+    child.stdin.end(input)
+  }
 })
 
 export class KubectlLoadJobClient implements KubernetesLoadJobClient {
@@ -95,15 +130,15 @@ export class KubectlLoadJobClient implements KubernetesLoadJobClient {
     this.runner = options.runner ?? defaultKubectlCommandRunner(options.executable)
   }
 
-  async apply(resources: Array<Record<string, unknown>>, namespace: string): Promise<void> {
+  async apply(resources: Array<Record<string, unknown>>, namespace: string, signal?: AbortSignal): Promise<void> {
     await this.runner([
       ...this.contextArgs,
       '--namespace', namespace,
       'apply', '--filename', '-',
-    ], JSON.stringify({ apiVersion: 'v1', kind: 'List', items: resources }))
+    ], JSON.stringify({ apiVersion: 'v1', kind: 'List', items: resources }), signal)
   }
 
-  async waitForCompletion(jobName: string, namespace: string, timeoutMs: number): Promise<void> {
+  async waitForCompletion(jobName: string, namespace: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       const { stdout } = await this.runner([
@@ -111,7 +146,7 @@ export class KubectlLoadJobClient implements KubernetesLoadJobClient {
         '--namespace', namespace,
         'get', 'job', jobName,
         '--output', 'json',
-      ])
+      ], undefined, signal)
       const job = JSON.parse(stdout) as {
         status?: {
           succeeded?: number
@@ -130,22 +165,22 @@ export class KubectlLoadJobClient implements KubernetesLoadJobClient {
           `k6 Job ${namespace}/${jobName} failed${failure?.reason ? ` (${failure.reason})` : ''}${failure?.message ? `: ${failure.message}` : ''}`,
         )
       }
-      await delay(Math.min(this.pollIntervalMs, Math.max(1, deadline - Date.now())))
+      await delay(Math.min(this.pollIntervalMs, Math.max(1, deadline - Date.now())), undefined, { signal })
     }
     throw new Error(`Timed out after ${timeoutMs}ms waiting for k6 Job ${namespace}/${jobName}`)
   }
 
-  async logs(jobName: string, namespace: string): Promise<string> {
+  async logs(jobName: string, namespace: string, signal?: AbortSignal): Promise<string> {
     const { stdout } = await this.runner([
       ...this.contextArgs,
       '--namespace', namespace,
       'logs', `job/${jobName}`,
       '--container', 'k6',
-    ])
+    ], undefined, signal)
     return stdout
   }
 
-  async delete(jobName: string, configMapName: string, namespace: string): Promise<void> {
+  async delete(jobName: string, configMapName: string, namespace: string, signal?: AbortSignal): Promise<void> {
     await this.runner([
       ...this.contextArgs,
       '--namespace', namespace,
@@ -154,7 +189,7 @@ export class KubectlLoadJobClient implements KubernetesLoadJobClient {
       `configmap/${configMapName}`,
       '--ignore-not-found=true',
       '--wait=false',
-    ])
+    ], undefined, signal)
   }
 }
 

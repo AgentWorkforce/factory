@@ -50,6 +50,13 @@ export type {
   EnvironmentProvider,
   EnvironmentStatus,
   ProvisionEnvironmentSpec,
+  DeployEndpoint,
+  DeployEnvironmentInput,
+  DeployManifest,
+  DeployReadinessCheck,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
 } from './environment'
 export type {
   FactoryEventReporter,

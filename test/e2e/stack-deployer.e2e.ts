@@ -1,0 +1,109 @@
+import assert from 'node:assert/strict'
+import { resolve } from 'node:path'
+
+import {
+  KubectlEnvironmentProvider,
+  ProcessCommandRunner,
+  StackDeploymentError,
+  VerificationStackDeployer,
+  resolveVerificationStackDescriptor,
+  type StackDeployment,
+  type VerificationEnvironment,
+  type VerificationStackDescriptor,
+} from '../../src/index.js'
+
+const root = resolve(import.meta.dirname, '../..')
+const context = process.env.FACTORY_E2E_KUBE_CONTEXT
+const kubeconfig = process.env.KUBECONFIG
+const suffix = `${process.pid}-${Date.now().toString(36)}`
+const provider = new KubectlEnvironmentProvider()
+const runner = new ProcessCommandRunner()
+const deployer = new VerificationStackDeployer({
+  referenceResolver: {
+    resolve: async (reference) => {
+      if (reference === 'fixture://postgres/password') return 'factory-e2e-password'
+      return undefined
+    },
+  },
+})
+
+let successEnvironment: VerificationEnvironment | undefined
+let failureEnvironment: VerificationEnvironment | undefined
+let successDeployment: StackDeployment | undefined
+
+try {
+  const loaded = await resolveVerificationStackDescriptor({
+    repoPath: root,
+    descriptorPath: 'test/fixtures/verification-stack/verification-stack.yaml',
+  })
+
+  successEnvironment = await provider.provision({
+    runId: `healthy-${suffix}`,
+    repository: 'AgentWorkforce/factory',
+    namespacePrefix: 'factory-stack-e2e',
+    ttlMs: 10 * 60_000,
+    maxActiveEnvironments: 2,
+    ...(context ? { kubeContext: context } : {}),
+  })
+  successDeployment = await deployer.deploy(loaded, successEnvironment)
+  assert.deepEqual(Object.keys(successDeployment.endpoints), ['web'])
+  for (const [name, url] of Object.entries(successDeployment.endpoints)) {
+    const response = await fetch(url)
+    assert.equal(response.status, 200, `${name} returned HTTP ${response.status}`)
+    assert.match(await response.text(), /healthy/u, `${name} did not return its health body`)
+  }
+
+  const namespace = successEnvironment.namespace!
+  const seeded = await runner.run('kubectl', [
+    ...(kubeconfig ? ['--kubeconfig', kubeconfig] : []),
+    ...(context ? ['--context', context] : []),
+    '--namespace', namespace,
+    'exec', 'deployment/postgres', '--',
+    'psql', '-U', 'factory', '-d', 'factory', '-tAc',
+    'SELECT value FROM verification_seed WHERE id = 1',
+  ], { timeoutMs: 30_000 })
+  assert.equal(seeded.stdout.trim(), 'ran', 'the declared Postgres seed step did not run')
+
+  failureEnvironment = await provider.provision({
+    runId: `unready-${suffix}`,
+    repository: 'AgentWorkforce/factory',
+    namespacePrefix: 'factory-stack-e2e',
+    ttlMs: 10 * 60_000,
+    maxActiveEnvironments: 2,
+    ...(context ? { kubeContext: context } : {}),
+  })
+  const impossible = structuredClone(loaded.descriptor) as VerificationStackDescriptor
+  const web = impossible.services.find((service) => service.name === 'web')!
+  web.readiness = {
+    type: 'http',
+    port: 5999,
+    path: '/never-ready',
+    scheme: 'http',
+    expectedStatuses: [200],
+    timeoutSeconds: 4,
+    intervalSeconds: 0.5,
+  }
+  impossible.seeds = []
+  impossible.endpoints = []
+  const started = Date.now()
+  let readinessFailure: unknown
+  try {
+    await deployer.deploy({ ...loaded, descriptor: impossible }, failureEnvironment)
+  } catch (error) {
+    readinessFailure = error
+  }
+  const elapsed = Date.now() - started
+  assert(readinessFailure instanceof StackDeploymentError, 'unready stack unexpectedly deployed')
+  assert.equal(readinessFailure.stage, 'readiness')
+  assert.equal(readinessFailure.service, 'web')
+  assert.match(readinessFailure.message, /Service web readiness probe never became ready within 4s/u)
+  assert(elapsed < 15_000, `unready stack failure was not bounded (elapsed ${elapsed}ms)`)
+
+  process.stdout.write(
+    `stack-deployer e2e passed: ${Object.keys(successDeployment.endpoints).length} endpoint(s), seed verified, bounded failure in ${elapsed}ms\n`,
+  )
+} finally {
+  await successDeployment?.dispose()
+  if (failureEnvironment) await provider.teardown(failureEnvironment)
+  if (successEnvironment) await provider.teardown(successEnvironment)
+}

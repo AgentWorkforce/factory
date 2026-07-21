@@ -31,6 +31,7 @@ import {
   readStandalonePullRequest,
   readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
+  reapFactoryEnvironmentsOnce,
   readFactoryLoopHeartbeat,
   resolveFactoryStates,
   stateResolutionFromIds,
@@ -102,6 +103,8 @@ interface FleetCliDeps {
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
   featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
+  /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
+  reapEnvironments?: typeof reapFactoryEnvironmentsOnce
 }
 
 interface GlobalOptions {
@@ -234,12 +237,13 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       case 'factory-babysit': {
         if (!loaded) throw new Error('factory command requires config')
         if (command.kind === 'factory' && command.action === 'reap-orphans') {
-          writeJson(out, await reapFactoryOrphansOnce({
+          const processes = await reapFactoryOrphansOnce({
             heartbeatPath: loaded.config.loop.heartbeatPath,
             registryPath: loaded.config.loop.registryPath,
             staleMs: loaded.config.loop.heartbeatStaleMs,
             fleet,
-          }))
+          })
+          writeJson(out, { ...processes, environments: await safeEnvironmentReap(deps.reapEnvironments) })
           return 0
         }
         // Derive the workspace from the cloud session when it isn't pinned in
@@ -588,16 +592,6 @@ async function runFactoryCommand(
       writeJson(out, { killed: heartbeat.pid, signal: 'SIGTERM' })
       return 0
     }
-    if (command.action === 'reap-orphans') {
-      writeJson(out, await reapFactoryOrphansOnce({
-        heartbeatPath: config.loop.heartbeatPath,
-        registryPath: config.loop.registryPath,
-        staleMs: config.loop.heartbeatStaleMs,
-        fleet,
-      }))
-      return 0
-    }
-
     await ensureClonePathMounts(
       mountFn,
       workspaceId,
@@ -1660,6 +1654,26 @@ function requireValue(args: string[], index: number, flag: string): string {
 
 function writeJson(out: Pick<NodeJS.WriteStream, 'write'>, value: unknown): void {
   out.write(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+async function safeEnvironmentReap(
+  reap: typeof reapFactoryEnvironmentsOnce = reapFactoryEnvironmentsOnce,
+): Promise<Awaited<ReturnType<typeof reapFactoryEnvironmentsOnce>> | {
+  reaped: never[]
+  retained: never[]
+  error: string
+}> {
+  try {
+    return await reap()
+  } catch (error) {
+    // Process cleanup remains useful on hosts without kubectl or an active
+    // cluster. Surface the skipped backstop without failing the whole command.
+    return {
+      reaped: [],
+      retained: [],
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
 }
 
 async function flushProcessOutput(): Promise<void> {

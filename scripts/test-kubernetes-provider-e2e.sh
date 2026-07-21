@@ -3,7 +3,6 @@ set -euo pipefail
 
 cluster_name="${KIND_CLUSTER_NAME:-customer-eks-sim}"
 kubeconfig_file="${KUBECONFIG:-}"
-calico_version="${CALICO_VERSION:-v3.32.1}"
 kind_node_image="${KIND_NODE_IMAGE:-kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f}"
 created_cluster=0
 created_kubeconfig=0
@@ -39,10 +38,7 @@ export KUBECONFIG="$kubeconfig_file"
 export FACTORY_E2E_POSTGRES_PASSWORD="${FACTORY_E2E_POSTGRES_PASSWORD:-factory-e2e-not-production}"
 
 if [[ "$created_cluster" == "1" ]]; then
-  kubectl create --filename \
-    "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/calico.yaml"
-  kubectl --namespace kube-system rollout status daemonset/calico-node --timeout=300s
-  kubectl wait nodes --all --for=condition=Ready --timeout=300s
+  bash scripts/install-calico.sh
 fi
 
 npx tsx test/e2e/kubernetes-provider.e2e.ts

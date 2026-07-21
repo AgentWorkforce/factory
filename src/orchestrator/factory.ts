@@ -6,6 +6,7 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
   AgentLifecycleSignal,
@@ -365,6 +366,7 @@ export class FactoryLoop implements Factory {
   readonly #githubWritebackProvided: boolean
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
+  readonly #verificationGate?: VerificationGate
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
@@ -548,6 +550,17 @@ export class FactoryLoop implements Factory {
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
+    this.#verificationGate = ports.verificationGate ?? (config.verification.enabled
+      ? new VerificationPipeline({
+          descriptorPath: config.verification.descriptorPath,
+          reporter: ports.reporter,
+          logger: ports.logger,
+          maxConcurrentEnvironments: config.verification.maxConcurrentEnvironments,
+          maxRunTimeoutMs: config.verification.maxRunTimeoutMs,
+          maxEnvironmentTtlMs: config.verification.maxEnvironmentTtlMs,
+          maxTeardownTimeoutMs: config.verification.maxTeardownTimeoutMs,
+        })
+      : undefined)
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
     this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
@@ -10320,6 +10333,7 @@ export class FactoryLoop implements Factory {
       // state.
       const issueTeam = issue?.team
       const githubIssue = issue ? isGithubIssue(issue) : false
+      const syntheticProbe = issue ? this.#isSyntheticProbeIssue(issue) : false
       const configuredHumanReview = opts.targetState !== 'done' &&
         this.#config.terminalState === 'human-review' &&
         (githubIssue || this.#states.hasHumanReview(issueTeam))
@@ -10327,13 +10341,29 @@ export class FactoryLoop implements Factory {
       if (issue && githubIssue && !configuredHumanReview && !githubMerged) {
         githubMerged = await this.#githubPrObservedMerged(record, issue)
         if (!githubMerged && opts.runMergeGate !== false) {
-          const mergeCommandAccepted = await this.#runCompletionMergeGate(issue)
+          const mergeCommandAccepted = await this.#runCompletionMergeGate(issue, record)
           // A successful merge command can mean queued/auto-merge rather than
           // merged. Only mounted PR state or a merged webhook may prove merge.
           if (mergeCommandAccepted) {
             githubMerged = await this.#githubPrObservedMerged(record, issue)
           }
         }
+      }
+      // Linear-backed issues historically wrote Done before invoking the
+      // guarded merge. With live verification in that guard, a red verdict
+      // would therefore release the team and make the failure terminal even
+      // though the PR remained open. Require the entire merge gate (including
+      // verification) to accept the merge before applying terminal writeback.
+      if (
+        issue &&
+        !githubIssue &&
+        !syntheticProbe &&
+        !configuredHumanReview &&
+        opts.runMergeGate !== false &&
+        this.#config.mergePolicy === 'on-green-with-review'
+      ) {
+        const mergeCommandAccepted = await this.#runCompletionMergeGate(issue, record)
+        if (!mergeCommandAccepted) return
       }
       // A GitHub issue only closes after its PR merges. If a configured done
       // path cannot merge (including mergePolicy: never), park it for a human
@@ -10391,13 +10421,12 @@ export class FactoryLoop implements Factory {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
       }
-      // Only auto-merge on the `done` terminal path. Human Review parks the PR
-      // for an operator — the merge gate (which requires an APPROVED review)
-      // would refuse anyway, and we must not merge before the human has looked.
-      if (issue && !githubIssue && !humanReview && opts.runMergeGate !== false) {
-        await this.#runCompletionMergeGate(issue)
+      // Synthetic canaries are cleanup probes, not merge candidates. Preserve
+      // their close-before-release path under every merge policy without
+      // subjecting them to the required feature verification gate.
+      if (issue && syntheticProbe && !githubIssue && opts.runMergeGate !== false) {
+        await this.#runCompletionMergeGate(issue, record)
       }
-
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
       releaseReasonForRetry = releaseReason
       if (this.#usesDurableDispatchLifecycle()) {
@@ -12459,7 +12488,7 @@ export class FactoryLoop implements Factory {
       : undefined
   }
 
-  async #runCompletionMergeGate(issue: LinearIssue): Promise<boolean> {
+  async #runCompletionMergeGate(issue: LinearIssue, record: InFlightIssue): Promise<boolean> {
     if (this.#isSyntheticProbeIssue(issue)) {
       await this.#closeSyntheticProbeIfPresent(issue)
       return false
@@ -12489,6 +12518,48 @@ export class FactoryLoop implements Factory {
       return false
     }
 
+    if (this.#verificationGate) {
+      const repositoryPath = this.#verificationRepositoryPath(record, pr.repo)
+      if (!repositoryPath) {
+        this.#logger.warn?.('[factory] verification gate has no feature checkout for merge candidate', {
+          issue: issue.key,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+        })
+        this.#increment('verificationGateMissingRepository')
+        return false
+      }
+      try {
+        const verification = await this.#verificationGate.verify({
+          repository: pr.repo,
+          repositoryPath,
+          issueKey: issue.key,
+          expectedHeadSha: headSha,
+        })
+        if (!verification.passed) {
+          this.#logger.warn?.('[factory] verification gate blocked merge', {
+            issue: issue.key,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            environmentId: verification.evidence.environmentId,
+            reason: verification.reason,
+          })
+          this.#increment('verificationGateFailed')
+          return false
+        }
+        this.#increment('verificationGatePassed')
+      } catch (error) {
+        this.#logger.warn?.('[factory] verification gate failed closed', {
+          issue: issue.key,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          error: describeError(error).errorMessage,
+        })
+        this.#increment('verificationGateFailed')
+        return false
+      }
+    }
+
     const result = await this.#mergeGate.merge({
       repo: pr.repo,
       number: pr.prNumber,
@@ -12514,6 +12585,15 @@ export class FactoryLoop implements Factory {
     })
     this.#increment('mergeGateMerged')
     return true
+  }
+
+  #verificationRepositoryPath(record: InFlightIssue, repo: string): string | undefined {
+    const normalized = repo.toLowerCase()
+    const active = [...record.agents.values()]
+      .map((tracked) => tracked.spec)
+      .find((spec) => spec.role === 'implementer' && spec.repo.toLowerCase() === normalized && spec.clonePath)
+      ?? record.decision.implementers.find((spec) => spec.repo.toLowerCase() === normalized && spec.clonePath)
+    return active?.clonePath ?? this.#config.repos.clonePaths[repo]
   }
 
   async #closeSyntheticProbeIfPresent(issue: LinearIssue): Promise<void> {

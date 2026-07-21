@@ -210,6 +210,7 @@ export interface RunLoadOptions {
   evidencePath?: string
   runId?: string
   now?: () => Date
+  signal?: AbortSignal
 }
 
 export function evaluateLoadSlo(
@@ -311,9 +312,9 @@ export async function runLoad(
   let mainError: unknown
 
   try {
-    await client.apply(jobResources.resources, namespace)
-    await client.waitForCompletion(jobResources.jobName, namespace, jobResources.timeoutMs)
-    const logs = await client.logs(jobResources.jobName, namespace)
+    await client.apply(jobResources.resources, namespace, options.signal)
+    await client.waitForCompletion(jobResources.jobName, namespace, jobResources.timeoutMs, options.signal)
+    const logs = await client.logs(jobResources.jobName, namespace, options.signal)
     const measured = parseK6LoadMeasurements(logs)
     const gate = evaluateLoadSlo(measured, profile.thresholds)
     const status = gate.passed ? 'pass' : 'fail'
@@ -353,6 +354,8 @@ export async function runLoad(
   } finally {
     if (options.cleanup !== false) {
       try {
+        // Cleanup gets a fresh budget from the caller; an aborted load signal
+        // must not suppress deletion of its Job and ConfigMap.
         await client.delete(jobResources.jobName, jobResources.configMapName, namespace)
       } catch (cleanupError) {
         if (mainError === undefined) throw cleanupError

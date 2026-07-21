@@ -182,6 +182,16 @@ const githubSchema = z.object({
   identity: z.enum(['app', 'user', 'auto']).default('auto'),
 }).default({})
 
+const verificationSchema = z.object({
+  /** Default-on: an auto-merge must have a green live-stack verification verdict. */
+  enabled: z.boolean().default(true),
+  descriptorPath: z.string().trim().min(1).default('.factory/verification-stack.yaml'),
+  maxConcurrentEnvironments: z.number().int().min(1).max(20).default(2),
+  maxRunTimeoutMs: z.number().int().min(1_000).max(2 * 60 * 60_000).default(30 * 60_000),
+  maxEnvironmentTtlMs: z.number().int().min(1_000).max(24 * 60 * 60_000).default(60 * 60_000),
+  maxTeardownTimeoutMs: z.number().int().min(1_000).max(30 * 60_000).default(5 * 60_000),
+}).strict().default({})
+
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
 // don't hand-configure them. These names let the factory resolve a role from a
 // synced record that carries state.name but no state.id (sparse-sync fallback).
@@ -252,6 +262,7 @@ const WorkspaceConfigObjectSchema = z.object({
   reporting: reportingSchema,
   preview: previewSchema,
   github: githubSchema,
+  verification: verificationSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the
