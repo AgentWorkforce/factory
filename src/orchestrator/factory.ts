@@ -2474,9 +2474,18 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       const newlyCreated = uniquePreviewReferences(
-        dispatchSpecs(dispatchDecision).map((spec) => spec.preview),
+        [
+          ...dispatchSpecs(dispatchDecision).map((spec) => spec.preview),
+          ...(this.#previewReferences.get(issueKey(dispatchDecision.issue)) ?? []),
+        ],
       ).filter((preview) => !previouslyPersistedPreviewIds.has(preview.id))
-      if (newlyCreated.length > 0) {
+      // Once the durable fence is lost, the successor may already have
+      // adopted this deterministic issue preview. Leave cleanup to the
+      // identity-aware sweep instead of letting a stale owner tear down the
+      // successor's route.
+      const mayRollback = !claimedLifecycle ||
+        await this.#assertIssueDispatchLifecycleOwner(dispatchDecision.issue)
+      if (newlyCreated.length > 0 && mayRollback) {
         await this.#teardownPreviewReferences(newlyCreated).catch((cleanupError) => {
           this.#logger.warn?.('[factory] failed to roll back preview provisioning', {
             issue: dispatchDecision.issue.key,
@@ -2484,7 +2493,7 @@ export class FactoryLoop implements Factory {
           })
         })
       }
-      this.#previewReferences.delete(issueKey(dispatchDecision.issue))
+      if (mayRollback) this.#previewReferences.delete(issueKey(dispatchDecision.issue))
       if (claimedLifecycle) {
         this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claimedLifecycle))
       }
@@ -2507,7 +2516,9 @@ export class FactoryLoop implements Factory {
     if (record.result) {
       return record.result
     }
-    await this.#saveDispatchLifecycle(record, 'dispatching')
+    if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+      throw new Error(`Dispatch lifecycle ownership lost immediately before spawning ${dispatchDecision.issue.key}`)
+    }
     if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
@@ -2602,36 +2613,46 @@ export class FactoryLoop implements Factory {
         }
       }
       let failedState: { terminal: boolean } | undefined
-      if (liveStateChanged) {
-        await this.#clearDispatchInFlight(decision.issue)
-        await this.#saveDispatchLifecycle(
+      if (!liveStateChanged) {
+        await this.#recordDispatchFailure(decision.issue)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+      }
+      if (liveStateChanged || failedState?.terminal) {
+        try {
+          await this.#teardownPreviews(record)
+        } catch (previewError) {
+          this.#logger.warn?.('[factory] failed to tear down previews after terminal dispatch failure', {
+            issue: record.issue.key,
+            error: describeError(previewError).errorMessage,
+          })
+          // Do not commit a terminal lifecycle while an externally reachable
+          // preview remains. The abandonment driver retries the identity-
+          // checked teardown and commits terminal state only after it succeeds.
+          this.#scheduleAbandonedDispatchRetry(record, cleanupReason)
+          if (!liveStateChanged) this.#error(error, decision.issue)
+          if (worktreesTornDown) {
+            await this.#writeInFlightRegistry().catch((registryError) => {
+              this.#logger.warn?.('[factory] failed to rewrite registry after dispatch worktree teardown', {
+                issue: record.issue,
+                error: describeError(registryError).errorMessage,
+              })
+            })
+          }
+          throw error
+        }
+        if (!await this.#saveDispatchLifecycle(
           record,
           'abandoned',
           undefined,
           undefined,
           new Set(),
           { cancellationReason },
-        )
-        this.#increment('dispatchLiveStateRaces')
+        )) throw error
+        if (liveStateChanged) await this.#clearDispatchInFlight(decision.issue)
+        else await this.#recordDispatchTerminal(decision.issue)
+        if (liveStateChanged) this.#increment('dispatchLiveStateRaces')
       } else {
-        await this.#recordDispatchFailure(decision.issue)
-        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-        await this.#saveDispatchLifecycle(
-          record,
-          failedState?.terminal ? 'abandoned' : 'retryable',
-          undefined,
-          undefined,
-          new Set(),
-          { cancellationReason: failedState?.terminal ? cancellationReason : undefined },
-        )
-      }
-      if (liveStateChanged || failedState?.terminal) {
-        await this.#teardownPreviews(record).catch((previewError) => {
-          this.#logger.warn?.('[factory] failed to tear down previews after terminal dispatch failure', {
-            issue: record.issue.key,
-            error: describeError(previewError).errorMessage,
-          })
-        })
+        if (!await this.#saveDispatchLifecycle(record, 'retryable')) throw error
       }
       batch.abandon(decision.issue)
       if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
@@ -2786,6 +2807,36 @@ export class FactoryLoop implements Factory {
         this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
+        if (
+          !durableRecord.dryRun &&
+          claim.lifecycle.phase !== 'writeback-applied' &&
+          claim.lifecycle.phase !== 'releasing'
+        ) {
+          const liveIssue = await this.#readIssue(durableRecord.issue.path)
+          // A babysat Linear issue already at Done may have merged while this
+          // process was down. Let authoritative PR restoration drive the
+          // normal `complete` path so merged work is not mislabeled abandoned.
+          const deferDoneToBabysitterRecovery = Boolean(
+            liveIssue &&
+            !isGithubIssue(liveIssue) &&
+            this.#states.roleOf(liveIssue.stateId) === 'done' &&
+            this.#config.babysitter.enabled &&
+            await this.#hasRestorableMergedBabysitterSession(durableRecord.issue),
+          )
+          if (liveIssue && this.#isIssueExternallyTerminal(liveIssue) && !deferDoneToBabysitterRecovery) {
+            const restored = batch.restore(durableRecord)
+            try {
+              await this.#abandonDurableResume(restored, 'source issue is already terminal during startup recovery')
+            } catch (error) {
+              this.#logger.warn?.('[factory] terminal source preview cleanup will retry after startup', {
+                issue: durableRecord.issue.key,
+                error: describeError(error).errorMessage,
+              })
+              this.#scheduleDispatchLifecycleRetry(restored)
+            }
+            continue
+          }
+        }
         const restored = claim.lifecycle.phase === 'queued' || claim.lifecycle.phase === 'releasing'
           ? durableRecord
           : batch.restore(durableRecord)
@@ -3375,6 +3426,14 @@ export class FactoryLoop implements Factory {
     if (!await this.#assertDispatchLifecycleOwner(record)) return
     if (acquiredNow && this.#config.babysitter.enabled) await this.#restoreBabysitterOwnership()
 
+    if (lifecycle.phase === 'running' && !record.dryRun) {
+      const liveIssue = await this.#readIssue(record.issue.path)
+      if (liveIssue && this.#isIssueExternallyTerminal(liveIssue)) {
+        await this.#abandonDurableResume(record, 'source issue became terminal before lifecycle cleanup')
+        return
+      }
+    }
+
     if (acquiredNow && lifecycle.phase === 'running') {
       if (this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(lifecycle.agents.map((agent) => ({
@@ -3457,8 +3516,8 @@ export class FactoryLoop implements Factory {
       if (!liveIssue) {
         throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
       }
-      if (isGithubIssue(liveIssue) && !this.#isGithubIssueResumable(liveIssue)) {
-        await this.#abandonDurableResume(record, 'live GitHub issue is closed or no longer ready-for-agent')
+      if (this.#isIssueExternallyTerminal(liveIssue)) {
+        await this.#abandonDurableResume(record, 'live source issue is already terminal')
         return
       }
 
@@ -3471,9 +3530,13 @@ export class FactoryLoop implements Factory {
         if (!await this.#saveDispatchLifecycle(record, 'dispatching')) return
       } catch (error) {
         const newlyCreated = uniquePreviewReferences(
-          dispatchSpecs(record.decision).map((spec) => spec.preview),
+          [
+            ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+            ...(this.#previewReferences.get(issueKey(record.issue)) ?? []),
+          ],
         ).filter((preview) => !persistedPreviewIds.has(preview.id))
-        if (newlyCreated.length > 0) {
+        const mayRollback = await this.#assertDispatchLifecycleOwner(record)
+        if (newlyCreated.length > 0 && mayRollback) {
           await this.#teardownPreviewReferences(newlyCreated).catch((cleanupError) => {
             this.#logger.warn?.('[factory] failed to roll back recovered preview provisioning', {
               issue: record.issue.key,
@@ -3547,6 +3610,34 @@ export class FactoryLoop implements Factory {
       !labels.has('factory:human-review')
   }
 
+  #isIssueExternallyTerminal(issue: LinearIssue): boolean {
+    if (isGithubIssue(issue)) {
+      if (githubFactoryIssueIsClosed(issue)) return true
+      return issue.labels.some((label) => label.trim().toLowerCase() === 'factory:human-review')
+    }
+    const role = this.#states.roleOf(issue.stateId)
+    return role === 'humanReview' || role === 'done'
+  }
+
+  async #hasRestorableMergedBabysitterSession(issue: IssueRef): Promise<boolean> {
+    const wanted = issueKey(issue)
+    for (const [, session] of await this.#state.listBabysitterSessions(this.#workspaceId)) {
+      if (
+        issueKey(session.issue) !== wanted ||
+        !validGithubRepo(session.repo) ||
+        !validPrNumber(session.prNumber) ||
+        !session.agentName
+      ) continue
+      const snapshot = await this.#readPrSnapshot(session)
+      if (
+        snapshot &&
+        prMetaShowsMerged(snapshot) &&
+        prSnapshotIssueMatchScore(snapshot, session.issue.key) >= 30
+      ) return true
+    }
+    return false
+  }
+
   async #abandonDurableResume(record: InFlightIssue, reason: string): Promise<void> {
     const handoffs = this.#dispatchFailureHandoffs(record, [...record.agents].map(([name, tracked]) => ({
       issue: record.issue,
@@ -3555,6 +3646,31 @@ export class FactoryLoop implements Factory {
       persistedAtMs: this.#clock.now(),
     })))
     await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    // Keep the lifecycle nonterminal until every externally reachable route
+    // is confirmed gone. A restart can then retry cleanup instead of treating
+    // an abandoned row as finished and leaking its issue preview forever.
+    await this.#teardownPreviews(record)
+    if (handoffs.some((handoff) => handoff.worktree)) {
+      if (!await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')) {
+        throw new Error(`Unable to finish stale dispatch worktree teardown for ${record.issue.key}`)
+      }
+    } else if (handoffs.length > 0) {
+      const failed = new Set(await this.#releaseAndTerminateAgents(
+        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+        'live dispatch state changed',
+        'completion',
+      ))
+      if (failed.size > 0) {
+        throw new Error(`Unable to release stale dispatch agents for ${record.issue.key}: ${[...failed].join(', ')}`)
+      }
+      for (const handoff of handoffs) {
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
+
     if (!await this.#saveDispatchLifecycle(
       record,
       'abandoned',
@@ -3564,32 +3680,12 @@ export class FactoryLoop implements Factory {
       { cancellationReason: 'source_state_changed' },
     )) return
 
-    await this.#clearDispatchInFlight(record.issue)
+    await this.#recordDispatchTerminal(record.issue)
     const batch = await this.#batch()
     batch.abandon(record.issue)
     for (const [name] of record.agents) {
       this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
     }
-
-    if (handoffs.some((handoff) => handoff.worktree)) {
-      await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')
-    } else if (handoffs.length > 0) {
-      const failed = new Set(await this.#releaseAndTerminateAgents(
-        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
-        'live dispatch state changed',
-        'completion',
-      ))
-      for (const handoff of handoffs) {
-        if (failed.has(handoff.name)) continue
-        await this.#state.clearFailureHandoff(
-          this.#workspaceId,
-          registryHandoffKey(handoff.issue, handoff.name),
-        )
-      }
-    }
-
-    await this.#teardownPreviews(record)
-
     await this.#stopSlackWatcher(record.issue)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
@@ -7876,54 +7972,49 @@ export class FactoryLoop implements Factory {
     }
 
     const owner = issueKey(decision.issue)
-    const created: PreviewReference[] = []
     const byRepo = new Map<string, PreviewReference>()
-    try {
-      for (const implementer of decision.implementers) {
-        const service = previewServiceForRepo(this.#config, implementer.repo)
-        if (byRepo.has(implementer.repo)) continue
-        const persisted = implementer.preview
-        if (!service) {
-          if (persisted) byRepo.set(implementer.repo, persisted)
-          continue
-        }
-        if (!implementer.clonePath) {
-          throw new Error(`Preview service ${service.name} requires a configured checkout for ${implementer.repo}`)
-        }
-        await this.#preparePreviewCheckout(decision, implementer)
-        const preview = await this.#fleet.createPreview({
-          namespace: this.#workspaceId,
-          owner,
-          issueKey: decision.issue.key,
-          service: service.name,
-          repo: implementer.repo,
-          targetPort: service.config.port,
-          preferredHttpsPort: service.config.httpsPort,
-          startCommand: service.config.startCommand,
-          checkoutPath: implementer.clonePath,
-          node: persisted?.node ?? implementer.node,
-        })
-        if (preview.id !== persisted?.id) created.push(preview)
-        this.#removedPreviewIds.delete(preview.id)
-        assertPublishablePreview(preview, {
-          namespace: this.#workspaceId,
-          owner,
-          service: service.name,
-          repo: implementer.repo,
-          targetPort: service.config.port,
-          portSpan: service.config.portSpan ?? 100,
-          preferredHttpsPort: service.config.httpsPort,
-          startCommand: service.config.startCommand,
-          checkoutPath: implementer.clonePath,
-          requireNode: this.#fleet.placementLocality === 'remote',
-        })
-        byRepo.set(implementer.repo, preview)
+    for (const implementer of decision.implementers) {
+      const service = previewServiceForRepo(this.#config, implementer.repo)
+      if (byRepo.has(implementer.repo)) continue
+      const persisted = implementer.preview
+      if (!service) {
+        if (persisted) byRepo.set(implementer.repo, persisted)
+        continue
       }
-    } catch (error) {
-      if (this.#fleet.removePreview) {
-        await Promise.allSettled(created.map(async (preview) => await this.#fleet.removePreview!(preview)))
+      if (!implementer.clonePath) {
+        throw new Error(`Preview service ${service.name} requires a configured checkout for ${implementer.repo}`)
       }
-      throw error
+      await this.#preparePreviewCheckout(decision, implementer)
+      const preview = await this.#fleet.createPreview({
+        namespace: this.#workspaceId,
+        owner,
+        issueKey: decision.issue.key,
+        service: service.name,
+        repo: implementer.repo,
+        targetPort: service.config.port,
+        preferredHttpsPort: service.config.httpsPort,
+        startCommand: service.config.startCommand,
+        checkoutPath: implementer.clonePath,
+        node: persisted?.node ?? implementer.node,
+      })
+      this.#removedPreviewIds.delete(preview.id)
+      byRepo.set(implementer.repo, preview)
+      // Make the provider identity visible immediately. If validation or the
+      // following durable save fails, the caller can roll it back while it
+      // still owns the lifecycle; after fence loss the startup sweep owns it.
+      this.#previewReferences.set(owner, [...byRepo.values()])
+      assertPublishablePreview(preview, {
+        namespace: this.#workspaceId,
+        owner,
+        service: service.name,
+        repo: implementer.repo,
+        targetPort: service.config.port,
+        portSpan: service.config.portSpan ?? 100,
+        preferredHttpsPort: service.config.httpsPort,
+        startCommand: service.config.startCommand,
+        checkoutPath: implementer.clonePath,
+        requireNode: this.#fleet.placementLocality === 'remote',
+      })
     }
 
     this.#previewReferences.set(owner, [...byRepo.values()])
@@ -9505,10 +9596,6 @@ export class FactoryLoop implements Factory {
     let releaseReasonForRetry: string | undefined
     try {
       if (!await this.#assertDispatchLifecycleOwner(record)) return
-      // A terminal state must never be externally visible while its preview is
-      // still reachable. Removal is identity-checked and idempotent, so a crash
-      // after this point can safely repeat it during lifecycle recovery.
-      await this.#teardownPreviews(record)
       const issue = await this.#readIssue(record.issue.path)
       // Resolve the terminal state for the issue's own team. Land in
       // `human-review` only when the operator opted into that terminal state AND

@@ -23,16 +23,29 @@ access-control guarantee.
 ## Factory contract
 
 `preview.services.<repo>` declares a preferred local HTTP port, a required
-foreground dev command, an optional allocation span, and an optional stable tailnet HTTPS port. The
+bootstrap-plus-foreground dev command, an optional allocation span, and an optional stable tailnet HTTPS port. The
 node advertises `preview:tailscale-serve`. Factory asks the selected node to create the route,
 stores the returned reference on `AgentSpec`, and reuses it across the issue's
 agents. The route lifetime is the issue's in-flight lifetime—not an agent PID.
 The adapter reserves a distinct target port for concurrent issues using the
-same repository. The node starts the command in the selected issue checkout
+same repository. Because provisioning precedes agent startup, the command must
+install any ignored dependencies needed by a fresh worktree before starting the
+foreground server. The node starts it in the selected issue checkout
 with `PORT` set, waits for a local HTTP response, and records the wrapper's PID,
 start time, command line, checkout, and deterministic marker. The detached,
 identity-checked process and `tailscaled` route both outlive any one agent and
-are recovered together across handoffs and daemon restarts.
+are recovered together across handoffs and daemon restarts. The command gets a
+minimal execution environment rather than inheriting Factory, Relay, or
+provider credentials from the node process; repository-specific settings must
+come from an intentional checkout-local environment mechanism.
+
+Before publishing or recovering a URL, Factory resolves the local listener on
+Linux (`/proc`) or macOS (`lsof`) and confirms its parent chain reaches the
+exact supervised wrapper. An unrelated or indeterminate listener fails closed;
+an active sweep also disables the exact Factory route if ownership changes.
+This is a point-in-time guard. Eliminating the final listener-check/route-use
+race would require socket activation or an intermediary proxy, which is outside
+this integration's no-bespoke-runtime boundary.
 
 At Human Review or Done, Factory removes the exact route and terminates only the
 matching managed process tree before committing the

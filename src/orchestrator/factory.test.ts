@@ -4898,9 +4898,19 @@ describe('FactoryLoop', () => {
     const path = issuePath(585)
     const issue = issueFile(585)
     const stateStore = new RejectFirstLifecycleSaveStore({ batchSize: 2 })
-    const factory = createFactory(config(), {
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount: new FakeMountClient({ [path]: issue }),
-      fleet: new RemoteLifecycleFleetClient(),
+      fleet,
       stateStore,
       triage: new StaticTriage(),
     })
@@ -4910,12 +4920,124 @@ describe('FactoryLoop', () => {
     const key = issueKey(decision.issue)
     const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(fleet.previewRemovals).toEqual([])
 
     await factory.stop()
 
     const afterStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(afterStop?.lease?.leaseUntilMs).toBe(Number.MIN_SAFE_INTEGER)
   })
+
+  it('checks the durable fence again immediately before spawning a preview-bearing team', async () => {
+    class RejectSecondLifecycleSaveStore extends InMemoryStateStore {
+      saves = 0
+
+      override async saveDispatchLifecycle(
+        ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+      ): Promise<boolean> {
+        this.saves += 1
+        if (this.saves === 2) return false
+        return await super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const path = issuePath(586)
+    const issue = issueFile(586)
+    const stateStore = new RejectSecondLifecycleSaveStore({ batchSize: 2 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+    await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost immediately before spawning')
+
+    expect(stateStore.saves).toBe(2)
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(fleet.previewRemovals).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    await factory.stop()
+  })
+
+  it('retries preview teardown before terminalizing a lifecycle whose source is already terminal', async () => {
+    class FailOncePreviewRemovalFleetClient extends RemoteLifecycleFleetClient {
+      failuresRemaining = 1
+
+      override async removePreview(preview: PreviewReference): Promise<boolean> {
+        this.previewRemovals.push(structuredClone(preview))
+        if (this.failuresRemaining > 0) {
+          this.failuresRemaining -= 1
+          return false
+        }
+        return true
+      }
+    }
+
+    const path = issuePath(587)
+    const mount = new FakeMountClient({ [path]: issueFile(587) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previewConfig = {
+      stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: planning },
+      babysitter: { enabled: true },
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const first = createFactory(config(previewConfig), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await first.triageIssue(parseLinearIssue(path, issueFile(587)))
+    await first.dispatch(decision)
+    await first.stop()
+
+    // A manually terminal Done issue has no persisted, exact merged PR to
+    // reconcile. Babysitter mode must not mistake it for a merge-in-progress
+    // restart and leak its preview indefinitely.
+    mount.files.set(path, { content: issueFile(587, done) })
+    const cleanupFleet = new FailOncePreviewRemovalFleetClient()
+    const restarted = createFactory(config(previewConfig), {
+      mount,
+      fleet: cleanupFleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    try {
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      expect(cleanupFleet.previewRemovals).toHaveLength(1)
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'running' })
+
+      await vi.waitFor(() => expect(cleanupFleet.previewRemovals).toHaveLength(2), { timeout: 4_000 })
+      await vi.waitFor(async () => expect(
+        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      expect(cleanupFleet.spawns).toEqual([])
+    } finally {
+      await restarted.stop()
+    }
+  }, 8_000)
 
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
@@ -9592,6 +9714,18 @@ describe('FactoryLoop', () => {
       mount,
       fleet,
       triage: new StaticTriage(),
+      linear: {
+        async postComment() {},
+        async setState(_issue, stateId) {
+          fleet.terminalEvents.push(`state:${stateId}`)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
       probePrResolver: async () => undefined,
       probePrGhRunner: async () => { throw new Error('gh must not be invoked for PR publication') },
     })
@@ -9618,8 +9752,57 @@ describe('FactoryLoop', () => {
     }])
     await vi.waitFor(() => expect(fleet.previewRemovals).toHaveLength(1))
     await vi.waitFor(() => expect(fleet.releases).toHaveLength(2))
-    expect(fleet.terminalEvents[0]).toBe('preview:remove')
+    expect(fleet.terminalEvents.indexOf(`state:${done}`)).toBeLessThan(
+      fleet.terminalEvents.indexOf('preview:remove'),
+    )
+    expect(fleet.terminalEvents.indexOf('preview:remove')).toBeLessThan(
+      fleet.terminalEvents.indexOf('agent:release:ar-52-impl-pear'),
+    )
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+  })
+
+  it('prepares a fresh issue worktree before running a bootstrap-inclusive preview command', async () => {
+    const worktrees = new RecordingWorktreeManager()
+    class WorktreeObservingPreviewFleetClient extends FakeFleetClient {
+      preparedCounts: number[] = []
+
+      override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+        this.preparedCounts.push(worktrees.prepared.length)
+        return await super.createPreview(input)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(50)]: issueFile(50) })
+    const fleet = new WorktreeObservingPreviewFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {
+          'AgentWorkforce/pear': {
+            port: 3_000,
+            startCommand: 'npm ci && exec npm run dev',
+          },
+        },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(50), issueFile(50))))
+
+    expect(fleet.preparedCounts).toEqual([1])
+    expect(fleet.previewStarts).toEqual([expect.objectContaining({
+      checkoutPath: worktrees.prepared[0]?.worktreePath,
+      startCommand: 'npm ci && exec npm run dev',
+    })])
+    expect(fleet.spawns.every((spawn) => spawn.cwd === worktrees.prepared[0]?.worktreePath)).toBe(true)
   })
 
   it('refuses to surface a preview reference that is not credential-free HTTPS', async () => {

@@ -23,7 +23,8 @@ const checkoutPath = repoRoot
 const responseMarker = process.env.FACTORY_PREVIEW_E2E_RESPONSE_MARKER ?? `factory-preview-e2e:${randomUUID()}`
 const serverSource = `require('node:http').createServer((_request, response) => response.end(${JSON.stringify(responseMarker)})).listen(Number(process.env.PORT), '127.0.0.1')`
 const startCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(serverSource)}`
-const temporaryRoot = process.env.FACTORY_PREVIEW_E2E_TEMP_ROOT ?? mkdtempSync(join(tmpdir(), 'factory-preview-e2e-'))
+const configuredTemporaryRoot = process.env.FACTORY_PREVIEW_E2E_TEMP_ROOT
+const temporaryRoot = configuredTemporaryRoot ?? mkdtempSync(join(tmpdir(), 'factory-preview-e2e-'))
 const registryPath = join(temporaryRoot, 'registry.json')
 const referencePath = join(temporaryRoot, 'reference.json')
 
@@ -106,6 +107,7 @@ try {
   assert.equal(await manager.remove(recovered), true)
   assert.equal(await new PreviewProcessSupervisor().isRunning(recovered.process), false)
   await assert.rejects(fetchText(recovered.url, 3_000))
+  await assert.rejects(fetchText(`http://127.0.0.1:${targetPort}/`, 3_000))
   assert.deepEqual(withoutPort(serveStatus(), httpsPort), withoutPort(statusBefore, httpsPort))
 
   // Start a second preview from a short-lived process, then deliberately leave
@@ -136,6 +138,7 @@ try {
   assert.deepEqual(sweep.reaped.map((preview) => preview.id), [orphan.id])
   assert.equal(await new PreviewProcessSupervisor().isRunning(orphan.process), false)
   await assert.rejects(fetchText(orphan.url, 3_000))
+  await assert.rejects(fetchText(`http://127.0.0.1:${targetPort}/`, 3_000))
   assert.deepEqual(withoutPort(serveStatus(), httpsPort), withoutPort(statusBefore, httpsPort))
 
   console.log(JSON.stringify({
@@ -150,14 +153,60 @@ try {
     responseMarker,
     teardownConfirmed: true,
     orphanSweepConfirmed: true,
-    unrelatedServeConfigPreserved: true,
+    otherPortServeConfigurationPreserved: true,
   }, null, 2))
 } finally {
-  if (orphan ?? recovered ?? reference) {
-    await manager.remove(orphan ?? recovered ?? reference).catch(() => false)
+  let cleanupSucceeded = true
+  const cleanupErrors = []
+  const cleanupReference = orphan ?? recovered ?? reference
+  if (cleanupReference) {
+    try {
+      if (!await manager.remove(cleanupReference)) {
+        cleanupSucceeded = false
+        cleanupErrors.push('provider manager could not confirm preview removal')
+      }
+    } catch (error) {
+      cleanupSucceeded = false
+      cleanupErrors.push(`preview removal threw: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
-  await manager.sweep({ namespace: workspace, activeOwners: [], activePreviewIds: [] }).catch(() => undefined)
-  rmSync(temporaryRoot, { recursive: true, force: true })
+  try {
+    const cleanupSweep = await manager.sweep({ namespace: workspace, activeOwners: [], activePreviewIds: [] })
+    if (cleanupSweep.skipped.length > 0) {
+      cleanupSucceeded = false
+      cleanupErrors.push(`cleanup sweep skipped: ${JSON.stringify(cleanupSweep.skipped)}`)
+    }
+  } catch (error) {
+    cleanupSucceeded = false
+    cleanupErrors.push(`cleanup sweep threw: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (cleanupReference?.process && await new PreviewProcessSupervisor().isRunning(cleanupReference.process)) {
+    cleanupSucceeded = false
+    cleanupErrors.push(`managed wrapper process ${cleanupReference.process.pid} is still running`)
+  }
+  if (await isReachable(`http://127.0.0.1:${targetPort}/`, 1_000)) {
+    cleanupSucceeded = false
+    cleanupErrors.push(`managed local target port ${targetPort} is still reachable`)
+  }
+  try {
+    if (routeTarget(serveStatus(), httpsPort) === `http://127.0.0.1:${targetPort}`) {
+      cleanupSucceeded = false
+      cleanupErrors.push(`managed Tailscale route on HTTPS port ${httpsPort} is still present`)
+    }
+  } catch (error) {
+    cleanupSucceeded = false
+    cleanupErrors.push(`final Serve status check threw: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (cleanupSucceeded) {
+    // Only remove a directory this invocation created. The child receives the
+    // path through the environment, and an operator-supplied recovery path may
+    // contain evidence or other files that the harness must not delete.
+    if (!configuredTemporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true })
+  } else {
+    process.exitCode = 1
+    console.error(`E2E cleanup was incomplete; recovery artifacts retained at ${temporaryRoot}`)
+    for (const error of cleanupErrors) console.error(`- ${error}`)
+  }
 }
 
 function serveStatus() {
@@ -174,7 +223,7 @@ async function fetchText(url, timeoutMs = 10_000) {
 
 function routeTarget(status, port) {
   const suffix = `:${port}`
-  for (const [hostPort, server] of Object.entries(status.Web ?? {})) {
+  for (const [hostPort, server] of Object.entries(status?.Web ?? {})) {
     if (hostPort.endsWith(suffix)) return server?.Handlers?.['/']?.Proxy
   }
   return undefined
@@ -182,12 +231,12 @@ function routeTarget(status, port) {
 
 function routeAllowsFunnel(status, port) {
   const suffix = `:${port}`
-  return Object.entries(status.AllowFunnel ?? {})
+  return Object.entries(status?.AllowFunnel ?? {})
     .some(([hostPort, allowed]) => hostPort.endsWith(suffix) && allowed === true)
 }
 
 function withoutPort(status, port) {
-  const copy = structuredClone(status)
+  const copy = structuredClone(status ?? {})
   delete copy.TCP?.[String(port)]
   for (const key of Object.keys(copy.Web ?? {})) {
     if (key.endsWith(`:${port}`)) delete copy.Web[key]
@@ -196,6 +245,15 @@ function withoutPort(status, port) {
     if (key.endsWith(`:${port}`)) delete copy.AllowFunnel[key]
   }
   return copy
+}
+
+async function isReachable(url, timeoutMs) {
+  try {
+    await fetchText(url, timeoutMs)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function integerFromEnv(name, fallback) {

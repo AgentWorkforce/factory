@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { get } from 'node:http'
+import { get as getHttps } from 'node:https'
 import { createServer } from 'node:net'
 import { dirname } from 'node:path'
 import { promisify } from 'node:util'
@@ -24,8 +25,10 @@ const REGISTRY_VERSION = 1
 const MANAGED_BY = '@agent-relay/factory'
 const PREVIEW_LOCK_STALE_MS = 30_000
 const PREVIEW_PROVIDER_COMMAND_TIMEOUT_MS = 30_000
-const PREVIEW_READY_TIMEOUT_MS = 60_000
+const PREVIEW_READY_TIMEOUT_MS = 5 * 60_000
+const PREVIEW_PUBLISHED_READY_TIMEOUT_MS = 60_000
 const PREVIEW_READY_POLL_INTERVAL_MS = 250
+const PREVIEW_PROVISIONING_GRACE_MS = 10 * 60_000
 
 type PreviewIdentity = Omit<PreviewReference, 'url' | 'process'> & {
   managedBy: typeof MANAGED_BY
@@ -43,6 +46,10 @@ type CommandResult = { stdout: string; stderr: string }
 export type PreviewCommandRunner = (file: string, args: string[]) => Promise<CommandResult>
 export type PreviewPortProbe = (port: number) => Promise<boolean>
 export type PreviewReadyProbe = (port: number) => Promise<boolean>
+export type PreviewPublishedProbe = (url: string) => Promise<boolean>
+type PreviewProcessController =
+  Pick<PreviewProcessSupervisor, 'start' | 'isRunning' | 'find' | 'stop'> &
+  Partial<Pick<PreviewProcessSupervisor, 'listenerOwnership'>>
 
 export interface PreviewManager {
   start(input: PreviewStartInput): Promise<PreviewReference>
@@ -55,9 +62,11 @@ export interface TailscalePreviewManagerOptions {
   run?: PreviewCommandRunner
   isPortAvailable?: PreviewPortProbe
   isReady?: PreviewReadyProbe
-  processSupervisor?: Pick<PreviewProcessSupervisor, 'start' | 'isRunning' | 'find' | 'stop'>
+  isPublishedReady?: PreviewPublishedProbe
+  processSupervisor?: PreviewProcessController
   sleep?: (ms: number) => Promise<void>
   readyTimeoutMs?: number
+  publishedReadyTimeoutMs?: number
   readyPollIntervalMs?: number
   now?: () => Date
 }
@@ -73,9 +82,11 @@ export class TailscalePreviewManager implements PreviewManager {
   readonly #run: PreviewCommandRunner
   readonly #isPortAvailable: PreviewPortProbe
   readonly #isReady: PreviewReadyProbe
-  readonly #processes: Pick<PreviewProcessSupervisor, 'start' | 'isRunning' | 'find' | 'stop'>
+  readonly #isPublishedReady: PreviewPublishedProbe
+  readonly #processes: PreviewProcessController
   readonly #sleep: (ms: number) => Promise<void>
   readonly #readyTimeoutMs: number
+  readonly #publishedReadyTimeoutMs: number
   readonly #readyPollIntervalMs: number
   readonly #now: () => Date
   #operation: Promise<unknown> = Promise.resolve()
@@ -91,9 +102,11 @@ export class TailscalePreviewManager implements PreviewManager {
     })
     this.#isPortAvailable = options.isPortAvailable ?? portAvailable
     this.#isReady = options.isReady ?? httpReady
+    this.#isPublishedReady = options.isPublishedReady ?? httpsReady
     this.#processes = options.processSupervisor ?? new PreviewProcessSupervisor()
     this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
     this.#readyTimeoutMs = options.readyTimeoutMs ?? PREVIEW_READY_TIMEOUT_MS
+    this.#publishedReadyTimeoutMs = options.publishedReadyTimeoutMs ?? PREVIEW_PUBLISHED_READY_TIMEOUT_MS
     this.#readyPollIntervalMs = options.readyPollIntervalMs ?? PREVIEW_READY_POLL_INTERVAL_MS
     this.#now = options.now ?? (() => new Date())
   }
@@ -119,7 +132,16 @@ export class TailscalePreviewManager implements PreviewManager {
       if (existingMatchesRequest && existingRoute && !existingRoute.funnel) {
         const process = await this.#ensureManagedProcess(existing, input.checkoutPath)
         await this.#awaitReady(existing.targetPort, process)
+        try {
+          await this.#assertListenerOwned(existing.targetPort, process)
+        } catch (error) {
+          // The exact Factory root is unsafe to keep published when a different
+          // process owns its upstream. Other mounts survive the path-scoped off.
+          await this.#disable(existing)
+          throw error
+        }
         const liveUrl = previewUrl(existingRoute.host, existing.httpsPort)
+        await this.#awaitPublishedReady(liveUrl, process)
         const active = activatePreview({ ...existing, process }, liveUrl)
         if (
           existing.state === 'pending' ||
@@ -205,14 +227,8 @@ export class TailscalePreviewManager implements PreviewManager {
           pending.process = process
           await this.#writeRegistry(registry)
           await this.#awaitReady(targetPort, process)
-          await this.#run(this.#config.tailscaleBinary, [
-            'serve',
-            '--bg',
-            '--yes',
-            `--https=${httpsPort}`,
-            '--set-path=/',
-            `http://127.0.0.1:${targetPort}`,
-          ])
+          await this.#assertListenerOwned(targetPort, process)
+          await this.#configure(pending)
           commandSucceeded = true
           const configured = await this.#serveStatus()
           const route = liveRoute(configured, httpsPort, targetPort)
@@ -223,7 +239,9 @@ export class TailscalePreviewManager implements PreviewManager {
                 : `tailscale serve did not report the configured route on HTTPS port ${httpsPort}`,
             )
           }
-          const preview = activatePreview(pending, previewUrl(route.host, httpsPort))
+          const liveUrl = previewUrl(route.host, httpsPort)
+          await this.#awaitPublishedReady(liveUrl, process)
+          const preview = activatePreview(pending, liveUrl)
           registry.previews = registry.previews.map((candidate) =>
             candidate.id === pending.id ? preview : candidate,
           )
@@ -307,6 +325,16 @@ export class TailscalePreviewManager implements PreviewManager {
           await this.#writeRegistry(registry)
           return true
         }
+        if (preview.state === 'active' && processRemoved) {
+          // Active means Factory previously observed and published the route.
+          // Once both that route and its exact managed process are confirmed
+          // absent, teardown is complete and retaining the row would make every
+          // terminal retry fail forever. Pending rows remain conservative below
+          // because they may represent an in-flight provider mutation.
+          registry.previews = registry.previews.filter((candidate) => candidate.id !== preview.id)
+          await this.#writeRegistry(registry)
+          return true
+        }
         // An unconfigured port can be a transient status gap. Preserve the
         // identity so a later startup sweep can still remove a route that
         // becomes visible after this check.
@@ -327,14 +355,22 @@ export class TailscalePreviewManager implements PreviewManager {
         ? new Set(input.activePreviewIds)
         : undefined
       const registry = await this.#readRegistry()
-      const status = await this.#serveStatus()
+      let status = await this.#serveStatus()
       const reaped: PreviewReference[] = []
       const skipped: PreviewSweepResult['skipped'] = []
       const retained: RegistryPreview[] = []
 
       for (const preview of registry.previews) {
-        const authoritativeActive = active.has(preview.owner) &&
-          (!activePreviewIds || activePreviewIds.has(preview.id))
+        const ownerActive = active.has(preview.owner)
+        const exactActive = ownerActive && (!activePreviewIds || activePreviewIds.has(preview.id))
+        // Cross-daemon provisioning necessarily creates the provider record
+        // before the orchestrator can persist its returned ID. Give only recent
+        // records for a known-active owner a bounded chance to cross that gap.
+        const provisioningActive = ownerActive &&
+          activePreviewIds !== undefined &&
+          !activePreviewIds.has(preview.id) &&
+          this.#withinProvisioningGrace(preview)
+        const authoritativeActive = exactActive || provisioningActive
         if (
           preview.managedBy !== MANAGED_BY ||
           preview.namespace !== input.namespace
@@ -348,12 +384,49 @@ export class TailscalePreviewManager implements PreviewManager {
             if (!checkoutPath) throw new Error('managed preview checkout is not recoverable')
             const process = await this.#ensureManagedProcess(preview, checkoutPath)
             await this.#awaitReady(preview.targetPort, process)
-            retained.push({ ...preview, checkoutPath, process })
+            try {
+              await this.#assertListenerOwned(preview.targetPort, process)
+            } catch (error) {
+              // This is a point-in-time ownership check. Arbitrary dev servers
+              // cannot accept a reserved socket from Factory, so a narrow
+              // check/use race remains; the final URL probe and every active
+              // sweep repeat validation without introducing a bespoke proxy.
+              if (liveRoute(status, preview.httpsPort, preview.targetPort)) {
+                await this.#disable(preview)
+                status = await this.#serveStatus()
+              }
+              throw error
+            }
+            let route = liveRoute(status, preview.httpsPort, preview.targetPort)
+            if (route?.funnel) {
+              // This exact root route is ours, so it is safe to remove before
+              // recreating it as tailnet-only Serve. Other mounts survive due
+              // to the explicit root path selector.
+              await this.#disable(preview)
+              await this.#configure(preview)
+              status = await this.#serveStatus()
+              route = liveRoute(status, preview.httpsPort, preview.targetPort)
+            } else if (!route) {
+              if (livePortConfigured(status, preview.httpsPort)) {
+                throw new Error('refusing route recovery because the HTTPS port has been repurposed')
+              }
+              await this.#configure(preview)
+              status = await this.#serveStatus()
+              route = liveRoute(status, preview.httpsPort, preview.targetPort)
+            }
+            if (!route || route.funnel) {
+              throw new Error(route?.funnel
+                ? 'recovered route still allows public Funnel access'
+                : 'recovered Serve route is not observable')
+            }
+            const liveUrl = previewUrl(route.host, preview.httpsPort)
+            await this.#awaitPublishedReady(liveUrl, process)
+            retained.push(activatePreview({ ...preview, checkoutPath, process }, liveUrl))
           } catch (error) {
             retained.push(preview)
             skipped.push({
               id: preview.id,
-              reason: `active preview process recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+              reason: `active preview recovery failed: ${error instanceof Error ? error.message : String(error)}`,
               node: preview.node,
             })
           }
@@ -372,14 +445,18 @@ export class TailscalePreviewManager implements PreviewManager {
               node: preview.node,
             })
           }
-          if (!repurposed || !processRemoved) retained.push(preview)
-          skipped.push({
-            id: preview.id,
-            reason: repurposed
-              ? 'live route identity mismatch'
-              : 'live route is not currently observable; retained for retry',
-            node: preview.node,
-          })
+          if (!repurposed && preview.state === 'active' && processRemoved) {
+            reaped.push(referenceFrom(preview))
+          } else {
+            if (!repurposed || !processRemoved) retained.push(preview)
+            skipped.push({
+              id: preview.id,
+              reason: repurposed
+                ? 'live route identity mismatch'
+                : 'live route is not currently observable; retained for retry',
+              node: preview.node,
+            })
+          }
           continue
         }
         try {
@@ -405,16 +482,63 @@ export class TailscalePreviewManager implements PreviewManager {
   }
 
   async #awaitReady(port: number, process: PreviewProcessIdentity): Promise<void> {
-    const interval = Math.max(1, this.#readyPollIntervalMs)
-    const attempts = Math.max(1, Math.ceil(Math.max(0, this.#readyTimeoutMs) / interval) + 1)
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (!await this.#processes.isRunning(process)) {
-        throw new Error(`Preview command exited before local HTTP port ${port} became ready`)
-      }
-      if (await this.#isReady(port)) return
-      if (attempt + 1 < attempts) await this.#sleep(interval)
+    await this.#awaitProbe(
+      process,
+      async () => await this.#isReady(port),
+      `Preview command exited before local HTTP port ${port} became ready`,
+      `Preview command did not make local HTTP port ${port} ready within ${this.#readyTimeoutMs}ms`,
+      this.#readyTimeoutMs,
+    )
+  }
+
+  async #awaitPublishedReady(url: string, process: PreviewProcessIdentity): Promise<void> {
+    await this.#awaitProbe(
+      process,
+      async () => await this.#isPublishedReady(url),
+      `Preview command exited before published URL ${url} became ready`,
+      `Published preview URL ${url} did not become ready within ${this.#publishedReadyTimeoutMs}ms`,
+      this.#publishedReadyTimeoutMs,
+    )
+  }
+
+  async #assertListenerOwned(port: number, process: PreviewProcessIdentity): Promise<void> {
+    const ownership = await this.#processes.listenerOwnership?.(process, port) ?? 'indeterminate'
+    if (ownership !== 'owned') {
+      throw new Error(
+        ownership === 'unrelated'
+          ? `Local HTTP port ${port} is owned by a process outside the managed preview tree`
+          : `Ownership of local HTTP port ${port} could not be determined`,
+      )
     }
-    throw new Error(`Preview command did not make local HTTP port ${port} ready within ${this.#readyTimeoutMs}ms`)
+  }
+
+  async #awaitProbe(
+    process: PreviewProcessIdentity,
+    probe: () => Promise<boolean>,
+    exitedMessage: string,
+    timeoutMessage: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const interval = Math.max(1, this.#readyPollIntervalMs)
+    const deadline = Date.now() + Math.max(0, timeoutMs)
+    while (true) {
+      if (!await this.#processes.isRunning(process)) {
+        throw new Error(exitedMessage)
+      }
+      const remaining = Math.max(1, deadline - Date.now())
+      if (await resolveBeforeDeadline(probe(), remaining, false)) return
+      const remainingAfterProbe = deadline - Date.now()
+      if (remainingAfterProbe <= 0) break
+      await this.#sleep(Math.min(interval, remainingAfterProbe))
+    }
+    throw new Error(timeoutMessage)
+  }
+
+  #withinProvisioningGrace(preview: Pick<RegistryPreview, 'createdAt'>): boolean {
+    const createdAtMs = Date.parse(preview.createdAt)
+    if (!Number.isFinite(createdAtMs)) return false
+    const ageMs = this.#now().getTime() - createdAtMs
+    return ageMs >= 0 && ageMs <= PREVIEW_PROVISIONING_GRACE_MS
   }
 
   async #stopManagedProcess(preview: Pick<RegistryPreview, 'id' | 'process'>): Promise<boolean> {
@@ -450,6 +574,17 @@ export class TailscalePreviewManager implements PreviewManager {
       `--https=${preview.httpsPort}`,
       '--set-path=/',
       'off',
+    ])
+  }
+
+  async #configure(preview: Pick<PreviewReference, 'httpsPort' | 'targetPort'>): Promise<void> {
+    await this.#run(this.#config.tailscaleBinary, [
+      'serve',
+      '--bg',
+      '--yes',
+      `--https=${preview.httpsPort}`,
+      '--set-path=/',
+      `http://127.0.0.1:${preview.targetPort}`,
     ])
   }
 
@@ -691,4 +826,41 @@ const httpReady: PreviewReadyProbe = async (port) => await new Promise<boolean>(
     request.destroy()
     finish(false)
   })
+})
+
+const httpsReady: PreviewPublishedProbe = async (url) => await new Promise<boolean>((resolve) => {
+  let settled = false
+  const finish = (ready: boolean) => {
+    if (settled) return
+    settled = true
+    resolve(ready)
+  }
+  const request = getHttps(url, { timeout: 1_000 }, (response) => {
+    response.resume()
+    finish(true)
+  })
+  request.once('error', () => finish(false))
+  request.once('timeout', () => {
+    request.destroy()
+    finish(false)
+  })
+})
+
+const resolveBeforeDeadline = async <T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  fallback: T,
+): Promise<T> => await new Promise<T>((resolve, reject) => {
+  let settled = false
+  const finish = (result: () => void) => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    result()
+  }
+  const timer = setTimeout(() => finish(() => resolve(fallback)), Math.max(0, timeoutMs))
+  void operation.then(
+    (value) => finish(() => resolve(value)),
+    (error) => finish(() => reject(error)),
+  )
 })

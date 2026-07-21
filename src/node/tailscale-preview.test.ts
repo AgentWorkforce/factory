@@ -2,11 +2,19 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { PreviewStartInput } from '../ports/fleet'
-import { previewProcessMarker, type PreviewProcessIdentity } from './preview-process'
-import { TailscalePreviewManager, type PreviewCommandRunner } from './tailscale-preview'
+import {
+  previewProcessMarker,
+  type PreviewListenerOwnership,
+  type PreviewProcessIdentity,
+} from './preview-process'
+import {
+  TailscalePreviewManager,
+  type PreviewCommandRunner,
+  type TailscalePreviewManagerOptions,
+} from './tailscale-preview'
 
 type Route = { targetPort: number; host: string }
 
@@ -59,6 +67,7 @@ function fakeTailscale() {
         targetPort: Number(target?.slice('http://127.0.0.1:'.length)),
         host: 'factory-node.example.ts.net',
       })
+      funnels.delete(httpsPort)
       return { stdout: '', stderr: '' }
     }
     if (args.at(-1) === 'off') {
@@ -71,7 +80,12 @@ function fakeTailscale() {
   return { calls, foreignTcp, foregroundTcp, funnels, humanWeb, routes, run }
 }
 
-function manager(run: PreviewCommandRunner, registryPath: string) {
+function manager(
+  run: PreviewCommandRunner,
+  registryPath: string,
+  options: Partial<TailscalePreviewManagerOptions> = {},
+  listenerOwnership: () => Promise<PreviewListenerOwnership> = async () => 'owned',
+) {
   const processes = new Map<string, PreviewProcessIdentity>()
   return new TailscalePreviewManager({
     config: {
@@ -85,6 +99,7 @@ function manager(run: PreviewCommandRunner, registryPath: string) {
     run,
     isPortAvailable: async () => true,
     isReady: async () => true,
+    isPublishedReady: async () => true,
     processSupervisor: {
       async start(input) {
         const existing = processes.get(input.id)
@@ -103,6 +118,7 @@ function manager(run: PreviewCommandRunner, registryPath: string) {
       async isRunning(process) {
         return [...processes.values()].some((candidate) => candidate.pid === process.pid)
       },
+      listenerOwnership,
       async find(id) { return processes.get(id) },
       async stop(process) {
         for (const [id, candidate] of processes) {
@@ -112,6 +128,7 @@ function manager(run: PreviewCommandRunner, registryPath: string) {
       },
     },
     now: () => new Date('2026-07-20T12:00:00.000Z'),
+    ...options,
   })
 }
 
@@ -157,6 +174,85 @@ describe('TailscalePreviewManager', () => {
     expect(fake.calls.filter((args) => args.includes('--bg'))).toHaveLength(1)
   })
 
+  it('probes the published tailnet URL before returning a preview reference', async () => {
+    const fake = fakeTailscale()
+    const publishedProbe = vi.fn(async () => true)
+    const previewManager = manager(
+      fake.run,
+      join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
+      { isPublishedReady: publishedProbe },
+    )
+
+    const preview = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
+    })
+
+    expect(publishedProbe).toHaveBeenCalledWith(preview.url)
+  })
+
+  it.each(['unrelated', 'indeterminate'] as const)(
+    'refuses to publish when local listener ownership is %s',
+    async (ownership) => {
+      const fake = fakeTailscale()
+      const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+      const publishedProbe = vi.fn(async () => true)
+      const previewManager = manager(
+        fake.run,
+        registryPath,
+        { isPublishedReady: publishedProbe },
+        async () => ownership,
+      )
+
+      await expect(start(previewManager, {
+        namespace: 'factory-test',
+        owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
+      })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
+
+      expect(fake.routes).toHaveLength(0)
+      expect(publishedProbe).not.toHaveBeenCalled()
+      expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
+    },
+  )
+
+  it('rolls back the route and process when the published URL never becomes reachable', async () => {
+    const fake = fakeTailscale()
+    const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    const previewManager = manager(fake.run, registryPath, {
+      isPublishedReady: async () => false,
+      publishedReadyTimeoutMs: 0,
+    })
+
+    await expect(start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
+    })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
+
+    expect(fake.routes).toHaveLength(0)
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
+  })
+
+  it('bounds a slow readiness probe by one wall-clock deadline', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(
+      fake.run,
+      join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
+      {
+        isReady: async () => await new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+        readyTimeoutMs: 20,
+        readyPollIntervalMs: 1,
+      },
+    )
+    const startedAt = Date.now()
+
+    await expect(start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
+    })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
+
+    expect(Date.now() - startedAt).toBeLessThan(250)
+  })
+
   it('removes only an exact live route identity', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
@@ -174,6 +270,22 @@ describe('TailscalePreviewManager', () => {
     await expect(previewManager.remove(preview)).resolves.toBe(true)
     expect(fake.routes.get(preview.httpsPort)?.targetPort).toBe(9_999)
     expect(fake.calls.some((args) => args.at(-1) === 'off')).toBe(false)
+  })
+
+  it('clears an active registry record after its route and process are confirmed absent', async () => {
+    const fake = fakeTailscale()
+    const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    const previewManager = manager(fake.run, registryPath)
+    const preview = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
+    })
+    fake.routes.delete(preview.httpsPort)
+
+    await expect(previewManager.remove(preview)).resolves.toBe(true)
+
+    expect(fake.calls.some((args) => args.at(-1) === 'off')).toBe(false)
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
   })
 
   it('removes only the Factory root mount and preserves human-owned paths', async () => {
@@ -331,9 +443,169 @@ describe('TailscalePreviewManager', () => {
     expect(fake.routes.has(orphan.httpsPort)).toBe(false)
   })
 
-  it('reaps duplicate references for an active owner when their ids are not durable', async () => {
+  it('clears an inactive active-state record when its route is already absent', async () => {
+    const fake = fakeTailscale()
+    const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    const previewManager = manager(fake.run, registryPath)
+    const orphan = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-orphan', issueKey: 'AR-2', service: 'two', repo: 'two', targetPort: 3_002,
+    })
+    fake.routes.delete(orphan.httpsPort)
+
+    const report = await previewManager.sweep({ namespace: 'factory-test', activeOwners: [] })
+
+    expect(report).toEqual({ reaped: [orphan], skipped: [] })
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
+  })
+
+  it('restores a missing route for an active preview without replacing another configured port', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const active = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    fake.routes.delete(active.httpsPort)
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [active.id],
+    })
+
+    expect(report).toEqual({ reaped: [], skipped: [] })
+    expect(fake.routes.get(active.httpsPort)?.targetPort).toBe(active.targetPort)
+    expect(fake.calls.filter((args) => args.includes('--bg'))).toHaveLength(2)
+  })
+
+  it('rechecks listener ownership during active sweep and disables an unsafe exact route', async () => {
+    const fake = fakeTailscale()
+    let ownership: PreviewListenerOwnership = 'owned'
+    const previewManager = manager(
+      fake.run,
+      join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
+      {},
+      async () => ownership,
+    )
+    const active = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    ownership = 'unrelated'
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [active.id],
+    })
+
+    expect(report.reaped).toEqual([])
+    expect(report.skipped).toEqual([expect.objectContaining({
+      id: active.id,
+      reason: expect.stringContaining('outside the managed preview tree'),
+    })])
+    expect(fake.routes.has(active.httpsPort)).toBe(false)
+    expect(fake.calls.filter((args) => args.at(-1) === 'off')).toHaveLength(1)
+  })
+
+  it('switches an active exact route from public Funnel back to tailnet-only Serve', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const active = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    fake.funnels.add(active.httpsPort)
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [active.id],
+    })
+
+    expect(report).toEqual({ reaped: [], skipped: [] })
+    expect(fake.routes.get(active.httpsPort)?.targetPort).toBe(active.targetPort)
+    expect(fake.funnels.has(active.httpsPort)).toBe(false)
+    expect(fake.calls.filter((args) => args.at(-1) === 'off')).toHaveLength(1)
+    expect(fake.calls.filter((args) => args.includes('--bg'))).toHaveLength(2)
+  })
+
+  it('refuses to repair an active preview after its HTTPS port is repurposed', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const active = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    fake.routes.set(active.httpsPort, { targetPort: 9_999, host: 'factory-node.example.ts.net' })
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [active.id],
+    })
+
+    expect(report.reaped).toEqual([])
+    expect(report.skipped).toEqual([expect.objectContaining({
+      id: active.id,
+      reason: expect.stringContaining('HTTPS port has been repurposed'),
+    })])
+    expect(fake.routes.get(active.httpsPort)?.targetPort).toBe(9_999)
+    expect(fake.calls.filter((args) => args.at(-1) === 'off')).toHaveLength(0)
+    expect(fake.calls.filter((args) => args.includes('--bg'))).toHaveLength(1)
+  })
+
+  it('retains a recent preview for an active owner while its exact ID is not yet durable', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const provisioning = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [],
+    })
+
+    expect(report).toEqual({ reaped: [], skipped: [] })
+    expect(fake.routes.has(provisioning.httpsPort)).toBe(true)
+  })
+
+  it('does not grant provisioning grace to a future-dated registry record', async () => {
+    const fake = fakeTailscale()
+    let now = new Date('2026-07-20T12:00:00.000Z')
+    const previewManager = manager(
+      fake.run,
+      join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
+      { now: () => now },
+    )
+    const futureDated = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    now = new Date('2026-07-20T11:59:00.000Z')
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [],
+    })
+
+    expect(report).toEqual({ reaped: [futureDated], skipped: [] })
+    expect(fake.routes.has(futureDated.httpsPort)).toBe(false)
+  })
+
+  it('reaps duplicate references for an active owner when their ids are not durable', async () => {
+    const fake = fakeTailscale()
+    let now = new Date('2026-07-20T12:00:00.000Z')
+    const previewManager = manager(
+      fake.run,
+      join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
+      { now: () => now },
+    )
     const durable = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
@@ -342,6 +614,7 @@ describe('TailscalePreviewManager', () => {
       namespace: 'factory-test',
       owner: 'owner-active', issueKey: 'AR-1', service: 'two', repo: 'two', targetPort: 3_002,
     })
+    now = new Date('2026-07-20T12:11:00.000Z')
 
     const report = await previewManager.sweep({
       namespace: 'factory-test',

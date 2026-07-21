@@ -295,7 +295,7 @@ once):
       "AgentWorkforce/pear": {
         "port": 3000,
         "portSpan": 25,
-        "startCommand": "npm run dev"
+        "startCommand": "npm ci && exec npm run dev"
       }
     }
   }
@@ -313,13 +313,30 @@ surface a route marked as Funnel.
 port in `port..port + portSpan - 1` (the span defaults to 100), places that
 allocated port in every agent task, and reserves a separate HTTPS port from
 `preview.httpsPortRange`. Keep that HTTPS range dedicated to Factory previews.
-`startCommand` must be a foreground development command that honors `PORT`.
+Preview provisioning happens immediately after Factory creates the isolated
+issue worktree, before an agent has had a chance to install ignored dependencies
+such as `node_modules`. `startCommand` must therefore include any bounded,
+non-interactive bootstrap the fresh checkout needs, followed by a foreground
+development command that honors `PORT` (for example,
+`npm ci && exec npm run dev`).
 The node starts it in the issue checkout, waits for the allocated local HTTP
-port to respond before returning the URL, and persists an exact process identity
-so the command survives agent handoffs and can be safely recovered or stopped.
-The command must not daemonize or bind a different port.
+port to respond, and verifies on Linux or macOS that the listener belongs to the
+supervised process tree before returning the URL. It persists an exact process
+identity so the command survives agent handoffs and can be safely recovered or
+stopped. The command must not daemonize or bind a different port. Active sweeps
+repeat listener ownership verification and disable the exact Factory route if
+the port is taken over by an unrelated process.
+For safety, preview commands receive only `PORT` plus basic shell, locale, home,
+and temporary-directory variables; they do not inherit arbitrary Factory,
+Relay, or provider credentials from the node process. Load intentional
+application settings through a checkout-local environment mechanism. Do not put
+secrets directly in `startCommand`, because lifecycle recovery persists the
+command as metadata.
 
-Routes and their supervised commands are removed before Human Review or Done.
+Terminal lifecycle completion is withheld until routes and their supervised
+commands have been removed at Human Review or Done. If the source-state
+writeback wins a crash race, startup recovery observes that terminal source
+state and finishes preview teardown before terminalizing the durable lifecycle.
 A startup and periodic sweep reaps only orphaned resources in the current
 Factory workspace whose persisted route and process identities still match.
 See the [provider evaluation](planning/preview-provider-evaluation.md)

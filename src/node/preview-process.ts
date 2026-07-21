@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { readdir, readFile, readlink } from 'node:fs/promises'
+import { promisify } from 'node:util'
 
 import {
   findAgentProcessByName,
@@ -17,6 +19,19 @@ const DEFAULT_IDENTITY_TIMEOUT_MS = 5_000
 const DEFAULT_IDENTITY_POLL_INTERVAL_MS = 25
 const PREVIEW_CWD_ARGUMENT = '--factory-preview-cwd'
 const PREVIEW_COMMAND_ARGUMENT = '--factory-preview-command'
+const execFileAsync = promisify(execFile)
+const PREVIEW_ENVIRONMENT_KEYS = new Set([
+  'HOME',
+  'LANG',
+  'LOGNAME',
+  'PATH',
+  'SHELL',
+  'TEMP',
+  'TERM',
+  'TMP',
+  'TMPDIR',
+  'USER',
+])
 
 // Keep the wrapper process alive while its configured command runs so the
 // stable, Factory-owned marker remains visible in the wrapper's command line.
@@ -53,6 +68,11 @@ export interface PreviewProcessIdentity {
   marker: string
 }
 
+export type PreviewListenerOwnership = 'owned' | 'unrelated' | 'indeterminate'
+export type PreviewListenerPidResolver = (port: number) => Promise<number[] | undefined>
+export type PreviewProcessParentReader = (pid: number) => Promise<number | undefined>
+export type PreviewListenerCommandRunner = (file: string, args: string[]) => Promise<string>
+
 export interface PreviewProcessSpawnOptions {
   cwd: string
   detached: true
@@ -82,6 +102,11 @@ export interface PreviewProcessSupervisorOptions {
   identityTimeoutMs?: number
   identityPollIntervalMs?: number
   env?: NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+  procRoot?: string
+  resolveListenerPids?: PreviewListenerPidResolver
+  readParentPid?: PreviewProcessParentReader
+  runListenerCommand?: PreviewListenerCommandRunner
 }
 
 /**
@@ -101,6 +126,8 @@ export class PreviewProcessSupervisor {
   readonly #identityTimeoutMs: number
   readonly #identityPollIntervalMs: number
   readonly #env: NodeJS.ProcessEnv
+  readonly #resolveListenerPids: PreviewListenerPidResolver
+  readonly #readParentPid: PreviewProcessParentReader
 
   constructor(options: PreviewProcessSupervisorOptions = {}) {
     this.#shell = options.shell ?? '/bin/sh'
@@ -117,6 +144,13 @@ export class PreviewProcessSupervisor {
     this.#identityTimeoutMs = options.identityTimeoutMs ?? DEFAULT_IDENTITY_TIMEOUT_MS
     this.#identityPollIntervalMs = options.identityPollIntervalMs ?? DEFAULT_IDENTITY_POLL_INTERVAL_MS
     this.#env = options.env ?? process.env
+    const platform = options.platform ?? process.platform
+    const procRoot = options.procRoot ?? '/proc'
+    const runListenerCommand = options.runListenerCommand ?? runCommand
+    this.#resolveListenerPids = options.resolveListenerPids ?? (async (port) =>
+      await resolveListeningPids(port, platform, procRoot, runListenerCommand))
+    this.#readParentPid = options.readParentPid ?? (async (pid) =>
+      await readParentPid(pid, platform, procRoot, runListenerCommand))
   }
 
   async start(input: PreviewProcessStartInput): Promise<PreviewProcessIdentity> {
@@ -148,7 +182,7 @@ export class PreviewProcessSupervisor {
     ], {
       cwd: input.cwd,
       detached: true,
-      env: { ...this.#env, PORT: String(input.port) },
+      env: previewEnvironment(this.#env, input.port),
       stdio: 'ignore',
     })
     const pid = child.pid
@@ -159,9 +193,23 @@ export class PreviewProcessSupervisor {
 
     const identity = await this.#awaitIdentity(pid!, marker, input.cwd, commandToken)
     if (!identity) {
-      throw new Error(
-        `Preview process ${marker} started as PID ${pid} but its exact identity was not observable; recover it with find(${JSON.stringify(input.id)})`,
-      )
+      try {
+        // The PID came directly from this spawn call. Do not leave that known
+        // detached process behind merely because the platform identity lookup
+        // did not become observable before the deadline.
+        const report = await this.#terminatePids([pid!], this.#terminateOptions)
+        const cleanupConfirmed = report.terminated.some((entry) => entry.pid === pid) ||
+          report.skipped.some((entry) => entry.pid === pid && entry.reason === 'pid not running')
+        if (!cleanupConfirmed) {
+          throw new Error(report.skipped.find((entry) => entry.pid === pid)?.reason ?? 'termination was not confirmed')
+        }
+      } catch (cleanupError) {
+        throw new Error(
+          `Preview process ${marker} started as PID ${pid} but its exact identity was not observable and the spawned process could not be terminated`,
+          { cause: cleanupError },
+        )
+      }
+      throw new Error(`Preview process ${marker} started as PID ${pid} but its exact identity was not observable and was terminated`)
     }
     return identity
   }
@@ -170,6 +218,31 @@ export class PreviewProcessSupervisor {
     if (!validPersistedIdentity(identity)) return false
     const current = await this.#readProcessIdentity(identity.pid)
     return Boolean(current && processIdentityMatches(identity, current))
+  }
+
+  async listenerOwnership(identity: PreviewProcessIdentity, port: number): Promise<PreviewListenerOwnership> {
+    // This is deliberately a point-in-time guard. Arbitrary development
+    // servers cannot inherit a reserved Factory socket, so eliminating the
+    // final check/use race would require socket activation or an intermediary
+    // proxy. Callers repeat this check during active reconciliation.
+    if (!validPersistedIdentity(identity) || !validPort(port) || !await this.isRunning(identity)) {
+      return 'indeterminate'
+    }
+    let listenerPids: number[] | undefined
+    try {
+      listenerPids = await this.#resolveListenerPids(port)
+    } catch {
+      return 'indeterminate'
+    }
+    if (!listenerPids || listenerPids.length === 0) return 'indeterminate'
+
+    let indeterminate = false
+    for (const pid of new Set(listenerPids)) {
+      const belongs = await this.#belongsToProcessTree(pid, identity.pid)
+      if (belongs === false) return 'unrelated'
+      if (belongs === undefined) indeterminate = true
+    }
+    return indeterminate ? 'indeterminate' : 'owned'
   }
 
   async find(id: string): Promise<PreviewProcessIdentity | undefined> {
@@ -232,6 +305,24 @@ export class PreviewProcessSupervisor {
     }
     return undefined
   }
+
+  async #belongsToProcessTree(pid: number, rootPid: number): Promise<boolean | undefined> {
+    let current = pid
+    const seen = new Set<number>()
+    for (let depth = 0; depth < 256; depth += 1) {
+      if (current === rootPid) return true
+      if (!Number.isInteger(current) || current <= 1 || seen.has(current)) return false
+      seen.add(current)
+      try {
+        const parent = await this.#readParentPid(current)
+        if (parent === undefined) return undefined
+        current = parent
+      } catch {
+        return undefined
+      }
+    }
+    return undefined
+  }
 }
 
 export function previewProcessMarker(id: string): string {
@@ -244,9 +335,22 @@ function validateStartInput(input: PreviewProcessStartInput): void {
   previewProcessMarker(input.id)
   if (!input.command.trim()) throw new Error('Preview process command must be non-empty')
   if (!input.cwd.trim()) throw new Error('Preview process cwd must be non-empty')
-  if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65_535) {
+  if (!validPort(input.port)) {
     throw new Error('Preview process port must be an integer between 1 and 65535')
   }
+}
+
+const validPort = (port: number): boolean => Number.isInteger(port) && port >= 1 && port <= 65_535
+
+function previewEnvironment(source: NodeJS.ProcessEnv, port: number): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { PORT: String(port) }
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue
+    if (PREVIEW_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_')) {
+      environment[key] = value
+    }
+  }
+  return environment
 }
 
 function validPersistedIdentity(identity: PreviewProcessIdentity): boolean {
@@ -302,4 +406,123 @@ function digest(value: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+}
+
+async function resolveListeningPids(
+  port: number,
+  platform: NodeJS.Platform,
+  procRoot: string,
+  run: PreviewListenerCommandRunner,
+): Promise<number[] | undefined> {
+  if (!validPort(port)) return undefined
+  if (platform === 'linux') return await resolveLinuxListeningPids(port, procRoot)
+  if (platform === 'darwin') return await resolveDarwinListeningPids(port, run)
+  return undefined
+}
+
+async function resolveLinuxListeningPids(port: number, procRoot: string): Promise<number[] | undefined> {
+  const tables = await Promise.allSettled([
+    readFile(`${procRoot}/net/tcp`, 'utf8'),
+    readFile(`${procRoot}/net/tcp6`, 'utf8'),
+  ])
+  const readableTables = tables.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+  if (readableTables.length === 0) return undefined
+  const socketInodes = new Set(readableTables.flatMap((table) => listeningSocketInodes(table, port)))
+  if (socketInodes.size === 0) return []
+
+  let processEntries: string[]
+  try {
+    processEntries = await readdir(procRoot)
+  } catch {
+    return undefined
+  }
+  const owners = new Set<number>()
+  await Promise.all(processEntries.filter((entry) => /^\d+$/u.test(entry)).map(async (entry) => {
+    let descriptors: string[]
+    try {
+      descriptors = await readdir(`${procRoot}/${entry}/fd`)
+    } catch {
+      return
+    }
+    for (const descriptor of descriptors) {
+      try {
+        const target = await readlink(`${procRoot}/${entry}/fd/${descriptor}`)
+        const inode = /^socket:\[(\d+)\]$/u.exec(target)?.[1]
+        if (inode && socketInodes.has(inode)) {
+          owners.add(Number(entry))
+          return
+        }
+      } catch {
+        // Processes and descriptors can disappear during the scan.
+      }
+    }
+  }))
+  return [...owners]
+}
+
+function listeningSocketInodes(table: string, port: number): string[] {
+  const expectedPort = port.toString(16).toUpperCase().padStart(4, '0')
+  const inodes: string[] = []
+  for (const line of table.split(/\r?\n/u).slice(1)) {
+    const fields = line.trim().split(/\s+/u)
+    if (fields.length < 10) continue
+    const localPort = fields[1]?.split(':').at(-1)?.toUpperCase()
+    const state = fields[3]?.toUpperCase()
+    const inode = fields[9]
+    if (localPort === expectedPort && state === '0A' && /^\d+$/u.test(inode ?? '')) {
+      inodes.push(inode!)
+    }
+  }
+  return inodes
+}
+
+async function resolveDarwinListeningPids(
+  port: number,
+  run: PreviewListenerCommandRunner,
+): Promise<number[] | undefined> {
+  try {
+    const output = await run('/usr/sbin/lsof', [
+      '-nP',
+      '-a',
+      `-iTCP:${port}`,
+      '-sTCP:LISTEN',
+      '-Fp',
+    ])
+    return [...new Set(output.split(/\r?\n/u)
+      .filter((line) => /^p\d+$/u.test(line))
+      .map((line) => Number(line.slice(1))))]
+  } catch {
+    return undefined
+  }
+}
+
+async function readParentPid(
+  pid: number,
+  platform: NodeJS.Platform,
+  procRoot: string,
+  run: PreviewListenerCommandRunner,
+): Promise<number | undefined> {
+  if (platform === 'linux') {
+    try {
+      const status = await readFile(`${procRoot}/${pid}/status`, 'utf8')
+      const parent = Number(/^PPid:\s+(\d+)$/mu.exec(status)?.[1])
+      return Number.isInteger(parent) && parent >= 0 ? parent : undefined
+    } catch {
+      return undefined
+    }
+  }
+  if (platform === 'darwin') {
+    try {
+      const parent = Number((await run('/bin/ps', ['-o', 'ppid=', '-p', String(pid)])).trim())
+      return Number.isInteger(parent) && parent >= 0 ? parent : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+const runCommand: PreviewListenerCommandRunner = async (file, args) => {
+  const result = await execFileAsync(file, args, { encoding: 'utf8' })
+  return result.stdout
 }
