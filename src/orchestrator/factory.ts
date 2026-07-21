@@ -3540,13 +3540,58 @@ export class FactoryLoop implements Factory {
     }
 
     if (acquiredNow && lifecycle.phase === 'running') {
-      if (this.#fleet.hydrateTracked) {
-        this.#fleet.hydrateTracked(lifecycle.agents.map((agent) => ({
+      const activeAgents = lifecycle.agents.filter((agent) => agent.releasedAtMs === undefined)
+      if (this.#fleet.hydrateTracked && activeAgents.length > 0) {
+        const hydrated = activeAgents.map((agent) => ({
           name: agent.name,
           invocationId: agent.tracked.spec.invocationId,
           node: agent.tracked.result?.node,
-        })))
-        await this.#fleet.reconcileTrackedAgents?.()
+        }))
+        this.#fleet.hydrateTracked(hydrated)
+        try {
+          await this.#fleet.reconcileTrackedAgents?.()
+          const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+          const fleetTracked = this.#fleet.trackedAgents?.()
+          const missing = activeAgents.filter((agent) =>
+            (!online.has(agent.name) || (fleetTracked !== undefined && !fleetTracked.has(agent.name))) &&
+            !this.#agentExitsInFlight.has(agent.name))
+          missing.sort((left, right) => {
+            const priority = (role: TrackedAgent['spec']['role']): number =>
+              role === 'implementer' ? 0 : role === 'babysitter' ? 1 : 2
+            return priority(left.tracked.spec.role) - priority(right.tracked.spec.role) ||
+              left.name.localeCompare(right.name)
+          })
+          for (const agent of missing) {
+            this.#fleet.markAgentTerminal?.(agent.name, 'reconciled-missing')
+            this.#queueAgentExit(agent.name, 'reconciled-missing')
+          }
+          if (missing.length > 0) {
+            this.#increment('takeoverRosterMissingExitsSynthesized', missing.length)
+            this.#logger.info?.('[factory] synthesized missing durable takeover roster exits', {
+              issue: lifecycle.issue.key,
+              agents: missing.map((agent) => agent.name),
+            })
+          }
+          const exitNames = new Set(activeAgents.map((agent) => agent.name))
+          const drained = await this.#drainAgentExitsInFlight(
+            exitNames,
+            this.#startMode === 'live' ? this.#startupAgentExitDrainTimeoutMs : undefined,
+          )
+          if (!drained) {
+            this.#increment('takeoverAgentExitDrainTimeouts')
+            this.#logger.warn?.('[factory] durable takeover exit reconciliation is still running', {
+              issue: lifecycle.issue.key,
+              timeoutMs: this.#startupAgentExitDrainTimeoutMs,
+              pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => exitNames.has(name)),
+            })
+          }
+        } catch (error) {
+          // Force the retry path back through takeover reconciliation. Keeping
+          // the epoch cached here would turn the next drive into an ordinary
+          // running lifecycle and permanently skip the authoritative roster.
+          this.#dispatchLifecycleEpochs.delete(key)
+          throw error
+        }
       }
       if (this.#config.babysitter.enabled) await this.#reconcileRestoredBabysitterReceipts(record)
       return
