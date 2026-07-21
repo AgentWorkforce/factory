@@ -284,6 +284,7 @@ const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
+const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
@@ -401,6 +402,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
+  readonly #abandonedDispatchReasons = new Map<string, string>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
   readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
@@ -440,6 +442,8 @@ export class FactoryLoop implements Factory {
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
+  #reconciledAgentExitsActive = 0
+  readonly #reconciledAgentExitWaiters: Array<() => void> = []
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   #startupAgentAdoptionActive = false
   #startupRosterExitSignals?: Set<string>
@@ -800,6 +804,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    this.#abandonedDispatchReasons.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
@@ -2658,7 +2663,13 @@ export class FactoryLoop implements Factory {
     const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
     const handling = previous
       .catch(() => undefined)
-      .then(async () => await this.#handleAgentExit(name, reason))
+      .then(async () => {
+        if (reason === 'reconciled-missing') {
+          await this.#withReconciledAgentExitSlot(async () => this.#handleAgentExit(name, reason))
+          return
+        }
+        await this.#handleAgentExit(name, reason)
+      })
       .catch((error) => this.#error(error))
       .finally(() => {
         if (this.#agentExitsInFlight.get(name) === handling) {
@@ -2774,7 +2785,13 @@ export class FactoryLoop implements Factory {
         // the hydrated durable session is no longer usable. Classify it as a
         // reconciled miss so remote implementers recover a PR or restart
         // instead of waiting forever for branch replication after a crash.
-        for (const name of signalled) this.#queueAgentExit(name, 'reconciled-missing')
+        const rolePriority = (name: string): number => {
+          const role = batch.getIssueByAgent(name)?.agents.get(name)?.spec.role
+          return role === 'implementer' ? 0 : role === 'babysitter' ? 1 : 2
+        }
+        const orderedSignals = [...signalled].sort((left, right) =>
+          rolePriority(left) - rolePriority(right) || left.localeCompare(right))
+        for (const name of orderedSignals) this.#queueAgentExit(name, 'reconciled-missing')
         if (synthesized.length > 0) {
           this.#increment('startupRosterMissingExitsSynthesized', synthesized.length)
           this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
@@ -2896,6 +2913,20 @@ export class FactoryLoop implements Factory {
     ])
     if (timer) clearTimeout(timer)
     return completed
+  }
+
+  async #withReconciledAgentExitSlot(run: () => Promise<void>): Promise<void> {
+    if (this.#reconciledAgentExitsActive >= RECONCILED_AGENT_EXIT_CONCURRENCY) {
+      this.#increment('reconciledAgentExitBackpressure')
+      await new Promise<void>((resolve) => this.#reconciledAgentExitWaiters.push(resolve))
+    }
+    this.#reconciledAgentExitsActive += 1
+    try {
+      await run()
+    } finally {
+      this.#reconciledAgentExitsActive -= 1
+      this.#reconciledAgentExitWaiters.shift()?.()
+    }
   }
 
   #scheduleDispatchLifecycleRenewal(): void {
@@ -3293,6 +3324,12 @@ export class FactoryLoop implements Factory {
     const record = lifecycle.phase === 'releasing' ? durableRecord : batch.restore(durableRecord)
     if (!await this.#assertDispatchLifecycleOwner(record)) return
     if (acquiredNow && this.#config.babysitter.enabled) await this.#restoreBabysitterOwnership()
+
+    const abandonedReason = this.#abandonedDispatchReasons.get(key)
+    if (abandonedReason !== undefined) {
+      await this.#abandonStuckDispatch(record, abandonedReason)
+      return
+    }
 
     if (acquiredNow && lifecycle.phase === 'running') {
       if (this.#fleet.hydrateTracked) {
@@ -5066,6 +5103,7 @@ export class FactoryLoop implements Factory {
     if (isCompletionReason(reason)) {
       if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,
+        preferExactBranch: tracingReconciledExit,
       }, exiting)) {
         if (this.#config.babysitter.enabled) await this.#ensureBabysitterForIssue(record)
         else if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
@@ -5120,6 +5158,7 @@ export class FactoryLoop implements Factory {
       const hasCompletionPr = tracked.spec.role === 'implementer'
         ? await this.#issueHasCompletionPr(record, {
             openOnly: this.#config.babysitter.enabled,
+            preferExactBranch: tracingReconciledExit,
           }, tracked)
         : false
       if (tracingReconciledExit) {
@@ -5220,43 +5259,58 @@ export class FactoryLoop implements Factory {
         }
       }
 
+      // Bound recovery by the durable logical agent, not by the session ref.
+      // Harnesses may return a fresh session ref from every successful resume,
+      // and no-sessionRef workers use respawn instead. Keying only resumptions
+      // by the changing ref (and not recording respawns at all) let an agent
+      // that exited immediately consume a batch slot forever while Factory
+      // continuously recreated it. One successful recovery is enough; a
+      // subsequent no-PR implementer exit is terminal and frees the slot.
+      const recoveryLifecycle = await this.#state.getDispatchLifecycle(
+        this.#workspaceId,
+        issueKey(record.issue),
+      )
+      const recoveryRunIdentity = recoveryLifecycle?.runId
+        ?? tracked.spec.branch
+        ?? batch.invocationIdFor(record.issue, tracked.spec)
+      const recoveryKey = `${recoveryRunIdentity}:${tracked.spec.name}`
+      if (await this.#state.isResumed(this.#workspaceId, recoveryKey)) {
+        if (tracked.spec.role === 'implementer') {
+          await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
+        }
+        return
+      }
+
+      const existing = this.#resumeInFlight.get(recoveryKey)
+      if (existing) {
+        try {
+          await existing
+        } catch {
+          // The initiating recovery handler owns classification and logging.
+          // Followers only coalesce onto its lifetime and must not re-report
+          // the same failure.
+        }
+        return
+      }
+
       let recovered = false
       if (tracked.sessionRef) {
-        const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
-        if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
-          // Already resumed once and STILL exiting with no completion PR — the
-          // agent isn't making progress. Conclude the dispatch so a human
-          // notices AND the reviewer waiting on the implementer's DM is torn
-          // down, instead of leaving the issue silently in-flight forever with
-          // a live reviewer stalling the owned-broker dispose-wait (#67).
-          if (tracked.spec.role === 'implementer') {
-            await this.#concludeTerminalImplementer(record, name, 'stalled-no-pr')
-          }
-          return
-        }
-
-        const existing = this.#resumeInFlight.get(resumeKey)
-        if (existing) {
-          await existing
-          return
-        }
-
         const resume = this.#resumeTrackedAgent(record, name, tracked)
-        this.#resumeInFlight.set(resumeKey, resume)
+        this.#resumeInFlight.set(recoveryKey, resume)
         try {
           await resume
-          await this.#state.markResumed(this.#workspaceId, resumeKey)
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           recovered = true
         } catch (error) {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
             // (relay#1116-family), so re-registering collides with the stuck
             // name. Retrying just re-collides forever. Treat it as terminal for
-            // this name: record the resume key so subsequent exit events
+            // this name: record the recovery key so subsequent exit events
             // short-circuit, count it, and warn once. The external reaper / a
             // broker restart reclaims the leaked name.
             this.#fleet.markAgentTerminal?.(name, 'resume-already-exists')
-            await this.#state.markResumed(this.#workspaceId, resumeKey)
+            await this.#state.markResumed(this.#workspaceId, recoveryKey)
             this.#increment('resumeNameCollisions')
             this.#logger.warn?.('[factory] resume skipped: broker still holds agent name (relay#1116); not retrying', {
               issue: record.issue.key,
@@ -5273,11 +5327,11 @@ export class FactoryLoop implements Factory {
             throw error
           }
         } finally {
-          this.#resumeInFlight.delete(resumeKey)
+          this.#resumeInFlight.delete(recoveryKey)
         }
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:restart:${this.#clock.now()}`
-        try {
+        const respawn = (async (): Promise<void> => {
           await this.#prepareAgentWorktree(record, tracked.spec)
           const result = await this.#fleet.spawn({
             name: tracked.spec.name,
@@ -5293,6 +5347,11 @@ export class FactoryLoop implements Factory {
             channel: tracked.spec.channel,
           })
           batch.recordSpawn(record, tracked.spec, invocationId, result)
+        })()
+        this.#resumeInFlight.set(recoveryKey, respawn)
+        try {
+          await respawn
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           recovered = true
         } catch (error) {
           if (!isAgentAlreadyExistsError(error)) {
@@ -5305,6 +5364,7 @@ export class FactoryLoop implements Factory {
           // the dispatch so a reviewer blocked on the implementer's DM does not
           // hang the owned-broker dispose-wait (#67).
           this.#fleet.markAgentTerminal?.(name, 'respawn-already-exists')
+          await this.#state.markResumed(this.#workspaceId, recoveryKey)
           this.#increment('resumeNameCollisions')
           this.#logger.warn?.('[factory] respawn skipped: broker still holds agent name (relay#1116); not retrying', {
             issue: record.issue.key,
@@ -5313,6 +5373,8 @@ export class FactoryLoop implements Factory {
           if (tracked.spec.role === 'implementer') {
             await this.#concludeTerminalImplementer(record, name, 'respawn-already-exists')
           }
+        } finally {
+          this.#resumeInFlight.delete(recoveryKey)
         }
       }
       if (recovered && tracked.spec.role === 'implementer') {
@@ -5826,6 +5888,8 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
+    const key = issueKey(record.issue)
+    this.#abandonedDispatchReasons.set(key, reason)
     const agents = [...record.agents]
     for (const [agentName, tracked] of agents) {
       if (tracked.spec.role === 'implementer') continue
@@ -5856,6 +5920,22 @@ export class FactoryLoop implements Factory {
       await this.#writeInFlightRegistry()
       return
     }
+    // Batch completion alone only frees the process-local slot. Durable
+    // capacity is computed from lifecycle phases, so leaving this row in
+    // `publishing`/`running` makes every queued issue wait forever even though
+    // all agents and worktrees are already gone. Fence the terminal phase
+    // before promoting the next issue.
+    if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      // #saveDispatchLifecycle already schedules the generic durable retry. The
+      // pending reason makes that retry re-acquire ownership and return here,
+      // rather than merely restoring the old running lifecycle and leaking the
+      // slot. The abandoned-specific scheduler remains the non-durable fallback.
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      await this.#writeInFlightRegistry()
+      return
+    }
+    this.#abandonedDispatchReasons.delete(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
@@ -5886,7 +5966,7 @@ export class FactoryLoop implements Factory {
 
   async #issueHasCompletionPr(
     record: InFlightIssue,
-    opts: { openOnly?: boolean } = {},
+    opts: { openOnly?: boolean; preferExactBranch?: boolean } = {},
     implementer?: TrackedAgent,
   ): Promise<boolean> {
     try {
@@ -5894,7 +5974,14 @@ export class FactoryLoop implements Factory {
       if (!issue) {
         return false
       }
-      if (implementer?.spec.branch && record.decision.implementers.length > 1) {
+      // During startup recovery, the implementer's deterministic branch is the
+      // strongest and cheapest lookup. Avoid scanning mounted PR metadata across
+      // every configured repository. Normal event-driven exits keep using the
+      // webhook-fed mount so they do not introduce a GitHub API dependency.
+      if (
+        implementer?.spec.branch &&
+        (opts.preferExactBranch || record.decision.implementers.length > 1)
+      ) {
         const sourceOwner = record.issue.path
           ? githubIssuePathParts(record.issue.path)?.owner
           : undefined
