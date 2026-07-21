@@ -178,6 +178,11 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
 
   async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
     assertSafeWorktree(worktree)
+    // Inspection runs before cleanup, so it must clear unrelated deleted
+    // registrations itself. Otherwise #assertRegisteredCheckout can fail on
+    // realpath() for a stale sibling and retain every healthy candidate in the
+    // repository without ever reaching cleanup's existing prune step.
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (!await pathExists(worktree.worktreePath)) return { bytes: 0, retentionReasons: [] }
     await this.#assertRegisteredCheckout(worktree)
 

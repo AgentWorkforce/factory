@@ -278,6 +278,9 @@ describe('GitAgentWorktreeManager', () => {
       await rm(stalePath, { recursive: true, force: true })
 
       await expect(manager.prepare(worktree)).resolves.toBeUndefined()
+      await expect(manager.inspectForCleanup(worktree)).resolves.toMatchObject({
+        retentionReasons: ['1 unpushed commit'],
+      })
       expect(await git(worktreePath, ['branch', '--show-current']))
         .toBe('factory/ar-34-pear-abcdefgh\n')
     } finally {
