@@ -240,7 +240,12 @@ export class RelayFleetClient implements FleetClient {
       messaging.nodes.list(),
     ])
     return {
-      agents: agents.map((agent) => {
+      // Relaycast has returned offline rows even when the SDK request asked
+      // for `status: online`. Enforce the roster contract at this boundary so
+      // stale durable names cannot look live and suppress startup recovery.
+      // Preserve `unknown`: freshly placed agents can briefly lack a canonical
+      // presence status while still owning their registered name.
+      agents: agents.filter((agent) => agent.status !== 'offline').map((agent) => {
         const record = asRecord(agent)
         const node = readString(record, 'node', 'node_id', 'nodeId')
         return { name: agent.name, ...(node ? { node } : {}) }
