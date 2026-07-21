@@ -2,9 +2,9 @@ version: '1.1'
 updated: '2026-07-21'
 catalog:
   category_count: 23
-  feature_count: 287
+  feature_count: 288
   tier_counts:
-    1: 39
+    1: 40
     2: 121
     3: 11
     4: 45
@@ -1401,6 +1401,13 @@ categories:
         api: normalizeLogValue() / normalizeLogger() / stringifyLogValue()
         description: Preserve Error diagnostics and structured context as bounded redacted JSON-safe metadata without invoking getters, toJSON hooks, custom stack hooks, or failing on cycles and BigInt
         location: src/logging.ts
+        verify_tier: 1
+
+      - id: api-feature-map-generation
+        name: Lazy Repository Feature Map Generation
+        api: generateFeatureMap()
+        description: Create or incrementally extend a schema-compatible feature manifest from bounded touched-file discovery without making dispatch depend on generation success
+        location: src/featuremap/generate.ts, src/featuremap/index.ts, src/index.ts
         verify_tier: 1
 
       - id: api-dependency-graph
