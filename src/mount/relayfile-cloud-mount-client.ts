@@ -379,13 +379,22 @@ export class RelayfileCloudMountClient implements MountClient {
       : undefined
     if (staleBefore?.stale) this.#markLocalMountDegraded(localDir, 'mount_stale')
 
-    await this.#localMountPreflight(this.workspaceId, startDir, {
-      ...options,
-      acceptableWorkspaceIds: [...acceptableWorkspaceIds],
-      startMount: async () => {
-        await this.#replaceLocalMount(localDir, launch)
-      },
-    })
+    try {
+      await this.#localMountPreflight(this.workspaceId, startDir, {
+        ...options,
+        acceptableWorkspaceIds: [...acceptableWorkspaceIds],
+        startMount: async () => {
+          await this.#replaceLocalMount(localDir, launch)
+        },
+      })
+    } catch (error) {
+      // A first-ever mount has no state file from which staleness can be
+      // inferred. Surface the launch failure and arm the same retry supervisor
+      // used for later stale sessions before returning control to startup.
+      this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
+      this.#scheduleLocalMountHealthCheck(localDir)
+      throw error
+    }
     const staleAfter = checkMountStaleness(statePath, this.workspaceId, [...acceptableWorkspaceIds])
     if (staleAfter.stale) this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
     else this.#markLocalMountRecovered(localDir)
