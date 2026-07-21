@@ -62,7 +62,9 @@ export interface FeatureMapFeature {
 }
 
 export interface ParsedFeatureMapManifest {
+  version: string
   categoryIds: string[]
+  categoryProcedures: Record<string, string>
   features: FeatureMapFeature[]
 }
 
@@ -354,7 +356,9 @@ async function acquireManifestLock(manifestPath: string, deadline: Deadline): Pr
 export function parseFeatureMapManifest(raw: string): ParsedFeatureMapManifest {
   const validation = validateFeatureManifest(raw)
   return {
+    version: validation.version,
     categoryIds: validation.categoryIds,
+    categoryProcedures: validation.categoryProcedures,
     features: validation.features.map(toFeatureMapFeature),
   }
 }
@@ -921,6 +925,9 @@ function extendManifest(
     ].join(eol)
     const prefix = raw.slice(0, categoriesEnd)
     next = `${prefix}${prefix.endsWith(eol) ? '' : eol}${block}${raw.slice(categoriesEnd)}`
+    if (parsed.version === '1.1') {
+      next = addGeneratedVerificationRoute(next, parsed.categoryProcedures, eol)
+    }
   }
 
   const allFeatures = [...parsed.features, ...additions]
@@ -937,6 +944,33 @@ function extendManifest(
     next = replaceRequired(next, new RegExp(`^    ${tier}:\\s*\\d+\\s*$`, 'mu'), `    ${tier}: ${tiers[tier]}`, `tier ${tier}`)
   }
   return next
+}
+
+/** Route a generated v1.1 category through an already-declared procedure. */
+function addGeneratedVerificationRoute(
+  raw: string,
+  categoryProcedures: Record<string, string>,
+  eol: string,
+): string {
+  const procedure = categoryProcedures['programmatic-api'] ??
+    Object.values(categoryProcedures).find((candidate) => candidate === 'public-api') ??
+    Object.values(categoryProcedures)[0]
+  if (!procedure) {
+    throw new Error('Manifest version 1.1 has no verification procedure available for generated features')
+  }
+
+  const categories = /^categories:\s*$/mu.exec(raw)
+  if (!categories) throw new Error('Feature manifest is missing categories')
+  const prefix = raw.slice(0, categories.index)
+  if (!/^verification:\s*$/mu.test(prefix) || !/^  categories:\s*$/mu.test(prefix)) {
+    throw new Error('Manifest version 1.1 is missing verification routing')
+  }
+  if (new RegExp(`^    ${GENERATED_CATEGORY_ID}:`, 'mu').test(prefix)) {
+    throw new Error(`Manifest already routes generated category ${GENERATED_CATEGORY_ID}`)
+  }
+
+  const routedPrefix = prefix.replace(/\s*$/u, '')
+  return `${routedPrefix}${eol}    ${GENERATED_CATEGORY_ID}: ${procedure}${eol}${eol}${raw.slice(categories.index)}`
 }
 
 function renderFeatureEntries(features: FeatureMapFeature[], eol: string): string {

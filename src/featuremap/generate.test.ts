@@ -248,6 +248,23 @@ describe('generateFeatureMap', () => {
     expect(raw).toContain('        description: Original hand-authored entry\n')
   })
 
+  it('routes a generated category through an existing v1.1 verification procedure', async () => {
+    const root = await repository()
+    await put(root, 'src/existing.ts', 'export function existing(): void {}\n')
+    await put(root, 'src/new.ts', 'export function newlyTouched(): void {}\n')
+    await put(root, '.agentworkforce/features/verify/procedures.md', '## public-api\n')
+    await put(root, FEATURE_MAP_MANIFEST_PATH, handAuthoredV11Manifest())
+
+    const result = await generateFeatureMap(root, ['src/new.ts'], { now: fixedNow })
+
+    expect(result.status).toBe('updated')
+    const raw = await readFile(result.manifestPath, 'utf8')
+    const manifest = parseFeatureMapManifest(raw)
+    expect(manifest.version).toBe('1.1')
+    expect(manifest.categoryProcedures[GENERATED_CATEGORY_ID_FOR_TEST]).toBe('public-api')
+    expect(validateFeatureManifest(raw, { rootDir: root }).features).toHaveLength(2)
+  })
+
   it('extends a valid manifest when categories are not the final top-level key', async () => {
     const root = await repository()
     await put(root, 'src/existing.ts', 'export function existing(): void {}\n')
@@ -352,6 +369,42 @@ function handAuthoredManifest(catalogAfterCategories = false): string {
   return [
     ...header,
     ...(catalogAfterCategories ? [...categories, ...catalog] : [...catalog, ...categories]),
+    '',
+  ].join('\n')
+}
+
+const GENERATED_CATEGORY_ID_FOR_TEST = 'generated-touched-surfaces'
+
+function handAuthoredV11Manifest(): string {
+  return [
+    "version: '1.1'",
+    "updated: '2026-07-01'",
+    'catalog:',
+    '  category_count: 1',
+    '  feature_count: 1',
+    '  tier_counts:',
+    '    1: 1',
+    '    2: 0',
+    '    3: 0',
+    '    4: 0',
+    '    5: 0',
+    '    6: 0',
+    'verification:',
+    '  document: .agentworkforce/features/verify/procedures.md',
+    '  categories:',
+    '    programmatic-api: public-api',
+    'categories:',
+    '  programmatic-api:',
+    '    name: Programmatic API',
+    '    description: Existing public surfaces',
+    '    criticality: critical',
+    '    features:',
+    '      - id: existing',
+    '        name: Existing',
+    '        api: existing()',
+    '        description: Original hand-authored entry',
+    '        location: src/existing.ts',
+    '        verify_tier: 1',
     '',
   ].join('\n')
 }
