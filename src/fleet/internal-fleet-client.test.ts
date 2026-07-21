@@ -709,7 +709,7 @@ describe('InternalFleetClient', () => {
       cwd: '/worktree',
       // Keep the unit isolated from an AGENT_RELAY_STATE_DIR inherited by the
       // test process; this assertion is specifically about the injected client.
-      connectionPath: 'test/fixtures/no-such-broker-connection.json',
+      connectionPath: '/worktree/.agentworkforce/relay/missing-connection.json',
     })
 
     await expect(fleet.protectedPids()).resolves.toEqual([68009])
