@@ -577,6 +577,7 @@ function checkTcp(port: number, timeoutMs: number): Promise<void> {
     })
     socket.once('error', (error) => {
       clearTimeout(timer)
+      socket.destroy()
       reject(error)
     })
   })

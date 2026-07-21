@@ -118,7 +118,10 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
         ...kubectlConnectionArgs(this.connection),
         'get', 'namespace', namespace, '-o', 'jsonpath={.status.phase}',
       ])
-      return result.stdout.trim() === 'Active' ? 'ready' : 'provisioning'
+      const phase = result.stdout.trim()
+      if (phase === 'Active') return 'ready'
+      if (phase === 'Terminating') return 'destroying'
+      return 'provisioning'
     } catch (error) {
       if (error instanceof CommandExecutionError && /not found/iu.test(error.stderr)) return 'destroyed'
       throw error

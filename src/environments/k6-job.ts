@@ -95,8 +95,11 @@ export const defaultKubectlCommandRunner = (
     else finish(commandError(executable, args, code, stderr))
   })
   signal?.addEventListener('abort', abort, { once: true })
-  if (signal?.aborted) abort()
-  child.stdin.end(input)
+  if (signal?.aborted) {
+    abort()
+  } else {
+    child.stdin.end(input)
+  }
 })
 
 export class KubectlLoadJobClient implements KubernetesLoadJobClient {

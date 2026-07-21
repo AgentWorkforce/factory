@@ -505,14 +505,22 @@ export async function runE2eCommand(input: E2eCommandInput): Promise<E2eCommandR
     let stdout = ''
     let stderr = ''
     let settled = false
+    let forceKillTimer: NodeJS.Timeout | undefined
     const timeout = setTimeout(() => finish(new VerificationTimeoutError(`E2E stage timed out after ${input.timeoutMs}ms`)), input.timeoutMs)
     const abort = (): void => finish(new VerificationTimeoutError('E2E stage aborted'))
-    const stop = (): void => {
-      if (child.pid && process.platform !== 'win32') {
-        try { process.kill(-child.pid, 'SIGTERM') } catch { child.kill('SIGTERM') }
+    const kill = (signal: NodeJS.Signals): void => {
+      if (!child.pid || child.exitCode !== null) return
+      if (process.platform !== 'win32') {
+        try { process.kill(-child.pid, signal) } catch { child.kill(signal) }
       } else {
-        child.kill('SIGTERM')
+        child.kill(signal)
       }
+    }
+    const stop = (): void => {
+      if (!child.pid || child.exitCode !== null) return
+      kill('SIGTERM')
+      forceKillTimer = setTimeout(() => kill('SIGKILL'), 2_000)
+      forceKillTimer.unref()
     }
     const finish = (error?: Error, exitCode?: number): void => {
       if (settled) return
@@ -531,7 +539,10 @@ export async function runE2eCommand(input: E2eCommandInput): Promise<E2eCommandR
     child.stdout.on('data', (chunk: string) => { stdout = boundedAppend(stdout, chunk) })
     child.stderr.on('data', (chunk: string) => { stderr = boundedAppend(stderr, chunk) })
     child.once('error', (error) => finish(error))
-    child.once('close', (code) => finish(undefined, code ?? 1))
+    child.once('close', (code) => {
+      if (forceKillTimer) clearTimeout(forceKillTimer)
+      finish(undefined, code ?? 1)
+    })
     input.signal.addEventListener('abort', abort, { once: true })
     if (input.signal.aborted) abort()
   })

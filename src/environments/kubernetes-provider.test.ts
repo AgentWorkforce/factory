@@ -6,12 +6,12 @@ import { KubernetesEnvironmentProvider } from './kubernetes-provider'
 class FakeRunner implements CommandRunner {
   calls: Array<{ command: string; args: string[]; options?: RunCommandOptions }> = []
 
-  constructor(readonly inventory = '{"items":[]}') {}
+  constructor(readonly inventory = '{"items":[]}', readonly phase = 'Active') {}
 
   async run(command: string, args: string[], options?: RunCommandOptions) {
     this.calls.push({ command, args, options })
     if (args.includes('--output') && args.includes('json')) return { stdout: this.inventory, stderr: '' }
-    return { stdout: args.includes('jsonpath={.status.phase}') ? 'Active' : '', stderr: '' }
+    return { stdout: args.includes('jsonpath={.status.phase}') ? this.phase : '', stderr: '' }
   }
 }
 
@@ -57,6 +57,14 @@ describe('KubernetesEnvironmentProvider', () => {
     const deleteCalls = runner.calls.filter((call) => call.args.includes('delete'))
     expect(deleteCalls).toHaveLength(2)
     expect(deleteCalls[0].args).toContain('--ignore-not-found=true')
+  })
+
+  it('reports a terminating namespace as destroying', async () => {
+    const provider = new KubernetesEnvironmentProvider({
+      commandRunner: new FakeRunner('{"items":[]}', 'Terminating'),
+    })
+
+    await expect(provider.status('terminating')).resolves.toBe('destroying')
   })
 
   it('fails before namespace creation when the cluster-wide environment cap is reached', async () => {
