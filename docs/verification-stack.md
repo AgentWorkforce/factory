@@ -39,6 +39,17 @@ endpoints:
     service: api
     port: 8080
     path: /health
+verification:
+  environmentTtlSeconds: 900
+  e2e:
+    command: npm
+    args: [run, test:e2e]
+    timeoutSeconds: 300
+  load:
+    profile: .factory/load.yaml
+    timeoutSeconds: 300
+  overallTimeoutSeconds: 900
+  teardownTimeoutSeconds: 120
 ```
 
 Secret and config entries contain only opaque references. The caller supplies a
@@ -51,6 +62,11 @@ loads the descriptor committed at that branch or SHA instead of the working
 tree version. On deployment, Factory materializes stack assets from that same
 commit so a dirty or differently checked-out working tree cannot change the
 selected stack.
+
+The optional `verification` section declares the E2E command, load profile,
+environment lease, and run/teardown limits used by Factory's required merge
+gate. The descriptor/deployer APIs may be used without it; the merge gate fails
+closed when the section or all exposed endpoints are absent.
 
 `VerificationStackDeployer.deploy(descriptor, environment)` supports local or
 OCI/HTTP Helm charts, kustomize directories, raw Kubernetes manifests, and

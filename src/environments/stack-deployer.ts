@@ -44,6 +44,7 @@ export interface PortForwarder {
     service: string
     remotePort: string | number
     timeoutMs: number
+    signal?: AbortSignal
   }): Promise<ManagedPortForward>
 }
 
@@ -52,6 +53,10 @@ export interface StackDeployerOptions {
   referenceResolver?: VerificationStackReferenceResolver
   portForwarder?: PortForwarder
   fetch?: typeof globalThis.fetch
+}
+
+export interface StackDeployOptions {
+  signal?: AbortSignal
 }
 
 export interface StackDeployment {
@@ -88,6 +93,7 @@ export class VerificationStackDeployer {
   async deploy(
     stack: LoadedVerificationStack | VerificationStackDescriptor,
     environment: Environment,
+    options: StackDeployOptions = {},
   ): Promise<StackDeployment> {
     const descriptor = 'descriptor' in stack ? stack.descriptor : stack
     const target = kubernetesTarget(environment)
@@ -95,16 +101,17 @@ export class VerificationStackDeployer {
     let preparedRoot: PreparedStackRoot | undefined
 
     try {
-      preparedRoot = await this.prepareStackRoot(stack)
-      await this.applyReferences(descriptor.secrets, 'secret', target)
-      await this.applyReferences(descriptor.config, 'config', target)
-      await this.applySource(descriptor, preparedRoot.rootDir, target)
+      options.signal?.throwIfAborted()
+      preparedRoot = await this.prepareStackRoot(stack, options.signal)
+      await this.applyReferences(descriptor.secrets, 'secret', target, options.signal)
+      await this.applyReferences(descriptor.config, 'config', target, options.signal)
+      await this.applySource(descriptor, preparedRoot.rootDir, target, options.signal)
 
       for (const service of descriptor.services) {
-        await this.waitForService(service, target, tunnels)
+        await this.waitForService(service, target, tunnels, options.signal)
       }
       for (const seed of descriptor.seeds) {
-        await this.runSeed(seed, descriptor, preparedRoot.rootDir, target)
+        await this.runSeed(seed, descriptor, preparedRoot.rootDir, target, options.signal)
       }
 
       const endpoints: Record<string, string> = {}
@@ -115,6 +122,7 @@ export class VerificationStackDeployer {
           endpoint.service,
           endpoint.port,
           30_000,
+          options.signal,
         )
         endpoints[endpoint.name] = `${endpoint.protocol}://127.0.0.1:${tunnel.localPort}${endpoint.path}`
       }
@@ -145,6 +153,7 @@ export class VerificationStackDeployer {
 
   private async prepareStackRoot(
     stack: LoadedVerificationStack | VerificationStackDescriptor,
+    signal?: AbortSignal,
   ): Promise<PreparedStackRoot> {
     if (!('descriptor' in stack)) {
       return { rootDir: process.cwd(), cleanup: async () => undefined }
@@ -157,10 +166,10 @@ export class VerificationStackDeployer {
     try {
       await this.runner.run('git', [
         'clone', '--quiet', '--shared', '--no-checkout', stack.rootDir, checkout,
-      ], { timeoutMs: 120_000 })
+      ], { timeoutMs: 120_000, signal })
       await this.runner.run('git', [
         '-C', checkout, 'checkout', '--quiet', '--detach', stack.ref,
-      ], { timeoutMs: 120_000 })
+      ], { timeoutMs: 120_000, signal })
       return {
         rootDir: checkout,
         cleanup: async () => await rm(checkout, { recursive: true, force: true }),
@@ -180,6 +189,7 @@ export class VerificationStackDeployer {
     groups: VerificationStackReferenceGroup[],
     kind: 'secret' | 'config',
     target: KubernetesEnvironmentTarget,
+    signal?: AbortSignal,
   ): Promise<void> {
     const requiresResolver = groups.some((group) => (
       Object.values(group.data).some((reference) => !reference.optional)
@@ -242,7 +252,7 @@ export class VerificationStackDeployer {
         await this.runner.run('kubectl', [
           ...kubectlConnectionArgs(target),
           'apply', '-f', '-',
-        ], { input: JSON.stringify(resource), timeoutMs: 30_000 })
+        ], { input: JSON.stringify(resource), timeoutMs: 30_000, signal })
       } catch (cause) {
         throw new StackDeploymentError(
           `Failed to materialize ${kind} ${group.name} in namespace ${target.namespace}: ${errorMessage(cause)}`,
@@ -258,6 +268,7 @@ export class VerificationStackDeployer {
     descriptor: VerificationStackDescriptor,
     rootDir: string,
     target: KubernetesEnvironmentTarget,
+    signal?: AbortSignal,
   ): Promise<void> {
     const source = descriptor.source
     try {
@@ -267,7 +278,7 @@ export class VerificationStackDeployer {
             ...kubectlConnectionArgs(target),
             '--namespace', target.namespace,
             'apply', '-f', resolveVerificationStackAsset(rootDir, path),
-          ], { timeoutMs: 120_000 })
+          ], { timeoutMs: 120_000, signal })
         }
         return
       }
@@ -276,7 +287,7 @@ export class VerificationStackDeployer {
           ...kubectlConnectionArgs(target),
           '--namespace', target.namespace,
           'apply', '-k', resolveVerificationStackAsset(rootDir, source.path),
-        ], { timeoutMs: 120_000 })
+        ], { timeoutMs: 120_000, signal })
         return
       }
       if (source.type === 'helm') {
@@ -290,18 +301,18 @@ export class VerificationStackDeployer {
           ...source.valuesFiles.flatMap((path) => [
             '--values', resolveVerificationStackAsset(rootDir, path),
           ]),
-        ], { timeoutMs: 180_000 })
+        ], { timeoutMs: 180_000, signal })
         return
       }
 
       const compose = await this.runner.run('kompose', [
         'convert', '--file', resolveVerificationStackAsset(rootDir, source.path), '--stdout',
-      ], { timeoutMs: 120_000 })
+      ], { timeoutMs: 120_000, signal })
       await this.runner.run('kubectl', [
         ...kubectlConnectionArgs(target),
         '--namespace', target.namespace,
         'apply', '-f', '-',
-      ], { input: compose.stdout, timeoutMs: 120_000 })
+      ], { input: compose.stdout, timeoutMs: 120_000, signal })
     } catch (cause) {
       throw new StackDeploymentError(
         `Failed to apply ${source.type} source for stack ${descriptor.name} in namespace ${target.namespace}: ${errorMessage(cause)}`,
@@ -316,6 +327,7 @@ export class VerificationStackDeployer {
     service: VerificationStackService,
     target: KubernetesEnvironmentTarget,
     tunnels: Map<string, ManagedPortForward>,
+    signal?: AbortSignal,
   ): Promise<void> {
     const workload = `${service.workload.kind}/${service.workload.name ?? service.name}`
     try {
@@ -324,7 +336,7 @@ export class VerificationStackDeployer {
         '--namespace', target.namespace,
         'rollout', 'status', workload,
         `--timeout=${service.readiness.timeoutSeconds}s`,
-      ], { timeoutMs: service.readiness.timeoutSeconds * 1_000 + 5_000 })
+      ], { timeoutMs: service.readiness.timeoutSeconds * 1_000 + 5_000, signal })
     } catch (cause) {
       throw new StackDeploymentError(
         `Service ${service.name} workload ${workload} never became ready within ${service.readiness.timeoutSeconds}s: ${errorMessage(cause)}`,
@@ -334,8 +346,8 @@ export class VerificationStackDeployer {
       )
     }
 
-    await this.waitForProbe(service, service.readiness, 'readiness', target, tunnels)
-    if (service.health) await this.waitForProbe(service, service.health, 'health', target, tunnels)
+    await this.waitForProbe(service, service.readiness, 'readiness', target, tunnels, signal)
+    if (service.health) await this.waitForProbe(service, service.health, 'health', target, tunnels, signal)
   }
 
   private async waitForProbe(
@@ -344,12 +356,14 @@ export class VerificationStackDeployer {
     label: 'readiness' | 'health',
     target: KubernetesEnvironmentTarget,
     tunnels: Map<string, ManagedPortForward>,
+    signal?: AbortSignal,
   ): Promise<void> {
     const timeoutMs = probe.timeoutSeconds * 1_000
     const deadline = Date.now() + timeoutMs
     let lastError = 'probe returned unhealthy'
 
     while (Date.now() < deadline) {
+      signal?.throwIfAborted()
       try {
         const remaining = Math.max(1, deadline - Date.now())
         if (probe.type === 'exec') {
@@ -360,7 +374,7 @@ export class VerificationStackDeployer {
             'exec', workload,
             ...(probe.container ? ['--container', probe.container] : []),
             '--', ...probe.command,
-          ], { timeoutMs: Math.min(remaining, 10_000) })
+          ], { timeoutMs: Math.min(remaining, 10_000), signal })
           return
         }
 
@@ -371,6 +385,7 @@ export class VerificationStackDeployer {
           serviceName,
           probe.port,
           Math.min(remaining, 15_000),
+          signal,
         )
         if (probe.type === 'tcp') {
           await checkTcp(tunnel.localPort, Math.min(remaining, 5_000))
@@ -380,9 +395,10 @@ export class VerificationStackDeployer {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), Math.min(remaining, 5_000))
         try {
+          const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
           const response = await this.fetchImpl(
             `${probe.scheme}://127.0.0.1:${tunnel.localPort}${probe.path}`,
-            { signal: controller.signal },
+            { signal: requestSignal },
           )
           await response.body?.cancel()
           if (probe.expectedStatuses.includes(response.status)) return
@@ -395,7 +411,7 @@ export class VerificationStackDeployer {
       }
 
       const delay = Math.min(probe.intervalSeconds * 1_000, Math.max(0, deadline - Date.now()))
-      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+      if (delay > 0) await abortableDelay(delay, signal)
     }
 
     throw new StackDeploymentError(
@@ -410,6 +426,7 @@ export class VerificationStackDeployer {
     descriptor: VerificationStackDescriptor,
     rootDir: string,
     target: KubernetesEnvironmentTarget,
+    signal?: AbortSignal,
   ): Promise<void> {
     try {
       if (seed.type === 'job') {
@@ -417,13 +434,13 @@ export class VerificationStackDeployer {
           ...kubectlConnectionArgs(target),
           '--namespace', target.namespace,
           'apply', '-f', resolveVerificationStackAsset(rootDir, seed.manifest),
-        ], { timeoutMs: 30_000 })
+        ], { timeoutMs: 30_000, signal })
         await this.runner.run('kubectl', [
           ...kubectlConnectionArgs(target),
           '--namespace', target.namespace,
           'wait', `job/${seed.job}`, '--for=condition=complete',
           `--timeout=${seed.timeoutSeconds}s`,
-        ], { timeoutMs: seed.timeoutSeconds * 1_000 + 5_000 })
+        ], { timeoutMs: seed.timeoutSeconds * 1_000 + 5_000, signal })
         return
       }
 
@@ -436,7 +453,7 @@ export class VerificationStackDeployer {
         'exec', workload,
         ...(seed.container ? ['--container', seed.container] : []),
         '--', ...seed.command,
-      ], { timeoutMs: seed.timeoutSeconds * 1_000 })
+      ], { timeoutMs: seed.timeoutSeconds * 1_000, signal })
     } catch (cause) {
       throw new StackDeploymentError(
         `Seed step ${seed.name} failed in namespace ${target.namespace}: ${errorMessage(cause)}`,
@@ -453,6 +470,7 @@ export class VerificationStackDeployer {
     service: string,
     port: string | number,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<ManagedPortForward> {
     const key = `${service}:${port}`
     const existing = tunnels.get(key)
@@ -464,6 +482,7 @@ export class VerificationStackDeployer {
         service,
         remotePort: port,
         timeoutMs,
+        signal,
       })
       tunnels.set(key, tunnel)
       return tunnel
@@ -493,6 +512,7 @@ export class KubectlPortForwarder implements PortForwarder {
     service: string
     remotePort: string | number
     timeoutMs: number
+    signal?: AbortSignal
   }): Promise<ManagedPortForward> {
     const child = spawn('kubectl', [
       ...kubectlConnectionArgs(input.connection),
@@ -503,7 +523,7 @@ export class KubectlPortForwarder implements PortForwarder {
     child.stdin.end()
 
     try {
-      const localPort = await waitForForwardedPort(child, input.timeoutMs)
+      const localPort = await waitForForwardedPort(child, input.timeoutMs, input.signal)
       let closed = false
       return {
         localPort,
@@ -562,7 +582,11 @@ function checkTcp(port: number, timeoutMs: number): Promise<void> {
   })
 }
 
-function waitForForwardedPort(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<number> {
+function waitForForwardedPort(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     let output = ''
     let settled = false
@@ -572,6 +596,7 @@ function waitForForwardedPort(child: ChildProcessWithoutNullStreams, timeoutMs: 
       if (match) finish(undefined, Number(match[1]))
     }
     const onError = (error: Error) => finish(error)
+    const onAbort = () => finish(signal?.reason instanceof Error ? signal.reason : new Error('port-forward aborted'))
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
       finish(new Error(
         `kubectl port-forward exited with ${code ?? signal ?? 'unknown status'}${output.trim() ? `: ${output.trim()}` : ''}`,
@@ -588,6 +613,7 @@ function waitForForwardedPort(child: ChildProcessWithoutNullStreams, timeoutMs: 
       child.stderr.off('data', onData)
       child.off('error', onError)
       child.off('close', onClose)
+      signal?.removeEventListener('abort', onAbort)
       if (error) reject(error)
       else resolve(port!)
     }
@@ -596,6 +622,23 @@ function waitForForwardedPort(child: ChildProcessWithoutNullStreams, timeoutMs: 
     child.stderr.on('data', onData)
     child.once('error', onError)
     child.once('close', onClose)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+  })
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, ms)
+    const abort = () => finish(signal?.reason ?? new Error('verification deployment aborted'))
+    function finish(error?: unknown): void {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      if (error) reject(error)
+      else resolve()
+    }
+    signal?.addEventListener('abort', abort, { once: true })
   })
 }
 

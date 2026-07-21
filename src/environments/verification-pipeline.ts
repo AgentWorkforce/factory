@@ -3,12 +3,16 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import type { FactoryEventReporter } from '../ports/observability.js'
-import type { VerificationEnvironment, VerificationEnvironmentProvider } from '../ports/environment.js'
+import type { Environment, EnvironmentProvider, VerificationEnvironment } from '../ports/environment.js'
 import { createFactoryCloudEventV1 } from '../observability/events.js'
 import type { LoadMeasurements, LoadSloViolation } from './load-harness.js'
 import { runLoad } from './load-harness.js'
 import { loadLoadProfile } from './load-profile.js'
-import { KubectlEnvironmentProvider } from './kubernetes-environment.js'
+import { KubernetesEnvironmentProvider } from './kubernetes-provider.js'
+import {
+  VerificationStackDeployer,
+  type StackDeployment,
+} from './stack-deployer.js'
 import { loadVerificationGateStack, type ResolvedVerificationStack } from './verification-stack.js'
 
 export const VERIFICATION_EVIDENCE_CONTRACT = 'factory.verification.evidence.v1' as const
@@ -104,11 +108,21 @@ export type VerificationLoadRunner = (
   environment: VerificationEnvironment,
   stack: ResolvedVerificationStack,
   runId: string,
+  signal?: AbortSignal,
 ) => Promise<VerificationLoadResult>
+
+export interface VerificationStackDeployRunner {
+  deploy(
+    stack: ResolvedVerificationStack['loaded'],
+    environment: Environment,
+    options?: { signal?: AbortSignal },
+  ): Promise<StackDeployment>
+}
 
 export interface VerificationPipelineOptions {
   descriptorPath?: string
-  environmentProvider?: VerificationEnvironmentProvider
+  environmentProvider?: EnvironmentProvider
+  stackDeployer?: VerificationStackDeployRunner
   e2eRunner?: E2eCommandRunner
   loadRunner?: VerificationLoadRunner
   revisionResolver?: VerificationRevisionResolver
@@ -123,7 +137,8 @@ export interface VerificationPipelineOptions {
 
 export class VerificationPipeline implements VerificationGate {
   readonly #descriptorPath: string
-  readonly #environmentProvider: VerificationEnvironmentProvider
+  readonly #environmentProvider: EnvironmentProvider
+  readonly #stackDeployer: VerificationStackDeployRunner
   readonly #e2eRunner: E2eCommandRunner
   readonly #loadRunner: VerificationLoadRunner
   readonly #revisionResolver: VerificationRevisionResolver
@@ -138,7 +153,10 @@ export class VerificationPipeline implements VerificationGate {
 
   constructor(options: VerificationPipelineOptions = {}) {
     this.#descriptorPath = options.descriptorPath ?? DEFAULT_VERIFICATION_DESCRIPTOR
-    this.#environmentProvider = options.environmentProvider ?? new KubectlEnvironmentProvider()
+    this.#environmentProvider = options.environmentProvider ?? new KubernetesEnvironmentProvider({
+      maxActiveEnvironments: options.maxConcurrentEnvironments ?? 2,
+    })
+    this.#stackDeployer = options.stackDeployer ?? new VerificationStackDeployer()
     this.#e2eRunner = options.e2eRunner ?? runE2eCommand
     this.#loadRunner = options.loadRunner ?? defaultLoadRunner
     this.#revisionResolver = options.revisionResolver ?? resolveGitHeadRevision
@@ -158,18 +176,33 @@ export class VerificationPipeline implements VerificationGate {
     const stages = emptyStages()
     const descriptorPath = input.descriptorPath ?? this.#descriptorPath
     let stack: ResolvedVerificationStack | undefined
-    let environment: VerificationEnvironment | undefined
+    let environment: Environment | undefined
+    let deployedEnvironment: VerificationEnvironment | undefined
+    let deployment: StackDeployment | undefined
     let release: (() => void) | undefined
     let functionalPass = false
     let timedOut = false
     let reason = 'verification did not run'
     const controller = new AbortController()
     let overallTimer: ReturnType<typeof setTimeout> | undefined
+    const armOverallTimeout = (timeoutMs: number): void => {
+      if (overallTimer) clearTimeout(overallTimer)
+      overallTimer = setTimeout(() => {
+        timedOut = true
+        controller.abort(new VerificationTimeoutError(`verification timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+    }
+    armOverallTimeout(this.#maxRunTimeoutMs)
 
     try {
       const resolveStarted = Date.now()
       try {
-        stack = await loadVerificationGateStack(input.repositoryPath, descriptorPath)
+        stack = await withinTimeout(
+          loadVerificationGateStack(input.repositoryPath, descriptorPath),
+          this.#maxRunTimeoutMs,
+          'verification resolution',
+          controller.signal,
+        )
         if (input.expectedHeadSha) {
           const checkoutHeadSha = await this.#revisionResolver(stack.repositoryPath)
           if (checkoutHeadSha.toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
@@ -182,14 +215,15 @@ export class VerificationPipeline implements VerificationGate {
       } catch (error) {
         stages.resolve = failStage(resolveStarted, error)
         reason = `verification resolution failed: ${message(error)}`
-        return await this.#finish(input, runId, startedAt, descriptorPath, stages, false, reason, undefined, false)
+        return await this.#finish(
+          input, runId, startedAt, descriptorPath, stages, false, reason, undefined,
+          controller.signal.aborted || error instanceof VerificationTimeoutError,
+        )
       }
 
       const overallMs = Math.min(stack.timeouts.overallMs, this.#maxRunTimeoutMs)
-      overallTimer = setTimeout(() => {
-        timedOut = true
-        controller.abort(new VerificationTimeoutError(`verification timed out after ${overallMs}ms`))
-      }, overallMs)
+      const remainingOverallMs = Math.max(1, overallMs - (Date.now() - startedAt.getTime()))
+      armOverallTimeout(remainingOverallMs)
 
       const acquireStarted = Date.now()
       try {
@@ -203,12 +237,10 @@ export class VerificationPipeline implements VerificationGate {
       const provisionStarted = Date.now()
       try {
         environment = await this.#environmentProvider.provision({
-          runId,
-          repository: input.repository,
-          namespacePrefix: stack.provision.namespacePrefix,
-          ttlMs: Math.min(stack.provision.ttlMs, this.#maxEnvironmentTtlMs),
-          maxActiveEnvironments: this.#maxConcurrentEnvironments,
-          ...(stack.provision.kubeContext ? { kubeContext: stack.provision.kubeContext } : {}),
+          id: runId,
+          ttl: Math.min(stack.environmentTtlMs, this.#maxEnvironmentTtlMs),
+          labels: { 'factory.agentworkforce.dev/repository': labelValue(input.repository) },
+          annotations: { 'factory.agentworkforce.dev/repository': input.repository },
           signal: controller.signal,
         })
         stages.provision = passStage(provisionStarted)
@@ -216,25 +248,25 @@ export class VerificationPipeline implements VerificationGate {
         stages.provision = timeoutOrFailure(provisionStarted, error, controller.signal)
         reason = stageReason('provision', error, controller.signal)
         return await this.#finishWithTeardown(
-          input, runId, startedAt, stack, stages, false, reason, environment, controller.signal.aborted,
+          input, runId, startedAt, stack, stages, false, reason, environment, deployment, controller.signal.aborted,
         )
       }
 
       const deployStarted = Date.now()
       try {
-        environment = await this.#environmentProvider.deploy(environment, {
-          repositoryPath: stack.repositoryPath,
-          manifests: stack.deploy.manifests,
-          readiness: stack.deploy.readiness,
-          endpoints: stack.deploy.endpoints,
-          signal: controller.signal,
-        })
+        deployment = await withinTimeout(
+          this.#stackDeployer.deploy(stack.loaded, environment, { signal: controller.signal }),
+          remainingTimeout(stack, this.#maxRunTimeoutMs, startedAt),
+          'deploy stage',
+          controller.signal,
+        )
+        deployedEnvironment = asVerificationEnvironment(environment, stack, deployment.endpoints)
         stages.deploy = passStage(deployStarted)
       } catch (error) {
         stages.deploy = timeoutOrFailure(deployStarted, error, controller.signal)
         reason = stageReason('deploy', error, controller.signal)
         return await this.#finishWithTeardown(
-          input, runId, startedAt, stack, stages, false, reason, environment, controller.signal.aborted,
+          input, runId, startedAt, stack, stages, false, reason, environment, deployment, controller.signal.aborted,
         )
       }
 
@@ -248,9 +280,9 @@ export class VerificationPipeline implements VerificationGate {
             env: {
               ...stack.e2e.env,
               FACTORY_VERIFICATION_RUN_ID: runId,
-              FACTORY_ENVIRONMENT_ID: environment.id,
-              FACTORY_ENVIRONMENT_NAMESPACE: environment.namespace,
-              ...endpointEnvironment(environment),
+              FACTORY_ENVIRONMENT_ID: deployedEnvironment.id,
+              FACTORY_ENVIRONMENT_NAMESPACE: deployedEnvironment.namespace,
+              ...endpointEnvironment(deployedEnvironment),
             },
             timeoutMs: stack.e2e.timeoutMs,
             signal: controller.signal,
@@ -268,21 +300,21 @@ export class VerificationPipeline implements VerificationGate {
         if (result.exitCode !== 0) {
           reason = `E2E stage failed with exit code ${result.exitCode}`
           return await this.#finishWithTeardown(
-            input, runId, startedAt, stack, stages, false, reason, environment, false,
+            input, runId, startedAt, stack, stages, false, reason, environment, deployment, false,
           )
         }
       } catch (error) {
         stages.e2e = timeoutOrFailure(e2eStarted, error, controller.signal)
         reason = stageReason('E2E', error, controller.signal)
         return await this.#finishWithTeardown(
-          input, runId, startedAt, stack, stages, false, reason, environment, controller.signal.aborted || error instanceof VerificationTimeoutError,
+          input, runId, startedAt, stack, stages, false, reason, environment, deployment, controller.signal.aborted || error instanceof VerificationTimeoutError,
         )
       }
 
       const loadStarted = Date.now()
       try {
         const result = await withinTimeout(
-          this.#loadRunner(environment, stack, runId),
+          this.#loadRunner(deployedEnvironment, stack, runId, controller.signal),
           stack.load.timeoutMs,
           'load stage',
           controller.signal,
@@ -297,21 +329,21 @@ export class VerificationPipeline implements VerificationGate {
         if (result.status === 'fail') {
           reason = 'load stage violated one or more SLO thresholds'
           return await this.#finishWithTeardown(
-            input, runId, startedAt, stack, stages, false, reason, environment, false,
+            input, runId, startedAt, stack, stages, false, reason, environment, deployment, false,
           )
         }
       } catch (error) {
         stages.load = timeoutOrFailure(loadStarted, error, controller.signal)
         reason = stageReason('load', error, controller.signal)
         return await this.#finishWithTeardown(
-          input, runId, startedAt, stack, stages, false, reason, environment, controller.signal.aborted || error instanceof VerificationTimeoutError,
+          input, runId, startedAt, stack, stages, false, reason, environment, deployment, controller.signal.aborted || error instanceof VerificationTimeoutError,
         )
       }
 
       functionalPass = true
       reason = 'provision, deploy, E2E, and load SLO verification passed'
       return await this.#finishWithTeardown(
-        input, runId, startedAt, stack, stages, functionalPass, reason, environment, timedOut,
+        input, runId, startedAt, stack, stages, functionalPass, reason, environment, deployment, timedOut,
       )
     } finally {
       if (overallTimer) clearTimeout(overallTimer)
@@ -327,7 +359,8 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     functionalPass: boolean,
     reason: string,
-    environment: VerificationEnvironment | undefined,
+    environment: Environment | undefined,
+    deployment: StackDeployment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
     const evaluateStarted = Date.now()
@@ -341,12 +374,28 @@ export class VerificationPipeline implements VerificationGate {
       const teardownStarted = Date.now()
       const teardownController = new AbortController()
       const teardownMs = Math.min(stack.timeouts.teardownMs, this.#maxTeardownTimeoutMs)
+      const teardownDeadline = Date.now() + teardownMs
       try {
-        await withinTimeout(
-          this.#environmentProvider.teardown(environment, { signal: teardownController.signal }),
-          teardownMs,
-          'teardown stage',
-        )
+        const errors: unknown[] = []
+        try {
+          await withinTimeout(
+            deployment?.dispose() ?? Promise.resolve(),
+            Math.max(1, Math.min(5_000, Math.floor(teardownMs / 4))),
+            'deployment cleanup',
+          )
+        } catch (error) {
+          errors.push(error)
+        }
+        try {
+          await withinTimeout(
+            this.#environmentProvider.destroy(environment.id, { signal: teardownController.signal }),
+            Math.max(1, teardownDeadline - Date.now()),
+            'environment teardown',
+          )
+        } catch (error) {
+          errors.push(error)
+        }
+        if (errors.length > 0) throw new AggregateError(errors, errors.map(message).join('; '))
         stages.teardown = passStage(teardownStarted)
       } catch (error) {
         teardownController.abort(error)
@@ -372,7 +421,7 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     passed: boolean,
     reason: string,
-    environment: VerificationEnvironment | undefined,
+    environment: Environment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
     if (stages.evaluate.status === 'skipped') {
@@ -385,7 +434,10 @@ export class VerificationPipeline implements VerificationGate {
       repositoryPath: input.repositoryPath,
       descriptorPath,
       ...(input.expectedHeadSha ? { expectedHeadSha: input.expectedHeadSha } : {}),
-      ...(environment ? { environmentId: environment.id, namespace: environment.namespace } : {}),
+      ...(environment ? {
+        environmentId: environment.id,
+        ...(environment.namespace ? { namespace: environment.namespace } : {}),
+      } : {}),
       startedAt: startedAt.toISOString(),
       completedAt: this.#now().toISOString(),
       timedOut,
@@ -485,7 +537,7 @@ export async function runE2eCommand(input: E2eCommandInput): Promise<E2eCommandR
   })
 }
 
-const defaultLoadRunner: VerificationLoadRunner = async (environment, stack, runId) => {
+const defaultLoadRunner: VerificationLoadRunner = async (environment, stack, runId, signal) => {
   const profile = await loadLoadProfile(stack.load.profilePath)
   const result = await runLoad({
     id: environment.id,
@@ -498,6 +550,7 @@ const defaultLoadRunner: VerificationLoadRunner = async (environment, stack, run
     timeoutMs: stack.load.timeoutMs,
     k6Image: stack.load.k6Image,
     runId,
+    signal,
   })
   return { status: result.status, measured: result.measured, violations: result.violations }
 }
@@ -675,3 +728,40 @@ const positiveInteger = (value: number, field: string): number => {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${field} must be a positive integer`)
   return value
 }
+
+function asVerificationEnvironment(
+  environment: Environment,
+  stack: ResolvedVerificationStack,
+  endpoints: Record<string, string>,
+): VerificationEnvironment {
+  const namespace = environment.namespace ?? (environment.target?.type === 'kubernetes'
+    ? String(environment.target.namespace)
+    : undefined)
+  if (!namespace) throw new Error(`environment ${environment.id} has no Kubernetes namespace`)
+  const internalEndpoints = Object.fromEntries(stack.loaded.descriptor.endpoints.map((endpoint) => [
+    endpoint.name,
+    `${endpoint.protocol}://${endpoint.service}.${namespace}.svc.cluster.local:${endpoint.port}${endpoint.path}`,
+  ]))
+  return {
+    id: environment.id,
+    namespace,
+    endpoints,
+    internalEndpoints,
+    ...(environment.target?.type === 'kubernetes' && typeof environment.target.context === 'string'
+      ? { kubeContext: environment.target.context }
+      : {}),
+    expiresAt: new Date(Date.parse(environment.createdAt) + environment.ttl).toISOString(),
+  }
+}
+
+const remainingTimeout = (
+  stack: ResolvedVerificationStack,
+  maxRunTimeoutMs: number,
+  startedAt: Date,
+): number => Math.max(1, Math.min(stack.timeouts.overallMs, maxRunTimeoutMs) - (Date.now() - startedAt.getTime()))
+
+const labelValue = (value: string): string => value
+  .toLowerCase()
+  .replace(/[^a-z0-9_.-]+/gu, '-')
+  .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gu, '')
+  .slice(0, 63) || 'repository'

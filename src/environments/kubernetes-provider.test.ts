@@ -6,8 +6,11 @@ import { KubernetesEnvironmentProvider } from './kubernetes-provider'
 class FakeRunner implements CommandRunner {
   calls: Array<{ command: string; args: string[]; options?: RunCommandOptions }> = []
 
+  constructor(readonly inventory = '{"items":[]}') {}
+
   async run(command: string, args: string[], options?: RunCommandOptions) {
     this.calls.push({ command, args, options })
+    if (args.includes('--output') && args.includes('json')) return { stdout: this.inventory, stderr: '' }
     return { stdout: args.includes('jsonpath={.status.phase}') ? 'Active' : '', stderr: '' }
   }
 }
@@ -40,6 +43,13 @@ describe('KubernetesEnvironmentProvider', () => {
         context: 'kind-factory',
       },
     })
+    const apply = runner.calls.find((call) => call.args.includes('apply'))
+    expect(JSON.parse(apply?.options?.input ?? '{}')).toMatchObject({
+      metadata: {
+        labels: { 'factory.agent-relay.dev/managed': 'true' },
+        annotations: { 'factory.agent-relay.dev/expires-at': expect.any(String) },
+      },
+    })
     await expect(provider.status(environment.id)).resolves.toBe('ready')
     await provider.destroy(environment.id)
     await provider.destroy(environment.id)
@@ -47,5 +57,29 @@ describe('KubernetesEnvironmentProvider', () => {
     const deleteCalls = runner.calls.filter((call) => call.args.includes('delete'))
     expect(deleteCalls).toHaveLength(2)
     expect(deleteCalls[0].args).toContain('--ignore-not-found=true')
+  })
+
+  it('fails before namespace creation when the cluster-wide environment cap is reached', async () => {
+    const runner = new FakeRunner(JSON.stringify({
+      items: [
+        { metadata: { name: 'factory-test-live' } },
+        { metadata: { name: 'factory-test-deleting', deletionTimestamp: '2026-07-21T00:00:00Z' } },
+      ],
+    }))
+    const provider = new KubernetesEnvironmentProvider({
+      maxActiveEnvironments: 1,
+      commandRunner: runner,
+    })
+
+    await expect(provider.provision({ id: 'capped' })).rejects.toThrow(
+      'verification environment concurrency cap reached (1/1)',
+    )
+    expect(runner.calls.some((call) => call.args.includes('apply'))).toBe(false)
+  })
+
+  it('rejects invalid environment capacity configuration', () => {
+    expect(() => new KubernetesEnvironmentProvider({ maxActiveEnvironments: 0 })).toThrow(
+      'maxActiveEnvironments must be a positive integer',
+    )
   })
 })

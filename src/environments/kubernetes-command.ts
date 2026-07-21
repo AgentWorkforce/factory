@@ -9,6 +9,7 @@ export interface RunCommandOptions {
   cwd?: string
   input?: string
   timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export interface CommandRunner {
@@ -46,23 +47,33 @@ export class ProcessCommandRunner implements CommandRunner {
       let stderr = ''
       let timedOut = false
       let forceTimer: ReturnType<typeof setTimeout> | undefined
+      let settled = false
 
       child.stdout.setEncoding('utf8')
       child.stderr.setEncoding('utf8')
       child.stdout.on('data', (chunk: string) => { stdout += chunk })
       child.stderr.on('data', (chunk: string) => { stderr += chunk })
 
+      const stop = (): void => {
+        child.kill('SIGTERM')
+        forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000)
+      }
+      const abort = (): void => stop()
+      options.signal?.addEventListener('abort', abort, { once: true })
+
       const timer = options.timeoutMs === undefined
         ? undefined
           : setTimeout(() => {
             timedOut = true
-            child.kill('SIGTERM')
-            forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000)
+            stop()
           }, options.timeoutMs)
 
       child.on('error', (cause) => {
+        if (settled) return
+        settled = true
         if (timer) clearTimeout(timer)
         if (forceTimer) clearTimeout(forceTimer)
+        options.signal?.removeEventListener('abort', abort)
         reject(new CommandExecutionError(
           `Failed to start ${command}: ${cause.message}`,
           command,
@@ -73,13 +84,18 @@ export class ProcessCommandRunner implements CommandRunner {
         ))
       })
       child.on('close', (code, signal) => {
+        if (settled) return
+        settled = true
         if (timer) clearTimeout(timer)
         if (forceTimer) clearTimeout(forceTimer)
+        options.signal?.removeEventListener('abort', abort)
         if (code === 0 && !timedOut) {
           resolve({ stdout, stderr })
           return
         }
-        const detail = timedOut
+        const detail = options.signal?.aborted
+          ? 'was aborted'
+          : timedOut
           ? `timed out after ${options.timeoutMs}ms`
           : `exited with ${code ?? signal ?? 'unknown status'}`
         reject(new CommandExecutionError(
@@ -93,6 +109,7 @@ export class ProcessCommandRunner implements CommandRunner {
 
       if (options.input === undefined) child.stdin.end()
       else child.stdin.end(options.input)
+      if (options.signal?.aborted) stop()
     })
   }
 }

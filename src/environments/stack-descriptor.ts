@@ -143,6 +143,23 @@ const endpointSchema = z.object({
   path: z.string().startsWith('/').default('/'),
 }).strict()
 
+const verificationGateSchema = z.object({
+  environmentTtlSeconds: z.number().int().min(1).max(24 * 60 * 60).default(15 * 60),
+  e2e: z.object({
+    command: z.string().trim().min(1),
+    args: z.array(z.string()).default([]),
+    env: z.record(z.string()).default({}),
+    timeoutSeconds: z.number().int().min(1).max(60 * 60).default(5 * 60),
+  }).strict(),
+  load: z.object({
+    profile: relativePathSchema,
+    timeoutSeconds: z.number().int().min(1).max(60 * 60).default(5 * 60),
+    k6Image: z.string().trim().min(1).optional(),
+  }).strict(),
+  overallTimeoutSeconds: z.number().int().min(1).max(2 * 60 * 60).default(15 * 60),
+  teardownTimeoutSeconds: z.number().int().min(1).max(30 * 60).default(2 * 60),
+}).strict()
+
 export const VerificationStackDescriptorSchema = z.object({
   apiVersion: z.literal(VERIFICATION_STACK_API_VERSION),
   kind: z.literal(VERIFICATION_STACK_KIND),
@@ -153,6 +170,8 @@ export const VerificationStackDescriptorSchema = z.object({
   services: z.array(serviceSchema).min(1),
   seeds: z.array(seedSchema).default([]),
   endpoints: z.array(endpointSchema).default([]),
+  /** Required when this descriptor participates in Factory's live merge gate. */
+  verification: verificationGateSchema.optional(),
 }).strict().superRefine((descriptor, context) => {
   uniqueNames(descriptor.services, 'services', context)
   uniqueNames(descriptor.secrets, 'secrets', context)
@@ -188,6 +207,7 @@ export type VerificationStackService = VerificationStackDescriptor['services'][n
 export type VerificationStackSeed = VerificationStackDescriptor['seeds'][number]
 export type VerificationStackEndpoint = VerificationStackDescriptor['endpoints'][number]
 export type VerificationStackReferenceGroup = VerificationStackDescriptor['secrets'][number]
+export type VerificationGateDescriptor = NonNullable<VerificationStackDescriptor['verification']>
 
 export interface LoadedVerificationStack {
   descriptor: VerificationStackDescriptor

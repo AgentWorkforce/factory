@@ -7,11 +7,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { FactoryCloudEventInputV1 } from '../observability/events'
 import type { FactoryEventReporter, FactoryEventReportResult } from '../ports/observability'
 import type {
-  DeployEnvironmentInput,
-  ProvisionEnvironmentInput,
-  VerificationEnvironment,
-  VerificationEnvironmentProvider,
+  Environment,
+  EnvironmentProvider,
+  EnvironmentSpec,
+  EnvironmentStatus,
 } from '../ports/environment'
+import type { LoadedVerificationStack } from './stack-descriptor'
+import type { StackDeployment } from './stack-deployer'
 import {
   VerificationPipeline,
   type E2eCommandResult,
@@ -24,31 +26,35 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
 })
 
-class RecordingEnvironmentProvider implements VerificationEnvironmentProvider {
+class RecordingEnvironmentProvider implements EnvironmentProvider {
   readonly calls: string[] = []
   teardownError?: Error
 
-  async provision(input: ProvisionEnvironmentInput): Promise<VerificationEnvironment> {
+  async provision(input: EnvironmentSpec): Promise<Environment> {
     this.calls.push('provision')
     return {
-      id: `env-${input.runId}`,
-      namespace: `env-${input.runId}`,
+      id: `env-${input.id}`,
+      namespace: `env-${input.id}`,
+      status: 'ready',
+      createdAt: new Date().toISOString(),
+      ttl: input.ttl ?? 60_000,
       endpoints: {},
-      internalEndpoints: {},
-      expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
+      bindings: {},
     }
   }
 
-  async deploy(environment: VerificationEnvironment, _input: DeployEnvironmentInput): Promise<VerificationEnvironment> {
+  async deploy(_stack: LoadedVerificationStack, _environment: Environment): Promise<StackDeployment> {
     this.calls.push('deploy')
     return {
-      ...environment,
       endpoints: { api: 'http://127.0.0.1:1234/health' },
-      internalEndpoints: { api: `http://api.${environment.namespace}.svc.cluster.local:8080/health` },
+      dispose: async () => undefined,
     }
   }
 
-  async teardown(_environment: VerificationEnvironment): Promise<void> {
+  async status(): Promise<EnvironmentStatus> { return 'ready' }
+  async endpoints(): Promise<Record<string, string>> { return {} }
+
+  async destroy(): Promise<void> {
     this.calls.push('teardown')
     if (this.teardownError) throw this.teardownError
   }
@@ -74,6 +80,7 @@ describe('VerificationPipeline', () => {
     const calls: string[] = []
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       reporter,
       runId: () => 'green-run',
       revisionResolver: async () => 'abc123',
@@ -133,6 +140,7 @@ describe('VerificationPipeline', () => {
     const environment = new RecordingEnvironmentProvider()
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       runId: () => 'stale-checkout',
       revisionResolver: async () => 'stale-head',
       e2eRunner: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
@@ -165,6 +173,7 @@ describe('VerificationPipeline', () => {
     let loadCalls = 0
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       runId: () => 'red-e2e',
       e2eRunner: async () => ({ exitCode: 23, stdout: '', stderr: 'assertion failed', durationMs: 3 }),
       loadRunner: async () => {
@@ -196,6 +205,7 @@ describe('VerificationPipeline', () => {
     }]
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       runId: () => 'red-load',
       e2eRunner: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
       loadRunner: async () => failedLoad,
@@ -220,10 +230,11 @@ describe('VerificationPipeline', () => {
   })
 
   it('bounds a stuck E2E stage and tears down with a fresh cleanup budget', async () => {
-    const root = await fixtureRepository({ e2eTimeout: '20ms', overallTimeout: '100ms' })
+    const root = await fixtureRepository({ e2eTimeoutSeconds: 1, overallTimeoutSeconds: 2 })
     const environment = new RecordingEnvironmentProvider()
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       runId: () => 'timeout',
       e2eRunner: async () => await new Promise(() => undefined),
       loadRunner: async () => passingLoad(),
@@ -244,6 +255,7 @@ describe('VerificationPipeline', () => {
     environment.teardownError = new Error('namespace deletion unavailable')
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       runId: () => 'teardown-red',
       e2eRunner: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
       loadRunner: async () => passingLoad(),
@@ -268,6 +280,7 @@ describe('VerificationPipeline', () => {
     const firstReleased = new Promise<void>((resolve) => { releaseFirst = resolve })
     const pipeline = new VerificationPipeline({
       environmentProvider: environment,
+      stackDeployer: environment,
       maxConcurrentEnvironments: 1,
       runId: () => `concurrent-${++run}`,
       e2eRunner: async () => {
@@ -293,36 +306,37 @@ describe('VerificationPipeline', () => {
   })
 })
 
-async function fixtureRepository(options: { e2eTimeout?: string; overallTimeout?: string } = {}): Promise<string> {
+async function fixtureRepository(options: { e2eTimeoutSeconds?: number; overallTimeoutSeconds?: number } = {}): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'factory-verification-'))
   roots.push(root)
   await mkdir(join(root, '.factory'), { recursive: true })
   await writeFile(join(root, '.factory', 'verification-stack.yaml'), `
 apiVersion: factory.agentworkforce.dev/v1alpha1
 kind: VerificationStack
-provision:
-  namespacePrefix: factory-test
-  ttl: 2m
-deploy:
-  manifests: [kubernetes.yaml]
-  readiness:
-    - resource: deployment/api
-      condition: Available
-      timeout: 30s
-  endpoints:
-    api:
-      service: api
-      port: 8080
-e2e:
-  command: node
-  args: [test-e2e.mjs]
-  timeout: ${options.e2eTimeout ?? '30s'}
-load:
-  profile: load.yaml
-  timeout: 30s
-timeouts:
-  overall: ${options.overallTimeout ?? '2m'}
-  teardown: 30s
+name: factory-test
+source:
+  type: manifests
+  paths: [kubernetes.yaml]
+services:
+  - name: api
+    workload: { kind: deployment }
+    readiness: { type: http, port: 8080 }
+endpoints:
+  - name: api
+    service: api
+    port: 8080
+    path: /health
+verification:
+  environmentTtlSeconds: 120
+  e2e:
+    command: node
+    args: [test-e2e.mjs]
+    timeoutSeconds: ${options.e2eTimeoutSeconds ?? 30}
+  load:
+    profile: load.yaml
+    timeoutSeconds: 30
+  overallTimeoutSeconds: ${options.overallTimeoutSeconds ?? 120}
+  teardownTimeoutSeconds: 30
 `, 'utf8')
   return root
 }

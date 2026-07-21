@@ -11445,6 +11445,8 @@ describe('FactoryLoop', () => {
     expect(gate.merges).toEqual([])
     expect(factory.status().counters.verificationGateFailed).toBe(1)
     expect(factory.status().counters.mergeGateMerged).toBeUndefined()
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-244', key: 'AR-244', path: issuePath(244) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(244), content: { stateId: done } })
   })
 
   it('PR-state sweep does not complete on a wrong PR or draft PR', async () => {

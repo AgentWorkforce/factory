@@ -317,6 +317,7 @@ export type {
   LoadedVerificationStack,
   ResolveVerificationStackOptions,
   VerificationProbe,
+  VerificationGateDescriptor,
   VerificationStackDescriptor,
   VerificationStackEndpoint,
   VerificationStackReferenceGroup,
@@ -334,6 +335,7 @@ export type {
   ManagedPortForward,
   PortForwarder,
   ReferenceResolutionContext,
+  StackDeployOptions,
   StackDeployerOptions,
   StackDeployment,
   VerificationStackReferenceResolver,
@@ -481,18 +483,13 @@ export type {
   VerificationLoadRunner,
   VerificationPipelineOptions,
   VerificationRevisionResolver,
+  VerificationStackDeployRunner,
   VerificationStageEvidence,
   VerificationStageStatus,
   VerificationVerdict,
 } from './environments/verification-pipeline'
-export {
-  VerificationStackSchema,
-  loadVerificationGateStack,
-} from './environments/verification-stack'
-export type {
-  ResolvedVerificationStack,
-  VerificationStack,
-} from './environments/verification-stack'
+export { loadVerificationGateStack } from './environments/verification-stack'
+export type { ResolvedVerificationStack } from './environments/verification-stack'
 export {
   FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION,
   FACTORY_ENVIRONMENT_ID_LABEL,

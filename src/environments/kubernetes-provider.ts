@@ -17,14 +17,21 @@ import {
 export interface KubernetesEnvironmentProviderOptions extends KubernetesConnection {
   namespacePrefix?: string
   defaultTtl?: number
+  maxActiveEnvironments?: number
   commandRunner?: CommandRunner
 }
+
+export const FACTORY_ENVIRONMENT_MANAGED_LABEL = 'factory.agent-relay.dev/managed'
+export const FACTORY_ENVIRONMENT_ID_LABEL = 'factory.agent-relay.dev/environment'
+export const FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION = 'factory.agent-relay.dev/expires-at'
+export const FACTORY_ENVIRONMENT_REPOSITORY_ANNOTATION = 'factory.agentworkforce.dev/repository'
 
 /** A small Kubernetes EnvironmentProvider used by verification-stack deployments. */
 export class KubernetesEnvironmentProvider implements EnvironmentProvider {
   private readonly runner: CommandRunner
   private readonly namespacePrefix: string
   private readonly defaultTtl: number
+  private readonly maxActiveEnvironments: number
   private readonly connection: KubernetesConnection
   private readonly environments = new Map<string, Environment>()
 
@@ -32,30 +39,54 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     this.runner = options.commandRunner ?? new ProcessCommandRunner()
     this.namespacePrefix = normalizeDnsLabel(options.namespacePrefix ?? 'factory-verification')
     this.defaultTtl = options.defaultTtl ?? 30 * 60_000
+    this.maxActiveEnvironments = positiveInteger(options.maxActiveEnvironments ?? 2, 'maxActiveEnvironments')
     this.connection = { kubeconfig: options.kubeconfig, context: options.context }
   }
 
   async provision(spec: EnvironmentSpec = {}): Promise<Environment> {
+    const listed = await this.runner.run('kubectl', [
+      ...kubectlConnectionArgs(this.connection),
+      'get', 'namespaces',
+      '--selector', `${FACTORY_ENVIRONMENT_MANAGED_LABEL}=true`,
+      '--output', 'json',
+    ], { timeoutMs: 30_000, signal: spec.signal })
+    const active = activeNamespaceCount(listed.stdout)
+    if (active >= this.maxActiveEnvironments) {
+      throw new Error(
+        `verification environment concurrency cap reached (${active}/${this.maxActiveEnvironments})`,
+      )
+    }
+
     const id = normalizeDnsLabel(spec.id ?? randomUUID())
     const namespace = `${this.namespacePrefix}-${id}`.slice(0, 63).replace(/-+$/u, '')
+    const ttl = spec.ttl ?? this.defaultTtl
+    const createdAt = new Date()
+    const expiresAt = new Date(createdAt.getTime() + ttl).toISOString()
     const labels = {
       'app.kubernetes.io/managed-by': 'factory',
       'factory.agentworkforce.dev/environment-id': id,
       ...spec.labels,
+      [FACTORY_ENVIRONMENT_MANAGED_LABEL]: 'true',
+      [FACTORY_ENVIRONMENT_ID_LABEL]: id,
+    }
+    const annotations = {
+      ...spec.annotations,
+      [FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION]: expiresAt,
     }
 
-    await this.runner.run('kubectl', [
-      ...kubectlConnectionArgs(this.connection),
-      'create', 'namespace', namespace,
-    ])
-
     try {
-      for (const [key, value] of Object.entries(labels)) {
-        await this.runner.run('kubectl', [
-          ...kubectlConnectionArgs(this.connection),
-          'label', 'namespace', namespace, `${key}=${value}`, '--overwrite',
-        ])
-      }
+      await this.runner.run('kubectl', [
+        ...kubectlConnectionArgs(this.connection),
+        'apply', '--filename', '-',
+      ], {
+        input: JSON.stringify({
+          apiVersion: 'v1',
+          kind: 'Namespace',
+          metadata: { name: namespace, labels, annotations },
+        }),
+        timeoutMs: 30_000,
+        signal: spec.signal,
+      })
     } catch (error) {
       await this.deleteNamespace(namespace).catch(() => undefined)
       throw error
@@ -64,8 +95,8 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     const environment: Environment = {
       id,
       status: 'ready',
-      createdAt: new Date().toISOString(),
-      ttl: spec.ttl ?? this.defaultTtl,
+      createdAt: createdAt.toISOString(),
+      ttl,
       endpoints: {},
       bindings: { ...spec.bindings },
       namespace,
@@ -98,12 +129,12 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     return { ...(this.environments.get(normalizeDnsLabel(id))?.endpoints ?? {}) }
   }
 
-  async destroy(id: string): Promise<void> {
+  async destroy(id: string, options: { signal?: AbortSignal } = {}): Promise<void> {
     const normalizedId = normalizeDnsLabel(id)
     const environment = this.environments.get(normalizedId)
     const namespace = environment?.namespace ?? this.namespaceFor(normalizedId)
     if (environment) environment.status = 'destroying'
-    await this.deleteNamespace(namespace)
+    await this.deleteNamespace(namespace, options.signal)
     if (environment) environment.status = 'destroyed'
     this.environments.delete(normalizedId)
   }
@@ -112,13 +143,28 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     return `${this.namespacePrefix}-${normalizeDnsLabel(id)}`.slice(0, 63).replace(/-+$/u, '')
   }
 
-  private async deleteNamespace(namespace: string): Promise<void> {
+  private async deleteNamespace(namespace: string, signal?: AbortSignal): Promise<void> {
     await this.runner.run('kubectl', [
       ...kubectlConnectionArgs(this.connection),
       'delete', 'namespace', namespace,
       '--ignore-not-found=true', '--wait=true', '--timeout=2m',
-    ], { timeoutMs: 125_000 })
+    ], { timeoutMs: 125_000, signal })
   }
+}
+
+function activeNamespaceCount(stdout: string): number {
+  try {
+    const value = JSON.parse(stdout) as { items?: Array<{ metadata?: { deletionTimestamp?: string } }> }
+    if (!Array.isArray(value.items)) throw new Error('missing items array')
+    return value.items.filter((item) => !item.metadata?.deletionTimestamp).length
+  } catch (error) {
+    throw new Error(`kubectl returned invalid namespace inventory: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function positiveInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${field} must be a positive integer`)
+  return value
 }
 
 function normalizeDnsLabel(value: string): string {

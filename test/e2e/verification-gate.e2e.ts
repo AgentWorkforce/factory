@@ -7,41 +7,52 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import {
+  FactoryConfigSchema,
   FactoryCloudReporter,
   FileFactoryCloudEventOutbox,
-  KubectlEnvironmentProvider,
+  KubernetesEnvironmentProvider,
   VerificationPipeline,
+  createFactory,
   defaultKubectlEnvironmentRunner,
+  parseLinearIssue,
   reapFactoryEnvironmentsOnce,
-  type DeployEnvironmentInput,
+  type FactoryConfig,
+  type Environment,
+  type EnvironmentProvider,
+  type EnvironmentSpec,
+  type EnvironmentStatus,
   type FactoryCloudEventBatchV1,
   type FactoryEventReporter,
-  type ProvisionEnvironmentInput,
-  type VerificationEnvironment,
-  type VerificationEnvironmentProvider,
+  type GithubMergeGate,
+  type GithubMergeInput,
+  type LinearIssue,
+  type LinearWriteback,
+  type TriageDecision,
+  type TriageEngine,
+  type VerificationGate,
+  type VerificationGateInput,
   type VerificationVerdict,
 } from '../../src/index.ts'
+import { FakeFleetClient, FakeMountClient } from '../../src/testing/index.ts'
 
 const artifactDirectory = join(process.cwd(), 'artifacts', 'verification-gate-e2e')
 const execFileAsync = promisify(execFile)
 
-class SignalingEnvironmentProvider implements VerificationEnvironmentProvider {
-  readonly #delegate = new KubectlEnvironmentProvider()
+class SignalingEnvironmentProvider implements EnvironmentProvider {
+  readonly #delegate = new KubernetesEnvironmentProvider({ maxActiveEnvironments: 2 })
 
   constructor(readonly signalPath: string) {}
 
-  async provision(input: ProvisionEnvironmentInput): Promise<VerificationEnvironment> {
+  async provision(input: EnvironmentSpec): Promise<Environment> {
     const environment = await this.#delegate.provision(input)
     await writeFile(this.signalPath, environment.namespace, 'utf8')
     return environment
   }
 
-  async deploy(environment: VerificationEnvironment, input: DeployEnvironmentInput): Promise<VerificationEnvironment> {
-    return await this.#delegate.deploy(environment, input)
-  }
-
-  async teardown(environment: VerificationEnvironment, options?: { signal?: AbortSignal }): Promise<void> {
-    await this.#delegate.teardown(environment, options)
+  async status(id: string): Promise<EnvironmentStatus> { return await this.#delegate.status(id) }
+  async endpoints(id: string): Promise<Record<string, string>> { return await this.#delegate.endpoints(id) }
+  async destroy(id: string, options?: { signal?: AbortSignal }): Promise<void> {
+    await this.#delegate.destroy(id, options)
   }
 }
 
@@ -71,29 +82,26 @@ async function main(): Promise<void> {
   const verdicts: Record<string, VerificationVerdict> = {}
   const mergeAttempts: string[] = []
   try {
-    verdicts.green = await gate(root, reporter, 'green', expectedHeadSha)
+    verdicts.green = await gateThroughFactory(root, reporter, 'green', expectedHeadSha, mergeAttempts)
     assert.equal(verdicts.green.passed, true, verdicts.green.reason)
-    assert.equal(await attemptMerge(verdicts.green, 'green', mergeAttempts), true, 'green verification must allow merge')
     await assertNamespaceGone(verdicts.green.evidence.namespace!)
 
-    verdicts.redE2e = await gate(root, reporter, 'red-e2e', expectedHeadSha)
+    verdicts.redE2e = await gateThroughFactory(root, reporter, 'red-e2e', expectedHeadSha, mergeAttempts)
     assert.equal(verdicts.redE2e.passed, false)
     assert.equal(verdicts.redE2e.evidence.stages.e2e.status, 'fail')
     assert.equal(verdicts.redE2e.evidence.stages.load.status, 'skipped')
-    assert.equal(await attemptMerge(verdicts.redE2e, 'red-e2e', mergeAttempts), false, 'red E2E must block merge')
     await assertNamespaceGone(verdicts.redE2e.evidence.namespace!)
 
-    verdicts.redLoad = await gate(root, reporter, 'red-load', expectedHeadSha)
+    verdicts.redLoad = await gateThroughFactory(root, reporter, 'red-load', expectedHeadSha, mergeAttempts)
     assert.equal(verdicts.redLoad.passed, false)
     assert.equal(verdicts.redLoad.evidence.stages.e2e.status, 'pass')
     assert.equal(verdicts.redLoad.evidence.stages.load.status, 'fail')
     assert.ok((verdicts.redLoad.evidence.stages.load.violations ?? []).some(
       (violation) => violation.metric === 'p95LatencyMs',
     ))
-    assert.equal(await attemptMerge(verdicts.redLoad, 'red-load', mergeAttempts), false, 'load SLO violation must block merge')
     await assertNamespaceGone(verdicts.redLoad.evidence.namespace!)
 
-    verdicts.timeout = await gate(root, reporter, 'timeout', expectedHeadSha)
+    verdicts.timeout = await pipelineGate(root, reporter, 'timeout', expectedHeadSha)
     assert.equal(verdicts.timeout.passed, false)
     assert.equal(verdicts.timeout.evidence.stages.e2e.status, 'timed_out')
     assert.equal(verdicts.timeout.evidence.stages.teardown.status, 'pass')
@@ -135,7 +143,7 @@ async function main(): Promise<void> {
   }
 }
 
-async function gate(
+async function pipelineGate(
   root: string,
   reporter: FactoryEventReporter,
   scenario: string,
@@ -154,15 +162,207 @@ async function gate(
   })
 }
 
-async function attemptMerge(
-  verdict: VerificationVerdict,
+async function gateThroughFactory(
+  root: string,
+  reporter: FactoryEventReporter,
   scenario: string,
-  attempts: string[],
-): Promise<boolean> {
-  if (!verdict.passed) return false
-  attempts.push(scenario)
-  return true
+  expectedHeadSha: string,
+  mergeAttempts: string[],
+): Promise<VerificationVerdict> {
+  const issuePath = `/linear/issues/AR-145__verification-${scenario}.json`
+  const issueRecord = verificationIssue(scenario)
+  const mount = new FakeMountClient({
+    [issuePath]: issueRecord,
+    '/github/repos/AgentWorkforce__factory/pulls/by-id/145.json': verificationPullRequest(scenario),
+  })
+  const pipeline = new VerificationPipeline({
+    reporter,
+    descriptorPath: `.factory/${scenario}.yaml`,
+    runId: () => `${scenario}-${process.pid}`,
+    maxConcurrentEnvironments: 2,
+  })
+  const verificationGate = new RecordingVerificationGate(pipeline)
+  const mergeGate = new RecordingMergeGate(expectedHeadSha, scenario, mergeAttempts)
+  const factory = createFactory(verificationFactoryConfig(root, scenario), {
+    mount,
+    fleet: new FakeFleetClient(),
+    triage: new VerificationTriage(root),
+    linear: stateOnlyLinear(mount),
+    mergeGate,
+    verificationGate,
+    logger: { info() {}, warn() {}, error() {} },
+  })
+
+  const issue = parseLinearIssue(issuePath, issueRecord)
+  let status: ReturnType<typeof factory.status>
+  try {
+    await factory.dispatch(await factory.triageIssue(issue))
+    await factory.runLoop({ maxIterations: 1 })
+    status = factory.status()
+  } finally {
+    await factory.dispose()
+  }
+
+  assert.ok(
+    verificationGate.verdict,
+    `Factory did not run verification for ${scenario}: ${JSON.stringify(status!)}`,
+  )
+  if (verificationGate.verdict.passed) {
+    assert.equal(mergeGate.inputs.length, 1, `green ${scenario} verdict did not reach the merge port`)
+    assert.equal(status!.inFlight.length, 0, `green ${scenario} run did not complete the Factory workflow`)
+  } else {
+    assert.equal(mergeGate.inputs.length, 0, `red ${scenario} verdict reached the merge port`)
+    assert.equal(status!.inFlight.length, 1, `red ${scenario} run incorrectly completed the Factory workflow`)
+  }
+  return verificationGate.verdict
 }
+
+class RecordingVerificationGate implements VerificationGate {
+  verdict?: VerificationVerdict
+
+  constructor(readonly delegate: VerificationGate) {}
+
+  async verify(input: VerificationGateInput): Promise<VerificationVerdict> {
+    this.verdict = await this.delegate.verify(input)
+    return this.verdict
+  }
+}
+
+class RecordingMergeGate implements GithubMergeGate {
+  readonly inputs: GithubMergeInput[] = []
+
+  constructor(
+    readonly expectedHeadSha: string,
+    readonly scenario: string,
+    readonly attempts: string[],
+  ) {}
+
+  async check() {
+    return {
+      verdict: 'READY' as const,
+      ready: true,
+      reason: 'fixture checks and review are green',
+      live: {
+        mergeable: 'MERGEABLE',
+        mergeStateStatus: 'CLEAN',
+        headRefOid: this.expectedHeadSha,
+        reviewDecision: 'APPROVED',
+        checkStates: ['SUCCESS'],
+      },
+    }
+  }
+
+  async merge(input: GithubMergeInput) {
+    this.inputs.push(input)
+    this.attempts.push(this.scenario)
+    return { merged: true, reason: 'fixture merge recorded' }
+  }
+}
+
+class VerificationTriage implements TriageEngine {
+  constructor(readonly root: string) {}
+
+  async triage(issue: LinearIssue): Promise<TriageDecision> {
+    const common = {
+      repo: 'AgentWorkforce/factory',
+      clonePath: this.root,
+      node: 'self' as const,
+    }
+    return {
+      issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
+      routes: [{ repo: common.repo, clonePath: common.clonePath, rationale: 'verification fixture' }],
+      scope: 'single',
+      implementers: [{
+        ...common,
+        name: 'ar-145-impl-verification',
+        role: 'implementer',
+        capability: 'spawn:codex',
+        model: 'codex',
+        task: 'Fixture implementation is complete.',
+      }],
+      reviewer: {
+        ...common,
+        name: 'ar-145-review-verification',
+        role: 'reviewer',
+        capability: 'spawn:claude',
+        model: 'claude',
+        task: 'Fixture review is complete.',
+      },
+      thin: false,
+      confidence: 'high',
+      rationale: 'verification fixture',
+    }
+  }
+}
+
+function verificationFactoryConfig(root: string, scenario: string): FactoryConfig {
+  return FactoryConfigSchema.parse({
+    workspaceId: `verification-gate-${scenario}`,
+    repos: {
+      byLabel: { factory: 'AgentWorkforce/factory' },
+      clonePaths: { 'AgentWorkforce/factory': root },
+      default: 'AgentWorkforce/factory',
+    },
+    triage: { maxImplementers: 1 },
+    batchSize: 1,
+    mergePolicy: 'on-green-with-review',
+    verification: { enabled: false },
+    safety: { requireTitlePrefix: 'Real', requireLabel: 'factory', requireTeamKey: 'AR' },
+    stateIds: {
+      readyForAgent: 'state-ready',
+      agentImplementing: 'state-implementing',
+      done: 'state-done',
+      inPlanning: 'state-planning',
+    },
+    loop: {
+      maxIterations: 1,
+      heartbeatPath: join(tmpdir(), `factory-verification-${scenario}-${process.pid}-heartbeat.json`),
+      registryPath: join(tmpdir(), `factory-verification-${scenario}-${process.pid}-registry.json`),
+    },
+  })
+}
+
+function verificationIssue(scenario: string) {
+  return {
+    provider: 'linear',
+    objectType: 'issue',
+    objectId: `verification-${scenario}`,
+    payload: {
+      id: `verification-${scenario}`,
+      identifier: 'AR-145',
+      title: `Real verification gate ${scenario}`,
+      description: 'Exercise the live verification merge gate.',
+      stateId: 'state-ready',
+      url: `https://linear.app/agent-relay/issue/AR-145/verification-gate-${scenario}`,
+      labels: [{ name: 'factory' }],
+      team: { key: 'AR', name: 'Agent Relay' },
+      state: { id: 'state-ready', name: 'Ready for Agent' },
+    },
+  }
+}
+
+function verificationPullRequest(scenario: string) {
+  return {
+    provider: 'github',
+    objectType: 'pull_request',
+    objectId: '145',
+    payload: {
+      number: 145,
+      title: `AR-145: verification gate ${scenario}`,
+      body: 'Linear: AR-145',
+      head_ref: `verification-${scenario}`,
+      state: 'OPEN',
+      isDraft: false,
+    },
+  }
+}
+
+const stateOnlyLinear = (mount: FakeMountClient): LinearWriteback => ({
+  async setState(issue, stateId) { await mount.writeFile(issue.path, { stateId }) },
+  async postComment() {},
+  async createIssue() { throw new Error('not used by verification fixture') },
+  async verify() { return true },
+})
 
 function cloudReporter(root: string, batches: FactoryCloudEventBatchV1[]): FactoryCloudReporter {
   return new FactoryCloudReporter({
@@ -279,31 +479,42 @@ async function writeDescriptor(
   await writeFile(join(root, '.factory', `${name}.yaml`), `
 apiVersion: factory.agentworkforce.dev/v1alpha1
 kind: VerificationStack
-provision:
-  namespacePrefix: factory-gate
-  ttl: ${ttl}
-deploy:
-  manifests: [stack.yaml]
-  readiness:
-    - resource: deployment/sample-api
-      condition: Available
-      timeout: 2m
-  endpoints:
-    api:
-      service: sample-api
+name: factory-gate-${name}
+source:
+  type: manifests
+  paths: [stack.yaml]
+services:
+  - name: sample-api
+    workload: { kind: deployment }
+    readiness:
+      type: http
       port: 5678
-      portForward: true
-e2e:
-  command: node
-  args: [e2e.mjs, ${e2eMode}]
-  timeout: ${e2eTimeout}
-load:
-  profile: ${profile}
-  timeout: 2m
-timeouts:
-  overall: ${overallTimeout}
-  teardown: 2m
+      path: /
+      timeoutSeconds: 120
+      intervalSeconds: 1
+endpoints:
+  - name: api
+    service: sample-api
+    port: 5678
+    path: /
+verification:
+  environmentTtlSeconds: ${durationSeconds(ttl)}
+  e2e:
+    command: node
+    args: [e2e.mjs, ${e2eMode}]
+    timeoutSeconds: ${durationSeconds(e2eTimeout)}
+  load:
+    profile: ${profile}
+    timeoutSeconds: 120
+  overallTimeoutSeconds: ${durationSeconds(overallTimeout)}
+  teardownTimeoutSeconds: 120
 `, 'utf8')
+}
+
+function durationSeconds(value: string): number {
+  const match = /^(\d+)(s|m)$/u.exec(value)
+  if (!match) throw new Error(`unsupported E2E duration ${value}`)
+  return Number(match[1]) * (match[2] === 'm' ? 60 : 1)
 }
 
 const stackManifest = `

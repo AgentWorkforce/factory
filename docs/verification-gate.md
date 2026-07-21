@@ -12,41 +12,45 @@ environment.
 ```yaml
 apiVersion: factory.agentworkforce.dev/v1alpha1
 kind: VerificationStack
-provision:
-  namespacePrefix: factory-verify
-  ttl: 15m
-deploy:
-  manifests:
-    - deploy/kubernetes.yaml
-  readiness:
-    - resource: deployment/api
-      condition: Available
-      timeout: 2m
-  endpoints:
-    api:
-      service: api
+name: my-app
+source:
+  type: manifests
+  paths: [deploy/kubernetes.yaml]
+services:
+  - name: api
+    workload: { kind: deployment }
+    readiness:
+      type: http
       port: 8080
-      scheme: http
-      portForward: true
-e2e:
-  command: npm
-  args: [run, test:e2e]
-  timeout: 5m
-load:
-  profile: .factory/load.yaml
-  timeout: 5m
-timeouts:
-  overall: 15m
-  teardown: 2m
+      path: /health
+      timeoutSeconds: 120
+endpoints:
+  - name: api
+    service: api
+    port: 8080
+    path: /health
+verification:
+  environmentTtlSeconds: 900
+  e2e:
+    command: npm
+    args: [run, test:e2e]
+    timeoutSeconds: 300
+  load:
+    profile: .factory/load.yaml
+    timeoutSeconds: 300
+  overallTimeoutSeconds: 900
+  teardownTimeoutSeconds: 120
 ```
 
 The E2E process receives `FACTORY_ENVIRONMENT_ID`,
 `FACTORY_ENVIRONMENT_NAMESPACE`, and one `FACTORY_ENDPOINT_<NAME>` variable per
 endpoint. In-cluster load jobs use the corresponding service DNS names.
 
-Only namespaced manifest resources are accepted. Factory creates a leased,
-managed namespace, caps active environments, runs the declared readiness/E2E
-and load stages, evaluates the verdict, and deletes the namespace in `finally`.
+The deployment portion is the shared repository-owned descriptor documented in
+`docs/verification-stack.md`; the `verification` section makes that stack
+eligible for the required merge gate. Factory creates a leased, managed
+namespace, caps active environments, runs readiness/E2E/load, evaluates the
+verdict, closes deployment tunnels, and deletes the namespace on every return.
 Expired leases can be reclaimed with `reapFactoryEnvironmentsOnce()` or the
 recurring `FactoryEnvironmentReaper` after a hard process kill.
 

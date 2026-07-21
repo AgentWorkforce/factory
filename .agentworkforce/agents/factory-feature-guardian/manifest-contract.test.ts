@@ -189,6 +189,7 @@ describe('Factory feature manifest contract', () => {
       './node': 'createFactoryNodeDefinition()',
       './featuremap': '@agent-relay/factory/featuremap',
       './hosted': '@agent-relay/factory/hosted',
+      './verification-stack.schema.json': '@agent-relay/factory/verification-stack.schema.json',
     }
     expect(Object.keys(packageJson.exports).sort()).toEqual(Object.keys(expected).sort())
     for (const surface of Object.values(expected)) {

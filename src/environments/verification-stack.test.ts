@@ -13,52 +13,75 @@ afterEach(async () => {
 })
 
 describe('loadVerificationGateStack', () => {
-  it('resolves repository-relative files and duration safety controls', async () => {
-    const root = await repositoryWith(`
-apiVersion: factory.agentworkforce.dev/v1alpha1
-kind: VerificationStack
-deploy:
-  manifests: [deploy/stack.yaml]
-  endpoints:
-    api: { service: api, port: 8080 }
-e2e: { command: npm, args: [run, e2e], timeout: 45s }
-load: { profile: load/profile.yaml, timeout: 1m }
-timeouts: { overall: 10m, teardown: 90s }
-`)
+  it('normalizes live-gate stages from the repository-owned deployment descriptor', async () => {
+    const root = await repositoryWith(gateDescriptor())
 
     await expect(loadVerificationGateStack(root)).resolves.toMatchObject({
       repositoryPath: root,
-      provision: { namespacePrefix: 'factory-verify', ttlMs: 15 * 60_000 },
-      deploy: {
-        manifests: [{ path: join(root, 'deploy/stack.yaml') }],
-        endpoints: { api: { service: 'api', port: 8080, scheme: 'http', portForward: true } },
+      environmentTtlMs: 120_000,
+      loaded: {
+        descriptor: {
+          name: 'factory-test',
+          source: { type: 'manifests', paths: ['deploy/stack.yaml'] },
+          endpoints: [{ name: 'api', service: 'api', port: 8080 }],
+        },
       },
-      e2e: { timeoutMs: 45_000 },
+      e2e: { command: 'npm', args: ['run', 'e2e'], timeoutMs: 45_000 },
       load: { profilePath: join(root, 'load/profile.yaml'), timeoutMs: 60_000 },
-      timeouts: { overallMs: 10 * 60_000, teardownMs: 90_000 },
+      timeouts: { overallMs: 600_000, teardownMs: 90_000 },
     })
   })
 
-  it('rejects files that escape the feature checkout', async () => {
-    const root = await repositoryWith(`
-apiVersion: factory.agentworkforce.dev/v1alpha1
-kind: VerificationStack
-deploy:
-  manifests: [../cluster-admin.yaml]
-  endpoints:
-    api: { service: api, port: 8080 }
-e2e: { command: npm }
-load: { profile: load.yaml }
-`)
+  it('fails closed when deployment endpoints or required gate stages are absent', async () => {
+    const withoutGate = await repositoryWith(gateDescriptor().replace(/verification:[\s\S]*$/u, ''))
+    await expect(loadVerificationGateStack(withoutGate)).rejects.toThrow(/required verification section/u)
 
-    await expect(loadVerificationGateStack(root)).rejects.toThrow(/escapes the repository/)
+    const withoutEndpoints = await repositoryWith(gateDescriptor().replace(
+      /endpoints:[\s\S]*?verification:/u,
+      'endpoints: []\nverification:',
+    ))
+    await expect(loadVerificationGateStack(withoutEndpoints)).rejects.toThrow(/at least one endpoint/u)
+  })
+
+  it('rejects descriptor traversal outside the repository', async () => {
+    const root = await repositoryWith(gateDescriptor())
+    await expect(loadVerificationGateStack(root, '../outside.yaml')).rejects.toThrow(/must stay inside the repository/u)
   })
 })
 
 async function repositoryWith(descriptor: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'factory-stack-'))
+  const root = await mkdtemp(join(tmpdir(), 'factory-verification-stack-'))
   roots.push(root)
   await mkdir(join(root, '.factory'), { recursive: true })
   await writeFile(join(root, '.factory', 'verification-stack.yaml'), descriptor, 'utf8')
   return root
+}
+
+function gateDescriptor(): string {
+  return `apiVersion: factory.agentworkforce.dev/v1alpha1
+kind: VerificationStack
+name: factory-test
+source:
+  type: manifests
+  paths: [deploy/stack.yaml]
+services:
+  - name: api
+    workload: { kind: deployment }
+    readiness: { type: http, port: 8080 }
+endpoints:
+  - name: api
+    service: api
+    port: 8080
+verification:
+  environmentTtlSeconds: 120
+  e2e:
+    command: npm
+    args: [run, e2e]
+    timeoutSeconds: 45
+  load:
+    profile: load/profile.yaml
+    timeoutSeconds: 60
+  overallTimeoutSeconds: 600
+  teardownTimeoutSeconds: 90
+`
 }

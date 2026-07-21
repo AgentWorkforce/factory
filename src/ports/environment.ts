@@ -73,6 +73,8 @@ export interface EnvironmentSpec {
   ttl?: number
   labels?: Record<string, string>
   bindings?: Record<string, string>
+  annotations?: Record<string, string>
+  signal?: AbortSignal
 }
 
 /**
@@ -98,5 +100,5 @@ export interface EnvironmentProvider {
   provision(spec: EnvironmentSpec): Promise<Environment>
   status(id: string): Promise<EnvironmentStatus>
   endpoints(id: string): Promise<Record<string, string>>
-  destroy(id: string): Promise<void>
+  destroy(id: string, options?: { signal?: AbortSignal }): Promise<void>
 }

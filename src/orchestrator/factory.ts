@@ -9426,6 +9426,21 @@ export class FactoryLoop implements Factory {
           }
         }
       }
+      // Linear-backed issues historically wrote Done before invoking the
+      // guarded merge. With live verification in that guard, a red verdict
+      // would therefore release the team and make the failure terminal even
+      // though the PR remained open. Require the entire merge gate (including
+      // verification) to accept the merge before applying terminal writeback.
+      if (
+        issue &&
+        !githubIssue &&
+        !configuredHumanReview &&
+        opts.runMergeGate !== false &&
+        this.#config.mergePolicy === 'on-green-with-review'
+      ) {
+        const mergeCommandAccepted = await this.#runCompletionMergeGate(issue, record)
+        if (!mergeCommandAccepted) return
+      }
       // A GitHub issue only closes after its PR merges. If a configured done
       // path cannot merge (including mergePolicy: never), park it for a human
       // instead of closing the issue while its PR remains open.
@@ -9482,13 +9497,6 @@ export class FactoryLoop implements Factory {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
       }
-      // Only auto-merge on the `done` terminal path. Human Review parks the PR
-      // for an operator — the merge gate (which requires an APPROVED review)
-      // would refuse anyway, and we must not merge before the human has looked.
-      if (issue && !githubIssue && !humanReview && opts.runMergeGate !== false) {
-        await this.#runCompletionMergeGate(issue, record)
-      }
-
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
       releaseReasonForRetry = releaseReason
       if (this.#usesDurableDispatchLifecycle()) {

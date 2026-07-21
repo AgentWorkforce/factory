@@ -52,7 +52,25 @@ describe('verification-stack descriptor', () => {
 
     expect(schema.$schema).toBe('https://json-schema.org/draft/2020-12/schema')
     expect(schema.properties.source.$ref).toBe('#/$defs/source')
+    expect(schema.properties.verification.$ref).toBe('#/$defs/verification')
     expect(schema.$defs.reference.properties).not.toHaveProperty('value')
+  })
+
+  it('validates and defaults the optional merge-gate stages', () => {
+    const loaded = loadVerificationStack(descriptor({
+      verification: {
+        e2e: { command: 'npm', args: ['run', 'test:e2e'] },
+        load: { profile: '.factory/load.yaml' },
+      },
+    }))
+
+    expect(loaded.verification).toEqual({
+      environmentTtlSeconds: 900,
+      e2e: { command: 'npm', args: ['run', 'test:e2e'], env: {}, timeoutSeconds: 300 },
+      load: { profile: '.factory/load.yaml', timeoutSeconds: 300 },
+      overallTimeoutSeconds: 900,
+      teardownTimeoutSeconds: 120,
+    })
   })
 
   it('fails closed with paths for inline secrets, unknown keys, and dangling services', () => {

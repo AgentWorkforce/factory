@@ -35,6 +35,9 @@
       "type": "array",
       "default": [],
       "items": { "$ref": "#/$defs/endpoint" }
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
     }
   },
   "$defs": {
@@ -247,6 +250,37 @@
         "port": { "$ref": "#/$defs/port" },
         "protocol": { "enum": ["http", "https"], "default": "http" },
         "path": { "type": "string", "pattern": "^/", "default": "/" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["e2e", "load"],
+      "properties": {
+        "environmentTtlSeconds": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 900 },
+        "e2e": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command"],
+          "properties": {
+            "command": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "args": { "type": "array", "default": [], "items": { "type": "string" } },
+            "env": { "type": "object", "default": {}, "additionalProperties": { "type": "string" } },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 }
+          }
+        },
+        "load": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile"],
+          "properties": {
+            "profile": { "$ref": "#/$defs/relativePath" },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 },
+            "k6Image": { "type": "string", "minLength": 1, "pattern": "\\S" }
+          }
+        },
+        "overallTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 7200, "default": 900 },
+        "teardownTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 1800, "default": 120 }
       }
     }
   }
