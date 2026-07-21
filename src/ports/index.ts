@@ -47,3 +47,10 @@ export type {
   AgentWorktree,
   AgentWorktreeManager,
 } from './worktree'
+export type {
+  Environment,
+  EnvironmentProvider,
+  EnvironmentSpec,
+  EnvironmentStatus,
+  KubernetesEnvironmentTarget,
+} from './environment'

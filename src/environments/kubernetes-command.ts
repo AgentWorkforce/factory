@@ -1,0 +1,112 @@
+import { spawn } from 'node:child_process'
+
+export interface CommandResult {
+  stdout: string
+  stderr: string
+}
+
+export interface RunCommandOptions {
+  cwd?: string
+  input?: string
+  timeoutMs?: number
+}
+
+export interface CommandRunner {
+  run(command: string, args: string[], options?: RunCommandOptions): Promise<CommandResult>
+}
+
+export interface KubernetesConnection {
+  kubeconfig?: string
+  context?: string
+}
+
+export class CommandExecutionError extends Error {
+  constructor(
+    message: string,
+    public readonly command: string,
+    public readonly args: readonly string[],
+    public readonly stdout: string,
+    public readonly stderr: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'CommandExecutionError'
+  }
+}
+
+export class ProcessCommandRunner implements CommandRunner {
+  async run(command: string, args: string[], options: RunCommandOptions = {}): Promise<CommandResult> {
+    return await new Promise<CommandResult>((resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd: options.cwd,
+        env: process.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      let timedOut = false
+      let forceTimer: ReturnType<typeof setTimeout> | undefined
+
+      child.stdout.setEncoding('utf8')
+      child.stderr.setEncoding('utf8')
+      child.stdout.on('data', (chunk: string) => { stdout += chunk })
+      child.stderr.on('data', (chunk: string) => { stderr += chunk })
+
+      const timer = options.timeoutMs === undefined
+        ? undefined
+          : setTimeout(() => {
+            timedOut = true
+            child.kill('SIGTERM')
+            forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000)
+          }, options.timeoutMs)
+
+      child.on('error', (cause) => {
+        if (timer) clearTimeout(timer)
+        if (forceTimer) clearTimeout(forceTimer)
+        reject(new CommandExecutionError(
+          `Failed to start ${command}: ${cause.message}`,
+          command,
+          args,
+          stdout,
+          stderr,
+          { cause },
+        ))
+      })
+      child.on('close', (code, signal) => {
+        if (timer) clearTimeout(timer)
+        if (forceTimer) clearTimeout(forceTimer)
+        if (code === 0 && !timedOut) {
+          resolve({ stdout, stderr })
+          return
+        }
+        const detail = timedOut
+          ? `timed out after ${options.timeoutMs}ms`
+          : `exited with ${code ?? signal ?? 'unknown status'}`
+        reject(new CommandExecutionError(
+          `${command} ${detail}${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
+          command,
+          args,
+          stdout,
+          stderr,
+        ))
+      })
+
+      if (options.input === undefined) child.stdin.end()
+      else child.stdin.end(options.input)
+    })
+  }
+}
+
+export function kubectlConnectionArgs(connection: KubernetesConnection): string[] {
+  return [
+    ...(connection.kubeconfig ? ['--kubeconfig', connection.kubeconfig] : []),
+    ...(connection.context ? ['--context', connection.context] : []),
+  ]
+}
+
+export function helmConnectionArgs(connection: KubernetesConnection): string[] {
+  return [
+    ...(connection.kubeconfig ? ['--kubeconfig', connection.kubeconfig] : []),
+    ...(connection.context ? ['--kube-context', connection.context] : []),
+  ]
+}

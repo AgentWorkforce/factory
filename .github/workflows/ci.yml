@@ -56,3 +56,29 @@ jobs:
 
       - name: Verify package contents
         run: npm pack --dry-run
+
+  verification-stack-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: factory-stack-e2e
+
+      - name: Deploy and verify descriptor stack
+        run: npm run test:stack-e2e
