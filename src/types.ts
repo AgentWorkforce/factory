@@ -1,6 +1,6 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
-import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
+import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
 import type { FactoryEventReporter } from './ports/observability'
@@ -9,6 +9,7 @@ import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-close
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
+import type { VerificationGate } from './environments/verification-pipeline'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -24,6 +25,7 @@ export interface FactoryPorts {
   github?: GithubRead
   githubWriteback?: GithubWriteback
   mergeGate?: GithubMergeGate
+  verificationGate?: VerificationGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver
   probePrGhRunner?: GhRunner
@@ -179,6 +181,7 @@ export interface DispatchResult {
   agents: Array<{ name: string; role: AgentSpec['role'] }>
   comments?: string[]
   stateId?: string
+  previews?: PreviewReference[]
   dryRun: boolean
   hold?: {
     kind: 'capacity' | 'dependency' | 'dependency-cycle'

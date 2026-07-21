@@ -20,6 +20,12 @@ export type {
   AgentPidResolution,
   AgentSpec,
   Capability,
+  NodeCapability,
+  PreviewCapability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
   FleetClient,
   RestartPolicy,
   RosterEntry,
@@ -40,10 +46,25 @@ export type {
   TelemetrySink,
 } from './system'
 export type {
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
+  ProvisionEnvironmentSpec,
+  DeployEndpoint,
+  DeployEnvironmentInput,
+  DeployManifest,
+  DeployReadinessCheck,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
+} from './environment'
+export type {
   FactoryEventReporter,
   FactoryEventReportResult,
 } from './observability'
 export type {
   AgentWorktree,
+  AgentWorktreeCleanupInspection,
   AgentWorktreeManager,
+  AgentWorktreeRepository,
 } from './worktree'

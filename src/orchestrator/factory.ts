@@ -6,6 +6,7 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
   AgentLifecycleSignal,
@@ -23,6 +24,7 @@ import type {
   LinearWriteback,
   MountClient,
   ProviderSyncStatus,
+  PreviewReference,
   SlackWriteback,
   SpawnResult,
   Subscription,
@@ -40,8 +42,8 @@ import type {
   WaitingClarification,
 } from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
-import type { AgentWorktree, AgentWorktreeManager } from '../ports/worktree'
-import { factoryWorktreePath } from '../git/agent-worktree'
+import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
+import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
@@ -59,6 +61,7 @@ import {
 import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
+import { isResourceSubscriptionsUnavailable, type ResourceSubscription } from '../subscriptions'
 import type {
   DispatchResult,
   Factory,
@@ -143,7 +146,19 @@ type BabysitterWakeKind =
   | 'checks-failed'
   | 'merge-conflict'
   | 'base-diverged'
-type BabysitterPrRef = { repo: string; prNumber: number; path?: string; agentName: string }
+type BabysitterResourceSubscription = Pick<
+  ResourceSubscription,
+  'subscriptionId' | 'provider' | 'resourceRef' | 'subscriberId' | 'ownerId' | 'expiresAt'
+> & { terminal?: boolean }
+type BabysitterPendingDeliveryClaim = { deliveryId: string; claimToken: string }
+type BabysitterPrRef = {
+  repo: string
+  prNumber: number
+  path?: string
+  agentName: string
+  resourceSubscription?: BabysitterResourceSubscription
+  pendingDeliveryClaims?: BabysitterPendingDeliveryClaim[]
+}
 type BabysitterWakeState = {
   issue: IssueRef
   repo: string
@@ -238,6 +253,7 @@ const LIVE_DEDUPE_LIMIT = 5_000
 const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
 const COMPLETION_SWEEP_INTERVAL_MS = 15_000
 const COMPLETION_SWEEP_BATCH_SIZE = 2
+const PREVIEW_SWEEP_INTERVAL_MS = 60_000
 const PROBE_PR_GH_BACKOFF_MS = 60_000
 const PROBE_PR_GH_CANDIDATE_LIMIT = 200
 const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
@@ -260,6 +276,24 @@ const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const BABYSITTER_EVENT_COALESCE_MS = 750
 const BABYSITTER_EVENT_RETRY_MS = 1_000
+const BABYSITTER_SUBSCRIPTION_TTL_SECONDS = 60 * 60
+// Relayfile receives provider-native GitHub events, not the materialized file
+// changes that the legacy local router consumed. `closed` is separately
+// indexed as a terminal event below, so terminal delivery does not need a
+// broad normal-event subscription.
+const BABYSITTER_SUBSCRIPTION_EVENT_TYPES = [
+  'pull_request.opened',
+  'pull_request.reopened',
+  'pull_request.synchronize',
+  'pull_request.ready_for_review',
+  'pull_request_review.submitted',
+  'pull_request_review_comment.created',
+  'issue_comment.created',
+  'check_run.completed',
+]
+const BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES = ['pull_request.closed']
+const BABYSITTER_RESOURCE_DELIVERY_RETRY_MS = 5_000
+const BABYSITTER_RESOURCE_SUBSCRIPTION_RENEW_MS = (BABYSITTER_SUBSCRIPTION_TTL_SECONDS * 1_000) / 2
 // A babysitter wake fails with a "registration lag" error (agent_not_found /
 // recipient unavailable) both when a freshly spawned agent has not finished
 // enrolling AND when an agent is up but its relay identity never becomes
@@ -332,6 +366,7 @@ export class FactoryLoop implements Factory {
   readonly #githubWritebackProvided: boolean
   readonly #slack?: SlackWriteback
   readonly #mergeGate: GithubMergeGatePort
+  readonly #verificationGate?: VerificationGate
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
@@ -440,6 +475,8 @@ export class FactoryLoop implements Factory {
   #deferLiveEventDrain = false
   #completionSweepTimer?: ReturnType<typeof setTimeout>
   #completionSweepActive = false
+  #previewSweepTimer?: ReturnType<typeof setTimeout>
+  #previewSweepInFlight?: Promise<void>
   readonly #completionInFlight = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
@@ -456,6 +493,14 @@ export class FactoryLoop implements Factory {
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, BabysitterPrRef>()
   readonly #babysitterIssueRefs = new Map<string, IssueRef>()
+  // Relayfile matches subscription IDs server-side. This direct index means a
+  // delivery claim never requires the legacy local repo/PR scan to find an
+  // owning babysitter.
+  readonly #babysitterSubscriptionOwners = new Map<string, string>()
+  #babysitterResourceSubscriptionFault = false
+  #babysitterResourceSubscriptionUnavailable = false
+  #babysitterResourceDeliveryRetryTimer?: ReturnType<typeof setTimeout>
+  #babysitterResourceSubscriptionRenewTimer?: ReturnType<typeof setTimeout>
   readonly #babysitterReady = new Set<string>()
   readonly #babysitterWakeStates = new Map<string, BabysitterWakeState>()
   // A babysitter announces this fence before invoking destructive git tooling
@@ -463,6 +508,8 @@ export class FactoryLoop implements Factory {
   // is active, but the PTY submit must never land in that critical window.
   readonly #babysitterCriticalAgents = new Set<string>()
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
+  readonly #previewReferences = new Map<string, PreviewReference[]>()
+  readonly #removedPreviewIds = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
@@ -503,6 +550,17 @@ export class FactoryLoop implements Factory {
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
+    this.#verificationGate = ports.verificationGate ?? (config.verification.enabled
+      ? new VerificationPipeline({
+          descriptorPath: config.verification.descriptorPath,
+          reporter: ports.reporter,
+          logger: ports.logger,
+          maxConcurrentEnvironments: config.verification.maxConcurrentEnvironments,
+          maxRunTimeoutMs: config.verification.maxRunTimeoutMs,
+          maxEnvironmentTtlMs: config.verification.maxEnvironmentTtlMs,
+          maxTeardownTimeoutMs: config.verification.maxTeardownTimeoutMs,
+        })
+      : undefined)
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
     this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
@@ -726,12 +784,14 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
+      if (opts.mode !== 'dispatch-owner') await this.#reapOrphanedWorktreesOnStartup(legacyRegistry)
       if (this.#config.babysitter.enabled) {
         // Re-run the idempotent receipt fold after adoption returns. This
         // catches records restored by lifecycle work that completed while the
         // startup roster drain was in progress.
         await this.#reconcileRestoredBabysitterReceipts()
       }
+      await this.#reapPreviewOrphans()
     } catch (error) {
       this.#startupAgentAdoptionActive = false
       if (live) await this.#stopLiveHeartbeat('stopping')
@@ -740,6 +800,7 @@ export class FactoryLoop implements Factory {
 
     if (opts.mode === 'dispatch-owner') {
       this.#started = true
+      this.#schedulePreviewSweep()
       this.#scheduleDispatchLifecycleRenewal()
       // A replacement one-shot owner must also recover a team parked for
       // human input; it intentionally does not subscribe to the full issue
@@ -752,6 +813,7 @@ export class FactoryLoop implements Factory {
 
     if (live) {
       this.#started = true
+      this.#schedulePreviewSweep()
       try {
         await this.#startLiveSubscription(issueSource, opts.liveSubscription)
         await this.#rearmSlackReplyWatchers()
@@ -791,6 +853,7 @@ export class FactoryLoop implements Factory {
       void this.#handleChange(path)
     })
     this.#started = true
+    this.#schedulePreviewSweep()
     await this.#rearmSlackReplyWatchers()
     await this.#drainReadyClarificationWake()
     await this.#rearmGithubIssueCommentWatchers()
@@ -800,6 +863,10 @@ export class FactoryLoop implements Factory {
   async stop(): Promise<void> {
     this.#started = false
     this.#stopping = true
+    if (this.#babysitterResourceDeliveryRetryTimer) clearTimeout(this.#babysitterResourceDeliveryRetryTimer)
+    this.#babysitterResourceDeliveryRetryTimer = undefined
+    if (this.#babysitterResourceSubscriptionRenewTimer) clearTimeout(this.#babysitterResourceSubscriptionRenewTimer)
+    this.#babysitterResourceSubscriptionRenewTimer = undefined
     if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
@@ -808,6 +875,9 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
+    if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
+    this.#previewSweepTimer = undefined
+    await this.#previewSweepInFlight
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
       // Relinquish durable ownership before waiting on mount-backed lifecycle
@@ -847,6 +917,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
+      this.#babysitterSubscriptionOwners.clear()
       this.#babysitterReady.clear()
       this.#babysitterCriticalAgents.clear()
       const subscription = this.#subscription
@@ -2395,9 +2466,6 @@ export class FactoryLoop implements Factory {
       }
     }
     this.#clearDependencyPark(batch, dispatchDecision.issue)
-    // Full task rendering is part of the durable spawn specification. It must
-    // happen before a remote lifecycle is first claimed so takeover cannot
-    // recover a persisted minimal triage task after a crash in this gap.
     const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
     // ones. Without it, every worker starts in the configured shared checkout
@@ -2409,10 +2477,17 @@ export class FactoryLoop implements Factory {
         isolateLocalWorktree,
       })
     }
+    // Full task rendering is part of the durable spawn specification. It must
+    // happen before a remote lifecycle is first claimed so takeover cannot
+    // recover a persisted minimal triage task after a crash in this gap. The
+    // task is rendered again below after preview provisioning adds its URL.
     dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
+    let claimedLifecycle: DispatchLifecycle | undefined
+    let recoveredRecord: InFlightIssue | undefined
     if (durableDispatch) {
       const lifecycleClaim = await this.#claimDispatchLifecycle(dispatchDecision, dryRun, lifecycleRunId)
       this.#consumePendingDispatchClarifications(dispatchDecision.issue)
+      claimedLifecycle = lifecycleClaim.lifecycle
       dispatchDecision = structuredClone(lifecycleClaim.lifecycle.decision)
       if (lifecycleClaim.lifecycle.phase === 'waiting-for-human') {
         return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
@@ -2430,14 +2505,71 @@ export class FactoryLoop implements Factory {
         }
       }
       if (!lifecycleClaim.created) {
-        const restored = batch.restore(inFlightRecordFromLifecycle(lifecycleClaim.lifecycle))
-        if (restored.result) return restored.result
+        recoveredRecord = inFlightRecordFromLifecycle(lifecycleClaim.lifecycle)
+        if (recoveredRecord.result) return recoveredRecord.result
       }
+    }
+
+    // External preview creation must happen only after the durable lease is
+    // acquired and capacity admission has promoted the lifecycle. Persist the
+    // fully rendered, preview-bearing decision before any worker can spawn so
+    // takeover never recovers a minimal triage task.
+    const previouslyPersistedPreviewIds = new Set(
+      dispatchSpecs(dispatchDecision).map((spec) => spec.preview?.id).filter((id): id is string => Boolean(id)),
+    )
+    try {
+      if (!dryRun) {
+        dispatchDecision = await this.#withPreviewReferences(dispatchDecision)
+      }
+      dispatchDecision = await this.#withRenderedDispatchTasks(dispatchDecision, liveIssue)
+      if (durableDispatch && claimedLifecycle) {
+        const stagedRecord = inFlightRecordFromLifecycle({
+          ...claimedLifecycle,
+          decision: structuredClone(dispatchDecision),
+        })
+        if (!await this.#saveDispatchLifecycle(stagedRecord, 'dispatching')) {
+          throw new Error(`Dispatch lifecycle ownership lost before spawning ${dispatchDecision.issue.key}`)
+        }
+        if (recoveredRecord) {
+          recoveredRecord.decision = structuredClone(dispatchDecision)
+          recoveredRecord = batch.restore(recoveredRecord)
+        }
+      }
+    } catch (error) {
+      const newlyCreated = uniquePreviewReferences(
+        [
+          ...dispatchSpecs(dispatchDecision).map((spec) => spec.preview),
+          ...(this.#previewReferences.get(issueKey(dispatchDecision.issue)) ?? []),
+        ],
+      ).filter((preview) => !previouslyPersistedPreviewIds.has(preview.id))
+      // Once the durable fence is lost, the successor may already have
+      // adopted this deterministic issue preview. Leave cleanup to the
+      // identity-aware sweep instead of letting a stale owner tear down the
+      // successor's route.
+      const mayRollback = !claimedLifecycle ||
+        await this.#assertIssueDispatchLifecycleOwner(dispatchDecision.issue)
+      if (newlyCreated.length > 0 && mayRollback) {
+        await this.#teardownPreviewReferences(newlyCreated).catch((cleanupError) => {
+          this.#logger.warn?.('[factory] failed to roll back preview provisioning', {
+            issue: dispatchDecision.issue.key,
+            error: describeError(cleanupError).errorMessage,
+          })
+        })
+      }
+      if (mayRollback) this.#previewReferences.delete(issueKey(dispatchDecision.issue))
+      if (claimedLifecycle) {
+        this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claimedLifecycle))
+      }
+      throw error
     }
     if (!durableDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
     await this.#recordDispatchAttempt(dispatchDecision.issue)
-    const record = batch.start(dispatchDecision, dryRun, dependencyAdmission)
+    const record = recoveredRecord ?? batch.start(dispatchDecision, dryRun, dependencyAdmission)
     if (!record) {
+      if (!dryRun) {
+        await this.#teardownPreviewReferences(dispatchSpecs(dispatchDecision).map((spec) => spec.preview))
+        this.#previewReferences.delete(issueKey(dispatchDecision.issue))
+      }
       await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
@@ -2447,7 +2579,9 @@ export class FactoryLoop implements Factory {
     if (record.result) {
       return record.result
     }
-    await this.#saveDispatchLifecycle(record, 'dispatching')
+    if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+      throw new Error(`Dispatch lifecycle ownership lost immediately before spawning ${dispatchDecision.issue.key}`)
+    }
     if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
@@ -2502,6 +2636,9 @@ export class FactoryLoop implements Factory {
         agents,
         comments: [comment],
         stateId: implementingStateId,
+        ...(this.#previewReferences.get(issueKey(dispatchDecision.issue))?.length
+          ? { previews: this.#previewReferences.get(issueKey(dispatchDecision.issue)) }
+          : {}),
         dryRun,
       }
       record.result = result
@@ -2521,6 +2658,21 @@ export class FactoryLoop implements Factory {
       const liveStateChanged = error instanceof LiveDispatchStateChangedError
       const cancellationReason = factoryCloudDispatchCancellationReason(error)
       const cleanupReason = liveStateChanged ? 'live dispatch state changed' : 'dispatch failed'
+      let failedState: { terminal: boolean } | undefined
+      if (!liveStateChanged) {
+        await this.#recordDispatchFailure(decision.issue)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+      }
+      const terminalFailure = liveStateChanged || Boolean(failedState?.terminal)
+      if (terminalFailure && !await this.#saveDispatchLifecycle(
+        record,
+        'abandoning',
+        undefined,
+        cleanupReason,
+        new Set(),
+        { cancellationReason },
+      )) throw error
+
       let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs, cleanupReason)
       if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
         const failed = await this.#releaseAndTerminateAgents(
@@ -2538,29 +2690,42 @@ export class FactoryLoop implements Factory {
           worktreesTornDown = failureHandoffs.length > 0
         }
       }
-      let failedState: { terminal: boolean } | undefined
-      if (liveStateChanged) {
-        await this.#clearDispatchInFlight(decision.issue)
-        await this.#saveDispatchLifecycle(
+      if (terminalFailure) {
+        try {
+          await this.#teardownPreviews(record)
+        } catch (previewError) {
+          this.#logger.warn?.('[factory] failed to tear down previews after terminal dispatch failure', {
+            issue: record.issue.key,
+            error: describeError(previewError).errorMessage,
+          })
+          // Do not commit a terminal lifecycle while an externally reachable
+          // preview remains. The abandonment driver retries the identity-
+          // checked teardown and commits terminal state only after it succeeds.
+          this.#scheduleAbandonedDispatchRetry(record, cleanupReason)
+          if (!liveStateChanged) this.#error(error, decision.issue)
+          if (worktreesTornDown) {
+            await this.#writeInFlightRegistry().catch((registryError) => {
+              this.#logger.warn?.('[factory] failed to rewrite registry after dispatch worktree teardown', {
+                issue: record.issue,
+                error: describeError(registryError).errorMessage,
+              })
+            })
+          }
+          throw error
+        }
+        if (!await this.#saveDispatchLifecycle(
           record,
           'abandoned',
           undefined,
           undefined,
           new Set(),
           { cancellationReason },
-        )
-        this.#increment('dispatchLiveStateRaces')
+        )) throw error
+        if (liveStateChanged) await this.#clearDispatchInFlight(decision.issue)
+        else await this.#recordDispatchTerminal(decision.issue)
+        if (liveStateChanged) this.#increment('dispatchLiveStateRaces')
       } else {
-        await this.#recordDispatchFailure(decision.issue)
-        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-        await this.#saveDispatchLifecycle(
-          record,
-          failedState?.terminal ? 'abandoned' : 'retryable',
-          undefined,
-          undefined,
-          new Set(),
-          { cancellationReason: failedState?.terminal ? cancellationReason : undefined },
-        )
+        if (!await this.#saveDispatchLifecycle(record, 'retryable')) throw error
       }
       batch.abandon(decision.issue)
       if (!liveStateChanged && !failedState?.terminal) this.#scheduleDispatchLifecycleRetry(record)
@@ -2697,6 +2862,11 @@ export class FactoryLoop implements Factory {
       })
       for (const [key, lifecycle] of durableLifecycles) {
         if (isTerminalDispatchLifecycle(lifecycle)) continue
+        const previews = uniquePreviewReferences([
+          ...dispatchSpecs(lifecycle.decision).map((spec) => spec.preview),
+          ...lifecycle.agents.map((agent) => agent.tracked.spec.preview),
+        ])
+        if (previews.length > 0) this.#previewReferences.set(issueKey(lifecycle.issue), previews)
         hasNonterminalDurableLifecycle = true
         const claim = await this.#state.claimDispatchLifecycle(
           this.#workspaceId,
@@ -2716,6 +2886,36 @@ export class FactoryLoop implements Factory {
         this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
+        if (
+          !durableRecord.dryRun &&
+          claim.lifecycle.phase !== 'writeback-applied' &&
+          claim.lifecycle.phase !== 'releasing'
+        ) {
+          const liveIssue = await this.#readIssue(durableRecord.issue.path)
+          // A babysat Linear issue already at Done may have merged while this
+          // process was down. Let authoritative PR restoration drive the
+          // normal `complete` path so merged work is not mislabeled abandoned.
+          const deferDoneToBabysitterRecovery = Boolean(
+            liveIssue &&
+            !isGithubIssue(liveIssue) &&
+            this.#states.roleOf(liveIssue.stateId) === 'done' &&
+            this.#config.babysitter.enabled &&
+            await this.#hasRestorableMergedBabysitterSession(durableRecord.issue),
+          )
+          if (liveIssue && this.#isIssueExternallyTerminal(liveIssue) && !deferDoneToBabysitterRecovery) {
+            const restored = batch.restore(durableRecord)
+            try {
+              await this.#abandonDurableResume(restored, 'source issue is already terminal during startup recovery')
+            } catch (error) {
+              this.#logger.warn?.('[factory] terminal source preview cleanup will retry after startup', {
+                issue: durableRecord.issue.key,
+                error: describeError(error).errorMessage,
+              })
+              this.#scheduleDispatchLifecycleRetry(restored)
+            }
+            continue
+          }
+        }
         const restored = claim.lifecycle.phase === 'queued' || claim.lifecycle.phase === 'releasing'
           ? durableRecord
           : batch.restore(durableRecord)
@@ -3331,6 +3531,14 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    if (lifecycle.phase === 'running' && !record.dryRun) {
+      const liveIssue = await this.#readIssue(record.issue.path)
+      if (liveIssue && this.#isIssueExternallyTerminal(liveIssue)) {
+        await this.#abandonDurableResume(record, 'source issue became terminal before lifecycle cleanup')
+        return
+      }
+    }
+
     if (acquiredNow && lifecycle.phase === 'running') {
       if (this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(lifecycle.agents.map((agent) => ({
@@ -3350,6 +3558,10 @@ export class FactoryLoop implements Factory {
         throw new Error(`durable dispatch ${record.issue.key} has no clarification to finish parking`)
       }
       await this.#finishClarificationPark(waiting, true)
+      return
+    }
+    if (lifecycle.phase === 'abandoning') {
+      await this.#abandonStuckDispatch(record, lifecycle.releaseReason ?? 'dispatch failed')
       return
     }
     if (lifecycle.phase === 'dispatching' || lifecycle.phase === 'retryable') {
@@ -3407,14 +3619,41 @@ export class FactoryLoop implements Factory {
   }
 
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
+    let liveIssue: LinearIssue | undefined
     if (!record.dryRun) {
-      const issue = await this.#readIssue(record.issue.path)
-      if (!issue) {
+      liveIssue = await this.#readIssue(record.issue.path)
+      if (!liveIssue) {
         throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
       }
-      if (isGithubIssue(issue) && !this.#isGithubIssueResumable(issue)) {
-        await this.#abandonDurableResume(record, 'live GitHub issue is closed or no longer ready-for-agent')
+      if (this.#isIssueExternallyTerminal(liveIssue)) {
+        await this.#abandonDurableResume(record, 'live source issue is already terminal')
         return
+      }
+
+      const persistedPreviewIds = new Set(
+        dispatchSpecs(record.decision).map((spec) => spec.preview?.id).filter((id): id is string => Boolean(id)),
+      )
+      try {
+        record.decision = await this.#withPreviewReferences(record.decision)
+        record.decision = await this.#withRenderedDispatchTasks(record.decision, liveIssue)
+        if (!await this.#saveDispatchLifecycle(record, 'dispatching')) return
+      } catch (error) {
+        const newlyCreated = uniquePreviewReferences(
+          [
+            ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+            ...(this.#previewReferences.get(issueKey(record.issue)) ?? []),
+          ],
+        ).filter((preview) => !persistedPreviewIds.has(preview.id))
+        const mayRollback = await this.#assertDispatchLifecycleOwner(record)
+        if (newlyCreated.length > 0 && mayRollback) {
+          await this.#teardownPreviewReferences(newlyCreated).catch((cleanupError) => {
+            this.#logger.warn?.('[factory] failed to roll back recovered preview provisioning', {
+              issue: record.issue.key,
+              error: describeError(cleanupError).errorMessage,
+            })
+          })
+        }
+        throw error
       }
     }
     const agents: DispatchResult['agents'] = []
@@ -3431,7 +3670,7 @@ export class FactoryLoop implements Factory {
     }
     await this.#writeInFlightRegistry()
     if (!record.dryRun) {
-      const issue = await this.#readIssue(record.issue.path)
+      const issue = liveIssue ?? await this.#readIssue(record.issue.path)
       if (!issue) throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
       await this.#ensureGithubAgentQuestionWatch(record, issue)
       if (isGithubIssue(issue)) {
@@ -3440,14 +3679,23 @@ export class FactoryLoop implements Factory {
         await this.#linear.setState(issue, this.#states.idFor(issue.team, 'agentImplementing'))
       }
     }
+    const recoveredPreviews = uniquePreviewReferences([
+      ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+      ...[...record.agents.values()].map((tracked) => tracked.spec.preview),
+    ])
     record.result ??= {
       issue: record.issue,
       agents,
       comments: [dispatchComment(record.decision, agents)],
+      ...(recoveredPreviews.length > 0 ? { previews: recoveredPreviews } : {}),
       dryRun: record.dryRun,
+    }
+    if (recoveredPreviews.length > 0 && !record.result.previews?.length) {
+      record.result = { ...record.result, previews: recoveredPreviews }
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
     if (!record.dryRun) {
+      await this.#ensureSlackDispatchThread(record, record.result)
       for (const tracked of record.agents.values()) {
         const owned = tracked.spec.ownedPullRequest
         if (tracked.spec.role !== 'babysitter' || !owned) continue
@@ -3471,6 +3719,34 @@ export class FactoryLoop implements Factory {
       !labels.has('factory:human-review')
   }
 
+  #isIssueExternallyTerminal(issue: LinearIssue): boolean {
+    if (isGithubIssue(issue)) {
+      if (githubFactoryIssueIsClosed(issue)) return true
+      return issue.labels.some((label) => label.trim().toLowerCase() === 'factory:human-review')
+    }
+    const role = this.#states.roleOf(issue.stateId)
+    return role === 'humanReview' || role === 'done'
+  }
+
+  async #hasRestorableMergedBabysitterSession(issue: IssueRef): Promise<boolean> {
+    const wanted = issueKey(issue)
+    for (const [, session] of await this.#state.listBabysitterSessions(this.#workspaceId)) {
+      if (
+        issueKey(session.issue) !== wanted ||
+        !validGithubRepo(session.repo) ||
+        !validPrNumber(session.prNumber) ||
+        !session.agentName
+      ) continue
+      const snapshot = await this.#readPrSnapshot(session)
+      if (
+        snapshot &&
+        prMetaShowsMerged(snapshot) &&
+        prSnapshotIssueMatchScore(snapshot, session.issue.key) >= 30
+      ) return true
+    }
+    return false
+  }
+
   async #abandonDurableResume(record: InFlightIssue, reason: string): Promise<void> {
     const handoffs = this.#dispatchFailureHandoffs(record, [...record.agents].map(([name, tracked]) => ({
       issue: record.issue,
@@ -3479,6 +3755,31 @@ export class FactoryLoop implements Factory {
       persistedAtMs: this.#clock.now(),
     })))
     await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    // Keep the lifecycle nonterminal until every externally reachable route
+    // is confirmed gone. A restart can then retry cleanup instead of treating
+    // an abandoned row as finished and leaking its issue preview forever.
+    await this.#teardownPreviews(record)
+    if (handoffs.some((handoff) => handoff.worktree)) {
+      if (!await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')) {
+        throw new Error(`Unable to finish stale dispatch worktree teardown for ${record.issue.key}`)
+      }
+    } else if (handoffs.length > 0) {
+      const failed = new Set(await this.#releaseAndTerminateAgents(
+        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+        'live dispatch state changed',
+        'completion',
+      ))
+      if (failed.size > 0) {
+        throw new Error(`Unable to release stale dispatch agents for ${record.issue.key}: ${[...failed].join(', ')}`)
+      }
+      for (const handoff of handoffs) {
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
+
     if (!await this.#saveDispatchLifecycle(
       record,
       'abandoned',
@@ -3488,30 +3789,12 @@ export class FactoryLoop implements Factory {
       { cancellationReason: 'source_state_changed' },
     )) return
 
-    await this.#clearDispatchInFlight(record.issue)
+    await this.#recordDispatchTerminal(record.issue)
     const batch = await this.#batch()
     batch.abandon(record.issue)
     for (const [name] of record.agents) {
       this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
     }
-
-    if (handoffs.some((handoff) => handoff.worktree)) {
-      await this.#teardownFailedDispatchWorktrees(handoffs, 'live dispatch state changed')
-    } else if (handoffs.length > 0) {
-      const failed = new Set(await this.#releaseAndTerminateAgents(
-        handoffs.map((handoff) => [handoff.name, handoff.tracked]),
-        'live dispatch state changed',
-        'completion',
-      ))
-      for (const handoff of handoffs) {
-        if (failed.has(handoff.name)) continue
-        await this.#state.clearFailureHandoff(
-          this.#workspaceId,
-          registryHandoffKey(handoff.issue, handoff.name),
-        )
-      }
-    }
-
     await this.#stopSlackWatcher(record.issue)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
@@ -3527,6 +3810,15 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
     const releaseKey = issueKey(record.issue)
+    // Terminal writeback has already been acknowledged before this method is
+    // entered. Remove externally reachable routes first so a stuck agent
+    // release cannot leave a preview live after Human Review or Done.
+    try {
+      await this.#teardownPreviews(record)
+    } catch {
+      this.#scheduleReleaseRetry(record, reason)
+      return false
+    }
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, releaseKey)
     const released = new Set(lifecycle?.agents
       .filter((agent) => agent.releasedAtMs !== undefined)
@@ -5517,7 +5809,7 @@ export class FactoryLoop implements Factory {
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
       baseRef,
       title: `${issue.key}: ${issue.title}`,
-      body: githubPullRequestBody(issue),
+      body: githubPullRequestBody(issue, implementer.spec.preview),
     })
     const published = result.author
       ? result
@@ -5710,9 +6002,41 @@ export class FactoryLoop implements Factory {
       const worktree = this.#agentWorktree(record, tracked.spec)
       if (worktree) unique.set(worktree.worktreePath, worktree)
     }
+    const issueSlug = factoryWorktreeIssueSlug(record.issue.key)
     const failures: string[] = []
+    for (const repository of this.#worktreeRepositories(record)) {
+      try {
+        const candidates = await this.#worktrees.listWorktrees(repository)
+        for (const candidate of candidates) {
+          if (factoryWorktreeIssueSlug(candidate.issueKey) === issueSlug) {
+            unique.set(candidate.worktreePath, candidate)
+          }
+        }
+      } catch (error) {
+        const message = `${repository.baseClonePath}: ${describeError(error).errorMessage}`
+        failures.push(message)
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] failed to enumerate completed issue worktrees', {
+          issue: record.issue.key,
+          repo: repository.repo,
+          baseClonePath: repository.baseClonePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
     for (const worktree of unique.values()) {
       try {
+        const inspection = await this.#worktrees.inspectForCleanup(worktree)
+        if (inspection.retentionReasons.length > 0) {
+          this.#increment('agentWorktreeCleanupRetained')
+          this.#logger.warn?.('[factory] retained completed issue worktree with local state', {
+            issue: record.issue.key,
+            repo: worktree.repo,
+            worktreePath: worktree.worktreePath,
+            retentionReasons: inspection.retentionReasons,
+          })
+          continue
+        }
         await this.#worktrees.cleanup(worktree)
         this.#increment('agentWorktreesCleaned')
       } catch (error) {
@@ -5729,6 +6053,132 @@ export class FactoryLoop implements Factory {
     if (failures.length > 0) {
       throw new Error(`Factory worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
     }
+  }
+
+  #worktreeRepositories(record?: InFlightIssue): AgentWorktreeRepository[] {
+    const repositories = new Map<string, AgentWorktreeRepository>()
+    const add = (repo: string, baseClonePath: string | undefined): void => {
+      if (!baseClonePath) return
+      const key = `${repo}\u0000${resolve(baseClonePath)}`
+      repositories.set(key, { repo, baseClonePath })
+    }
+
+    if (record) {
+      for (const route of record.decision.routes) {
+        add(route.repo, this.#config.repos.clonePaths[route.repo] ?? route.clonePath)
+      }
+      for (const tracked of record.agents.values()) {
+        add(tracked.spec.repo, tracked.spec.baseClonePath)
+      }
+      for (const spec of record.decision.implementers) {
+        add(spec.repo, spec.baseClonePath)
+      }
+    } else {
+      for (const [repo, baseClonePath] of Object.entries(this.#config.repos.clonePaths)) {
+        add(repo, baseClonePath)
+      }
+    }
+    return [...repositories.values()]
+  }
+
+  async #reapOrphanedWorktreesOnStartup(legacyRegistry?: FactoryInFlightRegistry): Promise<void> {
+    if (!this.#worktrees) return
+    const legacyAgents = (legacyRegistry?.agents ?? []).filter((agent) => agent.issue)
+    let durableLifecycles: Array<[string, DispatchLifecycle]>
+    let waitingClarifications: Array<[string, WaitingClarification]>
+    let onlineAgentNames: Set<string>
+    try {
+      const [lifecycles, clarifications, roster] = await Promise.all([
+        this.#state.listDispatchLifecycles(this.#workspaceId),
+        this.#state.listWaitingClarifications(this.#workspaceId),
+        legacyAgents.length > 0 ? this.#fleet.roster() : undefined,
+      ])
+      durableLifecycles = lifecycles
+      waitingClarifications = clarifications
+      onlineAgentNames = new Set((roster?.agents ?? []).map((agent) => agent.name))
+    } catch (error) {
+      this.#increment('agentWorktreeCleanupFailures')
+      this.#logger.warn?.('[factory] startup worktree reaper skipped because active lifecycle or roster state could not be loaded', {
+        error: describeError(error).errorMessage,
+      })
+      return
+    }
+    const activeIssueSlugs = new Set((await this.#batch()).inFlight.map((record) =>
+      factoryWorktreeIssueSlug(record.issue.key)))
+    for (const [, lifecycle] of durableLifecycles) {
+      if (!isTerminalDispatchLifecycle(lifecycle)) {
+        activeIssueSlugs.add(factoryWorktreeIssueSlug(lifecycle.issue.key))
+      }
+    }
+    for (const [, waiting] of waitingClarifications) {
+      activeIssueSlugs.add(factoryWorktreeIssueSlug(waiting.issue.key))
+    }
+    for (const agent of legacyAgents) {
+      if (agent.issue && onlineAgentNames.has(agent.name)) {
+        activeIssueSlugs.add(factoryWorktreeIssueSlug(agent.issue.key))
+      }
+    }
+    const candidates = new Map<string, AgentWorktree>()
+    let reaped = 0
+    let reclaimedBytes = 0
+    let retained = 0
+    let failures = 0
+
+    for (const repository of this.#worktreeRepositories()) {
+      try {
+        for (const candidate of await this.#worktrees.listWorktrees(repository)) {
+          candidates.set(candidate.worktreePath, candidate)
+        }
+      } catch (error) {
+        failures += 1
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] startup worktree reaper failed to enumerate repository', {
+          repo: repository.repo,
+          baseClonePath: repository.baseClonePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+
+    for (const worktree of candidates.values()) {
+      if (activeIssueSlugs.has(factoryWorktreeIssueSlug(worktree.issueKey))) continue
+      try {
+        const inspection = await this.#worktrees.inspectForCleanup(worktree)
+        if (inspection.retentionReasons.length > 0) {
+          retained += 1
+          this.#increment('agentWorktreeCleanupRetained')
+          this.#logger.warn?.('[factory] retained startup orphan worktree with local state', {
+            issue: worktree.issueKey,
+            repo: worktree.repo,
+            worktreePath: worktree.worktreePath,
+            retentionReasons: inspection.retentionReasons,
+          })
+          continue
+        }
+        await this.#worktrees.cleanup(worktree)
+        reaped += 1
+        reclaimedBytes += inspection.bytes
+        this.#increment('agentWorktreesCleaned')
+        this.#increment('agentWorktreesReapedOnStartup')
+      } catch (error) {
+        failures += 1
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] startup worktree reaper retained checkout after cleanup failure', {
+          issue: worktree.issueKey,
+          repo: worktree.repo,
+          worktreePath: worktree.worktreePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+
+    this.#logger.info?.('[factory] startup worktree reaper completed', {
+      reaped,
+      reclaimedBytes,
+      reclaimed: formatByteCount(reclaimedBytes),
+      retained,
+      failures,
+    })
   }
 
   async #confirmPublishedRemotePullRequest(
@@ -5890,6 +6340,34 @@ export class FactoryLoop implements Factory {
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
     const key = issueKey(record.issue)
     this.#abandonedDispatchReasons.set(key, reason)
+    if (!await this.#saveDispatchLifecycle(
+      record,
+      'abandoning',
+      undefined,
+      reason,
+      new Set(),
+      { cancellationReason: 'dispatch_failed' },
+    )) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      // The generic durable retry can recover the in-memory reason in this
+      // process; after restart the persisted `abandoning` phase is the fence.
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      return
+    }
+    try {
+      // Remove externally reachable routes before releasing the agents that
+      // could still be serving the upstream. A failed provider teardown keeps
+      // the durable lifecycle retryable instead of terminalizing a leak.
+      await this.#teardownPreviews(record)
+    } catch (error) {
+      this.#increment('abandonedDispatchReleaseRetries')
+      this.#logger.warn?.('[factory] abandoned dispatch preview teardown failed; retrying', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      return
+    }
     const agents = [...record.agents]
     for (const [agentName, tracked] of agents) {
       if (tracked.spec.role === 'implementer') continue
@@ -5921,16 +6399,20 @@ export class FactoryLoop implements Factory {
       return
     }
     // Batch completion alone only frees the process-local slot. Durable
-    // capacity is computed from lifecycle phases, so leaving this row in
-    // `publishing`/`running` makes every queued issue wait forever even though
-    // all agents and worktrees are already gone. Fence the terminal phase
-    // before promoting the next issue.
-    if (!await this.#saveDispatchLifecycle(record, 'abandoned', undefined, reason)) {
+    // capacity is computed from lifecycle phases, so commit the terminal phase
+    // only after the preview, agents, and worktrees have all been cleaned up.
+    if (!await this.#saveDispatchLifecycle(
+      record,
+      'abandoned',
+      undefined,
+      reason,
+      new Set(),
+      { cancellationReason: 'dispatch_failed' },
+    )) {
       this.#increment('abandonedDispatchReleaseRetries')
       // #saveDispatchLifecycle already schedules the generic durable retry. The
-      // pending reason makes that retry re-acquire ownership and return here,
-      // rather than merely restoring the old running lifecycle and leaking the
-      // slot. The abandoned-specific scheduler remains the non-durable fallback.
+      // pending reason makes an in-process retry return here, while the durable
+      // `abandoning` phase provides the same recovery guarantee after restart.
       this.#scheduleAbandonedDispatchRetry(record, reason)
       await this.#writeInFlightRegistry()
       return
@@ -7770,11 +8252,12 @@ export class FactoryLoop implements Factory {
     const integrationInstructions = await this.#resolveIntegrationInstructions()
     const render = async (spec: AgentSpec): Promise<AgentSpec> => {
       const route = routeForSpec(decision, spec)
+      const previewUrl = previewUrlFromSpec(spec)
       const testGuidance = await resolveTestGuidance({
         repoPath: route.clonePath,
         issue: templateIssue,
         route,
-        previewUrl: previewUrlFromSpec(spec),
+        previewUrl,
       })
       return {
         ...spec,
@@ -7791,6 +8274,11 @@ export class FactoryLoop implements Factory {
           branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
           branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
           agentName: spec.name,
+          ...(previewUrl ? {
+            previewUrl,
+            previewTargetPort: spec.preview?.targetPort,
+            previewStartCommand: spec.preview?.startCommand,
+          } : {}),
           ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
         }),
       }
@@ -7802,6 +8290,199 @@ export class FactoryLoop implements Factory {
       implementers: rendered.slice(0, decision.implementers.length),
       reviewer: rendered[decision.implementers.length]!,
     }
+  }
+
+  async #withPreviewReferences(decision: TriageDecision): Promise<TriageDecision> {
+    if (!this.#config.preview || decision.scope === 'workflow') return decision
+    if (!this.#fleet.createPreview) {
+      throw new Error('Preview services are configured but the selected fleet backend cannot create previews')
+    }
+
+    const owner = issueKey(decision.issue)
+    const byRepo = new Map<string, PreviewReference>()
+    for (const implementer of decision.implementers) {
+      const service = previewServiceForRepo(this.#config, implementer.repo)
+      if (byRepo.has(implementer.repo)) continue
+      const persisted = implementer.preview
+      if (!service) {
+        if (persisted) byRepo.set(implementer.repo, persisted)
+        continue
+      }
+      if (!implementer.clonePath) {
+        throw new Error(`Preview service ${service.name} requires a configured checkout for ${implementer.repo}`)
+      }
+      await this.#preparePreviewCheckout(decision, implementer)
+      const preview = await this.#fleet.createPreview({
+        namespace: this.#workspaceId,
+        owner,
+        issueKey: decision.issue.key,
+        service: service.name,
+        repo: implementer.repo,
+        targetPort: service.config.port,
+        preferredHttpsPort: service.config.httpsPort,
+        startCommand: service.config.startCommand,
+        checkoutPath: implementer.clonePath,
+        node: persisted?.node ?? implementer.node,
+      })
+      this.#removedPreviewIds.delete(preview.id)
+      byRepo.set(implementer.repo, preview)
+      // Make the provider identity visible immediately. If validation or the
+      // following durable save fails, the caller can roll it back while it
+      // still owns the lifecycle; after fence loss the startup sweep owns it.
+      this.#previewReferences.set(owner, [...byRepo.values()])
+      assertPublishablePreview(preview, {
+        namespace: this.#workspaceId,
+        owner,
+        service: service.name,
+        repo: implementer.repo,
+        targetPort: service.config.port,
+        portSpan: service.config.portSpan ?? 100,
+        preferredHttpsPort: service.config.httpsPort,
+        startCommand: service.config.startCommand,
+        checkoutPath: implementer.clonePath,
+        requireNode: this.#fleet.placementLocality === 'remote',
+      })
+    }
+
+    this.#previewReferences.set(owner, [...byRepo.values()])
+    return {
+      ...decision,
+      implementers: decision.implementers.map((spec) => specWithPreview(spec, byRepo.get(spec.repo))),
+      reviewer: specWithPreview(decision.reviewer, byRepo.get(decision.reviewer.repo)),
+    }
+  }
+
+  async #preparePreviewCheckout(decision: TriageDecision, spec: AgentSpec): Promise<void> {
+    if (
+      !this.#worktrees ||
+      !spec.baseClonePath ||
+      !spec.clonePath ||
+      spec.baseClonePath === spec.clonePath ||
+      !spec.branch
+    ) return
+    try {
+      await this.#worktrees.prepare({
+        repo: spec.repo,
+        issueKey: decision.issue.key,
+        baseClonePath: spec.baseClonePath,
+        worktreePath: spec.clonePath,
+        branch: spec.branch,
+        ...(spec.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
+      })
+      this.#increment('agentWorktreesPrepared')
+    } catch (error) {
+      throw contextualError(
+        `Unable to prepare preview checkout for ${decision.issue.key}/${spec.repo} at ${spec.clonePath}`,
+        error,
+      )
+    }
+  }
+
+  async #teardownPreviews(record: InFlightIssue): Promise<void> {
+    const previews = uniquePreviewReferences([
+      ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+      ...[...record.agents.values()].map((tracked) => tracked.spec.preview),
+      ...(this.#previewReferences.get(issueKey(record.issue)) ?? []),
+    ])
+    if (previews.length === 0) return
+    await this.#teardownPreviewReferences(previews)
+    this.#previewReferences.delete(issueKey(record.issue))
+  }
+
+  async #teardownPreviewReferences(references: Array<PreviewReference | undefined>): Promise<void> {
+    const previews = uniquePreviewReferences(references)
+      .filter((preview) => !this.#removedPreviewIds.has(preview.id))
+    if (previews.length === 0) return
+    if (!this.#fleet.removePreview) {
+      throw new Error('Fleet backend cannot remove its configured previews')
+    }
+    const results = await Promise.allSettled(previews.map(async (preview) =>
+      await this.#fleet.removePreview!(preview),
+    ))
+    const failures = results.flatMap((result, index) => {
+      const preview = previews[index]!
+      if (result.status === 'rejected') return [{ preview, reason: result.reason }]
+      if (!result.value) {
+        return [{
+          preview,
+          reason: new Error(`Preview provider could not confirm removal of ${preview.id}`),
+        }]
+      }
+      this.#removedPreviewIds.add(preview.id)
+      return []
+    })
+    if (failures.length > 0) {
+      this.#logger.warn?.('[factory] preview teardown failed', {
+        owners: [...new Set(failures.map(({ preview }) => preview.owner))],
+        previews: failures.map(({ preview }) => preview.id),
+      })
+      throw new AggregateError(failures.map(({ reason }) => reason), 'Unable to tear down every issue preview')
+    }
+  }
+
+  async #reapPreviewOrphans(): Promise<void> {
+    if (!this.#config.preview || !this.#fleet.reapPreviews) return
+    const [lifecycles, batch] = await Promise.all([
+      this.#state.listDispatchLifecycles(this.#workspaceId),
+      this.#batch(),
+    ])
+    const activePreviewIds = new Set<string>()
+    const activeOwners = new Set(
+      lifecycles
+        .map(([, lifecycle]) => lifecycle)
+        .filter((lifecycle) => !isTerminalDispatchLifecycle(lifecycle))
+        .map((lifecycle) => {
+          for (const preview of uniquePreviewReferences([
+            ...dispatchSpecs(lifecycle.decision).map((spec) => spec.preview),
+            ...lifecycle.agents.map((agent) => agent.tracked.spec.preview),
+          ])) activePreviewIds.add(preview.id)
+          return issueKey(lifecycle.issue)
+        }),
+    )
+    for (const record of batch.inFlight) {
+      activeOwners.add(issueKey(record.issue))
+      for (const preview of uniquePreviewReferences([
+        ...dispatchSpecs(record.decision).map((spec) => spec.preview),
+        ...[...record.agents.values()].map((tracked) => tracked.spec.preview),
+      ])) activePreviewIds.add(preview.id)
+    }
+    const report = await this.#fleet.reapPreviews({
+      namespace: this.#workspaceId,
+      activeOwners: [...activeOwners],
+      activePreviewIds: [...activePreviewIds],
+    })
+    if (report.reaped.length > 0 || report.skipped.length > 0) {
+      this.#logger.info?.('[factory] preview orphan sweep completed', {
+        reaped: report.reaped.map((preview) => preview.id),
+        skipped: report.skipped,
+      })
+    }
+  }
+
+  #schedulePreviewSweep(delayMs = PREVIEW_SWEEP_INTERVAL_MS): void {
+    if (
+      this.#stopping ||
+      !this.#started ||
+      !this.#config.preview ||
+      !this.#fleet.reapPreviews ||
+      this.#previewSweepTimer ||
+      this.#previewSweepInFlight
+    ) return
+    this.#previewSweepTimer = setTimeout(() => {
+      this.#previewSweepTimer = undefined
+      if (this.#stopping || !this.#started) return
+      this.#previewSweepInFlight = this.#reapPreviewOrphans()
+        .catch((error) => {
+          this.#logger.warn?.('[factory] periodic preview orphan sweep failed', {
+            error: describeError(error).errorMessage,
+          })
+        })
+        .finally(() => {
+          this.#previewSweepInFlight = undefined
+          this.#schedulePreviewSweep()
+        })
+    }, delayMs)
+    this.#previewSweepTimer.unref?.()
   }
 
   #consumePendingDispatchClarifications(issue: IssueRef): void {
@@ -7940,8 +8621,13 @@ export class FactoryLoop implements Factory {
         prNumber: session.prNumber,
         path: session.path,
         agentName: session.agentName,
+        resourceSubscription: session.resourceSubscription,
+        pendingDeliveryClaims: session.pendingDeliveryClaims,
       }
       this.#babysitterPr.set(ownershipKey, ref)
+      if (ref.resourceSubscription) {
+        this.#babysitterSubscriptionOwners.set(ref.resourceSubscription.subscriptionId, ownershipKey)
+      }
       this.#babysitterIssueRefs.set(ownershipKey, { ...session.issue })
       this.#babysitterSpawned.add(ownershipKey)
       if (session.critical) this.#babysitterCriticalAgents.add(session.agentName)
@@ -7952,10 +8638,21 @@ export class FactoryLoop implements Factory {
       this.#increment('babysitterOwnershipRestored')
       const pendingKinds = session.pendingKinds.filter(isBabysitterWakeKind)
       if (pendingKinds.length > 0) {
-        await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked)
+        // A terminal marker can coexist with the one wake persisted before
+        // acknowledgement. Rehydrate that durable hand-off once, while later
+        // raw events remain quarantined by #queueBabysitterWake.
+        await this.#queueBabysitterWake(session.issue, ref, pendingKinds, tracked, { allowTerminal: true })
         this.#increment('babysitterPendingWakesRestored')
       }
+      await this.#ensureBabysitterResourceSubscription(session.issue, ref, tracked)
     }
+    // A crash after the local queue write but before (or just after) the
+    // remote acceptance leaves an ID in state. Accept is idempotent once the
+    // lease was accepted, so settle those durable hand-offs before claiming
+    // new work; lease expiry is retried below when a server has not released
+    // the original claim yet.
+    await this.#retryPendingBabysitterDeliveryAcceptances()
+    await this.#routeDurableBabysitterDeliveries()
   }
 
   async #reconcileRestoredBabysitterReceipts(onlyRecord?: InFlightIssue): Promise<void> {
@@ -8056,6 +8753,28 @@ export class FactoryLoop implements Factory {
       this.#babysitterWakeStates.delete(key)
       this.#babysitterCriticalAgents.delete(state.agentName)
     }
+    if (mayClearDurable && ref?.resourceSubscription) {
+      this.#babysitterSubscriptionOwners.delete(ref.resourceSubscription.subscriptionId)
+      const subscriptions = this.#mount.resourceSubscriptions
+      if (subscriptions) {
+        try {
+          await subscriptions.cancel(this.#workspaceId, {
+            subscriptionId: ref.resourceSubscription.subscriptionId,
+          })
+          this.#increment('babysitterResourceSubscriptionsCancelled')
+        } catch (error) {
+          // Cancellation is deliberately idempotent. A terminal acceptance may
+          // have retired this record already; an outage leaves the bounded TTL
+          // as the leak backstop and must not prevent local session cleanup.
+          this.#increment('babysitterResourceSubscriptionCancelFailures')
+          this.#logger.warn?.('[factory] could not cancel durable babysitter resource subscription', {
+            issue: issue?.key,
+            subscriptionId: ref.resourceSubscription.subscriptionId,
+            error: describeError(error).errorMessage,
+          })
+        }
+      }
+    }
     this.#babysitterPr.delete(ownershipKey)
     this.#babysitterIssueRefs.delete(ownershipKey)
     this.#babysitterSpawned.delete(ownershipKey)
@@ -8071,7 +8790,331 @@ export class FactoryLoop implements Factory {
     await Promise.all(keys.map(async (key) => this.#cancelBabysitterWake(key)))
   }
 
+  async #ensureBabysitterResourceSubscription(
+    issue: IssueRef,
+    ref: BabysitterPrRef,
+    tracked?: TrackedAgent,
+  ): Promise<void> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions || !ref.agentName || !await this.#assertIssueDispatchLifecycleOwner(issue)) return
+    // A terminal claim is persisted before Relayfile acceptance so a crash in
+    // that gap can never renew a retired record into a fresh generation.
+    if (ref.resourceSubscription?.terminal) return
+
+    const resourceRef = babysitterResourceRef(ref.repo, ref.prNumber)
+    const subscriberId = babysitterSubscriberId(issue)
+    try {
+      const subscription = await subscriptions.createOrRenew(this.#workspaceId, {
+        provider: 'github',
+        resourceRef,
+        eventTypes: [...BABYSITTER_SUBSCRIPTION_EVENT_TYPES],
+        terminalEventTypes: [...BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES],
+        subscriberId,
+        ttlSeconds: BABYSITTER_SUBSCRIPTION_TTL_SECONDS,
+      })
+      if (
+        !subscription.subscriptionId ||
+        subscription.provider !== 'github' ||
+        subscription.resourceRef !== resourceRef ||
+        subscription.subscriberId !== subscriberId ||
+        !subscription.ownerId ||
+        !subscription.expiresAt ||
+        !subscription.terminalEventTypes?.includes('pull_request.closed')
+      ) {
+        throw new Error('Relayfile returned an invalid durable resource subscription')
+      }
+      if (ref.resourceSubscription?.subscriptionId && ref.resourceSubscription.subscriptionId !== subscription.subscriptionId) {
+        this.#babysitterSubscriptionOwners.delete(ref.resourceSubscription.subscriptionId)
+      }
+      ref.resourceSubscription = {
+        subscriptionId: subscription.subscriptionId,
+        provider: subscription.provider,
+        resourceRef: subscription.resourceRef,
+        subscriberId: subscription.subscriberId,
+        ownerId: subscription.ownerId,
+        expiresAt: subscription.expiresAt,
+      }
+      this.#babysitterSubscriptionOwners.set(
+        subscription.subscriptionId,
+        babysitterOwnershipKey(issue, ref),
+      )
+      await this.#persistBabysitterSession(issue, ref, tracked)
+      this.#babysitterResourceSubscriptionFault = false
+      this.#babysitterResourceSubscriptionUnavailable = false
+      this.#scheduleBabysitterResourceSubscriptionRenewal()
+      this.#increment('babysitterResourceSubscriptionsRenewed')
+    } catch (error) {
+      if (isResourceSubscriptionsUnavailable(error)) {
+        this.#babysitterResourceSubscriptionFault = false
+        this.#babysitterResourceSubscriptionUnavailable = true
+        this.#increment('babysitterResourceSubscriptionUnavailable')
+        return
+      }
+      this.#babysitterResourceSubscriptionFault = true
+      this.#scheduleDurableBabysitterDeliveryRetry()
+      this.#increment('babysitterResourceSubscriptionRenewFailures')
+      this.#logger.warn?.('[factory] could not create or renew durable babysitter resource subscription', {
+        issue: issue.key,
+        repo: ref.repo,
+        prNumber: ref.prNumber,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
+  async #routeDurableBabysitterDeliveries(): Promise<boolean> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions || !this.#config.babysitter.enabled || this.#stopping) return false
+    // Do not bypass the proven local router until every active babysitter has
+    // completed its own create/renew. This closes the rollout and transient
+    // provisioning gap without making a successful API response for some
+    // other subscription suppress an unregistered PR's wake.
+    if ([...this.#babysitterPr.values()].some((ref) => ref.agentName && !ref.resourceSubscription)) {
+      return false
+    }
+
+    let claims: Awaited<ReturnType<typeof subscriptions.claimDeliveryClaims>>
+    try {
+      claims = await subscriptions.claimDeliveryClaims(this.#workspaceId)
+    } catch (error) {
+      if (isResourceSubscriptionsUnavailable(error)) {
+        this.#babysitterResourceSubscriptionFault = false
+        this.#babysitterResourceSubscriptionUnavailable = true
+        this.#increment('babysitterResourceSubscriptionUnavailable')
+      } else {
+        this.#babysitterResourceSubscriptionFault = true
+        this.#scheduleDurableBabysitterDeliveryRetry()
+        this.#increment('babysitterResourceDeliveryLookupFailures')
+        this.#logger.warn?.('[factory] durable babysitter delivery-claim lookup failed; retaining durable delivery retry', {
+          error: describeError(error).errorMessage,
+        })
+      }
+      return !isResourceSubscriptionsUnavailable(error)
+    }
+    this.#babysitterResourceSubscriptionFault = false
+    this.#babysitterResourceSubscriptionUnavailable = false
+
+    for (const claim of claims) {
+      const issueIdentity = this.#babysitterSubscriptionOwners.get(claim.subscriptionId)
+      const issue = issueIdentity ? this.#babysitterIssueRefs.get(issueIdentity) : undefined
+      const ref = issueIdentity ? this.#babysitterPr.get(issueIdentity) : undefined
+      const subscription = ref?.resourceSubscription
+      if (
+        !issue ||
+        !ref ||
+        !subscription ||
+        subscription.subscriptionId !== claim.subscriptionId ||
+        subscription.provider !== claim.provider ||
+        subscription.resourceRef !== claim.resourceRef ||
+        subscription.subscriberId !== claim.subscriberId ||
+        subscription.ownerId !== claim.ownerId
+      ) {
+        // The service is owner-isolated, but Factory may have just retired a
+        // local owner. Never route a stale or other-session claim by resource.
+        this.#increment('babysitterResourceDeliveriesIgnoredUnowned')
+        continue
+      }
+      if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
+        this.#increment('babysitterResourceDeliveriesIgnoredNonOwner')
+        continue
+      }
+
+      // A terminal delivery may be reclaimed after a process crash before its
+      // remote acceptance. Only that already-persisted delivery may finish;
+      // no later claim is allowed to wake or re-open the retired session.
+      if (subscription.terminal && !ref.pendingDeliveryClaims?.some((pending) => pending.deliveryId === claim.deliveryId)) {
+        this.#increment('babysitterResourceDeliveriesIgnoredTerminal')
+        continue
+      }
+
+      const batch = await this.#batch()
+      const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+        ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        ?? durableBabysitterTrackedAgent({
+          issue,
+          repo: ref.repo,
+          prNumber: ref.prNumber,
+          path: ref.path,
+          agentName: ref.agentName,
+          critical: false,
+          pendingKinds: [],
+          resourceSubscription: subscription,
+          pendingDeliveryClaims: ref.pendingDeliveryClaims,
+        })
+
+      const pendingClaim = ref.pendingDeliveryClaims?.find((pending) => pending.deliveryId === claim.deliveryId)
+      const alreadyQueued = Boolean(pendingClaim)
+      if (!alreadyQueued) {
+        const queued = await this.#queueBabysitterWake(issue, ref, ['pull-request-state'], tracked)
+        if (!queued) continue
+      }
+      if (!pendingClaim || pendingClaim.claimToken !== claim.claimToken) {
+        ref.pendingDeliveryClaims = [
+          ...(ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId),
+          { deliveryId: claim.deliveryId, claimToken: claim.claimToken },
+        ]
+        // The claim lease joins Factory's durable pending-wake state before
+        // the external acceptance. A crash after this point can retry the
+        // exact hand-off without delivering the same wake a second time.
+        await this.#persistBabysitterSession(issue, ref, tracked)
+      }
+
+      try {
+        if (claim.terminal && !subscription.terminal) {
+          subscription.terminal = true
+          await this.#persistBabysitterSession(issue, ref, tracked)
+        }
+        const accepted = await subscriptions.acceptDelivery(this.#workspaceId, {
+          deliveryId: claim.deliveryId,
+          claimToken: claim.claimToken,
+        })
+        if (accepted.deliveryId !== claim.deliveryId || accepted.subscriptionId !== claim.subscriptionId) {
+          throw new Error('Relayfile accepted a different durable delivery claim')
+        }
+        if (accepted.terminal || claim.terminal) {
+          // Keep the terminal marker and subscription identity locally until
+          // normal PR/session teardown. That quarantines the babysitter from
+          // both legacy fallback and a restart-time create-or-renew.
+          subscription.terminal = true
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+          this.#increment('babysitterResourceSubscriptionsRetiredTerminal')
+        } else {
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== claim.deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+        }
+        this.#increment('babysitterResourceDeliveriesAccepted')
+      } catch (error) {
+        this.#increment('babysitterResourceDeliveryAcceptFailures')
+        this.#logger.warn?.('[factory] durable babysitter delivery claim remains pending after wake queue', {
+          issue: issue.key,
+          subscriptionId: claim.subscriptionId,
+          deliveryId: claim.deliveryId,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+    if ([...this.#babysitterPr.values()].some((ref) => ref.pendingDeliveryClaims?.length)) {
+      this.#scheduleDurableBabysitterDeliveryRetry()
+    }
+    return true
+  }
+
+  async #retryPendingBabysitterDeliveryAcceptances(): Promise<void> {
+    const subscriptions = this.#mount.resourceSubscriptions
+    if (!subscriptions) return
+    const retrySubscriptionRenewal = this.#babysitterResourceSubscriptionFault
+
+    for (const [issueIdentity, ref] of this.#babysitterPr) {
+      const issue = this.#babysitterIssueRefs.get(issueIdentity)
+      if (issue && ref.agentName && !ref.resourceSubscription?.terminal && (!ref.resourceSubscription || retrySubscriptionRenewal)) {
+        const batch = await this.#batch()
+        const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+          ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        await this.#ensureBabysitterResourceSubscription(issue, ref, tracked)
+      }
+      const subscription = ref.resourceSubscription
+      const pendingDeliveryClaims = [...(ref.pendingDeliveryClaims ?? [])]
+      if (!subscription || !issue || pendingDeliveryClaims.length === 0) continue
+      const batch = await this.#batch()
+      const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+        ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+        ?? durableBabysitterTrackedAgent({
+          issue,
+          repo: ref.repo,
+          prNumber: ref.prNumber,
+          path: ref.path,
+          agentName: ref.agentName,
+          critical: false,
+          pendingKinds: [],
+          resourceSubscription: subscription,
+          pendingDeliveryClaims,
+        })
+      for (const { deliveryId, claimToken } of pendingDeliveryClaims) {
+        try {
+          const accepted = await subscriptions.acceptDelivery(this.#workspaceId, { deliveryId, claimToken })
+          if (accepted.deliveryId !== deliveryId || accepted.subscriptionId !== subscription.subscriptionId) {
+            throw new Error('Relayfile accepted a different durable delivery claim')
+          }
+          if (accepted.terminal) subscription.terminal = true
+          ref.pendingDeliveryClaims = (ref.pendingDeliveryClaims ?? []).filter((pending) => pending.deliveryId !== deliveryId)
+          await this.#persistBabysitterSession(issue, ref, tracked)
+          this.#increment('babysitterResourceDeliveriesAcceptedAfterRestore')
+        } catch (error) {
+          if (isResourceSubscriptionsUnavailable(error)) {
+            this.#babysitterResourceSubscriptionFault = false
+            this.#babysitterResourceSubscriptionUnavailable = true
+            this.#increment('babysitterResourceSubscriptionUnavailable')
+          } else {
+            this.#babysitterResourceSubscriptionFault = true
+            this.#increment('babysitterResourceDeliveryAcceptFailures')
+            this.#logger.warn?.('[factory] durable babysitter delivery acceptance remains pending after restore', {
+              issue: issue.key,
+              subscriptionId: subscription.subscriptionId,
+              deliveryId,
+              error: describeError(error).errorMessage,
+            })
+          }
+        }
+      }
+    }
+    if ([...this.#babysitterPr.values()].some((ref) => ref.pendingDeliveryClaims?.length)) {
+      this.#scheduleDurableBabysitterDeliveryRetry()
+    }
+  }
+
+  #scheduleBabysitterResourceSubscriptionRenewal(): void {
+    if (
+      this.#babysitterResourceSubscriptionRenewTimer ||
+      this.#stopping ||
+      !this.#mount.resourceSubscriptions ||
+      ![...this.#babysitterPr.values()].some((ref) => ref.resourceSubscription && !ref.resourceSubscription.terminal)
+    ) return
+    this.#babysitterResourceSubscriptionRenewTimer = setTimeout(() => {
+      this.#babysitterResourceSubscriptionRenewTimer = undefined
+      void (async () => {
+        const batch = await this.#batch()
+        for (const [issueIdentity, ref] of this.#babysitterPr) {
+          const issue = this.#babysitterIssueRefs.get(issueIdentity)
+          if (!issue || !ref.resourceSubscription || ref.resourceSubscription.terminal) continue
+          const tracked = batch.getIssue(issue)?.agents.get(ref.agentName)
+            ?? [...(batch.getIssue(issue)?.agents.values() ?? [])].find((agent) => agent.spec.role === 'babysitter')
+          await this.#ensureBabysitterResourceSubscription(issue, ref, tracked)
+        }
+      })().catch((error) => {
+        this.#logger.warn?.('[factory] durable babysitter subscription renewal rejected', {
+          error: describeError(error).errorMessage,
+        })
+      }).finally(() => {
+        this.#scheduleBabysitterResourceSubscriptionRenewal()
+      })
+    }, BABYSITTER_RESOURCE_SUBSCRIPTION_RENEW_MS)
+    this.#babysitterResourceSubscriptionRenewTimer.unref?.()
+  }
+
+  #scheduleDurableBabysitterDeliveryRetry(): void {
+    if (this.#babysitterResourceDeliveryRetryTimer || this.#stopping || !this.#mount.resourceSubscriptions) return
+    this.#babysitterResourceDeliveryRetryTimer = setTimeout(() => {
+      this.#babysitterResourceDeliveryRetryTimer = undefined
+      void (async () => {
+        await this.#retryPendingBabysitterDeliveryAcceptances()
+        await this.#routeDurableBabysitterDeliveries()
+      })().catch((error) => {
+        this.#logger.warn?.('[factory] durable babysitter delivery retry rejected', {
+          error: describeError(error).errorMessage,
+        })
+      })
+    }, BABYSITTER_RESOURCE_DELIVERY_RETRY_MS)
+    this.#babysitterResourceDeliveryRetryTimer.unref?.()
+  }
+
   async #routeBabysitterEvent(path: string, extraKinds: Iterable<BabysitterWakeKind> = []): Promise<void> {
+    // A successful Relayfile claim lookup is the new exact demux. While some
+    // owners are still unregistered, the legacy path router remains available
+    // only to those owners. Registered owners retain and retry service claims,
+    // so a mixed rollout or transient create failure neither double-delivers a
+    // registered PR nor drops an event for an unregistered PR.
+    if (await this.#routeDurableBabysitterDeliveries()) return
     const event = githubBabysitterEventPathParts(path)
     if (!event || !this.#config.babysitter.enabled || this.#stopping) return
     let targets: Array<{ prNumber: number; kinds: BabysitterWakeKind[] }>
@@ -8100,6 +9143,14 @@ export class FactoryLoop implements Factory {
       if (!owner) {
         this.#increment('babysitterEventsIgnoredUnownedPr')
         this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', { ...event, prNumber: target.prNumber })
+        continue
+      }
+      if (
+        this.#mount.resourceSubscriptions &&
+        !this.#babysitterResourceSubscriptionUnavailable &&
+        owner.ref.resourceSubscription
+      ) {
+        this.#increment('babysitterEventsDeferredToDurableSubscription')
         continue
       }
       if (!await this.#assertIssueDispatchLifecycleOwner(owner.issue)) {
@@ -8166,10 +9217,15 @@ export class FactoryLoop implements Factory {
     ref: BabysitterPrRef,
     kinds: Iterable<BabysitterWakeKind>,
     tracked: TrackedAgent,
-  ): Promise<void> {
+    options: { allowTerminal?: boolean } = {},
+  ): Promise<boolean> {
+    if (ref.resourceSubscription?.terminal && !options.allowTerminal) {
+      this.#increment('babysitterEventsIgnoredTerminal')
+      return false
+    }
     if (!await this.#assertIssueDispatchLifecycleOwner(issue)) {
       this.#increment('babysitterEventsIgnoredNonOwner')
-      return
+      return false
     }
     // Owner lookup and queueing straddle async mount/state reads. Revalidate
     // the exact composite owner so a concurrent close/merge cancellation can
@@ -8182,7 +9238,7 @@ export class FactoryLoop implements Factory {
       githubPrIdentity(current.repo, current.prNumber) !== githubPrIdentity(ref.repo, ref.prNumber)
     ) {
       this.#increment('babysitterEventsIgnoredStaleOwner')
-      return
+      return false
     }
     // Any new event invalidates a prior readiness assertion for this exact PR.
     this.#babysitterReady.delete(ownershipKey)
@@ -8212,9 +9268,10 @@ export class FactoryLoop implements Factory {
 
     if (state.deferredSubmitTargets || state.inFlight || this.#babysitterCriticalAgents.has(state.agentName)) {
       this.#increment('babysitterEventWakesDeferred')
-      return
+      return true
     }
     this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+    return true
   }
 
   async #recordPendingBabysitterWake(state: BabysitterWakeState): Promise<void> {
@@ -8260,6 +9317,8 @@ export class FactoryLoop implements Factory {
       path: ref.path,
       critical: this.#babysitterCriticalAgents.has(ref.agentName),
       pendingKinds: pending?.kinds.filter(isBabysitterWakeKind).sort(compareBabysitterWakeKinds) ?? [],
+      ...(ref.resourceSubscription ? { resourceSubscription: { ...ref.resourceSubscription } } : {}),
+      ...(ref.pendingDeliveryClaims?.length ? { pendingDeliveryClaims: structuredClone(ref.pendingDeliveryClaims) } : {}),
     })
   }
 
@@ -8538,10 +9597,19 @@ export class FactoryLoop implements Factory {
       }
       if (!this.#config.babysitter.enabled) return
       if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
+        // A provider close produces a separately indexed terminal claim. Keep
+        // the durable owner until it has been accepted (or a transient retry
+        // has claimed it); do not let closed-state cleanup erase that hand-off.
+        await this.#routeDurableBabysitterDeliveries()
+        if (this.#babysitterResourceSubscriptionFault) return
         await this.#cancelBabysitterWake(owned.key)
         return
       }
       if (snapshot.draft) this.#increment('babysitterDraftPrSkipped')
+      // PR meta events are also the normal renewal heartbeat for the durable
+      // record. The store's identity makes this a create-or-renew, never a
+      // second subscription for the same babysitter.
+      await this.#ensureBabysitterResourceSubscription(owned.issue, owned.ref, owned.tracked)
       await this.#routeBabysitterEvent(path, babysitterWakeKindsFromSnapshot(snapshot))
       return
     }
@@ -8596,6 +9664,12 @@ export class FactoryLoop implements Factory {
     }
 
     if (snapshot.state && snapshot.state.trim().toUpperCase() !== 'OPEN') {
+      // `pull_request.closed` is a separately indexed Relayfile terminal
+      // event. Claim and accept its durable hand-off before the local closed
+      // PR cleanup drops the subscription owner. On a transient service fault,
+      // retain the owner so the retry loop can claim it without local fallback.
+      await this.#routeDurableBabysitterDeliveries()
+      if (this.#babysitterResourceSubscriptionFault) return
       if (babysitterKey && existing) await this.#cancelBabysitterWake(babysitterKey)
       return
     }
@@ -8804,6 +9878,11 @@ export class FactoryLoop implements Factory {
       await this.#babysitterSpawnInFlight.get(babysitterKey)
       const settled = this.#babysitterPr.get(babysitterKey)
       if (settled && prRef.path) settled.path = prRef.path
+      if (settled) {
+        const tracked = record.agents.get(settled.agentName)
+          ?? [...record.agents.values()].find((agent) => agent.spec.role === 'babysitter')
+        await this.#ensureBabysitterResourceSubscription(record.issue, settled, tracked)
+      }
       return
     }
     const wantedPr = githubPrIdentity(prRef.repo, prRef.prNumber)
@@ -8825,7 +9904,9 @@ export class FactoryLoop implements Factory {
         agentName: tracked.result?.name ?? trackedName,
       })
       this.#babysitterSpawned.add(babysitterKey)
-      await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      const ref = this.#babysitterPr.get(babysitterKey)!
+      await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#retargetSlackConversationToBabysitter(record)
       return
     }
@@ -8858,9 +9939,13 @@ export class FactoryLoop implements Factory {
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
         ?? record.decision.implementers
           .find((candidate) => candidate.repo === initialSpec.repo && candidate.baseClonePath && candidate.clonePath)
+      const preview = [...record.agents.values()]
+        .map((agent) => agent.spec)
+        .find((candidate) => candidate.repo === initialSpec.repo && candidate.preview)?.preview
+        ?? record.decision.implementers.find((candidate) => candidate.repo === initialSpec.repo)?.preview
       const implementerBranch = prRef.headRef ?? record.decision.implementers
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
-      const spec: AgentSpec = sharedCheckout
+      const checkoutSpec: AgentSpec = sharedCheckout
         ? {
             ...initialSpec,
             baseClonePath: sharedCheckout.baseClonePath,
@@ -8869,6 +9954,7 @@ export class FactoryLoop implements Factory {
             ...(sharedCheckout.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
           }
         : initialSpec
+      const spec = specWithPreview(checkoutSpec, preview)
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
       const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name
         ?? agentNameForRole(issue, 'review', { repo: route?.repo ?? prRef.repo })
@@ -8901,6 +9987,11 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        ...(spec.preview ? {
+          previewUrl: spec.preview.url,
+          previewTargetPort: spec.preview.targetPort,
+          previewStartCommand: spec.preview.startCommand,
+        } : {}),
         ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       })
 
@@ -8916,7 +10007,9 @@ export class FactoryLoop implements Factory {
         path: prRef.path,
         agentName: tracked?.result?.name ?? spawned.name,
       })
-      await this.#persistBabysitterSession(record.issue, this.#babysitterPr.get(babysitterKey)!, tracked)
+      const ref = this.#babysitterPr.get(babysitterKey)!
+      await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#retargetSlackConversationToBabysitter(record)
       await this.#writeInFlightRegistry()
       if (!await this.#saveDispatchLifecycle(record, 'running')) return
@@ -9240,6 +10333,7 @@ export class FactoryLoop implements Factory {
       // state.
       const issueTeam = issue?.team
       const githubIssue = issue ? isGithubIssue(issue) : false
+      const syntheticProbe = issue ? this.#isSyntheticProbeIssue(issue) : false
       const configuredHumanReview = opts.targetState !== 'done' &&
         this.#config.terminalState === 'human-review' &&
         (githubIssue || this.#states.hasHumanReview(issueTeam))
@@ -9247,13 +10341,29 @@ export class FactoryLoop implements Factory {
       if (issue && githubIssue && !configuredHumanReview && !githubMerged) {
         githubMerged = await this.#githubPrObservedMerged(record, issue)
         if (!githubMerged && opts.runMergeGate !== false) {
-          const mergeCommandAccepted = await this.#runCompletionMergeGate(issue)
+          const mergeCommandAccepted = await this.#runCompletionMergeGate(issue, record)
           // A successful merge command can mean queued/auto-merge rather than
           // merged. Only mounted PR state or a merged webhook may prove merge.
           if (mergeCommandAccepted) {
             githubMerged = await this.#githubPrObservedMerged(record, issue)
           }
         }
+      }
+      // Linear-backed issues historically wrote Done before invoking the
+      // guarded merge. With live verification in that guard, a red verdict
+      // would therefore release the team and make the failure terminal even
+      // though the PR remained open. Require the entire merge gate (including
+      // verification) to accept the merge before applying terminal writeback.
+      if (
+        issue &&
+        !githubIssue &&
+        !syntheticProbe &&
+        !configuredHumanReview &&
+        opts.runMergeGate !== false &&
+        this.#config.mergePolicy === 'on-green-with-review'
+      ) {
+        const mergeCommandAccepted = await this.#runCompletionMergeGate(issue, record)
+        if (!mergeCommandAccepted) return
       }
       // A GitHub issue only closes after its PR merges. If a configured done
       // path cannot merge (including mergePolicy: never), park it for a human
@@ -9311,13 +10421,12 @@ export class FactoryLoop implements Factory {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
       }
-      // Only auto-merge on the `done` terminal path. Human Review parks the PR
-      // for an operator — the merge gate (which requires an APPROVED review)
-      // would refuse anyway, and we must not merge before the human has looked.
-      if (issue && !githubIssue && !humanReview && opts.runMergeGate !== false) {
-        await this.#runCompletionMergeGate(issue)
+      // Synthetic canaries are cleanup probes, not merge candidates. Preserve
+      // their close-before-release path under every merge policy without
+      // subjecting them to the required feature verification gate.
+      if (issue && syntheticProbe && !githubIssue && opts.runMergeGate !== false) {
+        await this.#runCompletionMergeGate(issue, record)
       }
-
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
       releaseReasonForRetry = releaseReason
       if (this.#usesDurableDispatchLifecycle()) {
@@ -9341,6 +10450,8 @@ export class FactoryLoop implements Factory {
       const stateKey = issueStateKey(record.issue)
       this.#probePrGhBackoffUntilMs.delete(stateKey)
       this.#probePrResolvedCache.delete(stateKey)
+      // Cancellation must see the subscription identity so it can issue the
+      // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysittersForIssue(record.issue)
       const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
       if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
@@ -9709,6 +10820,12 @@ export class FactoryLoop implements Factory {
         await this.#rearmSlackWatcher(record, existingThread, {
           replayConversationReplies: Boolean(durableConversation),
         })
+        const previews = uniquePreviewReferences(result.previews ?? [])
+        if (previews.length > 0) {
+          await this.#slack.reply(existingThread, previews.map((preview) =>
+            `Live preview (${preview.repo}, tailnet access required): ${preview.url}`,
+          ).join('\n'))
+        }
       }
       return
     }
@@ -9730,12 +10847,17 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    const previews = uniquePreviewReferences(result.previews ?? [])
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
         `${record.issue.key}: factory agents dispatched.`,
-        `State: ${result.stateId ?? 'dispatching'}`,
-        `Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+        `State: ${result.stateId ?? 'dispatching'} · Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+        ...(previews.length > 0
+          ? [previews.map((preview) =>
+              `Live preview (${preview.repo}, tailnet access required): ${preview.url}`,
+            ).join(' · ')]
+          : []),
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
@@ -11366,7 +12488,7 @@ export class FactoryLoop implements Factory {
       : undefined
   }
 
-  async #runCompletionMergeGate(issue: LinearIssue): Promise<boolean> {
+  async #runCompletionMergeGate(issue: LinearIssue, record: InFlightIssue): Promise<boolean> {
     if (this.#isSyntheticProbeIssue(issue)) {
       await this.#closeSyntheticProbeIfPresent(issue)
       return false
@@ -11396,6 +12518,48 @@ export class FactoryLoop implements Factory {
       return false
     }
 
+    if (this.#verificationGate) {
+      const repositoryPath = this.#verificationRepositoryPath(record, pr.repo)
+      if (!repositoryPath) {
+        this.#logger.warn?.('[factory] verification gate has no feature checkout for merge candidate', {
+          issue: issue.key,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+        })
+        this.#increment('verificationGateMissingRepository')
+        return false
+      }
+      try {
+        const verification = await this.#verificationGate.verify({
+          repository: pr.repo,
+          repositoryPath,
+          issueKey: issue.key,
+          expectedHeadSha: headSha,
+        })
+        if (!verification.passed) {
+          this.#logger.warn?.('[factory] verification gate blocked merge', {
+            issue: issue.key,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            environmentId: verification.evidence.environmentId,
+            reason: verification.reason,
+          })
+          this.#increment('verificationGateFailed')
+          return false
+        }
+        this.#increment('verificationGatePassed')
+      } catch (error) {
+        this.#logger.warn?.('[factory] verification gate failed closed', {
+          issue: issue.key,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          error: describeError(error).errorMessage,
+        })
+        this.#increment('verificationGateFailed')
+        return false
+      }
+    }
+
     const result = await this.#mergeGate.merge({
       repo: pr.repo,
       number: pr.prNumber,
@@ -11421,6 +12585,15 @@ export class FactoryLoop implements Factory {
     })
     this.#increment('mergeGateMerged')
     return true
+  }
+
+  #verificationRepositoryPath(record: InFlightIssue, repo: string): string | undefined {
+    const normalized = repo.toLowerCase()
+    const active = [...record.agents.values()]
+      .map((tracked) => tracked.spec)
+      .find((spec) => spec.role === 'implementer' && spec.repo.toLowerCase() === normalized && spec.clonePath)
+      ?? record.decision.implementers.find((spec) => spec.repo.toLowerCase() === normalized && spec.clonePath)
+    return active?.clonePath ?? this.#config.repos.clonePaths[repo]
   }
 
   async #closeSyntheticProbeIfPresent(issue: LinearIssue): Promise<void> {
@@ -11812,6 +12985,120 @@ function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
   }
 
   return [...decision.implementers, decision.reviewer]
+}
+
+function previewServiceForRepo(
+  config: FactoryConfig,
+  repo: string,
+): { name: string; config: NonNullable<FactoryConfig['preview']>['services'][string] } | undefined {
+  const services = config.preview?.services
+  if (!services) return undefined
+  const normalizedRepo = repo.replace(/^\/+|\/+$/gu, '').toLowerCase()
+  const basename = normalizedRepo.slice(normalizedRepo.lastIndexOf('/') + 1)
+  const entries = Object.entries(services).map(([name, service]) => ({
+    name,
+    service,
+    normalized: name.replace(/^\/+|\/+$/gu, '').toLowerCase(),
+  }))
+  const exact = entries.find((entry) => entry.normalized === normalizedRepo)
+  if (exact) return { name: exact.name, config: exact.service }
+  const basenameMatches = entries.filter((entry) =>
+    entry.normalized.slice(entry.normalized.lastIndexOf('/') + 1) === basename,
+  )
+  return basenameMatches.length === 1
+    ? { name: basenameMatches[0]!.name, config: basenameMatches[0]!.service }
+    : undefined
+}
+
+function uniquePreviewReferences(previews: Array<PreviewReference | undefined>): PreviewReference[] {
+  const unique = new Map<string, PreviewReference>()
+  for (const preview of previews) {
+    if (preview) unique.set(preview.id, preview)
+  }
+  return [...unique.values()]
+}
+
+function assertPublishablePreview(
+  preview: PreviewReference,
+  expected: {
+    namespace: string
+    owner: string
+    service: string
+    repo: string
+    targetPort: number
+    portSpan: number
+    preferredHttpsPort?: number
+    startCommand: string
+    checkoutPath: string
+    requireNode: boolean
+  },
+): void {
+  const refuse = (reason: string): never => {
+    throw new Error(`Refusing insecure preview for ${expected.repo}: ${reason}`)
+  }
+  if (preview.provider !== 'tailscale-serve') refuse('unexpected provider')
+  if (preview.access !== 'tailnet') refuse('provider did not guarantee tailnet access')
+  if (preview.lifetime !== 'issue') refuse('provider did not guarantee issue-scoped lifetime')
+  if (
+    preview.namespace !== expected.namespace ||
+    preview.owner !== expected.owner ||
+    preview.service !== expected.service ||
+    preview.repo !== expected.repo ||
+    preview.startCommand !== expected.startCommand ||
+    (preview.configuredTargetPort ?? preview.targetPort) !== expected.targetPort ||
+    preview.targetPort < expected.targetPort ||
+    preview.targetPort >= expected.targetPort + expected.portSpan
+  ) {
+    refuse('provider returned a reference for a different dispatch identity')
+  }
+  if (expected.preferredHttpsPort !== undefined && preview.httpsPort !== expected.preferredHttpsPort) {
+    refuse('provider ignored the configured HTTPS port')
+  }
+  if (expected.requireNode && (!preview.node || preview.node === 'self')) {
+    refuse('remote provider did not identify the placement node')
+  }
+  const managedProcess = preview.process
+  if (
+    !managedProcess ||
+    !Number.isInteger(managedProcess.pid) ||
+    managedProcess.pid <= 0 ||
+    !managedProcess.startTime ||
+    !managedProcess.cmdline ||
+    !managedProcess.cwd ||
+    !managedProcess.marker
+  ) {
+    refuse('provider did not return an identity-checked managed process')
+  }
+  if (!expected.requireNode && managedProcess!.cwd !== expected.checkoutPath) {
+    refuse('provider started the managed process in a different checkout')
+  }
+
+  const url = (() => {
+    try {
+      return new URL(preview.url)
+    } catch {
+      return refuse('provider returned an invalid URL')
+    }
+  })()
+  if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) {
+    refuse('provider URL is not credential-free HTTPS')
+  }
+  if (!url.hostname.endsWith('.ts.net')) {
+    refuse('provider URL is not a Tailscale HTTPS name')
+  }
+  const urlPort = url.port ? Number(url.port) : 443
+  if (urlPort !== preview.httpsPort) refuse('provider URL does not match its guarded HTTPS route')
+}
+
+function specWithPreview(spec: AgentSpec, preview?: PreviewReference): AgentSpec {
+  if (!preview) return { ...spec }
+  return {
+    ...spec,
+    preview,
+    // The provider route forwards to loopback on its placement node. Pin every
+    // agent using that checkout to the same node so its dev server is reachable.
+    ...(preview.node ? { node: preview.node } : {}),
+  }
 }
 
 type LabelDispatchResolution =
@@ -12264,6 +13551,7 @@ const routeForSpec = (decision: TriageDecision, spec: AgentSpec) => {
 }
 
 const previewUrlFromSpec = (spec: AgentSpec): string | undefined => {
+  if (spec.preview?.url.trim()) return spec.preview.url.trim()
   const previewUrl = (spec as AgentSpec & { previewUrl?: unknown }).previewUrl
   return typeof previewUrl === 'string' && previewUrl.trim() ? previewUrl.trim() : undefined
 }
@@ -13209,6 +14497,19 @@ const validPrNumber = (value: number): boolean => Number.isInteger(value) && val
 const githubPrIdentity = (repo: string, prNumber: number): string | undefined =>
   validGithubRepo(repo) && validPrNumber(prNumber) ? `${repo.toLowerCase()}#${prNumber}` : undefined
 
+// This is the public Relayfile stable identity for a GitHub pull request. It
+// deliberately comes from the PR's repo/number ownership record, never by
+// transforming an incoming canonical path (whose title slug can be renamed).
+const babysitterResourceRef = (repo: string, prNumber: number): string => {
+  if (!validGithubRepo(repo) || !validPrNumber(prNumber)) {
+    throw new Error('Cannot create a durable babysitter subscription for an invalid GitHub PR identity')
+  }
+  const [owner, name] = repo.split('/')
+  return `/github/repos/${owner}__${name}/pulls/by-id/${prNumber}.json`
+}
+
+const babysitterSubscriberId = (issue: IssueRef): string => `factory-babysitter:${issue.uuid}`
+
 const babysitterOwnershipKey = (
   issue: IssueRef,
   ref: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
@@ -13610,12 +14911,17 @@ const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
   return `${owner}/${repo}`
 }
 
-const githubPullRequestBody = (issue: LinearIssue): string => [
+const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): string => [
   issue.description,
   '',
   isGithubIssue(issue) && /^\d+$/u.test(issue.key)
     ? `Fixes #${issue.key}`
     : `Factory issue ${issue.key}`,
+  ...(preview ? [
+    '',
+    `Live preview: ${preview.url}`,
+    'Access: Tailscale tailnet membership and the tailnet grants/ACLs are required; this URL is not public.',
+  ] : []),
 ].join('\n').trim()
 
 // The broker rejects re-registering a name it never released on exit
@@ -14167,6 +15473,18 @@ const clarificationStaleSlackText = (
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 
+const formatByteCount = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes
+  let unit = 'B'
+  for (const candidate of units) {
+    value /= 1024
+    unit = candidate
+    if (value < 1024) break
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`
+}
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)
   timer.unref?.()

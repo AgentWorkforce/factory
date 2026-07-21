@@ -47,6 +47,14 @@ describe('FactoryConfigSchema', () => {
       requestTimeoutMs: 15_000,
     })
     expect(parsed.github).toEqual({ identity: 'auto' })
+    expect(parsed.verification).toEqual({
+      enabled: true,
+      descriptorPath: '.factory/verification-stack.yaml',
+      maxConcurrentEnvironments: 2,
+      maxRunTimeoutMs: 30 * 60_000,
+      maxEnvironmentTtlMs: 60 * 60_000,
+      maxTeardownTimeoutMs: 5 * 60_000,
+    })
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',
@@ -78,6 +86,47 @@ describe('FactoryConfigSchema', () => {
       requireTeamKey: 'AR',
     })
     expect(parsed.dryRun).toBe(false)
+    expect(parsed.environments).toEqual({})
+  })
+
+  it('accepts secret-reference-only Kubernetes BYOC and managed connections', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      environments: {
+        kubernetes: {
+          connections: [
+            {
+              id: 'customer-eks',
+              target: 'byoc',
+              customers: ['customer-a'],
+              repositories: ['AgentWorkforce/factory'],
+              credential: { kind: 'irsa', secretRef: 'aws-sm:customer-a/verification-role' },
+              protectedNamespaces: ['payments-prod'],
+            },
+            {
+              id: 'factory-managed',
+              target: 'managed',
+              credential: { kind: 'kubeconfig', secretRef: 'env:FACTORY_MANAGED_KUBECONFIG' },
+            },
+          ],
+        },
+      },
+    })
+
+    expect(parsed.environments.kubernetes?.connections[0].credential.secretRef)
+      .toBe('aws-sm:customer-a/verification-role')
+    expect(parsed.environments.kubernetes?.connections[1].fidelityCaveat).toContain('may differ')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      environments: {
+        kubernetes: {
+          connections: [{
+            id: 'unsafe',
+            credential: { kind: 'kubeconfig', secretRef: 'apiVersion: v1\nclusters: []' },
+          }],
+        },
+      },
+    })).toThrow(/never inline kubeconfig/iu)
   })
 
   it('preserves explicit model overrides', () => {
@@ -331,6 +380,48 @@ describe('FactoryConfigSchema', () => {
     expect(loaded.factoryConfig.repos.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
     expect(loaded.nodeConfig.cloneRoot).toBe(join(homedir(), 'Projects/AgentWorkforce'))
     expect(loaded.nodeConfig.clonePaths).toEqual(loaded.factoryConfig.clonePaths)
+  })
+
+  it('merges split preview services and enforces a tailnet-only provider', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        preview: {
+          services: { factory: { port: 3_000, portSpan: 25, startCommand: 'npm run dev' } },
+        },
+      },
+      nodeConfig: {
+        preview: {
+          services: { pear: { port: 4_173, startCommand: 'npm run dev' } },
+          registryPath: '~/.factory/test-previews.json',
+        },
+      },
+    })
+
+    expect(loaded.factoryConfig.preview).toEqual({
+      provider: 'tailscale-serve',
+      access: 'tailnet',
+      services: {
+        factory: { port: 3_000, portSpan: 25, startCommand: 'npm run dev' },
+        pear: { port: 4_173, startCommand: 'npm run dev' },
+      },
+      tailscaleBinary: 'tailscale',
+      registryPath: join(homedir(), '.factory/test-previews.json'),
+      httpsPortRange: [10_000, 10_999],
+    })
+    expect(loaded.nodeConfig.preview).toEqual(loaded.factoryConfig.preview)
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { provider: 'tailscale-funnel', access: 'public', services: {} },
+    })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { services: {}, httpsPortRange: [11_000, 10_000] },
+    })).toThrow('preview.httpsPortRange start must be less than or equal to end')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      preview: { services: { factory: { port: 65_500, startCommand: 'npm run dev' } } },
+    })).toThrow('preview service port range must end at or below 65535')
   })
 
   it('does not rewrite embedded tildes', () => {

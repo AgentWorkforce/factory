@@ -13,7 +13,12 @@ import type {
   SubscribeOptions,
   Subscription,
   Capability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
 } from '../ports'
+import type { ResourceSubscriptionsClient } from '../subscriptions'
 
 type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
@@ -23,6 +28,7 @@ type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Pro
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
   githubWrite?: GithubConnectionWrite
+  resourceSubscriptions?: ResourceSubscriptionsClient
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []
@@ -195,6 +201,9 @@ export class FakeFleetClient implements FleetClient {
   readonly hydrated: Array<{ name: string; invocationId?: string; node?: string }> = []
   reconciles = 0
   preservedInfrastructure = 0
+  readonly previewStarts: PreviewStartInput[] = []
+  readonly previewRemovals: PreviewReference[] = []
+  readonly previewSweeps: PreviewSweepInput[] = []
 
   #agents = new Set<string>()
   #tracked = new Map<string, { invocationId?: string; node?: string }>()
@@ -233,6 +242,45 @@ export class FakeFleetClient implements FleetClient {
     this.releases.push({ name, reason })
     this.#agents.delete(name)
     this.#tracked.delete(name)
+  }
+
+  async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    this.previewStarts.push(structuredClone(input))
+    const httpsPort = input.preferredHttpsPort ?? 10_000 + this.previewStarts.length - 1
+    return {
+      id: `preview-${this.previewStarts.length}`,
+      provider: 'tailscale-serve',
+      namespace: input.namespace,
+      owner: input.owner,
+      service: input.service,
+      repo: input.repo,
+      url: `https://factory-node.tailnet.ts.net:${httpsPort}/`,
+      configuredTargetPort: input.targetPort,
+      targetPort: input.targetPort,
+      httpsPort,
+      access: 'tailnet',
+      lifetime: 'issue',
+      createdAt: '2026-07-20T12:00:00.000Z',
+      startCommand: input.startCommand,
+      process: {
+        pid: 10_000 + this.previewStarts.length,
+        startTime: '2026-07-20T12:00:00.000Z',
+        cmdline: `factory-preview ${input.owner}`,
+        cwd: input.checkoutPath,
+        marker: `factory-preview-${this.previewStarts.length}`,
+      },
+      ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+    }
+  }
+
+  async removePreview(preview: PreviewReference): Promise<boolean> {
+    this.previewRemovals.push(structuredClone(preview))
+    return true
+  }
+
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
+    this.previewSweeps.push(structuredClone(input))
+    return { reaped: [], skipped: [] }
   }
 
   trackedAgents(): ReadonlyMap<string, { invocationId?: string; node?: string }> {

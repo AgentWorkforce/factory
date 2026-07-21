@@ -1,15 +1,15 @@
 version: '1.1'
 updated: '2026-07-21'
 catalog:
-  category_count: 23
-  feature_count: 287
+  category_count: 24
+  feature_count: 300
   tier_counts:
-    1: 39
-    2: 121
+    1: 43
+    2: 123
     3: 11
-    4: 45
+    4: 51
     5: 57
-    6: 14
+    6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
 #
@@ -48,6 +48,7 @@ verification:
     hosted-control-plane: hosted-control-plane
     cloud-observability: cloud-observability
     release-verification: release-verification
+    verification-environments: verification-environments
     proactive-health: proactive-health
     config-intake: triage-and-configuration
     config-repositories: triage-and-configuration
@@ -1190,6 +1191,13 @@ categories:
         location: src/fleet/relay-fleet-client.ts
         verify_tier: 4
 
+      - id: fleet-tailnet-live-preview
+        name: Issue-Lifetime Tailnet Live Preview
+        api: preview:tailscale-serve / PreviewReference
+        description: Start a repository dev command in its issue checkout, publish a tailnet-only HTTPS URL to agents, Slack, and pull requests, preserve it across handoffs, and identity-check terminal teardown plus orphan recovery
+        location: src/node/tailscale-preview.ts, src/node/preview-process.ts, src/node/factory-node.ts, src/ports/fleet.ts, src/orchestrator/factory.ts, src/dispatch/templates.ts
+        verify_tier: 4
+
       - id: fleet-message-events
         name: Fleet Messaging Events
         api: FleetClient.sendMessage() / onAgentMessage()
@@ -1326,6 +1334,13 @@ categories:
         location: src/config/schema.ts
         verify_tier: 1
 
+      - id: api-kubernetes-environments
+        name: Kubernetes Environment Provider API
+        api: '@agent-relay/factory/environments / @agent-relay/factory/kubernetes-environment-stack.schema.json / EnvironmentProvider / KubernetesEnvironmentProvider / StackDeployer'
+        description: Resolve BYOC or managed cluster references and provision, inspect, expose, destroy, and reap namespace-isolated Kubernetes verification stacks
+        location: src/ports/environment.ts, src/environments/, src/index.ts, schemas/kubernetes-environment-stack.schema.json, package.json
+        verify_tier: 1
+
       - id: api-featuremap-validator
         name: Feature-Map Validator API
         api: '@agent-relay/factory/featuremap'
@@ -1401,6 +1416,13 @@ categories:
         api: normalizeLogValue() / normalizeLogger() / stringifyLogValue()
         description: Preserve Error diagnostics and structured context as bounded redacted JSON-safe metadata without invoking getters, toJSON hooks, custom stack hooks, or failing on cycles and BigInt
         location: src/logging.ts
+        verify_tier: 1
+
+      - id: api-feature-map-generation
+        name: Lazy Repository Feature Map Generation
+        api: generateFeatureMap()
+        description: Create or incrementally extend a schema-compatible feature manifest from bounded touched-file discovery without making dispatch depend on generation success
+        location: src/featuremap/generate.ts, src/featuremap/index.ts, src/index.ts
         verify_tier: 1
 
       - id: api-dependency-graph
@@ -1586,6 +1608,74 @@ categories:
         location: .github/workflows/ci.yml, docs/pr-end-to-end-verification.md, scripts/verify-packed-e2e.mjs
         verify_tier: 1
 
+  verification-environments:
+    name: Live Stack Verification Environments
+    description: Repository-owned stack deployment, E2E and load gates, auditable verdicts, and guaranteed environment cleanup
+    criticality: critical
+    features:
+      - id: verification-stack-descriptor
+        name: Repository-Owned Verification Stack
+        api: loadVerificationStack() / resolveVerificationStackDescriptor() / @agent-relay/factory/verification-stack.schema.json
+        description: Validate and resolve a repository-relative, secret-reference-only deployment contract with services, probes, seeds, endpoints, and optional merge-gate stages
+        location: src/environments/verification-stack-descriptor.ts, schemas/verification-stack.schema.json
+        verify_tier: 1
+
+      - id: verification-environment-provider
+        name: Leased Kubernetes Verification Environment
+        api: KubectlEnvironmentProvider / reapFactoryEnvironmentsOnce()
+        description: Provision concurrency-capped managed namespaces with expiration leases and always destroy them, while the reaper removes expired environments after hard process death
+        location: src/environments/kubernetes-environment.ts, src/ports/environment.ts, src/orchestrator/reaper.ts
+        verify_tier: 4
+
+      - id: verification-stack-deployer
+        name: Generic Verification Stack Deployer
+        api: VerificationStackDeployer
+        description: Materialize referenced secrets and config, deploy manifests, Helm, kustomize, or translated Compose, run bounded probes and seeds, and return disposable live endpoints
+        location: src/environments/verification-stack-deployer.ts, src/environments/kubernetes-command.ts
+        verify_tier: 4
+
+      - id: verification-load-gate
+        name: In-Cluster Load SLO Gate
+        api: runLoad() / evaluateLoadSlo()
+        description: Run a hardened k6 Job against cluster-routable endpoints, reject empty or inconsistent evidence, evaluate latency, error, and throughput SLOs, and retain measured evidence
+        location: src/environments/load-harness.ts, src/environments/load-profile.ts, src/environments/k6-job.ts
+        verify_tier: 4
+
+      - id: verification-gate-pipeline
+        name: Required Live Verification Pipeline
+        api: VerificationPipeline.verify()
+        description: Run resolve, provision, deploy, E2E, load, evaluate, and teardown under bounded cancellation and environment concurrency, returning one structured fail-closed verdict
+        location: src/environments/verification-pipeline.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: verification-merge-block
+        name: Verification-Required Merge Decision
+        api: Factory mergePolicy on-green-with-review + VerificationGate
+        description: Allow the guarded merge operation only after GitHub readiness and a green exact-head live-stack verdict, while every red or thrown verdict leaves the pull request unmerged
+        location: src/orchestrator/factory.ts, src/github/merge-gate.ts
+        verify_tier: 6
+
+      - id: verification-cloud-evidence
+        name: Auditable Verification Verdict Evidence
+        api: FactoryCloudVerificationEvidenceV1Schema
+        description: Persist a bounded verification.completed event with environment identity, stage outcomes, E2E status, load measurements, SLO violations, timeout, and teardown result through the Cloud reporter path
+        location: src/observability/events.ts, src/observability/cloud-reporter.ts
+        verify_tier: 1
+
+      - id: config-verification-gate
+        name: Verification Gate Safety Limits
+        api: factory.config.json#verification.enabled / descriptorPath / maxConcurrentEnvironments / maxRunTimeoutMs / maxEnvironmentTtlMs / maxTeardownTimeoutMs
+        description: Configure default-on verification, descriptor selection, environment admission, overall runtime, lease TTL, and teardown ceilings with bounded schema validation
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: verification-kubernetes-provider-e2e
+        name: Kubernetes Provider Binding E2E
+        cli: npm run test:e2e:kubernetes
+        description: Deploy an API and Postgres Helm stack to kind, prove namespace RBAC, NetworkPolicy, quota, endpoint, k6 SLO, teardown, and TTL reaping guardrails, and retain production fixture identity
+        location: test/e2e/kubernetes-provider.e2e.ts, scripts/test-kubernetes-provider-e2e.sh, test/fixtures/kubernetes/, .github/workflows/ci.yml
+        verify_tier: 4
+
   proactive-health:
     name: Proactive Feature Guardian
     description: Scheduled, exhaustive, durable Slack questions over the live Factory feature manifest
@@ -1622,6 +1712,13 @@ categories:
         api: factory.config.json#workspaceId
         description: Pin a Relayfile workspace handle; when omitted the CLI derives the active cloud workspace
         location: src/config/schema.ts, src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 2
+
+      - id: config-kubernetes-environments
+        name: Kubernetes Environment Connections
+        api: factory.config.json#environments.kubernetes
+        description: Map customers and repositories to BYOC or managed clusters using secret references, protected namespaces, cluster-scope opt-ins, placement constraints, quotas, limits, and a managed-fidelity caveat
+        location: src/config/schema.ts, src/environments/connection-registry.ts, factory-test-infra/kubernetes-connections.example.yaml
         verify_tier: 2
 
       - id: config-issue-source

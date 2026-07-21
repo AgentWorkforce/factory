@@ -1,6 +1,7 @@
 import { InternalFleetClient, type HarnessDriverClientLike } from './internal-fleet-client'
 import { RelayFleetClient } from './relay-fleet-client'
 import type { Logger } from '../ports/system'
+import type { PreviewConfig } from '../config/schema'
 
 export type FleetBackend = 'internal' | 'relay'
 export const FACTORY_AGENT_EXIT_TIMEOUT_ENV = 'FACTORY_AGENT_EXIT_TIMEOUT_MS'
@@ -9,6 +10,7 @@ export interface CreateFleetOptions {
   backend?: FleetBackend
   cwd?: string
   connectionPath?: string
+  previewConfig?: PreviewConfig
 }
 
 export interface CreateFleetDeps {
@@ -64,5 +66,6 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
     logger: deps.logger,
     cwd: options.cwd,
     connectionPath: options.connectionPath,
+    previewConfig: options.previewConfig,
   })
 }

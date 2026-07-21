@@ -688,7 +688,7 @@ mkdir "$TMP/consumer" && cd "$TMP/consumer"
 npm init -y >/dev/null
 npm install --ignore-scripts "$TMP"/*.tgz >/dev/null
 node --input-type=module <<'NODE'
-for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/hosted']) {
+for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/hosted', '/environments']) {
   const mod = await import(`@agent-relay/factory${subpath}`)
   if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)
 }
@@ -698,7 +698,7 @@ NODE
 ```
 
 Back in the checkout, run the focused tests named by each API entry. Assert root
-types and all seven package export keys resolve, hosted remains worker-safe,
+types and all eight package export keys resolve, hosted remains worker-safe,
 feature-map validation includes procedure routing, dependency/worktree ports are
 exported, and fake clients support a hermetic consumer. Clean only `$TMP`.
 
@@ -769,15 +769,22 @@ npm test
 FACTORY_E2E_HEAD_SHA="$(git rev-parse HEAD)" \
 FACTORY_E2E_BASE_SHA="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" \
   npm run verify:e2e
-node -e 'const a=require("./artifacts/factory-e2e-attestation.json"); if (a.headSha !== process.argv[1]) process.exit(1)' "$(git rev-parse HEAD)"
+node -e 'const a=require("./artifacts/factory-e2e-attestation.json"); if (a.git?.headSha !== process.argv[1]) process.exit(1)' "$(git rev-parse HEAD)"
 ```
+
+For Kubernetes provider changes, a Docker-capable node with kind, kubectl, and
+Helm must additionally run `npm run test:e2e:kubernetes`; the check is not
+passed when those prerequisites are absent.
 
 Assert the manifest contract test covers every CLI leaf, config field, public
 subpath, category procedure, and required implementation area. The packed run
 must install the tarball in a clean consumer, import root/hosted surfaces, drive
 the fixture and hosted lifecycle, and record only passing checks. Follow
 `docs/pr-end-to-end-verification.md`; never accept an artifact from the base,
-synthetic merge, another head, or a run that skipped its declared check.
+synthetic merge, another head, or a run that skipped its declared check. The
+Kubernetes binding run must prove a positive cross-namespace connectivity
+control before its deny assertion, then retain the exact production namespace
+and workload identities through teardown and reaping.
 
 ## proactive-health
 
@@ -832,6 +839,36 @@ command, run `loop-status`, then `kill-loop`; only that PID may receive SIGTERM.
 Seed one stale Factory-owned child and one unrelated/broker/node PID, run
 `reap-orphans`, and require only the exact stale child to terminate. The shared
 cleanup guard handles a failed assertion without signalling a reused PID.
+
+## verification-environments
+
+**Categories:** `verification-environments`.
+
+**Prerequisites:** tiers 1–2 require only the checkout and fixture config. The
+live scenarios require Docker, `kind`, and `kubectl`; the manual merge decision
+also requires one disposable reviewed pull request and therefore remains tier 6.
+
+```bash
+npm run build
+npx vitest run \
+  src/environments/verification-stack-descriptor.test.ts \
+  src/environments/verification-stack-deployer.test.ts \
+  src/environments/kubernetes-provider.test.ts \
+  src/environments/load-harness.test.ts \
+  src/environments/verification-pipeline.test.ts \
+  src/orchestrator/environment-reaper.test.ts
+
+kind create cluster --name factory-gate-e2e
+npm run test:e2e:verification
+kind delete cluster --name factory-gate-e2e
+```
+
+Require the real cluster run to prove one green decision, E2E-red and load-red
+decisions, bounded timeout teardown, hard-kill reaping, namespace absence, and
+Cloud-reporter evidence. Unit coverage must prove that a red verifier never
+reaches the guarded merge operation and that the exact reviewed head is passed
+to the verifier. Always delete the kind cluster in a shell trap. Do not claim
+the tier-6 merge lifecycle without a disposable approved PR.
 
 ---
 

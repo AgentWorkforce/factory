@@ -140,6 +140,61 @@ export const FactoryCloudInstanceV1Schema = z.object({
 
 export type FactoryCloudInstanceV1 = z.infer<typeof FactoryCloudInstanceV1Schema>
 
+const verificationStageStatus = z.enum(['pass', 'fail', 'skipped', 'timed_out'])
+const verificationMeasurements = z.object({
+  requestCount: z.number().finite().nonnegative(),
+  errorCount: z.number().finite().nonnegative(),
+  errorRate: z.number().finite().min(0).max(1),
+  throughputRps: z.number().finite().nonnegative(),
+  durationMs: z.number().finite().nonnegative(),
+  latency: z.object({
+    minMs: z.number().finite().nonnegative(),
+    averageMs: z.number().finite().nonnegative(),
+    medianMs: z.number().finite().nonnegative(),
+    maxMs: z.number().finite().nonnegative(),
+    p95Ms: z.number().finite().nonnegative(),
+    p99Ms: z.number().finite().nonnegative(),
+  }).strict(),
+  histogram: z.array(z.object({
+    upperBoundMs: z.number().finite().positive().nullable(),
+    count: z.number().finite().nonnegative(),
+  }).strict()).min(2),
+}).strict()
+
+/** Auditable, bounded verification evidence; command output and raw errors are intentionally excluded. */
+export const FactoryCloudVerificationEvidenceV1Schema = z.object({
+  contract: z.literal('factory.verification.evidence.v1'),
+  environmentId: opaqueString.optional(),
+  namespace: opaqueString.optional(),
+  verdict: z.enum(['pass', 'fail']),
+  timedOut: z.boolean(),
+  stages: z.object({
+    resolve: verificationStageStatus,
+    provision: verificationStageStatus,
+    deploy: verificationStageStatus,
+    e2e: verificationStageStatus,
+    load: verificationStageStatus,
+    evaluate: verificationStageStatus,
+    teardown: verificationStageStatus,
+  }).strict(),
+  e2e: z.object({
+    durationMs: nonNegativeInteger,
+    exitCode: z.number().int().nullable().optional(),
+  }).strict(),
+  load: z.object({
+    durationMs: nonNegativeInteger,
+    measured: verificationMeasurements,
+    violations: z.array(z.object({
+      metric: z.enum(['requestCount', 'p95LatencyMs', 'p99LatencyMs', 'errorRate', 'throughputRps']),
+      actual: z.number().finite(),
+      threshold: z.number().finite(),
+      operator: z.enum(['at-most', 'at-least']),
+    }).strict()),
+  }).strict().optional(),
+}).strict()
+
+export type FactoryCloudVerificationEvidenceV1 = z.infer<typeof FactoryCloudVerificationEvidenceV1Schema>
+
 const factoryCloudEventShape = {
   id: opaqueString,
   occurredAt: z.string().datetime({ offset: true }),
@@ -155,6 +210,7 @@ const factoryCloudEventShape = {
     recipe: categoryString.optional(),
   }).strict().optional(),
   attributes: FactoryCloudEventAttributesV1Schema.optional(),
+  verification: FactoryCloudVerificationEvidenceV1Schema.optional(),
   trace: z.object({
     traceId: FactoryCloudTraceIdV1Schema,
     spanId: FactoryCloudSpanIdV1Schema.optional(),

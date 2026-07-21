@@ -3,6 +3,8 @@ import { join } from 'node:path'
 
 import { z } from 'zod'
 
+import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
+
 // The five workflow-state roles the factory drives an issue through. Each is
 // configured either by name (config.linear.states.<role>, resolved to a
 // workspace UUID at startup) or by explicit UUID (config.stateIds.<role>).
@@ -129,6 +131,49 @@ const reportingSchema = z.object({
   requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
 }).default({})
 
+const previewServiceSchema = z.object({
+  /** Local HTTP port the repository's development server listens on. */
+  port: z.number().int().min(1).max(65_535),
+  /** Consecutive node-local ports Factory may allocate for concurrent issues. */
+  portSpan: z.number().int().min(1).max(1_000).optional(),
+  /** Optional stable tailnet HTTPS port; otherwise Factory allocates one. */
+  httpsPort: z.number().int().min(1).max(65_535).optional(),
+  /** Foreground command Factory supervises for the issue-lifetime preview. */
+  startCommand: z.string().trim().min(1),
+}).superRefine((service, ctx) => {
+  if (service.port + (service.portSpan ?? 100) - 1 > 65_535) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['portSpan'],
+      message: 'preview service port range must end at or below 65535',
+    })
+  }
+})
+
+// Tailscale Serve is deliberately the only initial provider. Unlike Funnel,
+// Serve is tailnet-only and keeps the tailnet's grants/ACLs in the request path.
+// Making the access mode a literal prevents a config typo from silently
+// publishing an unauthenticated URL to Slack or GitHub.
+const previewSchema = z.object({
+  provider: z.literal('tailscale-serve').default('tailscale-serve'),
+  access: z.literal('tailnet').default('tailnet'),
+  services: z.record(z.string(), previewServiceSchema).default({}),
+  tailscaleBinary: z.string().trim().min(1).default('tailscale'),
+  registryPath: z.string().min(1).default('~/.factory/tailscale-previews.json'),
+  httpsPortRange: z.tuple([
+    z.number().int().min(1).max(65_535),
+    z.number().int().min(1).max(65_535),
+  ]).default([10_000, 10_999]),
+}).superRefine((preview, ctx) => {
+  if (preview.httpsPortRange[0] > preview.httpsPortRange[1]) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['httpsPortRange'],
+      message: 'preview.httpsPortRange start must be less than or equal to end',
+    })
+  }
+}).optional()
+
 const githubSchema = z.object({
   // Controls the credential identity used when Factory creates pull requests.
   // `auto` preserves the compatibility behavior: prefer the connected
@@ -136,6 +181,16 @@ const githubSchema = z.object({
   // when the app write path is unavailable.
   identity: z.enum(['app', 'user', 'auto']).default('auto'),
 }).default({})
+
+const verificationSchema = z.object({
+  /** Default-on: an auto-merge must have a green live-stack verification verdict. */
+  enabled: z.boolean().default(true),
+  descriptorPath: z.string().trim().min(1).default('.factory/verification-stack.yaml'),
+  maxConcurrentEnvironments: z.number().int().min(1).max(20).default(2),
+  maxRunTimeoutMs: z.number().int().min(1_000).max(2 * 60 * 60_000).default(30 * 60_000),
+  maxEnvironmentTtlMs: z.number().int().min(1_000).max(24 * 60 * 60_000).default(60 * 60_000),
+  maxTeardownTimeoutMs: z.number().int().min(1_000).max(30 * 60_000).default(5 * 60_000),
+}).strict().default({})
 
 // The factory owns its workflow-state NAME conventions; consumers (e.g. pear)
 // don't hand-configure them. These names let the factory resolve a role from a
@@ -169,6 +224,10 @@ const safetySchema = z.object({
   requireTeamKey: z.string().min(1).default('AR'),
 }).default({})
 
+const environmentsSchema = z.object({
+  kubernetes: KubernetesEnvironmentConfigSchema.optional(),
+}).strict().default({})
+
 const WorkspaceConfigObjectSchema = z.object({
   // Optional. When omitted, the CLI derives the workspace from the cloud session
   // via `resolveActiveWorkspace()` (returns the active `relayfileWorkspaceId`),
@@ -201,7 +260,9 @@ const WorkspaceConfigObjectSchema = z.object({
   // analytics. It defaults on for real CLI sessions and remains no-op when no
   // Cloud account is available; delivery failure never changes orchestration.
   reporting: reportingSchema,
+  preview: previewSchema,
   github: githubSchema,
+  verification: verificationSchema,
   // Which Linear state an issue lands in once the agents finish and the PR is
   // open. `human-review` parks it for operator review (Done is reserved for the
   // actual merge); `done` is the legacy behavior. Only honored when the
@@ -222,6 +283,7 @@ const WorkspaceConfigObjectSchema = z.object({
   // place once resolution runs, so the orchestrator always sees concrete UUIDs.
   stateIds: stateIdsSchema,
   safety: safetySchema,
+  environments: environmentsSchema,
 })
 
 const NodeConfigObjectSchema = z.object({
@@ -232,6 +294,7 @@ const NodeConfigObjectSchema = z.object({
   dryRun: z.boolean().default(false),
   factoryLoopHeartbeatPath: z.string().min(1).optional(),
   factoryLoopRegistryPath: z.string().min(1).optional(),
+  preview: previewSchema,
 })
 
 const FactoryConfigObjectSchema = WorkspaceConfigObjectSchema.merge(NodeConfigObjectSchema)
@@ -253,6 +316,7 @@ function normalizeWorkspaceConfig(cfg: z.infer<typeof WorkspaceConfigObjectSchem
   return {
     ...cfg,
     subscription: { ...cfg.subscription, labels },
+    preview: normalizePreviewConfig(cfg.preview),
     repos: {
       ...repos,
       byLabel: resolved.byLabel,
@@ -274,6 +338,7 @@ function normalizeNodeConfig(cfg: z.infer<typeof NodeConfigObjectSchema>) {
     clonePaths: expandClonePaths(cfg.clonePaths),
     factoryLoopHeartbeatPath: cfg.factoryLoopHeartbeatPath,
     factoryLoopRegistryPath: cfg.factoryLoopRegistryPath,
+    preview: normalizePreviewConfig(cfg.preview),
   }
 }
 
@@ -306,6 +371,7 @@ function normalizeFactoryConfig(cfg: z.infer<typeof FactoryConfigObjectSchema>) 
       heartbeatPath,
       registryPath,
     },
+    preview: normalizePreviewConfig(cfg.preview),
     repos: {
       ...(cfg.repos.org !== undefined ? { org: cfg.repos.org } : {}),
       ...(cfg.repos.names !== undefined ? { names: cfg.repos.names } : {}),
@@ -418,6 +484,7 @@ function normalizeLoadedConfig(input: unknown): LoadedFactoryConfig {
     dryRun: factoryConfig.dryRun,
     factoryLoopHeartbeatPath: factoryConfig.loop.heartbeatPath,
     factoryLoopRegistryPath: factoryConfig.loop.registryPath,
+    preview: factoryConfig.preview,
   })
 
   return { workspaceConfig, nodeConfig, factoryConfig }
@@ -434,15 +501,37 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   validateClonePathSyntax(workspaceRepos, 'workspaceConfig.repos')
   validateClonePathSyntax(node, 'nodeConfig')
 
+  const workspacePreview = asOptionalConfigRecord(workspace.preview)
+  const nodePreview = asOptionalConfigRecord(node.preview)
+  const hasPreview = workspace.preview !== undefined || node.preview !== undefined
+
   return {
     ...workspace,
     ...node,
+    ...(hasPreview ? {
+      preview: {
+        ...workspacePreview,
+        ...nodePreview,
+        services: {
+          ...asOptionalConfigRecord(workspacePreview.services),
+          ...asOptionalConfigRecord(nodePreview.services),
+        },
+      },
+    } : {}),
     repos: {
       ...workspaceRepos,
       cloneRoot: node.cloneRoot ?? workspaceRepos.cloneRoot,
       clonePaths: node.clonePaths ?? workspaceRepos.clonePaths,
     },
   }
+}
+
+function normalizePreviewConfig<T extends z.infer<typeof previewSchema>>(preview: T): T {
+  if (!preview) return preview
+  return {
+    ...preview,
+    registryPath: expandLeadingTilde(preview.registryPath, 'preview.registryPath'),
+  } as T
 }
 
 function validateClonePathSyntax(input: Record<string, unknown>, field: string): void {
@@ -478,3 +567,5 @@ function asOptionalConfigRecord(value: unknown): Record<string, unknown> {
 export type WorkspaceConfig = z.infer<typeof WorkspaceConfigSchema>
 export type NodeConfig = z.infer<typeof NodeConfigSchema>
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>
+export type PreviewConfig = NonNullable<FactoryConfig['preview']>
+export type PreviewServiceConfig = PreviewConfig['services'][string]

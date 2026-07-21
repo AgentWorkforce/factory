@@ -75,6 +75,19 @@ export type BabysitterSessionState = {
   path?: string
   critical: boolean
   pendingKinds: string[]
+  /** Durable Relayfile subscription identity, if the workspace supports it. */
+  resourceSubscription?: {
+    subscriptionId: string
+    provider: string
+    resourceRef: string
+    subscriberId: string
+    ownerId: string
+    expiresAt: string
+    /** Terminal delivery accepted or awaiting acceptance; never renew this record. */
+    terminal?: boolean
+  }
+  /** Claims already queued locally but not yet accepted by Relayfile. */
+  pendingDeliveryClaims?: Array<{ deliveryId: string; claimToken: string }>
 }
 
 export type ConversationMessage = {
@@ -130,6 +143,7 @@ export type DispatchLifecyclePhase =
   | 'queued'
   | 'dispatching'
   | 'retryable'
+  | 'abandoning'
   | 'running'
   | 'parking'
   | 'waiting-for-human'

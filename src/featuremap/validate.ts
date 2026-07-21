@@ -23,6 +23,7 @@ export interface ManifestFeature {
 export interface FeatureManifestValidation {
   version: string
   categoryCount: number
+  categoryIds: string[]
   features: ManifestFeature[]
   verificationDocument?: string
   categoryProcedures: Record<string, string>
@@ -121,6 +122,7 @@ export function validateFeatureManifest(
   return {
     version,
     categoryCount: categoryIds.length,
+    categoryIds,
     features,
     ...(verification.document ? { verificationDocument: verification.document } : {}),
     categoryProcedures: verification.categoryProcedures,

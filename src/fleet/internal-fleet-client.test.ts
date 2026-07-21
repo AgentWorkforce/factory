@@ -704,7 +704,13 @@ describe('InternalFleetClient', () => {
   it('surfaces the broker pid as protected process state', async () => {
     const harness = new FakeHarnessDriverClient()
     harness.brokerPid = 68009
-    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      // Keep the unit isolated from an AGENT_RELAY_STATE_DIR inherited by the
+      // test process; this assertion is specifically about the injected client.
+      connectionPath: '/worktree/.agentworkforce/relay/missing-connection.json',
+    })
 
     await expect(fleet.protectedPids()).resolves.toEqual([68009])
   })

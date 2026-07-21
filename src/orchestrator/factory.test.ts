@@ -27,14 +27,22 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { AgentWorktree, AgentWorktreeManager, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
+import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
 import { githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
+import {
+  ResourceSubscriptionsUnavailableError,
+  type AcceptedResourceDelivery,
+  type ResourceDeliveryClaim,
+  type ResourceSubscription,
+  type ResourceSubscriptionInput,
+  type ResourceSubscriptionsClient,
+} from '../subscriptions'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { ConversationMessage, ConversationSessionState, DispatchLifecycle } from '../ports/state'
 
@@ -62,6 +70,9 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
   // intentionally omitted so terminalState: 'human-review' falls back to done
   // unless a test opts in — preserving the prior default behavior.
   stateIds: { readyForAgent: ready, agentImplementing: implementing, done, inPlanning: planning },
+  // Most orchestrator fixtures use virtual clone paths. Gate-specific tests opt
+  // back in with an injected verifier so no unit test reaches a live cluster.
+  verification: { enabled: false },
   ...overrides,
 })
 
@@ -704,6 +715,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   override readonly lifecycleActionName = 'factory.lifecycle'
   exitImplementerOnReconcile = false
 
+  override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    return { ...await super.createPreview(input), node: 'sf-mini' }
+  }
+
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     const result = await super.spawn(input)
     return { ...result, node: 'sf-mini', locality: 'remote' }
@@ -909,6 +924,44 @@ class ScriptedGithubMergeGate implements GithubMergeGatePort {
   async merge(input: GithubMergeInput): Promise<{ merged: boolean; reason: string }> {
     this.merges.push(input)
     return this.#mergeResult
+  }
+}
+
+class ScriptedVerificationGate implements VerificationGate {
+  readonly inputs: VerificationGateInput[] = []
+
+  constructor(readonly passed: boolean) {}
+
+  async verify(input: VerificationGateInput): Promise<VerificationVerdict> {
+    this.inputs.push(input)
+    const stage = { status: this.passed ? 'pass' as const : 'fail' as const, durationMs: 1 }
+    return {
+      status: this.passed ? 'pass' : 'fail',
+      passed: this.passed,
+      reason: this.passed ? 'green fixture' : 'red fixture',
+      evidence: {
+        contract: 'factory.verification.evidence.v1',
+        runId: 'verification-test',
+        repository: input.repository,
+        repositoryPath: input.repositoryPath,
+        descriptorPath: `${input.repositoryPath}/.factory/verification-stack.yaml`,
+        expectedHeadSha: input.expectedHeadSha,
+        environmentId: 'factory-verify-test',
+        namespace: 'factory-verify-test',
+        startedAt: '2026-07-21T00:00:00.000Z',
+        completedAt: '2026-07-21T00:00:01.000Z',
+        timedOut: false,
+        stages: {
+          resolve: stage,
+          provision: stage,
+          deploy: stage,
+          e2e: { ...stage, exitCode: this.passed ? 0 : 1 },
+          load: stage,
+          evaluate: stage,
+          teardown: { status: 'pass', durationMs: 1 },
+        },
+      },
+    }
   }
 }
 
@@ -1523,6 +1576,8 @@ class CloudWritebackFakeMountClient extends FakeMountClient {
 class RecordingWorktreeManager implements AgentWorktreeManager {
   readonly prepared: AgentWorktree[] = []
   readonly cleaned: AgentWorktree[] = []
+  readonly listed: AgentWorktree[] = []
+  readonly inspections = new Map<string, AgentWorktreeCleanupInspection>()
   cleanupAttempts = 0
   failCleanups = 0
   onCleanup?: () => void
@@ -1539,6 +1594,17 @@ class RecordingWorktreeManager implements AgentWorktreeManager {
       throw new Error('transient worktree cleanup failure')
     }
     this.cleaned.push(structuredClone(worktree))
+  }
+
+  async listWorktrees(repository: AgentWorktreeRepository): Promise<AgentWorktree[]> {
+    return this.listed
+      .filter((worktree) =>
+        worktree.repo === repository.repo && worktree.baseClonePath === repository.baseClonePath)
+      .map((worktree) => structuredClone(worktree))
+  }
+
+  async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
+    return structuredClone(this.inspections.get(worktree.worktreePath) ?? { bytes: 0, retentionReasons: [] })
   }
 }
 
@@ -1681,6 +1747,30 @@ class RecoveringSlackRootMountClient extends CloudWritebackFakeMountClient {
 }
 
 describe('FactoryLoop', () => {
+  it('sweeps preview orphans on daemon startup using durable active issue owners', async () => {
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {},
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(fleet.previewSweeps).toEqual([{
+      namespace: 'factory-test',
+      activeOwners: [],
+      activePreviewIds: [],
+    }])
+    await factory.stop()
+  })
+
   it('parses wrapped Linear issue records', () => {
     expect(parseLinearIssue(issuePath(1), issueFile(1))).toMatchObject({
       uuid: 'uuid-1',
@@ -4910,9 +5000,19 @@ describe('FactoryLoop', () => {
     const path = issuePath(585)
     const issue = issueFile(585)
     const stateStore = new RejectFirstLifecycleSaveStore({ batchSize: 2 })
-    const factory = createFactory(config(), {
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount: new FakeMountClient({ [path]: issue }),
-      fleet: new RemoteLifecycleFleetClient(),
+      fleet,
       stateStore,
       triage: new StaticTriage(),
     })
@@ -4922,12 +5022,197 @@ describe('FactoryLoop', () => {
     const key = issueKey(decision.issue)
     const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(fleet.previewRemovals).toEqual([])
 
     await factory.stop()
 
     const afterStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(afterStop?.lease?.leaseUntilMs).toBe(Number.MIN_SAFE_INTEGER)
   })
+
+  it('checks the durable fence again immediately before spawning a preview-bearing team', async () => {
+    class RejectSecondLifecycleSaveStore extends InMemoryStateStore {
+      saves = 0
+
+      override async saveDispatchLifecycle(
+        ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+      ): Promise<boolean> {
+        this.saves += 1
+        if (this.saves === 2) return false
+        return await super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const path = issuePath(586)
+    const issue = issueFile(586)
+    const stateStore = new RejectSecondLifecycleSaveStore({ batchSize: 2 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+    await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost immediately before spawning')
+
+    expect(stateStore.saves).toBe(2)
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(fleet.previewRemovals).toEqual([])
+    expect(fleet.spawns).toEqual([])
+    await factory.stop()
+  })
+
+  it('retries preview teardown before terminalizing a lifecycle whose source is already terminal', async () => {
+    class FailOncePreviewRemovalFleetClient extends RemoteLifecycleFleetClient {
+      failuresRemaining = 1
+
+      override async removePreview(preview: PreviewReference): Promise<boolean> {
+        this.previewRemovals.push(structuredClone(preview))
+        if (this.failuresRemaining > 0) {
+          this.failuresRemaining -= 1
+          return false
+        }
+        return true
+      }
+    }
+
+    const path = issuePath(587)
+    const mount = new FakeMountClient({ [path]: issueFile(587) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previewConfig = {
+      stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: planning },
+      babysitter: { enabled: true },
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const first = createFactory(config(previewConfig), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await first.triageIssue(parseLinearIssue(path, issueFile(587)))
+    await first.dispatch(decision)
+    await first.stop()
+
+    // A manually terminal Done issue has no persisted, exact merged PR to
+    // reconcile. Babysitter mode must not mistake it for a merge-in-progress
+    // restart and leak its preview indefinitely.
+    mount.files.set(path, { content: issueFile(587, done) })
+    const cleanupFleet = new FailOncePreviewRemovalFleetClient()
+    const restarted = createFactory(config(previewConfig), {
+      mount,
+      fleet: cleanupFleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    try {
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      expect(cleanupFleet.previewRemovals).toHaveLength(1)
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'running' })
+
+      await vi.waitFor(() => expect(cleanupFleet.previewRemovals).toHaveLength(2), { timeout: 4_000 })
+      await vi.waitFor(async () => expect(
+        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      expect(cleanupFleet.spawns).toEqual([])
+    } finally {
+      await restarted.stop()
+    }
+  }, 8_000)
+
+  it('recovers terminal dispatch cleanup from the durable abandoning phase without respawning', async () => {
+    class FailingDispatchAndRemovalFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        this.spawns.push(input)
+        throw new Error('terminal spawn failure')
+      }
+
+      override async removePreview(preview: PreviewReference): Promise<boolean> {
+        this.previewRemovals.push(structuredClone(preview))
+        return false
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-abandoning-preview-recovery-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const path = issuePath(589)
+    const issue = issueFile(589)
+    const mount = new FakeMountClient({ [path]: issue })
+    const previewConfig = {
+      dispatch: { errorCooldownMs: 0, maxAttempts: 1 },
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const failingFleet = new FailingDispatchAndRemovalFleetClient()
+    const first = createFactory(config(previewConfig), {
+      mount,
+      fleet: failingFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      const key = issueKey(decision.issue)
+
+      await expect(first.dispatch(decision)).rejects.toThrow('terminal spawn failure')
+      await expect(state().getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({
+        phase: 'abandoning',
+        releaseReason: 'dispatch failed',
+      })
+      expect(failingFleet.previewStarts).toHaveLength(1)
+      expect(failingFleet.previewRemovals).toHaveLength(1)
+      await first.stop()
+
+      const cleanupFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(config(previewConfig), {
+        mount,
+        fleet: cleanupFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(
+        await state().getDispatchLifecycle('factory-test', key),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      expect(cleanupFleet.previewRemovals).toHaveLength(1)
+      expect(cleanupFleet.spawns).toEqual([])
+      expect(cleanupFleet.releases).toEqual([{ name: 'ar-589-impl-pear', reason: 'issue-abandoned' }])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 8_000)
 
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
@@ -5269,9 +5554,19 @@ describe('FactoryLoop', () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-duplicate-owner-'))
     const watchStatePath = join(root, 'state.json')
     const mount = new FakeMountClient({ [issuePath(85)]: issueFile(85) })
+    const previewConfig = {
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
     try {
       const firstFleet = new RemoteLifecycleFleetClient()
-      const first = createFactory(config(), {
+      const first = createFactory(config(previewConfig), {
         mount,
         fleet: firstFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
@@ -5281,7 +5576,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       const duplicateFleet = new RemoteLifecycleFleetClient()
-      const duplicate = createFactory(config(), {
+      const duplicate = createFactory(config(previewConfig), {
         mount: new FakeMountClient({ [issuePath(85)]: issueFile(85) }),
         fleet: duplicateFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
@@ -5289,7 +5584,9 @@ describe('FactoryLoop', () => {
       })
       await expect(duplicate.dispatch(decision)).rejects.toThrow(/lifecycle is owned by/)
       expect(firstFleet.spawns).toHaveLength(2)
+      expect(firstFleet.previewStarts).toHaveLength(1)
       expect(duplicateFleet.spawns).toEqual([])
+      expect(duplicateFleet.previewStarts).toEqual([])
       await first.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -5316,7 +5613,18 @@ describe('FactoryLoop', () => {
     }, githubWrite)
     const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
     const firstFleet = new RemoteLifecycleFleetClient()
-    const first = createFactory(config({ batchSize: 1 }), {
+    const previewConfig = {
+      batchSize: 1,
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const first = createFactory(config(previewConfig), {
       mount,
       fleet: firstFleet,
       stateStore: state(),
@@ -5331,11 +5639,12 @@ describe('FactoryLoop', () => {
       await first.dispatch(running)
       await first.dispatch(queued)
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-985-impl-pear', 'ar-985-review'])
+      expect(firstFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-985'])
       expect(await state().getDispatchLifecycle('factory-test', issueKey(queued.issue))).toMatchObject({ phase: 'queued' })
 
       clock.advance(5 * 60_000 + 1)
       const restartedFleet = new RemoteLifecycleFleetClient()
-      restarted = createFactory(config({ batchSize: 1 }), {
+      restarted = createFactory(config(previewConfig), {
         mount,
         fleet: restartedFleet,
         stateStore: state(),
@@ -5346,11 +5655,13 @@ describe('FactoryLoop', () => {
       await restarted.start({ mode: 'dispatch-owner' })
       await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.spawns).toEqual([])
+      expect(restartedFleet.previewStarts).toEqual([])
       expect(restarted.status().counters.dispatchLifecycleCapacityWaits).toBe(1)
 
       restartedFleet.emitAgentExit('ar-985-impl-pear', 'exited')
       await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
         .toEqual(['ar-986-impl-pear', 'ar-986-review']), { timeout: 4_000 })
+      expect(restartedFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-986'])
       await first.stop()
     } finally {
       await restarted?.stop()
@@ -9646,6 +9957,20 @@ describe('FactoryLoop', () => {
   )
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
+    class OrderedPreviewFleetClient extends FakeFleetClient {
+      readonly terminalEvents: string[] = []
+
+      override async removePreview(preview: PreviewReference): Promise<boolean> {
+        this.terminalEvents.push('preview:remove')
+        return await super.removePreview(preview)
+      }
+
+      override async release(name: string, reason?: string): Promise<void> {
+        this.terminalEvents.push(`agent:release:${name}`)
+        await super.release(name, reason)
+      }
+    }
+
     const publishInputs: GithubPublishPullRequestInput[] = []
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => {
@@ -9664,16 +9989,52 @@ describe('FactoryLoop', () => {
       [issuePath(52)]: issueFile(52),
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
     }, githubWrite)
-    const fleet = new FakeFleetClient()
-    const factory = createFactory(config(), {
+    const fleet = new OrderedPreviewFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {
+          'AgentWorkforce/pear': {
+            port: 3_000,
+            httpsPort: 10_052,
+            startCommand: 'npm run dev -- --host 127.0.0.1',
+          },
+        },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
+      linear: {
+        async postComment() {},
+        async setState(_issue, stateId) {
+          fleet.terminalEvents.push(`state:${stateId}`)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
       probePrResolver: async () => undefined,
       probePrGhRunner: async () => { throw new Error('gh must not be invoked for PR publication') },
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
+    expect(fleet.previewStarts).toEqual([expect.objectContaining({
+      issueKey: 'AR-52',
+      repo: 'AgentWorkforce/pear',
+      targetPort: 3_000,
+      preferredHttpsPort: 10_052,
+    })])
+    expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
+    expect(fleet.spawns[0]?.task).toContain('Factory is supervising `npm run dev -- --host 127.0.0.1`')
+    expect(fleet.spawns[1]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
     fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
@@ -9682,9 +10043,88 @@ describe('FactoryLoop', () => {
       clonePath: '/work/pear',
       baseRef: 'main',
       title: 'AR-52: [factory-e2e] Fix factory issue 52',
-      body: expect.stringContaining('Factory issue AR-52'),
+      body: expect.stringContaining('Live preview: https://factory-node.tailnet.ts.net:10052/'),
     }])
+    await vi.waitFor(() => expect(fleet.previewRemovals).toHaveLength(1))
+    await vi.waitFor(() => expect(fleet.releases).toHaveLength(2))
+    expect(fleet.terminalEvents.indexOf(`state:${done}`)).toBeLessThan(
+      fleet.terminalEvents.indexOf('preview:remove'),
+    )
+    expect(fleet.terminalEvents.indexOf('preview:remove')).toBeLessThan(
+      fleet.terminalEvents.indexOf('agent:release:ar-52-impl-pear'),
+    )
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+  })
+
+  it('prepares a fresh issue worktree before running a bootstrap-inclusive preview command', async () => {
+    const worktrees = new RecordingWorktreeManager()
+    class WorktreeObservingPreviewFleetClient extends FakeFleetClient {
+      preparedCounts: number[] = []
+
+      override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+        this.preparedCounts.push(worktrees.prepared.length)
+        return await super.createPreview(input)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(50)]: issueFile(50) })
+    const fleet = new WorktreeObservingPreviewFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: {
+          'AgentWorkforce/pear': {
+            port: 3_000,
+            startCommand: 'npm ci && exec npm run dev',
+          },
+        },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(50), issueFile(50))))
+
+    expect(fleet.preparedCounts).toEqual([1])
+    expect(fleet.previewStarts).toEqual([expect.objectContaining({
+      checkoutPath: worktrees.prepared[0]?.worktreePath,
+      startCommand: 'npm ci && exec npm run dev',
+    })])
+    expect(fleet.spawns.every((spawn) => spawn.cwd === worktrees.prepared[0]?.worktreePath)).toBe(true)
+  })
+
+  it('refuses to surface a preview reference that is not credential-free HTTPS', async () => {
+    class InsecurePreviewFleetClient extends FakeFleetClient {
+      override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+        const preview = await super.createPreview(input)
+        return { ...preview, url: `http://factory-node.tailnet.ts.net:${preview.httpsPort}/` }
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(53)]: issueFile(53) })
+    const fleet = new InsecurePreviewFleetClient()
+    const factory = createFactory(config({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(53), issueFile(53)))))
+      .rejects.toThrow('provider URL is not credential-free HTTPS')
+    expect(fleet.spawns).toEqual([])
+    expect(fleet.previewRemovals).toHaveLength(1)
   })
 
   it('uses the configured repo owner and mounted default branch for PR publication', async () => {
@@ -11329,6 +11769,7 @@ describe('FactoryLoop', () => {
     })
     const fleet = new FakeFleetClient()
     const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-approved-sha')])
+    const verificationGate = new ScriptedVerificationGate(true)
     const factory = createFactory(config({
       mergePolicy: 'on-green-with-review',
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -11338,6 +11779,7 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       linear: stateOnlyLinear(mount),
       mergeGate: gate,
+      verificationGate,
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(242), realMergeIssueFile(242))))
@@ -11348,8 +11790,49 @@ describe('FactoryLoop', () => {
       number: 242,
       expectedHeadSha: 'green-approved-sha',
     }])
+    expect(verificationGate.inputs).toEqual([{
+      repository: 'AgentWorkforce/pear',
+      repositoryPath: '/work/pear',
+      issueKey: 'AR-242',
+      expectedHeadSha: 'green-approved-sha',
+    }])
+    expect(factory.status().counters.verificationGatePassed).toBe(1)
     expect(factory.status().counters.mergeGateMerged).toBe(1)
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('PR-state sweep blocks merge when live-stack verification is red', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(244)]: realMergeIssueFile(244),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/244.json': prFile(244, {
+        title: 'Real product issue 244',
+        head_ref: 'ar-244-real-fix',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-approved-sha')])
+    const verificationGate = new ScriptedVerificationGate(false)
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+      verificationGate,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(244), realMergeIssueFile(244))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(verificationGate.inputs).toHaveLength(1)
+    expect(gate.merges).toEqual([])
+    expect(factory.status().counters.verificationGateFailed).toBe(1)
+    expect(factory.status().counters.mergeGateMerged).toBeUndefined()
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-244', key: 'AR-244', path: issuePath(244) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(244), content: { stateId: done } })
   })
 
   it('PR-state sweep does not complete on a wrong PR or draft PR', async () => {
@@ -11711,9 +12194,11 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(20), realMergeIssueFile(20))))
     fleet.emitAgentExit('ar-20-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-20-impl-pear', 'ar-20-review']))
-    expect(gate.checks).toHaveLength(12)
+    await vi.waitFor(() => expect(gate.checks).toHaveLength(12))
     expect(gate.merges).toEqual([])
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(20), content: { stateId: done } })
   })
 
   it('aborts a real PR merge when the guarded head commit has drifted', async () => {
@@ -11737,7 +12222,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), realMergeIssueFile(21))))
     fleet.emitAgentExit('ar-21-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-21-impl-pear', 'ar-21-review']))
+    await vi.waitFor(() => expect(gate.merges).toHaveLength(1))
     expect(gate.merges).toEqual([{
       repo: 'AgentWorkforce/pear',
       number: 21,
@@ -11745,6 +12230,9 @@ describe('FactoryLoop', () => {
     }])
     expect(factory.status().counters.mergeGateMergeAborted).toBe(1)
     expect(factory.status().counters.mergeGateMerged).toBeUndefined()
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-21', key: 'AR-21', path: issuePath(21) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(21), content: { stateId: done } })
   })
 
   it('merges a real PR once checks are green, review is approved, and head still matches', async () => {
@@ -12401,7 +12889,17 @@ describe('FactoryLoop', () => {
     const mount = new SlackSyncStatusMount({ [issuePath(47)]: issueFile(47) })
     mount.slackStatus = { provider: 'slack', lastEventAt: new Date().toISOString() }
     const fleet = new FakeFleetClient()
-    const factory = createFactory(config({ slack: slackConfig() }), {
+    const factory = createFactory(config({
+      slack: slackConfig(),
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { pear: { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -12410,10 +12908,16 @@ describe('FactoryLoop', () => {
     const report = await factory.runOnce()
 
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-47'])
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(report.dispatched[0]?.previews).toHaveLength(1)
+    expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(report.slackDegraded).toBe(false)
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-47: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain(
+      'Live preview (AgentWorkforce/pear, tailnet access required): https://factory-node.tailnet.ts.net:10000/',
+    )
     expect(factory.status().slackDegraded).toBe(false)
   })
 
@@ -15283,7 +15787,17 @@ describe('FactoryLoop', () => {
     const fleet = new FakeFleetClient()
     fleet.setSessionRef('ar-80-impl-pear', 'session-ar-80-impl-pear')
     const slack = new RecordingSlack()
-    const factory = createFactory(config({ slack: slackConfig() }), {
+    const factory = createFactory(config({
+      slack: slackConfig(),
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -15291,12 +15805,22 @@ describe('FactoryLoop', () => {
       stateStore: state,
     })
 
-    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(80), issueFile(80))))
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(80), issueFile(80))))
     await flush()
     await flush()
 
+    expect(fleet.previewStarts).toHaveLength(1)
+    expect(result.previews).toHaveLength(1)
     // The thread already exists, so no new root thread is posted...
     expect(slack.roots).toEqual([])
+    // ...and the newly created preview is still surfaced to that durable
+    // thread instead of being lost because the root predates this process.
+    expect(slackReplyWrites(mount)).toEqual([expect.objectContaining({
+      content: expect.objectContaining({
+        thread_ts: persistedThread,
+        text: 'Live preview (AgentWorkforce/pear, tailnet access required): https://factory-node.tailnet.ts.net:10000/',
+      }),
+    })])
     // ...but the reply watcher is re-armed against the persisted thread.
     expect(factory.status().counters.slackWatchersRearmed).toBe(1)
 
@@ -15620,8 +16144,10 @@ describe('FactoryLoop', () => {
       user_is_bot: false,
     })
     await expectSlackConversationResume(fleet, ['status?', 'status again?'], 2)
-    expect(factory.status().counters.slackConversationTurnResumeFailures).toBe(1)
-    expect(factory.status().counters.slackConversationTurnsResumed).toBe(1)
+    await vi.waitFor(() => {
+      expect(factory.status().counters.slackConversationTurnResumeFailures).toBe(1)
+      expect(factory.status().counters.slackConversationTurnsResumed).toBe(1)
+    })
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
@@ -15700,6 +16226,99 @@ describe('FactoryLoop PR babysitter', () => {
     })
   }
 
+  class FakeResourceSubscriptions implements ResourceSubscriptionsClient {
+    readonly createCalls: Array<{ workspaceId: string; input: ResourceSubscriptionInput }> = []
+    readonly claimCalls: Array<{ workspaceId: string; limit?: number }> = []
+    readonly accepted: Array<{ workspaceId: string; deliveryId: string; claimToken: string }> = []
+    readonly cancelled: Array<{ workspaceId: string; subscriptionId: string }> = []
+    readonly records: ResourceSubscription[] = []
+    claims: ResourceDeliveryClaim[] = []
+    readonly leasedClaims = new Map<string, ResourceDeliveryClaim>()
+    readonly acceptedClaims = new Map<string, { claimToken: string; receipt: AcceptedResourceDelivery }>()
+    ownerId = 'configured-factory-agent'
+    unavailable = false
+    createFailure?: Error
+    claimFailure?: Error
+    onAccept?: (deliveryId: string) => Promise<void> | void
+
+    async createOrRenew(workspaceId: string, input: ResourceSubscriptionInput): Promise<ResourceSubscription> {
+      if (this.unavailable) throw new ResourceSubscriptionsUnavailableError()
+      if (this.createFailure) throw this.createFailure
+      this.createCalls.push({ workspaceId, input: structuredClone(input) })
+      const identity = JSON.stringify([input.subscriberId, input.resourceRef, [...input.eventTypes].sort()])
+      let record = this.records.find((candidate) => JSON.stringify([
+        candidate.subscriberId,
+        candidate.resourceRef,
+        [...candidate.eventTypes].sort(),
+      ]) === identity)
+      if (!record) {
+        record = {
+          ...structuredClone(input),
+          ownerId: this.ownerId,
+          eventTypes: [...input.eventTypes].sort(),
+          subscriptionId: `sub-${this.records.length + 1}`,
+          expiresAt: '2026-12-31T00:00:00.000Z',
+        }
+        this.records.push(record)
+      }
+      return structuredClone(record)
+    }
+
+    claimFor(
+      subscription: ResourceSubscription,
+      eventType: string,
+      deliveryId: string,
+    ): ResourceDeliveryClaim {
+      return {
+        deliveryId,
+        claimToken: `claim-token-${deliveryId}`,
+        subscriptionId: subscription.subscriptionId,
+        provider: subscription.provider,
+        resourceRef: subscription.resourceRef,
+        eventType,
+        ownerId: subscription.ownerId,
+        subscriberId: subscription.subscriberId,
+        terminal: subscription.terminalEventTypes?.includes(eventType) === true,
+      }
+    }
+
+    async claimDeliveryClaims(workspaceId: string, input?: { limit?: number }): Promise<ResourceDeliveryClaim[]> {
+      if (this.unavailable) throw new ResourceSubscriptionsUnavailableError()
+      if (this.claimFailure) throw this.claimFailure
+      this.claimCalls.push({ workspaceId, ...input })
+      // Model Relayfile's atomic claim lease: overlapping runtime polls can
+      // observe a delivery at most once, independent of client-side locking.
+      const claimed = this.claims.splice(0, input?.limit ?? this.claims.length)
+      for (const claim of claimed) this.leasedClaims.set(claim.deliveryId, claim)
+      return claimed.map((claim) => structuredClone(claim))
+    }
+
+    async acceptDelivery(
+      workspaceId: string,
+      input: { deliveryId: string; claimToken: string },
+    ): Promise<AcceptedResourceDelivery> {
+      if (this.unavailable) throw new ResourceSubscriptionsUnavailableError()
+      const accepted = this.acceptedClaims.get(input.deliveryId)
+      if (accepted) {
+        if (accepted.claimToken !== input.claimToken) throw new Error(`claim ${input.deliveryId} has an invalid token`)
+        this.accepted.push({ workspaceId, ...input })
+        return structuredClone(accepted.receipt)
+      }
+      const claim = this.leasedClaims.get(input.deliveryId)
+      if (!claim) throw new Error(`claim ${input.deliveryId} is unavailable`)
+      if (claim.claimToken !== input.claimToken) throw new Error(`claim ${input.deliveryId} has an invalid token`)
+      this.accepted.push({ workspaceId, ...input })
+      const receipt = { deliveryId: claim.deliveryId, subscriptionId: claim.subscriptionId, terminal: claim.terminal }
+      this.acceptedClaims.set(input.deliveryId, { claimToken: input.claimToken, receipt })
+      await this.onAccept?.(input.deliveryId)
+      this.leasedClaims.delete(input.deliveryId)
+      return structuredClone(receipt)
+    }
+
+    async cancel(workspaceId: string, input: { subscriptionId: string }): Promise<void> {
+      this.cancelled.push({ workspaceId, ...input })
+    }
+  }
   it('releases a weak-match babysitter when exact branch reconciliation proves a different PR', async () => {
     const issue = realIssueFile(495, ready, { title: 'Real exact PR ownership' })
     const mount = new FakeMountClient({ [issuePath(495)]: issue }, {
@@ -16255,6 +16874,43 @@ describe('FactoryLoop PR babysitter', () => {
     expect(factory.status().inFlight.map((ref) => ref.key)).toEqual(['AR-401'])
   })
 
+  it('pins a remote babysitter to the preview node and gives it the live URL', async () => {
+    class RemotePreviewFleetClient extends RemoteLifecycleFleetClient {
+      override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+        return { ...await super.createPreview(input), node: 'preview-node' }
+      }
+    }
+
+    const issue = realIssueFile(402, ready, { title: 'Real remote preview babysitter handoff' })
+    const mount = new FakeMountClient({ [issuePath(402)]: issue })
+    const fleet = new RemotePreviewFleetClient()
+    const factory = createFactory(babysitterConfig({
+      preview: {
+        provider: 'tailscale-serve',
+        access: 'tailnet',
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999],
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 402 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(402), issue)))
+    fleet.emitAgentExit('ar-402-impl-pear', 'worker_exited')
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-402-babysit'))
+    const babysitter = fleet.spawns.find((spawn) => spawn.name === 'ar-402-babysit')!
+    expect(babysitter.node).toBe('preview-node')
+    expect(babysitter.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-impl-pear')?.task)
+      .toContain('Factory is supervising `npm run dev` in this checkout on local port 3000')
+  })
+
   it('retargets an owned Slack conversation session onto the babysitter once it takes over from the implementer', async () => {
     const issue = realIssueFile(404, ready, { title: 'Real babysitter conversation handoff' })
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(404)]: issue })
@@ -16357,6 +17013,402 @@ describe('FactoryLoop PR babysitter', () => {
     expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
   })
 
+  it('uses Relayfile by-id delivery claims for renamed PR activity, renews idempotently, and retires terminal claims after the local queue is durable', async () => {
+    const number = 604
+    const issue = realIssueFile(number, ready, { title: 'Real durable resource babysitter' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const renamedCommentPath = `/github/repos/AgentWorkforce/pear/pulls/${number}__renamed-after-review/comments/6041.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage(), stateStore: state })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'durable-pr-open'))
+      await flush()
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+
+      const [[sessionKey, initialSession]] = await state.listBabysitterSessions('factory-test')
+      expect(initialSession.resourceSubscription).toMatchObject({
+        resourceRef: `/github/repos/AgentWorkforce__pear/pulls/by-id/${number}.json`,
+        ownerId: 'configured-factory-agent',
+        subscriberId: `factory-babysitter:uuid-${number}`,
+      })
+      const subscription = initialSession.resourceSubscription!
+      expect(subscriptions.createCalls[0]?.input).toMatchObject({
+        eventTypes: expect.arrayContaining(['pull_request_review_comment.created']),
+        terminalEventTypes: ['pull_request.closed'],
+      })
+      expect(subscriptions.createCalls[0]?.input.eventTypes).not.toContain('pull_request.closed')
+      subscriptions.claims = [
+        {
+          deliveryId: 'delivery-unowned',
+          claimToken: 'claim-token-unowned',
+          subscriptionId: 'sub-unowned',
+          resourceRef: '/github/repos/AgentWorkforce__pear/pulls/by-id/999.json',
+          eventType: 'pull_request_review_comment.created',
+          ownerId: 'configured-factory-agent',
+          subscriberId: 'factory-babysitter:unowned',
+          provider: 'github',
+          terminal: false,
+        },
+        subscriptions.claimFor(subscription, 'pull_request_review_comment.created', 'delivery-renamed'),
+      ]
+      let sessionAtAcceptance: Awaited<ReturnType<typeof state.listBabysitterSessions>> | undefined
+      subscriptions.onAccept = async (deliveryId) => {
+        if (deliveryId === 'delivery-renamed') sessionAtAcceptance = await state.listBabysitterSessions('factory-test')
+      }
+
+      // The raw path carries a new title slug. Factory does not transform it or
+      // scan its local owners: the service's stable by-id delivery claim picks
+      // the one session that must wake.
+      // Two raw events may race in the runtime; the service lease gives the
+      // babysitter one delivery and therefore one injected wake.
+      mount.emit(changeEvent(renamedCommentPath, 'renamed-pr-comment-a'))
+      mount.emit(changeEvent(renamedCommentPath, 'renamed-pr-comment-b'))
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')),
+      ).toHaveLength(1))
+      expect(fleet.messages.find((message) => message.text.startsWith('<integration-event'))?.to).toBe(`ar-${number}-babysit`)
+      expect(subscriptions.accepted.map((entry) => entry.deliveryId)).toEqual(['delivery-renamed'])
+      expect(sessionAtAcceptance?.find(([key]) => key === sessionKey)?.[1]).toMatchObject({
+        pendingKinds: ['pull-request-state'],
+        pendingDeliveryClaims: [{ deliveryId: 'delivery-renamed', claimToken: 'claim-token-delivery-renamed' }],
+      })
+      expect(factory.status().counters.babysitterResourceDeliveriesIgnoredUnowned).toBe(1)
+
+      // A duplicate PR observation renews the same server identity rather than
+      // making another subscription record. There is no claim, so no wake.
+      const renamedPrPath = `/github/repos/AgentWorkforce/pear/pulls/${number}__renamed-after-review/metadata.json`
+      mount.files.set(renamedPrPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(renamedPrPath, 'durable-pr-repeat'))
+      await vi.waitFor(() => expect(subscriptions.createCalls).toHaveLength(2))
+      expect(subscriptions.records).toHaveLength(1)
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(1)
+
+      const renewed = (await state.listBabysitterSessions('factory-test')).find(([key]) => key === sessionKey)![1]
+      subscriptions.claims = [subscriptions.claimFor(
+        subscriptions.records[0]!,
+        'pull_request.closed',
+        'delivery-terminal',
+      )]
+      let terminalSessionAtAcceptance: Awaited<ReturnType<typeof state.listBabysitterSessions>> | undefined
+      subscriptions.onAccept = async (deliveryId) => {
+        if (deliveryId === 'delivery-terminal') terminalSessionAtAcceptance = await state.listBabysitterSessions('factory-test')
+      }
+      mount.emit(changeEvent(renamedCommentPath, 'renamed-pr-terminal'))
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId))
+        .toEqual(['delivery-renamed', 'delivery-terminal']))
+      expect(terminalSessionAtAcceptance?.find(([key]) => key === sessionKey)?.[1].resourceSubscription).toMatchObject({
+        terminal: true,
+      })
+      expect((await state.listBabysitterSessions('factory-test')).find(([key]) => key === sessionKey)?.[1].resourceSubscription)
+        .toMatchObject({ terminal: true })
+      expect(factory.status().counters.babysitterResourceSubscriptionsRetiredTerminal).toBe(1)
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')),
+      ).toHaveLength(2))
+      const wakesAfterTerminal = fleet.messages.filter((message) => message.text.startsWith('<integration-event')).length
+
+      // The durable terminal marker prevents both a restart-time renewal and
+      // the legacy path router from reviving a retired PR session.
+      mount.emit(changeEvent(renamedPrPath, 'terminal-pr-repeat'))
+      mount.emit(changeEvent(renamedCommentPath, 'terminal-comment-repeat'))
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      expect(subscriptions.createCalls).toHaveLength(2)
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(wakesAfterTerminal)
+
+      // Even if a later deployment only exposes the old capability (404),
+      // the local fallback must not reawaken the terminal babysitter.
+      subscriptions.unavailable = true
+      mount.emit(changeEvent(renamedCommentPath, 'terminal-capability-fallback'))
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(wakesAfterTerminal)
+      expect(factory.status().counters.babysitterEventsIgnoredTerminal).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('falls back to the local babysitter router while the durable subscription API is unavailable', async () => {
+    const number = 605
+    const issue = realIssueFile(number, ready, { title: 'Real durable subscription fallback' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const commentPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/comments/6051.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    subscriptions.unavailable = true
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage() })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'fallback-pr-open'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
+
+      mount.emit(changeEvent(commentPath, 'fallback-comment'))
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).map((message) => message.to),
+      ).toEqual([`ar-${number}-babysit`]))
+      expect(factory.status().counters.babysitterResourceSubscriptionUnavailable).toBeGreaterThan(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('keeps local routing for an unregistered owner, then renews its durable subscription without double delivery', async () => {
+    vi.useFakeTimers()
+    const number = 610
+    const issue = realIssueFile(number, ready, { title: 'Real durable renewal' })
+    const commentPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/comments/6101.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const subscriptions = new FakeResourceSubscriptions()
+    subscriptions.createFailure = Object.assign(new Error('transient create failure'), { status: 503 })
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.waitFor(() => expect(
+        factory.status().counters.babysitterResourceSubscriptionRenewFailures,
+      ).toBe(1))
+      expect(subscriptions.records).toEqual([])
+
+      mount.emit(changeEvent(commentPath, 'unregistered-owner-comment'))
+      await vi.advanceTimersByTimeAsync(800)
+      expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).map((message) => message.to),
+      ).toEqual([`ar-${number}-babysit`])
+
+      subscriptions.createFailure = undefined
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(subscriptions.records).toHaveLength(1)
+
+      mount.emit(changeEvent(commentPath, 'registered-owner-comment'))
+      await vi.advanceTimersByTimeAsync(800)
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(1)
+      expect(subscriptions.claimCalls.length).toBeGreaterThan(0)
+
+      await vi.advanceTimersByTimeAsync(30 * 60_000)
+      expect(subscriptions.createCalls).toHaveLength(2)
+    } finally {
+      await factory.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('accepts a provider terminal claim before a closed PR tears down its local subscription owner', async () => {
+    const number = 607
+    const issue = realIssueFile(number, ready, { title: 'Real durable terminal close' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const state = new InMemoryStateStore({ batchSize: 2 })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore: state,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
+
+      const subscription = subscriptions.records[0]!
+      subscriptions.claims = [subscriptions.claimFor(subscription, 'pull_request.closed', 'delivery-close')]
+      mount.files.set(prPath, { content: { number, state: 'closed', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'terminal-close'))
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId)).toEqual(['delivery-close']))
+      expect(subscriptions.cancelled).toEqual([{
+        workspaceId: 'factory-test',
+        subscriptionId: subscription.subscriptionId,
+      }])
+      await expect(state.listBabysitterSessions('factory-test')).resolves.toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('reuses the persisted claim token after a crash following terminal acceptance', async () => {
+    class FailingTerminalAcceptancePersistStore extends InMemoryStateStore {
+      failFinalTerminalPersist = false
+
+      override async setBabysitterSession(...args: Parameters<InMemoryStateStore['setBabysitterSession']>): Promise<void> {
+        const [, , session] = args
+        if (
+          this.failFinalTerminalPersist &&
+          session.resourceSubscription?.terminal &&
+          !session.pendingDeliveryClaims?.length
+        ) {
+          this.failFinalTerminalPersist = false
+          throw new Error('process stopped after Relayfile accepted the terminal delivery')
+        }
+        await super.setBabysitterSession(...args)
+      }
+    }
+
+    const number = 609
+    const issue = realIssueFile(number, ready, { title: 'Real durable acceptance restart' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const state = new FailingTerminalAcceptancePersistStore({ batchSize: 2 })
+    const first = createFactory(babysitterConfig(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      stateStore: state,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+
+    try {
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'acceptance-restart-open'))
+      await flush()
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+
+      const subscription = subscriptions.records[0]!
+      subscriptions.claims = [subscriptions.claimFor(subscription, 'pull_request.closed', 'delivery-accepted-before-crash')]
+      state.failFinalTerminalPersist = true
+      mount.emit(changeEvent(`/github/repos/AgentWorkforce/pear/pulls/${number}/comments/6091.json`, 'acceptance-restart-terminal'))
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId))
+        .toEqual(['delivery-accepted-before-crash']))
+      await vi.waitFor(async () => expect(await state.listBabysitterSessions('factory-test')).toEqual([
+        [expect.any(String), expect.objectContaining({
+          resourceSubscription: expect.objectContaining({ terminal: true }),
+          pendingDeliveryClaims: [{
+            deliveryId: 'delivery-accepted-before-crash',
+            claimToken: 'claim-token-delivery-accepted-before-crash',
+          }],
+        })],
+      ]))
+      await first.stop()
+
+      restarted = createFactory(babysitterConfig(), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        stateStore: state,
+      })
+      await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId))
+        .toEqual(['delivery-accepted-before-crash', 'delivery-accepted-before-crash']))
+      await vi.waitFor(async () => {
+        const [[, restored]] = await state.listBabysitterSessions('factory-test')
+        expect(restored?.resourceSubscription).toMatchObject({ terminal: true })
+        expect(restored?.pendingDeliveryClaims).toBeUndefined()
+      })
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+    }
+  })
+
+  it('cancels the durable subscription before completion clears the babysitter owner', async () => {
+    const number = 608
+    const issue = realIssueFile(number, ready, { title: 'Real durable completion cancellation' })
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: number }),
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+      const subscription = subscriptions.records[0]!
+
+      fleet.emitAgentMessage({ from: `ar-${number}-babysit`, target: 'factory', body: `[factory-pr-ready] AR-${number}` })
+      await vi.waitFor(() => expect(subscriptions.cancelled).toEqual([{
+        workspaceId: 'factory-test',
+        subscriptionId: subscription.subscriptionId,
+      }]))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not double-route locally when an established durable delivery lookup is transiently unavailable', async () => {
+    const number = 606
+    const issue = realIssueFile(number, ready, { title: 'Real durable transient claim retry' })
+    const prPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`
+    const commentPath = `/github/repos/AgentWorkforce/pear/pulls/${number}__renamed/comments/6061.json`
+    const mount = new FakeMountClient({ [issuePath(number)]: issue })
+    const subscriptions = new FakeResourceSubscriptions()
+    mount.resourceSubscriptions = subscriptions
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), { mount, fleet, triage: new StaticTriage() })
+
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
+      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.emit(changeEvent(prPath, 'transient-pr-open'))
+      await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
+      const subscription = subscriptions.records[0]!
+
+      subscriptions.claimFailure = Object.assign(new Error('temporarily unavailable'), { status: 503 })
+      mount.emit(changeEvent(commentPath, 'transient-claim-event'))
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
+      expect(factory.status().counters.babysitterResourceDeliveryLookupFailures).toBe(1)
+
+      subscriptions.claimFailure = undefined
+      subscriptions.claims = [subscriptions.claimFor(
+        subscription,
+        'pull_request_review_comment.created',
+        'delivery-after-recovery',
+      )]
+      mount.emit(changeEvent(commentPath, 'recovered-claim-event'))
+      await vi.waitFor(() => expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).map((message) => message.to),
+      ).toEqual([`ar-${number}-babysit`]))
+      expect(subscriptions.accepted.map((entry) => entry.deliveryId)).toEqual(['delivery-after-recovery'])
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('publishes a ready PR and reaches Human Review through lifecycle actions without control identities', async () => {
     class LifecycleActionFleet extends FakeFleetClient {
       override readonly lifecycleActionName = 'factory.lifecycle'
@@ -16443,6 +17495,241 @@ describe('FactoryLoop PR babysitter', () => {
     expect(worktrees.cleaned).toHaveLength(1)
     expect(cleanupReleaseCounts).toEqual([3])
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('removes every clean worktree run for an issue when completion is fenced', async () => {
+    const issue = realIssueFile(412, ready, { title: 'Real multi-run worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(412)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 412, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 412 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(412), issue)))
+    const current = worktrees.prepared[0]
+    expect(current).toBeDefined()
+    const priorRun: AgentWorktree = {
+      ...current!,
+      worktreePath: '/work/.factory-worktrees/pear/ar-412-pear-11111111',
+      branch: 'factory/ar-412-pear-11111111',
+    }
+    worktrees.listed.push(priorRun)
+    fleet.emitAgentExit('ar-412-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-412-babysit'))
+    fleet.emitAgentMessage({ from: 'ar-412-babysit', target: 'factory', body: '[factory-pr-ready] AR-412' })
+
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+    expect(new Set(worktrees.cleaned.map((worktree) => worktree.worktreePath))).toEqual(new Set([
+      current!.worktreePath,
+      priorRun.worktreePath,
+    ]))
+    expect(factory.status().counters.agentWorktreesCleaned).toBe(2)
+  })
+
+  it('retains and logs a dirty extra run while removing clean completion worktrees', async () => {
+    const issue = realIssueFile(413, ready, { title: 'Real dirty multi-run worktree cleanup' })
+    const mount = new FakeMountClient({ [issuePath(413)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 413, { state: 'open', draft: false })
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      logger,
+      triage: new StaticTriage(),
+      worktrees,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 413 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(413), issue)))
+    const current = worktrees.prepared[0]
+    expect(current).toBeDefined()
+    const dirtyRun: AgentWorktree = {
+      ...current!,
+      worktreePath: '/work/.factory-worktrees/pear/ar-413-pear-22222222',
+      branch: 'factory/ar-413-pear-22222222',
+    }
+    worktrees.listed.push(dirtyRun)
+    worktrees.inspections.set(dirtyRun.worktreePath, { bytes: 512, retentionReasons: ['uncommitted changes'] })
+    fleet.emitAgentExit('ar-413-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-413-babysit'))
+    fleet.emitAgentMessage({ from: 'ar-413-babysit', target: 'factory', body: '[factory-pr-ready] AR-413' })
+
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+    expect(worktrees.cleaned.map((worktree) => worktree.worktreePath)).toEqual([current!.worktreePath])
+    expect(factory.status().counters.agentWorktreeCleanupRetained).toBe(1)
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[factory] retained completed issue worktree with local state',
+      expect.objectContaining({ worktreePath: dirtyRun.worktreePath, retentionReasons: ['uncommitted changes'] }),
+    )
+  })
+
+  it('reaps clean startup orphans and retains dirty ones with a reclaimed-size summary', async () => {
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const worktrees = new RecordingWorktreeManager()
+    const clean: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: 'ar-900',
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-900-pear-11111111',
+      branch: 'factory/ar-900-pear-11111111',
+    }
+    const dirty: AgentWorktree = {
+      ...clean,
+      issueKey: 'ar-901',
+      worktreePath: '/work/.factory-worktrees/pear/ar-901-pear-22222222',
+      branch: 'factory/ar-901-pear-22222222',
+    }
+    worktrees.listed.push(clean, dirty)
+    worktrees.inspections.set(clean.worktreePath, { bytes: 4096, retentionReasons: [] })
+    worktrees.inspections.set(dirty.worktreePath, { bytes: 1024, retentionReasons: ['uncommitted changes'] })
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config(), { mount, fleet, logger, worktrees, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(worktrees.cleaned.map((worktree) => worktree.worktreePath)).toEqual([clean.worktreePath])
+    expect(factory.status().counters.agentWorktreesReapedOnStartup).toBe(1)
+    expect(factory.status().counters.agentWorktreesCleaned).toBe(1)
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[factory] retained startup orphan worktree with local state',
+      expect.objectContaining({ worktreePath: dirty.worktreePath, retentionReasons: ['uncommitted changes'] }),
+    )
+    expect(logger.info).toHaveBeenCalledWith(
+      '[factory] startup worktree reaper completed',
+      { reaped: 1, reclaimedBytes: 4096, reclaimed: '4.00 KiB', retained: 1, failures: 0 },
+    )
+    await factory.stop()
+  })
+
+  it('retains a clean worktree for a durable issue waiting for human input on startup', async () => {
+    const issue = parseLinearIssue(issuePath(902), issueFile(902))
+    const decision = await new StaticTriage().triage(issue)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      issueKey(decision.issue),
+      {
+        runId: 'durable-waiting-run',
+        issue: decision.issue,
+        decision,
+        dryRun: false,
+        phase: 'waiting-for-human',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      },
+      'previous-owner',
+      0,
+      60_000,
+    )
+    const worktrees = new RecordingWorktreeManager()
+    const active: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: 'ar-902',
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-902-pear-11111111',
+      branch: 'factory/ar-902-pear-11111111',
+    }
+    worktrees.listed.push(active)
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      stateStore,
+      worktrees,
+      triage: new StaticTriage(),
+    })
+
+    await factory.start({ mode: 'backfill-and-subscribe' })
+
+    expect(worktrees.cleaned).toEqual([])
+    expect(factory.status().counters.agentWorktreesReapedOnStartup).toBeUndefined()
+    await factory.stop()
+  })
+
+  it('reaps a clean startup orphan referenced only by a stale legacy registry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-stale-legacy-worktree-'))
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issue = { uuid: 'uuid-903', key: 'AR-903', path: issuePath(903) }
+    await writeFile(registryPath, JSON.stringify({
+      pid: 99_903,
+      updatedAt: new Date(0).toISOString(),
+      updatedAtMs: 0,
+      agents: [{ name: 'ar-903-impl-pear', role: 'implementer', issue, pids: [] }],
+    }))
+    const worktrees = new RecordingWorktreeManager()
+    const orphan: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: issue.key,
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-903-pear-11111111',
+      branch: 'factory/ar-903-pear-11111111',
+    }
+    worktrees.listed.push(orphan)
+    const factory = createFactory(config({ loop: { registryPath, heartbeatPath } }), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      worktrees,
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(worktrees.cleaned).toEqual([orphan])
+      expect(factory.status().counters.agentWorktreesReapedOnStartup).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retains a clean startup worktree for an online legacy-registry agent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-online-legacy-worktree-'))
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issue = { uuid: 'uuid-904', key: 'AR-904', path: issuePath(904) }
+    const agentName = 'ar-904-impl-pear'
+    await writeFile(registryPath, JSON.stringify({
+      pid: 99_904,
+      updatedAt: new Date().toISOString(),
+      updatedAtMs: Date.now(),
+      agents: [{ name: agentName, role: 'implementer', issue, pids: [] }],
+    }))
+    const fleet = new FakeFleetClient()
+    fleet.hydrateTracked([{ name: agentName }])
+    const worktrees = new RecordingWorktreeManager()
+    const active: AgentWorktree = {
+      repo: 'AgentWorkforce/pear',
+      issueKey: issue.key,
+      baseClonePath: '/work/pear',
+      worktreePath: '/work/.factory-worktrees/pear/ar-904-pear-11111111',
+      branch: 'factory/ar-904-pear-11111111',
+    }
+    worktrees.listed.push(active)
+    const factory = createFactory(config({ loop: { registryPath, heartbeatPath } }), {
+      mount: new FakeMountClient(),
+      fleet,
+      worktrees,
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      expect(worktrees.cleaned).toEqual([])
+      expect(factory.status().counters.agentWorktreesReapedOnStartup).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('releases failed-dispatch agents before cleaning their isolated worktree', async () => {
@@ -17125,7 +18412,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
-  }, 15_000)
+  }, 25_000)
 
   it('restarts once and backs off when the replacement babysitter stays unreachable', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-backoff-'))

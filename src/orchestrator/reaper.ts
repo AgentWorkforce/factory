@@ -8,6 +8,12 @@ import { normalizeLogger } from '../logging'
 import type { FactoryInFlightRegistry, FactoryInFlightRegistryAgent, FactoryInFlightRegistryProcess } from '../types'
 import { checkFactoryLoopLiveness, readFactoryLoopHeartbeat } from './factory'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder, type ProcessIdentity } from './process-identity'
+import {
+  FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION,
+  FACTORY_ENVIRONMENT_MANAGED_LABEL,
+  defaultKubectlEnvironmentRunner,
+  type KubectlEnvironmentCommandRunner,
+} from '../environments/kubernetes-environment'
 
 const execFileAsync = promisify(execFile)
 
@@ -383,3 +389,134 @@ const processIdentityMatches = (
   current.startTime === expected.startTime &&
   current.cmdline === expected.cmdline &&
   current.cmdline.includes(expected.agentName)
+
+export interface FactoryEnvironmentReaperOptions {
+  kubeContext?: string
+  nowMs?: number
+  intervalMs?: number
+  logger?: Logger
+  runner?: KubectlEnvironmentCommandRunner
+}
+
+export interface FactoryEnvironmentReaperReport {
+  reaped: string[]
+  retained: Array<{ namespace: string; expiresAt?: string; reason: string }>
+}
+
+/** Backstop for a gate process killed before its guaranteed teardown can run. */
+export async function reapFactoryEnvironmentsOnce(
+  options: FactoryEnvironmentReaperOptions = {},
+): Promise<FactoryEnvironmentReaperReport> {
+  const run = options.runner ?? defaultKubectlEnvironmentRunner()
+  const context = options.kubeContext ? ['--context', options.kubeContext] : []
+  const inventory = await run([
+    ...context,
+    'get', 'namespaces',
+    '--selector', `${FACTORY_ENVIRONMENT_MANAGED_LABEL}=true`,
+    '--output', 'json',
+  ])
+  const namespaces = parseEnvironmentNamespaces(inventory.stdout)
+  const nowMs = options.nowMs ?? Date.now()
+  const reaped: string[] = []
+  const retained: FactoryEnvironmentReaperReport['retained'] = []
+  for (const namespace of namespaces) {
+    const expiresAtMs = namespace.expiresAt ? Date.parse(namespace.expiresAt) : Number.NaN
+    if (!Number.isFinite(expiresAtMs)) {
+      retained.push({ ...namespace, reason: 'missing or invalid expiration lease' })
+      continue
+    }
+    if (expiresAtMs > nowMs) {
+      retained.push({ ...namespace, reason: 'lease has not expired' })
+      continue
+    }
+    try {
+      await run([
+        ...context,
+        'delete', 'namespace', namespace.namespace,
+        '--ignore-not-found=true',
+        '--wait=false',
+      ])
+      reaped.push(namespace.namespace)
+      options.logger?.warn?.('[factory-reaper] deleted expired verification environment', {
+        namespace: namespace.namespace,
+        expiresAt: namespace.expiresAt,
+      })
+    } catch (error) {
+      retained.push({ ...namespace, reason: 'deletion failed' })
+      options.logger?.warn?.('[factory-reaper] failed to delete expired verification environment', {
+        namespace: namespace.namespace,
+        expiresAt: namespace.expiresAt,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return { reaped, retained }
+}
+
+export class FactoryEnvironmentReaper {
+  readonly #options: FactoryEnvironmentReaperOptions & { intervalMs: number }
+  #timer?: ReturnType<typeof setTimeout>
+  #stopped = false
+  #running = false
+
+  constructor(options: FactoryEnvironmentReaperOptions = {}) {
+    this.#options = { ...options, intervalMs: options.intervalMs ?? 30_000 }
+  }
+
+  start(): void {
+    if (!this.#timer && !this.#stopped) this.#schedule(0)
+  }
+
+  stop(): void {
+    this.#stopped = true
+    if (this.#timer) clearTimeout(this.#timer)
+    this.#timer = undefined
+  }
+
+  #schedule(delayMs: number): void {
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined
+      void this.#tick()
+    }, delayMs)
+  }
+
+  async #tick(): Promise<void> {
+    if (this.#stopped || this.#running) return
+    this.#running = true
+    try {
+      await reapFactoryEnvironmentsOnce(this.#options)
+    } catch (error) {
+      this.#options.logger?.warn?.('[factory-reaper] verification environment sweep failed', error)
+    } finally {
+      this.#running = false
+      if (!this.#stopped) this.#schedule(this.#options.intervalMs)
+    }
+  }
+}
+
+function parseEnvironmentNamespaces(stdout: string): Array<{ namespace: string; expiresAt?: string }> {
+  let value: unknown
+  try {
+    value = JSON.parse(stdout)
+  } catch (error) {
+    throw new Error(`kubectl returned invalid verification environment inventory: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const items = asObject(value).items
+  if (!Array.isArray(items)) throw new Error('kubectl verification environment inventory has no items array')
+  return items.flatMap((item) => {
+    const metadata = asObject(asObject(item).metadata)
+    const namespace = typeof metadata.name === 'string' ? metadata.name : undefined
+    if (!namespace) return []
+    const annotations = asObject(metadata.annotations)
+    const expiresAt = annotations[FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION]
+    return [{
+      namespace,
+      ...(typeof expiresAt === 'string' ? { expiresAt } : {}),
+    }]
+  })
+}
+
+const asObject = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}

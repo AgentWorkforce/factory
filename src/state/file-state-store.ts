@@ -1049,7 +1049,23 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
       (candidate.path !== undefined && typeof candidate.path !== 'string') ||
       typeof candidate.critical !== 'boolean' ||
       !Array.isArray(candidate.pendingKinds) ||
-      !candidate.pendingKinds.every((kind) => typeof kind === 'string')
+      !candidate.pendingKinds.every((kind) => typeof kind === 'string') ||
+      (candidate.pendingDeliveryClaims !== undefined && (
+        !Array.isArray(candidate.pendingDeliveryClaims) ||
+        !candidate.pendingDeliveryClaims.every((claim) =>
+          isRecord(claim) && typeof claim.deliveryId === 'string' && typeof claim.claimToken === 'string'
+        )
+      )) ||
+      (candidate.resourceSubscription !== undefined && (
+        !isRecord(candidate.resourceSubscription) ||
+        typeof candidate.resourceSubscription.subscriptionId !== 'string' ||
+        typeof candidate.resourceSubscription.provider !== 'string' ||
+        typeof candidate.resourceSubscription.resourceRef !== 'string' ||
+        typeof candidate.resourceSubscription.subscriberId !== 'string' ||
+        typeof candidate.resourceSubscription.ownerId !== 'string' ||
+        typeof candidate.resourceSubscription.expiresAt !== 'string' ||
+        (candidate.resourceSubscription.terminal !== undefined && typeof candidate.resourceSubscription.terminal !== 'boolean')
+      ))
     ) {
       throw new Error('Factory GitHub watch state file is invalid')
     }
@@ -1061,6 +1077,23 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
       ...(candidate.path === undefined ? {} : { path: candidate.path }),
       critical: candidate.critical,
       pendingKinds: [...candidate.pendingKinds] as string[],
+      ...(candidate.resourceSubscription === undefined ? {} : {
+        resourceSubscription: {
+          subscriptionId: candidate.resourceSubscription.subscriptionId as string,
+          provider: candidate.resourceSubscription.provider as string,
+          resourceRef: candidate.resourceSubscription.resourceRef as string,
+          subscriberId: candidate.resourceSubscription.subscriberId as string,
+          ownerId: candidate.resourceSubscription.ownerId as string,
+          expiresAt: candidate.resourceSubscription.expiresAt as string,
+          ...(candidate.resourceSubscription.terminal === undefined ? {} : { terminal: candidate.resourceSubscription.terminal as boolean }),
+        },
+      }),
+      ...(candidate.pendingDeliveryClaims === undefined ? {} : {
+        pendingDeliveryClaims: (candidate.pendingDeliveryClaims as Array<Record<string, unknown>>).map((claim) => ({
+          deliveryId: claim.deliveryId as string,
+          claimToken: claim.claimToken as string,
+        })),
+      }),
     }
   }
   return sessions
