@@ -135,6 +135,34 @@ describe('VerificationPipeline', () => {
     })
   })
 
+  it('preserves a green verdict when completion evidence cannot be serialized', async () => {
+    const root = await fixtureRepository()
+    const environment = new RecordingEnvironmentProvider()
+    const reporter = new RecordingReporter()
+    const warnings: Array<[string, ...unknown[]]> = []
+    const load = passingLoad()
+    load.measured.histogram = [{ upperBoundMs: null, count: 100 }]
+    const pipeline = new VerificationPipeline({
+      environmentProvider: environment,
+      stackDeployer: environment,
+      reporter,
+      logger: { warn: (message, ...details) => warnings.push([message, ...details]) },
+      runId: () => 'invalid-evidence',
+      e2eRunner: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
+      loadRunner: async () => load,
+    })
+
+    const verdict = await pipeline.verify({ repository: 'AgentWorkforce/factory', repositoryPath: root })
+
+    expect(verdict.passed).toBe(true)
+    expect(verdict.evidence.stages.teardown.status).toBe('pass')
+    expect(reporter.events).toEqual([])
+    expect(warnings).toContainEqual([
+      '[factory-verification] failed to report completion evidence',
+      expect.anything(),
+    ])
+  })
+
   it('fails closed before provisioning when the feature checkout does not match the reviewed head', async () => {
     const root = await fixtureRepository()
     const environment = new RecordingEnvironmentProvider()

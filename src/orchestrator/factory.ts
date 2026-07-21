@@ -515,6 +515,7 @@ export class FactoryLoop implements Factory {
       ? new VerificationPipeline({
           descriptorPath: config.verification.descriptorPath,
           reporter: ports.reporter,
+          logger: ports.logger,
           maxConcurrentEnvironments: config.verification.maxConcurrentEnvironments,
           maxRunTimeoutMs: config.verification.maxRunTimeoutMs,
           maxEnvironmentTtlMs: config.verification.maxEnvironmentTtlMs,

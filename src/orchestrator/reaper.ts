@@ -429,17 +429,26 @@ export async function reapFactoryEnvironmentsOnce(
       retained.push({ ...namespace, reason: 'lease has not expired' })
       continue
     }
-    await run([
-      ...context,
-      'delete', 'namespace', namespace.namespace,
-      '--ignore-not-found=true',
-      '--wait=false',
-    ])
-    reaped.push(namespace.namespace)
-    options.logger?.warn?.('[factory-reaper] deleted expired verification environment', {
-      namespace: namespace.namespace,
-      expiresAt: namespace.expiresAt,
-    })
+    try {
+      await run([
+        ...context,
+        'delete', 'namespace', namespace.namespace,
+        '--ignore-not-found=true',
+        '--wait=false',
+      ])
+      reaped.push(namespace.namespace)
+      options.logger?.warn?.('[factory-reaper] deleted expired verification environment', {
+        namespace: namespace.namespace,
+        expiresAt: namespace.expiresAt,
+      })
+    } catch (error) {
+      retained.push({ ...namespace, reason: 'deletion failed' })
+      options.logger?.warn?.('[factory-reaper] failed to delete expired verification environment', {
+        namespace: namespace.namespace,
+        expiresAt: namespace.expiresAt,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
   return { reaped, retained }
 }

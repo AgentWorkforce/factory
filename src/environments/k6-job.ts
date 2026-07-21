@@ -73,13 +73,20 @@ export const defaultKubectlCommandRunner = (
   let stdout = ''
   let stderr = ''
   let settled = false
+  let aborted = false
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined
   const abort = (): void => {
+    aborted = true
     child.kill('SIGTERM')
-    finish(new Error('kubectl command aborted'))
+    forceKillTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, 2_000)
+    forceKillTimer.unref()
   }
   const finish = (error?: Error, result?: KubectlCommandResult): void => {
     if (settled) return
     settled = true
+    if (forceKillTimer) clearTimeout(forceKillTimer)
     signal?.removeEventListener('abort', abort)
     if (error) reject(error)
     else resolve(result!)
@@ -91,6 +98,10 @@ export const defaultKubectlCommandRunner = (
   child.stderr.on('data', (chunk: string) => { stderr += chunk })
   child.once('error', (error) => finish(error))
   child.once('close', (code) => {
+    if (aborted) {
+      finish(new Error('kubectl command aborted'))
+      return
+    }
     if (code === 0) finish(undefined, { stdout, stderr })
     else finish(commandError(executable, args, code, stderr))
   })

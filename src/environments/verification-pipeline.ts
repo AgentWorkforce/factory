@@ -3,7 +3,9 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import type { FactoryEventReporter } from '../ports/observability.js'
+import type { Logger } from '../ports/system.js'
 import type { VerificationTargetEnvironment, VerificationTargetProvider, VerificationEnvironment } from '../ports/environment.js'
+import { normalizeLogger } from '../logging.js'
 import { createFactoryCloudEventV1 } from '../observability/events.js'
 import type { LoadMeasurements, LoadSloViolation } from './load-harness.js'
 import { runLoad } from './load-harness.js'
@@ -127,6 +129,7 @@ export interface VerificationPipelineOptions {
   loadRunner?: VerificationLoadRunner
   revisionResolver?: VerificationRevisionResolver
   reporter?: FactoryEventReporter
+  logger?: Logger
   maxConcurrentEnvironments?: number
   maxRunTimeoutMs?: number
   maxEnvironmentTtlMs?: number
@@ -143,6 +146,7 @@ export class VerificationPipeline implements VerificationGate {
   readonly #loadRunner: VerificationLoadRunner
   readonly #revisionResolver: VerificationRevisionResolver
   readonly #reporter?: FactoryEventReporter
+  readonly #logger: Logger
   readonly #maxConcurrentEnvironments: number
   readonly #maxRunTimeoutMs: number
   readonly #maxEnvironmentTtlMs: number
@@ -161,6 +165,7 @@ export class VerificationPipeline implements VerificationGate {
     this.#loadRunner = options.loadRunner ?? defaultLoadRunner
     this.#revisionResolver = options.revisionResolver ?? resolveGitHeadRevision
     this.#reporter = options.reporter
+    this.#logger = normalizeLogger(options.logger ?? console)
     this.#maxConcurrentEnvironments = positiveInteger(options.maxConcurrentEnvironments ?? 2, 'maxConcurrentEnvironments')
     this.#maxRunTimeoutMs = positiveInteger(options.maxRunTimeoutMs ?? 30 * 60_000, 'maxRunTimeoutMs')
     this.#maxEnvironmentTtlMs = positiveInteger(options.maxEnvironmentTtlMs ?? 60 * 60_000, 'maxEnvironmentTtlMs')
@@ -444,19 +449,29 @@ export class VerificationPipeline implements VerificationGate {
       stages,
     }
     const verdict: VerificationVerdict = { status: passed ? 'pass' : 'fail', passed, reason, evidence }
-    await this.#reporter?.report(createFactoryCloudEventV1({
-      type: 'verification.completed',
-      level: passed ? 'info' : 'error',
-      runId,
-      phase: 'verification',
-      status: passed ? 'succeeded' : 'failed',
-      run: {
-        source: 'verification-gate',
-        repository: input.repository,
-        ...(input.issueKey ? { issueKey: input.issueKey } : {}),
-      },
-      verification: observabilityEvidence(verdict),
-    }))
+    if (this.#reporter) {
+      try {
+        await this.#reporter.report(createFactoryCloudEventV1({
+          type: 'verification.completed',
+          level: passed ? 'info' : 'error',
+          runId,
+          phase: 'verification',
+          status: passed ? 'succeeded' : 'failed',
+          run: {
+            source: 'verification-gate',
+            repository: input.repository,
+            ...(input.issueKey ? { issueKey: input.issueKey } : {}),
+          },
+          verification: observabilityEvidence(verdict),
+        }))
+      } catch (error) {
+        try {
+          this.#logger.warn?.('[factory-verification] failed to report completion evidence', error)
+        } catch {
+          // Reporting and logging are best-effort and must not change the gate verdict.
+        }
+      }
+    }
     return verdict
   }
 }
