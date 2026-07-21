@@ -283,7 +283,6 @@ export class InternalFleetClient implements FleetClient {
     for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
         await this.#client.release(name, reason)
-        return
       } catch (error) {
         if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS || !isRetryableReleaseError(error)) {
           throw error
@@ -295,7 +294,47 @@ export class InternalFleetClient implements FleetClient {
           error,
         })
         await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
+        continue
       }
+
+      // A successful HTTP acknowledgement is not sufficient proof that the
+      // broker name is reusable. Under concurrent startup reconciliation the
+      // worker can disappear while a stale inventory row remains, making an
+      // immediate same-name resume fail with `agent already exists`. Verify the
+      // raw Harness Driver inventory and repeat the public release until the
+      // broker itself no longer advertises the name.
+      let retained: boolean
+      try {
+        const agents = await this.#client.listAgents()
+        if (!Array.isArray(agents)) {
+          throw new TypeError('Expected Harness Driver listAgents() to return an array')
+        }
+        retained = agents.some((agent) => agent?.name === name)
+      } catch (error) {
+        if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS) throw error
+        this.#logger?.warn?.('[factory-sdk] unable to verify released broker name; retrying release', {
+          name,
+          attempt,
+          maxAttempts: RELEASE_RETRY_MAX_ATTEMPTS,
+          error,
+        })
+        await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
+        continue
+      }
+      if (!retained) return
+
+      const retainedError = Object.assign(
+        new Error(`Broker still reports agent ${name} after a successful release acknowledgement`),
+        { code: 'release_not_observed', retryable: true },
+      )
+      if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS) throw retainedError
+      this.#logger?.warn?.('[factory-sdk] released broker name is still present; retrying release', {
+        name,
+        attempt,
+        maxAttempts: RELEASE_RETRY_MAX_ATTEMPTS,
+        error: retainedError,
+      })
+      await sleep(RELEASE_RETRY_BACKOFF_MS * attempt)
     }
   }
 

@@ -38,6 +38,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
     if (this.throwOnRelease) {
       throw new Error('release failed')
     }
+    this.agents = this.agents.filter((agent) => agent.name !== name)
     return { name }
   }
 
@@ -532,6 +533,7 @@ describe('InternalFleetClient', () => {
               data: { error: 'internal reply dropped', success: false },
             })
           }
+          this.agents = this.agents.filter((agent) => agent.name !== name)
           return { name }
         }
       }
@@ -905,9 +907,45 @@ describe('InternalFleetClient', () => {
 
     expect(harness.released).toEqual([{ name: 'ar-1-impl', reason: 'done' }])
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }],
+      agents: [],
       nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
     })
+  })
+
+  it('retries a successful release acknowledgement until the broker name disappears', async () => {
+    vi.useFakeTimers()
+    try {
+      class RetainedFirstReleaseHarnessDriverClient extends FakeHarnessDriverClient {
+        attempts = 0
+
+        override async release(name: string, reason?: string): Promise<{ name: string }> {
+          this.attempts += 1
+          this.released.push({ name, reason })
+          if (this.attempts > 1) {
+            this.agents = this.agents.filter((agent) => agent.name !== name)
+          }
+          return { name }
+        }
+      }
+
+      const harness = new RetainedFirstReleaseHarnessDriverClient()
+      harness.agents = [{ name: 'ar-stale-review', cli: 'codex' }]
+      const logger = { warn: vi.fn() }
+      const fleet = new InternalFleetClient({ client: harness, logger })
+
+      const released = fleet.release('ar-stale-review', 'reconciled-missing')
+      await vi.advanceTimersByTimeAsync(250)
+      await released
+
+      expect(harness.attempts).toBe(2)
+      expect(harness.agents).toEqual([])
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory-sdk] released broker name is still present; retrying release',
+        expect.objectContaining({ name: 'ar-stale-review', attempt: 1, maxAttempts: 3 }),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('re-adopts tracked workers and synthesizes exits for workers missing after restart', async () => {
