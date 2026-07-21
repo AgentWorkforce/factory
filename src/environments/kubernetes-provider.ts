@@ -274,6 +274,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     if (!namespace) {
       record.environment.status = 'destroyed'
       await this.#stopForwards(record)
+      this.#records.delete(id)
       return 'destroyed'
     }
     assertOwnedNamespace(namespace, id, record.connection.id)
@@ -321,6 +322,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
         throw new AggregateError(cleanupErrors, `Could not safely delete cluster-scoped resources for ${id}`)
       }
       record.environment.status = 'destroyed'
+      this.#records.delete(id)
       return
     }
     assertOwnedNamespace(namespace, id, record.connection.id)
@@ -331,6 +333,7 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
     }
     await this.#client.deleteNamespace(id, record.connection)
     record.environment.status = 'destroyed'
+    this.#records.delete(id)
     this.#logger?.info?.('[kubernetes-environment] destroyed environment', {
       id,
       connectionId: record.connection.id,
@@ -417,7 +420,10 @@ export class KubernetesEnvironmentProvider implements EnvironmentProvider {
           })
           continue
         }
-        if (record) record.environment.status = 'destroyed'
+        if (record) {
+          record.environment.status = 'destroyed'
+          this.#records.delete(id)
+        }
         report.reaped.push({ id, connectionId: connection.id, reason })
         this.#logger?.warn?.('[kubernetes-environment] reaped environment', {
           id,

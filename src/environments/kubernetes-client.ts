@@ -117,6 +117,8 @@ export interface KubectlKubernetesClientOptions {
   commandRunner?: KubernetesCommandRunner
 }
 
+const MAX_PORT_FORWARD_DIAGNOSTICS = 4_000
+
 /** Thin kubectl/Helm integration; all policy decisions remain in the provider. */
 export class KubectlKubernetesClient implements KubernetesClient {
   readonly #kubectl: string
@@ -301,13 +303,14 @@ export class KubectlKubernetesClient implements KubernetesClient {
         reject(new Error(`Timed out starting port-forward for ${namespace}/${service}:${port}: ${diagnostics.slice(-2_000)}`))
       }, 15_000)
       const observe = (chunk: Buffer | string): void => {
-        const text = chunk.toString()
-        diagnostics += text
+        if (settled) return
+        diagnostics = `${diagnostics}${chunk.toString()}`.slice(-MAX_PORT_FORWARD_DIAGNOSTICS)
         const match = /Forwarding from 127\.0\.0\.1:(\d+)/u.exec(diagnostics)
-        if (!match || settled) return
+        if (!match) return
         settled = true
         clearTimeout(timeout)
         const localPort = Number(match[1])
+        diagnostics = ''
         resolvePromise({
           url: `${protocol}://127.0.0.1:${localPort}`,
           stop: async () => {

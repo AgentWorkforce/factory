@@ -53,6 +53,7 @@ class FakeKubernetesClient implements KubernetesClient {
   readonly applies: Array<{ namespace: string; resources: KubernetesResource[] }> = []
   readonly deletes: string[] = []
   readonly clusterDeletes: string[] = []
+  readonly namespaceGets: string[] = []
   readonly forwards: string[] = []
   readonly stoppedForwards: string[] = []
   failForwardFor: string | undefined
@@ -102,6 +103,7 @@ class FakeKubernetesClient implements KubernetesClient {
   async waitForReady(): Promise<void> {}
 
   async getNamespace(name: string): Promise<KubernetesResource | undefined> {
+    this.namespaceGets.push(name)
     const namespace = this.namespaces.get(name)
     return namespace ? structuredClone(namespace) : undefined
   }
@@ -632,6 +634,33 @@ describe('KubernetesEnvironmentProvider', () => {
     expect(client.clusterResources.has('scheduling.k8s.io/v1/PriorityClass/orphan-priority')).toBe(false)
     expect(client.namespaces.has('factory-label-spoof')).toBe(true)
     expect(client.namespaces.has('payments-prod')).toBe(true)
+  })
+
+  it('evicts in-memory records after reaping a provisioned environment', async () => {
+    const client = new FakeKubernetesClient()
+    let now = new Date('2026-07-21T12:00:00.000Z')
+    const provider = new KubernetesEnvironmentProvider({
+      registry: registry(), client,
+      now: () => now,
+      randomId: () => 'reaped-record',
+      secretResolver: { resolve: async () => 'secret' },
+    })
+    const environment = await provider.provision({
+      customerId: 'customer-a', repository: 'AgentWorkforce/factory', ownerId: 'run',
+      ttl: 60_000, stack: stack(),
+    })
+    now = new Date('2026-07-21T12:02:00.000Z')
+
+    const report = await provider.reap()
+    client.namespaceGets.length = 0
+
+    expect(report.reaped).toContainEqual({
+      id: environment.id, connectionId: 'customer-eks', reason: 'ttl-expired',
+    })
+    expect(await provider.status(environment.id)).toBe('destroyed')
+    // A cache hit would perform one lookup. Both configured connections are
+    // scanned only after the terminal record has been evicted.
+    expect(client.namespaceGets).toHaveLength(2)
   })
 
   it('continues reaping reachable clusters when another credential is unavailable', async () => {
