@@ -1,8 +1,46 @@
 # Feature Verification Procedures
 
-Verify Factory from the user's point of view, lowest prerequisite tier first. A higher tier does not replace the lower tiers: it adds provider, fleet, cloud, or live-work prerequisites.
+This is the executable companion to `../manifest.yaml`. Its
+`verification.categories` map assigns every feature category to one named
+procedure below. Verify Factory from the user's point of view, lowest
+prerequisite tier first. A higher tier does not replace the lower tiers: it adds
+provider, fleet, cloud, or live-work prerequisites.
 
 Use a disposable workspace, issue, repository branch, and Slack channel for tiers 3–6. Never point mutation checks at production work unless the operator explicitly selected those records.
+
+For any mutating procedure, start in a Bash shell with a unique run and an
+exact cleanup target:
+
+```bash
+set -Eeuo pipefail
+RUN_ID="${CI_RUN_ID:-${GITHUB_RUN_ID:-local}}"
+RUN_RANDOM="$(od -An -N6 -tx1 /dev/urandom | tr -d '[:space:]')"
+RUN="factory-feature-${RUN_ID}-$(date +%s)-$RUN_RANDOM"
+TMP="$(mktemp -d)"
+CONFIG="$TMP/factory.config.json"
+cleanup() {
+  status=$?
+  if [[ -n "${FACTORY_VERIFY_PID:-}" ]] && kill -0 "$FACTORY_VERIFY_PID" 2>/dev/null; then
+    command="$(ps -p "$FACTORY_VERIFY_PID" -o command= 2>/dev/null || true)"
+    if printf '%s\n' "$command" | grep -F -- "bin/factory.mjs" >/dev/null && \
+       printf '%s\n' "$command" | grep -F -- "$CONFIG" >/dev/null; then
+      kill -TERM "$FACTORY_VERIFY_PID" 2>/dev/null || true
+      wait "$FACTORY_VERIFY_PID" 2>/dev/null || true
+    else
+      printf 'Refusing to terminate unexpected PID %s\n' "$FACTORY_VERIFY_PID" >&2
+    fi
+  fi
+  rm -rf "$TMP"
+  exit "$status"
+}
+trap cleanup EXIT
+```
+
+The cleanup guard never signals a PID merely because it was recorded. Provider
+issues, branches, PRs, comments, labels, webhooks, Slack threads, and cloud
+records must use `$RUN` in their identity and be removed or closed through the
+same provider after assertions. If the available API cannot create and safely
+remove that fixture, the procedure is manual for that environment.
 
 ---
 
@@ -343,6 +381,460 @@ Start a disposable live daemon, read its heartbeat, run `factory kill-loop`, and
 
 ---
 
+## cli-and-package
+
+**Categories:** `cli-operations`.
+
+**Prerequisites:** source checkout, Node 20.18.1 or newer, and `npm ci`. No
+provider credentials are required for the package-only portion.
+
+```bash
+npm run build
+npm test -- --run src/cli/fleet.test.ts src/featuremap/validate.test.ts
+node bin/factory.mjs --help | tee "$TMP/help.txt"
+node bin/factory.mjs --version | tee "$TMP/version.txt"
+node bin/factory.mjs featuremap check | tee "$TMP/featuremap.json"
+node -e 'const p=require("./package.json"); if (!p.version) process.exit(1)'
+grep -Fq 'featuremap check' "$TMP/help.txt"
+grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' "$TMP/version.txt"
+node -e 'const r=require(process.argv[1]); if (!r.ok || r.featureCount < 1) process.exit(1)' "$TMP/featuremap.json"
+```
+
+Then exercise `run-once`, `status`, `loop`, and `loop-status` with the fixture
+from Tier 2. Exercise `triage` and the always-dry `canary` with the disposable
+provider fixture from `provider-discovery`; exercise `dispatch` only after the
+fleet fixture is ready. `start`, `kill-loop`, `reap-orphans`, `babysit`, and
+`close-probe` use their owning procedures below. Assert stdout is parseable JSON
+where promised, progress logs stay on stderr, unknown commands/options fail, and
+help/version/feature-map validation do not load config or construct providers.
+
+**Automation limit:** the package and fixture subset is deterministic. Commands
+that signal a process or mutate an issue/PR remain live or manual checks.
+
+## fleet-execution
+
+**Categories:** `fleet-cli`, `fleet-node`, `config-node-and-loading`.
+
+**Prerequisites:** an isolated Relay project; installed/authenticated Codex or
+Claude CLI for real harness spawns. For hosted placement, use a disposable
+workspace key and an enrolled node advertising a disposable checkout.
+
+```bash
+npm run build
+npx vitest run \
+  src/cli/fleet.test.ts \
+  src/fleet/create-fleet.test.ts \
+  src/fleet/ensure-relay-broker.test.ts \
+  src/fleet/internal-fleet-client.test.ts \
+  src/fleet/relay-fleet-client.test.ts \
+  src/node/factory-node.test.ts
+
+NAME="factory-vf-$RUN"
+node bin/factory.mjs fleet roster --backend internal | tee "$TMP/roster-before.json"
+node bin/factory.mjs fleet spawn spawn:codex --backend internal \
+  --name "$NAME" --task 'Reply with exactly FACTORY_VERIFY_OK' | tee "$TMP/spawn.json"
+node bin/factory.mjs fleet roster --backend internal | tee "$TMP/roster-live.json"
+node bin/factory.mjs fleet release "$NAME" --reason feature-verification --backend internal
+node bin/factory.mjs fleet roster --backend internal | tee "$TMP/roster-after.json"
+grep -Fq "$NAME" "$TMP/roster-live.json"
+if grep -Fq "$NAME" "$TMP/roster-after.json"; then exit 1; fi
+```
+
+Repeat with `spawn:claude`, `workflow:run`, `--model`, `--cwd`, and
+`--resume <session-ref>` when those fixtures exist. For `--backend relay`, pass
+`--node` and an advertised checkout, assert returned invocation/node identity,
+then retry with an unadvertised path and require refusal. Restart the client from
+saved tracking and prove it adopts the same invocation before processing an
+exit. Canonical local presence must exclude stale/offline rows, preserve live
+non-MCP workers, fail closed when presence is unavailable, and confirm absence
+before a released name is reused. An owned broker must honor its isolated state
+directory and stop only after the configured task-exit drain; an operator-owned
+broker must remain running.
+
+## provider-discovery
+
+**Categories:** `discovery-events`, `config-linear-states`.
+
+**Prerequisites:** one disposable Linear issue and/or GitHub issue selected by a
+disposable config. Tier-3 reads use `--dry-run`; tier-5 stream/mirror checks need
+connected integrations. Copy the real config to `$CONFIG` and change only test
+scope to records named with `$RUN`.
+
+```bash
+factory triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"
+factory canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"
+factory run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"
+node -e 'const r=require(process.argv[1]); if (!r.ok) process.exit(1)' "$TMP/canary.json"
+```
+
+For Linear, assert canonical and sparse aliases resolve the configured team
+state names/IDs. For GitHub, cover `owner__repo` and `owner/repo`, `meta.json`,
+`by-id`, flat and paginated listings, numeric disambiguation, closed/unlabeled
+exclusion, source auto-selection, and cross-path deduplication without merging
+equal numbers from different repos. Then start each `subscribe`, `poll`, and
+`subscribe-and-poll` transport before one test update; assert exactly one intake,
+replay suppression, buffered high-water fallback, and stream recovery. In
+Linear-source mode, assert a factory-labeled GitHub issue creates one mirror and
+its closure advances that mirror once.
+
+## triage-and-configuration
+
+**Categories:** `triage-routing`, `config-intake`, `config-repositories`.
+
+**Prerequisites:** package-only fixtures for schema/routing; the provider fixture
+from `provider-discovery` for a true issue round trip.
+
+```bash
+npx vitest run \
+  src/config/schema.test.ts \
+  src/config/local-clone-paths.test.ts \
+  src/triage/triage.test.ts \
+  src/safety/factory-scope.test.ts
+```
+
+Assert label → project → keyword → default precedence, low-confidence refusal,
+single/team/workflow shape, surface detection, LLM fallback, decision
+normalization, and repo-qualified GitHub agent identities. Parse defaults and
+both envelope forms for every manifest-listed field, then test min/max and enum
+rejections. Validate compact repo derivation, explicit precedence, exact `~` and
+`~/` expansion, `~user` rejection, one-repo cwd inference only after matching
+the GitHub remote, linked-worktree acceptance, and preflight refusal for a
+missing/non-git/non-root checkout. Finally compare the live `triage` result with
+the deterministic fixture result; no write or spawn is allowed during this
+procedure.
+
+## issue-dispatch-lifecycle
+
+**Categories:** `dispatch-orchestration`.
+
+**Prerequisites:** Tier 2 fixture for deterministic paths, then a disposable
+provider issue plus fleet for the full lifecycle.
+
+```bash
+npx vitest run \
+  src/orchestrator/batch-tracker.test.ts \
+  src/orchestrator/factory.test.ts \
+  src/dispatch/templates.test.ts \
+  src/git/agent-worktree.test.ts \
+  src/state/file-state-store.test.ts \
+  src/state/github-lifecycle-identity.test.ts
+factory dispatch "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" --dry-run \
+  | tee "$TMP/dispatch-dry.json"
+```
+
+Assert one batch admission, capacity queue/promotion, duplicate suppression,
+bounded retry, authoritative label identity, rendered per-role tasks, confirmed
+task injection, and one resumption. Add `Blocked by:` fixtures for same-repo,
+cross-repo, closed, merged, missing, and cyclic dependencies; parked dependencies
+must not consume capacity and cycles must report rather than run. With a real
+fleet, verify each agent receives a unique owned worktree and branch, remote PR
+branches recover without overwriting divergence, and cleanup refuses any path
+outside `.factory-worktrees`. Crash at spawn intent, acknowledgement,
+publication receipt, writeback, and release; a replacement same-host owner must
+adopt exactly once, preserve global capacity, canonicalize legacy GitHub aliases
+atomically, reuse provider receipts, publish from the remote head, and reach a
+terminal state without duplicate agent, PR, or comment.
+
+## human-clarification
+
+**Categories:** `human-loop`, `config-models-and-human`.
+
+**Prerequisites:** deterministic state tests, then a disposable Slack channel
+and issue reporter identity. GitHub fallback needs a disposable issue owned by
+that reporter.
+
+```bash
+npx vitest run \
+  src/config/schema.test.ts \
+  src/orchestrator/coalesced-task-queue.test.ts \
+  src/orchestrator/factory.test.ts \
+  src/state/file-state-store.test.ts
+```
+
+Create one thin triage issue and one running worker that emits the documented
+needs-input signal. Assert configured stakeholder IDs are mentioned, only the
+first concurrent question is reserved, the full team is released and absent
+before the issue is parked, and one authorized non-bot reply claims one wake.
+Restart before and after the reply to cover saved-session resume, cold start,
+reply recovery, wake lease renewal, scope-loss cancellation, and seven-day
+escalation retry. Ordinary Slack conversation turns must be coalesced within the
+configured window and delivered only through a fresh resume task—never injected
+into a running PTY. Disable or stale Slack and require a correlated GitHub
+comment; bot/unauthorized replies must be ignored. Exercise both harness
+capabilities and all per-role models, then delete only `$RUN` threads/comments.
+
+## pull-request-lifecycle
+
+**Categories:** `pr-lifecycle`.
+
+**Prerequisites:** disposable issue, same-repository non-draft PR, provider
+mount, and fleet. The deterministic refusals run without credentials.
+
+```bash
+npx vitest run \
+  src/github/merge-gate.test.ts \
+  src/github/probe-closer.test.ts \
+  src/github/standalone-babysitter.test.ts \
+  src/orchestrator/factory.test.ts \
+  src/state/file-state-store.test.ts
+```
+
+With babysitting enabled, assert exactly one PR owner/session for the exact
+normalized repo and number. Route review, review-comment, issue-comment,
+failed/cancelled/timed-out check, conflict, and base-divergence events; pending,
+green, inconsistent, or body-only identities must not wake. Coalesce wakes,
+retain an event during delivery, retry without duplication, persist the
+destructive no-submit fence before ACK, defer PTY input through the critical
+section, and cancel after terminal mounted readback. A valid readiness signal
+advances to Human Review; wrong agent/issue, draft, closed, or merged PR does
+not. For standalone mode, run `factory babysit <URL> --config "$CONFIG"` and
+assert one receipt for the existing branch while final merge remains human.
+Test merge refusals, then green+approved+stable-head guarded merge and post-merge
+issue advancement. Close only a `$RUN` synthetic probe and prove the wrong key
+or title marker refuses.
+
+## safety-boundaries
+
+**Categories:** `safety`, `config-safety`.
+
+**Prerequisites:** package fixtures; a disposable provider scope for guarded
+write assertions.
+
+```bash
+npx vitest run \
+  src/safety/factory-scope.test.ts \
+  src/github/merge-gate.test.ts \
+  src/github/probe-closer.test.ts \
+  src/node/factory-node.test.ts \
+  src/__tests__/mount-delete-callsite-invariant.test.ts \
+  src/__tests__/writefile-callsite-invariant.test.ts
+```
+
+Assert boundary-aware title, exact label forms, team restrictions, open GitHub
+status, token-type rejection, node checkout containment, stable merge head,
+probe/standalone PR identity, and fail-closed delete behavior. Against the
+disposable provider, attempt one out-of-scope Linear write, unsupported GitHub
+draft, unapproved delete, unadvertised node path, moved-head merge, and wrong
+probe close; every operation must fail before external mutation. Never weaken
+scope merely to make this procedure pass.
+
+## integrations-and-writeback
+
+**Categories:** `mount-writeback`.
+
+**Prerequisites:** non-interactive Cloud session and disposable Linear, GitHub,
+and optional Slack integrations with bounded write permission.
+
+```bash
+npx vitest run \
+  src/mount/local-mount-preflight.test.ts \
+  src/mount/relayfile-binary.test.ts \
+  src/mount/relayfile-cloud-mount-client.test.ts \
+  src/mount/relayfile-github-connection-write.test.ts \
+  src/mount/relayfile-integration-preflight.test.ts \
+  src/writeback/writeback.test.ts
+factory run-once --config "$CONFIG" --dry-run | tee "$TMP/mount-preflight.json"
+```
+
+Inspect the selected workspace, session, filesystem, local mount state, clone
+mounts, and provider connections. Missing integrations must name the provider
+and offer OAuth only in an interactive non-dry run; headless/dry runs must stop
+with an actionable command. Simulate stale/mismatched/dead mount state and
+require self-heal; live `start` must warm mounts in the background without using
+stale mirrors as source truth. For each provider, perform a scoped `$RUN`
+comment/state/create/thread/reply/PR write, require provider acknowledgement,
+then re-read the external object. Exercise strict `github.identity=app`, strict
+`user`, and `auto`; record confirmed identity/author and forbid fallback for a
+strict mode. Confirm the bounded mount health record. Remove only the test
+records after readback.
+
+## event-intake
+
+**Categories:** `webhook-subscriptions`.
+
+**Prerequisites:** package fixtures; live registration needs a disposable
+workspace and callback owned by the test.
+
+```bash
+npx vitest run \
+  src/webhook/handler.test.ts \
+  src/webhook/registrar.test.ts \
+  src/subscriptions/__tests__/globs.test.ts \
+  src/subscriptions/__tests__/linear-filter.test.ts \
+  src/subscriptions/__tests__/slack-filter.test.ts \
+  src/subscriptions/__tests__/specs.test.ts \
+  src/subscriptions/__tests__/event-client.test.ts
+```
+
+Assert invalid HMAC → 403, malformed JSON → 400, replayed event ID → 200 with
+no second callback, and correct Linear/Slack/GitHub routing. Verify canonical
+paths, DM/thread aliases, targets, predicates, token-workspace checks,
+path-coalescing, polling fallback, and stream recovery. Register the unique live
+callback twice and require one subscription, deliver one signed test event and
+assert its body/header at the controlled receiver, then unregister and prove it
+is absent. A shared public request bin is not an acceptable receiver.
+
+## public-api
+
+**Categories:** `programmatic-api`.
+
+**Prerequisites:** package checkout and a clean temporary consumer.
+
+```bash
+npm run build
+npx vitest run src/__tests__/dist-entrypoints.test.ts
+npm pack --pack-destination "$TMP"
+mkdir "$TMP/consumer" && cd "$TMP/consumer"
+npm init -y >/dev/null
+npm install --ignore-scripts "$TMP"/*.tgz >/dev/null
+node --input-type=module <<'NODE'
+for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/hosted']) {
+  const mod = await import(`@agent-relay/factory${subpath}`)
+  if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)
+}
+const node = await import('@agent-relay/factory/node')
+if (!node.default) throw new Error('node default export missing')
+NODE
+```
+
+Back in the checkout, run the focused tests named by each API entry. Assert root
+types and all seven package export keys resolve, hosted remains worker-safe,
+feature-map validation includes procedure routing, dependency/worktree ports are
+exported, and fake clients support a hermetic consumer. Clean only `$TMP`.
+
+## hosted-control-plane
+
+**Categories:** `hosted-control-plane`.
+
+**Prerequisites:** deterministic port fakes. A deployed check additionally needs
+a disposable Cloud worker, Durable Object namespace, providers, and fleet.
+
+```bash
+npx vitest run \
+  src/hosted/orchestrator.test.ts \
+  src/hosted/state-store.test.ts \
+  src/hosted/worker-safety.test.ts
+npm run verify:e2e
+```
+
+Assert reconciliation precedes discovery; scope, dedupe, batch capacity, triage,
+deterministic invocation IDs, clarification, spawn, pushed completion, polling
+completion, merge gate, and every provider writeback transition. Repeat each
+external success immediately before a simulated fenced save and require the
+same invocation or idempotency key after takeover. Two owners must yield one
+live epoch; expired owners cannot save. Run the same matrix through in-memory
+and Durable Object transaction adapters, including invocation index removal.
+Finally inspect the hosted dependency graph and packed export for Node
+filesystem/process/child-process imports. The deployed portion is Tier 5 and is
+skipped—not passed—when those fixtures are unavailable.
+
+## cloud-observability
+
+**Categories:** `cloud-observability`.
+
+**Prerequisites:** local filesystem for event/outbox tests; disposable Cloud
+account/workspace for authenticated ingestion.
+
+```bash
+npx vitest run \
+  src/observability/events.test.ts \
+  src/observability/instance-identity.test.ts \
+  src/observability/outbox.test.ts \
+  src/observability/cloud-reporter.test.ts \
+  src/cli/fleet.test.ts
+```
+
+Attempt forbidden task, prompt, message, path, command, source, token, raw error,
+and stack fields and require schema rejection. Assert stable nonzero trace IDs
+for the same durable run and different IDs for different runs without span
+claims. Concurrent identity creation must converge on one mode-0600 opaque UUID
+and never derive it from host/user/path. Restart the outbox, compact beyond
+count/byte limits while retaining critical events, batch under 240 KiB, and ACK
+only exact delivered IDs. Against Cloud, verify authenticated 201 ingestion,
+duplicate acceptance, token refresh, timeout, retry/backoff, permanent rejection,
+shutdown deadline, and replay after restart. Every reporter failure must leave
+Factory control flow and exit semantics unchanged.
+
+## release-verification
+
+**Categories:** `release-verification`.
+
+**Prerequisites:** package checkout. PR evidence also requires exact head/base
+SHAs from the reviewed event.
+
+```bash
+npm run build
+npm run featuremap:check
+npm test
+FACTORY_E2E_HEAD_SHA="$(git rev-parse HEAD)" \
+FACTORY_E2E_BASE_SHA="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" \
+  npm run verify:e2e
+node -e 'const a=require("./artifacts/factory-e2e-attestation.json"); if (a.headSha !== process.argv[1]) process.exit(1)' "$(git rev-parse HEAD)"
+```
+
+Assert the manifest contract test covers every CLI leaf, config field, public
+subpath, category procedure, and required implementation area. The packed run
+must install the tarball in a clean consumer, import root/hosted surfaces, drive
+the fixture and hosted lifecycle, and record only passing checks. Follow
+`docs/pr-end-to-end-verification.md`; never accept an artifact from the base,
+synthetic merge, another head, or a run that skipped its declared check.
+
+## proactive-health
+
+**Categories:** `proactive-health`.
+
+**Prerequisites:** proactive preview for deterministic tests; deployed check
+needs the scoped GitHub clone, exact Relayfile credentials, and the configured
+Slack channel.
+
+```bash
+npx vitest run \
+  .agentworkforce/agents/factory-feature-guardian/manifest-contract.test.ts \
+  .agentworkforce/agents/factory-feature-guardian/agent.test.ts
+```
+
+In preview, begin with no state, inject a checkpoint failure after a confirmed
+Slack write, and rerun: the same cycle/feature idempotency key must return the
+same provider timestamp and create only one Slack message. Verify positions 2
+and 3 across fresh contexts; additions preserve progress, one checked retirement
+starts a new generation under CAS, unchecked retirement preserves it, suspicious
+shrink/multiple retirements fail closed, and complete cycles increment exactly
+once. Reject malformed, duplicate, oversized, stale-revision, authorization,
+timeout, corrupt-readback, and receiptless states without advancing. Force LLM
+failure and require the fallback to retain CLI/API, source, tier, and procedure.
+In deployment, assert the manifest is read only from
+`/github/repos/AgentWorkforce/factory/.agentworkforce/features/**`, Slack can
+write only to `${SLACK_CHANNEL}`, and one scheduled tick posts one question with
+a real provider `ts` before the exact state checkpoint advances.
+
+## loop-and-recovery
+
+**Categories:** `config-loop`.
+
+**Prerequisites:** fixture config with heartbeat and registry paths inside
+`$TMP`; a live manual check may start one exact process using `$CONFIG`.
+
+```bash
+node bin/factory.mjs loop --config "$CONFIG" --dry-run
+node bin/factory.mjs loop-status --config "$CONFIG" | tee "$TMP/liveness.json"
+npx vitest run \
+  src/orchestrator/factory.test.ts \
+  src/orchestrator/process-identity.test.ts \
+  src/orchestrator/reaper.test.ts \
+  src/state/file-state-store.test.ts
+```
+
+Assert iteration/failure limits, heartbeat/registry aliases and paths, stale
+threshold, circuit opening, idle completion, atomic registry recovery, PID
+identity, and protected infrastructure. For the manual signal check, launch
+`factory start --config "$CONFIG"` in the background, record its exact PID and
+command, run `loop-status`, then `kill-loop`; only that PID may receive SIGTERM.
+Seed one stale Factory-owned child and one unrelated/broker/node PID, run
+`reap-orphans`, and require only the exact stale child to terminate. The shared
+cleanup guard handles a failed assertion without signalling a reused PID.
+
+---
+
 ## Verification by Change Area
 
 | Change area | Minimum tiers |
@@ -357,39 +849,41 @@ Start a disposable live daemon, read its heartbeat, run `factory kill-loop`, and
 | Internal/hosted fleet clients | 1, 2, 4 |
 | Node capability or checkout resolution | 1, 2, 4 |
 | Mount/event/subscription code | 1, 2, 5 |
+| Dependency admission or isolated worktrees | 1, 2, 3, 4 |
+| Hosted control plane (`src/hosted/`) | 1, 2, 5; tier 6 for merge/writeback behavior |
+| Cloud observability and reporting | 1, 2, 5 |
+| Feature manifest, verification workflow, or guardian | 1, 2, 5 |
 | State/reaper/process identity | 1, 2, 4 |
 | Durable dispatch/babysitter state | 1, 2, 4, 5; tier 6 for destructive-fence behavior |
 | Public exports | 1 |
 
 ---
 
-## Manifest Coverage Index
+## Manifest Coverage Contract
 
-Every feature below maps to the procedure for its manifest tier. This index is intentionally explicit so a manifest/procedure drift check can prove that no feature lacks a verification route.
+The v1.1 manifest is the authoritative feature list. Its
+`verification.categories` map routes every category to one named procedure in
+this document; the validator rejects missing routes, unknown category routes,
+missing procedure headings, duplicate IDs, stale summary counts, invalid source
+paths, and path escapes. The guardian manifest contract additionally enumerates
+the public CLI leaves, config schema fields, package export subpaths, and required
+implementation areas so a newly shipped surface cannot silently bypass the
+catalog.
 
-### Tier 1 IDs
+To inspect the live mapping without maintaining a second list of IDs:
 
-`cli-help`, `cli-featuremap-check`, `cli-config-option`, `safety-relay-token-types`, `safety-merge-head-sha`, `webhook-hmac-validation`, `webhook-event-routing`, `webhook-event-deduplication`, `subscription-canonical-paths`, `subscription-delivery-targets`, `subscription-linear-predicates`, `api-config-schemas`, `api-featuremap-validator`, `api-triage-engines`, `api-fleet-ports`, `api-mount-ports`, `api-writeback-ports`, `api-state-stores`, `api-reaper`, `api-relayflow-policy`, `api-testing`, `api-safe-log-serialization`, `config-node-path-env`, `config-node-name-env`.
-
-### Tier 2 IDs
-
-`cli-run-once`, `cli-status`, `cli-loop`, `cli-loop-status`, `cli-dry-run-option`, `triage-label-routing`, `triage-project-routing`, `triage-keyword-routing`, `triage-default-routing`, `triage-unroutable-escalation`, `triage-single-scope`, `triage-team-scope`, `triage-workflow-scope`, `triage-shape-labels`, `triage-surface-inference`, `triage-thin-issue-detection`, `triage-llm-fallback`, `triage-tiered-fail-safe`, `triage-decision-normalization`, `triage-repo-qualified-agent-identities`, `dispatch-batch-admission`, `dispatch-duplicate-suppression`, `dispatch-composite-issue-identity`, `dispatch-retry-backoff`, `dispatch-retry-limit`, `dispatch-agent-task-rendering`, `dispatch-inflight-registry`, `pr-never-auto-merge`, `safety-title-prefix`, `safety-label-gate`, `safety-team-gate`, `safety-babysit-pr-identity`, `safety-node-checkout-containment`, `node-definition`, `node-inventory-sync`, `api-factory-lifecycle`, `api-factory-events`, `api-linear-state-resolution`, `config-workspace-id`, `config-issue-source`, `config-batch-size`, `config-subscription-teams`, `config-subscription-projects`, `config-subscription-labels`, `config-subscription-assignees`, `config-live-transport`, `config-live-poll-interval`, `config-live-event-limit`, `config-live-replay-skew`, `config-dispatch-cooldown`, `config-dispatch-attempts`, `config-triage-implementers`, `config-repos-org`, `config-repos-names`, `config-repos-overrides`, `config-repos-by-label`, `config-repos-by-project`, `config-repos-keyword-rules`, `config-repos-default`, `config-repos-clone-root`, `config-repos-clone-paths`, `config-clone-root`, `config-clone-paths`, `config-home-clone-expansion`, `config-cwd-clone-inference`, `config-local-checkout-preflight`, `config-loop-max-iterations`, `config-loop-failure-limit`, `config-loop-heartbeat-path`, `config-loop-registry-path`, `config-loop-heartbeat-stale`, `config-loop-heartbeat-alias`, `config-loop-registry-alias`, `config-model-implementer`, `config-model-reviewer`, `config-model-triage`, `config-model-babysitter`, `config-babysitter-enabled`, `config-merge-policy`, `config-terminal-state`, `config-slack-channel`, `config-slack-style`, `config-slack-bot-user`, `config-slack-staleness`, `config-slack-conversation-coalesce`, `config-linear-ready-name`, `config-linear-implementing-name`, `config-linear-planning-name`, `config-linear-done-name`, `config-linear-human-review-name`, `config-linear-states-by-team`, `config-linear-team-ids`, `config-state-id-ready`, `config-state-id-implementing`, `config-state-id-planning`, `config-state-id-done`, `config-state-id-human-review`, `config-safety-title-prefix`, `config-safety-label`, `config-safety-team`, `config-node-capabilities`, `config-node-dry-run`, `config-combined-envelope`, `config-split-envelope`, `config-fixture-files`.
-
-### Tier 3 IDs
-
-`cli-canary`, `cli-triage`, `cli-github-numeric-issue`, `discovery-linear-ready`, `discovery-github-native`, `discovery-github-path-shapes`, `discovery-canonical-fallback`, `discovery-state-name-backfill`, `dispatch-label-authority`, `safety-github-open-label`.
-
-### Tier 4 IDs
-
-`cli-start-live`, `cli-reap-orphans`, `cli-dispatch`, `cli-backend-option`, `cli-agent-exit-timeout-option`, `fleet-spawn-codex`, `fleet-spawn-claude`, `fleet-spawn-workflow`, `fleet-resume`, `fleet-target-node`, `fleet-spawn-inputs`, `fleet-roster`, `fleet-release`, `dispatch-queue-promotion`, `dispatch-implementers`, `dispatch-reviewer`, `dispatch-workflow-agent`, `dispatch-confirmed-task-injection`, `dispatch-critical-delivery-retry`, `dispatch-agent-resume`, `dispatch-remote-re-adoption`, `dispatch-durable-relay-lifecycle`, `dispatch-same-host-owner-fencing`, `human-agent-questions`, `human-team-release-for-clarification`, `human-durable-clarification-wake`, `human-slack-conversation-resume`, `pr-durable-babysitter-sessions`, `pr-babysitter-wake-coalescing`, `pr-babysitter-critical-ack-fence`, `fleet-internal-backend`, `fleet-broker-reuse`, `fleet-broker-autostart`, `fleet-owned-broker-drain`, `fleet-relay-backend`, `fleet-relay-repo-placement`, `fleet-relay-reconciliation`, `fleet-message-events`, `node-spawn-capabilities`, `node-workflow-capability`, `node-relay-mcp-harness`.
-
-### Tier 5 IDs
-
-`discovery-github-linear-mirror`, `discovery-github-mirror-close`, `discovery-source-auto-select`, `discovery-startup-backfill`, `discovery-live-subscribe`, `discovery-live-poll`, `discovery-live-hybrid`, `discovery-replay-suppression`, `discovery-duplicate-suppression`, `discovery-high-water-fallback`, `discovery-relayflow-events`, `dispatch-exit-pr-publication`, `dispatch-remote-publication-recovery`, `dispatch-state-writeback`, `human-slack-dispatch-thread`, `human-triage-escalation`, `human-github-question-fallback`, `human-slack-reply-watch`, `human-clarification-escalation-retry`, `human-clarified-redispatch`, `human-slack-degraded-mode`, `pr-completion-detection`, `pr-draft-block`, `pr-canonical-event-routing`, `pr-polling-readback-backstop`, `pr-human-review-terminal`, `pr-done-terminal`, `pr-post-merge-advance`, `safety-guarded-linear-drafts`, `safety-guarded-github-drafts`, `safety-delete-fail-closed`, `mount-active-workspace`, `mount-cloud-session`, `mount-cloud-filesystem`, `mount-write-confirmation`, `mount-local-auto-start`, `mount-stale-self-heal`, `mount-clone-paths`, `writeback-linear-state`, `writeback-linear-comment`, `writeback-linear-create`, `writeback-linear-verify`, `writeback-github-lifecycle`, `writeback-slack-thread`, `webhook-registration`, `webhook-unregistration`, `subscription-stream-recovery`.
-
-### Tier 6 IDs
-
-`cli-kill-loop`, `cli-babysit`, `cli-close-probe`, `human-authorized-github-replies`, `pr-babysitter-opt-in`, `pr-standalone-babysitter-validation`, `pr-babysitter-ready-signal`, `pr-merge-gate-check`, `pr-guarded-merge`, `pr-on-green-merge-policy`, `pr-synthetic-probe-cleanup`, `safety-probe-close-identity`, `writeback-github-pr-publication`, `writeback-github-pr-close`.
+```bash
+npm run build
+node bin/factory.mjs featuremap check
+node --input-type=module - <<'NODE'
+import { readFileSync } from 'node:fs'
+import { parseManifestFeatures } from './dist/featuremap/validate.js'
+const features = parseManifestFeatures(readFileSync('.agentworkforce/features/manifest.yaml', 'utf8'))
+for (const feature of features) {
+  console.log(`${feature.id}\t${feature.category}\t${feature.procedure}\ttier-${feature.tier}`)
+}
+NODE
+```
 
 ---
 
@@ -397,17 +891,19 @@ Every feature below maps to the procedure for its manifest tier. This index is i
 
 ```bash
 set -euo pipefail
+VERIFY_TMP="$(mktemp -d)"
+trap 'rm -rf "$VERIFY_TMP"' EXIT
 npm run build
 npm test
 node bin/factory.mjs --help >/dev/null
-node --input-type=module <<'NODE'
+node --input-type=module - "$VERIFY_TMP/factory.config.json" <<'NODE'
 import { readFileSync, writeFileSync } from 'node:fs'
 const config = JSON.parse(readFileSync('test/fixtures/factory.config.json', 'utf8'))
 config.fixtureFiles['/linear/issues/AR-77__uuid-77.json'].payload.url =
   'https://linear.app/agent-relay/issue/AR-77/cli-dry-run'
-writeFileSync('/tmp/factory-tier2-config.json', JSON.stringify(config, null, 2))
+writeFileSync(process.argv[2], JSON.stringify(config, null, 2))
 NODE
-node bin/factory.mjs run-once --config /tmp/factory-tier2-config.json --dry-run \
+node bin/factory.mjs run-once --config "$VERIFY_TMP/factory.config.json" --dry-run \
   | node --input-type=module -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const r=JSON.parse(s);if(!r.dryRun||r.triaged.length<1)process.exit(1)})"
 ```
 

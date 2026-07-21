@@ -1,14 +1,14 @@
-version: '1.0'
-updated: '2026-07-20'
+version: '1.1'
+updated: '2026-07-21'
 catalog:
-  category_count: 19
-  feature_count: 241
+  category_count: 23
+  feature_count: 287
   tier_counts:
-    1: 24
-    2: 105
-    3: 10
-    4: 41
-    5: 47
+    1: 39
+    2: 121
+    3: 11
+    4: 45
+    5: 57
     6: 14
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -25,6 +25,37 @@ catalog:
 #   4 - a fleet backend (internal broker or hosted Relay fleet) is available
 #   5 - cloud auth and a writable Relayfile mount are available
 #   6 - manual verification with a live issue or pull request
+#
+# Tier alone is not a test plan. Every category is mapped to a named procedure
+# with exact prerequisites, setup, assertions, cleanup, and automation limits.
+# Procedures live in .agentworkforce/features/verify/procedures.md.
+
+verification:
+  document: .agentworkforce/features/verify/procedures.md
+  categories:
+    cli-operations: cli-and-package
+    fleet-cli: fleet-execution
+    discovery-events: provider-discovery
+    triage-routing: triage-and-configuration
+    dispatch-orchestration: issue-dispatch-lifecycle
+    human-loop: human-clarification
+    pr-lifecycle: pull-request-lifecycle
+    safety: safety-boundaries
+    mount-writeback: integrations-and-writeback
+    fleet-node: fleet-execution
+    webhook-subscriptions: event-intake
+    programmatic-api: public-api
+    hosted-control-plane: hosted-control-plane
+    cloud-observability: cloud-observability
+    release-verification: release-verification
+    proactive-health: proactive-health
+    config-intake: triage-and-configuration
+    config-repositories: triage-and-configuration
+    config-loop: loop-and-recovery
+    config-models-and-human: human-clarification
+    config-linear-states: provider-discovery
+    config-safety: safety-boundaries
+    config-node-and-loading: fleet-execution
 
 categories:
   cli-operations:
@@ -39,9 +70,16 @@ categories:
         location: src/cli/fleet.ts
         verify_tier: 1
 
+      - id: cli-version
+        name: CLI Version
+        cli: factory --version
+        description: Print the installed @agent-relay/factory package version without loading configuration or constructing provider and fleet clients
+        location: src/cli/fleet.ts, package.json
+        verify_tier: 1
+
       - id: cli-featuremap-check
         name: Repository Feature-Map Check
-        cli: factory featuremap check [--base <ref>]
+        cli: factory featuremap check [--manifest <path>] [--base <ref>]
         api: checkFeatureMap()
         description: Fail CI on malformed feature manifests, duplicate ids, invalid tiers, catalog drift, or missing locations and advise reviewers when referenced code changes beside unchanged metadata
         location: src/featuremap/validate.ts, src/featuremap/check.ts, src/cli/fleet.ts
@@ -253,7 +291,7 @@ categories:
         name: Linear Ready Issue Discovery
         api: Factory.runOnce()
         description: Discover canonical Linear issues in the Ready for Agent state, including ready-state aliases
-        location: src/orchestrator/factory.ts
+        location: src/orchestrator/factory.ts, src/constants/linear.ts
         verify_tier: 3
 
       - id: discovery-github-native
@@ -623,6 +661,34 @@ categories:
         location: src/orchestrator/factory.ts, src/mount/relayfile-github-connection-write.ts, src/ports/state.ts
         verify_tier: 5
 
+      - id: dispatch-dependency-admission
+        name: Dependency-Aware Admission
+        api: parseBlockedBy() / BatchTracker.start()
+        description: Parse only exact Blocked by lines, resolve bare and repo-qualified issue references, park work behind open blockers without consuming batch capacity, and promote it after every blocker closes or merges
+        location: src/orchestrator/dependencies.ts, src/orchestrator/batch-tracker.ts, src/orchestrator/factory.ts
+        verify_tier: 3
+
+      - id: dispatch-dependency-cycle-fence
+        name: Dependency Cycle Fence
+        api: findDependencyCycle()
+        description: Detect repository-qualified dependency cycles and fail closed with a durable reported blocker instead of waiting indefinitely or dispatching cyclic work
+        location: src/orchestrator/dependencies.ts, src/orchestrator/batch-tracker.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: dispatch-isolated-worktrees
+        name: Isolated Agent Worktrees
+        api: AgentWorktreeManager.prepare() / cleanup()
+        description: Give each local issue one idempotent branch worktree, recover an existing remote PR branch without overwriting divergence, and clean up only paths inside Factory's owned worktree root
+        location: src/git/agent-worktree.ts, src/ports/worktree.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-github-lifecycle-alias-deduplication
+        name: Atomic GitHub Lifecycle Alias Deduplication
+        api: githubLifecycleAliases() / StateStore.claimDispatchLifecycle()
+        description: Resolve renamed legacy GitHub lifecycle keys to one canonical repo-and-issue identity under the same state lock so concurrent owners cannot dispatch or publish duplicates
+        location: src/state/github-lifecycle-identity.ts, src/state/file-state-store.ts, src/state/in-memory-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
   human-loop:
     name: Human Clarification Loop
     description: Slack and GitHub conversations that unblock triage and running agents
@@ -990,7 +1056,7 @@ categories:
         name: Linear State Writeback
         api: MountLinearWriteback().setState()
         description: Update a scoped Linear issue state and confirm provider acknowledgement
-        location: src/writeback/linear.ts
+        location: src/writeback/linear.ts, src/constants/linear.ts
         verify_tier: 5
 
       - id: writeback-linear-comment
@@ -1039,7 +1105,21 @@ categories:
         name: Slack Thread and Reply Writeback
         api: MountSlackWriteback
         description: Create issue threads and bounded replies using guarded Slack mount paths and confirmed writes
-        location: src/writeback/slack.ts
+        location: src/writeback/slack.ts, src/constants/slack.ts
+        verify_tier: 5
+
+      - id: mount-integration-preflight
+        name: Required Integration Preflight
+        api: ensureFactoryIntegrations() / inspectFactoryIntegration()
+        description: Inspect the selected issue source plus GitHub and optional Slack connections, open only the missing provider flow when interaction is allowed, and return actionable headless or dry-run guidance otherwise
+        location: src/mount/relayfile-integration-preflight.ts, src/cli/fleet.ts
+        verify_tier: 5
+
+      - id: mount-health-reporting
+        name: Factory Mount Health Record
+        api: publishFactoryMountHealth()
+        description: Publish a bounded current mount-health record under Factory's observability scope without allowing health reporting failures to interrupt orchestration
+        location: src/writeback/mount-health.ts, src/mount/relayfile-cloud-mount-client.ts
         verify_tier: 5
 
   fleet-node:
@@ -1071,7 +1151,21 @@ categories:
       - id: fleet-owned-broker-drain
         name: Owned Broker Drain
         api: InternalFleetClient.dispose()
-        description: Wait a bounded time for factory-spawned task-exit agents before stopping owned infrastructure
+        description: Wait a bounded time for factory-spawned task-exit agents, isolate owned broker state, and stop only infrastructure Factory started after canonical release confirmation
+        location: src/fleet/internal-fleet-client.ts, src/fleet/ensure-relay-broker.ts
+        verify_tier: 4
+
+      - id: fleet-canonical-agent-presence
+        name: Canonical Internal Agent Presence
+        api: InternalFleetClient.roster()
+        description: Treat Relay's canonical presence as authoritative, exclude stale or offline broker rows, preserve live non-MCP workers, and fail closed when canonical presence cannot be read
+        location: src/fleet/internal-fleet-client.ts
+        verify_tier: 4
+
+      - id: fleet-release-confirmation
+        name: Verified Agent Release
+        api: InternalFleetClient.release()
+        description: Confirm the released agent disappears from canonical presence before its name can be reused, while bounding retry and disposal windows
         location: src/fleet/internal-fleet-client.ts
         verify_tier: 4
 
@@ -1092,7 +1186,7 @@ categories:
       - id: fleet-relay-reconciliation
         name: Hosted Agent Reconciliation
         api: RelayFleetClient.reconcileTrackedAgents()
-        description: Reconcile tracked invocation IDs against hosted action status and roster state to recover missed exits
+        description: Reconcile tracked invocation IDs against hosted action status and roster state, defer exit recovery until adoption is attempted, and recover missing or offline startup agents without duplicating work
         location: src/fleet/relay-fleet-client.ts
         verify_tier: 4
 
@@ -1309,6 +1403,215 @@ categories:
         location: src/logging.ts
         verify_tier: 1
 
+      - id: api-dependency-graph
+        name: Dependency Graph API
+        api: parseBlockedBy() / dependencyIdentity() / findDependencyCycle()
+        description: Parse, normalize, and cycle-check explicit repository-qualified issue dependencies for custom admission and reporting integrations
+        location: src/index.ts, src/orchestrator/dependencies.ts, src/orchestrator/batch-tracker.ts
+        verify_tier: 1
+
+      - id: api-worktree-port
+        name: Agent Worktree Port
+        api: AgentWorktree / AgentWorktreeManager
+        description: Inject a worktree preparation and cleanup strategy independently from Factory orchestration
+        location: src/ports/worktree.ts, src/index.ts
+        verify_tier: 1
+
+      - id: api-integration-preflight
+        name: Integration Preflight API
+        api: ensureFactoryIntegrations() / inspectFactoryIntegration() / openIntegrationUrl()
+        description: Inspect and connect required Relayfile providers from an embedding application with injectable interaction and browser-open behavior
+        location: src/mount/relayfile-integration-preflight.ts, src/index.ts
+        verify_tier: 1
+
+      - id: api-observability
+        name: Cloud Observability API
+        api: '@agent-relay/factory/observability'
+        description: Export the bounded event contract, durable outbox, reporter, and opaque instance identity helpers as a dedicated package surface
+        location: src/observability/, src/index.ts, package.json
+        verify_tier: 1
+
+      - id: api-hosted-control-plane
+        name: Hosted Factory API
+        api: '@agent-relay/factory/hosted'
+        description: Export the worker-safe hosted loop, completion API, lease-fenced state adapters, and host-supplied integration ports without Node filesystem or process dependencies
+        location: src/hosted/, package.json
+        verify_tier: 1
+
+  hosted-control-plane:
+    name: Hosted Factory Control Plane
+    description: Cloud-worker-safe discovery, triage, dispatch, completion, merge-gate, writeback, and durable ownership
+    criticality: critical
+    features:
+      - id: hosted-run-once
+        name: Hosted Discovery-to-Dispatch Sweep
+        api: HostedFactory.runOnce()
+        description: Reconcile prior invocations, discover and deduplicate ready issues, enforce Factory scope and batch capacity, triage them, and dispatch the resulting agent or workflow shape
+        location: src/hosted/orchestrator.ts
+        verify_tier: 5
+
+      - id: hosted-completion-reconciliation
+        name: Hosted Completion Reconciliation
+        api: HostedFactory.runOnce()
+        description: Poll every nonterminal persisted invocation before discovery so a dropped completion webhook is recovered on the next scheduled sweep
+        location: src/hosted/orchestrator.ts
+        verify_tier: 5
+
+      - id: hosted-completion-ingest
+        name: Pushed Hosted Completion
+        api: HostedFactory.ingestCompletion()
+        description: Accept an invocation completion event idempotently, update only its owning issue, and finish merge-gate and writeback when every invocation is terminal
+        location: src/hosted/orchestrator.ts, src/hosted/types.ts
+        verify_tier: 5
+
+      - id: hosted-deterministic-invocations
+        name: Deterministic Hosted Invocation Identity
+        api: hostedFactoryInvocationId()
+        description: Derive stable workspace, issue, role, and route invocation IDs so an at-least-once spawn retry cannot create a second worker
+        location: src/hosted/orchestrator.ts
+        verify_tier: 2
+
+      - id: hosted-merge-gate-writeback
+        name: Hosted Merge Gate and Idempotent Writeback
+        api: HostedFactoryMergeGate / HostedFactoryWriteback
+        description: Persist pending provider writes, evaluate the host merge gate after terminal agents, and reuse stable provider idempotency keys across retries and lease loss
+        location: src/hosted/orchestrator.ts, src/hosted/types.ts
+        verify_tier: 5
+
+      - id: hosted-owner-lease-fencing
+        name: Hosted Owner Lease Fencing
+        api: HostedFactoryStateStore.claimRunLease() / renewRunLease()
+        description: Allow one workspace owner epoch to mutate hosted state at a time and stop stale isolates immediately after renewal or fenced-save failure
+        location: src/hosted/orchestrator.ts, src/hosted/state-store.ts, src/hosted/types.ts
+        verify_tier: 2
+
+      - id: hosted-durable-object-state
+        name: Durable Object Hosted State
+        api: DurableObjectHostedFactoryStateStore
+        description: Store workspace leases, issues, and invocation indexes transactionally with owner-and-epoch checks on every write
+        location: src/hosted/state-store.ts
+        verify_tier: 2
+
+      - id: hosted-worker-safety
+        name: Worker-Safe Hosted Bundle
+        api: '@agent-relay/factory/hosted'
+        description: Keep the hosted entrypoint free of Node filesystem, process, child-process, and local-broker imports so it can execute in a Cloud worker
+        location: src/hosted/, src/hosted/worker-safety.test.ts
+        verify_tier: 1
+
+  cloud-observability:
+    name: Cloud Progress and Correlation
+    description: Privacy-bounded lifecycle events, durable delivery, trace correlation, and installation identity
+    criticality: hot
+    features:
+      - id: cloud-event-contract
+        name: Bounded Cloud Event Contract
+        api: FACTORY_CLOUD_EVENT_CONTRACT_V1 / FactoryCloudEventV1Schema
+        description: Admit only a strict bounded operational field set and reject task text, prompts, messages, paths, commands, source, tokens, raw errors, and stack traces
+        location: src/observability/events.ts, src/ports/observability.ts
+        verify_tier: 1
+
+      - id: cloud-trace-correlation
+        name: Durable Run Trace Correlation
+        api: factoryRunTraceIdV1()
+        description: Derive one deterministic nonzero W3C-shaped trace ID from the opaque durable run ID without claiming an OpenTelemetry span exists
+        location: src/observability/events.ts, src/orchestrator/factory.ts
+        verify_tier: 1
+
+      - id: cloud-instance-identity
+        name: Opaque Factory Instance Identity
+        api: loadOrCreateFactoryInstanceId() / resolveFactoryInstanceName()
+        description: Converge concurrent starts on one private opaque installation UUID without fingerprinting hostname, user, or path and derive only an explicit or unambiguous display name
+        location: src/observability/instance-identity.ts, src/cli/fleet.ts
+        verify_tier: 1
+
+      - id: cloud-event-outbox
+        name: Durable Cloud Event Outbox
+        api: FileFactoryCloudEventOutbox
+        description: Persist ordered batches across restart, serialize concurrent writers, bound count and bytes, prefer critical events during compaction, and acknowledge only delivered IDs
+        location: src/observability/outbox.ts
+        verify_tier: 2
+
+      - id: cloud-reporter-delivery
+        name: Authenticated Cloud Event Delivery
+        api: FactoryCloudReporter
+        description: Send bounded batches with refreshed access tokens, timeouts, jittered retry, duplicate acknowledgement, payload ceilings, and safe handling for permanent rejection
+        location: src/observability/cloud-reporter.ts, src/cli/fleet.ts
+        verify_tier: 5
+
+      - id: cloud-reporting-nonblocking
+        name: Non-Blocking Cloud Reporting
+        api: FactoryEventReporter
+        description: Persist and flush lifecycle progress without allowing reporter construction, storage, network, retry, or shutdown failure to change Factory orchestration
+        location: src/observability/cloud-reporter.ts, src/orchestrator/factory.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+  release-verification:
+    name: Release and Feature Verification
+    description: Executable catalog contracts, clean-consumer package proof, and head-bound end-to-end attestations
+    criticality: critical
+    features:
+      - id: verification-procedure-routing
+        name: Manifest-to-Procedure Routing
+        api: manifest.yaml#verification.categories
+        description: Assign every feature category to a named procedure containing exact prerequisites, commands, assertions, cleanup, and automation limitations
+        location: .agentworkforce/features/manifest.yaml, .agentworkforce/features/verify/procedures.md
+        verify_tier: 1
+
+      - id: verification-agent-runbook
+        name: Agent Feature Verification Runbook
+        api: .claude/skills/verify-features.md
+        description: Tell an agent how to select changed features structurally, resolve their category procedure and tier, run critical paths, retain evidence, and stop before unauthorized live mutations
+        location: .claude/skills/verify-features.md, .agentworkforce/features/critical-paths.md
+        verify_tier: 1
+
+      - id: verification-workflow
+        name: Scheduled Feature Verification Workflow
+        cli: relay node workflow run workflows/verify-features.ts
+        description: Run deterministic package and fixture gates plus explicit opt-in provider, fleet, cloud, and manual tiers and fail the workflow when any required or selected check fails
+        location: workflows/verify-features.ts
+        verify_tier: 1
+
+      - id: verification-packed-e2e
+        name: Packed Consumer End-to-End Verification
+        cli: npm run verify:e2e
+        description: Pack Factory, install it in a clean consumer, verify public exports and CLI behavior, and drive the packaged fixture plus hosted lifecycle before writing an attestation
+        location: scripts/verify-packed-e2e.mjs, scripts/packed-e2e-scenario.mjs, src/packed-e2e-attestation.test.ts
+        verify_tier: 1
+
+      - id: verification-head-bound-attestation
+        name: Head-Bound PR Attestation
+        api: artifacts/factory-e2e-attestation.json
+        description: Bind the clean-consumer end-to-end evidence to the exact checked-out PR head SHA and reject missing, stale, or base-only attestations
+        location: .github/workflows/ci.yml, docs/pr-end-to-end-verification.md, scripts/verify-packed-e2e.mjs
+        verify_tier: 1
+
+  proactive-health:
+    name: Proactive Feature Guardian
+    description: Scheduled, exhaustive, durable Slack questions over the live Factory feature manifest
+    criticality: hot
+    features:
+      - id: guardian-hourly-feature-check
+        name: Hourly Factory Feature Check
+        api: factory-feature-guardian schedules.hourly-check
+        description: Load the manifest from the scoped cloned Factory repository and post one precise criticality-and-tier-ordered feature question to the configured Slack channel every hour
+        location: .agentworkforce/agents/factory-feature-guardian/agent.ts, .agentworkforce/agents/factory-feature-guardian/persona.json
+        verify_tier: 5
+
+      - id: guardian-exact-cycle-state
+        name: Exact Durable Guardian Cycle
+        api: /memory/workspace/factory-feature-guardian/cycle-state.json
+        description: Persist generation, checked IDs, manifest total, and last provider receipt with revision compare-and-set, bounded state, safe manifest reconciliation, and fail-closed load behavior
+        location: .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 5
+
+      - id: guardian-idempotent-slack-delivery
+        name: Idempotent Guardian Slack Delivery
+        api: slack.messages.write({ idempotencyKey })
+        description: Retry an ambiguous scheduled run with a stable cycle-and-feature key, require a real provider Slack timestamp, and advance progress only after the confirmed receipt
+        location: .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 5
+
   config-intake:
     name: Workspace Intake Configuration
     description: Factory source, capacity, subscription, and retry controls in factory.config.json
@@ -1412,6 +1715,41 @@ categories:
         location: src/config/schema.ts, src/triage/heuristic.ts
         verify_tier: 2
 
+      - id: config-reporting-enabled
+        name: Cloud Reporting Enablement
+        api: factory.config.json#reporting.enabled
+        description: Enable authenticated Cloud progress reporting for real CLI sessions while remaining a no-op when the active account cannot be resolved
+        location: src/config/schema.ts, src/cli/fleet.ts
+        verify_tier: 2
+
+      - id: config-reporting-instance-name
+        name: Cloud Reporting Instance Name
+        api: factory.config.json#reporting.instanceName
+        description: Set a trimmed bounded operator-facing Factory instance name instead of deriving one from a sole configured repository
+        location: src/config/schema.ts, src/observability/instance-identity.ts
+        verify_tier: 2
+
+      - id: config-reporting-outbox
+        name: Cloud Reporting Outbox Path
+        api: factory.config.json#reporting.outboxPath
+        description: Select the private durable event outbox; by default it is placed beside the loop registry
+        location: src/config/schema.ts, src/cli/fleet.ts, src/observability/outbox.ts
+        verify_tier: 2
+
+      - id: config-reporting-batch-size
+        name: Cloud Reporting Batch Size
+        api: factory.config.json#reporting.batchSize
+        description: Bound each Cloud progress batch from one through one hundred events without exceeding the event contract limit
+        location: src/config/schema.ts, src/observability/cloud-reporter.ts
+        verify_tier: 2
+
+      - id: config-reporting-timeout
+        name: Cloud Reporting Request Timeout
+        api: factory.config.json#reporting.requestTimeoutMs
+        description: Bound one Cloud delivery request from one hundred milliseconds through sixty seconds
+        location: src/config/schema.ts, src/observability/cloud-reporter.ts
+        verify_tier: 2
+
   config-repositories:
     name: Repository Routing Configuration
     description: Compact and explicit repository routing plus checkout derivation
@@ -1454,7 +1792,7 @@ categories:
 
       - id: config-repos-keyword-rules
         name: Keyword Route Rules
-        api: factory.config.json#repos.keywordRules
+        api: factory.config.json#repos.keywordRules[].pattern / factory.config.json#repos.keywordRules[].repo
         description: Provide ordered regex-to-repository routes used after label and project routes
         location: src/config/schema.ts, src/triage/heuristic.ts
         verify_tier: 2
@@ -1602,6 +1940,27 @@ categories:
         location: src/config/schema.ts, src/triage/heuristic.ts
         verify_tier: 2
 
+      - id: config-implementer-capability
+        name: Implementer Harness Capability
+        api: factory.config.json#agentCapabilities.implementer
+        description: Select spawn:codex or spawn:claude for implementer roles while preserving spawn:codex as the default
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-reviewer-capability
+        name: Reviewer Harness Capability
+        api: factory.config.json#agentCapabilities.reviewer
+        description: Select spawn:codex or spawn:claude for reviewer roles while preserving spawn:claude as the default
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-babysitter-capability
+        name: Babysitter Harness Capability
+        api: factory.config.json#agentCapabilities.babysitter
+        description: Select spawn:codex or spawn:claude for babysitter roles while preserving spawn:claude as the default
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
       - id: config-babysitter-enabled
         name: Automatic Babysitter Enablement
         api: factory.config.json#babysitter.enabled
@@ -1644,6 +2003,13 @@ categories:
         location: src/config/schema.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
+      - id: config-slack-stakeholders
+        name: Slack Stakeholder Mentions
+        api: factory.config.json#slack.stakeholderUserIds
+        description: Configure explicit Slack user IDs to mention for human decisions without guessing identities from issue-provider names
+        location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
       - id: config-slack-staleness
         name: Slack Staleness Threshold
         api: factory.config.json#slack.staleAfterMs
@@ -1656,6 +2022,13 @@ categories:
         api: factory.config.json#slack.conversationCoalesceMs
         description: Set the short bounded window used to fold rapid thread replies into one resumed agent turn
         location: src/config/schema.ts, src/orchestrator/coalesced-task-queue.ts
+        verify_tier: 2
+
+      - id: config-github-identity
+        name: GitHub Pull Request Identity
+        api: factory.config.json#github.identity
+        description: Choose strict connected-app publication, strict local gh user publication, or the default app-then-user compatibility fallback and report the confirmed author
+        location: src/config/schema.ts, src/orchestrator/factory.ts, src/mount/relayfile-github-connection-write.ts
         verify_tier: 2
 
   config-linear-states:
@@ -1780,14 +2153,14 @@ categories:
     features:
       - id: config-node-capabilities
         name: Node Capabilities
-        api: factory.node.json#capabilities
+        api: factory.node.json#capabilities / factory.config.json#capabilities
         description: Advertise any supported subset of spawn:claude, spawn:codex, and workflow:run; reject empty or unknown-only sets
         location: src/config/schema.ts, src/node/factory-node.ts
         verify_tier: 2
 
       - id: config-node-dry-run
         name: Node Dry-Run Metadata
-        api: factory.node.json#dryRun
+        api: factory.node.json#dryRun / factory.config.json#dryRun
         description: Advertise node dry-run intent in factory capability metadata
         location: src/config/schema.ts, src/node/factory-node.ts
         verify_tier: 2
@@ -1815,7 +2188,7 @@ categories:
 
       - id: config-split-envelope
         name: Split Workspace and Node Config
-        api: factory.config.json#workspaceConfig + nodeConfig
+        api: factory.config.json#workspaceConfig + factory.config.json#nodeConfig
         description: Combine required workspaceConfig and nodeConfig objects while rejecting mismatched workspace IDs
         location: src/config/schema.ts
         verify_tier: 2

@@ -10,17 +10,22 @@ export type FeatureCriticality = 'critical' | 'hot' | 'standard'
 export interface ManifestFeature {
   id: string
   name: string
+  category: string
   cli?: string
   api?: string
   desc: string
   location: string
   tier: number
   criticality: FeatureCriticality
+  procedure?: string
 }
 
 export interface FeatureManifestValidation {
+  version: string
   categoryCount: number
   features: ManifestFeature[]
+  verificationDocument?: string
+  categoryProcedures: Record<string, string>
 }
 
 export interface ValidateFeatureManifestOptions {
@@ -62,7 +67,11 @@ export function validateFeatureManifest(
   options: ValidateFeatureManifestOptions = {},
 ): FeatureManifestValidation {
   const manifest = parseManifestYaml(raw)
+  const version = nonEmptyString(manifest.version)
+  if (!version) throw new Error('Manifest is missing version')
   const categories = requireRecord(manifest.categories, 'Manifest is missing categories')
+  const categoryIds = Object.keys(categories)
+  const verification = validateVerification(manifest.verification, categoryIds, version)
   const features: ManifestFeature[] = []
   const seenIds = new Set<string>()
 
@@ -80,7 +89,12 @@ export function validateFeatureManifest(
     }
 
     for (const inputFeature of category.features) {
-      const feature = validateFeature(inputFeature, criticality)
+      const feature = validateFeature(
+        inputFeature,
+        categoryId,
+        criticality,
+        verification.categoryProcedures[categoryId],
+      )
       if (seenIds.has(feature.id)) {
         throw new Error(`Duplicate feature id in manifest: ${feature.id}`)
       }
@@ -90,13 +104,27 @@ export function validateFeatureManifest(
   }
 
   if (features.length === 0) throw new Error('Manifest parsed but contained no features')
-  validateCatalogSummary(manifest.catalog, Object.keys(categories).length, features)
+  validateCatalogSummary(manifest.catalog, categoryIds.length, features)
 
   if (options.rootDir !== undefined) {
     validateFeatureLocations(features, options.rootDir, options.pathExists ?? existsSync)
+    if (verification.document) {
+      validateRepositoryPath(
+        verification.document,
+        options.rootDir,
+        options.pathExists ?? existsSync,
+        'Feature verification document',
+      )
+    }
   }
 
-  return { categoryCount: Object.keys(categories).length, features }
+  return {
+    version,
+    categoryCount: categoryIds.length,
+    features,
+    ...(verification.document ? { verificationDocument: verification.document } : {}),
+    categoryProcedures: verification.categoryProcedures,
+  }
 }
 
 /** Read the conventional repository manifest and validate all declared paths. */
@@ -117,10 +145,20 @@ export function validateFeatureManifestFile(
     throw new Error(`Feature manifest must be inside the repository root: ${absoluteManifestPath}`)
   }
   const raw = readFileSync(absoluteManifestPath, 'utf8')
-  return validateFeatureManifest(raw, {
+  const result = validateFeatureManifest(raw, {
     rootDir,
     ...(options.pathExists ? { pathExists: options.pathExists } : {}),
   })
+  if (result.verificationDocument) {
+    const procedures = readFileSync(resolve(rootDir, result.verificationDocument), 'utf8')
+    for (const procedure of new Set(Object.values(result.categoryProcedures))) {
+      const heading = new RegExp(`^## ${escapeRegExp(procedure)}\\s*$`, 'mu')
+      if (!heading.test(procedures)) {
+        throw new Error(`Missing feature verification procedure heading: ## ${procedure}`)
+      }
+    }
+  }
+  return result
 }
 
 /** Split the manifest's comma-delimited location field into repository paths. */
@@ -177,7 +215,16 @@ function parseManifestYaml(raw: string): Record<string, unknown> {
   }
 }
 
-function validateFeature(input: unknown, criticality: FeatureCriticality): ManifestFeature {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+}
+
+function validateFeature(
+  input: unknown,
+  category: string,
+  criticality: FeatureCriticality,
+  procedure: string | undefined,
+): ManifestFeature {
   const record = input !== null && typeof input === 'object' && !Array.isArray(input)
     ? input as Record<string, unknown>
     : {}
@@ -203,13 +250,51 @@ function validateFeature(input: unknown, criticality: FeatureCriticality): Manif
   return {
     id,
     name,
+    category,
     ...(cli ? { cli } : {}),
     ...(api ? { api } : {}),
     desc: description,
     location,
     tier: verifyTier as number,
     criticality,
+    ...(procedure ? { procedure } : {}),
   }
+}
+
+function validateVerification(
+  input: unknown,
+  categoryIds: readonly string[],
+  version: string,
+): { document?: string; categoryProcedures: Record<string, string> } {
+  if (input === undefined) {
+    if (version === '1.1') {
+      throw new Error('Manifest version 1.1 is missing verification routing')
+    }
+    return { categoryProcedures: {} }
+  }
+
+  const verification = requireRecord(input, 'Manifest verification must be an object')
+  const document = nonEmptyString(verification.document)
+  if (!document) throw new Error('Manifest verification is missing document')
+  const procedures = requireRecord(
+    verification.categories,
+    'Manifest verification is missing categories',
+  )
+  const categorySet = new Set(categoryIds)
+  const categoryProcedures: Record<string, string> = {}
+  for (const categoryId of categoryIds) {
+    const procedure = nonEmptyString(procedures[categoryId])
+    if (!procedure || !/^[a-z0-9-]+$/u.test(procedure)) {
+      throw new Error(`Manifest category ${categoryId} has invalid verification procedure`)
+    }
+    categoryProcedures[categoryId] = procedure
+  }
+  for (const mappedCategory of Object.keys(procedures)) {
+    if (!categorySet.has(mappedCategory)) {
+      throw new Error(`Manifest verification maps unknown category: ${mappedCategory}`)
+    }
+  }
+  return { document, categoryProcedures }
 }
 
 function validateCatalogSummary(
@@ -247,21 +332,40 @@ function validateFeatureLocations(
       throw new Error(`Manifest feature ${feature.id} has no valid locations`)
     }
     for (const location of locations) {
-      const absolutePath = isAbsolute(location) ? location : resolve(rootDir, location)
-      const relativePath = relative(rootDir, absolutePath).replaceAll('\\', '/')
-      if (relativePath === '..' || relativePath.startsWith('../') || isAbsolute(relativePath)) {
-        throw new Error(`Feature location must be inside the repository root for ${feature.id}: ${location}`)
-      }
-      if (!pathExists(absolutePath)) {
-        throw new Error(`Missing location for ${feature.id}: ${location}`)
-      }
+      validateRepositoryPath(location, rootDir, pathExists, `Feature location for ${feature.id}`)
     }
+  }
+}
+
+function validateRepositoryPath(
+  path: string,
+  rootDir: string,
+  pathExists: (path: string) => boolean,
+  label: string,
+): void {
+  const absolutePath = isAbsolute(path) ? path : resolve(rootDir, path)
+  const relativePath = relative(rootDir, absolutePath).replaceAll('\\', '/')
+  if (relativePath === '..' || relativePath.startsWith('../') || isAbsolute(relativePath)) {
+    if (label.startsWith('Feature location for ')) {
+      const featureId = label.slice('Feature location for '.length)
+      throw new Error(`Feature location must be inside the repository root for ${featureId}: ${path}`)
+    }
+    throw new Error(`${label} must be inside the repository root: ${path}`)
+  }
+  if (!pathExists(absolutePath)) {
+    if (label.startsWith('Feature location for ')) {
+      const featureId = label.slice('Feature location for '.length)
+      throw new Error(`Missing location for ${featureId}: ${path}`)
+    }
+    throw new Error(`Missing ${label.toLowerCase()}: ${path}`)
   }
 }
 
 function featureConfirmationChanged(base: ManifestFeature, head: ManifestFeature): boolean {
   return base.desc !== head.desc ||
     base.tier !== head.tier ||
+    base.category !== head.category ||
+    base.procedure !== head.procedure ||
     featureLocations(base).map(normalizeRepositoryPath).join('\n') !==
       featureLocations(head).map(normalizeRepositoryPath).join('\n')
 }

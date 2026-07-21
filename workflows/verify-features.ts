@@ -16,6 +16,7 @@
  *   FACTORY_VERIFY_CONFIG=/path/to/factory.config.json
  *   FACTORY_VERIFY_FLEET=1
  *   FACTORY_VERIFY_BACKEND=internal|relay
+ *   FACTORY_VERIFY_CAPABILITY=spawn:codex|spawn:claude|workflow:run
  *   FACTORY_VERIFY_CLOUD=1
  */
 import { workflow } from '@relayflows/core'
@@ -45,10 +46,10 @@ mkdir -p "${ARTIFACTS}"
 cat > "${ARTIFACTS}/acceptance-contract.txt" <<'EOF'
 FACTORY FEATURE VERIFICATION ACCEPTANCE CONTRACT
 
-T1  Package only: manifest schema/coverage, public entrypoint, build
-T2  Valid config: complete unit suite and fixture-backed CLI cycle
+T1  Package only: v1.1 manifest/procedure contract, public entrypoint, build
+T2  Valid config: complete unit/guardian suite and fixture-backed CLI cycle
 T3  Ticket provider: optional live sync-fidelity canary
-T4  Fleet backend: optional internal/hosted roster health
+T4  Fleet backend: optional spawn → roster → release → absence cycle
 T5  Cloud mount: optional provider-backed dry-run discovery
 T6  Live issue/PR: manual critical-path verification
 
@@ -61,6 +62,11 @@ Final-main regression contracts exercised by T1/T2:
 - #84 repo-aware relay placement on initial and restart paths
 - #85 durable relay lifecycle, same-host fencing, remote publication/release/recovery
 - #87 canonical PR routing, durable/coalesced babysitter wakes, ACK fence, poll/readback
+- dependency admission/cycle fences and isolated worktree cleanup
+- hosted invocation identity, completion reconciliation, owner leases, and merge/writeback gates
+- bounded Cloud event contract, durable outbox, reporter retry, and non-blocking failure
+- exact guardian state, manifest reconciliation, idempotent Slack delivery, and confirmed receipts
+- packed tarball and head-bound release attestation
 
 Automated overall PASS requires T1 and T2 PASS and every opted-in T3-T5 check PASS.
 Skipped optional tiers are reported, never silently treated as exercised.
@@ -119,6 +125,8 @@ run_check "package build" npm run build
 # a build-only failure.
 npx tsc-alias -p tsconfig.build.json >> "$LOG" 2>&1 || true
 run_check "factory help" node bin/factory.mjs --help
+run_check "factory version" node bin/factory.mjs --version
+run_check "feature manifest" node bin/factory.mjs featuremap check
 
 if [ ! -e .agentworkforce/FEATURE_MAPPING_BRIEF.md ]; then
   echo "PASS  brief removed" | tee -a "$LOG"
@@ -133,10 +141,15 @@ import { readFileSync } from 'node:fs'
 import { validateFeatureManifestFile } from './dist/featuremap/index.js'
 
 const procedures = readFileSync('.agentworkforce/features/verify/procedures.md', 'utf8')
-const { categoryCount, features } = validateFeatureManifestFile({ rootDir: process.cwd() })
-for (const feature of features) {
-  const marker = String.fromCharCode(96) + feature.id + String.fromCharCode(96)
-  if (!procedures.includes(marker)) throw new Error('feature missing from procedures: ' + feature.id)
+const result = validateFeatureManifestFile({ rootDir: process.cwd() })
+if (result.version !== '1.1') throw new Error('feature manifest must use v1.1 verification routing')
+if (result.verificationDocument !== '.agentworkforce/features/verify/procedures.md') {
+  throw new Error('feature manifest points to the wrong verification document')
+}
+for (const [category, procedure] of Object.entries(result.categoryProcedures)) {
+  if (!procedures.includes('## ' + procedure)) {
+    throw new Error('missing named procedure for ' + category + ': ' + procedure)
+  }
 }
 
 const regressionMarkers = {
@@ -183,7 +196,7 @@ for (const [path, markers] of Object.entries(regressionMarkers)) {
     if (!source.includes(marker)) throw new Error('missing final-main regression marker in ' + path + ': ' + marker)
   }
 }
-console.log(JSON.stringify({ categories: categoryCount, features: features.length }))
+console.log(JSON.stringify({ categories: result.categoryCount, features: result.features.length }))
 NODE
 then
   echo "PASS  manifest schema and procedure coverage" | tee -a "$LOG"
@@ -193,85 +206,6 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-GUARDIAN_SELF_TEST="${ARTIFACTS}/guardian-self-test.ts"
-cat > "${ARTIFACTS}/guardian-delivery-stub.mjs" <<'JS'
-export const input = () => undefined
-JS
-cat > "${ARTIFACTS}/guardian-runtime-stub.mjs" <<'JS'
-export const defineAgent = (definition) => definition
-JS
-cat > "${ARTIFACTS}/guardian-slack-stub.mjs" <<'JS'
-export const slackClient = () => ({})
-JS
-cat > "$GUARDIAN_SELF_TEST" <<'TS'
-import { fallbackCheckMessage, parseManifestFeatures } from './guardian-test-bundle.mjs'
-
-const missingSecondCriticality = [
-  'catalog:',
-  '  category_count: 2',
-  '  feature_count: 2',
-  '  tier_counts:',
-  '    1: 2',
-  '    2: 0',
-  '    3: 0',
-  '    4: 0',
-  '    5: 0',
-  '    6: 0',
-  'categories:',
-  '  first:',
-  '    criticality: critical',
-  '    features:',
-  '      - id: first-feature',
-  '        name: First feature',
-  '        cli: factory first',
-  '        description: First expected behavior',
-  '        location: src/index.ts',
-  '        verify_tier: 1',
-  '  second:',
-  '    features:',
-  '      - id: second-feature',
-  '        name: Second feature',
-  '        cli: factory second',
-  '        description: Second expected behavior',
-  '        location: src/index.ts',
-  '        verify_tier: 1',
-].join('\\n')
-
-let rejected = false
-try {
-  parseManifestFeatures(missingSecondCriticality)
-} catch {
-  rejected = true
-}
-if (!rejected) throw new Error('guardian inherited criticality across category boundary')
-
-const source = 'src/orchestrator/factory.ts'
-const fallback = fallbackCheckMessage({
-  id: 'fallback-source-regression',
-  name: 'Fallback source regression',
-  cli: 'factory status',
-  desc: 'Preserve exact source context when LLM completion fails',
-  location: source,
-  tier: 1,
-  criticality: 'critical',
-})
-if (!fallback.includes('Source: ' + source)) throw new Error('guardian fallback omitted feature.location')
-TS
-if npx esbuild .agentworkforce/agents/factory-feature-guardian/agent.ts \
-  --bundle --platform=node --format=esm \
-  --external:yaml \
-  --alias:@agentworkforce/delivery="$PWD/${ARTIFACTS}/guardian-delivery-stub.mjs" \
-  --alias:@agentworkforce/runtime="$PWD/${ARTIFACTS}/guardian-runtime-stub.mjs" \
-  --alias:@relayfile/relay-helpers="$PWD/${ARTIFACTS}/guardian-slack-stub.mjs" \
-  --outfile="${ARTIFACTS}/guardian-test-bundle.mjs" >> "$LOG" 2>&1 && \
-  npx tsx "$GUARDIAN_SELF_TEST" >> "$LOG" 2>&1
-then
-  echo "PASS  guardian parser and fallback regressions" | tee -a "$LOG"
-  PASS=$((PASS + 1))
-else
-  echo "FAIL  guardian parser and fallback regressions" | tee -a "$LOG"
-  FAIL=$((FAIL + 1))
-fi
 
 echo "Tier 1 result: $PASS passed, $FAIL failed" | tee -a "$LOG"
 if [ "$FAIL" -gt 0 ]; then
@@ -299,6 +233,14 @@ if npm test -- --maxWorkers=1 >> "$LOG" 2>&1; then
   PASS=$((PASS + 1))
 else
   echo "FAIL  full Vitest suite" | tee -a "$LOG"
+  FAIL=$((FAIL + 1))
+fi
+
+if npm run verify:e2e >> "$LOG" 2>&1; then
+  echo "PASS  packed tarball and head-bound E2E" | tee -a "$LOG"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL  packed tarball and head-bound E2E" | tee -a "$LOG"
   FAIL=$((FAIL + 1))
 fi
 
@@ -398,6 +340,18 @@ LOG="${ARTIFACTS}/tier4.log"
 : > "$LOG"
 VERIFY_FLEET=$(printenv FACTORY_VERIFY_FLEET 2>/dev/null || true)
 BACKEND=$(printenv FACTORY_VERIFY_BACKEND 2>/dev/null || true)
+CAPABILITY=$(printenv FACTORY_VERIFY_CAPABILITY 2>/dev/null || true)
+if [ -z "$CAPABILITY" ]; then CAPABILITY=spawn:codex; fi
+AGENT_NAME="${RUN_ID}-fleet"
+SPAWNED=0
+
+cleanup_fleet() {
+  if [ "$SPAWNED" = "1" ]; then
+    node bin/factory.mjs fleet release "$AGENT_NAME" --backend "$BACKEND" \
+      --reason "Factory verification cleanup" >> "$LOG" 2>&1 || true
+  fi
+}
+trap cleanup_fleet EXIT
 
 if [ "$VERIFY_FLEET" != "1" ]; then
   echo "Skip reason: FACTORY_VERIFY_FLEET is not 1" | tee -a "$LOG"
@@ -409,12 +363,72 @@ if [ "$BACKEND" != "internal" ] && [ "$BACKEND" != "relay" ]; then
   echo "TIER4_FAIL" | tee -a "$LOG"
   exit 1
 fi
-if node bin/factory.mjs fleet roster --backend "$BACKEND" >> "$LOG" 2>&1; then
-  echo "TIER4_PASS" | tee -a "$LOG"
-  exit 0
+case "$CAPABILITY" in
+  spawn:codex|spawn:claude|workflow:run) ;;
+  *)
+    echo "Failure reason: FACTORY_VERIFY_CAPABILITY must be spawn:codex, spawn:claude, or workflow:run" | tee -a "$LOG"
+    echo "TIER4_FAIL" | tee -a "$LOG"
+    exit 1
+    ;;
+esac
+
+SPAWN_REPORT="${ARTIFACTS}/tier4-spawn.json"
+ROSTER_REPORT="${ARTIFACTS}/tier4-roster.json"
+FINAL_ROSTER="${ARTIFACTS}/tier4-final-roster.json"
+
+if ! node bin/factory.mjs fleet spawn "$CAPABILITY" --backend "$BACKEND" \
+    --name "$AGENT_NAME" --task "Reply with FACTORY_VERIFY_OK, then exit." \
+    > "$SPAWN_REPORT" 2>> "$LOG"; then
+  echo "Failure reason: fleet spawn failed" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
 fi
-echo "TIER4_FAIL" | tee -a "$LOG"
-exit 1
+SPAWNED=1
+
+if ! node bin/factory.mjs fleet roster --backend "$BACKEND" > "$ROSTER_REPORT" 2>> "$LOG" || \
+  ! node --input-type=module - "$ROSTER_REPORT" "$AGENT_NAME" <<'NODE' >> "$LOG" 2>&1
+import { readFileSync } from 'node:fs'
+const report = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const agents = Array.isArray(report) ? report : (report.agents ?? report.items ?? [])
+if (!agents.some((agent) => agent?.name === process.argv[3])) process.exit(1)
+NODE
+then
+  echo "Failure reason: spawned agent was not present in the canonical roster" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
+fi
+
+if ! node bin/factory.mjs fleet release "$AGENT_NAME" --backend "$BACKEND" \
+    --reason "Factory verification complete" >> "$LOG" 2>&1; then
+  echo "Failure reason: fleet release failed" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
+fi
+SPAWNED=0
+
+ABSENT=0
+for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if node bin/factory.mjs fleet roster --backend "$BACKEND" > "$FINAL_ROSTER" 2>> "$LOG" && \
+    node --input-type=module - "$FINAL_ROSTER" "$AGENT_NAME" <<'NODE' >> "$LOG" 2>&1
+import { readFileSync } from 'node:fs'
+const report = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const agents = Array.isArray(report) ? report : (report.agents ?? report.items ?? [])
+if (agents.some((agent) => agent?.name === process.argv[3])) process.exit(1)
+NODE
+  then
+    ABSENT=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ABSENT" != "1" ]; then
+  echo "Failure reason: released agent remained in the canonical roster" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
+fi
+
+echo "TIER4_PASS" | tee -a "$LOG"
+exit 0
 `,
   })
 
