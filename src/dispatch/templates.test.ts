@@ -101,6 +101,21 @@ describe('renderAgentTask', () => {
     expect(task).not.toContain('isolated issue worktree')
   })
 
+  it('tells a reviewer to map the PR diff to running-instance checks when a preview exists', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'AgentWorkforce/pear', clonePath: '/tmp/pear-team' },
+      role: 'reviewer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      previewUrl: 'https://factory-node.tailnet.ts.net:10000/',
+    })
+
+    expect(task).toContain("Use the PR's changed files to find overlapping manifest entries")
+    expect(task).toContain('`requires_running_instance: true`')
+    expect(task).toContain('computer-use/browser tool against https://factory-node.tailnet.ts.net:10000/')
+  })
+
   it('renders an aggressive, spec-grounded babysitter task referencing the open PR', () => {
     const task = renderAgentTask({
       issue,
@@ -275,8 +290,8 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(task).toContain('Tailscale Serve keeps this URL inside the configured tailnet')
     expect(task).toContain('tailnet grants/ACLs apply')
-    expect(task).toContain('Start the previewed app with `npm run dev -- --host 127.0.0.1`')
-    expect(task).toContain('make it listen on local port 3000')
+    expect(task).toContain('Factory is supervising `npm run dev -- --host 127.0.0.1`')
+    expect(task).toContain('local port 3000')
     expect(task).toContain('confirm the live preview URL responds and shows this issue\'s checkout')
   })
 

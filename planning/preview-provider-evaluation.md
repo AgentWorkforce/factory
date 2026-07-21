@@ -22,23 +22,26 @@ access-control guarantee.
 
 ## Factory contract
 
-`preview.services.<repo>` declares a preferred local HTTP port, an optional
-allocation span and dev command, and an optional stable tailnet HTTPS port. The
+`preview.services.<repo>` declares a preferred local HTTP port, a required
+foreground dev command, an optional allocation span, and an optional stable tailnet HTTPS port. The
 node advertises `preview:tailscale-serve`. Factory asks the selected node to create the route,
 stores the returned reference on `AgentSpec`, and reuses it across the issue's
 agents. The route lifetime is the issue's in-flight lifetime—not an agent PID.
 The adapter reserves a distinct target port for concurrent issues using the
-same repository, and the rendered task tells each agent the exact allocated
-port to bind and verify. Factory deliberately does not supervise the repository
-application process; `tailscaled` owns the provider route while the dispatched
-agent owns the dev command and must keep it running through handoff.
+same repository. The node starts the command in the selected issue checkout
+with `PORT` set, waits for a local HTTP response, and records the wrapper's PID,
+start time, command line, checkout, and deterministic marker. The detached,
+identity-checked process and `tailscaled` route both outlive any one agent and
+are recovered together across handoffs and daemon restarts.
 
-At Human Review or Done, Factory removes the exact route before committing the
+At Human Review or Done, Factory removes the exact route and terminates only the
+matching managed process tree before committing the
 dispatch lifecycle as complete. On daemon startup it sends every non-terminal
 dispatch identity to preview-capable nodes. Each node reaps registry entries
 whose owner is absent in that Factory workspace namespace. Route intent is
-persisted before Serve is mutated so a process crash in the provider API gap is
-recoverable. Teardown and sweeping are fail-closed: a route is touched only
+persisted before either resource is started so a crash in the process-spawn or
+provider API gap is recoverable. A periodic sweep retries nodes that were
+offline during daemon startup. Teardown and sweeping are fail-closed: a route is touched only
 when the Factory registry marker, workspace namespace, preview ID/owner, HTTPS
 port, and live upstream target all agree. Operators should reserve
 `preview.httpsPortRange` exclusively for Factory previews; pre-existing TCP,

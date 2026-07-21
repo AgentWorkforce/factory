@@ -210,7 +210,7 @@ describe('factory node definition', () => {
     const preview: PreviewReference = {
       id: 'preview-1',
       provider: 'tailscale-serve',
-      namespace: 'factory-test',
+      namespace: 'workspace-1',
       owner: 'AR-129:uuid:/linear/issues/129',
       service: 'factory',
       repo: 'AgentWorkforce/factory',
@@ -220,6 +220,7 @@ describe('factory node definition', () => {
       access: 'tailnet',
       lifetime: 'issue',
       createdAt: '2026-07-20T12:00:00.000Z',
+      startCommand: 'npm run dev',
     }
     const starts: unknown[] = []
     const definition = createFactoryNodeDefinition({
@@ -228,7 +229,7 @@ describe('factory node definition', () => {
         preview: {
           provider: 'tailscale-serve',
           access: 'tailnet',
-          services: { factory: { port: 3_000 } },
+          services: { factory: { port: 3_000, startCommand: 'npm run dev' } },
           tailscaleBinary: 'tailscale',
           registryPath: '/tmp/factory-previews.json',
           httpsPortRange: [10_000, 10_999],
@@ -258,6 +259,8 @@ describe('factory node definition', () => {
       service: 'factory',
       repo: preview.repo,
       targetPort: preview.targetPort,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
     }, ctx)).resolves.toEqual({
       operation: 'start',
       preview: { ...preview, node: 'factory-node' },
@@ -269,6 +272,8 @@ describe('factory node definition', () => {
       service: 'factory',
       repo: preview.repo,
       targetPort: preview.targetPort,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
       node: 'factory-node',
     }])
     await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
@@ -279,7 +284,14 @@ describe('factory node definition', () => {
       service: 'factory',
       repo: preview.repo,
       targetPort: 8_080,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
     }, ctx)).rejects.toThrow("does not match this node's configuration")
+    await expect(invokeNodeHandler(definition, 'preview:tailscale-serve', {
+      operation: 'sweep',
+      namespace: 'another-workspace',
+      activeOwners: [],
+    }, ctx)).rejects.toThrow("preview namespace does not match this node's workspace")
   })
 
   it('runs the default Relayflows SDK runner without a CLI binary', async () => {

@@ -313,14 +313,25 @@ surface a route marked as Funnel.
 port in `port..port + portSpan - 1` (the span defaults to 100), places that
 allocated port in every agent task, and reserves a separate HTTPS port from
 `preview.httpsPortRange`. Keep that HTTPS range dedicated to Factory previews.
-The optional `startCommand` is an instruction for the dispatched agent; Factory
-does not supervise the application process. The agent must keep the server
-running for the handoff and verify the URL before it reports readiness.
+`startCommand` must be a foreground development command that honors `PORT`.
+The node starts it in the issue checkout, waits for the allocated local HTTP
+port to respond before returning the URL, and persists an exact process identity
+so the command survives agent handoffs and can be safely recovered or stopped.
+The command must not daemonize or bind a different port.
 
-Routes are removed at Human Review or Done, and a startup sweep reaps only
-orphaned routes in the current Factory workspace whose persisted registry
-identity still matches the live upstream. See the [provider evaluation](planning/preview-provider-evaluation.md)
+Routes and their supervised commands are removed before Human Review or Done.
+A startup and periodic sweep reaps only orphaned resources in the current
+Factory workspace whose persisted route and process identities still match.
+See the [provider evaluation](planning/preview-provider-evaluation.md)
 for the decision and lifecycle contract.
+
+To exercise the real provider lifecycle on a signed-in node, build first and
+run `TAILSCALE_BIN=/path/to/tailscale node scripts/verify-tailscale-preview-e2e.mjs`.
+The check starts a detached HTTP service, reaches it through Serve, recovers it
+through a fresh manager instance, tears it down, then proves a startup orphan
+sweep reaps a second abandoned route and process while preserving unrelated
+Serve configuration. Override its dedicated ports with
+`FACTORY_PREVIEW_E2E_HTTPS_PORT` and `FACTORY_PREVIEW_E2E_TARGET_PORT`.
 
 ### Dispatching to nodes (`--backend relay`)
 

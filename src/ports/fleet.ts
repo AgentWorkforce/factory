@@ -23,8 +23,19 @@ export type PreviewReference = {
   access: 'tailnet'
   lifetime: 'issue'
   createdAt: string
-  startCommand?: string
+  /** Foreground command owned by the node for the issue lifetime. */
+  startCommand: string
+  /** Exact identity used to recover and terminate the node-owned command. */
+  process?: PreviewProcessReference
   node?: string
+}
+
+export type PreviewProcessReference = {
+  pid: number
+  startTime: string
+  cmdline: string
+  cwd: string
+  marker: string
 }
 
 export type PreviewStartInput = {
@@ -35,13 +46,17 @@ export type PreviewStartInput = {
   repo: string
   targetPort: number
   preferredHttpsPort?: number
-  startCommand?: string
+  startCommand: string
+  /** Advertised checkout in which the node starts the preview command. */
+  checkoutPath: string
   node?: 'self' | string
 }
 
 export type PreviewSweepInput = {
   namespace: string
   activeOwners: string[]
+  /** Exact persisted references that remain authoritative for active owners. */
+  activePreviewIds?: string[]
 }
 
 export type PreviewSweepResult = {

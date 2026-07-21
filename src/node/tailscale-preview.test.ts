@@ -4,6 +4,8 @@ import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
+import type { PreviewStartInput } from '../ports/fleet'
+import { previewProcessMarker, type PreviewProcessIdentity } from './preview-process'
 import { TailscalePreviewManager, type PreviewCommandRunner } from './tailscale-preview'
 
 type Route = { targetPort: number; host: string }
@@ -13,20 +15,31 @@ function fakeTailscale() {
   const funnels = new Set<number>()
   const foreignTcp = new Map<number, Record<string, unknown>>()
   const foregroundTcp = new Map<number, Record<string, unknown>>()
+  const humanWeb = new Map<number, Record<string, unknown>>()
   const calls: string[][] = []
   const run: PreviewCommandRunner = async (_file, args) => {
     calls.push(args)
     if (args.join(' ') === 'serve status --json') {
+      const webPorts = new Set([...routes.keys(), ...humanWeb.keys()])
       return {
         stdout: JSON.stringify({
           TCP: Object.fromEntries([
             ...[...routes].map(([port]) => [port, { HTTPS: true }] as const),
+            ...[...humanWeb].map(([port]) => [port, { HTTPS: true }] as const),
             ...foreignTcp,
           ]),
-          Web: Object.fromEntries([...routes].map(([port, route]) => [
-            `${route.host}:${port}`,
-            { Handlers: { '/': { Proxy: `http://127.0.0.1:${route.targetPort}` } } },
-          ])),
+          Web: Object.fromEntries([...webPorts].map((port) => {
+            const route = routes.get(port)
+            return [
+              `${route?.host ?? 'factory-node.example.ts.net'}:${port}`,
+              {
+                Handlers: {
+                  ...humanWeb.get(port),
+                  ...(route ? { '/': { Proxy: `http://127.0.0.1:${route.targetPort}` } } : {}),
+                },
+              },
+            ]
+          })),
           AllowFunnel: Object.fromEntries([...funnels].map((port) => [
             `${routes.get(port)?.host}:${port}`,
             true,
@@ -55,10 +68,11 @@ function fakeTailscale() {
     }
     throw new Error(`unexpected tailscale command: ${args.join(' ')}`)
   }
-  return { calls, foreignTcp, foregroundTcp, funnels, routes, run }
+  return { calls, foreignTcp, foregroundTcp, funnels, humanWeb, routes, run }
 }
 
 function manager(run: PreviewCommandRunner, registryPath: string) {
+  const processes = new Map<string, PreviewProcessIdentity>()
   return new TailscalePreviewManager({
     config: {
       provider: 'tailscale-serve',
@@ -70,7 +84,46 @@ function manager(run: PreviewCommandRunner, registryPath: string) {
     },
     run,
     isPortAvailable: async () => true,
+    isReady: async () => true,
+    processSupervisor: {
+      async start(input) {
+        const existing = processes.get(input.id)
+        if (existing) return existing
+        const marker = previewProcessMarker(input.id)
+        const process = {
+          pid: 10_000 + processes.size,
+          startTime: `started-${input.id}`,
+          cmdline: `/bin/sh --agent-name ${marker}`,
+          cwd: input.cwd,
+          marker,
+        }
+        processes.set(input.id, process)
+        return process
+      },
+      async isRunning(process) {
+        return [...processes.values()].some((candidate) => candidate.pid === process.pid)
+      },
+      async find(id) { return processes.get(id) },
+      async stop(process) {
+        for (const [id, candidate] of processes) {
+          if (candidate.pid === process.pid) processes.delete(id)
+        }
+        return true
+      },
+    },
     now: () => new Date('2026-07-20T12:00:00.000Z'),
+  })
+}
+
+function start(
+  previewManager: TailscalePreviewManager,
+  input: Omit<PreviewStartInput, 'startCommand' | 'checkoutPath'> &
+    Partial<Pick<PreviewStartInput, 'startCommand' | 'checkoutPath'>>,
+) {
+  return previewManager.start({
+    startCommand: 'npm run dev',
+    checkoutPath: '/work/factory',
+    ...input,
   })
 }
 
@@ -88,8 +141,8 @@ describe('TailscalePreviewManager', () => {
       startCommand: 'npm run dev',
     }
 
-    const first = await previewManager.start(input)
-    const second = await previewManager.start(input)
+    const first = await start(previewManager, input)
+    const second = await start(previewManager, input)
 
     expect(first).toEqual(second)
     expect(first).toMatchObject({
@@ -107,7 +160,7 @@ describe('TailscalePreviewManager', () => {
   it('removes only an exact live route identity', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
-    const preview = await previewManager.start({
+    const preview = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-1',
       issueKey: 'AR-129',
@@ -118,19 +171,44 @@ describe('TailscalePreviewManager', () => {
 
     fake.routes.set(preview.httpsPort, { targetPort: 9_999, host: 'factory-node.example.ts.net' })
 
-    await expect(previewManager.remove(preview)).resolves.toBe(false)
+    await expect(previewManager.remove(preview)).resolves.toBe(true)
     expect(fake.routes.get(preview.httpsPort)?.targetPort).toBe(9_999)
     expect(fake.calls.some((args) => args.at(-1) === 'off')).toBe(false)
+  })
+
+  it('removes only the Factory root mount and preserves human-owned paths', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const preview = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1',
+      issueKey: 'AR-129',
+      service: 'factory',
+      repo: 'AgentWorkforce/factory',
+      targetPort: 3_000,
+    })
+    fake.humanWeb.set(preview.httpsPort, {
+      '/human': { Proxy: 'http://127.0.0.1:9000' },
+    })
+
+    await expect(previewManager.remove(preview)).resolves.toBe(true)
+
+    expect(fake.routes.has(preview.httpsPort)).toBe(false)
+    expect(fake.humanWeb.get(preview.httpsPort)).toEqual({
+      '/human': { Proxy: 'http://127.0.0.1:9000' },
+    })
+    expect(fake.calls.filter((args) => args.includes('--bg')).at(-1)).toContain('--set-path=/')
+    expect(fake.calls.filter((args) => args.at(-1) === 'off').at(-1)).toContain('--set-path=/')
   })
 
   it('allocates distinct upstream ports for concurrent issues of the same service', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
-    const first = await previewManager.start({
+    const first = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-1', issueKey: 'AR-1', service: 'factory', repo: 'factory', targetPort: 3_000,
     })
-    const second = await previewManager.start({
+    const second = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-2', issueKey: 'AR-2', service: 'factory', repo: 'factory', targetPort: 3_000,
     })
@@ -141,6 +219,25 @@ describe('TailscalePreviewManager', () => {
     expect(fake.routes.get(second.httpsPort)?.targetPort).toBe(3_001)
   })
 
+  it('never reuses an upstream port referenced by an unowned live Serve route', async () => {
+    const fake = fakeTailscale()
+    fake.humanWeb.set(9_999, {
+      '/foreign': { Proxy: 'http://127.0.0.1:3000' },
+    })
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+
+    const preview = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-1',
+      issueKey: 'AR-1',
+      service: 'factory',
+      repo: 'factory',
+      targetPort: 3_000,
+    })
+
+    expect(preview).toMatchObject({ configuredTargetPort: 3_000, targetPort: 3_001 })
+  })
+
   it('serializes allocation across manager instances sharing one node registry', async () => {
     const fake = fakeTailscale()
     const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
@@ -148,11 +245,11 @@ describe('TailscalePreviewManager', () => {
     const secondManager = manager(fake.run, registryPath)
 
     const [first, second] = await Promise.all([
-      firstManager.start({
+      start(firstManager, {
         namespace: 'factory-test',
         owner: 'owner-1', issueKey: 'AR-1', service: 'factory', repo: 'factory', targetPort: 3_000,
       }),
-      secondManager.start({
+      start(secondManager, {
         namespace: 'factory-test',
         owner: 'owner-2', issueKey: 'AR-2', service: 'factory', repo: 'factory', targetPort: 3_000,
       }),
@@ -168,7 +265,7 @@ describe('TailscalePreviewManager', () => {
     fake.foregroundTcp.set(10_001, { TCPForward: '127.0.0.1:9000' })
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
 
-    const preview = await previewManager.start({
+    const preview = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-1', issueKey: 'AR-1', service: 'factory', repo: 'factory', targetPort: 3_000,
     })
@@ -179,12 +276,12 @@ describe('TailscalePreviewManager', () => {
   it('replaces a changed service target without leaving the old route behind', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
-    const initial = await previewManager.start({
+    const initial = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
     })
 
-    const replaced = await previewManager.start({
+    const replaced = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 4_173,
     })
@@ -202,10 +299,10 @@ describe('TailscalePreviewManager', () => {
       namespace: 'factory-test',
       owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
     }
-    const initial = await previewManager.start(input)
+    const initial = await start(previewManager, input)
     fake.funnels.add(initial.httpsPort)
 
-    const repaired = await previewManager.start(input)
+    const repaired = await start(previewManager, input)
 
     expect(repaired.id).not.toBe(initial.id)
     expect(repaired.httpsPort).toBe(initial.httpsPort)
@@ -217,11 +314,11 @@ describe('TailscalePreviewManager', () => {
   it('sweeps inactive Factory owners while preserving active issue routes', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
-    const active = await previewManager.start({
+    const active = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
     })
-    const orphan = await previewManager.start({
+    const orphan = await start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-orphan', issueKey: 'AR-2', service: 'two', repo: 'two', targetPort: 3_002,
     })
@@ -234,14 +331,37 @@ describe('TailscalePreviewManager', () => {
     expect(fake.routes.has(orphan.httpsPort)).toBe(false)
   })
 
+  it('reaps duplicate references for an active owner when their ids are not durable', async () => {
+    const fake = fakeTailscale()
+    const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
+    const durable = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
+    })
+    const crashGapDuplicate = await start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-active', issueKey: 'AR-1', service: 'two', repo: 'two', targetPort: 3_002,
+    })
+
+    const report = await previewManager.sweep({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+      activePreviewIds: [durable.id],
+    })
+
+    expect(report.reaped).toEqual([crashGapDuplicate])
+    expect(fake.routes.has(durable.httpsPort)).toBe(true)
+    expect(fake.routes.has(crashGapDuplicate.httpsPort)).toBe(false)
+  })
+
   it('never sweeps previews owned by another Factory workspace namespace', async () => {
     const fake = fakeTailscale()
     const previewManager = manager(fake.run, join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'))
-    const workspaceA = await previewManager.start({
+    const workspaceA = await start(previewManager, {
       namespace: 'workspace-a',
       owner: 'owner-a', issueKey: 'AR-1', service: 'one', repo: 'one', targetPort: 3_001,
     })
-    const workspaceB = await previewManager.start({
+    const workspaceB = await start(previewManager, {
       namespace: 'workspace-b',
       owner: 'owner-b', issueKey: 'AR-2', service: 'two', repo: 'two', targetPort: 3_002,
     })
@@ -272,6 +392,7 @@ describe('TailscalePreviewManager', () => {
         access: 'tailnet',
         lifetime: 'issue',
         createdAt: '2026-07-20T12:00:00.000Z',
+        startCommand: 'npm run dev',
         managedBy: '@agent-relay/factory',
         state: 'pending',
       }],
@@ -286,16 +407,30 @@ describe('TailscalePreviewManager', () => {
 
   it('retains pending identity when a successful Serve command is not yet observable', async () => {
     const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    let routeVisible = false
     const run: PreviewCommandRunner = async (_file, args) => {
       if (args.join(' ') === 'serve status --json') {
-        return { stdout: JSON.stringify({ TCP: {}, Web: {} }), stderr: '' }
+        return {
+          stdout: JSON.stringify(routeVisible
+            ? {
+                TCP: { 10_000: { HTTPS: true } },
+                Web: {
+                  'factory-node.example.ts.net:10000': {
+                    Handlers: { '/': { Proxy: 'http://127.0.0.1:3000' } },
+                  },
+                },
+              }
+            : { TCP: {}, Web: {} }),
+          stderr: '',
+        }
       }
       if (args.includes('--bg')) return { stdout: '', stderr: '' }
+      if (args.at(-1) === 'off') return { stdout: '', stderr: '' }
       throw new Error(`unexpected tailscale command: ${args.join(' ')}`)
     }
     const previewManager = manager(run, registryPath)
 
-    await expect(previewManager.start({
+    await expect(start(previewManager, {
       namespace: 'factory-test',
       owner: 'owner-interrupted', issueKey: 'AR-3', service: 'factory', repo: 'factory', targetPort: 3_000,
     })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
@@ -310,7 +445,65 @@ describe('TailscalePreviewManager', () => {
 
     await expect(previewManager.sweep({ namespace: 'factory-test', activeOwners: [] })).resolves.toMatchObject({
       reaped: [],
-      skipped: [{ reason: 'live route identity mismatch' }],
+      skipped: [{ reason: 'live route is not currently observable; retained for retry' }],
     })
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toHaveLength(1)
+
+    routeVisible = true
+    await expect(previewManager.sweep({ namespace: 'factory-test', activeOwners: [] })).resolves.toMatchObject({
+      reaped: [expect.objectContaining({ owner: 'owner-interrupted' })],
+      skipped: [],
+    })
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
+  })
+
+  it('rolls back a route when the Serve runner rejects after mutating provider state', async () => {
+    const fake = fakeTailscale()
+    const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    let rejectAfterMutation = true
+    const run: PreviewCommandRunner = async (file, args) => {
+      const result = await fake.run(file, args)
+      if (rejectAfterMutation && args.includes('--bg')) {
+        rejectAfterMutation = false
+        throw new Error('runner transport closed after provider mutation')
+      }
+      return result
+    }
+    const previewManager = manager(run, registryPath)
+
+    await expect(start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-interrupted',
+      issueKey: 'AR-4',
+      service: 'factory',
+      repo: 'factory',
+      targetPort: 3_000,
+    })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
+
+    expect(fake.routes).toHaveLength(0)
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
+    expect(fake.calls.filter((args) => args.at(-1) === 'off').at(-1)).toContain('--set-path=/')
+  })
+
+  it('clears pending intent when the Serve runner rejects before provider mutation', async () => {
+    const fake = fakeTailscale()
+    const registryPath = join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json')
+    const run: PreviewCommandRunner = async (file, args) => {
+      if (args.includes('--bg')) throw new Error('serve rejected before mutation')
+      return await fake.run(file, args)
+    }
+    const previewManager = manager(run, registryPath)
+
+    await expect(start(previewManager, {
+      namespace: 'factory-test',
+      owner: 'owner-before-mutation',
+      issueKey: 'AR-5',
+      service: 'factory',
+      repo: 'factory',
+      targetPort: 3_000,
+    })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
+
+    expect(fake.routes).toHaveLength(0)
+    expect((JSON.parse(readFileSync(registryPath, 'utf8')) as { previews: unknown[] }).previews).toEqual([])
   })
 })

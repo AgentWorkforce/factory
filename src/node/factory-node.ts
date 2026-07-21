@@ -16,7 +16,6 @@ import {
   resolveAgentRelayMcpCommand,
   type AgentRelayMcpCommand,
 } from '../fleet/internal-fleet-client'
-import type { PreviewConfig } from '../config/schema'
 import type { Capability, PreviewReference } from '../ports/fleet'
 import { TailscalePreviewManager, type PreviewManager } from './tailscale-preview'
 
@@ -108,7 +107,14 @@ const previewReferenceSchema: z.ZodType<PreviewReference> = z.object({
   access: z.literal('tailnet'),
   lifetime: z.literal('issue'),
   createdAt: z.string().min(1),
-  startCommand: z.string().min(1).optional(),
+  startCommand: z.string().min(1),
+  process: z.object({
+    pid: z.number().int().positive(),
+    startTime: z.string().min(1),
+    cmdline: z.string().min(1),
+    cwd: z.string().min(1),
+    marker: z.string().min(1),
+  }).optional(),
   node: z.string().min(1).optional(),
 })
 
@@ -122,13 +128,15 @@ const previewCapabilityInputSchema = z.discriminatedUnion('operation', [
     repo: z.string().min(1),
     targetPort: z.number().int().min(1).max(65_535),
     preferredHttpsPort: z.number().int().min(1).max(65_535).optional(),
-    startCommand: z.string().min(1).optional(),
+    startCommand: z.string().min(1),
+    checkoutPath: z.string().min(1),
   }),
   z.object({ operation: z.literal('remove'), preview: previewReferenceSchema }),
   z.object({
     operation: z.literal('sweep'),
     namespace: z.string().min(1),
     activeOwners: z.array(z.string().min(1)),
+    activePreviewIds: z.array(z.string().min(1)).optional(),
   }),
 ])
 
@@ -205,7 +213,7 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
       handlers[capability] = action<PreviewCapabilityInput>({
         input: previewCapabilityInputSchema,
         metadata: { ...metadata, handler: 'tailscale-serve', access: 'tailnet' },
-      }, async (input, ctx) => runPreviewCapability(input, ctx, previewManager, config.preview!)) as unknown as FleetCapabilityValue
+      }, async (input, ctx) => runPreviewCapability(input, ctx, previewManager, config)) as unknown as FleetCapabilityValue
       continue
     }
     if (capability === 'workflow:run') {
@@ -241,10 +249,15 @@ async function runPreviewCapability(
   input: PreviewCapabilityInput,
   ctx: FleetActionContext,
   manager: PreviewManager,
-  config: PreviewConfig,
+  config: NodeConfig,
 ): Promise<unknown> {
+  const namespace = input.operation === 'remove' ? input.preview.namespace : input.namespace
+  const expectedNamespace = config.workspaceId ?? 'default'
+  if (namespace !== expectedNamespace) {
+    throw new Error(`preview namespace does not match this node's workspace: ${namespace}`)
+  }
   if (input.operation === 'start') {
-    const configured = config.services[input.service]
+    const configured = config.preview!.services[input.service]
     if (!configured) {
       throw new Error(`preview service is not configured on this node: ${input.service}`)
     }
@@ -256,7 +269,11 @@ async function runPreviewCapability(
       throw new Error(`preview request does not match this node's configuration for ${input.service}`)
     }
     const { operation: _operation, ...request } = input
-    const preview = await manager.start({ ...request, node: ctx.node.name })
+    const checkoutPath = resolveCheckoutPath(config, {
+      repo: input.repo,
+      clonePath: input.checkoutPath,
+    })
+    const preview = await manager.start({ ...request, checkoutPath, node: ctx.node.name })
     return { operation: input.operation, preview: { ...preview, node: ctx.node.name } }
   }
   if (input.operation === 'remove') {
@@ -264,7 +281,11 @@ async function runPreviewCapability(
   }
   return {
     operation: input.operation,
-    ...await manager.sweep({ namespace: input.namespace, activeOwners: input.activeOwners }),
+    ...await manager.sweep({
+      namespace: input.namespace,
+      activeOwners: input.activeOwners,
+      activePreviewIds: input.activePreviewIds,
+    }),
   }
 }
 

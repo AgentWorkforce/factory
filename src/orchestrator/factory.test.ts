@@ -668,6 +668,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   override readonly lifecycleActionName = 'factory.lifecycle'
   exitImplementerOnReconcile = false
 
+  override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    return { ...await super.createPreview(input), node: 'sf-mini' }
+  }
+
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     const result = await super.spawn(input)
     return { ...result, node: 'sf-mini', locality: 'remote' }
@@ -1657,7 +1661,11 @@ describe('FactoryLoop', () => {
 
     await factory.start({ mode: 'backfill-and-subscribe' })
 
-    expect(fleet.previewSweeps).toEqual([{ namespace: 'factory-test', activeOwners: [] }])
+    expect(fleet.previewSweeps).toEqual([{
+      namespace: 'factory-test',
+      activeOwners: [],
+      activePreviewIds: [],
+    }])
     await factory.stop()
   })
 
@@ -5242,9 +5250,19 @@ describe('FactoryLoop', () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-duplicate-owner-'))
     const watchStatePath = join(root, 'state.json')
     const mount = new FakeMountClient({ [issuePath(85)]: issueFile(85) })
+    const previewConfig = {
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
     try {
       const firstFleet = new RemoteLifecycleFleetClient()
-      const first = createFactory(config(), {
+      const first = createFactory(config(previewConfig), {
         mount,
         fleet: firstFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
@@ -5254,7 +5272,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       const duplicateFleet = new RemoteLifecycleFleetClient()
-      const duplicate = createFactory(config(), {
+      const duplicate = createFactory(config(previewConfig), {
         mount: new FakeMountClient({ [issuePath(85)]: issueFile(85) }),
         fleet: duplicateFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
@@ -5262,7 +5280,9 @@ describe('FactoryLoop', () => {
       })
       await expect(duplicate.dispatch(decision)).rejects.toThrow(/lifecycle is owned by/)
       expect(firstFleet.spawns).toHaveLength(2)
+      expect(firstFleet.previewStarts).toHaveLength(1)
       expect(duplicateFleet.spawns).toEqual([])
+      expect(duplicateFleet.previewStarts).toEqual([])
       await first.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -5289,7 +5309,18 @@ describe('FactoryLoop', () => {
     }, githubWrite)
     const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
     const firstFleet = new RemoteLifecycleFleetClient()
-    const first = createFactory(config({ batchSize: 1 }), {
+    const previewConfig = {
+      batchSize: 1,
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const first = createFactory(config(previewConfig), {
       mount,
       fleet: firstFleet,
       stateStore: state(),
@@ -5304,11 +5335,12 @@ describe('FactoryLoop', () => {
       await first.dispatch(running)
       await first.dispatch(queued)
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-985-impl-pear', 'ar-985-review'])
+      expect(firstFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-985'])
       expect(await state().getDispatchLifecycle('factory-test', issueKey(queued.issue))).toMatchObject({ phase: 'queued' })
 
       clock.advance(5 * 60_000 + 1)
       const restartedFleet = new RemoteLifecycleFleetClient()
-      restarted = createFactory(config({ batchSize: 1 }), {
+      restarted = createFactory(config(previewConfig), {
         mount,
         fleet: restartedFleet,
         stateStore: state(),
@@ -5319,11 +5351,13 @@ describe('FactoryLoop', () => {
       await restarted.start({ mode: 'dispatch-owner' })
       await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.spawns).toEqual([])
+      expect(restartedFleet.previewStarts).toEqual([])
       expect(restarted.status().counters.dispatchLifecycleCapacityWaits).toBe(1)
 
       restartedFleet.emitAgentExit('ar-985-impl-pear', 'exited')
       await vi.waitFor(() => expect(restartedFleet.spawns.map((spawn) => spawn.name))
         .toEqual(['ar-986-impl-pear', 'ar-986-review']), { timeout: 4_000 })
+      expect(restartedFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-986'])
       await first.stop()
     } finally {
       await restarted?.stop()
@@ -9563,7 +9597,7 @@ describe('FactoryLoop', () => {
       preferredHttpsPort: 10_052,
     })])
     expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
-    expect(fleet.spawns[0]?.task).toContain('Start the previewed app with `npm run dev -- --host 127.0.0.1`')
+    expect(fleet.spawns[0]?.task).toContain('Factory is supervising `npm run dev -- --host 127.0.0.1`')
     expect(fleet.spawns[1]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
     fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
@@ -9595,7 +9629,7 @@ describe('FactoryLoop', () => {
       preview: {
         provider: 'tailscale-serve',
         access: 'tailnet',
-        services: { 'AgentWorkforce/pear': { port: 3_000 } },
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
         tailscaleBinary: 'tailscale',
         registryPath: '/tmp/factory-test-previews.json',
         httpsPortRange: [10_000, 10_999],
@@ -12180,7 +12214,7 @@ describe('FactoryLoop', () => {
       preview: {
         provider: 'tailscale-serve',
         access: 'tailnet',
-        services: { pear: { port: 3_000 } },
+        services: { pear: { port: 3_000, startCommand: 'npm run dev' } },
         tailscaleBinary: 'tailscale',
         registryPath: '/tmp/factory-test-previews.json',
         httpsPortRange: [10_000, 10_999],
@@ -15078,7 +15112,7 @@ describe('FactoryLoop', () => {
       preview: {
         provider: 'tailscale-serve',
         access: 'tailnet',
-        services: { 'AgentWorkforce/pear': { port: 3_000 } },
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
         tailscaleBinary: 'tailscale',
         registryPath: '/tmp/factory-test-previews.json',
         httpsPortRange: [10_000, 10_999],
@@ -16079,7 +16113,7 @@ describe('FactoryLoop PR babysitter', () => {
       preview: {
         provider: 'tailscale-serve',
         access: 'tailnet',
-        services: { 'AgentWorkforce/pear': { port: 3_000 } },
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
         tailscaleBinary: 'tailscale',
         registryPath: '/tmp/factory-test-previews.json',
         httpsPortRange: [10_000, 10_999],
@@ -16099,7 +16133,7 @@ describe('FactoryLoop PR babysitter', () => {
     expect(babysitter.node).toBe('preview-node')
     expect(babysitter.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-impl-pear')?.task)
-      .toContain('Start the app on local port 3000')
+      .toContain('Factory is supervising `npm run dev` in this checkout on local port 3000')
   })
 
   it('retargets an owned Slack conversation session onto the babysitter once it takes over from the implementer', async () => {

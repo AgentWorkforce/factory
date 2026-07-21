@@ -136,8 +136,8 @@ const previewServiceSchema = z.object({
   portSpan: z.number().int().min(1).max(1_000).optional(),
   /** Optional stable tailnet HTTPS port; otherwise Factory allocates one. */
   httpsPort: z.number().int().min(1).max(65_535).optional(),
-  /** Optional command rendered into the agent task; Factory does not supervise the app process. */
-  startCommand: z.string().trim().min(1).optional(),
+  /** Foreground command Factory supervises for the issue-lifetime preview. */
+  startCommand: z.string().trim().min(1),
 }).superRefine((service, ctx) => {
   if (service.port + (service.portSpan ?? 100) - 1 > 65_535) {
     ctx.addIssue({

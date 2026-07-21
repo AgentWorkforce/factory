@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { get } from 'node:http'
 import { createServer } from 'node:net'
 import { dirname } from 'node:path'
 import { promisify } from 'node:util'
@@ -13,20 +14,35 @@ import type {
   PreviewSweepInput,
   PreviewSweepResult,
 } from '../ports/fleet'
+import {
+  PreviewProcessSupervisor,
+  type PreviewProcessIdentity,
+} from './preview-process'
 
 const execFileAsync = promisify(execFile)
 const REGISTRY_VERSION = 1
 const MANAGED_BY = '@agent-relay/factory'
 const PREVIEW_LOCK_STALE_MS = 30_000
+const PREVIEW_PROVIDER_COMMAND_TIMEOUT_MS = 30_000
+const PREVIEW_READY_TIMEOUT_MS = 60_000
+const PREVIEW_READY_POLL_INTERVAL_MS = 250
 
-type PreviewIdentity = Omit<PreviewReference, 'url'> & { managedBy: typeof MANAGED_BY }
+type PreviewIdentity = Omit<PreviewReference, 'url' | 'process'> & {
+  managedBy: typeof MANAGED_BY
+  checkoutPath?: string
+  process?: PreviewProcessIdentity
+}
 type PendingPreview = PreviewIdentity & { state: 'pending' }
-type PersistedPreview = PreviewIdentity & { state: 'active'; url: string }
+type PersistedPreview = PreviewIdentity & {
+  state: 'active'
+  url: string
+}
 type RegistryPreview = PendingPreview | PersistedPreview
 type PreviewRegistry = { version: typeof REGISTRY_VERSION; previews: RegistryPreview[] }
 type CommandResult = { stdout: string; stderr: string }
 export type PreviewCommandRunner = (file: string, args: string[]) => Promise<CommandResult>
 export type PreviewPortProbe = (port: number) => Promise<boolean>
+export type PreviewReadyProbe = (port: number) => Promise<boolean>
 
 export interface PreviewManager {
   start(input: PreviewStartInput): Promise<PreviewReference>
@@ -38,6 +54,11 @@ export interface TailscalePreviewManagerOptions {
   config: PreviewConfig
   run?: PreviewCommandRunner
   isPortAvailable?: PreviewPortProbe
+  isReady?: PreviewReadyProbe
+  processSupervisor?: Pick<PreviewProcessSupervisor, 'start' | 'isRunning' | 'find' | 'stop'>
+  sleep?: (ms: number) => Promise<void>
+  readyTimeoutMs?: number
+  readyPollIntervalMs?: number
   now?: () => Date
 }
 
@@ -51,16 +72,29 @@ export class TailscalePreviewManager implements PreviewManager {
   readonly #config: PreviewConfig
   readonly #run: PreviewCommandRunner
   readonly #isPortAvailable: PreviewPortProbe
+  readonly #isReady: PreviewReadyProbe
+  readonly #processes: Pick<PreviewProcessSupervisor, 'start' | 'isRunning' | 'find' | 'stop'>
+  readonly #sleep: (ms: number) => Promise<void>
+  readonly #readyTimeoutMs: number
+  readonly #readyPollIntervalMs: number
   readonly #now: () => Date
   #operation: Promise<unknown> = Promise.resolve()
 
   constructor(options: TailscalePreviewManagerOptions) {
     this.#config = options.config
     this.#run = options.run ?? (async (file, args) => {
-      const result = await execFileAsync(file, args, { encoding: 'utf8' })
+      const result = await execFileAsync(file, args, {
+        encoding: 'utf8',
+        timeout: PREVIEW_PROVIDER_COMMAND_TIMEOUT_MS,
+      })
       return { stdout: result.stdout, stderr: result.stderr }
     })
     this.#isPortAvailable = options.isPortAvailable ?? portAvailable
+    this.#isReady = options.isReady ?? httpReady
+    this.#processes = options.processSupervisor ?? new PreviewProcessSupervisor()
+    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+    this.#readyTimeoutMs = options.readyTimeoutMs ?? PREVIEW_READY_TIMEOUT_MS
+    this.#readyPollIntervalMs = options.readyPollIntervalMs ?? PREVIEW_READY_POLL_INTERVAL_MS
     this.#now = options.now ?? (() => new Date())
   }
 
@@ -77,14 +111,21 @@ export class TailscalePreviewManager implements PreviewManager {
         existing.repo === input.repo &&
         (existing.configuredTargetPort ?? existing.targetPort) === input.targetPort &&
         (input.preferredHttpsPort === undefined || existing.httpsPort === input.preferredHttpsPort) &&
-        existing.startCommand === input.startCommand
+        existing.startCommand === input.startCommand &&
+        (!existing.process || existing.process.cwd === input.checkoutPath)
       const existingRoute = existing
         ? liveRoute(status, existing.httpsPort, existing.targetPort)
         : undefined
       if (existingMatchesRequest && existingRoute && !existingRoute.funnel) {
+        const process = await this.#ensureManagedProcess(existing, input.checkoutPath)
+        await this.#awaitReady(existing.targetPort, process)
         const liveUrl = previewUrl(existingRoute.host, existing.httpsPort)
-        const active = activatePreview(existing, liveUrl)
-        if (existing.state === 'pending' || existing.url !== liveUrl) {
+        const active = activatePreview({ ...existing, process }, liveUrl)
+        if (
+          existing.state === 'pending' ||
+          existing.url !== liveUrl ||
+          !sameProcess(existing.process, process)
+        ) {
           registry.previews = registry.previews.map((preview) => preview.id === existing.id ? active : preview)
           await this.#writeRegistry(registry)
         }
@@ -97,12 +138,19 @@ export class TailscalePreviewManager implements PreviewManager {
           await this.#disable(existing)
           status = await this.#serveStatus()
         }
+        if (!await this.#stopManagedProcess(existing)) {
+          throw new Error(`Unable to confirm teardown of replaced preview process ${existing.id}`)
+        }
         registry.previews = registry.previews.filter((preview) => preview.id !== existing.id)
+        await this.#writeRegistry(registry)
       }
 
       const serviceConfig = this.#config.services[input.service]
       const lastTargetPort = Math.min(65_535, input.targetPort + (serviceConfig?.portSpan ?? 100) - 1)
-      const occupiedTargetPorts = new Set(registry.previews.map((preview) => preview.targetPort))
+      const occupiedTargetPorts = new Set([
+        ...registry.previews.map((preview) => preview.targetPort),
+        ...liveUpstreamPorts(status),
+      ])
       let targetPort: number | undefined
       for (const candidate of portRange(input.targetPort, lastTargetPort)) {
         if (occupiedTargetPorts.has(candidate)) continue
@@ -135,23 +183,34 @@ export class TailscalePreviewManager implements PreviewManager {
           access: 'tailnet',
           lifetime: 'issue',
           createdAt: this.#now().toISOString(),
-          ...(input.startCommand ? { startCommand: input.startCommand } : {}),
+          startCommand: input.startCommand,
+          checkoutPath: input.checkoutPath,
           ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
           managedBy: MANAGED_BY,
           state: 'pending',
         }
         registry.previews.push(pending)
-        // Persist intent before mutating Tailscale. If this process dies after
-        // Serve accepts the route, startup sweeping can still identify it.
+        // Persist intent before starting either external resource. The
+        // deterministic process marker closes the spawn/persist crash gap,
+        // while the pending route identity closes the Serve API crash gap.
         await this.#writeRegistry(registry)
         let commandSucceeded = false
-        let rollbackCompleted = false
         try {
+          const process = await this.#processes.start({
+            id: pending.id,
+            command: input.startCommand,
+            cwd: input.checkoutPath,
+            port: targetPort,
+          })
+          pending.process = process
+          await this.#writeRegistry(registry)
+          await this.#awaitReady(targetPort, process)
           await this.#run(this.#config.tailscaleBinary, [
             'serve',
             '--bg',
             '--yes',
             `--https=${httpsPort}`,
+            '--set-path=/',
             `http://127.0.0.1:${targetPort}`,
           ])
           commandSucceeded = true
@@ -172,23 +231,34 @@ export class TailscalePreviewManager implements PreviewManager {
           return referenceFrom(preview)
         } catch (error) {
           lastError = error
-          if (commandSucceeded) {
-            try {
-              const cleanupStatus = await this.#serveStatus()
-              if (liveRoute(cleanupStatus, httpsPort, targetPort)) {
-                await this.#disable({ httpsPort })
-                rollbackCompleted = true
-              }
-            } catch (cleanupError) {
-              lastError = new AggregateError(
-                [error, cleanupError],
-                `Preview route setup and guarded rollback both failed on HTTPS port ${httpsPort}`,
-              )
+          let routeRollbackCompleted = false
+          let processRollbackCompleted = false
+          try {
+            const cleanupStatus = await this.#serveStatus()
+            if (liveRoute(cleanupStatus, httpsPort, targetPort)) {
+              await this.#disable({ httpsPort })
+              routeRollbackCompleted = true
+            } else if (!commandSucceeded) {
+              // A rejected command that left no exact route has no provider
+              // mutation Factory can safely undo. Clear the pending intent;
+              // genuinely ambiguous status failures retain it for sweeping.
+              routeRollbackCompleted = true
             }
-          } else {
-            rollbackCompleted = true
+          } catch (cleanupError) {
+            lastError = new AggregateError(
+              [error, cleanupError],
+              `Preview route setup and guarded rollback both failed on HTTPS port ${httpsPort}`,
+            )
           }
-          if (rollbackCompleted) {
+          try {
+            processRollbackCompleted = await this.#stopManagedProcess(pending)
+          } catch (cleanupError) {
+            lastError = new AggregateError(
+              [lastError, cleanupError],
+              `Preview setup and managed-process rollback both failed for ${pending.id}`,
+            )
+          }
+          if (routeRollbackCompleted && processRollbackCompleted) {
             registry.previews = registry.previews.filter((candidate) => candidate.id !== pending.id)
             try {
               await this.#writeRegistry(registry)
@@ -222,17 +292,28 @@ export class TailscalePreviewManager implements PreviewManager {
         candidate.httpsPort === reference.httpsPort &&
         candidate.targetPort === reference.targetPort,
       )
-      if (!preview) return false
+      // Idempotent teardown: an absent ownership record means this exact
+      // Factory route was already removed by a previous attempt or sweep.
+      if (!preview) return true
 
       const status = await this.#serveStatus()
       if (!liveRouteMatches(status, preview)) {
-        // The port no longer points at the route Factory created. Forget the
-        // stale ownership record, but never disable the new route.
-        registry.previews = registry.previews.filter((candidate) => candidate.id !== preview.id)
-        await this.#writeRegistry(registry)
+        const processRemoved = await this.#stopManagedProcess(preview)
+        if (livePortConfigured(status, preview.httpsPort)) {
+          // The port definitively points at another route. Forget the stale
+          // ownership record, but never disable the replacement.
+          if (!processRemoved) return false
+          registry.previews = registry.previews.filter((candidate) => candidate.id !== preview.id)
+          await this.#writeRegistry(registry)
+          return true
+        }
+        // An unconfigured port can be a transient status gap. Preserve the
+        // identity so a later startup sweep can still remove a route that
+        // becomes visible after this check.
         return false
       }
       await this.#disable(preview)
+      if (!await this.#stopManagedProcess(preview)) return false
       registry.previews = registry.previews.filter((candidate) => candidate.id !== preview.id)
       await this.#writeRegistry(registry)
       return true
@@ -242,6 +323,9 @@ export class TailscalePreviewManager implements PreviewManager {
   async sweep(input: PreviewSweepInput): Promise<PreviewSweepResult> {
     return await this.#exclusive(async () => {
       const active = new Set(input.activeOwners)
+      const activePreviewIds = input.activePreviewIds
+        ? new Set(input.activePreviewIds)
+        : undefined
       const registry = await this.#readRegistry()
       const status = await this.#serveStatus()
       const reaped: PreviewReference[] = []
@@ -249,21 +333,60 @@ export class TailscalePreviewManager implements PreviewManager {
       const retained: RegistryPreview[] = []
 
       for (const preview of registry.previews) {
+        const authoritativeActive = active.has(preview.owner) &&
+          (!activePreviewIds || activePreviewIds.has(preview.id))
         if (
           preview.managedBy !== MANAGED_BY ||
-          preview.namespace !== input.namespace ||
-          active.has(preview.owner)
+          preview.namespace !== input.namespace
         ) {
           retained.push(preview)
           continue
         }
+        if (authoritativeActive) {
+          try {
+            const checkoutPath = preview.checkoutPath ?? preview.process?.cwd
+            if (!checkoutPath) throw new Error('managed preview checkout is not recoverable')
+            const process = await this.#ensureManagedProcess(preview, checkoutPath)
+            await this.#awaitReady(preview.targetPort, process)
+            retained.push({ ...preview, checkoutPath, process })
+          } catch (error) {
+            retained.push(preview)
+            skipped.push({
+              id: preview.id,
+              reason: `active preview process recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+              node: preview.node,
+            })
+          }
+          continue
+        }
         const route = liveRoute(status, preview.httpsPort, preview.targetPort)
         if (!route) {
-          skipped.push({ id: preview.id, reason: 'live route identity mismatch', node: preview.node })
+          const repurposed = livePortConfigured(status, preview.httpsPort)
+          let processRemoved = false
+          try {
+            processRemoved = await this.#stopManagedProcess(preview)
+          } catch (error) {
+            skipped.push({
+              id: preview.id,
+              reason: `managed process teardown failed: ${error instanceof Error ? error.message : String(error)}`,
+              node: preview.node,
+            })
+          }
+          if (!repurposed || !processRemoved) retained.push(preview)
+          skipped.push({
+            id: preview.id,
+            reason: repurposed
+              ? 'live route identity mismatch'
+              : 'live route is not currently observable; retained for retry',
+            node: preview.node,
+          })
           continue
         }
         try {
           await this.#disable(preview)
+          if (!await this.#stopManagedProcess(preview)) {
+            throw new Error('managed process identity could not be confirmed stopped')
+          }
           reaped.push(referenceFrom(activatePreview(preview, previewUrl(route.host, preview.httpsPort))))
         } catch (error) {
           retained.push(preview)
@@ -281,11 +404,51 @@ export class TailscalePreviewManager implements PreviewManager {
     })
   }
 
+  async #awaitReady(port: number, process: PreviewProcessIdentity): Promise<void> {
+    const interval = Math.max(1, this.#readyPollIntervalMs)
+    const attempts = Math.max(1, Math.ceil(Math.max(0, this.#readyTimeoutMs) / interval) + 1)
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (!await this.#processes.isRunning(process)) {
+        throw new Error(`Preview command exited before local HTTP port ${port} became ready`)
+      }
+      if (await this.#isReady(port)) return
+      if (attempt + 1 < attempts) await this.#sleep(interval)
+    }
+    throw new Error(`Preview command did not make local HTTP port ${port} ready within ${this.#readyTimeoutMs}ms`)
+  }
+
+  async #stopManagedProcess(preview: Pick<RegistryPreview, 'id' | 'process'>): Promise<boolean> {
+    if (preview.process && await this.#processes.stop(preview.process)) return true
+    const recovered = await this.#processes.find(preview.id)
+    if (!recovered) return true
+    return await this.#processes.stop(recovered)
+  }
+
+  async #ensureManagedProcess(
+    preview: Pick<RegistryPreview, 'id' | 'startCommand' | 'targetPort' | 'process'>,
+    checkoutPath: string,
+  ): Promise<PreviewProcessIdentity> {
+    const recorded = preview.process && await this.#processes.isRunning(preview.process)
+      ? preview.process
+      : undefined
+    const recovered = recorded ?? await this.#processes.find(preview.id)
+    if (!recovered && !await this.#isPortAvailable(preview.targetPort)) {
+      throw new Error(`Refusing to attach preview ${preview.id} to occupied unowned port ${preview.targetPort}`)
+    }
+    return await this.#processes.start({
+      id: preview.id,
+      command: preview.startCommand,
+      cwd: checkoutPath,
+      port: preview.targetPort,
+    })
+  }
+
   async #disable(preview: Pick<PreviewReference, 'httpsPort'>): Promise<void> {
     await this.#run(this.#config.tailscaleBinary, [
       'serve',
       '--yes',
       `--https=${preview.httpsPort}`,
+      '--set-path=/',
       'off',
     ])
   }
@@ -366,8 +529,18 @@ const activatePreview = (preview: RegistryPreview, url: string): PersistedPrevie
 })
 
 const referenceFrom = (
-  { managedBy: _managedBy, state: _state, ...preview }: PersistedPreview,
+  { managedBy: _managedBy, state: _state, checkoutPath: _checkoutPath, ...preview }: PersistedPreview,
 ): PreviewReference => preview
+
+const sameProcess = (
+  left: PreviewProcessIdentity | undefined,
+  right: PreviewProcessIdentity | undefined,
+): boolean => Boolean(left && right &&
+  left.pid === right.pid &&
+  left.startTime === right.startTime &&
+  left.cmdline === right.cmdline &&
+  left.cwd === right.cwd &&
+  left.marker === right.marker)
 
 const portRange = (start: number, end: number): number[] =>
   Array.from({ length: end - start + 1 }, (_, index) => start + index)
@@ -378,6 +551,24 @@ const livePortConfigured = (status: unknown, httpsPort: number): boolean => {
     if (tcp && Object.hasOwn(tcp, String(httpsPort))) return true
   }
   return false
+}
+
+const liveUpstreamPorts = (status: unknown): Set<number> => {
+  const ports = new Set<number>()
+  for (const config of serveConfigs(status)) {
+    const web = isRecord(config.Web) ? config.Web : undefined
+    for (const rawServer of Object.values(web ?? {})) {
+      if (!isRecord(rawServer)) continue
+      const handlers = isRecord(rawServer.Handlers) ? rawServer.Handlers : undefined
+      for (const rawHandler of Object.values(handlers ?? {})) {
+        if (!isRecord(rawHandler) || typeof rawHandler.Proxy !== 'string') continue
+        const match = rawHandler.Proxy.match(/^http:\/\/127\.0\.0\.1:(\d{1,5})(?:\/|$)/u)
+        const port = Number(match?.[1])
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port)
+      }
+    }
+  }
+  return ports
 }
 
 const liveRouteMatches = (
@@ -443,13 +634,25 @@ const isRegistryPreview = (value: unknown): value is RegistryPreview => {
     typeof value.owner === 'string' &&
     typeof value.service === 'string' &&
     typeof value.repo === 'string' &&
+    typeof value.startCommand === 'string' &&
     typeof value.targetPort === 'number' &&
     typeof value.httpsPort === 'number' &&
     typeof value.createdAt === 'string'
   if (!identity) return false
   if (value.configuredTargetPort !== undefined && typeof value.configuredTargetPort !== 'number') return false
+  if (value.checkoutPath !== undefined && typeof value.checkoutPath !== 'string') return false
+  if (value.process !== undefined && !isPreviewProcessIdentity(value.process)) return false
   return value.state === 'pending' || (value.state === 'active' && typeof value.url === 'string')
 }
+
+const isPreviewProcessIdentity = (value: unknown): value is PreviewProcessIdentity =>
+  isRecord(value) &&
+  Number.isInteger(value.pid) &&
+  Number(value.pid) > 0 &&
+  typeof value.startTime === 'string' &&
+  typeof value.cmdline === 'string' &&
+  typeof value.cwd === 'string' &&
+  typeof value.marker === 'string'
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -470,4 +673,22 @@ const portAvailable: PreviewPortProbe = async (port) => await new Promise<boolea
     server.close((error) => finish(!error))
   })
   server.unref()
+})
+
+const httpReady: PreviewReadyProbe = async (port) => await new Promise<boolean>((resolve) => {
+  let settled = false
+  const finish = (ready: boolean) => {
+    if (settled) return
+    settled = true
+    resolve(ready)
+  }
+  const request = get({ host: '127.0.0.1', port, path: '/', timeout: 1_000 }, (response) => {
+    response.resume()
+    finish(true)
+  })
+  request.once('error', () => finish(false))
+  request.once('timeout', () => {
+    request.destroy()
+    finish(false)
+  })
 })

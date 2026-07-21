@@ -343,7 +343,7 @@ describe('FactoryConfigSchema', () => {
       },
       nodeConfig: {
         preview: {
-          services: { pear: { port: 4_173 } },
+          services: { pear: { port: 4_173, startCommand: 'npm run dev' } },
           registryPath: '~/.factory/test-previews.json',
         },
       },
@@ -354,7 +354,7 @@ describe('FactoryConfigSchema', () => {
       access: 'tailnet',
       services: {
         factory: { port: 3_000, portSpan: 25, startCommand: 'npm run dev' },
-        pear: { port: 4_173 },
+        pear: { port: 4_173, startCommand: 'npm run dev' },
       },
       tailscaleBinary: 'tailscale',
       registryPath: join(homedir(), '.factory/test-previews.json'),
@@ -371,7 +371,7 @@ describe('FactoryConfigSchema', () => {
     })).toThrow('preview.httpsPortRange start must be less than or equal to end')
     expect(() => FactoryConfigSchema.parse({
       repos: {},
-      preview: { services: { factory: { port: 65_500 } } },
+      preview: { services: { factory: { port: 65_500, startCommand: 'npm run dev' } } },
     })).toThrow('preview service port range must end at or below 65535')
   })
 

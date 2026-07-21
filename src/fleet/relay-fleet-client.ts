@@ -240,7 +240,8 @@ export class RelayFleetClient implements FleetClient {
         repo: input.repo,
         targetPort: input.targetPort,
         ...(input.preferredHttpsPort !== undefined ? { preferredHttpsPort: input.preferredHttpsPort } : {}),
-        ...(input.startCommand ? { startCommand: input.startCommand } : {}),
+        startCommand: input.startCommand,
+        checkoutPath: input.checkoutPath,
       },
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
       log: this.#log,
@@ -272,7 +273,12 @@ export class RelayFleetClient implements FleetClient {
         const ack = await messaging.placement.spawn({
           capability: 'preview:tailscale-serve',
           node: node.name,
-          input: { operation: 'sweep', namespace: input.namespace, activeOwners: input.activeOwners },
+          input: {
+            operation: 'sweep',
+            namespace: input.namespace,
+            activeOwners: input.activeOwners,
+            ...(input.activePreviewIds ? { activePreviewIds: input.activePreviewIds } : {}),
+          },
           ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
           log: this.#log,
         })
@@ -834,6 +840,22 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
     record?.provider !== 'tailscale-serve' || record.access !== 'tailnet' || record.lifetime !== 'issue'
   ) return undefined
   const startCommand = readString(record, 'startCommand', 'start_command')
+  if (!startCommand) return undefined
+  const rawProcess = asRecord(record?.process)
+  const processPid = readNumber(rawProcess, 'pid')
+  const processStartTime = readString(rawProcess, 'startTime', 'start_time')
+  const processCmdline = readString(rawProcess, 'cmdline')
+  const processCwd = readString(rawProcess, 'cwd')
+  const processMarker = readString(rawProcess, 'marker')
+  const process = processPid !== undefined && processStartTime && processCmdline && processCwd && processMarker
+    ? {
+        pid: processPid,
+        startTime: processStartTime,
+        cmdline: processCmdline,
+        cwd: processCwd,
+        marker: processMarker,
+      }
+    : undefined
   return {
     id,
     provider: 'tailscale-serve',
@@ -848,7 +870,8 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
     access: 'tailnet',
     lifetime: 'issue',
     createdAt,
-    ...(startCommand ? { startCommand } : {}),
+    startCommand,
+    ...(process ? { process } : {}),
     ...(node ? { node } : {}),
   }
 }

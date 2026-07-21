@@ -239,6 +239,14 @@ describe('RelayFleetClient', () => {
       access: 'tailnet',
       lifetime: 'issue',
       createdAt: '2026-07-20T12:00:00.000Z',
+      startCommand: 'npm run dev',
+      process: {
+        pid: 12_345,
+        startTime: 'started-12345',
+        cmdline: 'factory-preview preview-1',
+        cwd: '/work/factory',
+        marker: 'factory-preview-1',
+      },
     }
     messaging.placementAck = { invocationId: 'preview-start', status: 'pending', placement: { node: 'mac-mini' } }
     messaging.invocations.set('preview-start', [{
@@ -257,6 +265,8 @@ describe('RelayFleetClient', () => {
       repo: preview.repo,
       targetPort: preview.targetPort,
       preferredHttpsPort: preview.httpsPort,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
       node: 'self',
     })
 
@@ -273,6 +283,8 @@ describe('RelayFleetClient', () => {
         repo: preview.repo,
         targetPort: preview.targetPort,
         preferredHttpsPort: preview.httpsPort,
+        startCommand: preview.startCommand,
+        checkoutPath: '/work/factory',
       },
     })
     expect(messaging.placements[0]).not.toHaveProperty('node')
@@ -322,6 +334,7 @@ describe('RelayFleetClient', () => {
           access: 'tailnet',
           lifetime: 'issue',
           createdAt: '2026-07-20T12:00:00.000Z',
+          startCommand: 'npm run dev',
         }],
         skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch' }],
       },

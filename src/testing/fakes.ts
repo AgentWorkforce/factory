@@ -259,7 +259,14 @@ export class FakeFleetClient implements FleetClient {
       access: 'tailnet',
       lifetime: 'issue',
       createdAt: '2026-07-20T12:00:00.000Z',
-      ...(input.startCommand ? { startCommand: input.startCommand } : {}),
+      startCommand: input.startCommand,
+      process: {
+        pid: 10_000 + this.previewStarts.length,
+        startTime: '2026-07-20T12:00:00.000Z',
+        cmdline: `factory-preview ${input.owner}`,
+        cwd: input.checkoutPath,
+        marker: `factory-preview-${this.previewStarts.length}`,
+      },
       ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
     }
   }
