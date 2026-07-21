@@ -468,6 +468,14 @@ async function resolveTouchedFiles(
   const matches = new Map<string, CandidateFile>()
   const directoryCache = new Map<string, string[]>()
   const scanBudget = { paths: 0, capped: false }
+  const traversalDepths = new Map<string, number>()
+
+  for (const pattern of positivePatterns) {
+    if (!hasGlobMagic(pattern)) continue
+    const base = globStaticBase(pattern)
+    const depth = globTraversalDepth(pattern, base)
+    traversalDepths.set(base, Math.max(traversalDepths.get(base) ?? 0, depth))
+  }
 
   for (const pattern of positivePatterns) {
     deadline.check()
@@ -484,7 +492,15 @@ async function resolveTouchedFiles(
     const base = globStaticBase(pattern)
     let files = directoryCache.get(base)
     if (!files) {
-      files = await walkFiles(repoPath, base, limits.maxScannedPaths, scanBudget, warnings, deadline)
+      files = await walkFiles(
+        repoPath,
+        base,
+        traversalDepths.get(base) ?? Number.POSITIVE_INFINITY,
+        limits.maxScannedPaths,
+        scanBudget,
+        warnings,
+        deadline,
+      )
       directoryCache.set(base, files)
     }
     for (const location of files) {
@@ -544,6 +560,7 @@ async function exactCandidate(
 async function walkFiles(
   repoPath: string,
   base: string,
+  maxDepth: number,
   maxScannedPaths: number,
   budget: { paths: number; capped: boolean },
   warnings: string[],
@@ -564,10 +581,11 @@ async function walkFiles(
   }
 
   const files: string[] = []
-  const queue = [actualBase]
+  const queue = [{ directory: actualBase, depth: 0 }]
+  let truncatedDirectory = false
   while (queue.length > 0 && budget.paths < maxScannedPaths) {
     deadline.check()
-    const directory = queue.shift() as string
+    const { directory, depth } = queue.shift() as { directory: string; depth: number }
     let entries
     try {
       entries = await deadline.run(() => readdir(directory, { withFileTypes: true }))
@@ -577,19 +595,24 @@ async function walkFiles(
     }
     entries.sort((left, right) => left.name.localeCompare(right.name))
     for (const entry of entries) {
-      if (budget.paths >= maxScannedPaths) break
+      if (budget.paths >= maxScannedPaths) {
+        truncatedDirectory = true
+        break
+      }
       budget.paths += 1
       const absolutePath = join(directory, entry.name)
       const location = normalizeRelativePath(relative(repoPath, absolutePath))
       if (location === FEATURE_MAP_MANIFEST_PATH) continue
       if (entry.isDirectory()) {
-        if (!SKIPPED_DIRECTORIES.has(entry.name)) queue.push(absolutePath)
+        if (!SKIPPED_DIRECTORIES.has(entry.name) && depth + 1 < maxDepth) {
+          queue.push({ directory: absolutePath, depth: depth + 1 })
+        }
       } else if (entry.isFile()) {
         files.push(location)
       }
     }
   }
-  if (queue.length > 0 && !budget.capped) {
+  if ((queue.length > 0 || truncatedDirectory) && !budget.capped) {
     budget.capped = true
     warnings.push(`Touched-glob traversal capped after inspecting ${maxScannedPaths} paths.`)
   }
@@ -601,6 +624,14 @@ function globStaticBase(pattern: string): string {
   const firstMagic = segments.findIndex(hasGlobMagic)
   if (firstMagic <= 0) return '.'
   return segments.slice(0, firstMagic).join('/')
+}
+
+function globTraversalDepth(pattern: string, base: string): number {
+  const baseSegments = base === '.' ? 0 : base.split('/').length
+  const remainingSegments = pattern.split('/').slice(baseSegments)
+  return remainingSegments.some((segment) => segment.includes('**'))
+    ? Number.POSITIVE_INFINITY
+    : remainingSegments.length
 }
 
 function hasGlobMagic(value: string): boolean {

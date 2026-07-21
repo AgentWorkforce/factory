@@ -156,6 +156,34 @@ describe('generateFeatureMap', () => {
     expect(result.added.map((feature) => feature.location)).toEqual(['src/a.ts', 'src/nested/b.tsx'])
   })
 
+  it('does not crawl descendant directories for a shallow touched-file glob', async () => {
+    const root = await repository()
+    await put(root, 'root.ts', 'export const rootSurface = 1\n')
+    await put(root, 'nested/deep.ts', 'export const deepSurface = 2\n')
+
+    const result = await generateFeatureMap(root, ['*.ts'], {
+      maxScannedPaths: 3,
+      now: fixedNow,
+    })
+
+    expect(result.status).toBe('created')
+    expect(result.touchedFiles).toEqual(['root.ts'])
+    expect(result.warnings).not.toContain('Touched-glob traversal capped after inspecting 3 paths.')
+  })
+
+  it('reports when the traversal budget truncates a shallow glob directory', async () => {
+    const root = await repository()
+    await put(root, 'a.ts', 'export const alpha = 1\n')
+    await put(root, 'b.ts', 'export const beta = 2\n')
+
+    const result = await generateFeatureMap(root, ['*.ts'], {
+      maxScannedPaths: 1,
+      now: fixedNow,
+    })
+
+    expect(result.warnings).toContain('Touched-glob traversal capped after inspecting 1 paths.')
+  })
+
   it('caps incremental growth and defers excess touched files', async () => {
     const root = await repository()
     await put(root, 'src/a.ts', 'export const alpha = 1\n')
