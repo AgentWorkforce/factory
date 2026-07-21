@@ -302,6 +302,40 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('fences queued lifecycle cleanup against a concurrent promotion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-queued-clear-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 2 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const promotedKey = `promoted-${index}`
+        const queuedSeed = { ...dispatchLifecycle(880 + index), phase: 'queued' as const }
+        const snapshot = await store.claimDispatchLifecycle(
+          workspace, promotedKey, queuedSeed, `owner-${index}`, 1_000, 5_000,
+        )
+        expect(snapshot.lease).toBeDefined()
+        expect(await store.promoteDispatchLifecycle(
+          workspace, promotedKey, `owner-${index}`, snapshot.lease!.epoch, 1_001,
+        )).toBe(true)
+
+        expect(await store.clearQueuedDispatchLifecycle(workspace, promotedKey, snapshot.lease)).toBe(false)
+        expect(await store.getDispatchLifecycle(workspace, promotedKey)).toMatchObject({ phase: 'dispatching' })
+
+        const queuedKey = `queued-${index}`
+        const queued = await store.claimDispatchLifecycle(
+          workspace, queuedKey, { ...dispatchLifecycle(890 + index), phase: 'queued' }, `owner-q-${index}`, 1_002, 5_000,
+        )
+        expect(await store.clearQueuedDispatchLifecycle(workspace, queuedKey, queued.lease)).toBe(true)
+        expect(await store.getDispatchLifecycle(workspace, queuedKey)).toBeUndefined()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not count a bare-repo lifecycle after its canonical PR is handed to a babysitter', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-bare-repo-handoff-'))
     try {
