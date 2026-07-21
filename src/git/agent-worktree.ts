@@ -1,9 +1,14 @@
 import { execFile } from 'node:child_process'
-import { mkdir, realpath, rmdir, stat } from 'node:fs/promises'
+import { lstat, mkdir, readdir, realpath, rmdir, stat } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
-import type { AgentWorktree, AgentWorktreeManager } from '../ports/worktree'
+import type {
+  AgentWorktree,
+  AgentWorktreeCleanupInspection,
+  AgentWorktreeManager,
+  AgentWorktreeRepository,
+} from '../ports/worktree'
 
 const execFileAsync = promisify(execFile)
 
@@ -113,6 +118,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
   async cleanup(worktree: AgentWorktree): Promise<void> {
     await this.#prepares.get(resolve(worktree.worktreePath))
     assertSafeWorktree(worktree)
+    await assertNonSymlinkFactoryRoot(factoryWorktreeRoot(worktree.baseClonePath))
     await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (!await pathExists(worktree.worktreePath)) {
       await removeEmptyWorktreeParents(worktree.worktreePath)
@@ -124,8 +130,102 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     await removeEmptyWorktreeParents(worktree.worktreePath)
   }
 
+  async listWorktrees(repository: AgentWorktreeRepository): Promise<AgentWorktree[]> {
+    const root = factoryWorktreeRoot(repository.baseClonePath)
+    let entries
+    try {
+      entries = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return []
+      throw error
+    }
+
+    const repoSlug = sanitizeSegment(repository.repo.split('/').at(-1) ?? repository.repo)
+    const pattern = new RegExp(`^(.+)-${escapeRegExp(repoSlug)}-(.+)$`, 'u')
+    const worktrees: AgentWorktree[] = []
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory()) continue
+      const match = entry.name.match(pattern)
+      if (!match?.[1]) continue
+      const worktreePath = join(root, entry.name)
+      // Keep malformed or detached matching directories visible to the caller.
+      // Their synthetic unsafe branch makes inspection fail closed and ensures
+      // Factory logs the retained path without one bad entry hiding siblings.
+      let branch = '__factory-unreadable__'
+      try {
+        branch = (await this.#git(worktreePath, ['symbolic-ref', '--short', 'HEAD'])).trim()
+      } catch {
+        // Inspection will reject this candidate before deletion.
+      }
+      const issueKey = match[1]
+      worktrees.push({
+        repo: repository.repo,
+        issueKey,
+        baseClonePath: repository.baseClonePath,
+        worktreePath,
+        branch,
+        ...(isAuthorizedExistingPrBranch({
+          repo: repository.repo,
+          issueKey,
+          baseClonePath: repository.baseClonePath,
+          worktreePath,
+          branch,
+          existingPullRequestBranch: true,
+        }) ? { existingPullRequestBranch: true } : {}),
+      })
+    }
+    return worktrees
+  }
+
+  async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
+    assertSafeWorktree(worktree)
+    await assertNonSymlinkFactoryRoot(factoryWorktreeRoot(worktree.baseClonePath))
+    // Inspection runs before cleanup, so it must clear unrelated deleted
+    // registrations itself. Otherwise #assertRegisteredCheckout can fail on
+    // realpath() for a stale sibling and retain every healthy candidate in the
+    // repository without ever reaching cleanup's existing prune step.
+    await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
+    if (!await pathExists(worktree.worktreePath)) return { bytes: 0, retentionReasons: [] }
+    await this.#assertRegisteredCheckout(worktree)
+
+    const retentionReasons: string[] = []
+    const gitDir = resolveGitPath(
+      worktree.worktreePath,
+      (await this.#git(worktree.worktreePath, ['rev-parse', '--git-dir'])).trim(),
+    )
+    const commonDir = resolveGitPath(
+      worktree.worktreePath,
+      (await this.#git(worktree.worktreePath, ['rev-parse', '--git-common-dir'])).trim(),
+    )
+    const locks = await relevantGitLocks(gitDir, commonDir, worktree.branch)
+    if (locks.length > 0) retentionReasons.push(`git lock present (${locks.join(', ')})`)
+
+    const status = await this.#git(worktree.worktreePath, ['status', '--porcelain', '--untracked-files=all'])
+    if (status.trim()) retentionReasons.push('uncommitted changes')
+
+    const unpushed = Number.parseInt(
+      (await this.#git(worktree.worktreePath, ['rev-list', '--count', 'HEAD', '--not', '--remotes'])).trim(),
+      10,
+    )
+    if (!Number.isFinite(unpushed)) {
+      throw new Error(`Unable to determine unpushed commits for ${worktree.worktreePath}`)
+    }
+    if (unpushed > 0) retentionReasons.push(`${unpushed} unpushed commit${unpushed === 1 ? '' : 's'}`)
+
+    return {
+      bytes: await directorySize(worktree.worktreePath),
+      retentionReasons,
+    }
+  }
+
   async #assertRegisteredCheckout(worktree: AgentWorktree): Promise<void> {
     const wanted = await realpath(worktree.worktreePath)
+    const expectedRootPath = factoryWorktreeRoot(worktree.baseClonePath)
+    await assertNonSymlinkFactoryRoot(expectedRootPath)
+    const expectedRoot = await realpath(expectedRootPath)
+    if (wanted === expectedRoot || !wanted.startsWith(`${expectedRoot}/`)) {
+      throw new Error(`Refusing Factory worktree operation outside ${expectedRoot}: resolved target is ${wanted}`)
+    }
     const root = await realpath((await this.#git(worktree.worktreePath, ['rev-parse', '--show-toplevel'])).trim())
     if (root !== wanted) {
       throw new Error(`Refusing Factory worktree operation outside ${wanted}: git root is ${root}`)
@@ -134,7 +234,9 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
       .split(/\r?\n/u)
       .filter((line) => line.startsWith('worktree '))
       .map((line) => line.slice('worktree '.length).trim())
-    const registered = await Promise.all(registeredPaths.map(async (path) => await realpath(path)))
+    const registered = (await Promise.allSettled(
+      registeredPaths.map(async (path) => await realpath(path)),
+    )).flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
     if (!registered.includes(wanted)) {
       throw new Error(`Refusing Factory worktree operation for unregistered checkout ${wanted}`)
     }
@@ -194,13 +296,17 @@ export function factoryWorktreePath(
 ): string {
   const repoSlug = sanitizeSegment(repo.split('/').at(-1) ?? repo)
   const issueSlug = sanitizeSegment(issueKey)
-  const checkoutSlug = sanitizeSegment(basename(resolve(baseClonePath)))
   return join(
-    dirname(resolve(baseClonePath)),
-    '.factory-worktrees',
-    checkoutSlug,
+    factoryWorktreeRoot(baseClonePath),
     `${issueSlug}-${repoSlug}-${runId.slice(0, 8)}`,
   )
+}
+
+export const factoryWorktreeIssueSlug = (issueKey: string): string => sanitizeSegment(issueKey)
+
+const factoryWorktreeRoot = (baseClonePath: string): string => {
+  const base = resolve(baseClonePath)
+  return resolve(dirname(base), '.factory-worktrees', sanitizeSegment(basename(base)))
 }
 
 const sanitizeSegment = (value: string): string =>
@@ -209,7 +315,7 @@ const sanitizeSegment = (value: string): string =>
 const assertSafeWorktree = (worktree: AgentWorktree): void => {
   const base = resolve(worktree.baseClonePath)
   const target = resolve(worktree.worktreePath)
-  const expectedRoot = resolve(dirname(base), '.factory-worktrees', sanitizeSegment(basename(base)))
+  const expectedRoot = factoryWorktreeRoot(base)
   if (target === base || !target.startsWith(`${expectedRoot}/`)) {
     throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
   }
@@ -226,8 +332,55 @@ const isAuthorizedExistingPrBranch = (worktree: AgentWorktree): boolean =>
 const pathExists = async (path: string): Promise<boolean> => {
   try {
     return (await stat(path)).isDirectory()
-  } catch {
-    return false
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return false
+    throw error
+  }
+}
+
+const resolveGitPath = (cwd: string, path: string): string => resolve(cwd, path)
+
+const relevantGitLocks = async (gitDir: string, commonDir: string, branch: string): Promise<string[]> => {
+  const candidates = new Set([
+    join(gitDir, 'locked'),
+    join(gitDir, 'index.lock'),
+    join(gitDir, 'HEAD.lock'),
+    join(commonDir, 'packed-refs.lock'),
+    join(commonDir, 'config.lock'),
+    join(commonDir, 'refs', 'heads', `${branch}.lock`),
+  ])
+  const locks: string[] = []
+  for (const path of candidates) {
+    try {
+      await lstat(path)
+      locks.push(path)
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error
+    }
+  }
+  return locks
+}
+
+const directorySize = async (root: string): Promise<number> => {
+  const entry = await lstat(root)
+  if (!entry.isDirectory()) return entry.size
+  let bytes = entry.size
+  for (const child of await readdir(root)) {
+    bytes += await directorySize(join(root, child))
+  }
+  return bytes
+}
+
+const assertNonSymlinkFactoryRoot = async (expectedRoot: string): Promise<void> => {
+  for (const path of [dirname(expectedRoot), expectedRoot]) {
+    try {
+      if ((await lstat(path)).isSymbolicLink()) {
+        throw new Error(`Refusing Factory worktree operation through symbolic-link root ${path}`)
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return
+      throw error
+    }
   }
 }
 
@@ -239,10 +392,15 @@ const removeEmptyWorktreeParents = async (worktreePath: string): Promise<void> =
 }
 
 const ignoreNonEmptyOrMissing = (error: unknown): void => {
-  const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined
+  const code = errorCode(error)
   if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') return
   throw error
 }
+
+const errorCode = (error: unknown): string | undefined =>
+  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 
 const runGit: AgentWorktreeGitRunner = async (cwd, args) => {
   const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], {
