@@ -41,8 +41,8 @@ import type {
   WaitingClarification,
 } from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
-import type { AgentWorktree, AgentWorktreeManager } from '../ports/worktree'
-import { factoryWorktreePath } from '../git/agent-worktree'
+import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
+import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
@@ -732,6 +732,7 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
+      if (opts.mode !== 'dispatch-owner') await this.#reapOrphanedWorktreesOnStartup(legacyRegistry)
       if (this.#config.babysitter.enabled) {
         // Re-run the idempotent receipt fold after adoption returns. This
         // catches records restored by lifecycle work that completed while the
@@ -5944,9 +5945,41 @@ export class FactoryLoop implements Factory {
       const worktree = this.#agentWorktree(record, tracked.spec)
       if (worktree) unique.set(worktree.worktreePath, worktree)
     }
+    const issueSlug = factoryWorktreeIssueSlug(record.issue.key)
     const failures: string[] = []
+    for (const repository of this.#worktreeRepositories(record)) {
+      try {
+        const candidates = await this.#worktrees.listWorktrees(repository)
+        for (const candidate of candidates) {
+          if (factoryWorktreeIssueSlug(candidate.issueKey) === issueSlug) {
+            unique.set(candidate.worktreePath, candidate)
+          }
+        }
+      } catch (error) {
+        const message = `${repository.baseClonePath}: ${describeError(error).errorMessage}`
+        failures.push(message)
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] failed to enumerate completed issue worktrees', {
+          issue: record.issue.key,
+          repo: repository.repo,
+          baseClonePath: repository.baseClonePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
     for (const worktree of unique.values()) {
       try {
+        const inspection = await this.#worktrees.inspectForCleanup(worktree)
+        if (inspection.retentionReasons.length > 0) {
+          this.#increment('agentWorktreeCleanupRetained')
+          this.#logger.warn?.('[factory] retained completed issue worktree with local state', {
+            issue: record.issue.key,
+            repo: worktree.repo,
+            worktreePath: worktree.worktreePath,
+            retentionReasons: inspection.retentionReasons,
+          })
+          continue
+        }
         await this.#worktrees.cleanup(worktree)
         this.#increment('agentWorktreesCleaned')
       } catch (error) {
@@ -5963,6 +5996,132 @@ export class FactoryLoop implements Factory {
     if (failures.length > 0) {
       throw new Error(`Factory worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
     }
+  }
+
+  #worktreeRepositories(record?: InFlightIssue): AgentWorktreeRepository[] {
+    const repositories = new Map<string, AgentWorktreeRepository>()
+    const add = (repo: string, baseClonePath: string | undefined): void => {
+      if (!baseClonePath) return
+      const key = `${repo}\u0000${resolve(baseClonePath)}`
+      repositories.set(key, { repo, baseClonePath })
+    }
+
+    if (record) {
+      for (const route of record.decision.routes) {
+        add(route.repo, this.#config.repos.clonePaths[route.repo] ?? route.clonePath)
+      }
+      for (const tracked of record.agents.values()) {
+        add(tracked.spec.repo, tracked.spec.baseClonePath)
+      }
+      for (const spec of record.decision.implementers) {
+        add(spec.repo, spec.baseClonePath)
+      }
+    } else {
+      for (const [repo, baseClonePath] of Object.entries(this.#config.repos.clonePaths)) {
+        add(repo, baseClonePath)
+      }
+    }
+    return [...repositories.values()]
+  }
+
+  async #reapOrphanedWorktreesOnStartup(legacyRegistry?: FactoryInFlightRegistry): Promise<void> {
+    if (!this.#worktrees) return
+    const legacyAgents = (legacyRegistry?.agents ?? []).filter((agent) => agent.issue)
+    let durableLifecycles: Array<[string, DispatchLifecycle]>
+    let waitingClarifications: Array<[string, WaitingClarification]>
+    let onlineAgentNames: Set<string>
+    try {
+      const [lifecycles, clarifications, roster] = await Promise.all([
+        this.#state.listDispatchLifecycles(this.#workspaceId),
+        this.#state.listWaitingClarifications(this.#workspaceId),
+        legacyAgents.length > 0 ? this.#fleet.roster() : undefined,
+      ])
+      durableLifecycles = lifecycles
+      waitingClarifications = clarifications
+      onlineAgentNames = new Set((roster?.agents ?? []).map((agent) => agent.name))
+    } catch (error) {
+      this.#increment('agentWorktreeCleanupFailures')
+      this.#logger.warn?.('[factory] startup worktree reaper skipped because active lifecycle or roster state could not be loaded', {
+        error: describeError(error).errorMessage,
+      })
+      return
+    }
+    const activeIssueSlugs = new Set((await this.#batch()).inFlight.map((record) =>
+      factoryWorktreeIssueSlug(record.issue.key)))
+    for (const [, lifecycle] of durableLifecycles) {
+      if (!isTerminalDispatchLifecycle(lifecycle)) {
+        activeIssueSlugs.add(factoryWorktreeIssueSlug(lifecycle.issue.key))
+      }
+    }
+    for (const [, waiting] of waitingClarifications) {
+      activeIssueSlugs.add(factoryWorktreeIssueSlug(waiting.issue.key))
+    }
+    for (const agent of legacyAgents) {
+      if (agent.issue && onlineAgentNames.has(agent.name)) {
+        activeIssueSlugs.add(factoryWorktreeIssueSlug(agent.issue.key))
+      }
+    }
+    const candidates = new Map<string, AgentWorktree>()
+    let reaped = 0
+    let reclaimedBytes = 0
+    let retained = 0
+    let failures = 0
+
+    for (const repository of this.#worktreeRepositories()) {
+      try {
+        for (const candidate of await this.#worktrees.listWorktrees(repository)) {
+          candidates.set(candidate.worktreePath, candidate)
+        }
+      } catch (error) {
+        failures += 1
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] startup worktree reaper failed to enumerate repository', {
+          repo: repository.repo,
+          baseClonePath: repository.baseClonePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+
+    for (const worktree of candidates.values()) {
+      if (activeIssueSlugs.has(factoryWorktreeIssueSlug(worktree.issueKey))) continue
+      try {
+        const inspection = await this.#worktrees.inspectForCleanup(worktree)
+        if (inspection.retentionReasons.length > 0) {
+          retained += 1
+          this.#increment('agentWorktreeCleanupRetained')
+          this.#logger.warn?.('[factory] retained startup orphan worktree with local state', {
+            issue: worktree.issueKey,
+            repo: worktree.repo,
+            worktreePath: worktree.worktreePath,
+            retentionReasons: inspection.retentionReasons,
+          })
+          continue
+        }
+        await this.#worktrees.cleanup(worktree)
+        reaped += 1
+        reclaimedBytes += inspection.bytes
+        this.#increment('agentWorktreesCleaned')
+        this.#increment('agentWorktreesReapedOnStartup')
+      } catch (error) {
+        failures += 1
+        this.#increment('agentWorktreeCleanupFailures')
+        this.#logger.warn?.('[factory] startup worktree reaper retained checkout after cleanup failure', {
+          issue: worktree.issueKey,
+          repo: worktree.repo,
+          worktreePath: worktree.worktreePath,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+
+    this.#logger.info?.('[factory] startup worktree reaper completed', {
+      reaped,
+      reclaimedBytes,
+      reclaimed: formatByteCount(reclaimedBytes),
+      retained,
+      failures,
+    })
   }
 
   async #confirmPublishedRemotePullRequest(
@@ -14773,6 +14932,18 @@ const clarificationStaleSlackText = (
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 
+const formatByteCount = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes
+  let unit = 'B'
+  for (const candidate of units) {
+    value /= 1024
+    unit = candidate
+    if (value < 1024) break
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`
+}
 const unrefDelay = (ms: number): Promise<void> => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)
   timer.unref?.()
