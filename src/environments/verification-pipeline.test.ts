@@ -7,17 +7,17 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { FactoryCloudEventInputV1 } from '../observability/events'
 import type { FactoryEventReporter, FactoryEventReportResult } from '../ports/observability'
 import type {
-  Environment,
-  EnvironmentProvider,
-  EnvironmentSpec,
-  EnvironmentStatus,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
 } from '../ports/environment'
-import type { LoadedVerificationStack } from './stack-descriptor'
-import type { StackDeployment } from './stack-deployer'
+import type { LoadedVerificationStack } from './verification-stack-descriptor'
+import type { StackDeployment } from './verification-stack-deployer'
 import {
   VerificationPipeline,
   type E2eCommandResult,
+  type VerificationLeaseProvider,
   type VerificationLoadResult,
+  type VerificationStackDeployRunner,
 } from './verification-pipeline'
 
 const roots: string[] = []
@@ -26,24 +26,25 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
 })
 
-class RecordingEnvironmentProvider implements EnvironmentProvider {
+class RecordingEnvironmentProvider implements VerificationLeaseProvider, VerificationStackDeployRunner {
   readonly calls: string[] = []
   teardownError?: Error
 
-  async provision(input: EnvironmentSpec): Promise<Environment> {
+  async provision(input: ProvisionEnvironmentInput): Promise<VerificationEnvironment> {
     this.calls.push('provision')
     return {
-      id: `env-${input.id}`,
-      namespace: `env-${input.id}`,
-      status: 'ready',
-      createdAt: new Date().toISOString(),
-      ttl: input.ttl ?? 60_000,
+      id: `env-${input.runId}`,
+      namespace: `env-${input.runId}`,
       endpoints: {},
-      bindings: {},
+      internalEndpoints: {},
+      expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
     }
   }
 
-  async deploy(_stack: LoadedVerificationStack, _environment: Environment): Promise<StackDeployment> {
+  async deploy(
+    _stack: LoadedVerificationStack,
+    _environment: VerificationEnvironment,
+  ): Promise<StackDeployment> {
     this.calls.push('deploy')
     return {
       endpoints: { api: 'http://127.0.0.1:1234/health' },
@@ -51,10 +52,7 @@ class RecordingEnvironmentProvider implements EnvironmentProvider {
     }
   }
 
-  async status(): Promise<EnvironmentStatus> { return 'ready' }
-  async endpoints(): Promise<Record<string, string>> { return {} }
-
-  async destroy(): Promise<void> {
+  async teardown(): Promise<void> {
     this.calls.push('teardown')
     if (this.teardownError) throw this.teardownError
   }
@@ -86,7 +84,8 @@ describe('VerificationPipeline', () => {
       revisionResolver: async () => 'abc123',
       e2eRunner: async (input): Promise<E2eCommandResult> => {
         calls.push('e2e')
-        expect(input.env.FACTORY_ENDPOINT_API).toBe('http://127.0.0.1:1234/health')
+        expect(input.env.FACTORY_ENDPOINT_API).toContain('.svc.cluster.local')
+        expect(input.env.FACTORY_EXTERNAL_ENDPOINT_API).toBe('http://127.0.0.1:1234/health')
         return { exitCode: 0, stdout: 'ok', stderr: '', durationMs: 12 }
       },
       loadRunner: async (deployed): Promise<VerificationLoadResult> => {

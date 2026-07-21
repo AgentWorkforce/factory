@@ -2,22 +2,39 @@ import { access } from 'node:fs/promises'
 
 import { describe, expect, it } from 'vitest'
 
-import type { Environment } from '../ports/environment'
+import type { VerificationEnvironment } from '../ports/environment'
 import type { CommandRunner, RunCommandOptions } from './kubernetes-command'
 import {
   StackDeploymentError,
   VerificationStackDeployer,
   type ManagedPortForward,
   type PortForwarder,
-} from './stack-deployer'
-import { loadVerificationStack, type VerificationStackDescriptor } from './stack-descriptor'
+} from './verification-stack-deployer'
+import { loadVerificationStack, type VerificationStackDescriptor } from './verification-stack-descriptor'
+
+const SAFE_RENDERED_MANIFEST = `apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 8080
+      targetPort: 8080
+`
 
 class RecordingRunner implements CommandRunner {
   readonly calls: Array<{ command: string; args: string[]; options?: RunCommandOptions }> = []
 
+  constructor(readonly renderedManifest = SAFE_RENDERED_MANIFEST) {}
+
   async run(command: string, args: string[], options?: RunCommandOptions) {
     this.calls.push({ command, args, options })
-    return { stdout: command === 'kompose' ? 'apiVersion: v1\nkind: Service\n' : '', stderr: '' }
+    const rendersResources = command === 'helm'
+      || command === 'kompose'
+      || (command === 'kubectl' && args.includes('kustomize'))
+    return { stdout: rendersResources ? this.renderedManifest : '', stderr: '' }
   }
 }
 
@@ -34,20 +51,19 @@ class FakePortForwarder implements PortForwarder {
   }
 }
 
-function environment(): Environment {
+function environment(): VerificationEnvironment {
   return {
     id: 'env-1',
-    status: 'ready',
-    createdAt: new Date().toISOString(),
-    ttl: 60_000,
+    namespace: 'factory-env-1',
     endpoints: {},
-    bindings: {},
-    target: { type: 'kubernetes', namespace: 'factory-env-1', context: 'kind-test' },
+    internalEndpoints: {},
+    kubeContext: 'kind-test',
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
   }
 }
 
 function descriptor(source: VerificationStackDescriptor['source'] = {
-  type: 'manifests', paths: ['k8s/stack.yaml'],
+  type: 'kustomize', path: 'k8s/stack',
 }): VerificationStackDescriptor {
   return loadVerificationStack({
     apiVersion: 'factory.agentworkforce.dev/v1alpha1',
@@ -99,7 +115,7 @@ describe('VerificationStackDeployer', () => {
     expect(JSON.parse(secret!.options!.input!).data.PASSWORD).toBe(
       Buffer.from('resolved-password').toString('base64'),
     )
-    expect(runner.calls.some((call) => call.args.includes('/repo/k8s/stack.yaml'))).toBe(true)
+    expect(runner.calls.some((call) => call.args.includes('/repo/k8s/stack'))).toBe(true)
     expect(runner.calls.some((call) => call.args.includes('seed-database'))).toBe(false)
     expect(runner.calls.some((call) => call.args.includes('app') && call.args.includes('seed'))).toBe(true)
 
@@ -169,7 +185,7 @@ describe('VerificationStackDeployer', () => {
       '-C', checkout, 'checkout', '--quiet', '--detach',
       '0123456789abcdef0123456789abcdef01234567',
     ])
-    expect(runner.calls.some((call) => call.args.includes(`${checkout}/k8s/stack.yaml`))).toBe(true)
+    expect(runner.calls.some((call) => call.args.includes(`${checkout}/k8s/stack`))).toBe(true)
     await expect(access(checkout)).rejects.toThrow()
   })
 
@@ -198,7 +214,9 @@ describe('VerificationStackDeployer', () => {
   })
 
   it.each([
-    ['manifests', { type: 'manifests', paths: ['k8s/all.yaml'] }],
+    ['manifests', {
+      type: 'manifests', paths: ['test/fixtures/verification-stack/stack.yaml'],
+    }],
     ['kustomize', { type: 'kustomize', path: 'k8s/overlays/test' }],
     ['helm', { type: 'helm', chart: 'charts/app', release: 'verify', valuesFiles: ['values.test.yaml'] }],
     ['docker-compose', { type: 'docker-compose', path: 'docker-compose.yml' }],
@@ -215,7 +233,7 @@ describe('VerificationStackDeployer', () => {
     const deployment = await new VerificationStackDeployer({ commandRunner: runner }).deploy({
       descriptor: stack,
       descriptorPath: '.factory/verification-stack.yaml',
-      rootDir: '/repo',
+      rootDir: source.type === 'manifests' ? process.cwd() : '/repo',
     }, environment())
 
     const commands = runner.calls.map((call) => call.command)
@@ -223,6 +241,34 @@ describe('VerificationStackDeployer', () => {
     else if (source.type === 'docker-compose') expect(commands).toEqual(expect.arrayContaining(['kompose', 'kubectl']))
     else expect(commands).toContain('kubectl')
     await deployment.dispose()
+  })
+
+  it('rejects rendered resources before apply when they cross the safety boundary', async () => {
+    const runner = new RecordingRunner(`apiVersion: v1
+kind: Secret
+metadata:
+  name: smuggled-inline-secret
+stringData:
+  TOKEN: forbidden
+`)
+    const stack = descriptor()
+    stack.secrets = []
+    stack.services[0].readiness = {
+      type: 'exec', command: ['true'], timeoutSeconds: 1, intervalSeconds: 0.1,
+    }
+    stack.seeds = []
+    stack.endpoints = []
+
+    await expect(new VerificationStackDeployer({ commandRunner: runner }).deploy({
+      descriptor: stack,
+      descriptorPath: '.factory/verification-stack.yaml',
+      rootDir: '/repo',
+    }, environment())).rejects.toMatchObject({
+      name: 'StackDeploymentError',
+      stage: 'apply',
+      message: expect.stringContaining('Customer stack Secret/smuggled-inline-secret is denied'),
+    })
+    expect(runner.calls.filter((call) => call.args.includes('apply'))).toHaveLength(0)
   })
 
   it('rejects a non-Kubernetes environment clearly', async () => {

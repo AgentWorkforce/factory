@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process'
 
+const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+
 export interface CommandResult {
   stdout: string
   stderr: string
@@ -51,12 +53,18 @@ export class ProcessCommandRunner implements CommandRunner {
 
       child.stdout.setEncoding('utf8')
       child.stderr.setEncoding('utf8')
-      child.stdout.on('data', (chunk: string) => { stdout += chunk })
-      child.stderr.on('data', (chunk: string) => { stderr += chunk })
+      child.stdout.on('data', (chunk: string) => {
+        stdout = `${stdout}${chunk}`.slice(-MAX_COMMAND_OUTPUT_BYTES)
+      })
+      child.stderr.on('data', (chunk: string) => {
+        stderr = `${stderr}${chunk}`.slice(-MAX_COMMAND_OUTPUT_BYTES)
+      })
 
       const stop = (): void => {
+        if (child.exitCode !== null) return
         child.kill('SIGTERM')
         forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000)
+        forceTimer.unref()
       }
       const abort = (): void => stop()
       options.signal?.addEventListener('abort', abort, { once: true })
@@ -107,9 +115,13 @@ export class ProcessCommandRunner implements CommandRunner {
         ))
       })
 
-      if (options.input === undefined) child.stdin.end()
-      else child.stdin.end(options.input)
-      if (options.signal?.aborted) stop()
+      if (options.signal?.aborted) {
+        stop()
+      } else if (options.input === undefined) {
+        child.stdin.end()
+      } else {
+        child.stdin.end(options.input)
+      }
     })
   }
 }

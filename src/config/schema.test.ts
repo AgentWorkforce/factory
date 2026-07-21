@@ -86,6 +86,47 @@ describe('FactoryConfigSchema', () => {
       requireTeamKey: 'AR',
     })
     expect(parsed.dryRun).toBe(false)
+    expect(parsed.environments).toEqual({})
+  })
+
+  it('accepts secret-reference-only Kubernetes BYOC and managed connections', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+      environments: {
+        kubernetes: {
+          connections: [
+            {
+              id: 'customer-eks',
+              target: 'byoc',
+              customers: ['customer-a'],
+              repositories: ['AgentWorkforce/factory'],
+              credential: { kind: 'irsa', secretRef: 'aws-sm:customer-a/verification-role' },
+              protectedNamespaces: ['payments-prod'],
+            },
+            {
+              id: 'factory-managed',
+              target: 'managed',
+              credential: { kind: 'kubeconfig', secretRef: 'env:FACTORY_MANAGED_KUBECONFIG' },
+            },
+          ],
+        },
+      },
+    })
+
+    expect(parsed.environments.kubernetes?.connections[0].credential.secretRef)
+      .toBe('aws-sm:customer-a/verification-role')
+    expect(parsed.environments.kubernetes?.connections[1].fidelityCaveat).toContain('may differ')
+    expect(() => FactoryConfigSchema.parse({
+      repos: {},
+      environments: {
+        kubernetes: {
+          connections: [{
+            id: 'unsafe',
+            credential: { kind: 'kubeconfig', secretRef: 'apiVersion: v1\nclusters: []' },
+          }],
+        },
+      },
+    })).toThrow(/never inline kubeconfig/iu)
   })
 
   it('preserves explicit model overrides', () => {

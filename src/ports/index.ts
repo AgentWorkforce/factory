@@ -46,6 +46,19 @@ export type {
   TelemetrySink,
 } from './system'
 export type {
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
+  ProvisionEnvironmentSpec,
+  DeployEndpoint,
+  DeployEnvironmentInput,
+  DeployManifest,
+  DeployReadinessCheck,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
+} from './environment'
+export type {
   FactoryEventReporter,
   FactoryEventReportResult,
 } from './observability'
@@ -55,17 +68,3 @@ export type {
   AgentWorktreeManager,
   AgentWorktreeRepository,
 } from './worktree'
-export type {
-  DeployEndpoint,
-  DeployEnvironmentInput,
-  DeployManifest,
-  DeployReadinessCheck,
-  ProvisionEnvironmentInput,
-  VerificationEnvironment,
-  VerificationEnvironmentProvider,
-  Environment,
-  EnvironmentProvider,
-  EnvironmentSpec,
-  EnvironmentStatus,
-  KubernetesEnvironmentTarget,
-} from './environment'

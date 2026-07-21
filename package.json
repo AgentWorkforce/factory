@@ -58,7 +58,12 @@
       "types": "./dist/hosted/index.d.ts",
       "import": "./dist/hosted/index.js"
     },
-    "./verification-stack.schema.json": "./schemas/verification-stack.schema.json"
+    "./environments": {
+      "types": "./dist/environments/index.d.ts",
+      "import": "./dist/environments/index.js"
+    },
+    "./verification-stack.schema.json": "./schemas/verification-stack.schema.json",
+    "./kubernetes-environment-stack.schema.json": "./schemas/kubernetes-environment-stack.schema.json"
   },
   "publishConfig": {
     "access": "public"
@@ -67,6 +72,7 @@
     "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
+    "test:e2e:kubernetes": "bash scripts/test-kubernetes-provider-e2e.sh",
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
     "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
     "test:stack-e2e": "tsx test/e2e/stack-deployer.e2e.ts",

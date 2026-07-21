@@ -10,17 +10,13 @@ import {
   FactoryConfigSchema,
   FactoryCloudReporter,
   FileFactoryCloudEventOutbox,
-  KubernetesEnvironmentProvider,
+  KubectlEnvironmentProvider,
   VerificationPipeline,
   createFactory,
   defaultKubectlEnvironmentRunner,
   parseLinearIssue,
   reapFactoryEnvironmentsOnce,
   type FactoryConfig,
-  type Environment,
-  type EnvironmentProvider,
-  type EnvironmentSpec,
-  type EnvironmentStatus,
   type FactoryCloudEventBatchV1,
   type FactoryEventReporter,
   type GithubMergeGate,
@@ -31,6 +27,9 @@ import {
   type TriageEngine,
   type VerificationGate,
   type VerificationGateInput,
+  type VerificationEnvironment,
+  type VerificationLeaseProvider,
+  type ProvisionEnvironmentInput,
   type VerificationVerdict,
 } from '../../src/index.ts'
 import { FakeFleetClient, FakeMountClient } from '../../src/testing/index.ts'
@@ -38,21 +37,22 @@ import { FakeFleetClient, FakeMountClient } from '../../src/testing/index.ts'
 const artifactDirectory = join(process.cwd(), 'artifacts', 'verification-gate-e2e')
 const execFileAsync = promisify(execFile)
 
-class SignalingEnvironmentProvider implements EnvironmentProvider {
-  readonly #delegate = new KubernetesEnvironmentProvider({ maxActiveEnvironments: 2 })
+class SignalingEnvironmentProvider implements VerificationLeaseProvider {
+  readonly #delegate = new KubectlEnvironmentProvider()
 
   constructor(readonly signalPath: string) {}
 
-  async provision(input: EnvironmentSpec): Promise<Environment> {
+  async provision(input: ProvisionEnvironmentInput): Promise<VerificationEnvironment> {
     const environment = await this.#delegate.provision(input)
     await writeFile(this.signalPath, environment.namespace, 'utf8')
     return environment
   }
 
-  async status(id: string): Promise<EnvironmentStatus> { return await this.#delegate.status(id) }
-  async endpoints(id: string): Promise<Record<string, string>> { return await this.#delegate.endpoints(id) }
-  async destroy(id: string, options?: { signal?: AbortSignal }): Promise<void> {
-    await this.#delegate.destroy(id, options)
+  async teardown(
+    environment: VerificationEnvironment,
+    options?: { signal?: AbortSignal },
+  ): Promise<void> {
+    await this.#delegate.teardown(environment, options)
   }
 }
 
@@ -76,6 +76,7 @@ async function main(): Promise<void> {
   }
 
   const root = await fixtureRepository()
+  process.env.FACTORY_E2E_HOST_ONLY_SECRET = 'must-not-enter-the-verification-pod'
   const cloudBatches: FactoryCloudEventBatchV1[] = []
   const reporter = cloudReporter(root, cloudBatches)
   const expectedHeadSha = await gitHead(root)
@@ -530,6 +531,11 @@ spec:
     metadata:
       labels: { app: factory-gate-sample }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: http-echo
           image: hashicorp/http-echo:1.0.0@sha256:fcb75f691c8b0414d670ae570240cbf95502cc18a9ba57e982ecac589760a186
@@ -541,6 +547,10 @@ spec:
           resources:
             requests: { cpu: 10m, memory: 8Mi }
             limits: { cpu: 200m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
 ---
 apiVersion: v1
 kind: Service
@@ -553,6 +563,7 @@ spec:
 
 const e2eProgram = `
 const mode = process.argv[2]
+if (process.env.FACTORY_E2E_HOST_ONLY_SECRET) throw new Error('Factory host environment leaked into E2E pod')
 if (mode === 'hang') await new Promise(() => setInterval(() => undefined, 1_000))
 const response = await fetch(process.env.FACTORY_ENDPOINT_API)
 if (!response.ok) throw new Error('fixture endpoint returned ' + response.status)

@@ -4,7 +4,7 @@ import {
   resolveVerificationStackAsset,
   resolveVerificationStackDescriptor,
   type LoadedVerificationStack,
-} from './stack-descriptor.js'
+} from './verification-stack-descriptor.js'
 
 export interface ResolvedVerificationStack {
   descriptorPath: string
@@ -12,6 +12,7 @@ export interface ResolvedVerificationStack {
   loaded: LoadedVerificationStack
   environmentTtlMs: number
   e2e: {
+    image: string
     command: string
     args: string[]
     env: Record<string, string>
@@ -59,6 +60,7 @@ export async function loadVerificationGateStack(
     loaded,
     environmentTtlMs: gate.environmentTtlSeconds * 1_000,
     e2e: {
+      image: gate.e2e.image,
       command: gate.e2e.command,
       args: gate.e2e.args,
       env: gate.e2e.env,

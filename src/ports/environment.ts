@@ -44,6 +44,7 @@ export interface DeployEnvironmentInput {
   signal?: AbortSignal
 }
 
+/** Namespace-lease seam used by the live verification merge gate. */
 export interface VerificationEnvironmentProvider {
   provision(input: ProvisionEnvironmentInput): Promise<VerificationEnvironment>
   deploy(
@@ -53,6 +54,7 @@ export interface VerificationEnvironmentProvider {
   teardown(environment: VerificationEnvironment, options?: { signal?: AbortSignal }): Promise<void>
 }
 
+/** Lifecycle states shared by every disposable verification substrate. */
 export type EnvironmentStatus =
   | 'provisioning'
   | 'ready'
@@ -60,45 +62,37 @@ export type EnvironmentStatus =
   | 'destroying'
   | 'destroyed'
 
-export interface KubernetesEnvironmentTarget {
-  type: 'kubernetes'
-  namespace: string
-  kubeconfig?: string
-  context?: string
-}
-
-export interface EnvironmentSpec {
-  /** Stable caller-provided id. Providers generate one when it is omitted. */
-  id?: string
-  ttl?: number
-  labels?: Record<string, string>
-  bindings?: Record<string, string>
-  annotations?: Record<string, string>
-  signal?: AbortSignal
-}
-
 /**
- * A provisioned, isolated verification target. Provider-specific connection
- * details live in `target`; callers should otherwise treat environments as
- * substrate agnostic.
+ * A provisioned, issue-scoped verification environment.
+ *
+ * `ttl` is a duration in milliseconds. Providers persist an absolute expiry
+ * alongside their own resource identity so a restarted reaper can safely
+ * reclaim the environment.
  */
 export interface Environment {
   id: string
-  status: EnvironmentStatus
-  createdAt: string
-  /** Environment lifetime in milliseconds. */
-  ttl: number
+  provider: string
+  dispatchNamespace: string
   endpoints: Record<string, string>
   bindings: Record<string, string>
-  target?: KubernetesEnvironmentTarget | { type: string; [key: string]: unknown }
-  /** Compatibility fields for providers whose native isolation primitive is named directly. */
-  namespace?: string
-  dispatchNamespace?: string
+  status: EnvironmentStatus
+  createdAt: string
+  ttl: number
 }
 
+export interface ProvisionEnvironmentSpec {
+  customerId: string
+  repository: string
+  ownerId: string
+  ttl?: number
+  /** Provider-specific stack data supplied by the descriptor/deployer seam. */
+  stack?: unknown
+}
+
+/** Swappable provisioning seam used by deployers and verification gates. */
 export interface EnvironmentProvider {
-  provision(spec: EnvironmentSpec): Promise<Environment>
+  provision(spec: ProvisionEnvironmentSpec): Promise<Environment>
   status(id: string): Promise<EnvironmentStatus>
   endpoints(id: string): Promise<Record<string, string>>
-  destroy(id: string, options?: { signal?: AbortSignal }): Promise<void>
+  destroy(id: string): Promise<void>
 }

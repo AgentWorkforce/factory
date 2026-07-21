@@ -22,6 +22,7 @@ jobs:
           # PR checkouts otherwise use GitHub's synthetic merge commit, while
           # the attestation is required to bind the exact reviewed head SHA.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -48,6 +49,7 @@ jobs:
           FACTORY_E2E_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
 
       - name: Upload head-bound E2E attestation
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: factory-e2e-${{ github.event.pull_request.head.sha || github.sha }}
@@ -56,6 +58,52 @@ jobs:
 
       - name: Verify package contents
         run: npm pack --dry-run
+
+  kubernetes-provider-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  kind' | sha256sum --check
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Install Helm
+        run: |
+          curl --fail --location --output helm.tar.gz https://get.helm.sh/helm-v3.18.4-linux-amd64.tar.gz
+          echo 'f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1  helm.tar.gz' | sha256sum --check
+          tar --extract --gzip --file helm.tar.gz linux-amd64/helm
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+
+      - name: Verify Kubernetes provider against a stand-in customer cluster
+        run: npm run test:e2e:kubernetes
+
+      - name: Upload Kubernetes provider load evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: factory-kubernetes-provider-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/kubernetes-provider-e2e/load.json
+          if-no-files-found: error
 
   load-e2e:
     runs-on: ubuntu-latest
@@ -69,6 +117,7 @@ jobs:
           # Keep the load evidence bound to the reviewed head, matching the
           # package job's head-bound attestation.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -112,6 +161,7 @@ jobs:
           # The verification verdict and uploaded evidence must cover the exact
           # reviewed head, never GitHub's synthetic merge commit.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -132,7 +182,8 @@ jobs:
       - name: Run verification merge gate E2E
         run: |
           trap 'kind delete cluster --name factory-gate-e2e' EXIT
-          kind create cluster --name factory-gate-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+          kind create cluster --name factory-gate-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f --config test/fixtures/kubernetes/kind-config.yaml
+          bash scripts/install-calico.sh
           npm run test:e2e:verification
 
       - name: Upload verification evidence
@@ -153,6 +204,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -163,10 +215,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Create kind cluster
-        uses: helm/kind-action@v1.14.0
-        with:
-          cluster_name: factory-stack-e2e
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  kind' | sha256sum --check
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Install Helm
+        run: |
+          curl --fail --location --output helm.tar.gz https://get.helm.sh/helm-v3.18.4-linux-amd64.tar.gz
+          echo 'f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1  helm.tar.gz' | sha256sum --check
+          tar --extract --gzip --file helm.tar.gz linux-amd64/helm
+          sudo mv linux-amd64/helm /usr/local/bin/helm
 
       - name: Deploy and verify descriptor stack
-        run: npm run test:stack-e2e
+        run: |
+          trap 'kind delete cluster --name factory-stack-e2e' EXIT
+          kind create cluster --name factory-stack-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f --config test/fixtures/kubernetes/kind-config.yaml
+          bash scripts/install-calico.sh
+          npm run test:stack-e2e

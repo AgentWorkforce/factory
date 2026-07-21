@@ -2,12 +2,13 @@ import assert from 'node:assert/strict'
 import { resolve } from 'node:path'
 
 import {
-  KubernetesEnvironmentProvider,
+  KubectlEnvironmentProvider,
   ProcessCommandRunner,
   StackDeploymentError,
   VerificationStackDeployer,
   resolveVerificationStackDescriptor,
   type StackDeployment,
+  type VerificationEnvironment,
   type VerificationStackDescriptor,
 } from '../../src/index.js'
 
@@ -15,12 +16,7 @@ const root = resolve(import.meta.dirname, '../..')
 const context = process.env.FACTORY_E2E_KUBE_CONTEXT
 const kubeconfig = process.env.KUBECONFIG
 const suffix = `${process.pid}-${Date.now().toString(36)}`
-const provider = new KubernetesEnvironmentProvider({
-  context,
-  kubeconfig,
-  namespacePrefix: 'factory-stack-e2e',
-  defaultTtl: 10 * 60_000,
-})
+const provider = new KubectlEnvironmentProvider()
 const runner = new ProcessCommandRunner()
 const deployer = new VerificationStackDeployer({
   referenceResolver: {
@@ -31,8 +27,8 @@ const deployer = new VerificationStackDeployer({
   },
 })
 
-let successEnvironmentId: string | undefined
-let failureEnvironmentId: string | undefined
+let successEnvironment: VerificationEnvironment | undefined
+let failureEnvironment: VerificationEnvironment | undefined
 let successDeployment: StackDeployment | undefined
 
 try {
@@ -41,10 +37,14 @@ try {
     descriptorPath: 'test/fixtures/verification-stack/verification-stack.yaml',
   })
 
-  const successEnvironment = await provider.provision({ id: `healthy-${suffix}` })
-  successEnvironmentId = successEnvironment.id
-  assert.equal(await provider.status(successEnvironment.id), 'ready')
-
+  successEnvironment = await provider.provision({
+    runId: `healthy-${suffix}`,
+    repository: 'AgentWorkforce/factory',
+    namespacePrefix: 'factory-stack-e2e',
+    ttlMs: 10 * 60_000,
+    maxActiveEnvironments: 2,
+    ...(context ? { kubeContext: context } : {}),
+  })
   successDeployment = await deployer.deploy(loaded, successEnvironment)
   assert.deepEqual(Object.keys(successDeployment.endpoints), ['web'])
   for (const [name, url] of Object.entries(successDeployment.endpoints)) {
@@ -64,8 +64,14 @@ try {
   ], { timeoutMs: 30_000 })
   assert.equal(seeded.stdout.trim(), 'ran', 'the declared Postgres seed step did not run')
 
-  const failureEnvironment = await provider.provision({ id: `unready-${suffix}` })
-  failureEnvironmentId = failureEnvironment.id
+  failureEnvironment = await provider.provision({
+    runId: `unready-${suffix}`,
+    repository: 'AgentWorkforce/factory',
+    namespacePrefix: 'factory-stack-e2e',
+    ttlMs: 10 * 60_000,
+    maxActiveEnvironments: 2,
+    ...(context ? { kubeContext: context } : {}),
+  })
   const impossible = structuredClone(loaded.descriptor) as VerificationStackDescriptor
   const web = impossible.services.find((service) => service.name === 'web')!
   web.readiness = {
@@ -98,6 +104,6 @@ try {
   )
 } finally {
   await successDeployment?.dispose()
-  if (failureEnvironmentId) await provider.destroy(failureEnvironmentId)
-  if (successEnvironmentId) await provider.destroy(successEnvironmentId)
+  if (failureEnvironment) await provider.teardown(failureEnvironment)
+  if (successEnvironment) await provider.teardown(successEnvironment)
 }

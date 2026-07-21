@@ -3,6 +3,12 @@ import { readFile } from 'node:fs/promises'
 
 import { parseAllDocuments } from 'yaml'
 
+import {
+  DEFAULT_MANAGED_FIDELITY_CAVEAT,
+  KubernetesGuardrailDefaultsSchema,
+  type ResolvedKubernetesConnection,
+} from './connection-registry.js'
+import { createKubernetesGuardrailResources } from './kubernetes-provider.js'
 import type {
   DeployEnvironmentInput,
   ProvisionEnvironmentInput,
@@ -45,16 +51,24 @@ export function defaultKubectlEnvironmentRunner(
     let stdout = ''
     let stderr = ''
     let settled = false
+    let forceTimer: ReturnType<typeof setTimeout> | undefined
 
     const finish = (error?: Error): void => {
       if (settled) return
       settled = true
       options.signal?.removeEventListener('abort', abort)
+      if (!error && forceTimer) clearTimeout(forceTimer)
       if (error) reject(error)
       else resolve({ stdout, stderr })
     }
-    const abort = (): void => {
+    const stop = (): void => {
+      if (child.exitCode !== null) return
       child.kill('SIGTERM')
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000)
+      forceTimer.unref()
+    }
+    const abort = (): void => {
+      stop()
       finish(new VerificationEnvironmentAbortError())
     }
     options.signal?.addEventListener('abort', abort, { once: true })
@@ -66,12 +80,13 @@ export function defaultKubectlEnvironmentRunner(
     child.stderr.on('data', (chunk: string) => { stderr = boundedAppend(stderr, chunk) })
     child.once('error', (error) => finish(error))
     child.once('close', (code) => {
+      if (forceTimer) clearTimeout(forceTimer)
       if (code === 0) finish()
       else finish(new Error(
         `${executable} ${args.join(' ')} exited with ${code ?? 'no status'}: ${stderr.trim().slice(-4_000) || 'no stderr'}`,
       ))
     })
-    child.stdin.end(options.input)
+    if (!options.signal?.aborted) child.stdin.end(options.input)
   })
 }
 
@@ -117,6 +132,10 @@ export class KubectlEnvironmentProvider implements VerificationEnvironmentProvid
         labels: {
           [FACTORY_ENVIRONMENT_MANAGED_LABEL]: 'true',
           [FACTORY_ENVIRONMENT_ID_LABEL]: dnsLabel(input.runId).slice(0, 63),
+          'pod-security.kubernetes.io/enforce': 'restricted',
+          'pod-security.kubernetes.io/enforce-version': 'latest',
+          'pod-security.kubernetes.io/audit': 'restricted',
+          'pod-security.kubernetes.io/warn': 'restricted',
         },
         annotations: {
           [FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION]: expiresAt,
@@ -124,10 +143,39 @@ export class KubectlEnvironmentProvider implements VerificationEnvironmentProvid
         },
       },
     }
-    await this.#run([...context, 'apply', '--filename', '-'], {
-      input: JSON.stringify(namespace),
-      signal: input.signal,
-    })
+    try {
+      // A collision must fail; applying here could adopt and relabel an
+      // unrelated namespace selected by a caller-controlled run id.
+      await this.#run([...context, 'create', '--filename', '-'], {
+        input: JSON.stringify(namespace),
+        signal: input.signal,
+      })
+      const connection = verificationKubernetesConnection({
+        context: input.kubeContext,
+        repository: input.repository,
+      })
+      const guardrails = createKubernetesGuardrailResources(
+        id,
+        connection,
+        KubernetesGuardrailDefaultsSchema.parse({}),
+      )
+      await this.#run([
+        ...context,
+        '--namespace', id,
+        'apply', '--filename', '-',
+      ], {
+        input: JSON.stringify({ apiVersion: 'v1', kind: 'List', items: guardrails }),
+        signal: input.signal,
+      })
+    } catch (error) {
+      await this.#run([
+        ...context,
+        'delete', 'namespace', id,
+        '--ignore-not-found=true',
+        '--wait=false',
+      ]).catch(() => undefined)
+      throw error
+    }
     return {
       id,
       namespace: id,
@@ -212,16 +260,20 @@ export class KubectlEnvironmentProvider implements VerificationEnvironmentProvid
         clearTimeout(timeout)
         signal?.removeEventListener('abort', abort)
         if (error) {
-          child.kill('SIGTERM')
+          stopChildProcess(child)
           reject(error)
         } else {
           resolve(localPort!)
         }
       }
       const inspect = (chunk: Buffer | string): void => {
+        if (settled) return
         output = boundedAppend(output, chunk.toString())
         const match = /Forwarding from 127\.0\.0\.1:(\d+)\s+->/u.exec(output)
-        if (match) finish(undefined, Number(match[1]))
+        if (match) {
+          output = ''
+          finish(undefined, Number(match[1]))
+        }
       }
       child.stdout.on('data', inspect)
       child.stderr.on('data', inspect)
@@ -238,10 +290,40 @@ export class KubectlEnvironmentProvider implements VerificationEnvironmentProvid
 
   #stopPortForwards(environmentId: string): void {
     for (const child of this.#portForwards.get(environmentId) ?? []) {
-      child.kill('SIGTERM')
+      stopChildProcess(child)
     }
     this.#portForwards.delete(environmentId)
   }
+}
+
+export function verificationKubernetesConnection(input: {
+  repository: string
+  context?: string
+  kubeconfig?: string
+}): ResolvedKubernetesConnection {
+  return {
+    id: 'factory-verification-gate',
+    target: 'managed',
+    customers: ['*'],
+    repositories: [input.repository],
+    credentialKind: 'kubeconfig',
+    kubeconfigPath: input.kubeconfig ?? '',
+    ...(input.context ? { context: input.context } : {}),
+    protectedNamespaces: ['default', 'prod', 'production'],
+    allowClusterScopedResources: false,
+    allowedClusterScopedKinds: [],
+    nodeSelector: {},
+    tolerations: [],
+    fidelityCaveat: DEFAULT_MANAGED_FIDELITY_CAVEAT,
+  }
+}
+
+function stopChildProcess(child: ChildProcessWithoutNullStreams): void {
+  if (child.exitCode !== null) return
+  child.kill('SIGTERM')
+  const force = setTimeout(() => child.kill('SIGKILL'), 2_000)
+  force.unref()
+  child.once('close', () => clearTimeout(force))
 }
 
 async function resourcesFromManifest(path: string, namespace: string): Promise<Array<Record<string, unknown>>> {

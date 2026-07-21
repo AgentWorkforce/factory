@@ -42,6 +42,7 @@ endpoints:
 verification:
   environmentTtlSeconds: 900
   e2e:
+    image: node:22.17.0-alpine3.22@sha256:fc3e945f920b7e3000cd1af86c4ae406ec70c72f328b667baf0f3a8910d69eed
     command: npm
     args: [run, test:e2e]
     timeoutSeconds: 300
@@ -70,7 +71,10 @@ closed when the section or all exposed endpoints are absent.
 
 `VerificationStackDeployer.deploy(descriptor, environment)` supports local or
 OCI/HTTP Helm charts, kustomize directories, raw Kubernetes manifests, and
-Docker Compose through `kompose`. It waits for Deployment, StatefulSet, or
+Docker Compose through `kompose`. Every source is rendered before it reaches
+the cluster and passes the same namespace, RBAC, network, secret, pod-security,
+and cluster-scope policy checks. Helm is rendered with `helm template`; Factory
+does not let Helm or repository code apply resources directly. It waits for Deployment, StatefulSet, or
 DaemonSet rollout plus each HTTP, TCP, or exec probe. All waits and seed steps
 have descriptor-bounded timeouts. The returned deployment owns any local
 port-forward processes; call `dispose()` before destroying the environment.

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentworkforce.dev/schemas/kubernetes-environment-stack.schema.json",
+  "title": "Factory Kubernetes verification stack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "deployKind", "deployment"],
+  "properties": {
+    "apiVersion": { "const": "factory.agentworkforce.dev/v1alpha1", "default": "factory.agentworkforce.dev/v1alpha1" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 63 },
+    "deployKind": { "const": "kubernetes" },
+    "target": { "enum": ["byoc", "managed"], "default": "byoc" },
+    "deployment": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "chart"],
+          "properties": {
+            "strategy": { "const": "helm" },
+            "chart": { "$ref": "#/$defs/repoPath" },
+            "release": { "type": "string", "minLength": 1, "maxLength": 53 },
+            "valuesFiles": { "type": "array", "items": { "$ref": "#/$defs/repoPath" }, "default": [] },
+            "values": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean"] }, "default": {} }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "path"],
+          "properties": { "strategy": { "const": "kustomize" }, "path": { "$ref": "#/$defs/repoPath" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "paths"],
+          "properties": {
+            "strategy": { "const": "manifests" },
+            "paths": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/repoPath" } }
+          }
+        }
+      ]
+    },
+    "endpoints": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "service", "port"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 63 },
+          "service": { "type": "string", "minLength": 1, "maxLength": 253 },
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "protocol": { "enum": ["http", "https"], "default": "http" },
+          "path": { "type": "string", "pattern": "^/", "default": "/" },
+          "ingressUrl": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "secrets": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "key", "secretRef"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 63 },
+          "key": { "type": "string", "minLength": 1, "maxLength": 253 },
+          "secretRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:\\S+$"
+          }
+        }
+      }
+    },
+    "allowClusterScopedResources": { "type": "boolean", "default": false },
+    "readinessTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+  },
+  "$defs": {
+    "repoPath": { "type": "string", "minLength": 1, "not": { "pattern": "(^/|(^|[\\\\/])\\.\\.([\\\\/]|$))" } }
+  }
+}

@@ -1,18 +1,30 @@
 import { randomUUID } from 'node:crypto'
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import type { FactoryEventReporter } from '../ports/observability.js'
-import type { Environment, EnvironmentProvider, VerificationEnvironment } from '../ports/environment.js'
+import type {
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
+} from '../ports/environment.js'
 import { createFactoryCloudEventV1 } from '../observability/events.js'
 import type { LoadMeasurements, LoadSloViolation } from './load-harness.js'
 import { runLoad } from './load-harness.js'
 import { loadLoadProfile } from './load-profile.js'
-import { KubernetesEnvironmentProvider } from './kubernetes-provider.js'
+import { KubectlEnvironmentProvider } from './kubernetes-environment.js'
+import {
+  CommandExecutionError,
+  ProcessCommandRunner,
+  kubectlConnectionArgs,
+} from './kubernetes-command.js'
 import {
   VerificationStackDeployer,
   type StackDeployment,
-} from './stack-deployer.js'
+} from './verification-stack-deployer.js'
 import { loadVerificationGateStack, type ResolvedVerificationStack } from './verification-stack.js'
 
 export const VERIFICATION_EVIDENCE_CONTRACT = 'factory.verification.evidence.v1' as const
@@ -79,6 +91,8 @@ export interface VerificationGate {
 }
 
 export interface E2eCommandInput {
+  image: string
+  environment: VerificationEnvironment
   command: string
   args: string[]
   cwd: string
@@ -114,14 +128,19 @@ export type VerificationLoadRunner = (
 export interface VerificationStackDeployRunner {
   deploy(
     stack: ResolvedVerificationStack['loaded'],
-    environment: Environment,
+    environment: VerificationEnvironment,
     options?: { signal?: AbortSignal },
   ): Promise<StackDeployment>
 }
 
+export type VerificationLeaseProvider = Pick<
+  VerificationEnvironmentProvider,
+  'provision' | 'teardown'
+>
+
 export interface VerificationPipelineOptions {
   descriptorPath?: string
-  environmentProvider?: EnvironmentProvider
+  environmentProvider?: VerificationLeaseProvider
   stackDeployer?: VerificationStackDeployRunner
   e2eRunner?: E2eCommandRunner
   loadRunner?: VerificationLoadRunner
@@ -137,7 +156,7 @@ export interface VerificationPipelineOptions {
 
 export class VerificationPipeline implements VerificationGate {
   readonly #descriptorPath: string
-  readonly #environmentProvider: EnvironmentProvider
+  readonly #environmentProvider: VerificationLeaseProvider
   readonly #stackDeployer: VerificationStackDeployRunner
   readonly #e2eRunner: E2eCommandRunner
   readonly #loadRunner: VerificationLoadRunner
@@ -153,9 +172,7 @@ export class VerificationPipeline implements VerificationGate {
 
   constructor(options: VerificationPipelineOptions = {}) {
     this.#descriptorPath = options.descriptorPath ?? DEFAULT_VERIFICATION_DESCRIPTOR
-    this.#environmentProvider = options.environmentProvider ?? new KubernetesEnvironmentProvider({
-      maxActiveEnvironments: options.maxConcurrentEnvironments ?? 2,
-    })
+    this.#environmentProvider = options.environmentProvider ?? new KubectlEnvironmentProvider()
     this.#stackDeployer = options.stackDeployer ?? new VerificationStackDeployer()
     this.#e2eRunner = options.e2eRunner ?? runE2eCommand
     this.#loadRunner = options.loadRunner ?? defaultLoadRunner
@@ -176,7 +193,7 @@ export class VerificationPipeline implements VerificationGate {
     const stages = emptyStages()
     const descriptorPath = input.descriptorPath ?? this.#descriptorPath
     let stack: ResolvedVerificationStack | undefined
-    let environment: Environment | undefined
+    let environment: VerificationEnvironment | undefined
     let deployedEnvironment: VerificationEnvironment | undefined
     let deployment: StackDeployment | undefined
     let release: (() => void) | undefined
@@ -236,13 +253,15 @@ export class VerificationPipeline implements VerificationGate {
 
       const provisionStarted = Date.now()
       try {
-        environment = await this.#environmentProvider.provision({
-          id: runId,
-          ttl: Math.min(stack.environmentTtlMs, this.#maxEnvironmentTtlMs),
-          labels: { 'factory.agentworkforce.dev/repository': labelValue(input.repository) },
-          annotations: { 'factory.agentworkforce.dev/repository': input.repository },
+        const provisionInput: ProvisionEnvironmentInput = {
+          runId,
+          repository: input.repository,
+          namespacePrefix: 'factory-verification',
+          ttlMs: Math.min(stack.environmentTtlMs, this.#maxEnvironmentTtlMs),
+          maxActiveEnvironments: this.#maxConcurrentEnvironments,
           signal: controller.signal,
-        })
+        }
+        environment = await this.#environmentProvider.provision(provisionInput)
         stages.provision = passStage(provisionStarted)
       } catch (error) {
         stages.provision = timeoutOrFailure(provisionStarted, error, controller.signal)
@@ -274,6 +293,8 @@ export class VerificationPipeline implements VerificationGate {
       try {
         const result = await withinTimeout(
           this.#e2eRunner({
+            image: stack.e2e.image,
+            environment: deployedEnvironment,
             command: stack.e2e.command,
             args: stack.e2e.args,
             cwd: stack.repositoryPath,
@@ -359,7 +380,7 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     functionalPass: boolean,
     reason: string,
-    environment: Environment | undefined,
+    environment: VerificationEnvironment | undefined,
     deployment: StackDeployment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
@@ -388,7 +409,7 @@ export class VerificationPipeline implements VerificationGate {
         }
         try {
           await withinTimeout(
-            this.#environmentProvider.destroy(environment.id, { signal: teardownController.signal }),
+            this.#environmentProvider.teardown(environment, { signal: teardownController.signal }),
             Math.max(1, teardownDeadline - Date.now()),
             'environment teardown',
           )
@@ -421,7 +442,7 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     passed: boolean,
     reason: string,
-    environment: Environment | undefined,
+    environment: VerificationEnvironment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
     if (stages.evaluate.status === 'skipped') {
@@ -495,57 +516,136 @@ export async function resolveGitHeadRevision(repositoryPath: string): Promise<st
 
 export async function runE2eCommand(input: E2eCommandInput): Promise<E2eCommandResult> {
   const started = Date.now()
-  return await new Promise((resolve, reject) => {
-    const child = spawn(input.command, input.args, {
-      cwd: input.cwd,
-      env: { ...process.env, ...input.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-    })
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    let forceKillTimer: NodeJS.Timeout | undefined
-    const timeout = setTimeout(() => finish(new VerificationTimeoutError(`E2E stage timed out after ${input.timeoutMs}ms`)), input.timeoutMs)
-    const abort = (): void => finish(new VerificationTimeoutError('E2E stage aborted'))
-    const kill = (signal: NodeJS.Signals): void => {
-      if (!child.pid || child.exitCode !== null) return
-      if (process.platform !== 'win32') {
-        try { process.kill(-child.pid, signal) } catch { child.kill(signal) }
-      } else {
-        child.kill(signal)
+  input.signal.throwIfAborted()
+  const runner = new ProcessCommandRunner()
+  const connection = { context: input.environment.kubeContext }
+  const kubectl = kubectlConnectionArgs(connection)
+  const pod = dnsLabel(`factory-e2e-${input.env.FACTORY_VERIFICATION_RUN_ID ?? randomUUID()}`)
+    .slice(0, 63)
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), 'factory-verification-e2e-'))
+  const archivePath = join(temporaryDirectory, 'source.tar')
+  const environmentEntries = Object.entries(input.env)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) {
+        throw new Error(`invalid E2E environment variable name ${JSON.stringify(key)}`)
       }
-    }
-    const stop = (): void => {
-      if (!child.pid || child.exitCode !== null) return
-      kill('SIGTERM')
-      forceKillTimer = setTimeout(() => kill('SIGKILL'), 2_000)
-      forceKillTimer.unref()
-    }
-    const finish = (error?: Error, exitCode?: number): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      input.signal.removeEventListener('abort', abort)
-      if (error) {
-        stop()
-        reject(error)
-      } else {
-        resolve({ exitCode: exitCode ?? 1, stdout, stderr, durationMs: elapsed(started) })
-      }
-    }
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', (chunk: string) => { stdout = boundedAppend(stdout, chunk) })
-    child.stderr.on('data', (chunk: string) => { stderr = boundedAppend(stderr, chunk) })
-    child.once('error', (error) => finish(error))
-    child.once('close', (code) => {
-      if (forceKillTimer) clearTimeout(forceKillTimer)
-      finish(undefined, code ?? 1)
+      return `${key}=${value}`
     })
-    input.signal.addEventListener('abort', abort, { once: true })
-    if (input.signal.aborted) abort()
-  })
+  const podResource = {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name: pod,
+      namespace: input.environment.namespace,
+      labels: {
+        'app.kubernetes.io/managed-by': 'factory',
+        'factory.agentworkforce.dev/environment-id': input.environment.id,
+      },
+    },
+    spec: {
+      restartPolicy: 'Never',
+      terminationGracePeriodSeconds: 1,
+      activeDeadlineSeconds: Math.max(60, Math.ceil(input.timeoutMs / 1_000) + 120),
+      serviceAccountName: 'factory-guardrail-workload',
+      automountServiceAccountToken: false,
+      securityContext: {
+        runAsNonRoot: true,
+        runAsUser: 1_000,
+        runAsGroup: 1_000,
+        fsGroup: 1_000,
+        seccompProfile: { type: 'RuntimeDefault' },
+      },
+      containers: [{
+        name: 'runner',
+        image: input.image,
+        imagePullPolicy: 'IfNotPresent',
+        command: ['sh', '-c', 'while true; do sleep 3600; done'],
+        securityContext: {
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          capabilities: { drop: ['ALL'] },
+        },
+        resources: {
+          requests: { cpu: '25m', memory: '64Mi' },
+          limits: { cpu: '1', memory: '1Gi' },
+        },
+        volumeMounts: [
+          { name: 'workspace', mountPath: '/workspace' },
+          { name: 'tmp', mountPath: '/tmp' },
+        ],
+      }],
+      volumes: [
+        { name: 'workspace', emptyDir: {} },
+        { name: 'tmp', emptyDir: {} },
+      ],
+    },
+  }
+
+  try {
+    await execFileAsync('git', [
+      '-C', input.cwd,
+      'archive', '--format=tar', `--output=${archivePath}`, 'HEAD',
+    ], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+    await runner.run('kubectl', [
+      ...kubectl,
+      '--namespace', input.environment.namespace,
+      'create', '--filename', '-',
+    ], {
+      input: JSON.stringify(podResource),
+      timeoutMs: 30_000,
+      signal: input.signal,
+    })
+    await runner.run('kubectl', [
+      ...kubectl,
+      '--namespace', input.environment.namespace,
+      'wait', `pod/${pod}`, '--for=condition=Ready', '--timeout=120s',
+    ], { timeoutMs: 125_000, signal: input.signal })
+    await runner.run('kubectl', [
+      ...kubectl,
+      '--namespace', input.environment.namespace,
+      'cp', archivePath, `${pod}:/tmp/source.tar`,
+    ], { timeoutMs: 120_000, signal: input.signal })
+    await runner.run('kubectl', [
+      ...kubectl,
+      '--namespace', input.environment.namespace,
+      'exec', pod, '--',
+      'tar', '-xf', '/tmp/source.tar', '-C', '/workspace',
+    ], { timeoutMs: 120_000, signal: input.signal })
+
+    try {
+      const result = await runner.run('kubectl', [
+        ...kubectl,
+        '--namespace', input.environment.namespace,
+        'exec', pod, '--',
+        'env', ...environmentEntries,
+        'sh', '-c', 'cd /workspace && exec "$@"',
+        'factory-e2e', input.command, ...input.args,
+      ], { timeoutMs: input.timeoutMs, signal: input.signal })
+      return { exitCode: 0, ...result, durationMs: elapsed(started) }
+    } catch (error) {
+      if (input.signal.aborted || /timed out after/iu.test(message(error))) {
+        throw new VerificationTimeoutError(`E2E stage timed out after ${input.timeoutMs}ms`)
+      }
+      if (error instanceof CommandExecutionError) {
+        return {
+          exitCode: 1,
+          stdout: error.stdout,
+          stderr: error.stderr || error.message,
+          durationMs: elapsed(started),
+        }
+      }
+      throw error
+    }
+  } finally {
+    await runner.run('kubectl', [
+      ...kubectl,
+      '--namespace', input.environment.namespace,
+      'delete', 'pod', pod,
+      '--ignore-not-found=true', '--wait=true', '--grace-period=0', '--force',
+    ], { timeoutMs: 60_000 }).catch(() => undefined)
+    await rm(temporaryDirectory, { recursive: true, force: true })
+  }
 }
 
 const defaultLoadRunner: VerificationLoadRunner = async (environment, stack, runId, signal) => {
@@ -570,10 +670,11 @@ function endpointEnvironment(environment: VerificationEnvironment): Record<strin
   const values: Record<string, string> = {}
   for (const [name, endpoint] of Object.entries(environment.endpoints)) {
     const key = name.toUpperCase().replace(/[^A-Z0-9]+/gu, '_').replace(/^_+|_+$/gu, '')
-    values[`FACTORY_ENDPOINT_${key}`] = endpoint
+    values[`FACTORY_EXTERNAL_ENDPOINT_${key}`] = endpoint
   }
   for (const [name, endpoint] of Object.entries(environment.internalEndpoints)) {
     const key = name.toUpperCase().replace(/[^A-Z0-9]+/gu, '_').replace(/^_+|_+$/gu, '')
+    values[`FACTORY_ENDPOINT_${key}`] = endpoint
     values[`FACTORY_INTERNAL_ENDPOINT_${key}`] = endpoint
   }
   return values
@@ -730,7 +831,6 @@ const stageReason = (stage: string, error: unknown, signal?: AbortSignal): strin
 
 const elapsed = (started: number): number => Math.max(0, Date.now() - started)
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const boundedAppend = (current: string, chunk: string): string => `${current}${chunk}`.slice(-64 * 1024)
 const dnsLabel = (value: string): string => value
   .toLowerCase()
   .replace(/[^a-z0-9-]+/gu, '-')
@@ -741,14 +841,11 @@ const positiveInteger = (value: number, field: string): number => {
 }
 
 function asVerificationEnvironment(
-  environment: Environment,
+  environment: VerificationEnvironment,
   stack: ResolvedVerificationStack,
   endpoints: Record<string, string>,
 ): VerificationEnvironment {
-  const namespace = environment.namespace ?? (environment.target?.type === 'kubernetes'
-    ? String(environment.target.namespace)
-    : undefined)
-  if (!namespace) throw new Error(`environment ${environment.id} has no Kubernetes namespace`)
+  const namespace = environment.namespace
   const internalEndpoints = Object.fromEntries(stack.loaded.descriptor.endpoints.map((endpoint) => [
     endpoint.name,
     `${endpoint.protocol}://${endpoint.service}.${namespace}.svc.cluster.local:${endpoint.port}${endpoint.path}`,
@@ -758,10 +855,8 @@ function asVerificationEnvironment(
     namespace,
     endpoints,
     internalEndpoints,
-    ...(environment.target?.type === 'kubernetes' && typeof environment.target.context === 'string'
-      ? { kubeContext: environment.target.context }
-      : {}),
-    expiresAt: new Date(Date.parse(environment.createdAt) + environment.ttl).toISOString(),
+    ...(environment.kubeContext ? { kubeContext: environment.kubeContext } : {}),
+    expiresAt: environment.expiresAt,
   }
 }
 
@@ -770,9 +865,3 @@ const remainingTimeout = (
   maxRunTimeoutMs: number,
   startedAt: Date,
 ): number => Math.max(1, Math.min(stack.timeouts.overallMs, maxRunTimeoutMs) - (Date.now() - startedAt.getTime()))
-
-const labelValue = (value: string): string => value
-  .toLowerCase()
-  .replace(/[^a-z0-9_.-]+/gu, '-')
-  .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gu, '')
-  .slice(0, 63) || 'repository'
