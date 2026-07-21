@@ -8,8 +8,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { invokeNodeHandler } from '@agent-relay/fleet'
+
+import { createFactoryNodeDefinition } from '../dist/node/factory-node.js'
 import { PreviewProcessSupervisor } from '../dist/node/preview-process.js'
-import { TailscalePreviewManager } from '../dist/node/tailscale-preview.js'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const repoRoot = resolve(dirname(scriptPath), '..')
@@ -57,15 +59,32 @@ const startInput = {
   node: 'self',
 }
 
+const nodeDefinition = createFactoryNodeDefinition({
+  name: 'self',
+  config: {
+    workspaceId: workspace,
+    capabilities: [],
+    cloneRoot: repoRoot,
+    clonePaths: { 'AgentWorkforce/factory': repoRoot },
+    dryRun: false,
+    preview: config,
+  },
+})
+const nodeContext = {
+  node: { name: 'self', capabilities: ['preview:tailscale-serve'] },
+  invocationId: `factory-preview-e2e:${process.pid}`,
+  relay: { async sendMessage(input) { return { input } } },
+  async spawnAgent() { throw new Error('preview verification must not spawn an agent') },
+}
+assert.ok(nodeDefinition.capabilities['preview:tailscale-serve'])
+
 if (process.argv.includes('--start-child')) {
-  const manager = new TailscalePreviewManager({ config })
-  const reference = await manager.start(startInput)
+  const reference = await startPreview()
   writeFileSync(referencePath, JSON.stringify(reference), 'utf8')
   process.exit(0)
 }
 
 const statusBefore = serveStatus()
-const manager = new TailscalePreviewManager({ config })
 let reference
 let recovered
 let orphan
@@ -94,7 +113,7 @@ try {
 
   // A fresh manager represents the next agent/daemon owner. It must recover
   // the exact route and detached process rather than starting a duplicate.
-  recovered = await manager.start(startInput)
+  recovered = await startPreview()
   assert.equal(recovered.id, reference.id)
   assert.equal(recovered.process.pid, reference.process.pid)
   assert.equal(recovered.process.startTime, reference.process.startTime)
@@ -104,7 +123,7 @@ try {
   assert.equal(routeTarget(liveStatus, httpsPort), `http://127.0.0.1:${targetPort}`)
   assert.equal(routeAllowsFunnel(liveStatus, httpsPort), false)
 
-  assert.equal(await manager.remove(recovered), true)
+  assert.equal(await removePreview(recovered), true)
   assert.equal(await new PreviewProcessSupervisor().isRunning(recovered.process), false)
   await assert.rejects(fetchText(recovered.url, 3_000))
   await assert.rejects(fetchText(`http://127.0.0.1:${targetPort}/`, 3_000))
@@ -129,7 +148,7 @@ try {
   orphan = JSON.parse(readFileSync(referencePath, 'utf8'))
   assert.equal(await fetchText(orphan.url), responseMarker)
 
-  const sweep = await new TailscalePreviewManager({ config }).sweep({
+  const sweep = await sweepPreviews({
     namespace: workspace,
     activeOwners: [],
     activePreviewIds: [],
@@ -150,6 +169,7 @@ try {
     httpsPort: recovered.httpsPort,
     recoveredSamePreview: recovered.id === reference.id,
     recoveredSameProcess: recovered.process.pid === reference.process.pid,
+    nodeCapabilityPathConfirmed: true,
     responseMarker,
     teardownConfirmed: true,
     orphanSweepConfirmed: true,
@@ -161,7 +181,7 @@ try {
   const cleanupReference = orphan ?? recovered ?? reference
   if (cleanupReference) {
     try {
-      if (!await manager.remove(cleanupReference)) {
+      if (!await removePreview(cleanupReference)) {
         cleanupSucceeded = false
         cleanupErrors.push('provider manager could not confirm preview removal')
       }
@@ -171,7 +191,7 @@ try {
     }
   }
   try {
-    const cleanupSweep = await manager.sweep({ namespace: workspace, activeOwners: [], activePreviewIds: [] })
+    const cleanupSweep = await sweepPreviews({ namespace: workspace, activeOwners: [], activePreviewIds: [] })
     if (cleanupSweep.skipped.length > 0) {
       cleanupSucceeded = false
       cleanupErrors.push(`cleanup sweep skipped: ${JSON.stringify(cleanupSweep.skipped)}`)
@@ -207,6 +227,35 @@ try {
     console.error(`E2E cleanup was incomplete; recovery artifacts retained at ${temporaryRoot}`)
     for (const error of cleanupErrors) console.error(`- ${error}`)
   }
+}
+
+async function startPreview() {
+  const { node: _node, ...input } = startInput
+  const output = await invokeNodeHandler(nodeDefinition, 'preview:tailscale-serve', {
+    operation: 'start',
+    ...input,
+  }, nodeContext)
+  assert.equal(output?.operation, 'start')
+  assert.ok(output?.preview)
+  return output.preview
+}
+
+async function removePreview(preview) {
+  const output = await invokeNodeHandler(nodeDefinition, 'preview:tailscale-serve', {
+    operation: 'remove',
+    preview,
+  }, nodeContext)
+  assert.equal(output?.operation, 'remove')
+  return output?.removed === true
+}
+
+async function sweepPreviews(input) {
+  const output = await invokeNodeHandler(nodeDefinition, 'preview:tailscale-serve', {
+    operation: 'sweep',
+    ...input,
+  }, nodeContext)
+  assert.equal(output?.operation, 'sweep')
+  return { reaped: output?.reaped ?? [], skipped: output?.skipped ?? [] }
 }
 
 function serveStatus() {

@@ -5039,6 +5039,79 @@ describe('FactoryLoop', () => {
     }
   }, 8_000)
 
+  it('recovers terminal dispatch cleanup from the durable abandoning phase without respawning', async () => {
+    class FailingDispatchAndRemovalFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        this.spawns.push(input)
+        throw new Error('terminal spawn failure')
+      }
+
+      override async removePreview(preview: PreviewReference): Promise<boolean> {
+        this.previewRemovals.push(structuredClone(preview))
+        return false
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-abandoning-preview-recovery-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const path = issuePath(589)
+    const issue = issueFile(589)
+    const mount = new FakeMountClient({ [path]: issue })
+    const previewConfig = {
+      dispatch: { errorCooldownMs: 0, maxAttempts: 1 },
+      preview: {
+        provider: 'tailscale-serve' as const,
+        access: 'tailnet' as const,
+        services: { 'AgentWorkforce/pear': { port: 3_000, startCommand: 'npm run dev' } },
+        tailscaleBinary: 'tailscale',
+        registryPath: '/tmp/factory-test-previews.json',
+        httpsPortRange: [10_000, 10_999] as [number, number],
+      },
+    }
+    const failingFleet = new FailingDispatchAndRemovalFleetClient()
+    const first = createFactory(config(previewConfig), {
+      mount,
+      fleet: failingFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      const key = issueKey(decision.issue)
+
+      await expect(first.dispatch(decision)).rejects.toThrow('terminal spawn failure')
+      await expect(state().getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({
+        phase: 'abandoning',
+        releaseReason: 'dispatch failed',
+      })
+      expect(failingFleet.previewStarts).toHaveLength(1)
+      expect(failingFleet.previewRemovals).toHaveLength(1)
+      await first.stop()
+
+      const cleanupFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(config(previewConfig), {
+        mount,
+        fleet: cleanupFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(
+        await state().getDispatchLifecycle('factory-test', key),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      expect(cleanupFleet.previewRemovals).toHaveLength(1)
+      expect(cleanupFleet.spawns).toEqual([])
+      expect(cleanupFleet.releases).toEqual([{ name: 'ar-589-impl-pear', reason: 'issue-abandoned' }])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 8_000)
+
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
     const watchStatePath = join(root, 'state.json')

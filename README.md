@@ -344,10 +344,11 @@ for the decision and lifecycle contract.
 
 To exercise the real provider lifecycle on a signed-in node, build first and
 run `TAILSCALE_BIN=/path/to/tailscale node scripts/verify-tailscale-preview-e2e.mjs`.
-The check starts a detached HTTP service, reaches it through Serve, recovers it
-through a fresh manager instance, tears it down, then proves a startup orphan
-sweep reaps a second abandoned route and process while preserving unrelated
-Serve configuration. Override its dedicated ports with
+The check drives the node's advertised `preview:tailscale-serve` action to start
+a detached HTTP service, reaches it through Serve, recovers it through a fresh
+node-action instance, tears it down, then proves a startup orphan sweep reaps a
+second abandoned route and process while preserving unrelated Serve
+configuration. Override its dedicated ports with
 `FACTORY_PREVIEW_E2E_HTTPS_PORT` and `FACTORY_PREVIEW_E2E_TARGET_PORT`.
 
 ### Dispatching to nodes (`--backend relay`)

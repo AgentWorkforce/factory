@@ -2595,6 +2595,21 @@ export class FactoryLoop implements Factory {
       const liveStateChanged = error instanceof LiveDispatchStateChangedError
       const cancellationReason = factoryCloudDispatchCancellationReason(error)
       const cleanupReason = liveStateChanged ? 'live dispatch state changed' : 'dispatch failed'
+      let failedState: { terminal: boolean } | undefined
+      if (!liveStateChanged) {
+        await this.#recordDispatchFailure(decision.issue)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+      }
+      const terminalFailure = liveStateChanged || Boolean(failedState?.terminal)
+      if (terminalFailure && !await this.#saveDispatchLifecycle(
+        record,
+        'abandoning',
+        undefined,
+        cleanupReason,
+        new Set(),
+        { cancellationReason },
+      )) throw error
+
       let worktreesTornDown = await this.#teardownFailedDispatchWorktrees(failureHandoffs, cleanupReason)
       if (liveStateChanged && !failureHandoffs.some((handoff) => handoff.worktree)) {
         const failed = await this.#releaseAndTerminateAgents(
@@ -2612,12 +2627,7 @@ export class FactoryLoop implements Factory {
           worktreesTornDown = failureHandoffs.length > 0
         }
       }
-      let failedState: { terminal: boolean } | undefined
-      if (!liveStateChanged) {
-        await this.#recordDispatchFailure(decision.issue)
-        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
-      }
-      if (liveStateChanged || failedState?.terminal) {
+      if (terminalFailure) {
         try {
           await this.#teardownPreviews(record)
         } catch (previewError) {
@@ -3453,6 +3463,10 @@ export class FactoryLoop implements Factory {
         throw new Error(`durable dispatch ${record.issue.key} has no clarification to finish parking`)
       }
       await this.#finishClarificationPark(waiting, true)
+      return
+    }
+    if (lifecycle.phase === 'abandoning') {
+      await this.#abandonStuckDispatch(record, lifecycle.releaseReason ?? 'dispatch failed')
       return
     }
     if (lifecycle.phase === 'dispatching' || lifecycle.phase === 'retryable') {
@@ -6046,6 +6060,14 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
+    if (!await this.#saveDispatchLifecycle(
+      record,
+      'abandoning',
+      undefined,
+      reason,
+      new Set(),
+      { cancellationReason: 'dispatch_failed' },
+    )) return
     try {
       // Remove externally reachable routes before releasing the agents that
       // could still be serving the upstream. A failed provider teardown keeps
