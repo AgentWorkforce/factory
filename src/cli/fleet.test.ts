@@ -16,7 +16,9 @@ import type {
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { GithubConnectionWrite, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionWrite, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
@@ -40,6 +42,24 @@ const config = {
   },
   stateIds: TEST_STATE_IDS,
 }
+
+const fakeHarnessClient = (): HarnessDriverClientLike => ({
+  async spawnPty(input) {
+    return { name: input.name, sessionId: 'session' }
+  },
+  async release(name) {
+    return { name }
+  },
+  async listAgents() {
+    return []
+  },
+  async sendMessage(input) {
+    return { event_id: 'event', targets: [input.to] }
+  },
+  async sendInput() {},
+  async shutdown() {},
+  disconnect() {},
+})
 
 const issueFile = {
   provider: 'linear',
@@ -393,6 +413,47 @@ describe('fleet CLI parsing', () => {
 })
 
 describe('fleet CLI runtime', () => {
+  it.each([
+    { name: 'warns after spawning without a discovered connection', started: true, connection: false, warns: true },
+    { name: 'stays quiet when reusing a broker', started: false, connection: false, warns: false },
+    { name: 'stays quiet when a connection was discovered', started: true, connection: true, warns: false },
+  ])('$name', async ({ started, connection, warns }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-warning-'))
+    const previousCwd = process.cwd()
+    try {
+      if (connection) {
+        const connectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+        await mkdir(dirname(connectionPath), { recursive: true })
+        await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
+      }
+      process.chdir(root)
+      const cwd = process.cwd()
+      const errors = buffer()
+      const ensureRelayBroker = vi.fn(async () => ({
+        client: fakeHarnessClient(),
+        started,
+      }))
+
+      const code = await runFleetCli(['fleet', 'roster'], {
+        ensureRelayBroker,
+        env: {},
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(ensureRelayBroker).toHaveBeenCalledWith(expect.objectContaining({
+        cwd,
+        connectionPath: connection ? join(cwd, '.agentworkforce', 'relay', 'connection.json') : undefined,
+      }))
+      expect(errors.text().includes('no existing relay broker connection found')).toBe(warns)
+      expect(errors.text().match(/starting a NEW broker/gu) ?? []).toHaveLength(warns ? 1 : 0)
+    } finally {
+      process.chdir(previousCwd)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('runs the feature-map checker without loading config or constructing a fleet', async () => {
     const output = buffer()
     const featureMapCheck = vi.fn(async () => ({
@@ -2042,6 +2103,94 @@ describe('fleet CLI runtime', () => {
       expect(statusCode).toBe(0)
       expect(JSON.parse(statusOut.text())).toMatchObject({ ok: true, stale: false })
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('summarizes stale clone-path mount refreshes once and keeps path details at debug verbosity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-mounts-'))
+    const previousCwd = process.cwd()
+    try {
+      const clonePaths = [join(root, 'pear'), join(root, 'relay')]
+      await Promise.all(clonePaths.map((clonePath) => mkdir(clonePath)))
+      const configPath = await writeConfig(root, {
+        repos: {
+          ...config.repos,
+          clonePaths: {
+            'AgentWorkforce/pear': clonePaths[0],
+            'AgentWorkforce/relay': clonePaths[1],
+          },
+        },
+      })
+      process.chdir(root)
+
+      const writeMountState = async (startDir: string, lastReconcileAt: string): Promise<void> => {
+        const stateDir = join(startDir, '.integrations', '.relay')
+        await mkdir(stateDir, { recursive: true })
+        await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+          workspaceId: config.workspaceId,
+          lastReconcileAt,
+          pid: process.pid,
+        }))
+      }
+      const ensureLocalMount = async (
+        workspaceId: string,
+        startDir: string,
+        options: LocalMountOptions = {},
+      ): Promise<void> => runLocalMountPreflight(workspaceId, startDir, {
+        ...options,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+        startMount: async () => writeMountState(startDir, new Date().toISOString()),
+      })
+      const runStart = async (debug: boolean) => {
+        const factory = {
+          start: vi.fn(async () => {}),
+          stop: vi.fn(async () => {}),
+          runLoop: vi.fn(async () => []),
+          runOnce: vi.fn(),
+          status: vi.fn(),
+          triageIssue: vi.fn(),
+          dispatch: vi.fn(),
+          on: vi.fn(),
+          dispose: vi.fn(),
+        } as unknown as Factory
+        const errors = buffer()
+        const code = await runFleetCli(['start', '--config', configPath], {
+          fleet: new FakeFleetClient(),
+          mount: new FakeMountClient(),
+          createFactory: vi.fn(() => factory),
+          ensureLocalMount,
+          waitForStopSignal: vi.fn(async () => {
+            await vi.waitFor(() => {
+              expect(errors.text()).toContain('[factory] refreshed 2 stale local mount(s)')
+            })
+          }),
+          env: debug ? { FACTORY_LOG_LEVEL: 'debug' } : {},
+          stdout: buffer(),
+          stderr: errors,
+        })
+        expect(code, errors.text()).toBe(0)
+        return errors.text()
+      }
+
+      const staleAt = Date.now()
+      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
+      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      const normalOutput = await runStart(false)
+      expect(normalOutput).toContain('[factory] refreshed 2 stale local mount(s) (last reconcile ~31m ago)')
+      expect(normalOutput).not.toContain('local mount is stale')
+      expect(normalOutput).not.toContain('[factory] debug:')
+      expect(normalOutput.match(/stale local mount/gu)).toHaveLength(1)
+
+      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
+      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      const debugOutput = await runStart(true)
+      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[0]}`)
+      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[1]}`)
+      expect(debugOutput).toContain('[factory] refreshed 2 stale local mount(s)')
+    } finally {
+      process.chdir(previousCwd)
       await rm(root, { recursive: true, force: true })
     }
   })
