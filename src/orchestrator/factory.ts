@@ -6666,10 +6666,27 @@ export class FactoryLoop implements Factory {
     try {
       const configuredCapability = this.#config.agentCapabilities.babysitter
       const capabilityChanged = tracked.spec.capability !== configuredCapability
-      if (tracked.sessionRef && !capabilityChanged) {
+      // Persist the recovered session lineage with the tracked babysitter. A
+      // resumed session that still cannot register with Relay must not be
+      // resumed forever after every cooldown or Factory restart. A cold start
+      // creates a fresh tracked session with an empty fence, so that new
+      // session still receives one context-preserving resume attempt.
+      const sessionRecoverySpent = Boolean(
+        tracked.sessionRef && tracked.unreachableWakeResumedSessionRef === tracked.sessionRef,
+      )
+      if (tracked.sessionRef && !capabilityChanged && !sessionRecoverySpent) {
         await this.#resumeTrackedAgent(record, previousName, tracked)
+        tracked.unreachableWakeResumedSessionRef = tracked.sessionRef
       } else {
-        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
+        // Never derive a recovery id from the prior recovery id: recordSpawn
+        // persists invocationId back into the spec, so doing that recursively
+        // grows the value until telemetry and downstream id contracts reject
+        // it. Recompute the stable logical-agent base every time instead.
+        const recoveryInvocationBase = batch.invocationIdFor(record.issue, {
+          ...tracked.spec,
+          invocationId: undefined,
+        })
+        const invocationId = `${recoveryInvocationBase}:unreachable:${this.#clock.now()}`
         const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
         const replacementSpec = capabilityChanged
           ? {
@@ -6703,6 +6720,12 @@ export class FactoryLoop implements Factory {
             babysitter: result.name,
             previousCapability: tracked.spec.capability,
             capability: configuredCapability,
+          })
+        } else if (sessionRecoverySpent) {
+          this.#increment('babysitterUnreachableSessionColdStarts')
+          this.#logger.info?.('[factory] cold-started unreachable babysitter after its saved session stayed unreachable', {
+            issue: record.issue.key,
+            babysitter: result.name,
           })
         }
       }
@@ -15177,6 +15200,7 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   },
   result: tracked.result ? { ...tracked.result } : undefined,
   sessionRef: tracked.sessionRef,
+  unreachableWakeResumedSessionRef: tracked.unreachableWakeResumedSessionRef,
 })
 
 const durableBabysitterTrackedAgent = (

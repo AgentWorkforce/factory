@@ -6,6 +6,8 @@ export interface TrackedAgent {
   spec: AgentSpec
   result?: SpawnResult
   sessionRef?: string
+  /** Session lineage already resumed after Relay could not address a babysitter wake. */
+  unreachableWakeResumedSessionRef?: string
 }
 
 export interface InFlightIssue {
