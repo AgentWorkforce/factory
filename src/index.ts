@@ -6,6 +6,13 @@ export { FileStateStore, githubWatchStatePath } from './state/file-state-store.j
 export type { FileStateStoreOptions } from './state/file-state-store.js'
 export type { FactoryConfig, FactoryStateRole } from './config/schema'
 export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
+export * from './environments/index.js'
+export type {
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
+  ProvisionEnvironmentSpec,
+} from './ports/environment.js'
 export {
   resolveFactoryStates,
   stateResolutionFromIds,

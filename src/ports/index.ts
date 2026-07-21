@@ -40,6 +40,12 @@ export type {
   TelemetrySink,
 } from './system'
 export type {
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
+  ProvisionEnvironmentSpec,
+} from './environment'
+export type {
   FactoryEventReporter,
   FactoryEventReportResult,
 } from './observability'
