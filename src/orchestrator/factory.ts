@@ -299,10 +299,17 @@ const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
+const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
+const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
 class DispatchLifecycleCapacityError extends Error {}
+class DispatchLifecycleOwnedElsewhereError extends Error {
+  constructor(readonly leaseUntilMs?: number) {
+    super('durable dispatch is still owned by another publisher')
+  }
+}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -395,6 +402,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
+  readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -434,6 +442,7 @@ export class FactoryLoop implements Factory {
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   #startupAgentAdoptionActive = false
+  #startupRosterExitSignals?: Set<string>
   // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
   // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
   // owner per PR.
@@ -791,6 +800,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
@@ -862,7 +872,16 @@ export class FactoryLoop implements Factory {
   }
 
   async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
-    for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+    // The epoch cache is an execution optimization, not the durable ownership
+    // authority. Error/fence paths may evict a cached epoch while its persisted
+    // lease is still ours, so enumerate state before shutdown relinquishment.
+    const owned = new Map(this.#dispatchLifecycleEpochs)
+    for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      if (lifecycle.lease?.owner === this.#dispatchLifecycleOwner) {
+        owned.set(key, lifecycle.lease.epoch)
+      }
+    }
+    for (const [key, epoch] of owned) {
       await this.#state.releaseDispatchLifecycleLease(
         this.#workspaceId,
         key,
@@ -2594,20 +2613,7 @@ export class FactoryLoop implements Factory {
         // Ignore that pre-hydration history; the roster reconcile below runs
         // after durable records are restored and is the authoritative signal.
         if (this.#startupAgentAdoptionActive) return
-        // Broker replay can deliver an old exit immediately when the listener
-        // is installed, before durable agents are restored. Queue a later
-        // roster-reconciled exit behind it instead of dropping the newer event.
-        const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
-        const handling = previous
-          .catch(() => undefined)
-          .then(async () => await this.#handleAgentExit(name, reason))
-          .catch((error) => this.#error(error))
-          .finally(() => {
-            if (this.#agentExitsInFlight.get(name) === handling) {
-              this.#agentExitsInFlight.delete(name)
-            }
-          })
-        this.#agentExitsInFlight.set(name, handling)
+        this.#queueAgentExit(name, reason)
       })
     }
     if (!this.#offDeliveryFailed) {
@@ -2636,6 +2642,32 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  #queueAgentExit(name: string, reason?: string): void {
+    const startupSignals = this.#startupRosterExitSignals
+    if (startupSignals) {
+      // Fleet reconciliation callbacks are synchronous, while their durable
+      // handlers are async. Defer them until adoption has restored every
+      // lifecycle into the batch; otherwise a fast handler can observe no
+      // record, return, and still suppress the authoritative roster fallback.
+      startupSignals.add(name)
+      return
+    }
+    // Broker replay can deliver an old exit immediately when the listener is
+    // installed, before durable agents are restored. Queue a later
+    // roster-reconciled exit behind it instead of dropping the newer event.
+    const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
+    const handling = previous
+      .catch(() => undefined)
+      .then(async () => await this.#handleAgentExit(name, reason))
+      .catch((error) => this.#error(error))
+      .finally(() => {
+        if (this.#agentExitsInFlight.get(name) === handling) {
+          this.#agentExitsInFlight.delete(name)
+        }
+      })
+    this.#agentExitsInFlight.set(name, handling)
+  }
+
   // Durable backends survive orchestrator restarts: re-adopt the agents recorded
   // in the durable lifecycle store, restore their full batch/spec association,
   // then reconcile once so exits that happened while this process was down are
@@ -2644,8 +2676,11 @@ export class FactoryLoop implements Factory {
     try {
       const batch = await this.#batch()
       const agents: Array<{ name: string; invocationId?: string; node?: string }> = []
+      const durableAgentNames = new Set<string>()
       let hasNonterminalDurableLifecycle = false
-      const durableLifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+      const durableLifecycles = await this.#deduplicateQueuedGithubLifecycleAliases(
+        await this.#state.listDispatchLifecycles(this.#workspaceId),
+      )
       this.#logger.info?.('[factory] durable startup adoption loaded', {
         lifecycles: durableLifecycles.length,
       })
@@ -2667,7 +2702,7 @@ export class FactoryLoop implements Factory {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
           continue
         }
-        this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+        this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
         const restored = claim.lifecycle.phase === 'queued' || claim.lifecycle.phase === 'releasing'
@@ -2687,6 +2722,7 @@ export class FactoryLoop implements Factory {
           const node = agent.tracked.result?.node
           if (invocationId || node || agent.tracked.result) {
             agents.push({ name: agent.name, invocationId, node })
+            durableAgentNames.add(agent.name)
           }
         }
       }
@@ -2716,7 +2752,35 @@ export class FactoryLoop implements Factory {
         this.#logger.info?.('[factory] durable startup roster reconciliation started', {
           agents: agents.map((agent) => agent.name),
         })
-        await this.#fleet.reconcileTrackedAgents?.()
+        const signalled = new Set<string>()
+        this.#startupRosterExitSignals = signalled
+        let online = new Set<string>()
+        try {
+          await this.#fleet.reconcileTrackedAgents?.()
+          online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+        } finally {
+          this.#startupRosterExitSignals = undefined
+        }
+        const fleetTracked = this.#fleet.trackedAgents?.()
+        const synthesized = [...durableAgentNames]
+          .filter((name) => (
+            !online.has(name) || (fleetTracked !== undefined && !fleetTracked.has(name))
+          ) && !signalled.has(name))
+        for (const name of synthesized) {
+          this.#fleet.markAgentTerminal?.(name, 'reconciled-missing')
+          signalled.add(name)
+        }
+        // Every signal collected inside the authoritative startup sweep means
+        // the hydrated durable session is no longer usable. Classify it as a
+        // reconciled miss so remote implementers recover a PR or restart
+        // instead of waiting forever for branch replication after a crash.
+        for (const name of signalled) this.#queueAgentExit(name, 'reconciled-missing')
+        if (synthesized.length > 0) {
+          this.#increment('startupRosterMissingExitsSynthesized', synthesized.length)
+          this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
+            agents: synthesized,
+          })
+        }
         this.#logger.info?.('[factory] durable startup roster reconciliation completed', {
           pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => agents.some((agent) => agent.name === name)),
         })
@@ -2742,6 +2806,69 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
+  }
+
+  async #deduplicateQueuedGithubLifecycleAliases(
+    lifecycles: Array<[string, DispatchLifecycle]>,
+  ): Promise<Array<[string, DispatchLifecycle]>> {
+    const groups = new Map<string, Array<[string, DispatchLifecycle]>>()
+    for (const entry of lifecycles) {
+      if (isTerminalDispatchLifecycle(entry[1])) continue
+      const identity = githubIssueRefIdentity(entry[1].issue)
+      if (!identity) continue
+      const group = groups.get(identity) ?? []
+      group.push(entry)
+      groups.set(identity, group)
+    }
+
+    const clearedKeys = new Set<string>()
+    for (const [identity, group] of groups) {
+      if (group.length < 2) continue
+      const active = group.filter(([, lifecycle]) => lifecycle.phase !== 'queued')
+      // Two independently active aliases may each own useful work. Preserve
+      // both for operator reconciliation instead of guessing which branch wins.
+      if (active.length > 1) {
+        this.#increment('dispatchLifecycleGithubAliasConflicts')
+        this.#logger.warn?.('[factory] retained conflicting active GitHub lifecycle aliases', {
+          identity,
+          count: group.length,
+        })
+        continue
+      }
+      const nowMs = this.#clock.now()
+      const ownedElsewhere = group.some(([, lifecycle]) =>
+        lifecycle.lease &&
+        lifecycle.lease.owner !== this.#dispatchLifecycleOwner &&
+        lifecycle.lease.leaseUntilMs > nowMs)
+      if (ownedElsewhere) {
+        this.#increment('dispatchLifecycleGithubAliasDedupeDeferred')
+        continue
+      }
+
+      const winner = active[0] ?? [...group].sort(compareQueuedGithubLifecycleAliases)[0]!
+      for (const [key, lifecycle] of group) {
+        if (key === winner[0] || lifecycle.phase !== 'queued') continue
+        const cleared = await this.#state.clearQueuedDispatchLifecycle(
+          this.#workspaceId,
+          key,
+          lifecycle.lease,
+        )
+        if (!cleared) {
+          this.#increment('dispatchLifecycleGithubAliasDedupeDeferred')
+          continue
+        }
+        this.#dispatchLifecycleEpochs.delete(key)
+        const timer = this.#dispatchLifecycleRetryTimers.get(key)
+        if (timer) clearTimeout(timer)
+        this.#dispatchLifecycleRetryTimers.delete(key)
+        this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+        clearedKeys.add(key)
+        this.#increment('dispatchLifecycleGithubAliasesCollapsed')
+      }
+    }
+    return clearedKeys.size > 0
+      ? lifecycles.filter(([key]) => !clearedKeys.has(key))
+      : lifecycles
   }
 
   async #drainAgentExitsInFlight(names?: ReadonlySet<string>, timeoutMs?: number): Promise<boolean> {
@@ -2846,7 +2973,7 @@ export class FactoryLoop implements Factory {
         : `dispatch lifecycle is owned by ${claim.lifecycle.lease?.owner ?? 'another publisher'}`
       throw new Error(`Refusing to dispatch ${decision.issue.key}: ${reason}`)
     }
-    this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+    this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
     this.#scheduleDispatchLifecycleRenewal()
     if (claim.created) {
       await this.#reportLifecycle(claim.lifecycle, 'run.started')
@@ -3026,9 +3153,11 @@ export class FactoryLoop implements Factory {
       const drive = this.#driveDispatchLifecycle(key)
         .then(() => {
           this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+          this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
         })
         .catch((error) => {
           if (error instanceof DispatchLifecycleCapacityError) {
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
               this.#dispatchLifecycleCapacityWaitLogged.add(key)
               this.#increment('dispatchLifecycleCapacityWaits')
@@ -3037,8 +3166,22 @@ export class FactoryLoop implements Factory {
                 retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
               })
             }
+          } else if (error instanceof DispatchLifecycleOwnedElsewhereError) {
+            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            if (!this.#dispatchLifecycleOwnershipWaitLogged.has(key)) {
+              this.#dispatchLifecycleOwnershipWaitLogged.add(key)
+              this.#increment('dispatchLifecycleOwnershipWaits')
+              this.#logger.warn?.('[factory] durable dispatch is leased by another publisher; waiting for lease release', {
+                issue: record.issue.key,
+                leaseRemainingMs: error.leaseUntilMs === undefined
+                  ? undefined
+                  : Math.max(0, error.leaseUntilMs - this.#clock.now()),
+                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
+              })
+            }
           } else {
             this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
               issue: record.issue.key,
               error: describeError(error).errorMessage,
@@ -3097,9 +3240,9 @@ export class FactoryLoop implements Factory {
         DISPATCH_LIFECYCLE_LEASE_MS,
       )
       if (!claim.acquired || !claim.lease) {
-        throw new Error(`durable dispatch ${lifecycle.issue.key} is still owned by another publisher`)
+        throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
-      this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+      this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
       this.#scheduleDispatchLifecycleRenewal()
       lifecycle = claim.lifecycle
       acquiredNow = true
@@ -5051,12 +5194,33 @@ export class FactoryLoop implements Factory {
           }
           return
         }
-        if (tracked.result?.locality === 'remote' && tracked.spec.branch) {
+        // A normal remote exit can race branch replication, so leave it in the
+        // publishing retry loop briefly. Startup reconciliation is different:
+        // the live roster has already proved the hydrated session is gone. If
+        // its retained branch still has nothing publishable, restart the saved
+        // worker instead of consuming an implementation slot forever.
+        if (!tracingReconciledExit && tracked.result?.locality === 'remote' && tracked.spec.branch) {
           this.#scheduleDispatchLifecycleRetry(record)
           return
         }
       }
 
+      // The internal broker can retain a historical name after its cloud
+      // presence is authoritatively offline (relay#1116-family). Reclaim that
+      // supported fleet registration before attempting the deterministic
+      // resume/respawn; otherwise recovery immediately collides with the dead
+      // name and concludes useful work as terminal.
+      if (tracingReconciledExit && this.#fleet.placementLocality === 'local') {
+        if (!await this.#reclaimStaleLocalAgentName(record, name)) {
+          // Do not immediately collide with a row the broker just refused to
+          // release. Leave durable ownership intact and let the lifecycle retry
+          // re-run reconciliation after broker pressure subsides.
+          this.#scheduleDispatchLifecycleRetry(record)
+          return
+        }
+      }
+
+      let recovered = false
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
         if (await this.#state.isResumed(this.#workspaceId, resumeKey)) {
@@ -5082,6 +5246,7 @@ export class FactoryLoop implements Factory {
         try {
           await resume
           await this.#state.markResumed(this.#workspaceId, resumeKey)
+          recovered = true
         } catch (error) {
           if (isAgentAlreadyExistsError(error)) {
             // The broker never released this agent's name on exit
@@ -5128,6 +5293,7 @@ export class FactoryLoop implements Factory {
             channel: tracked.spec.channel,
           })
           batch.recordSpawn(record, tracked.spec, invocationId, result)
+          recovered = true
         } catch (error) {
           if (!isAgentAlreadyExistsError(error)) {
             throw error
@@ -5149,9 +5315,43 @@ export class FactoryLoop implements Factory {
           }
         }
       }
+      if (recovered && tracked.spec.role === 'implementer') {
+        await this.#writeInFlightRegistry()
+        await this.#saveDispatchLifecycle(record, 'running')
+      }
     } catch (error) {
       this.#error(error, record.issue)
     }
+  }
+
+  async #reclaimStaleLocalAgentName(record: InFlightIssue, name: string): Promise<boolean> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await this.#fleet.release(name, 'reconciled-missing')
+        this.#increment('staleLocalAgentNamesReclaimed')
+        this.#logger.info?.('[factory] reclaimed stale local agent name before recovery', {
+          issue: record.issue.key,
+          name,
+          attempt,
+        })
+        return true
+      } catch (error) {
+        lastError = error
+        if (attempt < STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS) {
+          await this.#clock.sleep(STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS * attempt)
+        }
+      }
+    }
+
+    this.#increment('staleLocalAgentNameReclaimFailures')
+    this.#logger.warn?.('[factory] stale local agent name reclaim failed; deferring recovery', {
+      issue: record.issue.key,
+      name,
+      attempts: STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS,
+      error: lastError,
+    })
+    return false
   }
 
   // Publish a PR from the implementer's committed branch when it exited without
@@ -7607,6 +7807,22 @@ export class FactoryLoop implements Factory {
         continue
       }
       const snapshot = await this.#readPrSnapshot(session)
+      const record = batch.getIssue(session.issue)
+      if (
+        snapshot &&
+        prMetaShowsMerged(snapshot) &&
+        prSnapshotIssueMatchScore(snapshot, session.issue.key) >= 30
+      ) {
+        await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
+        await this.#advanceMergedPrToDone(snapshot, record)
+        this.#increment('babysitterOwnershipRestoreMerged')
+        this.#logger.info?.('[factory] completed restored lifecycle whose pull request was already merged', {
+          issue: session.issue.key,
+          repo: session.repo,
+          prNumber: session.prNumber,
+        })
+        continue
+      }
       const guard = snapshot ? prMetaAllowsHumanReview(snapshot) : undefined
       if (!snapshot || !guard?.ok || prSnapshotIssueMatchScore(snapshot, session.issue.key) < 30) {
         await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
@@ -7623,7 +7839,6 @@ export class FactoryLoop implements Factory {
         })
         continue
       }
-      const record = batch.getIssue(session.issue)
       const trackedEntry = record?.agents.has(session.agentName)
         ? [session.agentName, record.agents.get(session.agentName)!] as const
         : [...(record?.agents.entries() ?? [])].find(([, agent]) =>
@@ -12110,24 +12325,46 @@ const normalizeGithubIssueCommentWatch = (watch: GithubIssueCommentWatchState): 
 })
 
 const githubIssueReadCandidatePaths = (path: string): string[] => {
+  const candidates: string[] = []
   if (path.endsWith('/')) {
-    return [`${path}meta.json`, `${path}metadata.json`]
-  }
-  if (path.endsWith('/meta.json')) {
-    return [path, path.replace(/\/meta\.json$/u, '/metadata.json')]
-  }
-  if (path.endsWith('/metadata.json')) {
-    return [path, path.replace(/\/metadata\.json$/u, '/meta.json')]
-  }
-  if (githubIssuePathParts(path)) {
-    return [path]
-  }
-  if (githubIssueDirectoryPathParts(path)) {
+    candidates.push(`${path}meta.json`, `${path}metadata.json`)
+  } else if (path.endsWith('/meta.json')) {
+    candidates.push(path, path.replace(/\/meta\.json$/u, '/metadata.json'))
+  } else if (path.endsWith('/metadata.json')) {
+    candidates.push(path, path.replace(/\/metadata\.json$/u, '/meta.json'))
+  } else if (githubIssuePathParts(path)) {
+    candidates.push(path)
+  } else if (githubIssueDirectoryPathParts(path)) {
     // meta.json is the canonical relayfile GitHub issue basename. metadata.json
     // remains a legacy read fallback for older local mount-state snapshots.
-    return [`${path}/meta.json`, `${path}/metadata.json`]
+    candidates.push(`${path}/meta.json`, `${path}/metadata.json`)
+  } else {
+    candidates.push(path)
   }
-  return [path]
+
+  // Title-derived directories are mutable aliases. A renamed issue may leave
+  // a durable lifecycle pointing at its old slug, while the adapter continues
+  // to expose the stable public by-id aliases. Always include both supported
+  // repository layouts so recovery never hot-loops on an obsolete title path.
+  const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+  if (parts) {
+    candidates.push(
+      `${GITHUB_ISSUE_ROOT}/${parts.owner}__${parts.repo}/issues/by-id/${parts.number}.json`,
+      `${GITHUB_ISSUE_ROOT}/${parts.owner}/${parts.repo}/issues/by-id/${parts.number}.json`,
+    )
+  }
+  return [...new Set(candidates)]
+}
+
+const compareQueuedGithubLifecycleAliases = (
+  left: [string, DispatchLifecycle],
+  right: [string, DispatchLifecycle],
+): number => {
+  const stablePath = (lifecycle: DispatchLifecycle): number =>
+    lifecycle.issue.path.includes('/issues/by-id/') ? 0 : 1
+  return stablePath(left[1]) - stablePath(right[1]) ||
+    (right[1].updatedAtMs ?? 0) - (left[1].updatedAtMs ?? 0) ||
+    left[0].localeCompare(right[0])
 }
 
 const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: string; number: number; slug?: string } | undefined => {

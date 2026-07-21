@@ -16,6 +16,7 @@ import type {
   WaitingClarification,
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
+import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
 
 type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
@@ -75,6 +76,10 @@ export class FileStateStore extends InMemoryStateStore {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
       let lifecycle = workspace.dispatchLifecycles[key]
+      if (!lifecycle) {
+        const matching = matchingGithubLifecycleEntry(Object.entries(workspace.dispatchLifecycles), seed)
+        if (matching) [key, lifecycle] = matching
+      }
       const created = !lifecycle
       if (!lifecycle) {
         lifecycle = cloneLifecycle(seed)
@@ -84,7 +89,7 @@ export class FileStateStore extends InMemoryStateStore {
       const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
       const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
       if (terminal || activeOtherOwner) {
-        return { acquired: false, lifecycle: cloneLifecycle(lifecycle), created }
+        return { key, acquired: false, lifecycle: cloneLifecycle(lifecycle), created }
       }
       const epoch = lifecycle.lease?.owner === owner
         ? lifecycle.lease.epoch
@@ -93,6 +98,7 @@ export class FileStateStore extends InMemoryStateStore {
       lifecycle.updatedAtMs = nowMs
       await this.#persist(document)
       return {
+        key,
         acquired: true,
         lifecycle: cloneLifecycle(lifecycle),
         lease: { ...lifecycle.lease },
@@ -197,6 +203,25 @@ export class FileStateStore extends InMemoryStateStore {
       const lifecycles = (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchLifecycles ?? {}
       return Object.entries(lifecycles).map(([key, lifecycle]) => [key, cloneLifecycle(lifecycle)])
     })
+  }
+
+  override async clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycle['lease'],
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const lifecycle = workspace?.dispatchLifecycles[key]
+      if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+        return false
+      }
+      delete workspace!.dispatchLifecycles[key]
+      if (workspaceIsEmpty(workspace!)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+      return true
+    }))
   }
 
   override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
@@ -1042,6 +1067,13 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
 }
 
 const cloneLifecycle = (record: DispatchLifecycle): DispatchLifecycle => structuredClone(record)
+
+const dispatchLifecycleLeaseMatches = (
+  current: DispatchLifecycle['lease'],
+  expected: DispatchLifecycle['lease'],
+): boolean => current === undefined
+  ? expected === undefined
+  : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
 
 const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecycle>, exceptKey?: string): number =>
   Object.entries(lifecycles).filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length

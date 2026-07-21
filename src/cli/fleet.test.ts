@@ -314,7 +314,24 @@ describe('fleet CLI parsing', () => {
       await mkdir(nested, { recursive: true })
       await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
 
-      expect(resolveBrokerConnectionPath(nested)).toBe(connectionPath)
+      expect(resolveBrokerConnectionPath(nested, {})).toBe(connectionPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers an explicit relay state directory without falling back to an ancestor broker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-state-'))
+    try {
+      const nested = join(root, 'packages', 'factory-sdk')
+      const stateDir = join(root, 'isolated-relay-state')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(nested, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(resolveBrokerConnectionPath(nested, { AGENT_RELAY_STATE_DIR: stateDir }))
+        .toBe(join(stateDir, 'connection.json'))
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2169,7 +2186,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('preflights configured clone mounts with bounded concurrency before live start', async () => {
+  it('warms configured clone mounts with bounded concurrency without blocking live start', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
     try {
       const clonePaths = Object.fromEntries(
@@ -2182,8 +2199,10 @@ describe('fleet CLI runtime', () => {
           default: 'AgentWorkforce/repo-0',
         },
       })
+      const mounted: string[] = []
+      let mountedWhenFactoryStarted = -1
       const factory = {
-        start: vi.fn(async () => {}),
+        start: vi.fn(async () => { mountedWhenFactoryStarted = mounted.length }),
         stop: vi.fn(async () => {}),
         runLoop: vi.fn(async () => []),
         runOnce: vi.fn(),
@@ -2195,7 +2214,6 @@ describe('fleet CLI runtime', () => {
       } as unknown as Factory
       let active = 0
       let maxActive = 0
-      const mounted: string[] = []
       const ensureLocalMount = vi.fn(async (_workspaceId: string, startDir: string) => {
         if (startDir === process.cwd()) return
         mounted.push(startDir)
@@ -2210,13 +2228,16 @@ describe('fleet CLI runtime', () => {
         mount: new FakeMountClient(),
         createFactory: vi.fn(() => factory),
         ensureLocalMount,
-        waitForStopSignal: vi.fn(async () => undefined),
+        waitForStopSignal: vi.fn(async () => {
+          await vi.waitFor(() => expect(mounted).toHaveLength(9))
+        }),
         stdout: buffer(),
         stderr: buffer(),
       })
 
       expect(maxActive).toBe(4)
       expect(mounted.sort()).toEqual(Object.values(clonePaths).sort())
+      expect(mountedWhenFactoryStarted).toBeLessThan(Object.keys(clonePaths).length)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
     } finally {
       await rm(root, { recursive: true, force: true })

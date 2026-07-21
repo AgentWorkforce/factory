@@ -165,6 +165,8 @@ export type DispatchLifecycle = {
 }
 
 export type DispatchLifecycleClaim = {
+  /** Actual persisted key. It may be an older GitHub alias adopted atomically. */
+  key?: string
   acquired: boolean
   lifecycle: DispatchLifecycle
   lease?: DispatchLifecycleLease
@@ -272,6 +274,11 @@ export interface StateStore {
   ): Promise<boolean>
   getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined>
   listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>>
+  clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycleLease | undefined,
+  ): Promise<boolean>
   clearDispatchLifecycle(workspaceId: string, key: string): Promise<void>
 
   recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void>

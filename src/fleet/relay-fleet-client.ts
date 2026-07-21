@@ -232,19 +232,25 @@ export class RelayFleetClient implements FleetClient {
 
   async roster(): Promise<RosterEntry> {
     const messaging = await this.#ensureMessaging()
-    const [agents, nodes] = await Promise.all([
-      // Roster means agents that can currently collide with a spawn. Including
-      // offline task-exit rows makes deterministic one-shot names permanently
-      // sticky and prevents a later review round from spawning a fresh worker.
-      messaging.agents.list({ status: 'online' }),
+    const [presence, agents, nodes] = await Promise.all([
+      // Presence is the SDK's canonical liveness surface. Agent-scoped list
+      // responses can omit status and normalize those rows to `unknown`, which
+      // made dead deterministic names look live and suppressed recovery.
+      messaging.agents.presence(),
+      // List data is supplemental metadata only; its status is never used to
+      // decide liveness.
+      messaging.agents.list({ status: 'all' }),
       messaging.nodes.list(),
     ])
+    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
     return {
-      agents: agents.map((agent) => {
-        const record = asRecord(agent)
-        const node = readString(record, 'node', 'node_id', 'nodeId')
-        return { name: agent.name, ...(node ? { node } : {}) }
-      }),
+      agents: presence
+        .filter((agent) => agent.status === 'online')
+        .map((agent) => {
+          const record = asRecord(agentsByName.get(agent.agentName))
+          const node = readString(record, 'node', 'node_id', 'nodeId')
+          return { name: agent.agentName, ...(node ? { node } : {}) }
+        }),
       nodes: nodes.map((node) => ({
         name: node.name,
         capabilities: normalizeCapabilities(node.capabilities),
@@ -447,17 +453,18 @@ export class RelayFleetClient implements FleetClient {
   async #reconcileTracked(): Promise<void> {
     if (this.#tracked.size === 0) return
     const messaging = await this.#ensureMessaging()
-    const [agents, nodes] = await Promise.all([
-      messaging.agents.list({ status: 'all' }),
+    const [presence, nodes] = await Promise.all([
+      messaging.agents.presence(),
       messaging.nodes.list(),
     ])
-    const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
+    const onlineAgentNames = new Set(
+      presence.filter((agent) => agent.status === 'online').map((agent) => agent.agentName),
+    )
     const nodeLive = new Map(nodes.map((node) => [node.name, node.live ?? node.status === 'online']))
     const nowMs = this.#now()
 
     for (const [name, entry] of [...this.#tracked]) {
-      const row = agentsByName.get(name)
-      if (!row || row.status === 'offline') {
+      if (!onlineAgentNames.has(name)) {
         // A just-spawned agent may not have registered with the engine yet;
         // absence only counts as an exit once the grace window has passed.
         if (nowMs - entry.spawnedAtMs < this.#registrationGraceMs) continue

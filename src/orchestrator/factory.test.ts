@@ -686,6 +686,41 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   }
 }
 
+class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
+  readonly terminal: Array<{ name: string; reason?: string }> = []
+  readonly #hydratedNames = new Set<string>()
+
+  constructor(readonly exitTiming: 'never' | 'reconcile' | 'hydrate' = 'never') {
+    super()
+  }
+
+  override async roster() {
+    return {
+      agents: this.exitTiming === 'hydrate'
+        ? [...this.#hydratedNames].map((name) => ({ name, node: 'sf-mini' }))
+        : [],
+      nodes: [{ name: 'sf-mini', capabilities: ['spawn:codex' as const, 'spawn:claude' as const], live: true }],
+    }
+  }
+
+  override hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
+    super.hydrateTracked(agents)
+    for (const agent of agents) this.#hydratedNames.add(agent.name)
+    if (this.exitTiming !== 'hydrate') return
+    for (const agent of agents) this.emitAgentExit(agent.name, 'offline')
+  }
+
+  markAgentTerminal(name: string, reason?: string): void {
+    this.terminal.push({ name, reason })
+  }
+
+  override async reconcileTrackedAgents(): Promise<void> {
+    await super.reconcileTrackedAgents()
+    if (this.exitTiming !== 'reconcile') return
+    for (const agent of [...this.hydrated]) this.emitAgentExit(agent.name, 'exited')
+  }
+}
+
 class LocalLifecycleFleetClient extends FakeFleetClient {
   readonly durableOwnership = true
 }
@@ -2284,6 +2319,105 @@ describe('FactoryLoop', () => {
 
     await expect(factory.dispatch(decision)).rejects.toThrow(/Live state changed/)
     expect(fleet.spawns).toEqual([])
+  })
+
+  it('recovers a renamed GitHub issue lifecycle through its stable by-id alias', async () => {
+    const number = 593
+    const stalePath = `/github/repos/AgentWorkforce/pear/issues/${number}__old-title/meta.json`
+    const stablePath = githubIssueCompactPath('AgentWorkforce', 'pear', number)
+    const issue = githubIssueFile(number, { title: 'Renamed after dispatch', labels: ['factory'] })
+    const mount = new ListingReadTrackingMount({ [stablePath]: issue })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseGithubFactoryIssue(stalePath, issue))
+
+      await expect(factory.dispatch(decision)).resolves.toMatchObject({
+        issue: { key: String(number) },
+      })
+
+      expect(mount.readPaths).toContain(stalePath)
+      expect(mount.readPaths).toContain(stablePath)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        `ar-${number}-impl-pear`,
+        `ar-${number}-review-pear`,
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('collapses expired queued lifecycle aliases for the same GitHub issue at startup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-lifecycle-alias-'))
+    const watchStatePath = join(root, 'state.json')
+    const number = 594
+    const stalePath = `/github/repos/AgentWorkforce/pear/issues/${number}__old-title/meta.json`
+    const stablePath = githubIssueCompactPath('AgentWorkforce', 'pear', number)
+    const issue = githubIssueFile(number, { labels: ['factory'] })
+    const state = new FileStateStore({ batchSize: 2, watchStatePath })
+    const seedFactory = createFactory(config({ issueSource: 'github' }), {
+      mount: new FakeMountClient({ [stablePath]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state,
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const staleDecision = await seedFactory.triageIssue(parseGithubFactoryIssue(stalePath, issue))
+      const stableDecision: TriageDecision = {
+        ...structuredClone(staleDecision),
+        issue: parseGithubFactoryIssue(stablePath, issue),
+      }
+      const lifecycle = (decision: TriageDecision, runId: string) => ({
+        runId,
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'queued' as const,
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      })
+      await state.claimDispatchLifecycle(
+        'factory-test', issueKey(staleDecision.issue), lifecycle(staleDecision, 'stale-run'), 'expired-owner', 0, 1,
+      )
+      // Simulate a document written before alias-aware claims were atomic. A
+      // current store would adopt the first row instead of creating this one.
+      const legacyDocument = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
+      }
+      legacyDocument.workspaces['factory-test']!.dispatchLifecycles[issueKey(stableDecision.issue)] = {
+        ...lifecycle(stableDecision, 'stable-run'),
+        lease: { owner: 'expired-owner', epoch: 1, leaseUntilMs: 1 },
+      }
+      await writeFile(watchStatePath, JSON.stringify(legacyDocument))
+
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount: new FakeMountClient({ [stablePath]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      const lifecycles = await new FileStateStore({ batchSize: 2, watchStatePath })
+        .listDispatchLifecycles('factory-test')
+      expect(lifecycles).toHaveLength(1)
+      expect(lifecycles[0]).toMatchObject([
+        issueKey(stableDecision.issue),
+        { runId: 'stable-run', issue: { path: stablePath } },
+      ])
+      expect(restarted.status().counters.dispatchLifecycleGithubAliasesCollapsed).toBe(1)
+    } finally {
+      await restarted?.stop()
+      await seedFactory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('isolates equal-number GitHub dispatch names, state, registry, resume, and completion across repos', async () => {
@@ -4718,6 +4852,43 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('releases persisted owner leases on stop even after the local epoch cache was evicted', async () => {
+    class RejectFirstLifecycleSaveStore extends InMemoryStateStore {
+      rejected = false
+
+      override async saveDispatchLifecycle(
+        ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+      ): Promise<boolean> {
+        if (!this.rejected) {
+          this.rejected = true
+          return false
+        }
+        return await super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const path = issuePath(585)
+    const issue = issueFile(585)
+    const stateStore = new RejectFirstLifecycleSaveStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost before spawning')
+    const key = issueKey(decision.issue)
+    const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
+    expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
+
+    await factory.stop()
+
+    const afterStop = await stateStore.getDispatchLifecycle('factory-test', key)
+    expect(afterStop?.lease?.leaseUntilMs).toBe(Number.MIN_SAFE_INTEGER)
+  })
+
   it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
     const watchStatePath = join(root, 'state.json')
@@ -4763,21 +4934,29 @@ describe('FactoryLoop', () => {
       // autonomously take over after expiry with no second start or event.
       const restartedFleet = new RemoteLifecycleFleetClient()
       restartedFleet.exitImplementerOnReconcile = true
+      const restartedLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
       const restarted = createFactory(config(), {
         mount,
         fleet: restartedFleet,
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
         triage: new StaticTriage(),
         clock,
+        logger: restartedLogger,
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
       await expect(restarted.dispatch(decision)).resolves.toEqual(originalResult)
       const terminal = restarted.waitForDispatchTerminal(decision.issue)
-      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.hydrated).toEqual([])
       expect(restartedFleet.spawns).toEqual([])
       expect(publishInputs).toEqual([])
+      expect(restarted.status().counters.dispatchLifecycleOwnershipWaits).toBe(1)
+      expect(restartedLogger.warn).toHaveBeenCalledTimes(1)
+      expect(restartedLogger.warn).toHaveBeenCalledWith(
+        '[factory] durable dispatch is leased by another publisher; waiting for lease release',
+        expect.objectContaining({ issue: 'AR-85', retryMs: 1_000 }),
+      )
 
       clock.advance(5 * 60_000 + 1)
       await terminal
@@ -5420,6 +5599,58 @@ describe('FactoryLoop', () => {
       expect(restarted.status().inFlight.map((entry) => entry.key)).toEqual(['AR-590'])
       expect([...restartedFleet.trackedAgents().keys()].sort()).toEqual(names)
       expect(harness.spawned).toHaveLength(spawnCountBeforeRestart)
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['synthesizes exits when fleet reconciliation misses absent agents', 'never', 2],
+    ['defers fleet reconciliation exits until durable adoption is complete', 'reconcile', undefined],
+    ['recovers exits dropped by the pre-adoption guard despite a stale online roster', 'hydrate', 2],
+  ] as const)('%s', async (_label, exitTiming, synthesizedCount) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-missing-startup-roster-'))
+    const watchStatePath = join(root, 'state.json')
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const path = issuePath(595)
+    const mount = new FakeMountClient({ [path]: issueFile(595) })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const factoryConfig = config({ loop: { registryPath, heartbeatPath } })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issueFile(595)))
+      await first.dispatch(decision)
+      await first.stop()
+
+      const restartedFleet = new MissingHydratedRosterFleetClient(exitTiming)
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      expect(restartedFleet.terminal).toEqual(exitTiming === 'reconcile' ? [] : [
+        { name: 'ar-595-impl-pear', reason: 'reconciled-missing' },
+        { name: 'ar-595-review', reason: 'reconciled-missing' },
+      ])
+      expect(restartedFleet.spawns.map((spawn) => spawn.name).sort()).toEqual([
+        'ar-595-impl-pear',
+        'ar-595-review',
+      ])
+      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'running' })
+      expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(synthesizedCount)
     } finally {
       await restarted?.stop()
       await first.stop()
@@ -9430,6 +9661,71 @@ describe('FactoryLoop', () => {
     ])
     expect(factory.status().counters.resumeNameCollisions).toBe(1)
     expect(factory.status().counters.errors ?? 0).toBe(0) // not surfaced as a hard error
+  })
+
+  it('reclaims a canonically missing local broker name before resuming it', async () => {
+    const mount = new FakeMountClient({ [issuePath(801)]: issueFile(801) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-801-impl-pear', 'session-impl-801')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(801), issueFile(801)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-801-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+    expect(fleet.releases).toContainEqual({
+      name: 'ar-801-impl-pear',
+      reason: 'reconciled-missing',
+    })
+    expect(fleet.resumes[0]).toMatchObject({
+      name: 'ar-801-impl-pear',
+      sessionRef: 'session-impl-801',
+    })
+    expect(factory.status().counters.staleLocalAgentNamesReclaimed).toBe(1)
+    expect(factory.status().counters.resumeNameCollisions ?? 0).toBe(0)
+    await factory.stop()
+  })
+
+  it('retries a transient stale-name release before resuming the recovered worker', async () => {
+    class TransientReclaimFleet extends FakeFleetClient {
+      reclaimAttempts = 0
+
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name === 'ar-802-impl-pear' && reason === 'reconciled-missing') {
+          this.reclaimAttempts += 1
+          if (this.reclaimAttempts < 3) throw new Error('broker release pressure')
+        }
+        await super.release(name, reason)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(802)]: issueFile(802) })
+    const fleet = new TransientReclaimFleet()
+    fleet.setSessionRef('ar-802-impl-pear', 'session-impl-802')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      clock: { now: Date.now, sleep: async () => {} },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(802), issueFile(802)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-802-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+    expect(fleet.reclaimAttempts).toBe(3)
+    expect(factory.status().counters.staleLocalAgentNamesReclaimed).toBe(1)
+    expect(factory.status().counters.staleLocalAgentNameReclaimFailures ?? 0).toBe(0)
+    expect(factory.status().counters.resumeNameCollisions ?? 0).toBe(0)
+    await factory.stop()
   })
 
   it('drains the real internal fleet after an implementer resume collides with a leaked name', async () => {
@@ -15369,7 +15665,7 @@ describe('FactoryLoop PR babysitter', () => {
         body: '[factory-pr-ready] AR-493',
       })
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
-        .toMatchObject({ phase: 'complete' }))
+        .toMatchObject({ phase: 'complete' }), { timeout: 4_000 })
       expect(await state().listBabysitterSessions('factory-test')).toEqual([])
     } finally {
       await first.stop()
@@ -17051,6 +17347,56 @@ describe('FactoryLoop PR babysitter', () => {
         .toEqual(['ar-423-babysit', 'ar-423-babysit'])
       expect(restarted.status().counters.babysitterOwnershipRestored).toBe(1)
       expect(restartedFleet.spawns).toEqual([])
+    } finally {
+      await first.stop()
+      await restarted?.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('completes a restored lifecycle when its exact babysat PR merged while Factory was down', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-merged-restart-'))
+    const watchStatePath = join(root, 'factory-state.json')
+    const issue = realIssueFile(425, ready, { title: 'Real merged PR restart reconciliation' })
+    const mount = new FakeMountClient({ [issuePath(425)]: issue })
+    const stateStore = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const firstFleet = new LocalLifecycleFleetClient()
+    const first = createFactory(babysitterConfig(), {
+      mount,
+      fleet: firstFleet,
+      triage: new StaticTriage(),
+      stateStore: stateStore(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 425 }),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      seedPrMeta(mount, 'AgentWorkforce/pear', 425, { state: 'open', draft: false })
+      await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const decision = await first.triageIssue(parseLinearIssue(issuePath(425), issue))
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit('ar-425-impl-pear', 'worker_exited')
+      await vi.waitFor(async () => expect(await stateStore().listBabysitterSessions('factory-test')).toHaveLength(1))
+      await first.stop()
+
+      seedPrMeta(mount, 'AgentWorkforce/pear', 425, { state: 'merged', merged: true, draft: false })
+      mount.files.set(issuePath(425), { content: realIssueFile(425, done, { title: 'Real merged PR restart reconciliation' }) })
+      const states: Array<{ key: string; stateId: string }> = []
+      restarted = createFactory(babysitterConfig(), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        stateStore: stateStore(),
+        linear: recordingLinear(states),
+      })
+
+      await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(async () => expect(await stateStore().getDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+      )).toMatchObject({ phase: 'complete' }))
+      await expect(stateStore().listBabysitterSessions('factory-test')).resolves.toEqual([])
+      expect(states).toContainEqual({ key: 'AR-425', stateId: done })
+      expect(restarted.status().counters.babysitterOwnershipRestoreMerged).toBe(1)
     } finally {
       await first.stop()
       await restarted?.stop()

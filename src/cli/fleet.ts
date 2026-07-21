@@ -504,10 +504,15 @@ async function runFactoryCommand(
   const mountFn = resolveLocalMountFn(deps, mount)
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      await mountFn(workspaceId, process.cwd(), {
-        acceptableWorkspaceIds: acceptableMountIds,
-      })
-      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
+      // Local mirrors are a writeback aid, not the source of truth for remote
+      // issue discovery. Start their SDK-backed supervisors immediately, but
+      // do not serialize durable recovery behind a stale checkout's readiness
+      // timeout. The mount client reports degradation and keeps retrying.
+      void warmStartPathMounts(mountFn, workspaceId, config, acceptableMountIds)
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          process.stderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
@@ -616,6 +621,28 @@ async function runFactoryCommand(
 
   writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
   return 0
+}
+
+async function warmStartPathMounts(
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
+  workspaceId: string,
+  config: FactoryConfig,
+  acceptableMountIds?: readonly string[],
+): Promise<void> {
+  const daemonMount = (async () => {
+    try {
+      await mountFn(workspaceId, process.cwd(), {
+        acceptableWorkspaceIds: acceptableMountIds,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`[factory] warning: could not start relayfile mount at ${process.cwd()}: ${message}\n`)
+    }
+  })()
+  await Promise.all([
+    daemonMount,
+    ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds),
+  ])
 }
 
 async function runStandaloneBabysitCommand(
@@ -1030,7 +1057,8 @@ async function buildFleet(
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
 
   const cwd = process.cwd()
-  const connectionPath = resolveBrokerConnectionPath(cwd)
+  const env = deps.env ?? process.env
+  const connectionPath = resolveBrokerConnectionPath(cwd, env)
 
   // An injected createFleet owns fleet construction entirely (tests), so skip the
   // real broker bootstrap.
@@ -1048,7 +1076,12 @@ async function buildFleet(
   if (globals.backend === 'internal') {
     const stderr = deps.stderr ?? process.stderr
     const logger = streamLogger(stderr)
-    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
+    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({
+      cwd,
+      connectionPath,
+      logger,
+      env,
+    })
     return createFleet(
       { backend: 'internal', cwd, connectionPath },
       {
@@ -1081,7 +1114,15 @@ export function formatLogArgs(args: unknown[]): string {
   return ` ${args.map((arg) => (typeof arg === 'string' ? arg : stringifyLogValue(arg))).join(' ')}`
 }
 
-export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {
+export function resolveBrokerConnectionPath(
+  startCwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const explicitStateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+  if (explicitStateDir) {
+    return join(explicitStateDir, 'connection.json')
+  }
+
   let current = resolve(startCwd)
   for (;;) {
     const candidate = join(current, '.agentworkforce', 'relay', 'connection.json')

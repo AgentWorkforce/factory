@@ -15,6 +15,7 @@ import type {
   WaitingClarification,
   ClarificationReply,
 } from '../ports/state'
+import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
 
 type WorkspaceState = {
   batch: BatchTracker
@@ -78,6 +79,10 @@ export class InMemoryStateStore implements StateStore {
   ): Promise<DispatchLifecycleClaim> {
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     let lifecycle = lifecycles.get(key)
+    if (!lifecycle) {
+      const matching = matchingGithubLifecycleEntry(lifecycles, seed)
+      if (matching) [key, lifecycle] = matching
+    }
     const created = !lifecycle
     if (!lifecycle) {
       lifecycle = cloneDispatchLifecycle(seed)
@@ -87,7 +92,7 @@ export class InMemoryStateStore implements StateStore {
     const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
     const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
     if (terminal || activeOtherOwner) {
-      return { acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
+      return { key, acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
     }
     const epoch = lifecycle.lease?.owner === owner
       ? lifecycle.lease.epoch
@@ -95,6 +100,7 @@ export class InMemoryStateStore implements StateStore {
     lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
     lifecycle.updatedAtMs = nowMs
     return {
+      key,
       acquired: true,
       lifecycle: cloneDispatchLifecycle(lifecycle),
       lease: { ...lifecycle.lease },
@@ -172,6 +178,20 @@ export class InMemoryStateStore implements StateStore {
   async listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>> {
     return [...this.#workspace(workspaceId).dispatchLifecycles]
       .map(([key, lifecycle]) => [key, cloneDispatchLifecycle(lifecycle)])
+  }
+
+  async clearQueuedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycle['lease'],
+  ): Promise<boolean> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    const lifecycle = lifecycles.get(key)
+    if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+      return false
+    }
+    lifecycles.delete(key)
+    return true
   }
 
   async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
@@ -647,6 +667,13 @@ export class InMemoryStateStore implements StateStore {
 }
 
 const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)
+
+const dispatchLifecycleLeaseMatches = (
+  current: DispatchLifecycle['lease'],
+  expected: DispatchLifecycle['lease'],
+): boolean => current === undefined
+  ? expected === undefined
+  : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
 
 const CONVERSATION_HISTORY_LIMIT = 50
 

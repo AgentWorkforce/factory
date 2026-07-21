@@ -21,6 +21,11 @@ const checks = []
 try {
   assert.match(headSha, /^[0-9a-f]{40}$/u, 'head SHA must be a full Git object ID')
   assert.match(testedCheckoutSha, /^[0-9a-f]{40}$/u, 'tested checkout SHA must be a full Git object ID')
+  assert.equal(
+    headSha,
+    testedCheckoutSha,
+    'FACTORY_E2E_HEAD_SHA must match the checkout being packed and tested',
+  )
   checks.push('head-sha-bound')
 
   mkdirSync(packDir, { recursive: true })
