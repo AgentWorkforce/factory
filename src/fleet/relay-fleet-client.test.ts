@@ -285,7 +285,13 @@ describe('RelayFleetClient', () => {
 
   it('returns the relay agent and node roster', async () => {
     const messaging = new FakeMessaging()
-    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    messaging.agentRows = [
+      { name: 'ar-1-impl', status: 'online' },
+      // The Relaycast API has returned rows outside the requested filter in
+      // production, so the fleet adapter must enforce offline exclusion too.
+      { name: 'ar-stale-impl', status: 'offline' },
+      { name: 'ar-registering-review', status: 'unknown' },
+    ]
     messaging.nodeRows = [
       {
         name: 'alpha',
@@ -297,7 +303,7 @@ describe('RelayFleetClient', () => {
     const fleet = createClient(messaging)
 
     await expect(fleet.roster()).resolves.toEqual({
-      agents: [{ name: 'ar-1-impl' }],
+      agents: [{ name: 'ar-1-impl' }, { name: 'ar-registering-review' }],
       nodes: [
         { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run'], live: true },
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
