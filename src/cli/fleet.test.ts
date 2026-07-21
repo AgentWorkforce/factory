@@ -2169,7 +2169,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('preflights configured clone mounts with bounded concurrency before live start', async () => {
+  it('warms configured clone mounts with bounded concurrency without blocking live start', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
     try {
       const clonePaths = Object.fromEntries(
@@ -2182,8 +2182,10 @@ describe('fleet CLI runtime', () => {
           default: 'AgentWorkforce/repo-0',
         },
       })
+      const mounted: string[] = []
+      let mountedWhenFactoryStarted = -1
       const factory = {
-        start: vi.fn(async () => {}),
+        start: vi.fn(async () => { mountedWhenFactoryStarted = mounted.length }),
         stop: vi.fn(async () => {}),
         runLoop: vi.fn(async () => []),
         runOnce: vi.fn(),
@@ -2195,7 +2197,6 @@ describe('fleet CLI runtime', () => {
       } as unknown as Factory
       let active = 0
       let maxActive = 0
-      const mounted: string[] = []
       const ensureLocalMount = vi.fn(async (_workspaceId: string, startDir: string) => {
         if (startDir === process.cwd()) return
         mounted.push(startDir)
@@ -2210,13 +2211,16 @@ describe('fleet CLI runtime', () => {
         mount: new FakeMountClient(),
         createFactory: vi.fn(() => factory),
         ensureLocalMount,
-        waitForStopSignal: vi.fn(async () => undefined),
+        waitForStopSignal: vi.fn(async () => {
+          await vi.waitFor(() => expect(mounted).toHaveLength(9))
+        }),
         stdout: buffer(),
         stderr: buffer(),
       })
 
       expect(maxActive).toBe(4)
       expect(mounted.sort()).toEqual(Object.values(clonePaths).sort())
+      expect(mountedWhenFactoryStarted).toBeLessThan(Object.keys(clonePaths).length)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
     } finally {
       await rm(root, { recursive: true, force: true })

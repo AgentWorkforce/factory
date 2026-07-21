@@ -321,6 +321,57 @@ describe('RelayfileCloudMountClient', () => {
     expect(stop).toHaveBeenCalledTimes(1)
   })
 
+  it('reports and supervises an initial SDK mount failure with no prior state file', async () => {
+    vi.useFakeTimers()
+    const fake = new FakeRelayFileClient()
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
+    let preflightCalls = 0
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => {
+      preflightCalls += 1
+      if (preflightCalls === 1) throw new Error('initial mount unavailable')
+      await options.startMount()
+    })
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace,
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await expect(mount.ensureLocalMount('/work/repo')).rejects.toThrow('initial mount unavailable')
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_refresh_failed',
+        degradedMounts: 1,
+      }])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(2))
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(1)
+    } finally {
+      await mount.dispose()
+      vi.useRealTimers()
+    }
+  })
+
   it('coalesces concurrent mount checks for the same checkout', async () => {
     const fake = new FakeRelayFileClient()
     let releasePreflight!: () => void
