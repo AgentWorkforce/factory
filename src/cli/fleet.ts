@@ -509,6 +509,10 @@ async function runFactoryCommand(
       // do not serialize durable recovery behind a stale checkout's readiness
       // timeout. The mount client reports degradation and keeps retrying.
       void warmStartPathMounts(mountFn, workspaceId, config, acceptableMountIds)
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          process.stderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
