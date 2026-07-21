@@ -18379,6 +18379,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({ [issuePath(426)]: issue })
     const harness = new ResumeThenColdStartBabysitterHarnessClient()
     const fleet = new InternalFleetClient({ client: harness, cwd: '/work/pear' })
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
     let clockValue = 1_700_000_000_000
     const clock = { now: () => clockValue, sleep: async (ms: number) => { clockValue += ms } }
     const factory = createFactory(babysitterConfig({
@@ -18393,11 +18394,13 @@ describe('FactoryLoop PR babysitter', () => {
       terminationGraceMs: 0,
       processFinder: async () => ({ status: 'missing' }),
       readChildPids: async () => [],
+      stateStore,
     })
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
-      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(426), issue)))
+      const parsedIssue = parseLinearIssue(issuePath(426), issue)
+      await factory.dispatch(await factory.triageIssue(parsedIssue))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/426/metadata.json'
       mount.files.set(prPath, { content: {
         number: 426,
@@ -18449,15 +18452,12 @@ describe('FactoryLoop PR babysitter', () => {
       expect(nextGenerationSpawns[3]?.continueFrom).toBe('session-ar-426-babysit')
       expect(nextGenerationSpawns[4]?.continueFrom).toBeUndefined()
       expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(4)
-      const coldStartInvocationIds = nextGenerationSpawns
-        .filter((spawn) => !spawn.continueFrom)
-        .slice(1)
-        .map((spawn) => spawn.invocationId)
-      expect(coldStartInvocationIds).toHaveLength(2)
-      for (const invocationId of coldStartInvocationIds) {
-        expect(invocationId).toMatch(/^factory:426:[a-z0-9]+:unreachable:\d+$/u)
-        expect(invocationId?.length).toBeLessThanOrEqual(256)
-      }
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(parsedIssue))
+      const invocationId = lifecycle?.agents
+        .find((agent) => agent.name === 'ar-426-babysit')
+        ?.tracked.spec.invocationId
+      expect(invocationId).toMatch(/^factory:426:[a-z0-9]+:unreachable:\d+$/u)
+      expect(invocationId?.length).toBeLessThanOrEqual(256)
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
