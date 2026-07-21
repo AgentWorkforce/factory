@@ -10,6 +10,7 @@ describe('published dist entrypoints', () => {
     const featuremap = await import('../../dist/featuremap/index.js')
     const main = await import('../../dist/index.js')
     const hosted = await import('../../dist/hosted/index.js')
+    const environments = await import('../../dist/environments/index.js')
     const testing = await import('../../dist/testing/index.js')
     const writeback = await import('../../dist/writeback/index.js')
 
@@ -22,6 +23,7 @@ describe('published dist entrypoints', () => {
     expect(main.generateFeatureMap).toBeTypeOf('function')
     expect(hosted.createHostedFactory).toBeTypeOf('function')
     expect(hosted.DurableObjectHostedFactoryStateStore).toBeTypeOf('function')
+    expect(environments.KubernetesEnvironmentProvider).toBeTypeOf('function')
     expect(testing.FakeFleetClient).toBeTypeOf('function')
     expect(writeback.MountLinearWriteback).toBeTypeOf('function')
   })

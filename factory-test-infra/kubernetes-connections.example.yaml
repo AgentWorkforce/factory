@@ -1,0 +1,54 @@
+# Merge this object under `environments.kubernetes` in factory config.
+connections:
+  - id: acme-production-eks
+    target: byoc
+    customers: [acme]
+    repositories: [acme/payments]
+    credential:
+      kind: irsa
+      secretRef: aws-secretsmanager:acme/factory-verification-role
+    context: acme-production
+    protectedNamespaces: [default, payments-prod, data-prod, kube-system]
+    allowClusterScopedResources: false
+    nodeSelector:
+      factory.agentworkforce.dev/pool: verification
+    tolerations:
+      - key: verification
+        operator: Equal
+        value: factory
+        effect: NoSchedule
+
+  - id: factory-managed-eks
+    target: managed
+    customers: ['*']
+    repositories: ['*']
+    credential:
+      kind: kubeconfig
+      secretRef: aws-secretsmanager:factory/managed-verification-kubeconfig
+    protectedNamespaces: [default, factory-system, kube-system]
+    nodeSelector:
+      factory.agentworkforce.dev/pool: verification
+    tolerations:
+      - key: verification
+        operator: Equal
+        value: factory
+        effect: NoSchedule
+    fidelityCaveat: >-
+      Managed verification runs on Factory infrastructure; Kubernetes version,
+      CNI, IAM/IRSA, ingress, add-ons, and node types may differ from the
+      customer cluster.
+
+defaults:
+  ttlMs: 3600000
+  readinessTimeoutMs: 600000
+  resourceQuota:
+    requests.cpu: '2'
+    requests.memory: 4Gi
+    limits.cpu: '4'
+    limits.memory: 8Gi
+    pods: '20'
+    count/services: '20'
+    count/persistentvolumeclaims: '10'
+    requests.storage: 20Gi
+    services.loadbalancers: '0'
+    services.nodeports: '0'

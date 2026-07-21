@@ -2,12 +2,12 @@ version: '1.1'
 updated: '2026-07-21'
 catalog:
   category_count: 23
-  feature_count: 289
+  feature_count: 292
   tier_counts:
-    1: 40
-    2: 121
+    1: 41
+    2: 122
     3: 11
-    4: 46
+    4: 47
     5: 57
     6: 14
 
@@ -1333,6 +1333,13 @@ categories:
         location: src/config/schema.ts
         verify_tier: 1
 
+      - id: api-kubernetes-environments
+        name: Kubernetes Environment Provider API
+        api: '@agent-relay/factory/environments / EnvironmentProvider / KubernetesEnvironmentProvider / StackDeployer'
+        description: Resolve BYOC or managed cluster references and provision, inspect, expose, destroy, and reap namespace-isolated Kubernetes verification stacks
+        location: src/ports/environment.ts, src/environments/, src/index.ts, package.json
+        verify_tier: 1
+
       - id: api-featuremap-validator
         name: Feature-Map Validator API
         api: '@agent-relay/factory/featuremap'
@@ -1600,6 +1607,13 @@ categories:
         location: .github/workflows/ci.yml, docs/pr-end-to-end-verification.md, scripts/verify-packed-e2e.mjs
         verify_tier: 1
 
+      - id: verification-kubernetes-provider-e2e
+        name: Kubernetes Provider Binding E2E
+        cli: npm run test:e2e:kubernetes
+        description: Deploy an API and Postgres Helm stack to kind, prove namespace RBAC, NetworkPolicy, quota, endpoint, k6 SLO, teardown, and TTL reaping guardrails, and retain production fixture identity
+        location: test/e2e/kubernetes-provider.e2e.ts, scripts/test-kubernetes-provider-e2e.sh, test/fixtures/kubernetes/, .github/workflows/ci.yml
+        verify_tier: 4
+
   proactive-health:
     name: Proactive Feature Guardian
     description: Scheduled, exhaustive, durable Slack questions over the live Factory feature manifest
@@ -1636,6 +1650,13 @@ categories:
         api: factory.config.json#workspaceId
         description: Pin a Relayfile workspace handle; when omitted the CLI derives the active cloud workspace
         location: src/config/schema.ts, src/mount/relayfile-cloud-mount-client.ts
+        verify_tier: 2
+
+      - id: config-kubernetes-environments
+        name: Kubernetes Environment Connections
+        api: factory.config.json#environments.kubernetes
+        description: Map customers and repositories to BYOC or managed clusters using secret references, protected namespaces, cluster-scope opt-ins, placement constraints, quotas, limits, and a managed-fidelity caveat
+        location: src/config/schema.ts, src/environments/connection-registry.ts, factory-test-infra/kubernetes-connections.example.yaml
         verify_tier: 2
 
       - id: config-issue-source
