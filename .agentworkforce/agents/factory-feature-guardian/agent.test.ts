@@ -14,7 +14,7 @@ import guardian, {
   ProgressStateConflictError,
   SLACK_WRITEBACK_POLL_MS,
   SLACK_WRITEBACK_TIMEOUT_MS,
-  createHttpProgressStore,
+  createSdkProgressStore,
   deliveredSlackTs,
   featurePostIdempotencyKey,
   resolveManifestPath,
@@ -158,40 +158,72 @@ class RelayfileStateServer {
     const headers = new Headers(init.headers);
     this.requests.push({ method, ifMatch: headers.get('if-match') });
     const url = new URL(input instanceof URL ? input : typeof input === 'string' ? input : input.url);
-    expect(url.searchParams.get('path')).toBe(CYCLE_STATE_PATH);
     expect(headers.get('authorization')).toBe('Bearer relayfile-token');
     expect(headers.get('x-correlation-id')).toMatch(/^guardian-state-/);
+
+    if (url.pathname.includes('/ops/')) {
+      return jsonResponse({
+        opId: url.pathname.split('/').at(-1),
+        path: CYCLE_STATE_PATH,
+        revision: `rev-${this.revision}`,
+        action: 'file_upsert',
+        status: 'succeeded',
+        attemptCount: 1,
+      });
+    }
+
+    expect(url.searchParams.get('path')).toBe(CYCLE_STATE_PATH);
 
     if (this.hangMethod === method) return new Promise<Response>(() => undefined);
     if (method === 'GET') {
       if (this.failGetStatus) {
-        return new Response(JSON.stringify({ error: 'read denied' }), { status: this.failGetStatus });
+        return jsonResponse({
+          code: 'read_denied',
+          message: `cycle state GET failed with HTTP ${this.failGetStatus}`,
+        }, this.failGetStatus);
       }
-      if (this.content === null) return new Response('{}', { status: 404 });
+      if (this.content === null) return jsonResponse({}, 404);
       const content = this.corruptReadBack ? `${JSON.stringify(progressState(1))}\n` : this.content;
-      return new Response(
-        JSON.stringify({
-          path: CYCLE_STATE_PATH,
-          revision: `rev-${this.revision}`,
-          content,
-          encoding: 'utf-8',
-        }),
-        { status: 200, headers: { ETag: `rev-${this.revision}` } }
-      );
+      return jsonResponse({
+        path: CYCLE_STATE_PATH,
+        revision: `rev-${this.revision}`,
+        content,
+        encoding: 'utf-8',
+      });
     }
 
     expect(method).toBe('PUT');
     const ifMatch = headers.get('if-match');
     const expected = this.content === null ? '0' : `rev-${this.revision}`;
-    if (ifMatch !== expected) return new Response(JSON.stringify({ error: 'conflict' }), { status: 409 });
-    this.content = String(init.body);
+    if (ifMatch !== expected) {
+      return jsonResponse({
+        code: 'revision_conflict',
+        message: 'Revision conflict',
+        expectedRevision: ifMatch,
+        currentRevision: expected,
+      }, 409);
+    }
+    const body = JSON.parse(String(init.body)) as { content?: unknown };
+    expect(body).toMatchObject({ contentType: 'application/json', encoding: 'utf-8' });
+    this.content = String(body.content);
     this.revision += 1;
-    return new Response(JSON.stringify({ revision: `rev-${this.revision}` }), { status: 200 });
+    return jsonResponse({
+      opId: `op-${this.revision}`,
+      status: 'queued',
+      targetRevision: `rev-${this.revision}`,
+    }, 202);
   }) as typeof fetch;
 
   state(): ProgressState {
     return JSON.parse(this.content ?? '{}') as ProgressState;
   }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
 }
 
 class IdempotentSlackTransport implements RelayTransport {
@@ -754,7 +786,7 @@ describe('factory-feature-guardian runtime paths', () => {
   });
 });
 
-describe('factory-feature-guardian exact HTTP state', () => {
+describe('factory-feature-guardian exact SDK state', () => {
   const credentials = {
     url: 'https://relayfile.test',
     token: 'relayfile-token',
@@ -763,7 +795,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
 
   it('bootstraps create-only and updates with the exact loaded revision', async () => {
     const server = new RelayfileStateServer(null);
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
 
     expect(await store.load(storeFeatures)).toBeNull();
     const initial = await store.save(progressState(0), null, storeFeatures);
@@ -778,7 +810,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
 
   it('rejects a stale writer after newer runs checkpoint positions 2 and 3', async () => {
     const server = new RelayfileStateServer(progressState(1));
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     const staleA = await store.load(storeFeatures);
     const runB = await store.load(storeFeatures);
     expect(staleA).not.toBeNull();
@@ -807,7 +839,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
       lastPost: { featureId: 'retired-feature', ts: '1784370419.029509' },
     };
     const server = new RelayfileStateServer(retiredState);
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     const loaded = await store.load(storeFeatures);
     expect(loaded).not.toBeNull();
 
@@ -830,7 +862,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
   it('uses the loaded revision for a bounded downward total reconciliation', async () => {
     const previousState = { ...progressState(1), totalFeatures: 123 };
     const server = new RelayfileStateServer(previousState);
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     const loaded = await store.load(storeFeatures);
     expect(loaded).not.toBeNull();
 
@@ -845,7 +877,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
 
   it('does not let an old completed generation overwrite its CAS reset', async () => {
     const server = new RelayfileStateServer(progressState(122));
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     const completedGeneration = await store.load(storeFeatures);
     expect(completedGeneration).not.toBeNull();
 
@@ -860,12 +892,12 @@ describe('factory-feature-guardian exact HTTP state', () => {
 
   it('treats only 404 as absent and fails closed on authorization errors', async () => {
     const absent = new RelayfileStateServer(null);
-    const absentStore = createHttpProgressStore(credentials, { fetchImpl: absent.fetch });
+    const absentStore = createSdkProgressStore(credentials, { fetchImpl: absent.fetch });
     expect(await absentStore.load(storeFeatures)).toBeNull();
 
     const forbidden = new RelayfileStateServer(progressState(1));
     forbidden.failGetStatus = 403;
-    const forbiddenStore = createHttpProgressStore(credentials, { fetchImpl: forbidden.fetch });
+    const forbiddenStore = createSdkProgressStore(credentials, { fetchImpl: forbidden.fetch });
     await expect(forbiddenStore.load(storeFeatures)).rejects.toThrow('HTTP 403');
   });
 
@@ -874,7 +906,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
     try {
       const hungGet = new RelayfileStateServer(progressState(1));
       hungGet.hangMethod = 'GET';
-      const getStore = createHttpProgressStore(credentials, {
+      const getStore = createSdkProgressStore(credentials, {
         fetchImpl: hungGet.fetch,
         timeoutMs: 25,
       });
@@ -885,7 +917,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
 
       const hungPut = new RelayfileStateServer(null);
       hungPut.hangMethod = 'PUT';
-      const putStore = createHttpProgressStore(credentials, {
+      const putStore = createSdkProgressStore(credentials, {
         fetchImpl: hungPut.fetch,
         timeoutMs: 25,
       });
@@ -901,7 +933,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
   it('fails closed when the exact GET read-back does not match the PUT', async () => {
     const server = new RelayfileStateServer(null);
     server.corruptReadBack = true;
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     await expect(store.save(progressState(0), null, storeFeatures)).rejects.toThrow(
       'read-back did not match'
     );
@@ -938,7 +970,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
     });
     const previousState = state(featureIds.slice(0, -1));
     const server = new RelayfileStateServer(null);
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
 
     await expect(
       Promise.resolve().then(() =>
@@ -956,7 +988,7 @@ describe('factory-feature-guardian exact HTTP state', () => {
   ])('rejects bounded v3 state with %s', async (_label, invalid) => {
     const server = new RelayfileStateServer(null);
     server.content = `${JSON.stringify(invalid)}\n`;
-    const store = createHttpProgressStore(credentials, { fetchImpl: server.fetch });
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
     await expect(store.load(storeFeatures)).rejects.toThrow(/cycle state/);
   });
 });

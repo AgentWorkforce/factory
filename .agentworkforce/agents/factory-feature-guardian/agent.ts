@@ -18,6 +18,12 @@ import {
   type WorkforceEvent,
 } from '@agentworkforce/runtime';
 import { input } from '@agentworkforce/delivery';
+import {
+  RelayFileApiError,
+  RelayFileClient,
+  RevisionConflictError,
+  type OperationStatusResponse,
+} from '@relayfile/sdk';
 import { slackClient, type WritebackResult } from '@relayfile/relay-helpers';
 import { randomUUID } from 'node:crypto';
 import {
@@ -316,57 +322,28 @@ async function withDeadline<T>(
   }
 }
 
-/** Normalize weak or quoted HTTP ETags to the Relayfile revision value. */
-function normalizeEtag(value: string | null): string {
-  return (value ?? '').trim().replace(/^W\//, '').replace(/^"|"$/g, '');
-}
-
-/** Build the exact Relayfile file endpoint for the guardian cycle state. */
-function relayfileStateUrl(credentials: RelayfileCredentials): URL {
-  const url = new URL(
-    `/v1/workspaces/${encodeURIComponent(credentials.workspaceId)}/fs/file`,
-    `${credentials.url.replace(/\/+$/, '')}/`
-  );
-  url.searchParams.set('path', CYCLE_STATE_PATH);
-  return url;
-}
-
-/** Build authenticated headers shared by guardian state requests. */
-function requestHeaders(credentials: RelayfileCredentials, correlationId: string): HeadersInit {
-  return {
-    Authorization: `Bearer ${credentials.token}`,
-    'X-Correlation-Id': correlationId,
-  };
-}
-
-/** Read, validate, and revision-bind one guardian state snapshot from Relayfile. */
-async function readHttpSnapshot(
-  credentials: RelayfileCredentials,
+/** Read, validate, and revision-bind one guardian state snapshot through the public SDK. */
+async function readSdkSnapshot(
+  client: RelayFileClient,
+  workspaceId: string,
   features: Feature[],
-  fetchImpl: FetchLike,
   signal: AbortSignal,
   correlationId: string,
   allowHistoricalIds = false
 ): Promise<ProgressSnapshot | null> {
-  const response = await fetchImpl(relayfileStateUrl(credentials), {
-    method: 'GET',
-    headers: requestHeaders(credentials, correlationId),
-    signal,
-  });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`cycle state GET failed with HTTP ${response.status}`);
-
-  const file = (await response.json()) as unknown;
-  if (!isRecord(file) || file.path !== CYCLE_STATE_PATH || typeof file.content !== 'string') {
-    throw new Error('cycle state GET returned an invalid file');
+  let file;
+  try {
+    file = await client.readFile(workspaceId, CYCLE_STATE_PATH, correlationId, signal);
+  } catch (error) {
+    if (error instanceof RelayFileApiError && error.status === 404) return null;
+    throw error;
+  }
+  if (file.path !== CYCLE_STATE_PATH || typeof file.content !== 'string') {
+    throw new Error('cycle state SDK read returned an invalid file');
   }
   assertStateSize(file.content);
-  const bodyRevision = typeof file.revision === 'string' ? file.revision.trim() : '';
-  const etagRevision = normalizeEtag(response.headers.get('etag'));
-  const revision = bodyRevision || etagRevision;
-  if (!revision || (bodyRevision && etagRevision && bodyRevision !== etagRevision)) {
-    throw new Error('cycle state GET returned an invalid revision');
-  }
+  const revision = typeof file.revision === 'string' ? file.revision.trim() : '';
+  if (!revision) throw new Error('cycle state SDK read returned an invalid revision');
 
   let parsed: unknown;
   try {
@@ -380,20 +357,58 @@ async function readHttpSnapshot(
   };
 }
 
-/** Create a compare-and-set progress store backed by the Relayfile HTTP API. */
-export function createHttpProgressStore(
+/** Require the SDK-queued compare-and-set write to reach a terminal success. */
+async function waitForSdkWrite(
+  client: RelayFileClient,
+  workspaceId: string,
+  opId: string,
+  signal: AbortSignal,
+  correlationId: string
+): Promise<OperationStatusResponse> {
+  for (;;) {
+    const operation = await client.getOp(workspaceId, opId, correlationId, signal);
+    if (operation.status === 'succeeded') return operation;
+    if (['failed', 'dead_lettered', 'canceled'].includes(operation.status)) {
+      throw new Error(
+        `cycle state SDK write ${operation.status}${operation.lastError ? `: ${operation.lastError}` : ''}`
+      );
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timeout);
+        signal.removeEventListener('abort', onAbort);
+        reject(signal.reason);
+      };
+      const timeout = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, 25);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+}
+
+/** Create a compare-and-set progress store backed only by public Relayfile SDK surfaces. */
+export function createSdkProgressStore(
   credentials: RelayfileCredentials,
   options: { fetchImpl?: FetchLike; timeoutMs?: number } = {}
 ): ProgressStore {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const client = new RelayFileClient({
+    baseUrl: credentials.url,
+    token: credentials.token,
+    fetchImpl: options.fetchImpl,
+    readCache: false,
+    retry: { maxRetries: 0 },
+  });
   const timeoutMs = options.timeoutMs ?? STATE_IO_TIMEOUT_MS;
   return {
     load: (features) =>
       withDeadline('cycle state load', timeoutMs, (signal) =>
-        readHttpSnapshot(
-          credentials,
+        readSdkSnapshot(
+          client,
+          credentials.workspaceId,
           features,
-          fetchImpl,
           signal,
           `guardian-state-load-${randomUUID()}`,
           true
@@ -409,23 +424,33 @@ export function createHttpProgressStore(
       assertValidTransition(expected, canonical, features);
       return withDeadline('cycle state save', timeoutMs, async (signal) => {
         const correlationId = `guardian-state-save-${randomUUID()}`;
-        const response = await fetchImpl(relayfileStateUrl(credentials), {
-          method: 'PUT',
-          headers: {
-            ...requestHeaders(credentials, correlationId),
-            'Content-Type': 'application/octet-stream',
-            'X-Relayfile-Encoding': 'utf-8',
-            'X-Relayfile-Content-Type': 'application/json',
-            'X-Workspace-Id': credentials.workspaceId,
-            'If-Match': expected?.revision ?? '0',
-          },
-          body: content,
+        let queued;
+        try {
+          queued = await client.writeFile({
+            workspaceId: credentials.workspaceId,
+            path: CYCLE_STATE_PATH,
+            baseRevision: expected?.revision ?? '0',
+            content,
+            contentType: 'application/json',
+            encoding: 'utf-8',
+            correlationId,
+            signal,
+          });
+        } catch (error) {
+          if (error instanceof RevisionConflictError ||
+              (error instanceof RelayFileApiError && error.status === 409)) {
+            throw new ProgressStateConflictError();
+          }
+          throw error;
+        }
+        await waitForSdkWrite(client, credentials.workspaceId, queued.opId, signal, correlationId);
+        const readBack = await readSdkSnapshot(
+          client,
+          credentials.workspaceId,
+          features,
           signal,
-        });
-        if (response.status === 409) throw new ProgressStateConflictError();
-        if (!response.ok) throw new Error(`cycle state PUT failed with HTTP ${response.status}`);
-
-        const readBack = await readHttpSnapshot(credentials, features, fetchImpl, signal, correlationId);
+          correlationId
+        );
         if (!readBack || JSON.stringify(readBack.state) !== JSON.stringify(canonical)) {
           throw new Error('cycle state read-back did not match the saved state');
         }
@@ -484,7 +509,7 @@ function createPreviewProgressStore(ctx: WorkforceCtx): ProgressStore {
 /** Select the exact production store or the explicitly constrained simulation store. */
 function createProgressStore(ctx: WorkforceCtx): ProgressStore {
   const credentials = ctx.credentials.tryRequire();
-  if (credentials) return createHttpProgressStore(credentials.relayfile);
+  if (credentials) return createSdkProgressStore(credentials.relayfile);
   if (ctx.agent.id === 'sim-agent' && ctx.deployment.id === 'sim-deployment') {
     return createPreviewProgressStore(ctx);
   }
