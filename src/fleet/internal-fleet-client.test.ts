@@ -704,7 +704,11 @@ describe('InternalFleetClient', () => {
   it('surfaces the broker pid as protected process state', async () => {
     const harness = new FakeHarnessDriverClient()
     harness.brokerPid = 68009
-    const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
+    const fleet = new InternalFleetClient({
+      client: harness,
+      cwd: '/worktree',
+      connectionPath: '/nonexistent/factory-test-relay-connection.json',
+    })
 
     await expect(fleet.protectedPids()).resolves.toEqual([68009])
   })
