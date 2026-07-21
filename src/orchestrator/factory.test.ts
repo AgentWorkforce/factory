@@ -1209,6 +1209,7 @@ class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
 class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient {
   babysitterWakeAttempts = 0
   coldStarted = false
+  failUntilNextResume = false
 
   override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
     const priorBabysitterSpawns = this.spawned.filter((spawn) => spawn.name.includes('-babysit')).length
@@ -1216,13 +1217,16 @@ class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient 
     if (input.name.includes('-babysit') && priorBabysitterSpawns > 0 && !input.continueFrom) {
       this.coldStarted = true
     }
+    if (input.name.includes('-babysit') && this.coldStarted && input.continueFrom) {
+      this.failUntilNextResume = false
+    }
     return result
   }
 
   override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
     if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
       this.babysitterWakeAttempts += 1
-      if (!this.coldStarted) {
+      if (!this.coldStarted || this.failUntilNextResume) {
         throw new Error(
           `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
         )
@@ -18425,6 +18429,25 @@ describe('FactoryLoop PR babysitter', () => {
       expect(babysitterSpawns[1]?.continueFrom).toBe('session-ar-426-babysit')
       expect(babysitterSpawns[2]?.continueFrom).toBeUndefined()
       expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(2)
+
+      // The cold start is a fresh session generation. If it later becomes
+      // unreachable, it receives one resume of its own instead of inheriting
+      // the spent fence from the previous broken session.
+      harness.failUntilNextResume = true
+      mount.files.set('/github/repos/AgentWorkforce/pear/comments/9427.json', { content: {
+        repository: { full_name: 'AgentWorkforce/pear' },
+        pull_request: { number: 426 },
+        comment: { id: 9427, body: 'one more review request' },
+      } })
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9427.json', 'comment-9427'))
+      await vi.waitFor(
+        () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(2),
+        { timeout: 12_000 },
+      )
+      const nextGenerationSpawns = harness.spawned.filter((spawn) => spawn.name === 'ar-426-babysit')
+      expect(nextGenerationSpawns).toHaveLength(4)
+      expect(nextGenerationSpawns[3]?.continueFrom).toBe('session-ar-426-babysit')
+      expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(3)
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })

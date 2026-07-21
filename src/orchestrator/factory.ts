@@ -6666,25 +6666,17 @@ export class FactoryLoop implements Factory {
     try {
       const configuredCapability = this.#config.agentCapabilities.babysitter
       const capabilityChanged = tracked.spec.capability !== configuredCapability
-      // Use the same durable logical-agent fence storage as ordinary
-      // reconciled exits, but keep a dedicated key so an unreachable-wake
-      // recovery cannot suppress the separate exit-recovery policy. A resumed
-      // session that still cannot register with Relay must not be resumed
-      // forever after every cooldown or Factory restart. Preserve context
-      // once, then cold-start from the persisted babysitter task so a broken
-      // session cannot consume a slot indefinitely.
-      const recoveryLifecycle = await this.#state.getDispatchLifecycle(
-        this.#workspaceId,
-        issueKey(record.issue),
+      // Persist the recovered session lineage with the tracked babysitter. A
+      // resumed session that still cannot register with Relay must not be
+      // resumed forever after every cooldown or Factory restart. A cold start
+      // creates a fresh tracked session with an empty fence, so that new
+      // session still receives one context-preserving resume attempt.
+      const sessionRecoverySpent = Boolean(
+        tracked.sessionRef && tracked.unreachableWakeResumedSessionRef === tracked.sessionRef,
       )
-      const recoveryRunIdentity = recoveryLifecycle?.runId
-        ?? tracked.spec.branch
-        ?? batch.invocationIdFor(record.issue, tracked.spec)
-      const recoveryKey = `babysitter-unreachable:${recoveryRunIdentity}:${tracked.spec.name}`
-      const sessionRecoverySpent = await this.#state.isResumed(this.#workspaceId, recoveryKey)
       if (tracked.sessionRef && !capabilityChanged && !sessionRecoverySpent) {
         await this.#resumeTrackedAgent(record, previousName, tracked)
-        await this.#state.markResumed(this.#workspaceId, recoveryKey)
+        tracked.unreachableWakeResumedSessionRef = tracked.sessionRef
       } else {
         const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
         const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
@@ -6713,7 +6705,6 @@ export class FactoryLoop implements Factory {
         if (!restarted) throw new Error(`Recovered babysitter ${result.name} was not tracked`)
         await this.#retargetBabysitterAgent(record, previousName, restarted)
         await this.#reportAgent(record, restarted, 'agent.resumed')
-        await this.#state.markResumed(this.#workspaceId, recoveryKey)
         if (capabilityChanged) {
           this.#increment('babysitterCapabilityMigrations')
           this.#logger.info?.('[factory] cold-started unreachable babysitter on configured capability', {
@@ -15201,6 +15192,7 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   },
   result: tracked.result ? { ...tracked.result } : undefined,
   sessionRef: tracked.sessionRef,
+  unreachableWakeResumedSessionRef: tracked.unreachableWakeResumedSessionRef,
 })
 
 const durableBabysitterTrackedAgent = (
