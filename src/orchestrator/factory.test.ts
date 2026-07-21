@@ -17074,10 +17074,11 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
-  it('renews quiet durable subscriptions and retries a transient initial create failure', async () => {
+  it('keeps local routing for an unregistered owner, then renews its durable subscription without double delivery', async () => {
     vi.useFakeTimers()
     const number = 610
     const issue = realIssueFile(number, ready, { title: 'Real durable renewal' })
+    const commentPath = `/github/repos/AgentWorkforce/pear/pulls/${number}/comments/6101.json`
     const mount = new FakeMountClient({ [issuePath(number)]: issue })
     seedPrMeta(mount, 'AgentWorkforce/pear', number, { state: 'open', draft: false })
     const subscriptions = new FakeResourceSubscriptions()
@@ -17092,6 +17093,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
 
     try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
       fleet.emitAgentExit(`ar-${number}-impl-pear`, 'worker_exited')
       await vi.advanceTimersByTimeAsync(0)
@@ -17100,9 +17102,20 @@ describe('FactoryLoop PR babysitter', () => {
       ).toBe(1))
       expect(subscriptions.records).toEqual([])
 
+      mount.emit(changeEvent(commentPath, 'unregistered-owner-comment'))
+      await vi.advanceTimersByTimeAsync(800)
+      expect(
+        fleet.messages.filter((message) => message.text.startsWith('<integration-event')).map((message) => message.to),
+      ).toEqual([`ar-${number}-babysit`])
+
       subscriptions.createFailure = undefined
       await vi.advanceTimersByTimeAsync(5_000)
       expect(subscriptions.records).toHaveLength(1)
+
+      mount.emit(changeEvent(commentPath, 'registered-owner-comment'))
+      await vi.advanceTimersByTimeAsync(800)
+      expect(fleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toHaveLength(1)
+      expect(subscriptions.claimCalls.length).toBeGreaterThan(0)
 
       await vi.advanceTimersByTimeAsync(30 * 60_000)
       expect(subscriptions.createCalls).toHaveLength(2)

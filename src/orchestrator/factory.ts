@@ -496,6 +496,7 @@ export class FactoryLoop implements Factory {
   // owning babysitter.
   readonly #babysitterSubscriptionOwners = new Map<string, string>()
   #babysitterResourceSubscriptionFault = false
+  #babysitterResourceSubscriptionUnavailable = false
   #babysitterResourceDeliveryRetryTimer?: ReturnType<typeof setTimeout>
   #babysitterResourceSubscriptionRenewTimer?: ReturnType<typeof setTimeout>
   readonly #babysitterReady = new Set<string>()
@@ -8826,11 +8827,13 @@ export class FactoryLoop implements Factory {
       )
       await this.#persistBabysitterSession(issue, ref, tracked)
       this.#babysitterResourceSubscriptionFault = false
+      this.#babysitterResourceSubscriptionUnavailable = false
       this.#scheduleBabysitterResourceSubscriptionRenewal()
       this.#increment('babysitterResourceSubscriptionsRenewed')
     } catch (error) {
       if (isResourceSubscriptionsUnavailable(error)) {
         this.#babysitterResourceSubscriptionFault = false
+        this.#babysitterResourceSubscriptionUnavailable = true
         this.#increment('babysitterResourceSubscriptionUnavailable')
         return
       }
@@ -8854,7 +8857,7 @@ export class FactoryLoop implements Factory {
     // provisioning gap without making a successful API response for some
     // other subscription suppress an unregistered PR's wake.
     if ([...this.#babysitterPr.values()].some((ref) => ref.agentName && !ref.resourceSubscription)) {
-      return this.#babysitterResourceSubscriptionFault
+      return false
     }
 
     let claims: Awaited<ReturnType<typeof subscriptions.claimDeliveryClaims>>
@@ -8863,6 +8866,7 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       if (isResourceSubscriptionsUnavailable(error)) {
         this.#babysitterResourceSubscriptionFault = false
+        this.#babysitterResourceSubscriptionUnavailable = true
         this.#increment('babysitterResourceSubscriptionUnavailable')
       } else {
         this.#babysitterResourceSubscriptionFault = true
@@ -8875,6 +8879,7 @@ export class FactoryLoop implements Factory {
       return !isResourceSubscriptionsUnavailable(error)
     }
     this.#babysitterResourceSubscriptionFault = false
+    this.#babysitterResourceSubscriptionUnavailable = false
 
     for (const claim of claims) {
       const issueIdentity = this.#babysitterSubscriptionOwners.get(claim.subscriptionId)
@@ -9025,6 +9030,7 @@ export class FactoryLoop implements Factory {
         } catch (error) {
           if (isResourceSubscriptionsUnavailable(error)) {
             this.#babysitterResourceSubscriptionFault = false
+            this.#babysitterResourceSubscriptionUnavailable = true
             this.#increment('babysitterResourceSubscriptionUnavailable')
           } else {
             this.#babysitterResourceSubscriptionFault = true
@@ -9090,11 +9096,11 @@ export class FactoryLoop implements Factory {
   }
 
   async #routeBabysitterEvent(path: string, extraKinds: Iterable<BabysitterWakeKind> = []): Promise<void> {
-    // A successful Relayfile claim lookup is the new exact demux. Fall back to
-    // the legacy path router only while the capability is absent; transient
-    // failures retain and retry service claims so they cannot double-deliver,
-    // preserving rollout and degraded-service behaviour without teaching this
-    // runtime how to resolve canonical/renamed paths to their by-id anchors.
+    // A successful Relayfile claim lookup is the new exact demux. While some
+    // owners are still unregistered, the legacy path router remains available
+    // only to those owners. Registered owners retain and retry service claims,
+    // so a mixed rollout or transient create failure neither double-delivers a
+    // registered PR nor drops an event for an unregistered PR.
     if (await this.#routeDurableBabysitterDeliveries()) return
     const event = githubBabysitterEventPathParts(path)
     if (!event || !this.#config.babysitter.enabled || this.#stopping) return
@@ -9124,6 +9130,14 @@ export class FactoryLoop implements Factory {
       if (!owner) {
         this.#increment('babysitterEventsIgnoredUnownedPr')
         this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', { ...event, prNumber: target.prNumber })
+        continue
+      }
+      if (
+        this.#mount.resourceSubscriptions &&
+        !this.#babysitterResourceSubscriptionUnavailable &&
+        owner.ref.resourceSubscription
+      ) {
+        this.#increment('babysitterEventsDeferredToDurableSubscription')
         continue
       }
       if (!await this.#assertIssueDispatchLifecycleOwner(owner.issue)) {
