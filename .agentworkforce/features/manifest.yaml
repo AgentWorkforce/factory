@@ -836,7 +836,7 @@ categories:
       - id: pr-babysitter-wake-coalescing
         name: Confirmed Babysitter Wake Coalescing and Retry
         api: FleetClient.waitForInjected() / StateStore.setBabysitterSession()
-        description: Coalesce metadata-only PR activity, require confirmed delivery, retain events arriving in flight, and retry failed delivery or persistence without loss or multiplication
+        description: Coalesce metadata-only PR activity, require confirmed delivery, retain events arriving in flight, retry failed delivery or persistence without loss or multiplication, and durably cold-start after one saved-session recovery remains unreachable
         location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
         verify_tier: 4
 

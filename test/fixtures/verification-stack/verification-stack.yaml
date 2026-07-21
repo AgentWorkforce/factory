@@ -25,7 +25,10 @@ services:
       kind: deployment
     readiness:
       type: exec
-      command: [pg_isready, -U, factory, -d, factory]
+      # The official image briefly runs an initialization-only PostgreSQL
+      # child before replacing PID 1 with the final server. pg_isready alone
+      # can observe that temporary server and race its intentional shutdown.
+      command: [sh, -ec, 'test "$(cat /proc/1/comm)" = postgres && pg_isready -U factory -d factory']
       timeoutSeconds: 180
       intervalSeconds: 1
 seeds:
