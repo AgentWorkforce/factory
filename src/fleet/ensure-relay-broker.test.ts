@@ -171,7 +171,14 @@ describe('ensureRelayBroker', () => {
       env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
     })
 
-    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/work' }))
+    expect(spawn).toHaveBeenCalledWith({
+      cwd: '/work',
+      workspaceKey: 'rk_live_test',
+      binaryArgs: {
+        persist: true,
+        stateDir: '/work/.agentworkforce/relay',
+      },
+    })
   })
 
   it('accepts a legacy or malformed empty broker status defensively', async () => {

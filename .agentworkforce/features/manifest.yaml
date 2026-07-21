@@ -1145,7 +1145,7 @@ categories:
       - id: fleet-broker-autostart
         name: Internal Broker Auto-Start
         api: ensureRelayBroker()
-        description: Start and own a project-local broker when none is reachable inside its workspace-key boundary, joining that workspace and waiting for cloud node delivery before dispatch
+        description: Start and own a persisted project-local broker when none is reachable inside its workspace-key boundary, joining that workspace and waiting for cloud node delivery before dispatch
         location: src/cli/fleet.ts, src/fleet/ensure-relay-broker.ts
         verify_tier: 4
 

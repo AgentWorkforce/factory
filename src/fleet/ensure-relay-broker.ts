@@ -87,7 +87,8 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
   const connect = options.connect ?? ((opts) => HarnessDriverClient.connect(opts))
   const spawn = options.spawn ?? ((opts) => HarnessDriverClient.spawn(opts))
   const env = options.env ?? process.env
-  const stateDir = env.AGENT_RELAY_STATE_DIR?.trim() || undefined
+  const stateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+    || (options.connectionPath ? dirname(options.connectionPath) : undefined)
   const workspaceKey = resolveRelayWorkspaceKey({
     workspaceKey: options.workspaceKey,
     env,
