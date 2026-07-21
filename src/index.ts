@@ -6,6 +6,7 @@ export { FileStateStore, githubWatchStatePath } from './state/file-state-store.j
 export type { FileStateStoreOptions } from './state/file-state-store.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
+export * from './environments/index.js'
 export {
   resolveFactoryStates,
   stateResolutionFromIds,
@@ -264,12 +265,16 @@ export type {
 } from './subscriptions'
 export type {
   Capability,
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
   NodeCapability,
   PreviewCapability,
   PreviewReference,
   PreviewStartInput,
   PreviewSweepInput,
   PreviewSweepResult,
+  ProvisionEnvironmentSpec,
   ChangeEvent,
   Clock,
   EventPage,

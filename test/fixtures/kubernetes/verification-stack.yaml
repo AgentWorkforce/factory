@@ -1,0 +1,19 @@
+apiVersion: factory.agentworkforce.dev/v1alpha1
+name: kubernetes-provider-e2e
+deployKind: kubernetes
+target: byoc
+deployment:
+  strategy: helm
+  chart: test/fixtures/kubernetes/chart
+  release: factory-kubernetes-e2e
+endpoints:
+  - name: api
+    service: fixture-api
+    port: 5678
+    protocol: http
+    path: /
+secrets:
+  - name: fixture-database
+    key: password
+    secretRef: env:FACTORY_E2E_POSTGRES_PASSWORD
+readinessTimeoutMs: 300000

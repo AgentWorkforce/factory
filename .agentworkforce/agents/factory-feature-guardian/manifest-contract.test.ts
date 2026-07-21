@@ -146,6 +146,7 @@ describe('Factory feature manifest contract', () => {
       'factory.config.json#slack.staleAfterMs',
       'factory.config.json#slack.conversationCoalesceMs',
       'factory.config.json#github.identity',
+      'factory.config.json#environments.kubernetes',
       'factory.config.json#linear.states.readyForAgent',
       'factory.config.json#linear.states.agentImplementing',
       'factory.config.json#linear.states.inPlanning',
@@ -189,6 +190,7 @@ describe('Factory feature manifest contract', () => {
       './node': 'createFactoryNodeDefinition()',
       './featuremap': '@agent-relay/factory/featuremap',
       './hosted': '@agent-relay/factory/hosted',
+      './environments': '@agent-relay/factory/environments',
     }
     expect(Object.keys(packageJson.exports).sort()).toEqual(Object.keys(expected).sort())
     for (const surface of Object.values(expected)) {
@@ -205,6 +207,7 @@ describe('Factory feature manifest contract', () => {
     )
     const expectedAreas = [
       'src/hosted/',
+      'src/environments/',
       'src/observability/',
       'src/orchestrator/dependencies.ts',
       'src/git/agent-worktree.ts',
