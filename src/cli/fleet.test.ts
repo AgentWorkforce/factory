@@ -314,7 +314,24 @@ describe('fleet CLI parsing', () => {
       await mkdir(nested, { recursive: true })
       await writeFile(connectionPath, JSON.stringify({ port: 3890 }))
 
-      expect(resolveBrokerConnectionPath(nested)).toBe(connectionPath)
+      expect(resolveBrokerConnectionPath(nested, {})).toBe(connectionPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers an explicit relay state directory without falling back to an ancestor broker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-state-'))
+    try {
+      const nested = join(root, 'packages', 'factory-sdk')
+      const stateDir = join(root, 'isolated-relay-state')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(nested, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(resolveBrokerConnectionPath(nested, { AGENT_RELAY_STATE_DIR: stateDir }))
+        .toBe(join(stateDir, 'connection.json'))
     } finally {
       await rm(root, { recursive: true, force: true })
     }

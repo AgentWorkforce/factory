@@ -7968,6 +7968,22 @@ export class FactoryLoop implements Factory {
         continue
       }
       const snapshot = await this.#readPrSnapshot(session)
+      const record = batch.getIssue(session.issue)
+      if (
+        snapshot &&
+        prMetaShowsMerged(snapshot) &&
+        prSnapshotIssueMatchScore(snapshot, session.issue.key) >= 30
+      ) {
+        await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
+        await this.#advanceMergedPrToDone(snapshot, record)
+        this.#increment('babysitterOwnershipRestoreMerged')
+        this.#logger.info?.('[factory] completed restored lifecycle whose pull request was already merged', {
+          issue: session.issue.key,
+          repo: session.repo,
+          prNumber: session.prNumber,
+        })
+        continue
+      }
       const guard = snapshot ? prMetaAllowsHumanReview(snapshot) : undefined
       if (!snapshot || !guard?.ok || prSnapshotIssueMatchScore(snapshot, session.issue.key) < 30) {
         await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
@@ -7984,7 +8000,6 @@ export class FactoryLoop implements Factory {
         })
         continue
       }
-      const record = batch.getIssue(session.issue)
       const trackedEntry = record?.agents.has(session.agentName)
         ? [session.agentName, record.agents.get(session.agentName)!] as const
         : [...(record?.agents.entries() ?? [])].find(([, agent]) =>

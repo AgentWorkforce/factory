@@ -52,6 +52,28 @@ describe('ensureRelayBroker', () => {
     expect(spawn).toHaveBeenCalledWith({ cwd: '/work', workspaceKey: undefined })
   })
 
+  it('persists an auto-started broker in the explicit relay state directory', async () => {
+    const spawned = fakeClient('spawned')
+    const spawn = vi.fn(async () => spawned)
+    const stateDir = '/work/isolated-relay-state'
+
+    const handle = await ensureRelayBroker({
+      cwd: '/work',
+      connect: () => { throw new Error('No running broker found') },
+      spawn,
+      env: { AGENT_RELAY_STATE_DIR: stateDir },
+      resolveWorkspaceKey: noStoredWorkspaceKey,
+    })
+
+    expect(handle.client).toBe(spawned)
+    expect(handle.started).toBe(true)
+    expect(spawn).toHaveBeenCalledWith({
+      cwd: '/work',
+      workspaceKey: undefined,
+      binaryArgs: { persist: true, stateDir },
+    })
+  })
+
   it('surfaces the connect error without spawning when autoStart is false', async () => {
     const connect = vi.fn(() => {
       throw new Error('No running broker found')

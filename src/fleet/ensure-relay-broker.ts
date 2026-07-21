@@ -17,7 +17,11 @@ export interface EnsureRelayBrokerOptions {
   logger?: Logger
   // Seams for tests so they never connect to or spawn a real broker.
   connect?: (options: { cwd?: string; connectionPath?: string }) => HarnessDriverClientLike
-  spawn?: (options: { cwd?: string; workspaceKey?: string }) => Promise<HarnessDriverClientLike>
+  spawn?: (options: {
+    cwd?: string
+    workspaceKey?: string
+    binaryArgs?: { persist?: boolean; stateDir?: string }
+  }) => Promise<HarnessDriverClientLike>
   env?: NodeJS.ProcessEnv
   resolveWorkspaceKey?: (env: NodeJS.ProcessEnv) => string | undefined
 }
@@ -42,6 +46,7 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
   const connect = options.connect ?? ((opts) => HarnessDriverClient.connect(opts))
   const spawn = options.spawn ?? ((opts) => HarnessDriverClient.spawn(opts))
   const env = options.env ?? process.env
+  const stateDir = env.AGENT_RELAY_STATE_DIR?.trim() || undefined
   const workspaceKey = resolveRelayWorkspaceKey({
     workspaceKey: options.workspaceKey,
     env,
@@ -66,7 +71,11 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
       joiningWorkspace: Boolean(workspaceKey),
     })
     try {
-      const client = await spawn({ cwd: options.cwd, workspaceKey })
+      const client = await spawn({
+        cwd: options.cwd,
+        workspaceKey,
+        ...(stateDir ? { binaryArgs: { persist: true, stateDir } } : {}),
+      })
       return { client, started: true, workspaceKey }
     } catch (spawnError) {
       if (!workspaceKey) {

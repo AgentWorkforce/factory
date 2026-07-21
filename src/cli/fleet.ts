@@ -1057,7 +1057,8 @@ async function buildFleet(
   if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
 
   const cwd = process.cwd()
-  const connectionPath = resolveBrokerConnectionPath(cwd)
+  const env = deps.env ?? process.env
+  const connectionPath = resolveBrokerConnectionPath(cwd, env)
 
   // An injected createFleet owns fleet construction entirely (tests), so skip the
   // real broker bootstrap.
@@ -1075,7 +1076,12 @@ async function buildFleet(
   if (globals.backend === 'internal') {
     const stderr = deps.stderr ?? process.stderr
     const logger = streamLogger(stderr)
-    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({ cwd, connectionPath, logger })
+    const { client, started, workspaceKey } = await (deps.ensureRelayBroker ?? ensureRelayBroker)({
+      cwd,
+      connectionPath,
+      logger,
+      env,
+    })
     return createFleet(
       { backend: 'internal', cwd, connectionPath, previewConfig: loaded?.config.preview },
       {
@@ -1108,7 +1114,15 @@ export function formatLogArgs(args: unknown[]): string {
   return ` ${args.map((arg) => (typeof arg === 'string' ? arg : stringifyLogValue(arg))).join(' ')}`
 }
 
-export function resolveBrokerConnectionPath(startCwd = process.cwd()): string | undefined {
+export function resolveBrokerConnectionPath(
+  startCwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const explicitStateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+  if (explicitStateDir) {
+    return join(explicitStateDir, 'connection.json')
+  }
+
   let current = resolve(startCwd)
   for (;;) {
     const candidate = join(current, '.agentworkforce', 'relay', 'connection.json')
