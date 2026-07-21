@@ -53,6 +53,48 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('atomically adopts an existing GitHub lifecycle across Relayfile issue aliases', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-github-alias-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 2 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const byId = githubDispatchLifecycle(146, '/github/repos/AgentWorkforce__factory/issues/by-id/146.json')
+        const slugged = githubDispatchLifecycle(
+          146,
+          '/github/repos/AgentWorkforce/factory/issues/146__stand-up-test-infra/meta.json',
+        )
+        const byIdKey = `146:${byId.issue.uuid}:${byId.issue.path}`
+        const sluggedKey = `146:${slugged.issue.uuid}:${slugged.issue.path}`
+
+        const initial = await store.claimDispatchLifecycle(
+          workspace, byIdKey, byId, 'owner-a', 1_000, 5_000,
+        )
+        const alias = await store.claimDispatchLifecycle(
+          workspace, sluggedKey, slugged, 'owner-a', 1_001, 5_000,
+        )
+
+        expect(initial).toMatchObject({ key: byIdKey, acquired: true, created: true })
+        expect(alias).toMatchObject({ key: byIdKey, acquired: true, created: false })
+        expect(alias.lifecycle.issue.path).toBe(byId.issue.path)
+        expect(await store.listDispatchLifecycles(workspace)).toHaveLength(1)
+
+        expect(await store.saveDispatchLifecycle(workspace, byIdKey, 'owner-a', 1, 1_002, {
+          ...alias.lifecycle,
+          phase: 'complete',
+        })).toBe(true)
+        await expect(store.claimDispatchLifecycle(
+          workspace, sluggedKey, slugged, 'owner-b', 1_003, 5_000,
+        )).resolves.toMatchObject({ key: byIdKey, acquired: false, created: false, lifecycle: { phase: 'complete' } })
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('restores and clears babysitter ownership plus pending wake state in a fresh process-equivalent store', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-babysitter-'))
     try {
@@ -694,6 +736,20 @@ const dispatchLifecycle = (number: number): DispatchLifecycle => ({
   invocationIds: [],
   updatedAtMs: 1_000,
 })
+
+const githubDispatchLifecycle = (number: number, path: string): DispatchLifecycle => {
+  const lifecycle = dispatchLifecycle(number)
+  const issue = {
+    key: String(number),
+    uuid: `AgentWorkforce/factory#${number}`,
+    path,
+  }
+  return {
+    ...lifecycle,
+    issue,
+    decision: { ...lifecycle.decision, issue },
+  }
+}
 
 const handedOffDispatchLifecycle = (number: number): DispatchLifecycle => {
   const lifecycle = dispatchLifecycle(number)
