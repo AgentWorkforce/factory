@@ -1,4 +1,5 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
+import { basename, dirname } from 'node:path'
 
 import type { Logger } from '../ports/system'
 import type { HarnessDriverClientLike } from './internal-fleet-client'
@@ -24,6 +25,9 @@ export interface EnsureRelayBrokerOptions {
   }) => Promise<HarnessDriverClientLike>
   env?: NodeJS.ProcessEnv
   resolveWorkspaceKey?: (env: NodeJS.ProcessEnv) => string | undefined
+  nodeDeliveryTimeoutMs?: number
+  nodeDeliveryPollMs?: number
+  sleep?: (ms: number) => Promise<void>
 }
 
 export interface RelayBrokerHandle {
@@ -33,6 +37,67 @@ export interface RelayBrokerHandle {
   // belongs to the operator and must never be killed.
   started: boolean
   workspaceKey?: string
+}
+
+const NODE_DELIVERY_TIMEOUT_MS = 45_000
+const NODE_DELIVERY_POLL_MS = 250
+
+function nodeDeliveryTimeoutError(timeoutMs: number): Error {
+  return new Error(
+    `Relay broker is reachable, but its cloud node delivery did not become ready within ${timeoutMs}ms`,
+  )
+}
+
+async function getStatusBeforeDeadline(
+  client: HarnessDriverClientLike,
+  remainingMs: number,
+  timeoutMs: number,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => client.getStatus?.()),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(nodeDeliveryTimeoutError(timeoutMs)), remainingMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function waitForNodeDelivery(
+  client: HarnessDriverClientLike,
+  options: Pick<EnsureRelayBrokerOptions, 'nodeDeliveryTimeoutMs' | 'nodeDeliveryPollMs' | 'sleep'>,
+): Promise<void> {
+  if (!client.getStatus) return
+
+  const timeoutMs = options.nodeDeliveryTimeoutMs ?? NODE_DELIVERY_TIMEOUT_MS
+  const pollMs = options.nodeDeliveryPollMs ?? NODE_DELIVERY_POLL_MS
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const deadline = Date.now() + timeoutMs
+
+  for (;;) {
+    const status = await getStatusBeforeDeadline(
+      client,
+      Math.max(0, deadline - Date.now()),
+      timeoutMs,
+    )
+    // Older brokers do not report node delivery. Preserve compatibility with
+    // them; current brokers must confirm their Relaycast node connection before
+    // Factory can safely spawn workers whose task delivery depends on it.
+    if (!status || !status.node_delivery || status.node_delivery.connected === true) return
+    if (Date.now() >= deadline) throw nodeDeliveryTimeoutError(timeoutMs)
+    await sleep(pollMs)
+  }
+}
+
+function projectCwdForConnectionPath(cwd: string | undefined, connectionPath: string | undefined): string | undefined {
+  if (!connectionPath || basename(connectionPath) !== 'connection.json') return cwd
+  const relayDir = dirname(connectionPath)
+  const agentWorkforceDir = dirname(relayDir)
+  if (basename(relayDir) !== 'relay' || basename(agentWorkforceDir) !== '.agentworkforce') return cwd
+  return dirname(agentWorkforceDir)
 }
 
 // Resolve the relay broker for the internal fleet backend: reuse the broker that
@@ -46,17 +111,17 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
   const connect = options.connect ?? ((opts) => HarnessDriverClient.connect(opts))
   const spawn = options.spawn ?? ((opts) => HarnessDriverClient.spawn(opts))
   const env = options.env ?? process.env
-  const stateDir = env.AGENT_RELAY_STATE_DIR?.trim() || undefined
+  const stateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+    || (options.connectionPath ? dirname(options.connectionPath) : undefined)
   const workspaceKey = resolveRelayWorkspaceKey({
     workspaceKey: options.workspaceKey,
     env,
     activeWorkspaceKey: options.resolveWorkspaceKey,
   })
 
+  let connectedClient: HarnessDriverClientLike | undefined
   try {
-    const client = connect({ cwd: options.cwd, connectionPath: options.connectionPath })
-    options.logger?.info?.('[factory] reusing the relay broker that is already running')
-    return { client, started: false, workspaceKey }
+    connectedClient = connect({ cwd: options.cwd, connectionPath: options.connectionPath })
   } catch (error) {
     if (options.autoStart === false) {
       throw error
@@ -70,14 +135,23 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
       reason: error instanceof Error ? error.message : String(error),
       joiningWorkspace: Boolean(workspaceKey),
     })
+    let client: HarnessDriverClientLike | undefined
     try {
-      const client = await spawn({
-        cwd: options.cwd,
+      client = await spawn({
+        cwd: projectCwdForConnectionPath(options.cwd, options.connectionPath),
         workspaceKey,
         ...(stateDir ? { binaryArgs: { persist: true, stateDir } } : {}),
       })
+      await waitForNodeDelivery(client, options)
       return { client, started: true, workspaceKey }
     } catch (spawnError) {
+      try {
+        await client?.shutdown?.()
+      } catch (shutdownError) {
+        options.logger?.warn?.('[factory] failed to shut down the spawned relay broker during cleanup', {
+          errorClass: shutdownError instanceof Error ? shutdownError.name : 'Error',
+        })
+      }
       if (!workspaceKey) {
         throw new Error(
           'Failed to start a relay broker and no workspace key was available to join the existing workspace. ' +
@@ -89,5 +163,16 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
       }
       throw spawnError
     }
+  }
+
+  try {
+    await waitForNodeDelivery(connectedClient, options)
+    options.logger?.info?.('[factory] reusing the relay broker that is already running')
+    return { client: connectedClient, started: false, workspaceKey }
+  } catch (error) {
+    // A reachable broker owns its connection file. Never start a competing
+    // broker merely because the existing one has not completed cloud delivery.
+    connectedClient.disconnect?.()
+    throw error
   }
 }

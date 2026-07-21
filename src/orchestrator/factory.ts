@@ -172,6 +172,9 @@ type BabysitterWakeState = {
   deferredSubmitTargets?: string[]
   cancelled?: boolean
   nextDelayMs?: number
+  // Preserve coalesced PR activity without targeting a team that Factory has
+  // deliberately released while it waits for durable human clarification.
+  suspendedForHuman?: boolean
   // Timestamp of the first of an uninterrupted run of registration-lag wake
   // failures. Cleared on the next successful delivery. Used to bound the
   // otherwise-unbounded 1s retry loop when a babysitter never becomes
@@ -6631,7 +6634,12 @@ export class FactoryLoop implements Factory {
         await this.#recordPendingBabysitterWake(state)
       }
       this.#babysitterWakeStates.set(babysitterWakeKey(record.issue, ref), state)
-      if (state.kinds.size > 0) this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+      if (
+        state.kinds.size > 0 &&
+        !await this.#suspendBabysitterWakeForHuman(state)
+      ) {
+        this.#scheduleBabysitterWake(state, BABYSITTER_EVENT_COALESCE_MS)
+      }
     }
     await this.#persistBabysitterSession(record.issue, ref, tracked, ownershipKey)
   }
@@ -6666,10 +6674,27 @@ export class FactoryLoop implements Factory {
     try {
       const configuredCapability = this.#config.agentCapabilities.babysitter
       const capabilityChanged = tracked.spec.capability !== configuredCapability
-      if (tracked.sessionRef && !capabilityChanged) {
+      // Persist the recovered session lineage with the tracked babysitter. A
+      // resumed session that still cannot register with Relay must not be
+      // resumed forever after every cooldown or Factory restart. A cold start
+      // creates a fresh tracked session with an empty fence, so that new
+      // session still receives one context-preserving resume attempt.
+      const sessionRecoverySpent = Boolean(
+        tracked.sessionRef && tracked.unreachableWakeResumedSessionRef === tracked.sessionRef,
+      )
+      if (tracked.sessionRef && !capabilityChanged && !sessionRecoverySpent) {
         await this.#resumeTrackedAgent(record, previousName, tracked)
+        tracked.unreachableWakeResumedSessionRef = tracked.sessionRef
       } else {
-        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
+        // Never derive a recovery id from the prior recovery id: recordSpawn
+        // persists invocationId back into the spec, so doing that recursively
+        // grows the value until telemetry and downstream id contracts reject
+        // it. Recompute the stable logical-agent base every time instead.
+        const recoveryInvocationBase = batch.invocationIdFor(record.issue, {
+          ...tracked.spec,
+          invocationId: undefined,
+        })
+        const invocationId = `${recoveryInvocationBase}:unreachable:${this.#clock.now()}`
         const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
         const replacementSpec = capabilityChanged
           ? {
@@ -6703,6 +6728,12 @@ export class FactoryLoop implements Factory {
             babysitter: result.name,
             previousCapability: tracked.spec.capability,
             capability: configuredCapability,
+          })
+        } else if (sessionRecoverySpent) {
+          this.#increment('babysitterUnreachableSessionColdStarts')
+          this.#logger.info?.('[factory] cold-started unreachable babysitter after its saved session stayed unreachable', {
+            issue: record.issue.key,
+            babysitter: result.name,
           })
         }
       }
@@ -9311,6 +9342,7 @@ export class FactoryLoop implements Factory {
       kinds: [...state.kinds],
     })
 
+    if (await this.#suspendBabysitterWakeForHuman(state)) return true
     if (state.deferredSubmitTargets || state.inFlight || this.#babysitterCriticalAgents.has(state.agentName)) {
       this.#increment('babysitterEventWakesDeferred')
       return true
@@ -9367,8 +9399,47 @@ export class FactoryLoop implements Factory {
     })
   }
 
+  async #suspendBabysitterWakeForHuman(state: BabysitterWakeState): Promise<boolean> {
+    const key = issueKey(state.issue)
+    const [lifecycle, clarification] = await Promise.all([
+      this.#usesDurableDispatchLifecycle()
+        ? this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        : undefined,
+      this.#state.getWaitingClarification(this.#workspaceId, key),
+    ])
+    // parkedAtMs is the durable release fence for local/non-lifecycle fleets.
+    // Once a lifecycle exists it is authoritative, because clarification
+    // resume promotes it before the saved agent sessions are restored.
+    const waitingForHuman = lifecycle
+      ? lifecycle.phase === 'waiting-for-human'
+      : clarification?.parkedAtMs !== undefined
+    if (!waitingForHuman) {
+      state.suspendedForHuman = false
+      return false
+    }
+    if (!state.suspendedForHuman) {
+      state.suspendedForHuman = true
+      this.#increment('babysitterEventWakesDeferredWaitingForHuman')
+      this.#logger.debug?.('[factory] suspended babysitter PR event wake while waiting for human clarification', {
+        issue: state.issue.key,
+        repo: state.repo,
+        prNumber: state.prNumber,
+        babysitter: state.agentName,
+        kinds: [...state.kinds].sort(compareBabysitterWakeKinds),
+      })
+    }
+    return true
+  }
+
   #scheduleBabysitterWake(state: BabysitterWakeState, delayMs: number): void {
-    if (state.timer || state.inFlight || state.deferredSubmitTargets || state.cancelled || this.#stopping) return
+    if (
+      state.timer ||
+      state.inFlight ||
+      state.deferredSubmitTargets ||
+      state.suspendedForHuman ||
+      state.cancelled ||
+      this.#stopping
+    ) return
     state.timer = setTimeout(() => {
       state.timer = undefined
       const pending = this.#flushBabysitterWake(state)
@@ -9376,7 +9447,12 @@ export class FactoryLoop implements Factory {
       void pending.finally(() => {
         state.inFlight = undefined
         if (this.#stopping) return
-        if (state.kinds.size > 0 && !state.deferredSubmitTargets && !this.#babysitterCriticalAgents.has(state.agentName)) {
+        if (
+          state.kinds.size > 0 &&
+          !state.deferredSubmitTargets &&
+          !state.suspendedForHuman &&
+          !this.#babysitterCriticalAgents.has(state.agentName)
+        ) {
           const delayMs = state.nextDelayMs ?? BABYSITTER_EVENT_COALESCE_MS
           state.nextDelayMs = undefined
           this.#scheduleBabysitterWake(state, delayMs)
@@ -9403,6 +9479,7 @@ export class FactoryLoop implements Factory {
       this.#increment('babysitterEventWakesCancelledNonOwner')
       return
     }
+    if (await this.#suspendBabysitterWakeForHuman(state)) return
     if (this.#babysitterCriticalAgents.has(state.agentName)) {
       this.#increment('babysitterEventWakesDeferredCritical')
       return
@@ -9580,6 +9657,7 @@ export class FactoryLoop implements Factory {
     }
     for (const state of this.#babysitterWakeStates.values()) {
       if (state.agentName !== agentName) continue
+      if (await this.#suspendBabysitterWakeForHuman(state)) continue
       if (state.deferredSubmitTargets) {
         const targets = state.deferredSubmitTargets
         state.deferredSubmitTargets = undefined
@@ -12183,7 +12261,10 @@ export class FactoryLoop implements Factory {
           batch.recordSpawn(record, tracked.spec, invocationId, result)
           await this.#saveDispatchLifecycle(record, 'dispatching')
           const live = record.agents.get(result.name)
-          if (live) resumed.push([result.name, live])
+          if (live) {
+            resumed.push([result.name, live])
+            await this.#retargetBabysitterAgent(record, parked.name, live)
+          }
           this.#assertClarificationWakeRunning()
           await renewLease()
         }
@@ -15177,6 +15258,7 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   },
   result: tracked.result ? { ...tracked.result } : undefined,
   sessionRef: tracked.sessionRef,
+  unreachableWakeResumedSessionRef: tracked.unreachableWakeResumedSessionRef,
 })
 
 const durableBabysitterTrackedAgent = (

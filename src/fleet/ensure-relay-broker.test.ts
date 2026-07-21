@@ -141,6 +141,122 @@ describe('ensureRelayBroker', () => {
     expect(handle.workspaceKey).toBe('rk_live_reused')
   })
 
+  it('waits for a spawned broker cloud node before returning it', async () => {
+    const client = fakeClient('spawned')
+    const getStatus = vi.fn()
+      .mockResolvedValueOnce({ node_delivery: { connected: false } })
+      .mockResolvedValueOnce({ node_delivery: { connected: true } })
+    client.getStatus = getStatus
+
+    const handle = await ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      sleep: async () => {},
+    })
+
+    expect(handle.client).toBe(client)
+    expect(handle.started).toBe(true)
+    expect(getStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('spawns at the project root selected by the connection boundary', async () => {
+    const spawn = vi.fn(async () => fakeClient('spawned'))
+
+    await ensureRelayBroker({
+      cwd: '/work/packages/sdk',
+      connectionPath: '/work/.agentworkforce/relay/connection.json',
+      connect: () => { throw new Error('no broker') },
+      spawn,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+    })
+
+    expect(spawn).toHaveBeenCalledWith({
+      cwd: '/work',
+      workspaceKey: 'rk_live_test',
+      binaryArgs: {
+        persist: true,
+        stateDir: '/work/.agentworkforce/relay',
+      },
+    })
+  })
+
+  it('accepts a legacy or malformed empty broker status defensively', async () => {
+    const client = fakeClient('connected')
+    client.getStatus = vi.fn(async () => undefined)
+
+    await expect(ensureRelayBroker({ connect: () => client }))
+      .resolves.toMatchObject({ client, started: false })
+  })
+
+  it('does not start a competing broker when a reachable broker has no cloud delivery', async () => {
+    const client = fakeClient('connected')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.disconnect = vi.fn()
+    const spawn = vi.fn(async () => fakeClient('spawned'))
+
+    await expect(ensureRelayBroker({
+      connect: () => client,
+      spawn,
+      nodeDeliveryTimeoutMs: 0,
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(spawn).not.toHaveBeenCalled()
+    expect(client.disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('shuts down a broker it started when cloud delivery never becomes ready', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.shutdown = vi.fn(async () => {})
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 0,
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(client.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it('bounds a stalled broker status poll by the node-delivery deadline', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(() => new Promise(() => {}))
+    client.shutdown = vi.fn(async () => {})
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 5,
+    })).rejects.toThrow(
+      'Relay broker is reachable, but its cloud node delivery did not become ready within 5ms',
+    )
+
+    expect(client.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the node-delivery error when spawned-broker cleanup also fails', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.shutdown = vi.fn(async () => { throw new Error('cleanup failed') })
+    const warn = vi.fn()
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 0,
+      logger: { warn },
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(warn).toHaveBeenCalledWith(
+      '[factory] failed to shut down the spawned relay broker during cleanup',
+      { errorClass: 'Error' },
+    )
+  })
+
   it('fails with actionable guidance when there is no broker and no workspace key', async () => {
     await expect(ensureRelayBroker({
       connect: () => { throw new Error('no broker') },

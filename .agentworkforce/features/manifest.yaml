@@ -836,7 +836,7 @@ categories:
       - id: pr-babysitter-wake-coalescing
         name: Confirmed Babysitter Wake Coalescing and Retry
         api: FleetClient.waitForInjected() / StateStore.setBabysitterSession()
-        description: Coalesce metadata-only PR activity, require confirmed delivery, retain events arriving in flight, and retry failed delivery or persistence without loss or multiplication
+        description: Coalesce metadata-only PR activity, require confirmed delivery, retain events arriving in flight, suspend durable wakes while the team is parked for human clarification, retry them after resume, and durably cold-start after one saved-session recovery remains unreachable
         location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/file-state-store.ts
         verify_tier: 4
 
@@ -1138,15 +1138,15 @@ categories:
       - id: fleet-broker-reuse
         name: Existing Broker Reuse
         api: ensureRelayBroker()
-        description: Connect to an existing workspace broker without taking ownership or stopping it on dispose
-        location: src/fleet/ensure-relay-broker.ts
+        description: Connect to an existing broker only within the nearest project workspace-key boundary, wait for cloud node delivery, and avoid taking ownership or starting a competing broker
+        location: src/cli/fleet.ts, src/fleet/ensure-relay-broker.ts
         verify_tier: 4
 
       - id: fleet-broker-autostart
         name: Internal Broker Auto-Start
         api: ensureRelayBroker()
-        description: Start and own a broker when none is reachable, joining the existing workspace when a key is available
-        location: src/fleet/ensure-relay-broker.ts
+        description: Start and own a persisted project-local broker when none is reachable inside its workspace-key boundary, joining that workspace and waiting for cloud node delivery before dispatch
+        location: src/cli/fleet.ts, src/fleet/ensure-relay-broker.ts
         verify_tier: 4
 
       - id: fleet-owned-broker-drain
