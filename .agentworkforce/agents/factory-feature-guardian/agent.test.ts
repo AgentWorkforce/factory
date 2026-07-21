@@ -16,9 +16,14 @@ import guardian, {
   SLACK_WRITEBACK_TIMEOUT_MS,
   createSdkProgressStore,
   deliveredSlackTs,
+  factoryFeatureGuardianAdapters,
   featurePostIdempotencyKey,
+  gateFactoryGuardianTier,
+  parseFactoryGuardianTestCounts,
   resolveManifestPath,
+  resolveFactoryGuardianProcedure,
   runGuardian,
+  runFactoryGuardianProcedure,
   type ProgressState,
 } from './agent.js';
 
@@ -424,8 +429,8 @@ describe('factory-feature-guardian runtime paths', () => {
 
   it('declares bounded manifest and memory reads plus configured Slack output', () => {
     expect(persona.integrations.github?.relayfileMount).toEqual({
-      requiredReadPaths: ['/github/repos/AgentWorkforce/factory/.agentworkforce/features/**'],
-      writeOnlyPaths: [],
+      requiredReadPaths: ['/github/repos/AgentWorkforce/factory/**'],
+      writeOnlyPaths: ['/github/repos/AgentWorkforce/factory/issues/**'],
     });
     expect(persona.memory).toEqual({
       enabled: true,
@@ -436,8 +441,8 @@ describe('factory-feature-guardian runtime paths', () => {
       optional: true,
       enabledByInput: 'SLACK_CHANNEL',
       relayfileMount: {
-        requiredReadPaths: [],
-        writeOnlyPaths: ['/slack/channels/${SLACK_CHANNEL}/**'],
+        requiredReadPaths: ['/slack/channels/${SLACK_CHANNEL}/messages/**'],
+        writeOnlyPaths: ['/slack/channels/${SLACK_CHANNEL}/messages/**'],
       },
     });
   });
@@ -583,7 +588,7 @@ describe('factory-feature-guardian runtime paths', () => {
         featureId: 'broker-status',
         ts: '1710000001.000100',
       });
-      expect(ctx.files.write).toHaveBeenCalledTimes(2);
+      expect(ctx.files.write).toHaveBeenCalledTimes(3);
     } finally {
       restore();
     }
@@ -749,13 +754,23 @@ describe('factory-feature-guardian runtime paths', () => {
     }
   });
 
-  it('scopes provider idempotency to a feature within one cycle', () => {
-    expect(featurePostIdempotencyKey('cycle-a', 'start-broker')).toBe(
-      featurePostIdempotencyKey('cycle-a', 'start-broker')
-    );
-    expect(featurePostIdempotencyKey('cycle-a', 'start-broker')).not.toBe(
-      featurePostIdempotencyKey('cycle-b', 'start-broker')
-    );
+  it('scopes provider idempotency to an exact feature revision and generation', () => {
+    const revision = { manifestRevision: 'manifest-a', procedureRevision: 'procedures-a', generation: 1 };
+    const key = featurePostIdempotencyKey('cycle-a', 'start-broker', revision);
+    expect(key).toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', revision));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-b', 'start-broker', revision));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      manifestRevision: 'manifest-b',
+    }));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      procedureRevision: 'procedures-b',
+    }));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      generation: 2,
+    }));
   });
 
   it('requires a delivered Slack ts instead of a draft receipt id', () => {
@@ -1111,5 +1126,85 @@ describe('factory-feature-guardian delayed Slack receipts', () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe('Factory feature guardian conversation adapters', () => {
+  const snapshot = {
+    id: 'verification-procedure-routing',
+    name: 'Manifest-to-Procedure Routing',
+    category: 'release-verification',
+    api: 'manifest.yaml#verification.categories',
+    description: 'Routes features to exact procedures.',
+    locations: ['.agentworkforce/features/manifest.yaml'],
+    procedure: 'cli-and-package',
+    tier: 1,
+    criticality: 'critical',
+  };
+
+  it.each([
+    ['all passing', ' Test Files  2 passed (2)\n      Tests  42 passed (42)', { passed: 42, failed: 0 }],
+    ['mixed', ' Test Files  1 failed | 2 passed (3)\n      Tests  3 failed | 39 passed (42)', { passed: 39, failed: 3 }],
+    ['build only', 'compiled successfully', { passed: 0, failed: 0 }],
+    ['ANSI summary', '\u001b[32m      Tests  7 passed (7)\u001b[39m', { passed: 7, failed: 0 }],
+  ])('parses %s test evidence without inventing failures', (_label, output, expected) => {
+    expect(parseFactoryGuardianTestCounts(output)).toEqual(expected);
+  });
+
+  it('fails confirmation authority closed until a configured actor matches', () => {
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-ANY')).toBe(false);
+    (ctx.persona.inputs as Record<string, string>).SLACK_USER_KHALIQ = 'U-KHALIQ';
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-KHALIQ')).toBe(true);
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-ANY')).toBe(false);
+  });
+
+  it('reports missing installed dependencies as SKIP instead of a defect', async () => {
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.exec = vi.fn(async () => ({ output: '', exitCode: 1 }));
+    const gate = await gateFactoryGuardianTier(ctx, snapshot, {
+      name: 'cli-and-package',
+      path: '.agentworkforce/features/verify/procedures.md',
+      prerequisites: 'source checkout and npm ci',
+      body: 'npm run build',
+    });
+    expect(gate).toEqual({
+      outcome: 'skip',
+      reason: expect.stringContaining('installed Node dependencies'),
+    });
+  });
+
+  it('selects the complete documented command and runs it in a disposable checkout', async () => {
+    const procedures = readFileSync(
+      new URL('../../features/verify/procedures.md', import.meta.url),
+      'utf8',
+    );
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.readFile = vi.fn(async () => procedures);
+    const exec = vi.fn(async () => ({
+      output: ' Test Files  2 passed (2)\n      Tests  42 passed (42)\n__FACTORY_GUARDIAN_CLEANUP_OK__\n',
+      exitCode: 0,
+    }));
+    ctx.sandbox.exec = exec;
+    const procedure = await resolveFactoryGuardianProcedure(ctx, snapshot);
+    const result = await runFactoryGuardianProcedure(ctx, snapshot, procedure, 'adapter-test');
+
+    expect(result).toMatchObject({
+      outcome: 'passed',
+      result: 'positive',
+      tests: { passed: 42, failed: 0 },
+      cleanup: ['Observed removal of the unique temporary checkout.'],
+    });
+    const script = String(exec.mock.calls[0]?.[0]);
+    expect(script).toContain('tar --exclude=.git --exclude=node_modules')
+    expect(script).toContain('cd "$TMP/repo"')
+    expect(script).toContain('node bin/factory.mjs --help')
+    expect(script).toContain('node bin/factory.mjs featuremap check')
+  });
+
+  it('routes every remediation only to the Factory repository', () => {
+    expect(factoryFeatureGuardianAdapters.repositoryForFeature(snapshot)).toBe(
+      'AgentWorkforce/factory',
+    );
   });
 });

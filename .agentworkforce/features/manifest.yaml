@@ -2,13 +2,13 @@ version: '1.1'
 updated: '2026-07-21'
 catalog:
   category_count: 24
-  feature_count: 300
+  feature_count: 304
   tier_counts:
-    1: 43
+    1: 45
     2: 123
     3: 11
     4: 51
-    5: 57
+    5: 59
     6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -1348,6 +1348,13 @@ categories:
         location: src/featuremap/index.ts, src/featuremap/validate.ts, src/featuremap/check.ts, package.json
         verify_tier: 1
 
+      - id: api-feature-guardian
+        name: Reusable Feature Guardian API
+        api: '@agent-relay/factory/feature-guardian'
+        description: Define repository-adapted scheduled guardians with shared Slack correlation, exact-revision state transitions, immutable confirmations, and remediation writeback contracts
+        location: src/feature-guardian/index.ts, src/feature-guardian/conversation.ts, src/index.ts, package.json
+        verify_tier: 1
+
       - id: api-linear-state-resolution
         name: Linear State Resolution API
         api: resolveFactoryStates() / stateResolutionFromIds()
@@ -1678,7 +1685,7 @@ categories:
 
   proactive-health:
     name: Proactive Feature Guardian
-    description: Scheduled, exhaustive, durable Slack questions over the live Factory feature manifest
+    description: Scheduled, exhaustive Slack questions owned through exact-revision confirmation, safe deferral, or deduplicated remediation
     criticality: hot
     features:
       - id: guardian-hourly-feature-check
@@ -1698,8 +1705,29 @@ categories:
       - id: guardian-idempotent-slack-delivery
         name: Idempotent Guardian Slack Delivery
         api: slack.messages.write({ idempotencyKey })
-        description: Retry an ambiguous scheduled run with a stable cycle-and-feature key, require a real provider Slack timestamp, and advance progress only after the confirmed receipt
+        description: Retry an ambiguous scheduled run with a stable cycle, feature, generation, manifest, and procedure key; require a real provider Slack timestamp; and advance progress only after the confirmed receipt
         location: .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 5
+
+      - id: guardian-conversation-state
+        name: Correlated Guardian Conversation State
+        api: defineFeatureGuardianAgent() / runGuardianConversationTurn()
+        description: Correlate exact-message reactions and threaded replies, fence duplicate and delayed events, resume pending work before later responses, and preserve bounded CAS-checked multi-turn state
+        location: src/feature-guardian/conversation.ts, src/feature-guardian/conversation.test.ts, .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 1
+
+      - id: guardian-confirmation-evidence
+        name: Immutable Guardian Confirmation Evidence
+        api: /memory/workspace/factory-feature-guardian/confirmations/*.json
+        description: Append one exact-revision confirmation containing feature, generation, actor or verifier, provider event time, command and test evidence, and Slack thread identity before posting the final summary
+        location: src/feature-guardian/conversation.ts, .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 5
+
+      - id: guardian-remediation-writeback
+        name: Deduplicated Guardian Remediation
+        api: GuardianIssueWriter / factoryFeatureGuardianAdapters.issuePolicy
+        description: Classify proven implementation, test, manifest, procedure, or documentation defects and write one provider-confirmed factory-ready issue with reproduction, affected paths, definition of done, and Slack backlink
+        location: src/feature-guardian/conversation.ts, .agentworkforce/agents/factory-feature-guardian/agent.ts, .agentworkforce/agents/factory-feature-guardian/persona.json
         verify_tier: 5
 
   config-intake:

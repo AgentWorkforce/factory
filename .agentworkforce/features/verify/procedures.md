@@ -688,7 +688,7 @@ mkdir "$TMP/consumer" && cd "$TMP/consumer"
 npm init -y >/dev/null
 npm install --ignore-scripts "$TMP"/*.tgz >/dev/null
 node --input-type=module <<'NODE'
-for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/hosted', '/environments']) {
+for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/feature-guardian', '/hosted', '/environments']) {
   const mod = await import(`@agent-relay/factory${subpath}`)
   if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)
 }
@@ -698,9 +698,10 @@ NODE
 ```
 
 Back in the checkout, run the focused tests named by each API entry. Assert root
-types and all eight package export keys resolve, hosted remains worker-safe,
-feature-map validation includes procedure routing, dependency/worktree ports are
-exported, and fake clients support a hermetic consumer. Clean only `$TMP`.
+types and all nine package export keys resolve, hosted remains worker-safe,
+feature-map validation includes procedure routing, the reusable feature guardian
+is exported, dependency/worktree ports are exported, and fake clients support a
+hermetic consumer. Clean only `$TMP`.
 
 ## hosted-control-plane
 
@@ -766,6 +767,7 @@ SHAs from the reviewed event.
 npm run build
 npm run featuremap:check
 npm test
+node bin/factory.mjs --help >/dev/null
 FACTORY_E2E_HEAD_SHA="$(git rev-parse HEAD)" \
 FACTORY_E2E_BASE_SHA="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" \
   npm run verify:e2e
@@ -797,7 +799,8 @@ Slack channel.
 ```bash
 npx vitest run \
   .agentworkforce/agents/factory-feature-guardian/manifest-contract.test.ts \
-  .agentworkforce/agents/factory-feature-guardian/agent.test.ts
+  .agentworkforce/agents/factory-feature-guardian/agent.test.ts \
+  src/feature-guardian/conversation.test.ts
 ```
 
 In preview, begin with no state, inject a checkpoint failure after a confirmed
@@ -809,10 +812,15 @@ shrink/multiple retirements fail closed, and complete cycles increment exactly
 once. Reject malformed, duplicate, oversized, stale-revision, authorization,
 timeout, corrupt-readback, and receiptless states without advancing. Force LLM
 failure and require the fallback to retain CLI/API, source, tier, and procedure.
-In deployment, assert the manifest is read only from
-`/github/repos/AgentWorkforce/factory/.agentworkforce/features/**`, Slack can
-write only to `${SLACK_CHANNEL}`, and one scheduled tick posts one question with
-a real provider `ts` before the exact state checkpoint advances.
+Exercise affirmative, wrench, untested, ambiguous, duplicate, delayed,
+unauthorized, two-turn restart, confirmation, deferral, and remediation paths,
+including provider-write-before-CAS retries and manifest/procedure revision
+changes.
+In deployment, assert the catalog comes from the scoped Factory checkout, the
+procedure runner copies that checkout into a disposable workspace before
+execution, Slack reads and writes only `${SLACK_CHANNEL}/messages/**`, and one
+scheduled tick posts one question with a real provider `ts` before the exact
+state checkpoint advances.
 
 ## loop-and-recovery
 

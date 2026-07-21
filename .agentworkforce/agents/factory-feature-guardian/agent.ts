@@ -12,7 +12,6 @@
  * After the full manifest is covered, the cycle resets.
  */
 import {
-  defineAgent,
   type RelayfileCredentials,
   type WorkforceCtx,
   type WorkforceEvent,
@@ -28,9 +27,26 @@ import { slackClient, type WritebackResult } from '@relayfile/relay-helpers';
 import { randomUUID } from 'node:crypto';
 import {
   parseManifestFeatures,
+  featureLocations,
+  validateFeatureManifest,
   type FeatureCriticality as Criticality,
   type ManifestFeature,
 } from '../../../src/featuremap/validate.js';
+import {
+  defineFeatureGuardianAgent,
+  guardianContentRevision,
+  registerGuardianQuestion,
+  remediationMarker,
+  runGuardianConversationTurn,
+  type FeatureGuardianAdapters,
+  type GuardianConversationDependencies,
+  type GuardianDefectKind,
+  type GuardianFeatureSnapshot,
+  type GuardianIssuePolicy,
+  type GuardianManifestCatalog,
+  type GuardianProcedure,
+  type GuardianProcedureResult,
+} from '../../../src/feature-guardian/conversation.js';
 
 export { parseManifestFeatures };
 
@@ -38,7 +54,41 @@ export { parseManifestFeatures };
 
 type Feature = ManifestFeature;
 
+function factoryFeatureSnapshot(feature: Feature): GuardianFeatureSnapshot {
+  if (!feature.procedure) {
+    throw new Error(`Factory manifest feature ${feature.id} is missing its named procedure`);
+  }
+  return {
+    id: feature.id,
+    name: feature.name,
+    category: feature.category,
+    ...(feature.cli ? { cli: feature.cli } : {}),
+    ...(feature.api ? { api: feature.api } : {}),
+    description: feature.desc,
+    locations: featureLocations(feature),
+    procedure: feature.procedure,
+    tier: feature.tier,
+    criticality: feature.criticality,
+  };
+}
+
+function snapshotManifestFeature(feature: GuardianFeatureSnapshot): Feature {
+  return {
+    id: feature.id,
+    name: feature.name,
+    category: feature.category,
+    ...(feature.cli ? { cli: feature.cli } : {}),
+    ...(feature.api ? { api: feature.api } : {}),
+    desc: feature.description,
+    location: feature.locations.join(', '),
+    tier: feature.tier,
+    criticality: feature.criticality as Criticality,
+    procedure: feature.procedure,
+  };
+}
+
 const MANIFEST_RELPATH = '.agentworkforce/features/manifest.yaml';
+const PROCEDURES_RELPATH = '.agentworkforce/features/verify/procedures.md';
 const FACTORY_REPO_RELPATH = 'github/repos/AgentWorkforce/factory';
 
 /**
@@ -51,11 +101,32 @@ export function resolveManifestPath(workspaceDir: string): string {
   return `${workspaceDir}/${FACTORY_REPO_RELPATH}/${MANIFEST_RELPATH}`;
 }
 
-/** Load and parse features from the Factory checkout mounted in the proactive workspace. */
-async function loadFeatures(ctx: WorkforceCtx): Promise<Feature[]> {
+export function resolveProceduresPath(workspaceDir: string): string {
+  return `${workspaceDir}/${FACTORY_REPO_RELPATH}/${PROCEDURES_RELPATH}`;
+}
+
+/** Load the exact manifest/procedure revisions from the scoped Factory checkout. */
+export async function loadFactoryGuardianCatalog(
+  ctx: WorkforceCtx,
+): Promise<GuardianManifestCatalog> {
   const absPath = resolveManifestPath(ctx.sandbox.cwd);
-  const raw = await ctx.sandbox.readFile(absPath);
-  return parseManifestFeatures(raw);
+  const [raw, procedures] = await Promise.all([
+    ctx.sandbox.readFile(absPath),
+    ctx.sandbox.readFile(resolveProceduresPath(ctx.sandbox.cwd)),
+  ]);
+  const validated = validateFeatureManifest(raw);
+  return {
+    manifestRevision: guardianContentRevision(raw),
+    manifestVersion: validated.version,
+    procedureRevision: guardianContentRevision(procedures),
+    features: validated.features.map(factoryFeatureSnapshot),
+  };
+}
+
+/** Compatibility loader retained for the scheduled feature ordering path. */
+async function loadFeatures(ctx: WorkforceCtx): Promise<Feature[]> {
+  const catalog = await loadFactoryGuardianCatalog(ctx);
+  return catalog.features.map(snapshotManifestFeature);
 }
 
 // ── progress tracking ─────────────────────────────────────────────────────────
@@ -523,9 +594,20 @@ function createProgressStore(ctx: WorkforceCtx): ProgressStore {
   throw new Error('exact Relayfile credentials are required for guardian cycle state');
 }
 
-/** Build the stable Slack idempotency key for one feature in one guardian cycle. */
-export function featurePostIdempotencyKey(cycleStartedAt: string, featureId: string): string {
-  return `factory-feature-guardian:${cycleStartedAt}:${featureId}`;
+/** Build the stable Slack key for one exact feature revision and cycle generation. */
+export function featurePostIdempotencyKey(
+  cycleStartedAt: string,
+  featureId: string,
+  revision?: {
+    manifestRevision: string;
+    procedureRevision: string;
+    generation: number;
+  },
+): string {
+  const revisionKey = revision
+    ? guardianContentRevision(JSON.stringify(revision)).replace(/^sha256:/u, '')
+    : 'legacy';
+  return `factory-feature-guardian:${cycleStartedAt}:${featureId}:${revisionKey}`;
 }
 
 /** Extract and validate the delivered Slack timestamp from a writeback receipt. */
@@ -535,6 +617,15 @@ export function deliveredSlackTs(result: WritebackResult | null | undefined): st
   if (isSlackTs(externalId)) return externalId;
   const ts = typeof receipt?.ts === 'string' ? receipt.ts.trim() : '';
   return isSlackTs(ts) ? ts : '';
+}
+
+/** Convert Slack's provider timestamp into a deterministic canonical time. */
+function slackTsTimestamp(ts: string): string {
+  const seconds = Number(ts);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error('Slack provider timestamp cannot identify the question time');
+  }
+  return new Date(seconds * 1_000).toISOString();
 }
 
 // ── feature selection ─────────────────────────────────────────────────────────
@@ -608,6 +699,8 @@ async function generateQuizMessage(ctx: WorkforceCtx, feature: Feature): Promise
 
 export interface GuardianDependencies {
   createSlackClient?: typeof slackClient;
+  registerQuestion?: typeof registerGuardianQuestion;
+  conversationDependencies?: Pick<GuardianConversationDependencies, 'conversationStore' | 'now'>;
 }
 
 /** Execute one fail-closed guardian tick from manifest load through durable Slack checkpoint. */
@@ -624,9 +717,11 @@ export async function runGuardian(
   }
 
   // Load the live feature list from the manifest
+  let catalog: GuardianManifestCatalog;
   let features: Feature[];
   try {
-    features = await loadFeatures(ctx);
+    catalog = await loadFactoryGuardianCatalog(ctx);
+    features = catalog.features.map(snapshotManifestFeature);
   } catch (err) {
     const absPath = resolveManifestPath(ctx.sandbox.cwd);
     ctx.log('error', 'factory-feature-guardian.manifest-load-failed', { path: absPath, err: String(err) });
@@ -795,7 +890,11 @@ export async function runGuardian(
       { channelId: channel },
       {
         text: message,
-        idempotencyKey: featurePostIdempotencyKey(progress.state.cycleStartedAt, feature.id),
+        idempotencyKey: featurePostIdempotencyKey(progress.state.cycleStartedAt, feature.id, {
+          manifestRevision: catalog.manifestRevision,
+          procedureRevision: catalog.procedureRevision,
+          generation: progress.state.generation,
+        }),
       }
     );
   } catch (err) {
@@ -810,6 +909,34 @@ export async function runGuardian(
   if (!ts) {
     ctx.log('error', 'factory-feature-guardian.post-failed', { channel, feature: feature.id });
     throw new Error(`Slack post failed: no timestamp returned for feature ${feature.id}`);
+  }
+
+  // Bind the exact provider thread to the exact manifest/procedure revisions
+  // before advancing the scheduled cycle. If this checkpoint fails, the next
+  // tick replays the same Slack idempotency key and retries registration.
+  try {
+    await (dependencies.registerQuestion ?? registerGuardianQuestion)(
+      ctx,
+      {
+        feature: factoryFeatureSnapshot(feature),
+        manifestRevision: catalog.manifestRevision,
+        manifestVersion: catalog.manifestVersion,
+        procedureRevision: catalog.procedureRevision,
+        generation: progress.state.generation,
+        channelId: channel,
+        threadTs: ts,
+        askedAt: slackTsTimestamp(ts),
+      },
+      dependencies.conversationDependencies,
+    );
+  } catch (err) {
+    ctx.log('error', 'factory-feature-guardian.conversation-checkpoint-failed', {
+      channel,
+      feature: feature.id,
+      ts,
+      err: String(err),
+    });
+    return;
   }
 
   // Checkpoint immediately after the confirmed provider receipt. The stable
@@ -844,7 +971,509 @@ export async function runGuardian(
   });
 }
 
-export default defineAgent({
+const FACTORY_PROCEDURE_COMMANDS: Record<string, string> = {
+  'cli-and-package': [
+    'npm run build',
+    'npm test -- --run src/cli/fleet.test.ts src/featuremap/validate.test.ts',
+    'node bin/factory.mjs --help | tee "$TMP/help.txt"',
+    'node bin/factory.mjs --version | tee "$TMP/version.txt"',
+    'node bin/factory.mjs featuremap check | tee "$TMP/featuremap.json"',
+    'node -e \'const p=require("./package.json"); if (!p.version) process.exit(1)\'',
+    "grep -Fq 'featuremap check' \"$TMP/help.txt\"",
+    "grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+' \"$TMP/version.txt\"",
+    'node -e \'const r=require(process.argv[1]); if (!r.ok || r.featureCount < 1) process.exit(1)\' "$TMP/featuremap.json"',
+  ].join('\n'),
+  'fleet-execution': [
+    'npm run build',
+    'npx vitest run \\',
+    '  src/cli/fleet.test.ts \\',
+    '  src/fleet/create-fleet.test.ts \\',
+    '  src/fleet/ensure-relay-broker.test.ts \\',
+    '  src/fleet/internal-fleet-client.test.ts \\',
+    '  src/fleet/relay-fleet-client.test.ts \\',
+    '  src/node/factory-node.test.ts',
+  ].join('\n'),
+  'provider-discovery': [
+    'factory triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"',
+    'factory canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"',
+    'factory run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"',
+    "node -e 'const r=require(process.argv[1]); if (!r.ok) process.exit(1)' \"$TMP/canary.json\"",
+  ].join('\n'),
+  'triage-and-configuration': [
+    'npx vitest run \\',
+    '  src/config/schema.test.ts \\',
+    '  src/config/local-clone-paths.test.ts \\',
+    '  src/triage/triage.test.ts \\',
+    '  src/safety/factory-scope.test.ts',
+  ].join('\n'),
+  'issue-dispatch-lifecycle': [
+    'npx vitest run \\',
+    '  src/orchestrator/batch-tracker.test.ts \\',
+    '  src/orchestrator/factory.test.ts \\',
+    '  src/dispatch/templates.test.ts \\',
+    '  src/git/agent-worktree.test.ts \\',
+    '  src/state/file-state-store.test.ts \\',
+    '  src/state/github-lifecycle-identity.test.ts',
+  ].join('\n'),
+  'human-clarification': [
+    'npx vitest run \\',
+    '  src/config/schema.test.ts \\',
+    '  src/orchestrator/coalesced-task-queue.test.ts \\',
+    '  src/orchestrator/factory.test.ts \\',
+    '  src/state/file-state-store.test.ts',
+  ].join('\n'),
+  'pull-request-lifecycle': [
+    'npx vitest run \\',
+    '  src/github/merge-gate.test.ts \\',
+    '  src/github/probe-closer.test.ts \\',
+    '  src/github/standalone-babysitter.test.ts \\',
+    '  src/orchestrator/factory.test.ts \\',
+    '  src/state/file-state-store.test.ts',
+  ].join('\n'),
+  'safety-boundaries': [
+    'npx vitest run \\',
+    '  src/safety/factory-scope.test.ts \\',
+    '  src/github/merge-gate.test.ts \\',
+    '  src/github/probe-closer.test.ts \\',
+    '  src/node/factory-node.test.ts \\',
+    '  src/__tests__/mount-delete-callsite-invariant.test.ts \\',
+    '  src/__tests__/writefile-callsite-invariant.test.ts',
+  ].join('\n'),
+  'integrations-and-writeback': [
+    'npx vitest run \\',
+    '  src/mount/local-mount-preflight.test.ts \\',
+    '  src/mount/relayfile-binary.test.ts \\',
+    '  src/mount/relayfile-cloud-mount-client.test.ts \\',
+    '  src/mount/relayfile-github-connection-write.test.ts \\',
+    '  src/mount/relayfile-integration-preflight.test.ts \\',
+    '  src/writeback/writeback.test.ts',
+  ].join('\n'),
+  'event-intake': [
+    'npx vitest run \\',
+    '  src/webhook/handler.test.ts \\',
+    '  src/webhook/registrar.test.ts \\',
+    '  src/subscriptions/__tests__/globs.test.ts \\',
+    '  src/subscriptions/__tests__/linear-filter.test.ts \\',
+    '  src/subscriptions/__tests__/slack-filter.test.ts \\',
+    '  src/subscriptions/__tests__/specs.test.ts \\',
+    '  src/subscriptions/__tests__/event-client.test.ts',
+  ].join('\n'),
+  'public-api': [
+    'npm run build',
+    'npx vitest run src/__tests__/dist-entrypoints.test.ts',
+    'npm pack --pack-destination "$TMP"',
+    'mkdir "$TMP/consumer" && cd "$TMP/consumer"',
+    'npm init -y >/dev/null',
+    'npm install --ignore-scripts "$TMP"/*.tgz >/dev/null',
+    "node --input-type=module <<'NODE'",
+    "for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/feature-guardian', '/hosted', '/environments']) {",
+    '  const mod = await import(`@agent-relay/factory${subpath}`)',
+    "  if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)",
+    '}',
+    "const node = await import('@agent-relay/factory/node')",
+    "if (!node.default) throw new Error('node default export missing')",
+    'NODE',
+  ].join('\n'),
+  'hosted-control-plane': [
+    'npx vitest run \\',
+    '  src/hosted/orchestrator.test.ts \\',
+    '  src/hosted/state-store.test.ts \\',
+    '  src/hosted/worker-safety.test.ts',
+  ].join('\n'),
+  'cloud-observability': [
+    'npx vitest run \\',
+    '  src/observability/events.test.ts \\',
+    '  src/observability/instance-identity.test.ts \\',
+    '  src/observability/outbox.test.ts \\',
+    '  src/observability/cloud-reporter.test.ts \\',
+    '  src/cli/fleet.test.ts',
+  ].join('\n'),
+  'release-verification': [
+    'npm run build',
+    'npm run featuremap:check',
+    'npm test',
+    'node bin/factory.mjs --help >/dev/null',
+  ].join('\n'),
+  'proactive-health': [
+    'npx vitest run \\',
+    '  .agentworkforce/agents/factory-feature-guardian/manifest-contract.test.ts \\',
+    '  .agentworkforce/agents/factory-feature-guardian/agent.test.ts \\',
+    '  src/feature-guardian/conversation.test.ts',
+  ].join('\n'),
+  'loop-and-recovery': [
+    'npx vitest run \\',
+    '  src/orchestrator/factory.test.ts \\',
+    '  src/orchestrator/process-identity.test.ts \\',
+    '  src/orchestrator/reaper.test.ts \\',
+    '  src/state/file-state-store.test.ts',
+  ].join('\n'),
+  'verification-environments': [
+    'npm run build',
+    'npx vitest run \\',
+    '  src/environments/verification-stack-descriptor.test.ts \\',
+    '  src/environments/verification-stack-deployer.test.ts \\',
+    '  src/environments/kubernetes-provider.test.ts \\',
+    '  src/environments/load-harness.test.ts \\',
+    '  src/environments/verification-pipeline.test.ts \\',
+    '  src/orchestrator/environment-reaper.test.ts',
+  ].join('\n'),
+};
+
+/** Resolve one named manifest procedure without allowing a heading escape. */
+export async function resolveFactoryGuardianProcedure(
+  ctx: WorkforceCtx,
+  feature: GuardianFeatureSnapshot,
+): Promise<GuardianProcedure> {
+  if (!/^[a-z0-9-]+$/u.test(feature.procedure)) {
+    throw new Error(`Factory feature ${feature.id} has an invalid procedure name`);
+  }
+  const path = resolveProceduresPath(ctx.sandbox.cwd);
+  const raw = await ctx.sandbox.readFile(path);
+  const escaped = feature.procedure.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const match = raw.match(
+    new RegExp(`^## ${escaped}\\s*$([\\s\\S]*?)(?=^## |(?![\\s\\S]))`, 'mu'),
+  );
+  if (!match?.[1]) {
+    throw new Error(`Missing Factory verification procedure: ${feature.procedure}`);
+  }
+  const body = match[1].trim();
+  const prerequisites = body.match(/\*\*Prerequisites:\*\*\s*([\s\S]*?)(?=\n```|\n\n)/u)?.[1]
+    ?.replace(/\s+/gu, ' ')
+    .trim();
+  if (!prerequisites) {
+    throw new Error(`Factory procedure ${feature.procedure} has no explicit prerequisites`);
+  }
+  return { name: feature.procedure, path: PROCEDURES_RELPATH, prerequisites, body };
+}
+
+/** Keep live/provider tiers opt-in and never turn missing prerequisites into confirmation. */
+export async function gateFactoryGuardianTier(
+  ctx: WorkforceCtx,
+  feature: GuardianFeatureSnapshot,
+  procedure: GuardianProcedure,
+) {
+  const command = FACTORY_PROCEDURE_COMMANDS[procedure.name];
+  if (!command) {
+    return { outcome: 'manual' as const, reason: `MANUAL: ${procedure.name} has no bounded automation command.` };
+  }
+  const repository = `${ctx.sandbox.cwd}/${FACTORY_REPO_RELPATH}`;
+  const packagePrerequisites = await ctx.sandbox.exec(
+    'test -f package.json && test -d node_modules && command -v node >/dev/null && command -v npm >/dev/null',
+    { cwd: repository, timeoutMs: 10_000 },
+  );
+  if (packagePrerequisites.exitCode !== 0) {
+    return {
+      outcome: 'skip' as const,
+      reason: 'SKIP: the scoped Factory checkout or its installed Node dependencies are unavailable.',
+    };
+  }
+  const maximum = Number(factoryGuardianInput(ctx, 'GUARDIAN_VERIFY_MAX_TIER') ?? '2');
+  if (!Number.isInteger(maximum) || feature.tier > maximum) {
+    return {
+      outcome: 'manual' as const,
+      reason: `MANUAL: tier ${feature.tier} exceeds the configured automated tier ${Number.isInteger(maximum) ? maximum : 2}.`,
+    };
+  }
+  if (feature.tier >= 6) {
+    return { outcome: 'manual' as const, reason: 'MANUAL: tier 6 requires a selected disposable live issue or pull request.' };
+  }
+  if (feature.tier >= 3) {
+    const optIn = new Set(
+      (factoryGuardianInput(ctx, 'GUARDIAN_LIVE_VERIFY_OPT_IN') ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean),
+    );
+    if (!optIn.has(feature.id) && !optIn.has(feature.procedure)) {
+      return {
+        outcome: 'manual' as const,
+        reason: `MANUAL: tier ${feature.tier} needs explicit opt-in for ${feature.id} or ${feature.procedure}.`,
+      };
+    }
+  }
+  if (
+    feature.tier === 3 &&
+    (!process.env.FACTORY_VERIFY_CANARY_ISSUE ||
+      !process.env.FACTORY_VERIFY_CONFIG ||
+      (await ctx.sandbox.exec('command -v factory >/dev/null', {
+        cwd: repository,
+        timeoutMs: 5_000,
+      })).exitCode !== 0)
+  ) {
+    return { outcome: 'skip' as const, reason: 'SKIP: the disposable provider issue/config or installed Factory CLI prerequisite is unavailable.' };
+  }
+  if (feature.tier === 4 && process.env.FACTORY_GUARDIAN_FLEET_OPT_IN !== 'true') {
+    return { outcome: 'skip' as const, reason: 'SKIP: no explicitly authorized disposable fleet is available.' };
+  }
+  if (
+    feature.tier === 5 &&
+    (!ctx.credentials.tryRequire() || process.env.FACTORY_GUARDIAN_CLOUD_OPT_IN !== 'true')
+  ) {
+    return { outcome: 'skip' as const, reason: 'SKIP: cloud credentials and writable disposable mount opt-in are unavailable.' };
+  }
+  return { outcome: 'available' as const, reason: `Tier ${feature.tier} prerequisites are available.` };
+}
+
+/** Execute only the exact bounded command documented by the named procedure. */
+export async function runFactoryGuardianProcedure(
+  ctx: WorkforceCtx,
+  feature: GuardianFeatureSnapshot,
+  procedure: GuardianProcedure,
+  runKey: string,
+): Promise<GuardianProcedureResult> {
+  const command = FACTORY_PROCEDURE_COMMANDS[procedure.name];
+  if (!command || !normalizedWhitespace(procedure.body).includes(normalizedWhitespace(command))) {
+    return {
+      source: 'procedure',
+      result: 'negative',
+      outcome: 'failed',
+      verifier: 'factory-feature-guardian:procedure-runner',
+      summary: `Procedure drift: ${procedure.name} no longer contains the allowlisted exact tier-safe command.`,
+      commands: [],
+      positiveAssertions: [],
+      negativeAssertions: ['Documented command did not match the Factory adapter allowlist.'],
+      tests: { passed: 0, failed: 0 },
+      cleanup: ['No command executed.'],
+    };
+  }
+  const run = runKey.replace(/[^a-zA-Z0-9_.-]/gu, '-').slice(-80);
+  const repository = `${ctx.sandbox.cwd}/${FACTORY_REPO_RELPATH}`;
+  const wrapped = [
+    'set -Eeuo pipefail',
+    'TMP="$(mktemp -d)"',
+    'cleanup() {',
+    '  status=$?',
+    '  cd /',
+    '  rm -rf "$TMP"',
+    '  if [[ -e "$TMP" ]]; then',
+    '    printf "__FACTORY_GUARDIAN_CLEANUP_FAILED__\\n" >&2',
+    '    status=1',
+    '  else',
+    '    printf "__FACTORY_GUARDIAN_CLEANUP_OK__\\n"',
+    '  fi',
+    '  exit "$status"',
+    '}',
+    'trap cleanup EXIT',
+    `RUN="${run}"`,
+    'CONFIG="${FACTORY_VERIFY_CONFIG:-$TMP/factory.config.json}"',
+    'export TMP RUN CONFIG',
+    `SOURCE=${shellQuote(repository)}`,
+    'mkdir "$TMP/repo"',
+    '(cd "$SOURCE" && tar --exclude=.git --exclude=node_modules --exclude=dist --exclude=artifacts -cf - .) | tar -xf - -C "$TMP/repo"',
+    'ln -s "$SOURCE/node_modules" "$TMP/repo/node_modules"',
+    'cd "$TMP/repo"',
+    command,
+  ].join('\n');
+  const execution = await ctx.sandbox.exec(wrapped, {
+    cwd: repository,
+    timeoutMs: 240_000,
+  });
+  const counts = parseFactoryGuardianTestCounts(execution.output);
+  const output = boundedText(execution.output.trim(), 2_000);
+  const cleaned = execution.output.includes('__FACTORY_GUARDIAN_CLEANUP_OK__');
+  if (execution.exitCode !== 0 || !cleaned) {
+    return {
+      source: 'procedure',
+      result: 'negative',
+      outcome: 'failed',
+      verifier: 'factory-feature-guardian:procedure-runner',
+      summary: `${procedure.name} failed with exit ${execution.exitCode}: ${output || '(no output)'}`,
+      commands: [command],
+      positiveAssertions: ['Exact tier-safe documented command and isolated cleanup trap were selected.'],
+      negativeAssertions: [
+        `Command exited ${execution.exitCode}.`,
+        ...(!cleaned ? ['Isolated workspace cleanup was not positively observed.'] : []),
+      ],
+      tests: counts,
+      cleanup: [cleaned
+        ? 'Observed removal of the unique temporary checkout.'
+        : 'Temporary-checkout removal was not confirmed.'],
+    };
+  }
+  return {
+    source: 'procedure',
+    result: 'positive',
+    outcome: 'passed',
+    verifier: 'factory-feature-guardian:procedure-runner',
+    summary: `${procedure.name} passed${counts.passed ? ` with ${counts.passed} tests` : ''}.`,
+    commands: [command],
+    positiveAssertions: [
+      'The exact tier-safe checked-in procedure command exited 0.',
+      'The named procedure and command allowlist matched.',
+    ],
+    negativeAssertions: [],
+    tests: counts,
+    cleanup: ['Observed removal of the unique temporary checkout.'],
+  };
+}
+
+export const factoryFeatureGuardianAdapters: FeatureGuardianAdapters = {
+  loadCatalog: loadFactoryGuardianCatalog,
+  resolveProcedure: resolveFactoryGuardianProcedure,
+  gateTier: gateFactoryGuardianTier,
+  runProcedure: runFactoryGuardianProcedure,
+  isAuthorizedConfirmer: (ctx, actorId) => {
+    const authorities = [
+      factoryGuardianInput(ctx, 'SLACK_USER_WILL'),
+      factoryGuardianInput(ctx, 'SLACK_USER_KHALIQ'),
+    ].filter((value): value is string => Boolean(value));
+    return authorities.includes(actorId);
+  },
+  clarification: (feature, procedure, turn, turnNumber) => {
+    const surface = [feature.cli && `CLI \`${feature.cli}\``, feature.api && `API/config \`${feature.api}\``]
+      .filter(Boolean)
+      .join(' / ');
+    const focus = turnNumber === 1
+      ? 'What exact command or user-visible path did you try, and what did you observe?'
+      : 'Please paste the positive and negative assertion results plus any cleanup evidence; if it was not run, say which prerequisite is unavailable.';
+    return [
+      `I can't confirm *${feature.name}* from that response yet (clarification ${turnNumber}).`,
+      `${surface}; source ${feature.locations.map((path) => `\`${path}\``).join(', ')}.`,
+      `Use \`${procedure.name}\` at tier ${feature.tier}: ${procedure.prerequisites}`,
+      focus,
+    ].join(' ');
+  },
+  classifyDefect: (_feature, turn, evidence) => classifyFactoryDefect(turn.text, evidence),
+  repositoryForFeature: () => 'AgentWorkforce/factory',
+  issuePolicy: ({ feature, conversation, defectKind, slackBacklink }) =>
+    factoryGuardianIssuePolicy(feature, conversation, defectKind, slackBacklink),
+};
+
+function factoryGuardianIssuePolicy(
+  feature: GuardianFeatureSnapshot,
+  conversation: Parameters<FeatureGuardianAdapters['issuePolicy']>[0]['conversation'],
+  defectKind: GuardianDefectKind,
+  slackBacklink: string,
+): GuardianIssuePolicy {
+  const dedupeKey = `factory:${feature.id}:${feature.procedure}`;
+  const commands = conversation.evidence.flatMap((entry) => entry.commands ?? []);
+  const observed = conversation.evidence
+    .filter((entry) => entry.result === 'negative')
+    .map((entry) => `- ${entry.summary}`)
+    .join('\n') || '- The scoped guardian response reported a defect.';
+  const evidence = conversation.evidence.map((entry) =>
+    `- ${entry.source}/${entry.result}: ${entry.summary}`,
+  ).join('\n');
+  return {
+    repository: 'AgentWorkforce/factory',
+    defectKind,
+    dedupeKey,
+    labels: ['factory-ready'],
+    title: `[Feature guardian] ${feature.name}: ${defectKind} defect`,
+    body: [
+      remediationMarker(dedupeKey),
+      '## Guardian finding',
+      '',
+      `Feature \`${feature.id}\` has an established **${defectKind}** defect.`,
+      `Manifest revision: \`${conversation.manifestRevision}\`; generation: \`${conversation.generation}\`.`,
+      '',
+      '## Expected behavior',
+      '',
+      feature.description,
+      '',
+      '## Observed behavior',
+      '',
+      observed,
+      '',
+      '## Reproduction and evidence',
+      '',
+      evidence,
+      ...(commands.length > 0 ? ['', '```bash', ...commands, '```'] : []),
+      '',
+      '## Affected surfaces',
+      '',
+      `- Feature: \`${feature.id}\` (${feature.category})`,
+      `- Procedure: \`${PROCEDURES_RELPATH}#${feature.procedure}\``,
+      ...feature.locations.map((path) => `- Source: \`${path}\``),
+      `- Verification tier: ${feature.tier}`,
+      `- Slack thread: ${slackBacklink}`,
+      '',
+      '## Definition of done',
+      '',
+      `- [ ] Correct the ${defectKind} defect at the affected Factory surface.`,
+      `- [ ] Add or update a regression test that fails before the fix and passes after it.`,
+      `- [ ] Run the exact \`${feature.procedure}\` procedure and record positive/negative assertions and cleanup.`,
+      '- [ ] Reconcile the manifest, procedure, and runbook so they describe the implemented behavior.',
+      '- [ ] Re-run the feature guardian check and produce one exact-revision confirmation record.',
+    ].join('\n'),
+  };
+}
+
+function classifyFactoryDefect(
+  text: string,
+  evidence: readonly { source?: string; result?: string; summary: string }[],
+): GuardianDefectKind {
+  if (evidence.some((entry) =>
+    entry.source === 'procedure' &&
+    entry.result === 'negative' &&
+    /\bprocedure drift\b/iu.test(entry.summary),
+  )) return 'procedure';
+  const actorEvidence = evidence
+    .filter((entry) => entry.source === 'actor')
+    .map((entry) => entry.summary)
+    .join('\n');
+  const haystack = `${text}\n${actorEvidence}`.toLowerCase();
+  if (/\b(manifest|catalog|feature map|featuremap)\b/u.test(haystack)) return 'manifest';
+  if (/\b(procedure|runbook|verification steps?)\b/u.test(haystack)) return 'procedure';
+  if (/\b(documentation|docs?|readme)\b/u.test(haystack)) return 'documentation';
+  if (/\b(test|spec|fixture|assertion)\b/u.test(haystack)) return 'test';
+  return 'implementation';
+}
+
+function factoryGuardianInput(ctx: WorkforceCtx, name: string): string | undefined {
+  const spec = ctx.persona?.inputSpecs?.[name];
+  const value = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizedWhitespace(value: string): string {
+  return value.replace(/\s+/gu, ' ').trim();
+}
+
+export function parseFactoryGuardianTestCounts(output: string): { passed: number; failed: number } {
+  const summary = output
+    .replace(/\u001b\[[0-9;]*m/gu, '')
+    .split(/\r?\n/u)
+    .filter((line) => /^\s*Tests(?:\s|:)/u.test(line))
+    .at(-1) ?? '';
+  const passed = Number(summary.match(/\b(\d+)\s+passed\b/iu)?.[1] ?? 0);
+  const failed = Number(summary.match(/\b(\d+)\s+failed\b/iu)?.[1] ?? 0);
+  return { passed, failed };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function boundedText(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+export interface FactoryGuardianHandlerDependencies {
+  schedule?: GuardianDependencies;
+  conversation?: GuardianConversationDependencies;
+}
+
+export async function runFactoryFeatureGuardian(
+  ctx: WorkforceCtx,
+  event: WorkforceEvent,
+  dependencies: FactoryGuardianHandlerDependencies = {},
+): Promise<void> {
+  if (event.type === 'cron.tick') {
+    await runGuardian(ctx, event, dependencies.schedule);
+    return;
+  }
+  await runGuardianConversationTurn(
+    ctx,
+    event,
+    factoryFeatureGuardianAdapters,
+    dependencies.conversation,
+  );
+}
+
+export default defineFeatureGuardianAgent({
+  adapters: factoryFeatureGuardianAdapters,
+  scheduled: runGuardian,
+  channelInput: 'SLACK_CHANNEL',
   schedules: [{ name: 'hourly-check', cron: '0 * * * *', tz: 'America/New_York' }],
-  handler: runGuardian,
 });

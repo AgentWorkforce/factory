@@ -2,7 +2,7 @@
   "id": "factory-feature-guardian",
   "intent": "relay-orchestrator",
   "tags": ["factory", "verification", "proactive", "health", "release-safety", "durability"],
-  "description": "Reads the validated Factory feature catalog from a scoped repository clone, then cycles through every @agent-relay/factory feature hourly. Each provider-confirmed, idempotent Slack check names the exact source surface, named end-to-end procedure, verification tier, and supported safety/topology boundary; exact revisioned progress persists across the exhaustive manifest and resets only after a complete cycle.",
+  "description": "Cycles through every Factory feature hourly, then owns exact-message Slack reactions and replies through clarification, safely gated procedure evidence, immutable exact-revision confirmation, or one deduplicated factory-ready remediation issue.",
   "cloud": true,
   "harness": "opencode",
   "model": "deepseek-v4-flash-free",
@@ -13,25 +13,30 @@
   "integrations": {
     "github": {
       "scope": {
-        "repo": "AgentWorkforce/factory"
+        "repo": "AgentWorkforce/factory",
+        "resources": ["issues"]
       },
       "relayfileMount": {
         "requiredReadPaths": [
-          "/github/repos/AgentWorkforce/factory/.agentworkforce/features/**"
+          "/github/repos/AgentWorkforce/factory/**"
         ],
-        "writeOnlyPaths": []
+        "writeOnlyPaths": [
+          "/github/repos/AgentWorkforce/factory/issues/**"
+        ]
       }
     },
     "slack": {
       "optional": true,
       "enabledByInput": "SLACK_CHANNEL",
       "scope": {
-        "paths": "/slack/channels/**"
+        "paths": "/slack/channels/${SLACK_CHANNEL}/messages/**"
       },
       "relayfileMount": {
-        "requiredReadPaths": [],
+        "requiredReadPaths": [
+          "/slack/channels/${SLACK_CHANNEL}/messages/**"
+        ],
         "writeOnlyPaths": [
-          "/slack/channels/${SLACK_CHANNEL}/**"
+          "/slack/channels/${SLACK_CHANNEL}/messages/**"
         ]
       }
     }
@@ -63,6 +68,36 @@
         "provider": "slack",
         "resource": "users"
       }
+    },
+    "GUARDIAN_VERIFY_MAX_TIER": {
+      "description": "Highest verification tier the guardian may automate; tiers above it remain MANUAL.",
+      "env": "GUARDIAN_VERIFY_MAX_TIER",
+      "default": "2"
+    },
+    "GUARDIAN_LIVE_VERIFY_OPT_IN": {
+      "description": "Comma-separated feature IDs or named procedures explicitly authorized for tier 3-5 disposable checks.",
+      "env": "GUARDIAN_LIVE_VERIFY_OPT_IN",
+      "optional": true
+    },
+    "FACTORY_VERIFY_CANARY_ISSUE": {
+      "description": "Disposable provider issue selected for explicitly opted-in tier-3 checks.",
+      "env": "FACTORY_VERIFY_CANARY_ISSUE",
+      "optional": true
+    },
+    "FACTORY_VERIFY_CONFIG": {
+      "description": "Disposable Factory config selected for explicitly opted-in provider checks.",
+      "env": "FACTORY_VERIFY_CONFIG",
+      "optional": true
+    },
+    "FACTORY_GUARDIAN_FLEET_OPT_IN": {
+      "description": "Explicit authorization to use a disposable fleet for a tier-4 procedure.",
+      "env": "FACTORY_GUARDIAN_FLEET_OPT_IN",
+      "optional": true
+    },
+    "FACTORY_GUARDIAN_CLOUD_OPT_IN": {
+      "description": "Explicit authorization to use disposable writable Cloud resources for a tier-5 procedure.",
+      "env": "FACTORY_GUARDIAN_CLOUD_OPT_IN",
+      "optional": true
     }
   },
   "memory": {
