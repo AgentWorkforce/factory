@@ -284,6 +284,7 @@ const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
+const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
@@ -441,6 +442,8 @@ export class FactoryLoop implements Factory {
   #completionSweepActive = false
   readonly #completionInFlight = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
+  #reconciledAgentExitsActive = 0
+  readonly #reconciledAgentExitWaiters: Array<() => void> = []
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   #startupAgentAdoptionActive = false
   #startupRosterExitSignals?: Set<string>
@@ -2660,7 +2663,13 @@ export class FactoryLoop implements Factory {
     const previous = this.#agentExitsInFlight.get(name) ?? Promise.resolve()
     const handling = previous
       .catch(() => undefined)
-      .then(async () => await this.#handleAgentExit(name, reason))
+      .then(async () => {
+        if (reason === 'reconciled-missing') {
+          await this.#withReconciledAgentExitSlot(async () => this.#handleAgentExit(name, reason))
+          return
+        }
+        await this.#handleAgentExit(name, reason)
+      })
       .catch((error) => this.#error(error))
       .finally(() => {
         if (this.#agentExitsInFlight.get(name) === handling) {
@@ -2776,7 +2785,13 @@ export class FactoryLoop implements Factory {
         // the hydrated durable session is no longer usable. Classify it as a
         // reconciled miss so remote implementers recover a PR or restart
         // instead of waiting forever for branch replication after a crash.
-        for (const name of signalled) this.#queueAgentExit(name, 'reconciled-missing')
+        const rolePriority = (name: string): number => {
+          const role = batch.getIssueByAgent(name)?.agents.get(name)?.spec.role
+          return role === 'implementer' ? 0 : role === 'babysitter' ? 1 : 2
+        }
+        const orderedSignals = [...signalled].sort((left, right) =>
+          rolePriority(left) - rolePriority(right) || left.localeCompare(right))
+        for (const name of orderedSignals) this.#queueAgentExit(name, 'reconciled-missing')
         if (synthesized.length > 0) {
           this.#increment('startupRosterMissingExitsSynthesized', synthesized.length)
           this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
@@ -2898,6 +2913,20 @@ export class FactoryLoop implements Factory {
     ])
     if (timer) clearTimeout(timer)
     return completed
+  }
+
+  async #withReconciledAgentExitSlot(run: () => Promise<void>): Promise<void> {
+    if (this.#reconciledAgentExitsActive >= RECONCILED_AGENT_EXIT_CONCURRENCY) {
+      this.#increment('reconciledAgentExitBackpressure')
+      await new Promise<void>((resolve) => this.#reconciledAgentExitWaiters.push(resolve))
+    }
+    this.#reconciledAgentExitsActive += 1
+    try {
+      await run()
+    } finally {
+      this.#reconciledAgentExitsActive -= 1
+      this.#reconciledAgentExitWaiters.shift()?.()
+    }
   }
 
   #scheduleDispatchLifecycleRenewal(): void {

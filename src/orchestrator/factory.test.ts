@@ -5698,6 +5698,72 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('bounds and prioritizes concurrent startup exit recovery across durable issues', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-bounded-startup-exits-'))
+    const watchStatePath = join(root, 'state.json')
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const issueNumbers = [610, 611, 612, 613, 614]
+    const mount = new FakeMountClient(Object.fromEntries(
+      issueNumbers.map((number) => [issuePath(number), issueFile(number)]),
+    ))
+    const state = () => new FileStateStore({ batchSize: 5, watchStatePath })
+    const factoryConfig = config({ batchSize: 5, loop: { registryPath, heartbeatPath } })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    let releaseProbes!: () => void
+    let signalLimitReached!: () => void
+    const probesReleased = new Promise<void>((resolve) => { releaseProbes = resolve })
+    const limitReached = new Promise<void>((resolve) => { signalLimitReached = resolve })
+    let activeProbes = 0
+    let maxActiveProbes = 0
+    let probeCalls = 0
+    try {
+      for (const number of issueNumbers) {
+        await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      }
+      await first.stop()
+
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: new MissingHydratedRosterFleetClient('never'),
+        stateStore: state(),
+        triage: new StaticTriage(),
+        probePrGhRunner: async () => {
+          probeCalls += 1
+          activeProbes += 1
+          maxActiveProbes = Math.max(maxActiveProbes, activeProbes)
+          if (activeProbes === 4) signalLimitReached()
+          await probesReleased
+          activeProbes -= 1
+          return { stdout: '[]' }
+        },
+      })
+
+      const starting = restarted.start({ mode: 'dispatch-owner' })
+      await limitReached
+      await flush()
+      expect(probeCalls).toBe(4)
+      expect(maxActiveProbes).toBe(4)
+
+      releaseProbes()
+      await starting
+      expect(probeCalls).toBe(5)
+      expect(maxActiveProbes).toBe(4)
+      expect(restarted.status().counters.reconciledAgentExitBackpressure).toBeGreaterThan(0)
+    } finally {
+      releaseProbes()
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists an existing PR receipt when restart reconciliation finds a missing implementer', async () => {
     const issue = issueFile(591)
     const publishPullRequest = vi.fn(async () => {
