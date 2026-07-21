@@ -108,6 +108,31 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('can suppress routine stale-refresh progress for caller-level summaries', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      })
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount: async () => writeMountState(dir, {
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+          pid: process.pid,
+        }),
+        suppressStaleRefreshLogs: true,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount is stale'))
+      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('local mount refreshed'))
+    })
+  })
+
   it('does not report a stale state file as refreshed when the SDK start leaves it unchanged', async () => {
     await withTempDir(async (dir) => {
       await writeMountState(dir, {

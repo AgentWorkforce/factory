@@ -53,6 +53,48 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('atomically adopts an existing GitHub lifecycle across Relayfile issue aliases', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-github-alias-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 2 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const byId = githubDispatchLifecycle(146, '/github/repos/AgentWorkforce__factory/issues/by-id/146.json')
+        const slugged = githubDispatchLifecycle(
+          146,
+          '/github/repos/AgentWorkforce/factory/issues/146__stand-up-test-infra/meta.json',
+        )
+        const byIdKey = `146:${byId.issue.uuid}:${byId.issue.path}`
+        const sluggedKey = `146:${slugged.issue.uuid}:${slugged.issue.path}`
+
+        const initial = await store.claimDispatchLifecycle(
+          workspace, byIdKey, byId, 'owner-a', 1_000, 5_000,
+        )
+        const alias = await store.claimDispatchLifecycle(
+          workspace, sluggedKey, slugged, 'owner-a', 1_001, 5_000,
+        )
+
+        expect(initial).toMatchObject({ key: byIdKey, acquired: true, created: true })
+        expect(alias).toMatchObject({ key: byIdKey, acquired: true, created: false })
+        expect(alias.lifecycle.issue.path).toBe(byId.issue.path)
+        expect(await store.listDispatchLifecycles(workspace)).toHaveLength(1)
+
+        expect(await store.saveDispatchLifecycle(workspace, byIdKey, 'owner-a', 1, 1_002, {
+          ...alias.lifecycle,
+          phase: 'complete',
+        })).toBe(true)
+        await expect(store.claimDispatchLifecycle(
+          workspace, sluggedKey, slugged, 'owner-b', 1_003, 5_000,
+        )).resolves.toMatchObject({ key: byIdKey, acquired: false, created: false, lifecycle: { phase: 'complete' } })
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('restores and clears babysitter ownership plus pending wake state in a fresh process-equivalent store', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-babysitter-'))
     try {
@@ -297,6 +339,40 @@ describe('FileStateStore', () => {
       })).toBe(true)
       expect(await second.promoteDispatchLifecycle('workspace-1', secondKey, 'owner-b', 1, 1_004)).toBe(true)
       expect(await second.getDispatchLifecycle('workspace-1', secondKey)).toMatchObject({ phase: 'dispatching' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fences queued lifecycle cleanup against a concurrent promotion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-queued-clear-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 2 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const promotedKey = `promoted-${index}`
+        const queuedSeed = { ...dispatchLifecycle(880 + index), phase: 'queued' as const }
+        const snapshot = await store.claimDispatchLifecycle(
+          workspace, promotedKey, queuedSeed, `owner-${index}`, 1_000, 5_000,
+        )
+        expect(snapshot.lease).toBeDefined()
+        expect(await store.promoteDispatchLifecycle(
+          workspace, promotedKey, `owner-${index}`, snapshot.lease!.epoch, 1_001,
+        )).toBe(true)
+
+        expect(await store.clearQueuedDispatchLifecycle(workspace, promotedKey, snapshot.lease)).toBe(false)
+        expect(await store.getDispatchLifecycle(workspace, promotedKey)).toMatchObject({ phase: 'dispatching' })
+
+        const queuedKey = `queued-${index}`
+        const queued = await store.claimDispatchLifecycle(
+          workspace, queuedKey, { ...dispatchLifecycle(890 + index), phase: 'queued' }, `owner-q-${index}`, 1_002, 5_000,
+        )
+        expect(await store.clearQueuedDispatchLifecycle(workspace, queuedKey, queued.lease)).toBe(true)
+        expect(await store.getDispatchLifecycle(workspace, queuedKey)).toBeUndefined()
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -660,6 +736,20 @@ const dispatchLifecycle = (number: number): DispatchLifecycle => ({
   invocationIds: [],
   updatedAtMs: 1_000,
 })
+
+const githubDispatchLifecycle = (number: number, path: string): DispatchLifecycle => {
+  const lifecycle = dispatchLifecycle(number)
+  const issue = {
+    key: String(number),
+    uuid: `AgentWorkforce/factory#${number}`,
+    path,
+  }
+  return {
+    ...lifecycle,
+    issue,
+    decision: { ...lifecycle.decision, issue },
+  }
+}
 
 const handedOffDispatchLifecycle = (number: number): DispatchLifecycle => {
   const lifecycle = dispatchLifecycle(number)
