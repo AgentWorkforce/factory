@@ -16136,8 +16136,10 @@ describe('FactoryLoop', () => {
       user_is_bot: false,
     })
     await expectSlackConversationResume(fleet, ['status?', 'status again?'], 2)
-    expect(factory.status().counters.slackConversationTurnResumeFailures).toBe(1)
-    expect(factory.status().counters.slackConversationTurnsResumed).toBe(1)
+    await vi.waitFor(() => {
+      expect(factory.status().counters.slackConversationTurnResumeFailures).toBe(1)
+      expect(factory.status().counters.slackConversationTurnsResumed).toBe(1)
+    })
     expect(slackReplyWrites(mount)).toEqual([])
   })
 
