@@ -99,11 +99,11 @@ jobs:
       # npmjs.com before the first CI publish.
       - name: Publish
         run: |
-          FLAGS="--access public --tag ${{ github.event.inputs.tag }}"
+          FLAGS=(--access public --tag "${{ github.event.inputs.tag }}")
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            npm publish --dry-run $FLAGS
+            npm publish --dry-run "${FLAGS[@]}"
           else
-            npm publish --provenance $FLAGS
+            npm publish --provenance "${FLAGS[@]}"
           fi
 
       - name: Commit + tag + push
