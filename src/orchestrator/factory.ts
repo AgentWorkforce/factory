@@ -299,10 +299,17 @@ const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
+const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
+const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
 class DispatchLifecycleCapacityError extends Error {}
+class DispatchLifecycleOwnedElsewhereError extends Error {
+  constructor(readonly leaseUntilMs?: number) {
+    super('durable dispatch is still owned by another publisher')
+  }
+}
 
 const realClock: Clock = {
   now: () => Date.now(),
@@ -395,6 +402,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
+  readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -792,6 +800,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
@@ -863,7 +872,16 @@ export class FactoryLoop implements Factory {
   }
 
   async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
-    for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+    // The epoch cache is an execution optimization, not the durable ownership
+    // authority. Error/fence paths may evict a cached epoch while its persisted
+    // lease is still ours, so enumerate state before shutdown relinquishment.
+    const owned = new Map(this.#dispatchLifecycleEpochs)
+    for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      if (lifecycle.lease?.owner === this.#dispatchLifecycleOwner) {
+        owned.set(key, lifecycle.lease.epoch)
+      }
+    }
+    for (const [key, epoch] of owned) {
       await this.#state.releaseDispatchLifecycleLease(
         this.#workspaceId,
         key,
@@ -3135,9 +3153,11 @@ export class FactoryLoop implements Factory {
       const drive = this.#driveDispatchLifecycle(key)
         .then(() => {
           this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+          this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
         })
         .catch((error) => {
           if (error instanceof DispatchLifecycleCapacityError) {
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
               this.#dispatchLifecycleCapacityWaitLogged.add(key)
               this.#increment('dispatchLifecycleCapacityWaits')
@@ -3146,8 +3166,22 @@ export class FactoryLoop implements Factory {
                 retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
               })
             }
+          } else if (error instanceof DispatchLifecycleOwnedElsewhereError) {
+            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            if (!this.#dispatchLifecycleOwnershipWaitLogged.has(key)) {
+              this.#dispatchLifecycleOwnershipWaitLogged.add(key)
+              this.#increment('dispatchLifecycleOwnershipWaits')
+              this.#logger.warn?.('[factory] durable dispatch is leased by another publisher; waiting for lease release', {
+                issue: record.issue.key,
+                leaseRemainingMs: error.leaseUntilMs === undefined
+                  ? undefined
+                  : Math.max(0, error.leaseUntilMs - this.#clock.now()),
+                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
+              })
+            }
           } else {
             this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
               issue: record.issue.key,
               error: describeError(error).errorMessage,
@@ -3206,7 +3240,7 @@ export class FactoryLoop implements Factory {
         DISPATCH_LIFECYCLE_LEASE_MS,
       )
       if (!claim.acquired || !claim.lease) {
-        throw new Error(`durable dispatch ${lifecycle.issue.key} is still owned by another publisher`)
+        throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
       this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
       this.#scheduleDispatchLifecycleRenewal()
@@ -5171,6 +5205,21 @@ export class FactoryLoop implements Factory {
         }
       }
 
+      // The internal broker can retain a historical name after its cloud
+      // presence is authoritatively offline (relay#1116-family). Reclaim that
+      // supported fleet registration before attempting the deterministic
+      // resume/respawn; otherwise recovery immediately collides with the dead
+      // name and concludes useful work as terminal.
+      if (tracingReconciledExit && this.#fleet.placementLocality === 'local') {
+        if (!await this.#reclaimStaleLocalAgentName(record, name)) {
+          // Do not immediately collide with a row the broker just refused to
+          // release. Leave durable ownership intact and let the lifecycle retry
+          // re-run reconciliation after broker pressure subsides.
+          this.#scheduleDispatchLifecycleRetry(record)
+          return
+        }
+      }
+
       let recovered = false
       if (tracked.sessionRef) {
         const resumeKey = `${issueKey(record.issue)}:${name}:${tracked.sessionRef}`
@@ -5273,6 +5322,36 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#error(error, record.issue)
     }
+  }
+
+  async #reclaimStaleLocalAgentName(record: InFlightIssue, name: string): Promise<boolean> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await this.#fleet.release(name, 'reconciled-missing')
+        this.#increment('staleLocalAgentNamesReclaimed')
+        this.#logger.info?.('[factory] reclaimed stale local agent name before recovery', {
+          issue: record.issue.key,
+          name,
+          attempt,
+        })
+        return true
+      } catch (error) {
+        lastError = error
+        if (attempt < STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS) {
+          await this.#clock.sleep(STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS * attempt)
+        }
+      }
+    }
+
+    this.#increment('staleLocalAgentNameReclaimFailures')
+    this.#logger.warn?.('[factory] stale local agent name reclaim failed; deferring recovery', {
+      issue: record.issue.key,
+      name,
+      attempts: STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS,
+      error: lastError,
+    })
+    return false
   }
 
   // Publish a PR from the implementer's committed branch when it exited without

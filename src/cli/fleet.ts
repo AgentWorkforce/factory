@@ -504,10 +504,15 @@ async function runFactoryCommand(
   const mountFn = resolveLocalMountFn(deps, mount)
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      await mountFn(workspaceId, process.cwd(), {
-        acceptableWorkspaceIds: acceptableMountIds,
-      })
-      await ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds)
+      // Local mirrors are a writeback aid, not the source of truth for remote
+      // issue discovery. Start their SDK-backed supervisors immediately, but
+      // do not serialize durable recovery behind a stale checkout's readiness
+      // timeout. The mount client reports degradation and keeps retrying.
+      void warmStartPathMounts(mountFn, workspaceId, config, acceptableMountIds)
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          process.stderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
@@ -616,6 +621,28 @@ async function runFactoryCommand(
 
   writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
   return 0
+}
+
+async function warmStartPathMounts(
+  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
+  workspaceId: string,
+  config: FactoryConfig,
+  acceptableMountIds?: readonly string[],
+): Promise<void> {
+  const daemonMount = (async () => {
+    try {
+      await mountFn(workspaceId, process.cwd(), {
+        acceptableWorkspaceIds: acceptableMountIds,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`[factory] warning: could not start relayfile mount at ${process.cwd()}: ${message}\n`)
+    }
+  })()
+  await Promise.all([
+    daemonMount,
+    ensureClonePathMounts(mountFn, workspaceId, config, acceptableMountIds),
+  ])
 }
 
 async function runStandaloneBabysitCommand(
