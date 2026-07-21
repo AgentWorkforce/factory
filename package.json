@@ -66,6 +66,7 @@
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
+    "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
     "verify:e2e": "node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
   },

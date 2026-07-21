@@ -125,6 +125,7 @@ export {
   BatchTracker,
   DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH,
   DEFAULT_FACTORY_LOOP_REGISTRY_PATH,
+  FactoryEnvironmentReaper,
   FactoryReaper,
   checkFactoryLoopLiveness,
   createFactory,
@@ -141,12 +142,15 @@ export {
   readLinearIssueWithCanonicalFallback,
   readFactoryInFlightRegistry,
   readFactoryLoopHeartbeat,
+  reapFactoryEnvironmentsOnce,
   reapFactoryOrphansOnce,
 } from './orchestrator'
 export type {
   DeclaredDependency,
   DependencyAdmission,
   DependencyBlocker,
+  FactoryEnvironmentReaperOptions,
+  FactoryEnvironmentReaperReport,
   InFlightIssue,
   ParkedIssue,
   QueuedIssue,
@@ -301,6 +305,7 @@ export {
   FactoryCloudEventInputV1Schema,
   FactoryCloudEventV1Schema,
   FactoryCloudInstanceV1Schema,
+  FactoryCloudVerificationEvidenceV1Schema,
   FactoryCloudSpanIdV1Schema,
   FactoryCloudTraceIdV1Schema,
   createFactoryCloudEventV1,
@@ -329,6 +334,7 @@ export type {
   FactoryCloudEventType,
   FactoryCloudEventV1,
   FactoryCloudInstanceV1,
+  FactoryCloudVerificationEvidenceV1,
   FactoryCloudReleaseReasonV1,
 } from './observability/events'
 export type {
@@ -402,6 +408,61 @@ export {
   renderK6Script,
   resolveLoadTargets,
 } from './environments/k6-job'
+export {
+  DEFAULT_VERIFICATION_DESCRIPTOR,
+  VERIFICATION_EVIDENCE_CONTRACT,
+  VerificationPipeline,
+  VerificationTimeoutError,
+  resolveGitHeadRevision,
+  runE2eCommand,
+} from './environments/verification-pipeline'
+export type {
+  E2eCommandInput,
+  E2eCommandResult,
+  E2eCommandRunner,
+  VerificationEvidence,
+  VerificationGate,
+  VerificationGateInput,
+  VerificationLoadResult,
+  VerificationLoadRunner,
+  VerificationPipelineOptions,
+  VerificationRevisionResolver,
+  VerificationStageEvidence,
+  VerificationStageStatus,
+  VerificationVerdict,
+} from './environments/verification-pipeline'
+export {
+  VerificationStackSchema,
+  loadVerificationStack,
+} from './environments/verification-stack'
+export type {
+  ResolvedVerificationStack,
+  VerificationStack,
+} from './environments/verification-stack'
+export {
+  FACTORY_ENVIRONMENT_EXPIRES_ANNOTATION,
+  FACTORY_ENVIRONMENT_ID_LABEL,
+  FACTORY_ENVIRONMENT_MANAGED_LABEL,
+  FACTORY_ENVIRONMENT_REPOSITORY_ANNOTATION,
+  KubectlEnvironmentProvider,
+  VerificationEnvironmentAbortError,
+  defaultKubectlEnvironmentRunner,
+} from './environments/kubernetes-environment'
+export type {
+  KubectlEnvironmentCommandOptions,
+  KubectlEnvironmentCommandResult,
+  KubectlEnvironmentCommandRunner,
+  KubectlEnvironmentProviderOptions,
+} from './environments/kubernetes-environment'
+export type {
+  DeployEndpoint,
+  DeployEnvironmentInput,
+  DeployManifest,
+  DeployReadinessCheck,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
+} from './ports/environment'
 export type {
   CreateK6LoadJobOptions,
   K6LoadJobResources,

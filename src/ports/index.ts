@@ -47,3 +47,12 @@ export type {
   AgentWorktree,
   AgentWorktreeManager,
 } from './worktree'
+export type {
+  DeployEndpoint,
+  DeployEnvironmentInput,
+  DeployManifest,
+  DeployReadinessCheck,
+  ProvisionEnvironmentInput,
+  VerificationEnvironment,
+  VerificationEnvironmentProvider,
+} from './environment'

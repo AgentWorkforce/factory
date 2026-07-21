@@ -9,6 +9,7 @@ import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-close
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
+import type { VerificationGate } from './environments/verification-pipeline'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -24,6 +25,7 @@ export interface FactoryPorts {
   github?: GithubRead
   githubWriteback?: GithubWriteback
   mergeGate?: GithubMergeGate
+  verificationGate?: VerificationGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver
   probePrGhRunner?: GhRunner

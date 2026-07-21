@@ -47,6 +47,14 @@ describe('FactoryConfigSchema', () => {
       requestTimeoutMs: 15_000,
     })
     expect(parsed.github).toEqual({ identity: 'auto' })
+    expect(parsed.verification).toEqual({
+      enabled: true,
+      descriptorPath: '.factory/verification-stack.yaml',
+      maxConcurrentEnvironments: 2,
+      maxRunTimeoutMs: 30 * 60_000,
+      maxEnvironmentTtlMs: 60 * 60_000,
+      maxTeardownTimeoutMs: 5 * 60_000,
+    })
     expect(parsed.slack).toEqual({
       channel: 'C123',
       style: 'threaded-summarized',

@@ -57,7 +57,7 @@ jobs:
       - name: Verify package contents
         run: npm pack --dry-run
 
-  load-e2e:
+  verification-gate-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -82,16 +82,16 @@ jobs:
           chmod +x kind
           sudo mv kind /usr/local/bin/kind
 
-      - name: Run in-cluster load harness E2E
+      - name: Run verification merge gate E2E
         run: |
-          trap 'kind delete cluster --name factory-load-e2e' EXIT
-          kind create cluster --name factory-load-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
-          npm run test:e2e:load
+          trap 'kind delete cluster --name factory-gate-e2e' EXIT
+          kind create cluster --name factory-gate-e2e --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+          npm run test:e2e:verification
 
       - name: Upload load evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: factory-load-evidence-${{ github.event.pull_request.head.sha || github.sha }}
-          path: artifacts/load-e2e/*.json
+          name: factory-verification-gate-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/verification-gate-e2e/*.json
           if-no-files-found: error

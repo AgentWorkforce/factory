@@ -29,7 +29,7 @@ import {
 import { changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeManager, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue } from '../index'
+import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
@@ -62,6 +62,9 @@ const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => Factor
   // intentionally omitted so terminalState: 'human-review' falls back to done
   // unless a test opts in — preserving the prior default behavior.
   stateIds: { readyForAgent: ready, agentImplementing: implementing, done, inPlanning: planning },
+  // Most orchestrator fixtures use virtual clone paths. Gate-specific tests opt
+  // back in with an injected verifier so no unit test reaches a live cluster.
+  verification: { enabled: false },
   ...overrides,
 })
 
@@ -869,6 +872,44 @@ class ScriptedGithubMergeGate implements GithubMergeGatePort {
   async merge(input: GithubMergeInput): Promise<{ merged: boolean; reason: string }> {
     this.merges.push(input)
     return this.#mergeResult
+  }
+}
+
+class ScriptedVerificationGate implements VerificationGate {
+  readonly inputs: VerificationGateInput[] = []
+
+  constructor(readonly passed: boolean) {}
+
+  async verify(input: VerificationGateInput): Promise<VerificationVerdict> {
+    this.inputs.push(input)
+    const stage = { status: this.passed ? 'pass' as const : 'fail' as const, durationMs: 1 }
+    return {
+      status: this.passed ? 'pass' : 'fail',
+      passed: this.passed,
+      reason: this.passed ? 'green fixture' : 'red fixture',
+      evidence: {
+        contract: 'factory.verification.evidence.v1',
+        runId: 'verification-test',
+        repository: input.repository,
+        repositoryPath: input.repositoryPath,
+        descriptorPath: `${input.repositoryPath}/.factory/verification-stack.yaml`,
+        expectedHeadSha: input.expectedHeadSha,
+        environmentId: 'factory-verify-test',
+        namespace: 'factory-verify-test',
+        startedAt: '2026-07-21T00:00:00.000Z',
+        completedAt: '2026-07-21T00:00:01.000Z',
+        timedOut: false,
+        stages: {
+          resolve: stage,
+          provision: stage,
+          deploy: stage,
+          e2e: { ...stage, exitCode: this.passed ? 0 : 1 },
+          load: stage,
+          evaluate: stage,
+          teardown: { status: 'pass', durationMs: 1 },
+        },
+      },
+    }
   }
 }
 
@@ -11022,6 +11063,7 @@ describe('FactoryLoop', () => {
     })
     const fleet = new FakeFleetClient()
     const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-approved-sha')])
+    const verificationGate = new ScriptedVerificationGate(true)
     const factory = createFactory(config({
       mergePolicy: 'on-green-with-review',
       safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
@@ -11031,6 +11073,7 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       linear: stateOnlyLinear(mount),
       mergeGate: gate,
+      verificationGate,
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(242), realMergeIssueFile(242))))
@@ -11041,8 +11084,47 @@ describe('FactoryLoop', () => {
       number: 242,
       expectedHeadSha: 'green-approved-sha',
     }])
+    expect(verificationGate.inputs).toEqual([{
+      repository: 'AgentWorkforce/pear',
+      repositoryPath: '/work/pear',
+      issueKey: 'AR-242',
+      expectedHeadSha: 'green-approved-sha',
+    }])
+    expect(factory.status().counters.verificationGatePassed).toBe(1)
     expect(factory.status().counters.mergeGateMerged).toBe(1)
     expect(factory.status().inFlight).toEqual([])
+  })
+
+  it('PR-state sweep blocks merge when live-stack verification is red', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(244)]: realMergeIssueFile(244),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/244.json': prFile(244, {
+        title: 'Real product issue 244',
+        head_ref: 'ar-244-real-fix',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const gate = new ScriptedGithubMergeGate([readyMergeVerdict('green-approved-sha')])
+    const verificationGate = new ScriptedVerificationGate(false)
+    const factory = createFactory(config({
+      mergePolicy: 'on-green-with-review',
+      safety: { requireTitlePrefix: 'Real', requireTeamKey: 'AR' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+      mergeGate: gate,
+      verificationGate,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(244), realMergeIssueFile(244))))
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(verificationGate.inputs).toHaveLength(1)
+    expect(gate.merges).toEqual([])
+    expect(factory.status().counters.verificationGateFailed).toBe(1)
+    expect(factory.status().counters.mergeGateMerged).toBeUndefined()
   })
 
   it('PR-state sweep does not complete on a wrong PR or draft PR', async () => {
