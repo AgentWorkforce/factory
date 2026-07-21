@@ -2386,9 +2386,16 @@ describe('FactoryLoop', () => {
       await state.claimDispatchLifecycle(
         'factory-test', issueKey(staleDecision.issue), lifecycle(staleDecision, 'stale-run'), 'expired-owner', 0, 1,
       )
-      await state.claimDispatchLifecycle(
-        'factory-test', issueKey(stableDecision.issue), lifecycle(stableDecision, 'stable-run'), 'expired-owner', 0, 1,
-      )
+      // Simulate a document written before alias-aware claims were atomic. A
+      // current store would adopt the first row instead of creating this one.
+      const legacyDocument = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
+      }
+      legacyDocument.workspaces['factory-test']!.dispatchLifecycles[issueKey(stableDecision.issue)] = {
+        ...lifecycle(stableDecision, 'stable-run'),
+        lease: { owner: 'expired-owner', epoch: 1, leaseUntilMs: 1 },
+      }
+      await writeFile(watchStatePath, JSON.stringify(legacyDocument))
 
       restarted = createFactory(config({ issueSource: 'github' }), {
         mount: new FakeMountClient({ [stablePath]: issue }),
