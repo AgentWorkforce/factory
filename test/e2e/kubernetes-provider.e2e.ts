@@ -11,6 +11,7 @@ import {
   KubernetesEnvironmentProvider,
   StackDeployer,
   loadKubernetesStackDescriptor,
+  runLoad,
   type Environment,
 } from '../../src/index.js'
 
@@ -259,64 +260,31 @@ try {
     `quota-busting pod was not rejected: ${quotaResult.stdout}\n${quotaResult.stderr}`)
   console.log('quota: oversized workload rejected by admission')
 
-  const k6Script = `
-import http from 'k6/http';
-import { check } from 'k6';
-export const options = { vus: 2, duration: '5s' };
-export default function () {
-  const response = http.get('http://fixture-api.${environment.id}.svc.cluster.local:5678/');
-  check(response, { healthy: (r) => r.status === 200 });
-}
-export function handleSummary(data) {
-  const duration = data.metrics.http_req_duration.values;
-  const requests = data.metrics.http_reqs.values;
-  const failed = data.metrics.http_req_failed.values;
-  return { stdout: 'FACTORY_K6_EVIDENCE=' + JSON.stringify({
-    requestCount: requests.count,
-    errorRate: failed.rate,
-    p95LatencyMs: duration['p(95)']
-  }) + '\\n' };
-}`
-  await apply({
-    apiVersion: 'v1', kind: 'List', items: [
-      {
-        apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'factory-k6' },
-        data: { 'script.js': k6Script },
-      },
-      {
-        apiVersion: 'batch/v1', kind: 'Job', metadata: { name: 'factory-k6' },
-        spec: {
-          backoffLimit: 0,
-          template: {
-            metadata: { labels: { app: 'factory-k6' } },
-            spec: {
-              restartPolicy: 'Never',
-              serviceAccountName: 'factory-guardrail-workload',
-              automountServiceAccountToken: false,
-              securityContext: { runAsNonRoot: true, runAsUser: 12345, seccompProfile: { type: 'RuntimeDefault' } },
-              containers: [{
-                name: 'k6', image: 'grafana/k6:1.7.1', args: ['run', '/scripts/script.js'],
-                volumeMounts: [{ name: 'script', mountPath: '/scripts' }],
-                securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] } },
-              }],
-              volumes: [{ name: 'script', configMap: { name: 'factory-k6' } }],
-            },
-          },
-        },
-      },
-    ],
-  }, environment.id)
-  await mustKubectl([
-    '--namespace', environment.id, 'wait', 'job/factory-k6', '--for=condition=complete', '--timeout=180s',
-  ])
-  const k6Logs = (await mustKubectl(['--namespace', environment.id, 'logs', 'job/factory-k6'])).stdout
-  const evidenceMatch = /FACTORY_K6_EVIDENCE=(\{[^\n]+\})/u.exec(k6Logs)
-  assert(evidenceMatch, `k6 did not emit SLO evidence:\n${k6Logs}`)
-  const evidence = JSON.parse(evidenceMatch[1]) as { requestCount: number; errorRate: number; p95LatencyMs: number }
-  assert(evidence.requestCount > 0, 'k6 made no requests')
-  assert(evidence.errorRate === 0, `k6 error-rate SLO failed: ${evidence.errorRate}`)
-  assert(evidence.p95LatencyMs < 2_000, `k6 p95 SLO failed: ${evidence.p95LatencyMs}ms`)
-  console.log(`load: ${evidence.requestCount} requests, errorRate=${evidence.errorRate}, p95=${evidence.p95LatencyMs}ms`)
+  const load = await runLoad({
+    id: environment.id,
+    namespace: environment.id,
+    endpoints: { api: `http://fixture-api.${environment.id}.svc.cluster.local:5678` },
+  }, {
+    name: 'kubernetes-provider',
+    targets: [{ name: 'api', endpoint: 'api', path: '/', expectedStatuses: [200] }],
+    vus: 2,
+    duration: '5s',
+    thresholds: {
+      maxP95LatencyMs: 2_000,
+      maxP99LatencyMs: 5_000,
+      maxErrorRate: 0,
+      minThroughputRps: 1,
+    },
+  }, {
+    runId: suffix,
+    timeoutMs: 180_000,
+    evidencePath: 'artifacts/kubernetes-provider-e2e/load.json',
+  })
+  assert(load.passed && load.evidence.gate.status === 'pass', `shared SLO gate failed:\n${load.evidenceJson}`)
+  console.log(
+    `load: ${load.measured.requestCount} requests, errorRate=${load.measured.errorRate}, ` +
+    `p95=${load.measured.latency.p95Ms}ms, gate=${load.evidence.gate.status}`,
+  )
 
   await create({
     apiVersion: 'v1', kind: 'Namespace',

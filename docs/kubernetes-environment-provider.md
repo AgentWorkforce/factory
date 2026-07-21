@@ -90,6 +90,8 @@ packet layer. It cleans that cluster up on exit. If `KUBECONFIG` is already set,
 it treats the cluster as externally owned, never changes its CNI, and never
 deletes it. The test creates a separate production namespace, deploys the Helm
 API+Postgres fixture, verifies a reachable port-forward URL, asserts RBAC,
-NetworkPolicy, and ResourceQuota admission, runs k6 with an SLO assertion,
-destroys the live namespace, sweeps an expired orphan, and proves the
-production namespace still exists.
+NetworkPolicy, and ResourceQuota admission, runs the shared `runLoad` k6
+harness through its SLO gate and writes structured evidence under
+`artifacts/kubernetes-provider-e2e/`, destroys the live namespace, sweeps an
+expired orphan, and proves the production namespace and workload identities
+were never replaced.

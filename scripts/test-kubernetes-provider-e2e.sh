@@ -4,6 +4,7 @@ set -euo pipefail
 cluster_name="${KIND_CLUSTER_NAME:-customer-eks-sim}"
 kubeconfig_file="${KUBECONFIG:-}"
 calico_version="${CALICO_VERSION:-v3.32.1}"
+kind_node_image="${KIND_NODE_IMAGE:-kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f}"
 created_cluster=0
 created_kubeconfig=0
 
@@ -25,6 +26,7 @@ if [[ -z "$kubeconfig_file" ]]; then
     # default CNI and install pinned Calico before deploying customer workloads.
     kind create cluster \
       --name "$cluster_name" \
+      --image "$kind_node_image" \
       --config test/fixtures/kubernetes/kind-config.yaml
     created_cluster=1
   fi
