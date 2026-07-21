@@ -18,6 +18,7 @@ import type {
   PreviewSweepInput,
   PreviewSweepResult,
 } from '../ports'
+import type { ResourceSubscriptionsClient } from '../subscriptions'
 
 type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
@@ -27,6 +28,7 @@ type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Pro
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
   githubWrite?: GithubConnectionWrite
+  resourceSubscriptions?: ResourceSubscriptionsClient
   readonly files = new Map<string, { content: unknown; revision?: string }>()
   readonly writes: Array<{ path: string; content: unknown }> = []
   readonly deletes: string[] = []

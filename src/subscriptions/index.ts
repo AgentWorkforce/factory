@@ -46,6 +46,20 @@ export {
   filesystemEventToChangeEvent,
   integrationRelayFileSyncOptions,
 } from './event-client'
+export {
+  createResourceSubscriptionsSdkClient,
+  isResourceSubscriptionsUnavailable,
+  ResourceSubscriptionsUnavailableError,
+} from './resource-subscriptions'
+export type {
+  AcceptedResourceDelivery,
+  ResourceDeliveryClaim,
+  ResourceSubscription,
+  ResourceSubscriptionInput,
+  ResourceSubscriptionsClient,
+  ResourceSubscriptionsSdk,
+  ResourceSubscriptionsSdkClientOptions,
+} from './resource-subscriptions'
 export type {
   ChangeEvent,
   FilesystemEventLike,

@@ -88,7 +88,7 @@
     "@agent-relay/integration-prompts": "^10.6.4",
     "@agent-relay/sdk": "^10.6.4",
     "@relayfile/relay-helpers": "^0.4.6",
-    "@relayfile/sdk": "^0.10.32",
+    "@relayfile/sdk": "0.10.34",
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^10.6.4",
     "proper-lockfile": "^4.1.2",

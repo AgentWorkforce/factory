@@ -2,6 +2,7 @@ import type {
   ChangeEvent as RelayFileChangeEvent,
   Subscription as RelayFileSubscription,
 } from '@relayfile/sdk'
+import type { ResourceSubscriptionsClient } from '../subscriptions/resource-subscriptions'
 
 export type ChangeEvent = RelayFileChangeEvent
 export type Subscription = RelayFileSubscription
@@ -98,6 +99,12 @@ export interface GithubConnectionWrite {
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readonly githubWrite?: GithubConnectionWrite
+  /**
+   * Optional durable Relayfile resource-subscription API. Its absence means
+   * this mount targets a pre-subscription service and consumers retain their
+   * established local routing behaviour.
+   */
+  readonly resourceSubscriptions?: ResourceSubscriptionsClient
   readonly integrationConnections?: FactoryIntegrationConnections
   /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
   ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
