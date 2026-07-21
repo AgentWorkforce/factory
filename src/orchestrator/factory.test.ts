@@ -689,6 +689,10 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
   readonly terminal: Array<{ name: string; reason?: string }> = []
 
+  constructor(readonly emitReconciledExits = false) {
+    super()
+  }
+
   override async roster() {
     return {
       agents: [],
@@ -698,6 +702,12 @@ class MissingHydratedRosterFleetClient extends RemoteLifecycleFleetClient {
 
   markAgentTerminal(name: string, reason?: string): void {
     this.terminal.push({ name, reason })
+  }
+
+  override async reconcileTrackedAgents(): Promise<void> {
+    await super.reconcileTrackedAgents()
+    if (!this.emitReconciledExits) return
+    for (const agent of [...this.hydrated]) this.emitAgentExit(agent.name, 'exited')
   }
 }
 
@@ -5534,7 +5544,10 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('synthesizes durable exits when fleet reconciliation misses agents absent from the live roster', async () => {
+  it.each([
+    ['synthesizes exits when fleet reconciliation misses absent agents', false, 2],
+    ['defers fleet reconciliation exits until durable adoption is complete', true, undefined],
+  ])('%s', async (_label, emitReconciledExits, synthesizedCount) => {
     const root = await mkdtemp(join(tmpdir(), 'factory-missing-startup-roster-'))
     const watchStatePath = join(root, 'state.json')
     const registryPath = join(root, 'registry.json')
@@ -5555,7 +5568,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       await first.stop()
 
-      const restartedFleet = new MissingHydratedRosterFleetClient()
+      const restartedFleet = new MissingHydratedRosterFleetClient(emitReconciledExits)
       restarted = createFactory(factoryConfig, {
         mount,
         fleet: restartedFleet,
@@ -5564,7 +5577,7 @@ describe('FactoryLoop', () => {
       })
       await restarted.start({ mode: 'dispatch-owner' })
 
-      expect(restartedFleet.terminal).toEqual([
+      expect(restartedFleet.terminal).toEqual(emitReconciledExits ? [] : [
         { name: 'ar-595-impl-pear', reason: 'reconciled-missing' },
         { name: 'ar-595-review', reason: 'reconciled-missing' },
       ])
@@ -5574,7 +5587,7 @@ describe('FactoryLoop', () => {
       ])
       await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, issueKey(decision.issue)))
         .resolves.toMatchObject({ phase: 'running' })
-      expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(2)
+      expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(synthesizedCount)
     } finally {
       await restarted?.stop()
       await first.stop()
