@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto'
 
 import { z } from 'zod'
 
+import { COST_LEDGER_ROLES, MAX_RUN_COST_MODELS_PER_ROLE } from '../cost/ledger'
+
 export const FACTORY_CLOUD_EVENT_CONTRACT_V1 = 'factory.telemetry.v1' as const
 export const FACTORY_CLOUD_EVENT_MAX_BATCH_SIZE = 100
 /** Leave headroom below Cloud's 256 KiB request-body limit. */
@@ -159,11 +161,11 @@ export const FactoryCloudRunCostV1Schema = z.object({
   outputTokens: boundedCount.nullable(),
   usd: z.number().finite().nonnegative().nullable(),
   byRole: z.array(z.object({
-    role: z.enum(['implementer', 'reviewer', 'babysitter', 'triage', 'workflow']),
+    role: z.enum(COST_LEDGER_ROLES),
     inputTokens: boundedCount.nullable(),
     outputTokens: boundedCount.nullable(),
     usd: z.number().finite().nonnegative().nullable(),
-    byModel: z.array(factoryCloudCostModelV1).max(32),
+    byModel: z.array(factoryCloudCostModelV1).max(MAX_RUN_COST_MODELS_PER_ROLE),
   }).strict()).max(5),
 }).strict()
 

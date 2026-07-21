@@ -39,6 +39,10 @@ export interface EstimateCostUsdOptions {
   onUnpricedModel?: (model: string) => void
 }
 
+export function hasModelPricing(model: string): boolean {
+  return Object.prototype.hasOwnProperty.call(MODEL_PRICING, model)
+}
+
 /** Estimate a metered model cost without ever making accounting control flow fatal. */
 export function estimateCostUsd(
   model: string,
@@ -46,8 +50,7 @@ export function estimateCostUsd(
   outputTokens: number,
   options: EstimateCostUsdOptions = {},
 ): number | null {
-  const pricing = MODEL_PRICING[model]
-  if (!pricing) {
+  if (!hasModelPricing(model)) {
     try {
       options.onUnpricedModel?.(model)
     } catch {
@@ -55,6 +58,7 @@ export function estimateCostUsd(
     }
     return null
   }
+  const pricing = MODEL_PRICING[model]!
   if (!validTokenCount(inputTokens) || !validTokenCount(outputTokens)) return null
 
   const inputCost = (inputTokens / 1_000_000) * pricing.costPer1MInput

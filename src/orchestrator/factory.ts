@@ -110,7 +110,7 @@ import {
   type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
-import { CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
+import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -488,6 +488,8 @@ export class FactoryLoop implements Factory {
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
+  readonly #agentUsageInFlight = new Set<Promise<void>>()
+  readonly #agentUsageGroups = new Set<string>()
   #startupAgentAdoptionActive = false
   #startupRosterExitSignals?: Set<string>
   // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
@@ -950,6 +952,7 @@ export class FactoryLoop implements Factory {
       this.#offAgentUsage?.()
       this.#offUnpricedModel?.()
       await Promise.allSettled([...this.#agentLifecycleSignalsInFlight.values()])
+      await this.#drainAgentUsage()
       await this.#slackConversationTurns.stop()
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
@@ -2827,15 +2830,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (!this.#offAgentUsage) {
-      this.#offAgentUsage = this.#fleet.onAgentUsage?.((usage) => {
-        void this.#handleAgentUsage(usage).catch((error) => {
-          this.#increment('costUsageRecordingFailures')
-          this.#logger.warn?.('[factory] unable to record agent token usage', {
-            agentName: usage.name,
-            errorClass: telemetryErrorClass(error),
-          })
-        })
-      })
+      this.#offAgentUsage = this.#fleet.onAgentUsage?.((usage) => this.#queueAgentUsage(usage))
     }
   }
 
@@ -3340,13 +3335,36 @@ export class FactoryLoop implements Factory {
       issueKey(record.issue),
     )
     if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) return
+    const model = usage.model ?? tracked.spec.model ?? 'unknown'
+    const groupId = costUsageGroupId(lifecycle.runId, tracked)
     this.#costLedger.record({
       runId: lifecycle.runId,
       role: tracked.spec.role,
-      model: usage.model ?? tracked.spec.model ?? 'unknown',
+      model,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
-    }, { entryId: costEntryId(lifecycle.runId, usage.name) })
+    }, { entryId: costEntryId(groupId, model) })
+    this.#agentUsageGroups.add(groupId)
+  }
+
+  #queueAgentUsage(usage: AgentUsage): Promise<void> {
+    const handling = this.#handleAgentUsage(usage).catch((error) => {
+      this.#increment('costUsageRecordingFailures')
+      this.#logger.warn?.('[factory] unable to record agent token usage', {
+        agentName: usage.name,
+        errorClass: telemetryErrorClass(error),
+      })
+    }).finally(() => {
+      this.#agentUsageInFlight.delete(handling)
+    })
+    this.#agentUsageInFlight.add(handling)
+    return handling
+  }
+
+  async #drainAgentUsage(): Promise<void> {
+    while (this.#agentUsageInFlight.size > 0) {
+      await Promise.allSettled([...this.#agentUsageInFlight])
+    }
   }
 
   async #reportUnpricedModel(record: UnpricedModelCostRecord): Promise<void> {
@@ -3365,18 +3383,18 @@ export class FactoryLoop implements Factory {
   }
 
   #finalizeRunCost(record: InFlightIssue, runId: string): RunCostTotal {
-    for (const [agentName, tracked] of record.agents) {
-      const entryId = costEntryId(runId, agentName)
-      if (this.#costLedger.hasEntry(entryId)) continue
+    for (const tracked of record.agents.values()) {
+      const groupId = costUsageGroupId(runId, tracked)
+      if (this.#agentUsageGroups.has(groupId)) continue
       this.#costLedger.record({
         runId,
         role: tracked.spec.role,
         model: tracked.spec.model ?? 'unknown',
         inputTokens: null,
         outputTokens: null,
-      }, { entryId })
+      }, { entryId: costEntryId(groupId, 'missing') })
     }
-    return this.#costLedger.getRunTotal(runId)
+    return boundedRunCostTotal(this.#costLedger.getRunTotal(runId))
   }
 
   async #reportRunCost(lifecycle: DispatchLifecycle): Promise<void> {
@@ -3405,6 +3423,7 @@ export class FactoryLoop implements Factory {
     telemetry: { cancellationReason?: FactoryCloudCancellationReasonV1 } = {},
   ): Promise<boolean> {
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
+    if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
     const key = issueKey(record.issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) {
@@ -15381,8 +15400,11 @@ const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
 const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): boolean =>
   phase === 'complete' || phase === 'abandoned'
 
-const costEntryId = (runId: string, agentName: string): string =>
-  `${runId}\0${agentName}`
+const costUsageGroupId = (runId: string, tracked: TrackedAgent): string =>
+  JSON.stringify([runId, tracked.spec.invocationId ?? tracked.spec.name])
+
+const costEntryId = (groupId: string, model: string): string =>
+  JSON.stringify([groupId, model])
 
 const publishedPullRequests = (lifecycle: DispatchLifecycle | undefined): GithubPublishPullRequestResult[] => {
   const receipts = [

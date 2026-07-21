@@ -10,5 +10,9 @@ describe('estimateCostUsd', () => {
     expect(() => estimateCostUsd('provider/not-priced', 10, 20, { onUnpricedModel })).not.toThrow()
     expect(estimateCostUsd('provider/not-priced', 10, 20, { onUnpricedModel })).toBeNull()
     expect(onUnpricedModel).toHaveBeenCalledWith('provider/not-priced')
+
+    // Object-prototype names are valid bounded identifiers, but never prices.
+    expect(estimateCostUsd('toString', 10, 20, { onUnpricedModel })).toBeNull()
+    expect(onUnpricedModel).toHaveBeenCalledWith('toString')
   })
 })

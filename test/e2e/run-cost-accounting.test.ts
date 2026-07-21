@@ -59,7 +59,7 @@ class UsageHarness implements HarnessDriverClientLike {
 
   connectEvents() {}
 
-  emitUsage(name: string, model: string, inputTokens: number, outputTokens: number): void {
+  emitUsage(name: string, model: string, inputTokens: number | null, outputTokens: number | null): void {
     this.#emit({
       kind: 'agent_usage',
       name,
@@ -125,39 +125,8 @@ class RecordingReporter implements FactoryEventReporter {
 
 describe('run cost accounting e2e', () => {
   it('attributes fake runtime usage, persists its aggregate, and emits one bounded completion event', async () => {
-    const issueRecord = linearIssueRecord()
-    const mount = new FakeMountClient({ [ISSUE_PATH]: issueRecord })
-    const harness = new UsageHarness()
-    const fleet = new InternalFleetClient({
-      client: harness,
-      cwd: '/work/factory',
-      resolveAgentRelayMcpCommand: () => undefined,
-    })
-    const stateStore = new InMemoryStateStore({ batchSize: 2 })
-    const ledger = new CostLedger()
-    const reporter = new RecordingReporter()
-    const stateWrites: string[] = []
-    const factory = createFactory(factoryConfig(), {
-      mount,
-      fleet,
-      stateStore,
-      costLedger: ledger,
-      reporter,
-      triage: new CostTriage(),
-      linear: recordingLinear(stateWrites),
-      probePrResolver: async () => ({
-        repo: 'AgentWorkforce/factory',
-        prNumber: 185,
-        headRef: 'factory/185-cost-accounting',
-        headRepo: 'AgentWorkforce/factory',
-        crossRepository: false,
-        state: 'OPEN',
-      }),
-      logger: { info() {}, warn() {}, error() {} },
-      processFinder: async () => ({ status: 'missing' }),
-      terminationGraceMs: 0,
-      readChildPids: async () => [],
-    })
+    const scenario = costScenario('cost-e2e')
+    const { factory, harness, stateStore, ledger, reporter, stateWrites, issueRecord } = scenario
 
     try {
       const issue = parseLinearIssue(ISSUE_PATH, issueRecord)
@@ -172,26 +141,22 @@ describe('run cost accounting e2e', () => {
       const [[, running]] = await stateStore.listDispatchLifecycles('cost-e2e')
       harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 1_000_000, 100_000)
       harness.emitUsage('ar-185-review', 'anthropic/claude-haiku-4.5', 500_000, 200_000)
-      await vi.waitFor(() => expect(ledger.getRunRecords(running.runId)).toHaveLength(2))
+      harness.emitUsage('ar-185-impl-factory', 'provider/not-priced', null, null)
+      // Completion follows immediately: the accounting seam must drain both
+      // async usage callbacks before it freezes the terminal summary.
+      harness.emitExit('ar-185-impl-factory')
+      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
 
-      expect(() => ledger.record({
-        runId: 'unpriced-e2e',
-        role: 'triage',
-        model: 'provider/not-priced',
-        inputTokens: 25,
-        outputTokens: 10,
-      })).not.toThrow()
       await vi.waitFor(() => expect(reporter.events.filter((event) => event.type === 'cost.model.unpriced'))
         .toHaveLength(1))
-      expect(ledger.getRunTotal('unpriced-e2e').usd).toBeNull()
       const unpricedEvent = reporter.events.find((event) => event.type === 'cost.model.unpriced')!
       expect(unpricedEvent).toMatchObject({
-        runId: 'unpriced-e2e',
+        runId: running.runId,
         attributes: {
-          agentRole: 'triage',
+          agentRole: 'implementer',
           model: 'provider/not-priced',
-          inputTokens: 25,
-          outputTokens: 10,
+          inputTokens: null,
+          outputTokens: null,
           usd: null,
         },
       })
@@ -199,10 +164,15 @@ describe('run cost accounting e2e', () => {
         'agentRole', 'inputTokens', 'model', 'outputTokens', 'usd',
       ])
 
-      harness.emitExit('ar-185-impl-factory')
-      await factory.waitForDispatchTerminal(decision.issue)
-
       const total = ledger.getRunTotal(running.runId)
+      expect(ledger.getRunRecords(running.runId)).toHaveLength(3)
+      expect(ledger.getRunRecords(running.runId)).toContainEqual(expect.objectContaining({
+        role: 'implementer',
+        model: 'provider/not-priced',
+        inputTokens: null,
+        outputTokens: null,
+        usd: null,
+      }))
       expect(total).toEqual({
         runId: running.runId,
         inputTokens: 1_500_000,
@@ -214,12 +184,20 @@ describe('run cost accounting e2e', () => {
             inputTokens: 1_000_000,
             outputTokens: 100_000,
             usd: 6.5,
-            byModel: [{
-              model: 'openai/gpt-5.4',
-              inputTokens: 1_000_000,
-              outputTokens: 100_000,
-              usd: 6.5,
-            }],
+            byModel: [
+              {
+                model: 'openai/gpt-5.4',
+                inputTokens: 1_000_000,
+                outputTokens: 100_000,
+                usd: 6.5,
+              },
+              {
+                model: 'provider/not-priced',
+                inputTokens: null,
+                outputTokens: null,
+                usd: null,
+              },
+            ],
           },
           {
             role: 'reviewer',
@@ -258,10 +236,79 @@ describe('run cost accounting e2e', () => {
       await factory.stop()
     }
   })
+
+  it('records null tokens when a spawned runtime reports no usage', async () => {
+    const { factory, harness, stateStore, ledger, reporter, issueRecord } = costScenario('cost-e2e-missing')
+    try {
+      const issue = parseLinearIssue(ISSUE_PATH, issueRecord)
+      const decision = await factory.triageIssue(issue)
+      await factory.dispatch(decision)
+      const [[, running]] = await stateStore.listDispatchLifecycles('cost-e2e-missing')
+
+      harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 100, 20)
+      harness.emitExit('ar-185-impl-factory')
+      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+
+      expect(ledger.getRunRecords(running.runId)).toContainEqual({
+        runId: running.runId,
+        role: 'reviewer',
+        model: 'anthropic/claude-haiku-4.5',
+        inputTokens: null,
+        outputTokens: null,
+        usd: null,
+      })
+      const completed = (await stateStore.listDispatchLifecycles('cost-e2e-missing'))
+        .find(([, lifecycle]) => lifecycle.runId === running.runId)?.[1]
+      expect(completed?.cost?.byRole.find(({ role }) => role === 'reviewer')).toMatchObject({
+        inputTokens: null,
+        outputTokens: null,
+        usd: null,
+      })
+      expect(reporter.events.filter((event) => event.type === 'run.cost.v1')).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
 })
 
-const factoryConfig = () => FactoryConfigSchema.parse({
-  workspaceId: 'cost-e2e',
+const costScenario = (workspaceId: string) => {
+  const issueRecord = linearIssueRecord()
+  const mount = new FakeMountClient({ [ISSUE_PATH]: issueRecord })
+  const harness = new UsageHarness()
+  const stateStore = new InMemoryStateStore({ batchSize: 2 })
+  const ledger = new CostLedger()
+  const reporter = new RecordingReporter()
+  const stateWrites: string[] = []
+  const factory = createFactory(factoryConfig(workspaceId), {
+    mount,
+    fleet: new InternalFleetClient({
+      client: harness,
+      cwd: '/work/factory',
+      resolveAgentRelayMcpCommand: () => undefined,
+    }),
+    stateStore,
+    costLedger: ledger,
+    reporter,
+    triage: new CostTriage(),
+    linear: recordingLinear(stateWrites),
+    probePrResolver: async () => ({
+      repo: 'AgentWorkforce/factory',
+      prNumber: 185,
+      headRef: 'factory/185-cost-accounting',
+      headRepo: 'AgentWorkforce/factory',
+      crossRepository: false,
+      state: 'OPEN',
+    }),
+    logger: { info() {}, warn() {}, error() {} },
+    processFinder: async () => ({ status: 'missing' }),
+    terminationGraceMs: 0,
+    readChildPids: async () => [],
+  })
+  return { factory, harness, stateStore, ledger, reporter, stateWrites, issueRecord }
+}
+
+const factoryConfig = (workspaceId: string) => FactoryConfigSchema.parse({
+  workspaceId,
   repos: {
     byLabel: { factory: 'AgentWorkforce/factory' },
     clonePaths: { 'AgentWorkforce/factory': '/work/factory' },

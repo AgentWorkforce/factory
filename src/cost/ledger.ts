@@ -1,4 +1,4 @@
-import { estimateCostUsd, roundUsd } from './pricing'
+import { estimateCostUsd, hasModelPricing, roundUsd } from './pricing'
 
 export const COST_LEDGER_ROLES = [
   'implementer',
@@ -9,6 +9,10 @@ export const COST_LEDGER_ROLES = [
 ] as const
 
 export type CostLedgerRole = (typeof COST_LEDGER_ROLES)[number]
+
+/** Matches the closed cloud-event bound for one role's model breakdown. */
+export const MAX_RUN_COST_MODELS_PER_ROLE = 32
+export const RUN_COST_OTHER_MODELS_ID = 'factory/other-models'
 
 export interface CostLedgerRecord {
   runId: string
@@ -71,12 +75,10 @@ export class CostLedger {
 
   record(input: CostLedgerRecordInput, options: CostLedgerRecordOptions = {}): CostLedgerRecord {
     const normalized = normalizeRecordInput(input)
-    let unpriced = false
+    const unpriced = !hasModelPricing(normalized.model)
     const usd = normalized.inputTokens === null || normalized.outputTokens === null
       ? null
-      : estimateCostUsd(normalized.model, normalized.inputTokens, normalized.outputTokens, {
-          onUnpricedModel: () => { unpriced = true },
-        })
+      : estimateCostUsd(normalized.model, normalized.inputTokens, normalized.outputTokens)
     const record: CostLedgerRecord = { ...normalized, usd }
     const entryId = options.entryId ?? `entry:${this.#nextEntry++}`
     this.#records.set(entryId, record)
@@ -121,7 +123,7 @@ export class CostLedger {
       outputTokens: nullableSum(roleRecords.map((record) => record.outputTokens)),
       usd: nullableUsdSum(roleRecords.map((record) => record.usd)),
       byModel: modelBreakdowns(roleRecords),
-    }))
+    })).sort((left, right) => roleIndex(left.role) - roleIndex(right.role))
   }
 
   onUnpricedModel(listener: UnpricedModelListener): () => void {
@@ -155,8 +157,45 @@ const modelBreakdowns = (records: CostLedgerRecord[]): CostModelBreakdown[] => {
     inputTokens: nullableSum(modelRecords.map((record) => record.inputTokens)),
     outputTokens: nullableSum(modelRecords.map((record) => record.outputTokens)),
     usd: nullableUsdSum(modelRecords.map((record) => record.usd)),
-  }))
+  })).sort((left, right) => compareModelIds(left.model, right.model))
 }
+
+/**
+ * Produces the deterministic, privacy-safe shape persisted and emitted when a
+ * run completes. The detailed ledger remains available through
+ * getRunRecords(); excess model buckets are folded into one aggregate instead
+ * of making the bounded observability event invalid.
+ */
+export const boundedRunCostTotal = (total: RunCostTotal): RunCostTotal => ({
+  ...structuredClone(total),
+  byRole: total.byRole
+    .map((role) => ({ ...structuredClone(role), byModel: boundedModels(role.byModel) }))
+    .sort((left, right) => roleIndex(left.role) - roleIndex(right.role)),
+})
+
+const boundedModels = (models: CostModelBreakdown[]): CostModelBreakdown[] => {
+  const sorted = structuredClone(models).sort((left, right) => compareModelIds(left.model, right.model))
+  if (sorted.length <= MAX_RUN_COST_MODELS_PER_ROLE) return sorted
+
+  const candidates = sorted.filter((entry) => entry.model !== RUN_COST_OTHER_MODELS_ID)
+  const overflow = [
+    ...sorted.filter((entry) => entry.model === RUN_COST_OTHER_MODELS_ID),
+    ...candidates.slice(MAX_RUN_COST_MODELS_PER_ROLE - 1),
+  ]
+  return [
+    ...candidates.slice(0, MAX_RUN_COST_MODELS_PER_ROLE - 1),
+    {
+      model: RUN_COST_OTHER_MODELS_ID,
+      inputTokens: nullableSum(overflow.map((entry) => entry.inputTokens)),
+      outputTokens: nullableSum(overflow.map((entry) => entry.outputTokens)),
+      usd: nullableUsdSum(overflow.map((entry) => entry.usd)),
+    },
+  ]
+}
+
+const roleIndex = (role: CostLedgerRole): number => COST_LEDGER_ROLES.indexOf(role)
+
+const compareModelIds = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0
 
 const normalizeRecordInput = (input: CostLedgerRecordInput): CostLedgerRecordInput => ({
   runId: boundedIdentifier(input.runId, 'unknown-run'),
@@ -183,7 +222,9 @@ const tokenCount = (value: number | null): number | null =>
 
 const nullableSum = (values: Array<number | null>): number | null => {
   const known = values.filter((value): value is number => value !== null)
-  return known.length > 0 ? known.reduce((sum, value) => sum + value, 0) : null
+  if (known.length === 0) return null
+  return known.reduce((sum, value) =>
+    sum >= Number.MAX_SAFE_INTEGER - value ? Number.MAX_SAFE_INTEGER : sum + value, 0)
 }
 
 const nullableUsdSum = (values: Array<number | null>): number | null => {

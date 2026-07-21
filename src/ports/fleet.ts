@@ -118,6 +118,7 @@ export type AgentLifecycleSignal = {
   question?: string
   invocationId?: string
 }
+/** Latest cumulative runtime totals for one spawned agent and model. */
 export type AgentUsage = {
   name: string
   /** Runtime-reported model wins over the spawn request when the provider supplies it. */
