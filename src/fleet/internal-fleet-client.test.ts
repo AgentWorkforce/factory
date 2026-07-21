@@ -21,7 +21,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   throwOnConnect = false
   partiallyConnected = false
 
-  agents: Array<{ name: string; pid?: number }> = []
+  agents: Array<{ name: string; cli?: string; pid?: number }> = []
   nextSessionRef = 'session-1'
   nextHandleName: string | undefined
   nextPid: number | undefined
@@ -29,7 +29,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
   async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string; pid?: number }> {
     this.spawned.push(input)
     const name = this.nextHandleName ?? input.name
-    this.agents.push({ name, pid: this.nextPid })
+    this.agents.push({ name, cli: input.cli, pid: this.nextPid })
     return { name, session_ref: this.nextSessionRef }
   }
 
@@ -41,7 +41,7 @@ class FakeHarnessDriverClient implements HarnessDriverClientLike {
     return { name }
   }
 
-  async listAgents(): Promise<Array<{ name: string; pid?: number }>> {
+  async listAgents(): Promise<Array<{ name: string; cli?: string; pid?: number }>> {
     return this.agents
   }
 
@@ -935,6 +935,80 @@ describe('InternalFleetClient', () => {
       { name: 'ar-1-review', reason: 'reconciled-missing' },
       { name: 'ar-1-impl', reason: 'reconciled-missing' },
     ])
+  })
+
+  it('filters stale broker rows through canonical presence while granting fresh local registration grace', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [
+      { name: 'ar-stale-impl', cli: 'codex' },
+      { name: 'ar-live-impl', cli: 'codex' },
+    ]
+    let nowMs = 1_000_000
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => ['ar-live-impl'],
+      now: () => nowMs,
+    })
+    const exits: string[] = []
+    fleet.onAgentExit((name) => exits.push(name))
+    fleet.hydrateTracked([
+      { name: 'ar-stale-impl', invocationId: 'inv-stale' },
+      { name: 'ar-live-impl', invocationId: 'inv-live' },
+    ])
+
+    await expect(fleet.roster()).resolves.toEqual({
+      agents: [{ name: 'ar-live-impl' }],
+      nodes: [{ name: 'self', capabilities: ['spawn:claude', 'spawn:codex', 'workflow:run'], live: true }],
+    })
+    await fleet.reconcileTrackedAgents()
+    expect(exits).toEqual(['ar-stale-impl'])
+
+    await fleet.spawn({ name: 'ar-fresh-impl', capability: 'spawn:codex' })
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }, { name: 'ar-fresh-impl' }],
+    })
+
+    nowMs += 60_000
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [{ name: 'ar-live-impl' }],
+    })
+  })
+
+  it('preserves non-MCP and live no-MCP fallback workers when canonical presence is absent', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [
+      { name: 'ar-workflow', cli: 'relayflows' },
+      { name: 'ar-fallback-live', cli: 'codex', pid: 101 },
+      { name: 'ar-stale-dead', cli: 'claude', pid: 102 },
+    ]
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => [],
+      isProcessAlive: (pid) => pid === 101,
+    })
+
+    await expect(fleet.roster()).resolves.toMatchObject({
+      agents: [
+        { name: 'ar-workflow' },
+        { name: 'ar-fallback-live' },
+      ],
+    })
+  })
+
+  it('fails closed when canonical presence is unavailable instead of reviving stale broker rows', async () => {
+    const harness = new FakeHarnessDriverClient()
+    harness.agents = [{ name: 'ar-stale-impl', cli: 'codex' }]
+    const fleet = new InternalFleetClient({
+      client: harness,
+      listCanonicalOnlineAgentNames: async () => {
+        throw new Error('presence unavailable')
+      },
+    })
+    fleet.hydrateTracked([{ name: 'ar-stale-impl', invocationId: 'inv-stale' }])
+
+    await expect(fleet.roster()).rejects.toThrow('presence unavailable')
+    await expect(fleet.reconcileTrackedAgents()).rejects.toThrow('presence unavailable')
+    expect(fleet.trackedAgents().has('ar-stale-impl')).toBe(true)
   })
 
   it('clears readiness even when releasing the agent fails', async () => {
