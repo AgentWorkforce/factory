@@ -1211,8 +1211,17 @@ export function resolveBrokerConnectionPath(
 
   let current = resolve(startCwd)
   for (;;) {
-    const candidate = join(current, '.agentworkforce', 'relay', 'connection.json')
+    const relayStateDir = join(current, '.agentworkforce', 'relay')
+    const candidate = join(relayStateDir, 'connection.json')
     if (existsSync(candidate)) {
+      return candidate
+    }
+    // A stored project workspace key is an ownership boundary. Do not keep
+    // walking upward and attach this project to (for example) a machine-level
+    // broker that belongs to a different Relay workspace. Returning the local
+    // connection path even before it exists makes ensureRelayBroker start a
+    // project-local broker that joins this key instead.
+    if (existsSync(join(relayStateDir, 'workspace-key.json'))) {
       return candidate
     }
     const parent = dirname(current)

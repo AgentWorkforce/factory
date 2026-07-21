@@ -24,6 +24,7 @@ export type AgentRelayMcpCommand = { command: string; args: string[] }
 
 export interface HarnessDriverClientLike {
   readonly brokerPid?: number
+  getStatus?(): Promise<{ node_delivery?: { connected?: boolean } }>
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
   listAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>>

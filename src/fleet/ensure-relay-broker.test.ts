@@ -141,6 +141,56 @@ describe('ensureRelayBroker', () => {
     expect(handle.workspaceKey).toBe('rk_live_reused')
   })
 
+  it('waits for a spawned broker cloud node before returning it', async () => {
+    const client = fakeClient('spawned')
+    const getStatus = vi.fn()
+      .mockResolvedValueOnce({ node_delivery: { connected: false } })
+      .mockResolvedValueOnce({ node_delivery: { connected: true } })
+    client.getStatus = getStatus
+
+    const handle = await ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      sleep: async () => {},
+    })
+
+    expect(handle.client).toBe(client)
+    expect(handle.started).toBe(true)
+    expect(getStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not start a competing broker when a reachable broker has no cloud delivery', async () => {
+    const client = fakeClient('connected')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.disconnect = vi.fn()
+    const spawn = vi.fn(async () => fakeClient('spawned'))
+
+    await expect(ensureRelayBroker({
+      connect: () => client,
+      spawn,
+      nodeDeliveryTimeoutMs: 0,
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(spawn).not.toHaveBeenCalled()
+    expect(client.disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('shuts down a broker it started when cloud delivery never becomes ready', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.shutdown = vi.fn(async () => {})
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 0,
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(client.shutdown).toHaveBeenCalledOnce()
+  })
+
   it('fails with actionable guidance when there is no broker and no workspace key', async () => {
     await expect(ensureRelayBroker({
       connect: () => { throw new Error('no broker') },
