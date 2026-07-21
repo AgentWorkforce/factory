@@ -206,6 +206,29 @@ describe('CloudflareEnvironmentProvider', () => {
     expect(client.namespaces.size).toBe(1)
   })
 
+  it('reconciles concurrent provisioning across provider instances', async () => {
+    const client = new FakeCloudflareEnvironmentClient()
+    client.namespaces.set('factory-verification-existing-z', {
+      namespace_name: 'factory-verification-existing-z', trusted_workers: false,
+    })
+    const first = new CloudflareEnvironmentProvider({
+      resource, client, config: { maxConcurrentEnvironments: 2 }, randomId: () => 'run-a',
+    })
+    const second = new CloudflareEnvironmentProvider({
+      resource, client, config: { maxConcurrentEnvironments: 2 }, randomId: () => 'run-b',
+    })
+    const spec = { customerId: 'customer', repository: 'org/repo', ownerId: 'run' }
+
+    const results = await Promise.allSettled([first.provision(spec), second.provision(spec)])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected') as PromiseRejectedResult
+    expect(rejected.reason).toBeInstanceOf(CloudflareEnvironmentQuotaError)
+    expect(String(rejected.reason)).toContain('concurrent provision')
+    expect(client.namespaces.size).toBe(2)
+    expect(client.namespaces.has('factory-verification-existing-z')).toBe(true)
+  })
+
   it('isolates environments by namespace and refuses teardown after ownership metadata is changed', async () => {
     const client = new FakeCloudflareEnvironmentClient()
     let random = 0

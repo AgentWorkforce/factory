@@ -360,6 +360,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
           `Cloudflare max-concurrent environment cap of ${this.config.maxConcurrentEnvironments} is exhausted`,
         )
       }
+      const preexistingNames = new Set(active.map((namespace) => namespace.namespace_name))
 
       const createdAt = this.#now()
       const expiresAt = new Date(createdAt.getTime() + ttl)
@@ -377,6 +378,27 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
         }
         if (namespace.trusted_workers === true) {
           throw new Error(`Cloudflare dispatch namespace ${id} is trusted; verification namespaces must be untrusted`)
+        }
+
+        // The in-process lock closes races within one Factory instance. This
+        // reconciliation also closes the common multi-run race where two
+        // providers both observe one free slot before either creates it.
+        const reconciled = (await this.#client.listDispatchNamespaces())
+          .filter((candidate) => isManagedNamespaceName(
+            candidate.namespace_name,
+            this.config.dispatchNamespacePrefix,
+          ))
+          .sort((left, right) => (
+            Number(preexistingNames.has(right.namespace_name)) - Number(preexistingNames.has(left.namespace_name)) ||
+            compareDispatchNamespaces(left, right)
+          ))
+        if (reconciled.length > this.config.maxConcurrentEnvironments &&
+          reconciled.findIndex((candidate) => candidate.namespace_name === id) >=
+            this.config.maxConcurrentEnvironments) {
+          throw new CloudflareEnvironmentQuotaError(
+            `Cloudflare max-concurrent environment cap of ${this.config.maxConcurrentEnvironments} ` +
+            'was exceeded by a concurrent provision',
+          )
         }
 
         const costBudget = stack.runCostBudgetUsd ?? this.config.maxRunCostUsd
@@ -681,6 +703,11 @@ export function cloudflareEnvironmentName(prefix: string, repository: string, ra
 
 function isManagedNamespaceName(name: string, prefix: string): boolean {
   return name.startsWith(`${prefix}-`) && name.length <= 63
+}
+
+function compareDispatchNamespaces(left: CloudflareDispatchNamespace, right: CloudflareDispatchNamespace): number {
+  const created = (left.created_on ?? '').localeCompare(right.created_on ?? '')
+  return created || left.namespace_name.localeCompare(right.namespace_name)
 }
 
 function metadataWorkerSource(): string {

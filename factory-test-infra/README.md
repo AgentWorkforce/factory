@@ -4,9 +4,8 @@ This directory is a source-control-safe handoff note, not the environment data
 plane. `@agent-relay/factory` is a library and must not own Cloudflare account
 resources or operate verification workloads.
 
-An organization owner must create the private
-`AgentWorkforce/factory-test-infra` repository. That repository is expected to
-own:
+The private `AgentWorkforce/factory-test-infra` repository is the data-plane
+home. Its companion implementation for this change owns:
 
 ```text
 infra/                         Terraform/SST account resources
@@ -28,8 +27,9 @@ The CI scripts are a strict contract. `run-suite.sh` must make isolation,
 Container quota, elapsed-time/cost budget, max-concurrency, orphan reaping, and
 k6 load assertions fail loudly if a guardrail is removed. `down.sh` must be
 idempotent and verify the namespace's sentinel Worker identity before deletion.
-`.github/workflows/cloudflare-verification.yml` in this repository invokes that
-contract against both Miniflare and a real Cloudflare account.
+`.github/workflows/cloudflare-verification.yml` in this repository and the
+dedicated repository's `verification.yml` invoke that contract against both
+Miniflare and a real Cloudflare account.
 
 `kubernetes-connections.example.yaml` remains the optional escape-hatch provider
 configuration for stacks Cloudflare Containers cannot faithfully run. It is not

@@ -7,7 +7,7 @@ on:
         description: Factory commit to verify
         required: false
         type: string
-        default: ''
+        default: main
       infra_repository:
         description: Dedicated private verification-infra repository
         required: false
@@ -47,7 +47,7 @@ jobs:
       - name: Checkout Factory
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.factory_ref || github.sha }}
+          ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
 
@@ -122,7 +122,7 @@ jobs:
       - name: Checkout Factory
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.factory_ref || github.sha }}
+          ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
 
