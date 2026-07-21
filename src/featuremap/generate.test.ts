@@ -91,6 +91,45 @@ describe('generateFeatureMap', () => {
     expect(await readFile(join(root, FEATURE_MAP_MANIFEST_PATH), 'utf8')).toBe(secondRaw)
   })
 
+  it('serializes concurrent incremental updates so neither touched surface is lost', async () => {
+    const root = await repository()
+    await put(root, 'src/a.ts', 'export const alpha = 1\n')
+    await put(root, 'src/b.ts', 'export const beta = 2\n')
+
+    const results = await Promise.all([
+      generateFeatureMap(root, ['src/a.ts'], { now: fixedNow }),
+      generateFeatureMap(root, ['src/b.ts'], { now: fixedNow }),
+    ])
+
+    expect(results.every((result) => result.ok)).toBe(true)
+    expect(results.map((result) => result.status).sort()).toEqual(['created', 'updated'])
+    const manifest = parseFeatureMapManifest(await readFile(join(root, FEATURE_MAP_MANIFEST_PATH), 'utf8'))
+    expect(manifest.features.map((feature) => feature.location).sort()).toEqual(['src/a.ts', 'src/b.ts'])
+  })
+
+  it('uses only an adjacent comment to describe an inferred public surface', async () => {
+    const root = await repository()
+    await put(root, 'src/actions.ts', [
+      '// Copyright Example Corp. All rights reserved.',
+      'const internalValue = 1',
+      '',
+      '// Perform the customer-visible action.',
+      'export function publicAction(): number { return internalValue }',
+      '',
+      '// This comment belongs to intervening code, not the exported surface below.',
+      'const anotherInternalValue = 2',
+      '',
+      'export function anotherPublicAction(): number { return anotherInternalValue }',
+    ].join('\n'))
+
+    const result = await generateFeatureMap(root, ['src/actions.ts'], { now: fixedNow })
+
+    expect(result.added).toMatchObject([{
+      api: 'publicAction()',
+      description: 'Perform the customer-visible action.',
+    }])
+  })
+
   it('supports bounded brace globs while excluding explicitly negated files', async () => {
     const root = await repository()
     await put(root, 'src/a.ts', 'export const alpha = 1\n')

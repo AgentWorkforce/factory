@@ -10,6 +10,9 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
+
+import lockfile from 'proper-lockfile'
 
 import type { Logger } from '../ports/system'
 import {
@@ -30,6 +33,8 @@ const DEFAULT_MAX_SCANNED_PATHS = 2_000
 const DEFAULT_MAX_SOURCE_BYTES = 128 * 1024
 const DEFAULT_MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 const DEFAULT_MAX_STALE_CHECKS = 500
+const MANIFEST_LOCK_STALE_MS = 30_000
+const MANIFEST_LOCK_RETRY_MS = 10
 const SKIPPED_DIRECTORIES = new Set([
   '.git',
   '.hg',
@@ -173,9 +178,22 @@ class Deadline {
 
     try {
       return await Promise.race([operation(controller.signal), timeout])
+    } catch (error) {
+      if (controller.signal.aborted) throw new GenerationTimeoutError()
+      throw error
     } finally {
       if (timer) clearTimeout(timer)
     }
+  }
+
+  remainingMs(): number {
+    return Math.max(0, this.#expiresAt - Date.now())
+  }
+
+  async pause(maximumMs: number): Promise<void> {
+    await this.run(async (signal) => {
+      await delay(Math.min(maximumMs, this.remainingMs()), undefined, { signal })
+    })
   }
 }
 
@@ -214,71 +232,81 @@ export async function generateFeatureMap(
     if (!repoStats.isDirectory()) throw new Error(`Target repository path is not a directory: ${repoPath}`)
 
     const manifestPath = join(repoPath, FEATURE_MAP_MANIFEST_PATH)
-    const existingRaw = await readExistingManifest(manifestPath, limits.maxManifestBytes, deadline)
-    const existing = existingRaw === undefined ? undefined : parseFeatureMapManifest(existingRaw)
-    const warnings: string[] = []
-    const staleLocations = existing
-      ? await findStaleLocations(repoPath, existing.features, limits.maxStaleChecks, warnings, deadline)
-      : []
+    const releaseLock = await acquireManifestLock(manifestPath, deadline)
+    try {
+      const existingRaw = await readExistingManifest(manifestPath, limits.maxManifestBytes, deadline)
+      const existing = existingRaw === undefined ? undefined : parseFeatureMapManifest(existingRaw)
+      const warnings: string[] = []
+      const staleLocations = existing
+        ? await findStaleLocations(repoPath, existing.features, limits.maxStaleChecks, warnings, deadline)
+        : []
 
-    const touchedFiles = await resolveTouchedFiles(
-      repoPath,
-      input.touchedFileGlobs,
-      limits,
-      warnings,
-      deadline,
-    )
-    const coveredLocations = new Set(
-      existing?.features.flatMap((feature) => splitLocations(feature.location).map(normalizeRelativePath)) ?? [],
-    )
-    const uncovered = touchedFiles.filter((candidate) => !coveredLocations.has(candidate.location))
-    const existingFeatureCount = existing?.features.length ?? 0
-    const remainingCapacity = Math.max(0, limits.maxManifestFeatures - existingFeatureCount)
-    const additionLimit = Math.min(limits.maxNewEntries, remainingCapacity)
-    if (uncovered.length > additionLimit) {
-      warnings.push(
-        `Feature map growth capped at ${additionLimit} new entries; ${uncovered.length - additionLimit} touched files were deferred.`,
+      const touchedFiles = await resolveTouchedFiles(
+        repoPath,
+        input.touchedFileGlobs,
+        limits,
+        warnings,
+        deadline,
       )
-    }
-    if (remainingCapacity === 0 && uncovered.length > 0) {
-      warnings.push(`Feature map already contains the configured maximum of ${limits.maxManifestFeatures} features.`)
-    }
+      const coveredLocations = new Set(
+        existing?.features.flatMap((feature) => splitLocations(feature.location).map(normalizeRelativePath)) ?? [],
+      )
+      const uncovered = touchedFiles.filter((candidate) => !coveredLocations.has(candidate.location))
+      const existingFeatureCount = existing?.features.length ?? 0
+      const remainingCapacity = Math.max(0, limits.maxManifestFeatures - existingFeatureCount)
+      const additionLimit = Math.min(limits.maxNewEntries, remainingCapacity)
+      if (uncovered.length > additionLimit) {
+        warnings.push(
+          `Feature map growth capped at ${additionLimit} new entries; ${uncovered.length - additionLimit} touched files were deferred.`,
+        )
+      }
+      if (remainingCapacity === 0 && uncovered.length > 0) {
+        warnings.push(`Feature map already contains the configured maximum of ${limits.maxManifestFeatures} features.`)
+      }
 
-    const existingIds = new Set(existing?.features.map((feature) => feature.id) ?? [])
-    const additions: FeatureMapFeature[] = []
-    for (const candidate of uncovered.slice(0, additionLimit)) {
-      deadline.check()
-      additions.push(await inferFeature(candidate, existingIds, limits.maxSourceBytes, warnings, deadline))
-    }
+      const existingIds = new Set(existing?.features.map((feature) => feature.id) ?? [])
+      const additions: FeatureMapFeature[] = []
+      for (const candidate of uncovered.slice(0, additionLimit)) {
+        deadline.check()
+        additions.push(await inferFeature(candidate, existingIds, limits.maxSourceBytes, warnings, deadline))
+      }
 
-    if (additions.length === 0) {
+      if (additions.length === 0) {
+        reportWarnings(input.options.logger, staleLocations, warnings)
+        return {
+          ok: true,
+          status: 'unchanged',
+          manifestPath,
+          added: [],
+          staleLocations,
+          touchedFiles: touchedFiles.map((file) => file.location),
+          warnings,
+        }
+      }
+
+      const updated = formatIsoDate(input.options.now?.() ?? new Date())
+      const nextRaw = existingRaw === undefined
+        ? renderBootstrapManifest(additions, updated)
+        : extendManifest(existingRaw, existing as ParsedFeatureMapManifest, additions, updated)
+      parseFeatureMapManifest(nextRaw)
+      await persistManifest(manifestPath, nextRaw, deadline)
       reportWarnings(input.options.logger, staleLocations, warnings)
       return {
         ok: true,
-        status: 'unchanged',
+        status: existingRaw === undefined ? 'created' : 'updated',
         manifestPath,
-        added: [],
+        added: additions,
         staleLocations,
         touchedFiles: touchedFiles.map((file) => file.location),
         warnings,
       }
-    }
-
-    const updated = formatIsoDate(input.options.now?.() ?? new Date())
-    const nextRaw = existingRaw === undefined
-      ? renderBootstrapManifest(additions, updated)
-      : extendManifest(existingRaw, existing as ParsedFeatureMapManifest, additions, updated)
-    parseFeatureMapManifest(nextRaw)
-    await persistManifest(manifestPath, nextRaw, deadline)
-    reportWarnings(input.options.logger, staleLocations, warnings)
-    return {
-      ok: true,
-      status: existingRaw === undefined ? 'created' : 'updated',
-      manifestPath,
-      added: additions,
-      staleLocations,
-      touchedFiles: touchedFiles.map((file) => file.location),
-      warnings,
+    } finally {
+      await releaseLock().catch((error: unknown) => {
+        safeWarn(input.options.logger, 'Could not release the feature map generation lock.', {
+          error: errorMessage(error),
+          manifestPath,
+        })
+      })
     }
   } catch (error) {
     const timedOut = error instanceof GenerationTimeoutError
@@ -293,6 +321,31 @@ export async function generateFeatureMap(
       status: timedOut ? 'timed-out' : 'failed',
       ...baseResult,
       error: message,
+    }
+  }
+}
+
+async function acquireManifestLock(manifestPath: string, deadline: Deadline): Promise<() => Promise<void>> {
+  await deadline.run(() => mkdir(dirname(manifestPath), { recursive: true }))
+  while (true) {
+    deadline.check()
+    try {
+      const release = await lockfile.lock(manifestPath, {
+        realpath: false,
+        stale: MANIFEST_LOCK_STALE_MS,
+        update: MANIFEST_LOCK_STALE_MS / 2,
+        retries: 0,
+      })
+      try {
+        deadline.check()
+        return release
+      } catch (error) {
+        await release().catch(() => undefined)
+        throw error
+      }
+    } catch (error) {
+      if (!isLockUnavailableError(error)) throw error
+      await deadline.pause(MANIFEST_LOCK_RETRY_MS)
     }
   }
 }
@@ -733,7 +786,7 @@ function precedingComment(source: string, matchIndex: number): string | undefine
   const prefix = source.slice(Math.max(0, matchIndex - 1_500), matchIndex)
   const block = /\/\*\*?([\s\S]*?)\*\/\s*(?:@[A-Za-z_$][^\r\n]*\s*)*$/u.exec(prefix)
   if (block) return cleanComment(block[1])
-  const lines = /((?:^\s*(?:\/\/|#)\s*[^\r\n]*\r?\n?)+)\s*$/mu.exec(prefix)
+  const lines = /(?:^|\r?\n)((?:(?:[ \t]*(?:\/\/|#)[^\r\n]*)(?:\r?\n|$))+)[ \t]*$/u.exec(prefix)
   return lines ? cleanComment(lines[1]) : undefined
 }
 
@@ -938,6 +991,10 @@ function safeWarn(logger: Pick<Logger, 'warn'> | undefined, message: string, met
 
 function isMissingFileError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+}
+
+function isLockUnavailableError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ELOCKED'
 }
 
 function errorMessage(error: unknown): string {
