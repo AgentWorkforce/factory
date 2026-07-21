@@ -394,6 +394,26 @@ describe('fleet CLI parsing', () => {
     }
   })
 
+  it('stops at the nearest project workspace key instead of reusing an ancestor broker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-boundary-'))
+    try {
+      const project = join(root, 'projects', 'factory')
+      const nested = join(project, 'packages', 'factory-sdk')
+      const projectStateDir = join(project, '.agentworkforce', 'relay')
+      const projectConnectionPath = join(projectStateDir, 'connection.json')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(projectStateDir, { recursive: true })
+      await mkdir(nested, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3889 }))
+      await writeFile(join(projectStateDir, 'workspace-key.json'), JSON.stringify({ workspace_key: 'rk_live_project' }))
+
+      expect(resolveBrokerConnectionPath(nested, {})).toBe(projectConnectionPath)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('prefers an explicit relay state directory without falling back to an ancestor broker', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-broker-state-'))
     try {
