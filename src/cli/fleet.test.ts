@@ -192,6 +192,60 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('requires and forwards a workflow path for workflow capability spawns', async () => {
+    expect(() => parseFleetCommand([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+    ])).toThrow('factory fleet spawn workflow:run requires --workflow <path>')
+
+    expect(parseFleetCommand([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+      '--workflow',
+      'workflows/verify-target.ts',
+    ])).toEqual({
+      kind: 'spawn',
+      input: {
+        capability: 'workflow:run',
+        node: undefined,
+        name: 'workflow-a',
+        task: undefined,
+        workflow: 'workflows/verify-target.ts',
+        model: undefined,
+        cwd: undefined,
+        sessionRef: undefined,
+      },
+    })
+
+    const fleet = new FakeFleetClient()
+    const code = await runFleetCli([
+      'fleet',
+      'spawn',
+      'workflow:run',
+      '--name',
+      'workflow-a',
+      '--workflow',
+      'workflows/verify-target.ts',
+    ], {
+      fleet,
+      stdout: buffer(),
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(fleet.spawns).toContainEqual(expect.objectContaining({
+      capability: 'workflow:run',
+      name: 'workflow-a',
+      workflow: 'workflows/verify-target.ts',
+    }))
+  })
+
   it('parses feature-map validation and base-drift options', () => {
     expect(parseFleetCommand([
       'featuremap',

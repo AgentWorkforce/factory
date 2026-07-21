@@ -2,7 +2,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports'
+import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -67,7 +67,7 @@ export interface RelayFleetClientOptions {
   log?: (message: string) => void
 }
 
-const knownCapabilities = new Set<Capability>(['spawn:claude', 'spawn:codex', 'workflow:run'])
+const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'])
 const openStatuses = new Set(['pending', 'dispatched', 'invoked'])
 const terminalStatuses = new Set(['completed', 'failed', 'denied'])
 const DEFAULT_AGENT_NAME = 'factory'
@@ -222,6 +222,90 @@ export class RelayFleetClient implements FleetClient {
     } finally {
       this.#tracked.delete(name)
       this.#syncExitWatcher()
+    }
+  }
+
+  async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
+    const messaging = await this.#ensureMessaging()
+    const ack = await messaging.placement.spawn({
+      capability: 'preview:tailscale-serve',
+      ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+      repo: input.repo,
+      input: {
+        operation: 'start',
+        namespace: input.namespace,
+        owner: input.owner,
+        issueKey: input.issueKey,
+        service: input.service,
+        repo: input.repo,
+        targetPort: input.targetPort,
+        ...(input.preferredHttpsPort !== undefined ? { preferredHttpsPort: input.preferredHttpsPort } : {}),
+        startCommand: input.startCommand,
+        checkoutPath: input.checkoutPath,
+      },
+      ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+      log: this.#log,
+    })
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId)
+  }
+
+  async removePreview(preview: PreviewReference): Promise<boolean> {
+    const messaging = await this.#ensureMessaging()
+    const ack = await messaging.placement.spawn({
+      capability: 'preview:tailscale-serve',
+      ...(preview.node ? { node: preview.node } : {}),
+      input: { operation: 'remove', preview },
+      ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+      log: this.#log,
+    })
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    return asRecord(invocation.output)?.removed === true
+  }
+
+  async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
+    const messaging = await this.#ensureMessaging()
+    const nodes = (await this.roster()).nodes.filter((node) =>
+      node.live && node.capabilities.includes('preview:tailscale-serve'),
+    )
+    const reports = await Promise.all(nodes.map(async (node): Promise<PreviewSweepResult> => {
+      try {
+        const ack = await messaging.placement.spawn({
+          capability: 'preview:tailscale-serve',
+          node: node.name,
+          input: {
+            operation: 'sweep',
+            namespace: input.namespace,
+            activeOwners: input.activeOwners,
+            ...(input.activePreviewIds ? { activePreviewIds: input.activePreviewIds } : {}),
+          },
+          ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+          log: this.#log,
+        })
+        const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+        const output = asRecord(invocation.output)
+        return {
+          reaped: Array.isArray(output?.reaped)
+            ? output.reaped.map((value) => previewReference(value, node.name)).filter((value): value is PreviewReference => Boolean(value))
+            : [],
+          skipped: Array.isArray(output?.skipped)
+            ? output.skipped.map((value) => {
+                const record = asRecord(value)
+                return {
+                  ...(readString(record, 'id') ? { id: readString(record, 'id') } : {}),
+                  reason: readString(record, 'reason') ?? 'unknown provider result',
+                  node: node.name,
+                }
+              })
+            : [],
+        }
+      } catch (error) {
+        return { reaped: [], skipped: [{ reason: errorMessage(error), node: node.name }] }
+      }
+    }))
+    return {
+      reaped: reports.flatMap((report) => report.reaped),
+      skipped: reports.flatMap((report) => report.skipped),
     }
   }
 
@@ -720,11 +804,76 @@ function lifecycleSignalFromInvocation(
   }
 }
 
-function normalizeCapabilities(capabilities: RelayNodeCapability[] | undefined): Capability[] {
+function normalizeCapabilities(capabilities: RelayNodeCapability[] | undefined): NodeCapability[] {
   const names = (capabilities ?? [])
     .map((capability) => capability.name)
-    .filter((name): name is Capability => knownCapabilities.has(name as Capability))
+    .filter((name): name is NodeCapability => knownCapabilities.has(name as NodeCapability))
   return [...new Set(names)]
+}
+
+function previewReferenceFromInvocation(
+  invocation: RelayActionInvocation,
+  placementNode?: string,
+): PreviewReference {
+  const output = asRecord(invocation.output)
+  const preview = previewReference(output?.preview, placementNode)
+  if (!preview) throw new Error('Preview provider returned an invalid reference')
+  return preview
+}
+
+function previewReference(value: unknown, placementNode?: string): PreviewReference | undefined {
+  const record = asRecord(value)
+  const id = readString(record, 'id')
+  const namespace = readString(record, 'namespace')
+  const owner = readString(record, 'owner')
+  const service = readString(record, 'service')
+  const repo = readString(record, 'repo')
+  const url = readString(record, 'url')
+  const configuredTargetPort = readNumber(record, 'configuredTargetPort', 'configured_target_port')
+  const targetPort = readNumber(record, 'targetPort', 'target_port')
+  const httpsPort = readNumber(record, 'httpsPort', 'https_port')
+  const createdAt = readString(record, 'createdAt', 'created_at')
+  const node = readString(record, 'node') ?? placementNode
+  if (
+    !id || !namespace || !owner || !service || !repo || !url || !createdAt ||
+    targetPort === undefined || httpsPort === undefined ||
+    record?.provider !== 'tailscale-serve' || record.access !== 'tailnet' || record.lifetime !== 'issue'
+  ) return undefined
+  const startCommand = readString(record, 'startCommand', 'start_command')
+  if (!startCommand) return undefined
+  const rawProcess = asRecord(record?.process)
+  const processPid = readNumber(rawProcess, 'pid')
+  const processStartTime = readString(rawProcess, 'startTime', 'start_time')
+  const processCmdline = readString(rawProcess, 'cmdline')
+  const processCwd = readString(rawProcess, 'cwd')
+  const processMarker = readString(rawProcess, 'marker')
+  const process = processPid !== undefined && processStartTime && processCmdline && processCwd && processMarker
+    ? {
+        pid: processPid,
+        startTime: processStartTime,
+        cmdline: processCmdline,
+        cwd: processCwd,
+        marker: processMarker,
+      }
+    : undefined
+  return {
+    id,
+    provider: 'tailscale-serve',
+    namespace,
+    owner,
+    service,
+    repo,
+    url,
+    ...(configuredTargetPort !== undefined ? { configuredTargetPort } : {}),
+    targetPort,
+    httpsPort,
+    access: 'tailnet',
+    lifetime: 'issue',
+    createdAt,
+    startCommand,
+    ...(process ? { process } : {}),
+    ...(node ? { node } : {}),
+  }
 }
 
 function isUnknownRecipientError(error: unknown): boolean {

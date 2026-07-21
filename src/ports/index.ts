@@ -20,6 +20,12 @@ export type {
   AgentPidResolution,
   AgentSpec,
   Capability,
+  NodeCapability,
+  PreviewCapability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
   FleetClient,
   RestartPolicy,
   RosterEntry,
@@ -45,5 +51,7 @@ export type {
 } from './observability'
 export type {
   AgentWorktree,
+  AgentWorktreeCleanupInspection,
   AgentWorktreeManager,
+  AgentWorktreeRepository,
 } from './worktree'

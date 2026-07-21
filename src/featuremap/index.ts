@@ -16,3 +16,18 @@ export type {
 } from './validate'
 export { checkFeatureMap } from './check'
 export type { CheckFeatureMapOptions, FeatureMapCheckReport } from './check'
+export {
+  generateFeatureMap,
+  parseFeatureMapManifest,
+} from './generate'
+export type {
+  FeatureMapCriticality,
+  FeatureMapFeature,
+  FeatureMapGenerationInput,
+  FeatureMapGenerationOptions,
+  FeatureMapGenerationResult,
+  FeatureMapGenerationStatus,
+  FeatureMapVerifyTier,
+  ParsedFeatureMapManifest,
+  StaleFeatureLocation,
+} from './generate'

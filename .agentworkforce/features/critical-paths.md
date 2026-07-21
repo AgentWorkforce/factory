@@ -223,7 +223,85 @@ factory --backend relay dispatch <KEY>
 
 Internal execution must reuse an operator-owned broker when present, otherwise start a workspace-joined broker and shut down only the infrastructure Factory owns.
 
+When `preview.services.<repo>` is configured, placement must first select a
+`preview:tailscale-serve` node, start the configured foreground command inside
+the authorized issue checkout, wait for its allocated loopback port, and pin
+the issue team to that node. The tailnet-only URL must reach every agent task,
+the Slack dispatch thread, and the pull-request body. Human Review, Done, and
+startup orphan recovery must remove only the exact Factory-owned route and
+process identity while preserving unrelated Serve/Funnel configuration.
+
 **What breaks if this fails:** work runs on the wrong machine or checkout, remote exits disappear, or Factory disrupts an operator's broker.
+
+---
+
+## Path 10: Hosted Run → Reconcile → Fence
+
+The hosted control plane must turn one scheduled/event invocation into one
+durable Factory run without allowing a stale owner to mutate current state.
+
+```text
+stable invocation input + owner lease
+  → deterministic invocation/run/branch identities
+  → one run-once execution
+  → durable state and provider receipts
+  → completion ingestion/reconciliation after retries or restart
+  → merge/writeback decisions pass the same live safety gates as local Factory
+  → stale lease epochs and duplicate completion events are rejected
+```
+
+Durable Object transaction state, invocation idempotency, lease generation, and
+completion reconciliation must survive a worker restart. Failed cloud reporting
+must not change orchestration success or duplicate provider mutations.
+
+**What breaks if this fails:** the hosted service duplicates work, loses completion, or lets an expired owner publish or merge.
+
+---
+
+## Path 11: Lifecycle Event → Durable Outbox → Cloud
+
+Every admitted lifecycle transition must emit a bounded, privacy-safe event
+with stable instance/run identity and deterministic W3C trace correlation.
+
+```text
+Factory lifecycle transition
+  → validate bounded event schema (no task/prompt/source/stack payload)
+  → append to durable local outbox before delivery
+  → batch to authenticated Cloud reporter
+  → acknowledge only confirmed records
+  → retry retained records after timeout/restart
+  → never block or change the Factory orchestration result
+```
+
+Disabled reporting performs no network work. Malformed records remain bounded
+and diagnosable, and delivery failures cannot erase undelivered events.
+
+**What breaks if this fails:** Cloud progress lies or leaks sensitive content, or telemetry failure stalls production work.
+
+---
+
+## Path 12: Catalog → Procedure → Workflow → Guardian
+
+Release verification must remain executable and proactive rather than a prose
+inventory that can drift from the product.
+
+```text
+public CLI/config/export/source change
+  → v1.1 manifest entry with exact implementation location
+  → category routes to a named end-to-end procedure
+  → manifest contract enumerates the public surface
+  → deterministic workflow runs tiers 1–2 and reports live tiers explicitly
+  → hourly guardian reads the scoped Factory clone
+  → exact CAS cycle state selects one unchecked feature
+  → idempotent Slack write receives a provider timestamp
+  → checkpoint records that exact receipt; full cycle then resets
+```
+
+A manifest read failure, unsafe shrink, state conflict, malformed/oversized
+state, missing exact credentials, Slack failure, or receiptless response must
+fail closed without advancing the feature cycle.
+
+**What breaks if this fails:** shipped behavior is omitted from verification, or the guardian skips/duplicates questions while claiming coverage.
 
 ---
 
@@ -251,8 +329,12 @@ Internal execution must reuse an operator-owned broker when present, otherwise s
 | File state + re-adoption | Restart loses live agent ownership | `src/state/`, `src/fleet/relay-fleet-client.ts` |
 | Relay repo placement on spawn/restart | Hosted work lands on a node without the source checkout | `src/ports/fleet.ts`, `src/fleet/relay-fleet-client.ts`, `src/orchestrator/factory.ts` |
 | Reaper PID identity/protection | Healthy broker, node, or unrelated process is killed | `src/orchestrator/reaper.ts`, `src/orchestrator/process-identity.ts` |
+| Preview route/process identity | A tailnet URL leaks past terminal state, an unrelated Serve route/process is removed, or a handoff loses the running app | `src/node/tailscale-preview.ts`, `src/node/preview-process.ts`, `src/orchestrator/factory.ts` |
 | Node checkout containment | Hosted input executes outside advertised repos | `src/node/factory-node.ts` |
 | Relayfile guarded write + confirmation | Writes escape scope or are reported before provider ack | `src/mount/`, `src/writeback/` |
+| Hosted invocation/lease/reconciliation | Duplicate run, stale-owner mutation, or lost completion | `src/hosted/` |
+| Cloud event outbox/reporter | Lost progress, sensitive payload, or orchestration blockage | `src/observability/`, `src/ports/observability.ts` |
+| Manifest/procedure/guardian contract | Public behavior is unverified or proactive progress lies | `.agentworkforce/features/`, `.agentworkforce/agents/factory-feature-guardian/`, `workflows/verify-features.ts` |
 
 ---
 
@@ -263,7 +345,9 @@ Run these in order when the system's state is unclear:
 ```bash
 factory --help
 npm run build
+npm run featuremap:check
 npm test
+npm run verify:e2e
 # Prepare /tmp/factory-tier2-config.json as documented in verify/procedures.md.
 factory run-once --config /tmp/factory-tier2-config.json --dry-run
 factory status --config /tmp/factory-tier2-config.json
