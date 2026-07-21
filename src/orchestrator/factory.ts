@@ -2703,7 +2703,7 @@ export class FactoryLoop implements Factory {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
           continue
         }
-        this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+        this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
         const restored = claim.lifecycle.phase === 'queued' || claim.lifecycle.phase === 'releasing'
@@ -2974,7 +2974,7 @@ export class FactoryLoop implements Factory {
         : `dispatch lifecycle is owned by ${claim.lifecycle.lease?.owner ?? 'another publisher'}`
       throw new Error(`Refusing to dispatch ${decision.issue.key}: ${reason}`)
     }
-    this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+    this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
     this.#scheduleDispatchLifecycleRenewal()
     if (claim.created) {
       await this.#reportLifecycle(claim.lifecycle, 'run.started')
@@ -3243,7 +3243,7 @@ export class FactoryLoop implements Factory {
       if (!claim.acquired || !claim.lease) {
         throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
-      this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
+      this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
       this.#scheduleDispatchLifecycleRenewal()
       lifecycle = claim.lifecycle
       acquiredNow = true

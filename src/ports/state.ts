@@ -165,6 +165,8 @@ export type DispatchLifecycle = {
 }
 
 export type DispatchLifecycleClaim = {
+  /** Actual persisted key. It may be an older GitHub alias adopted atomically. */
+  key?: string
   acquired: boolean
   lifecycle: DispatchLifecycle
   lease?: DispatchLifecycleLease
