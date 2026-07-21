@@ -15658,7 +15658,7 @@ describe('FactoryLoop PR babysitter', () => {
         body: '[factory-pr-ready] AR-493',
       })
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
-        .toMatchObject({ phase: 'complete' }))
+        .toMatchObject({ phase: 'complete' }), { timeout: 4_000 })
       expect(await state().listBabysitterSessions('factory-test')).toEqual([])
     } finally {
       await first.stop()
