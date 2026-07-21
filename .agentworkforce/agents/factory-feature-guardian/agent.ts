@@ -338,7 +338,7 @@ async function readSdkSnapshot(
     if (error instanceof RelayFileApiError && error.status === 404) return null;
     throw error;
   }
-  if (file.path !== CYCLE_STATE_PATH || typeof file.content !== 'string') {
+  if (!file || file.path !== CYCLE_STATE_PATH || typeof file.content !== 'string') {
     throw new Error('cycle state SDK read returned an invalid file');
   }
   assertStateSize(file.content);
@@ -367,10 +367,14 @@ async function waitForSdkWrite(
 ): Promise<OperationStatusResponse> {
   for (;;) {
     const operation = await client.getOp(workspaceId, opId, correlationId, signal);
-    if (operation.status === 'succeeded') return operation;
-    if (['failed', 'dead_lettered', 'canceled'].includes(operation.status)) {
+    const status = operation?.status;
+    if (!status || !['pending', 'running', 'succeeded', 'failed', 'dead_lettered', 'canceled'].includes(status)) {
+      throw new Error('cycle state SDK write returned an invalid operation response');
+    }
+    if (status === 'succeeded') return operation;
+    if (['failed', 'dead_lettered', 'canceled'].includes(status)) {
       throw new Error(
-        `cycle state SDK write ${operation.status}${operation.lastError ? `: ${operation.lastError}` : ''}`
+        `cycle state SDK write ${status}${operation.lastError ? `: ${operation.lastError}` : ''}`
       );
     }
     await new Promise<void>((resolve, reject) => {
@@ -382,7 +386,7 @@ async function waitForSdkWrite(
       const timeout = setTimeout(() => {
         signal.removeEventListener('abort', onAbort);
         resolve();
-      }, 25);
+      }, SLACK_WRITEBACK_POLL_MS);
       if (signal.aborted) onAbort();
       else signal.addEventListener('abort', onAbort, { once: true });
     });
@@ -442,6 +446,9 @@ export function createSdkProgressStore(
             throw new ProgressStateConflictError();
           }
           throw error;
+        }
+        if (!queued || typeof queued.opId !== 'string' || !queued.opId.trim()) {
+          throw new Error('cycle state SDK write did not return a valid operation ID');
         }
         await waitForSdkWrite(client, credentials.workspaceId, queued.opId, signal, correlationId);
         const readBack = await readSdkSnapshot(

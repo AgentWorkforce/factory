@@ -147,6 +147,9 @@ class RelayfileStateServer {
   failGetStatus = 0;
   hangMethod: 'GET' | 'PUT' | null = null;
   corruptReadBack = false;
+  invalidFileResponse = false;
+  invalidOperationResponse = false;
+  invalidQueuedResponse = false;
   readonly requests: Array<{ method: string; ifMatch: string | null }> = [];
 
   constructor(seed: ProgressState | null) {
@@ -162,6 +165,7 @@ class RelayfileStateServer {
     expect(headers.get('x-correlation-id')).toMatch(/^guardian-state-/);
 
     if (url.pathname.includes('/ops/')) {
+      if (this.invalidOperationResponse) return jsonResponse(null);
       return jsonResponse({
         opId: url.pathname.split('/').at(-1),
         path: CYCLE_STATE_PATH,
@@ -183,6 +187,7 @@ class RelayfileStateServer {
         }, this.failGetStatus);
       }
       if (this.content === null) return jsonResponse({}, 404);
+      if (this.invalidFileResponse) return jsonResponse(null);
       const content = this.corruptReadBack ? `${JSON.stringify(progressState(1))}\n` : this.content;
       return jsonResponse({
         path: CYCLE_STATE_PATH,
@@ -207,6 +212,7 @@ class RelayfileStateServer {
     expect(body).toMatchObject({ contentType: 'application/json', encoding: 'utf-8' });
     this.content = String(body.content);
     this.revision += 1;
+    if (this.invalidQueuedResponse) return jsonResponse(null, 202);
     return jsonResponse({
       opId: `op-${this.revision}`,
       status: 'queued',
@@ -937,6 +943,34 @@ describe('factory-feature-guardian exact SDK state', () => {
     await expect(store.save(progressState(0), null, storeFeatures)).rejects.toThrow(
       'read-back did not match'
     );
+  });
+
+  it('fails closed on malformed SDK file, queued-write, and operation responses', async () => {
+    const invalidFile = new RelayfileStateServer(progressState(1));
+    invalidFile.invalidFileResponse = true;
+    await expect(
+      createSdkProgressStore(credentials, { fetchImpl: invalidFile.fetch }).load(storeFeatures)
+    ).rejects.toThrow('cycle state SDK read returned an invalid file');
+
+    const invalidQueued = new RelayfileStateServer(null);
+    invalidQueued.invalidQueuedResponse = true;
+    await expect(
+      createSdkProgressStore(credentials, { fetchImpl: invalidQueued.fetch }).save(
+        progressState(0),
+        null,
+        storeFeatures
+      )
+    ).rejects.toThrow('cycle state SDK write did not return a valid operation ID');
+
+    const invalidOperation = new RelayfileStateServer(null);
+    invalidOperation.invalidOperationResponse = true;
+    await expect(
+      createSdkProgressStore(credentials, { fetchImpl: invalidOperation.fetch }).save(
+        progressState(0),
+        null,
+        storeFeatures
+      )
+    ).rejects.toThrow('cycle state SDK write returned an invalid operation response');
   });
 
   it('rejects oversized UTF-8 state before issuing a PUT', async () => {
