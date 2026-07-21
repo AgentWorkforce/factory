@@ -6,7 +6,7 @@ an isolated environment, waits for every declared service probe, runs seed
 steps, and returns local HTTP endpoint URLs for E2E and load stages.
 
 The published JSON Schema is available as
-`@agent-relay/factory/verification-stack.schema.json`.
+`@agent-relay/factory/verification-gate-stack.schema.json`.
 
 ```yaml
 apiVersion: factory.agentworkforce.dev/v1alpha1

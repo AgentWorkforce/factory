@@ -3,16 +3,16 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import type { FactoryEventReporter } from '../ports/observability.js'
-import type { Environment, EnvironmentProvider, VerificationEnvironment } from '../ports/environment.js'
+import type { VerificationTargetEnvironment, VerificationTargetProvider, VerificationEnvironment } from '../ports/environment.js'
 import { createFactoryCloudEventV1 } from '../observability/events.js'
 import type { LoadMeasurements, LoadSloViolation } from './load-harness.js'
 import { runLoad } from './load-harness.js'
 import { loadLoadProfile } from './load-profile.js'
-import { KubernetesEnvironmentProvider } from './kubernetes-provider.js'
+import { KubernetesVerificationEnvironmentProvider } from './kubernetes-verification-provider.js'
 import {
   VerificationStackDeployer,
   type StackDeployment,
-} from './stack-deployer.js'
+} from './verification-stack-deployer.js'
 import { loadVerificationGateStack, type ResolvedVerificationStack } from './verification-stack.js'
 
 export const VERIFICATION_EVIDENCE_CONTRACT = 'factory.verification.evidence.v1' as const
@@ -114,14 +114,14 @@ export type VerificationLoadRunner = (
 export interface VerificationStackDeployRunner {
   deploy(
     stack: ResolvedVerificationStack['loaded'],
-    environment: Environment,
+    environment: VerificationTargetEnvironment,
     options?: { signal?: AbortSignal },
   ): Promise<StackDeployment>
 }
 
 export interface VerificationPipelineOptions {
   descriptorPath?: string
-  environmentProvider?: EnvironmentProvider
+  environmentProvider?: VerificationTargetProvider
   stackDeployer?: VerificationStackDeployRunner
   e2eRunner?: E2eCommandRunner
   loadRunner?: VerificationLoadRunner
@@ -137,7 +137,7 @@ export interface VerificationPipelineOptions {
 
 export class VerificationPipeline implements VerificationGate {
   readonly #descriptorPath: string
-  readonly #environmentProvider: EnvironmentProvider
+  readonly #environmentProvider: VerificationTargetProvider
   readonly #stackDeployer: VerificationStackDeployRunner
   readonly #e2eRunner: E2eCommandRunner
   readonly #loadRunner: VerificationLoadRunner
@@ -153,7 +153,7 @@ export class VerificationPipeline implements VerificationGate {
 
   constructor(options: VerificationPipelineOptions = {}) {
     this.#descriptorPath = options.descriptorPath ?? DEFAULT_VERIFICATION_DESCRIPTOR
-    this.#environmentProvider = options.environmentProvider ?? new KubernetesEnvironmentProvider({
+    this.#environmentProvider = options.environmentProvider ?? new KubernetesVerificationEnvironmentProvider({
       maxActiveEnvironments: options.maxConcurrentEnvironments ?? 2,
     })
     this.#stackDeployer = options.stackDeployer ?? new VerificationStackDeployer()
@@ -176,7 +176,7 @@ export class VerificationPipeline implements VerificationGate {
     const stages = emptyStages()
     const descriptorPath = input.descriptorPath ?? this.#descriptorPath
     let stack: ResolvedVerificationStack | undefined
-    let environment: Environment | undefined
+    let environment: VerificationTargetEnvironment | undefined
     let deployedEnvironment: VerificationEnvironment | undefined
     let deployment: StackDeployment | undefined
     let release: (() => void) | undefined
@@ -359,7 +359,7 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     functionalPass: boolean,
     reason: string,
-    environment: Environment | undefined,
+    environment: VerificationTargetEnvironment | undefined,
     deployment: StackDeployment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
@@ -421,7 +421,7 @@ export class VerificationPipeline implements VerificationGate {
     stages: VerificationEvidence['stages'],
     passed: boolean,
     reason: string,
-    environment: Environment | undefined,
+    environment: VerificationTargetEnvironment | undefined,
     timedOut: boolean,
   ): Promise<VerificationVerdict> {
     if (stages.evaluate.status === 'skipped') {
@@ -741,7 +741,7 @@ const positiveInteger = (value: number, field: string): number => {
 }
 
 function asVerificationEnvironment(
-  environment: Environment,
+  environment: VerificationTargetEnvironment,
   stack: ResolvedVerificationStack,
   endpoints: Record<string, string>,
 ): VerificationEnvironment {

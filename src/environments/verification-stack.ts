@@ -4,7 +4,7 @@ import {
   resolveVerificationStackAsset,
   resolveVerificationStackDescriptor,
   type LoadedVerificationStack,
-} from './stack-descriptor.js'
+} from './verification-stack-descriptor.js'
 
 export interface ResolvedVerificationStack {
   descriptorPath: string

@@ -10,16 +10,16 @@ import {
   FactoryConfigSchema,
   FactoryCloudReporter,
   FileFactoryCloudEventOutbox,
-  KubernetesEnvironmentProvider,
+  KubernetesVerificationEnvironmentProvider,
   VerificationPipeline,
   createFactory,
   defaultKubectlEnvironmentRunner,
   parseLinearIssue,
   reapFactoryEnvironmentsOnce,
   type FactoryConfig,
-  type Environment,
-  type EnvironmentProvider,
-  type EnvironmentSpec,
+  type VerificationTargetEnvironment,
+  type VerificationTargetProvider,
+  type VerificationTargetSpec,
   type EnvironmentStatus,
   type FactoryCloudEventBatchV1,
   type FactoryEventReporter,
@@ -38,12 +38,12 @@ import { FakeFleetClient, FakeMountClient } from '../../src/testing/index.ts'
 const artifactDirectory = join(process.cwd(), 'artifacts', 'verification-gate-e2e')
 const execFileAsync = promisify(execFile)
 
-class SignalingEnvironmentProvider implements EnvironmentProvider {
-  readonly #delegate = new KubernetesEnvironmentProvider({ maxActiveEnvironments: 2 })
+class SignalingEnvironmentProvider implements VerificationTargetProvider {
+  readonly #delegate = new KubernetesVerificationEnvironmentProvider({ maxActiveEnvironments: 2 })
 
   constructor(readonly signalPath: string) {}
 
-  async provision(input: EnvironmentSpec): Promise<Environment> {
+  async provision(input: VerificationTargetSpec): Promise<VerificationTargetEnvironment> {
     const environment = await this.#delegate.provision(input)
     await writeFile(this.signalPath, environment.namespace, 'utf8')
     return environment

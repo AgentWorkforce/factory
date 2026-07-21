@@ -6,6 +6,7 @@ export { FileStateStore, githubWatchStatePath } from './state/file-state-store.j
 export type { FileStateStoreOptions } from './state/file-state-store.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
+export * from './environments/index.js'
 export {
   resolveFactoryStates,
   stateResolutionFromIds,
@@ -268,12 +269,16 @@ export type {
 } from './subscriptions'
 export type {
   Capability,
+  Environment,
+  EnvironmentProvider,
+  EnvironmentStatus,
   NodeCapability,
   PreviewCapability,
   PreviewReference,
   PreviewStartInput,
   PreviewSweepInput,
   PreviewSweepResult,
+  ProvisionEnvironmentSpec,
   ChangeEvent,
   Clock,
   EventPage,
@@ -305,11 +310,10 @@ export type {
   TelemetrySink,
   FactoryEventReporter,
   FactoryEventReportResult,
-  Environment,
-  EnvironmentProvider,
-  EnvironmentSpec,
-  EnvironmentStatus,
   KubernetesEnvironmentTarget,
+  VerificationTargetEnvironment,
+  VerificationTargetProvider,
+  VerificationTargetSpec,
 } from './ports'
 export {
   DEFAULT_VERIFICATION_STACK_PATH,
@@ -325,7 +329,7 @@ export {
   parseVerificationStack,
   resolveVerificationStackAsset,
   resolveVerificationStackDescriptor,
-} from './environments/stack-descriptor'
+} from './environments/verification-stack-descriptor'
 export type {
   LoadedVerificationStack,
   ResolveVerificationStackOptions,
@@ -337,13 +341,13 @@ export type {
   VerificationStackSeed,
   VerificationStackService,
   VerificationStackSource,
-} from './environments/stack-descriptor'
+} from './environments/verification-stack-descriptor'
 export {
   KubectlPortForwarder,
   StackDeploymentError,
   VerificationStackDeployer,
   deployVerificationStack,
-} from './environments/stack-deployer'
+} from './environments/verification-stack-deployer'
 export type {
   ManagedPortForward,
   PortForwarder,
@@ -352,14 +356,14 @@ export type {
   StackDeployerOptions,
   StackDeployment,
   VerificationStackReferenceResolver,
-} from './environments/stack-deployer'
-export { KubernetesEnvironmentProvider } from './environments/kubernetes-provider'
-export type { KubernetesEnvironmentProviderOptions } from './environments/kubernetes-provider'
+} from './environments/verification-stack-deployer'
+export { KubernetesVerificationEnvironmentProvider } from './environments/kubernetes-verification-provider'
+export type { KubernetesVerificationEnvironmentProviderOptions } from './environments/kubernetes-verification-provider'
 export { CommandExecutionError, ProcessCommandRunner } from './environments/kubernetes-command'
 export type {
-  CommandResult,
+  CommandResult as KubectlProcessCommandResult,
   CommandRunner,
-  KubernetesConnection,
+  KubectlConnectionOptions,
   RunCommandOptions,
 } from './environments/kubernetes-command'
 export {

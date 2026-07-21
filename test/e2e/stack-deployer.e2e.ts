@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { resolve } from 'node:path'
 
 import {
-  KubernetesEnvironmentProvider,
+  KubernetesVerificationEnvironmentProvider,
   ProcessCommandRunner,
   StackDeploymentError,
   VerificationStackDeployer,
@@ -15,7 +15,7 @@ const root = resolve(import.meta.dirname, '../..')
 const context = process.env.FACTORY_E2E_KUBE_CONTEXT
 const kubeconfig = process.env.KUBECONFIG
 const suffix = `${process.pid}-${Date.now().toString(36)}`
-const provider = new KubernetesEnvironmentProvider({
+const provider = new KubernetesVerificationEnvironmentProvider({
   context,
   kubeconfig,
   namespacePrefix: 'factory-stack-e2e',

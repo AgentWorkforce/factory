@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentworkforce.github.io/factory/schemas/verification-stack.schema.json",
+  "title": "Factory verification stack",
+  "description": "Repository-owned contract for deploying and health-gating a verification stack.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "name", "source", "services"],
+  "properties": {
+    "apiVersion": { "const": "factory.agentworkforce.dev/v1alpha1" },
+    "kind": { "const": "VerificationStack" },
+    "name": { "$ref": "#/$defs/dnsName" },
+    "source": { "$ref": "#/$defs/source" },
+    "secrets": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/referenceGroup" }
+    },
+    "config": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/referenceGroup" }
+    },
+    "services": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/service" }
+    },
+    "seeds": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/seed" }
+    },
+    "endpoints": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/endpoint" }
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
+    }
+  },
+  "$defs": {
+    "dnsName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![/\\\\])(?![A-Za-z]:)(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$",
+      "description": "Path relative to the repository root. Absolute paths and '..' segments are forbidden."
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "chart"],
+          "properties": {
+            "type": { "const": "helm" },
+            "chart": { "type": "string", "minLength": 1 },
+            "release": { "$ref": "#/$defs/dnsName" },
+            "valuesFiles": {
+              "type": "array",
+              "default": [],
+              "items": { "$ref": "#/$defs/relativePath" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "path"],
+          "properties": {
+            "type": { "const": "kustomize" },
+            "path": { "$ref": "#/$defs/relativePath" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "paths"],
+          "properties": {
+            "type": { "const": "manifests" },
+            "paths": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/relativePath" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "path"],
+          "properties": {
+            "type": { "const": "docker-compose" },
+            "path": { "$ref": "#/$defs/relativePath" }
+          }
+        }
+      ]
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref"],
+      "properties": {
+        "ref": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "optional": { "type": "boolean", "default": false }
+      }
+    },
+    "referenceGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "data"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsName" },
+        "data": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "additionalProperties": { "$ref": "#/$defs/reference" }
+        }
+      }
+    },
+    "probe": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "port"],
+          "properties": {
+            "type": { "const": "http" },
+            "service": { "$ref": "#/$defs/dnsName" },
+            "port": { "$ref": "#/$defs/port" },
+            "path": { "type": "string", "pattern": "^/", "default": "/" },
+            "scheme": { "enum": ["http", "https"], "default": "http" },
+            "expectedStatuses": {
+              "type": "array",
+              "minItems": 1,
+              "default": [200],
+              "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+            },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 120 },
+            "intervalSeconds": { "type": "number", "minimum": 0.1, "maximum": 60, "default": 2 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "port"],
+          "properties": {
+            "type": { "const": "tcp" },
+            "service": { "$ref": "#/$defs/dnsName" },
+            "port": { "$ref": "#/$defs/port" },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 120 },
+            "intervalSeconds": { "type": "number", "minimum": 0.1, "maximum": 60, "default": 2 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": { "const": "exec" },
+            "target": { "type": "string", "minLength": 1 },
+            "container": { "$ref": "#/$defs/dnsName" },
+            "command": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 120 },
+            "intervalSeconds": { "type": "number", "minimum": 0.1, "maximum": 60, "default": 2 }
+          }
+        }
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "workload", "readiness"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsName" },
+        "workload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["deployment", "statefulset", "daemonset"] },
+            "name": { "$ref": "#/$defs/dnsName" }
+          }
+        },
+        "readiness": { "$ref": "#/$defs/probe" },
+        "health": { "$ref": "#/$defs/probe" }
+      }
+    },
+    "seed": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "name", "service", "command"],
+          "properties": {
+            "type": { "const": "exec" },
+            "name": { "$ref": "#/$defs/dnsName" },
+            "service": { "$ref": "#/$defs/dnsName" },
+            "container": { "$ref": "#/$defs/dnsName" },
+            "command": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 120 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "name", "manifest", "job"],
+          "properties": {
+            "type": { "const": "job" },
+            "name": { "$ref": "#/$defs/dnsName" },
+            "manifest": { "$ref": "#/$defs/relativePath" },
+            "job": { "$ref": "#/$defs/dnsName" },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 120 }
+          }
+        }
+      ]
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "service", "port"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsName" },
+        "service": { "$ref": "#/$defs/dnsName" },
+        "port": { "$ref": "#/$defs/port" },
+        "protocol": { "enum": ["http", "https"], "default": "http" },
+        "path": { "type": "string", "pattern": "^/", "default": "/" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["e2e", "load"],
+      "properties": {
+        "environmentTtlSeconds": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 900 },
+        "e2e": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command"],
+          "properties": {
+            "command": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "args": { "type": "array", "default": [], "items": { "type": "string" } },
+            "env": { "type": "object", "default": {}, "additionalProperties": { "type": "string" } },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 }
+          }
+        },
+        "load": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile"],
+          "properties": {
+            "profile": { "$ref": "#/$defs/relativePath" },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 },
+            "k6Image": { "type": "string", "minLength": 1, "pattern": "\\S" }
+          }
+        },
+        "overallTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 7200, "default": 900 },
+        "teardownTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 1800, "default": 120 }
+      }
+    }
+  }
+}

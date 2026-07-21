@@ -3,6 +3,8 @@ import { join } from 'node:path'
 
 import { z } from 'zod'
 
+import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
+
 // The five workflow-state roles the factory drives an issue through. Each is
 // configured either by name (config.linear.states.<role>, resolved to a
 // workspace UUID at startup) or by explicit UUID (config.stateIds.<role>).
@@ -222,6 +224,10 @@ const safetySchema = z.object({
   requireTeamKey: z.string().min(1).default('AR'),
 }).default({})
 
+const environmentsSchema = z.object({
+  kubernetes: KubernetesEnvironmentConfigSchema.optional(),
+}).strict().default({})
+
 const WorkspaceConfigObjectSchema = z.object({
   // Optional. When omitted, the CLI derives the workspace from the cloud session
   // via `resolveActiveWorkspace()` (returns the active `relayfileWorkspaceId`),
@@ -277,6 +283,7 @@ const WorkspaceConfigObjectSchema = z.object({
   // place once resolution runs, so the orchestrator always sees concrete UUIDs.
   stateIds: stateIdsSchema,
   safety: safetySchema,
+  environments: environmentsSchema,
 })
 
 const NodeConfigObjectSchema = z.object({

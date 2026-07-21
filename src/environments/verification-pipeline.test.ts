@@ -7,13 +7,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { FactoryCloudEventInputV1 } from '../observability/events'
 import type { FactoryEventReporter, FactoryEventReportResult } from '../ports/observability'
 import type {
-  Environment,
-  EnvironmentProvider,
-  EnvironmentSpec,
+  VerificationTargetEnvironment,
+  VerificationTargetProvider,
+  VerificationTargetSpec,
   EnvironmentStatus,
 } from '../ports/environment'
-import type { LoadedVerificationStack } from './stack-descriptor'
-import type { StackDeployment } from './stack-deployer'
+import type { LoadedVerificationStack } from './verification-stack-descriptor'
+import type { StackDeployment } from './verification-stack-deployer'
 import {
   VerificationPipeline,
   type E2eCommandResult,
@@ -26,11 +26,11 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
 })
 
-class RecordingEnvironmentProvider implements EnvironmentProvider {
+class RecordingEnvironmentProvider implements VerificationTargetProvider {
   readonly calls: string[] = []
   teardownError?: Error
 
-  async provision(input: EnvironmentSpec): Promise<Environment> {
+  async provision(input: VerificationTargetSpec): Promise<VerificationTargetEnvironment> {
     this.calls.push('provision')
     return {
       id: `env-${input.id}`,
@@ -43,7 +43,7 @@ class RecordingEnvironmentProvider implements EnvironmentProvider {
     }
   }
 
-  async deploy(_stack: LoadedVerificationStack, _environment: Environment): Promise<StackDeployment> {
+  async deploy(_stack: LoadedVerificationStack, _environment: VerificationTargetEnvironment): Promise<StackDeployment> {
     this.calls.push('deploy')
     return {
       endpoints: { api: 'http://127.0.0.1:1234/health' },

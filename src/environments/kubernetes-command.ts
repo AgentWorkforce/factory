@@ -16,7 +16,7 @@ export interface CommandRunner {
   run(command: string, args: string[], options?: RunCommandOptions): Promise<CommandResult>
 }
 
-export interface KubernetesConnection {
+export interface KubectlConnectionOptions {
   kubeconfig?: string
   context?: string
 }
@@ -114,14 +114,14 @@ export class ProcessCommandRunner implements CommandRunner {
   }
 }
 
-export function kubectlConnectionArgs(connection: KubernetesConnection): string[] {
+export function kubectlConnectionArgs(connection: KubectlConnectionOptions): string[] {
   return [
     ...(connection.kubeconfig ? ['--kubeconfig', connection.kubeconfig] : []),
     ...(connection.context ? ['--context', connection.context] : []),
   ]
 }
 
-export function helmConnectionArgs(connection: KubernetesConnection): string[] {
+export function helmConnectionArgs(connection: KubectlConnectionOptions): string[] {
   return [
     ...(connection.kubeconfig ? ['--kubeconfig', connection.kubeconfig] : []),
     ...(connection.context ? ['--kube-context', connection.context] : []),

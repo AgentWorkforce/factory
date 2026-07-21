@@ -2,15 +2,15 @@ import { access } from 'node:fs/promises'
 
 import { describe, expect, it } from 'vitest'
 
-import type { Environment } from '../ports/environment'
+import type { VerificationTargetEnvironment } from '../ports/environment'
 import type { CommandRunner, RunCommandOptions } from './kubernetes-command'
 import {
   StackDeploymentError,
   VerificationStackDeployer,
   type ManagedPortForward,
   type PortForwarder,
-} from './stack-deployer'
-import { loadVerificationStack, type VerificationStackDescriptor } from './stack-descriptor'
+} from './verification-stack-deployer'
+import { loadVerificationStack, type VerificationStackDescriptor } from './verification-stack-descriptor'
 
 class RecordingRunner implements CommandRunner {
   readonly calls: Array<{ command: string; args: string[]; options?: RunCommandOptions }> = []
@@ -34,7 +34,7 @@ class FakePortForwarder implements PortForwarder {
   }
 }
 
-function environment(): Environment {
+function environment(): VerificationTargetEnvironment {
   return {
     id: 'env-1',
     status: 'ready',
