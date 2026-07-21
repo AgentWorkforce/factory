@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
@@ -91,6 +91,72 @@ describe('GitAgentWorktreeManager', () => {
       await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/resolved target is/u)
       await expect(manager.cleanup(worktree)).rejects.toThrow(/resolved target is/u)
       await expect(stat(outside)).resolves.toMatchObject({})
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses cleanup when the Factory checkout root itself redirects outside the owned tree', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-root-symlink-safety-'))
+    const base = join(root, 'PearCheckout')
+    const outsideRoot = join(root, 'outside-root')
+    try {
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      await git(base, ['config', 'user.email', 'factory@example.test'])
+      await git(base, ['config', 'user.name', 'Factory Test'])
+      await writeFile(join(base, 'README.md'), '# pear\n', 'utf8')
+      await git(base, ['add', 'README.md'])
+      await git(base, ['commit', '-m', 'initial'])
+      const worktreePath = factoryWorktreePath(base, 'AR-35', 'AgentWorkforce/pear', 'escape02')
+      const expectedRoot = dirname(worktreePath)
+      const outside = join(outsideRoot, basename(worktreePath))
+      await mkdir(outsideRoot)
+      await git(base, ['worktree', 'add', '-b', 'factory/ar-35-pear-escape02', outside])
+      await mkdir(dirname(expectedRoot), { recursive: true })
+      await symlink(outsideRoot, expectedRoot, 'dir')
+      const worktree = {
+        repo: 'AgentWorkforce/pear',
+        issueKey: 'AR-35',
+        baseClonePath: base,
+        worktreePath,
+        branch: 'factory/ar-35-pear-escape02',
+      }
+      const manager = new GitAgentWorktreeManager()
+
+      await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(manager.cleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(stat(outside)).resolves.toMatchObject({})
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses parent cleanup through a symbolic-link Factory container when the checkout is missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-container-symlink-safety-'))
+    const base = join(root, 'PearCheckout')
+    const outsideFactory = join(root, 'outside-factory')
+    try {
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      const worktreePath = factoryWorktreePath(base, 'AR-36', 'AgentWorkforce/pear', 'escape03')
+      const expectedRoot = dirname(worktreePath)
+      const factoryContainer = dirname(expectedRoot)
+      const outsideCheckout = join(outsideFactory, basename(expectedRoot))
+      await mkdir(outsideCheckout, { recursive: true })
+      await symlink(outsideFactory, factoryContainer, 'dir')
+      const worktree = {
+        repo: 'AgentWorkforce/pear',
+        issueKey: 'AR-36',
+        baseClonePath: base,
+        worktreePath,
+        branch: 'factory/ar-36-pear-escape03',
+      }
+      const manager = new GitAgentWorktreeManager()
+
+      await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(manager.cleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(stat(outsideCheckout)).resolves.toMatchObject({})
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -250,7 +316,7 @@ describe('GitAgentWorktreeManager', () => {
     })).rejects.toThrow(/unsafe Factory worktree branch/u)
   })
 
-  it('prunes an unrelated deleted registration before validating an existing checkout', async () => {
+  it('ignores an unrelated deleted locked registration when validating an existing checkout', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-prune-'))
     const base = join(root, 'pear')
     try {
@@ -275,6 +341,7 @@ describe('GitAgentWorktreeManager', () => {
 
       const stalePath = join(root, 'deleted-unrelated-worktree')
       await git(base, ['worktree', 'add', '-b', 'unrelated-stale', stalePath, 'main'])
+      await git(base, ['worktree', 'lock', stalePath])
       await rm(stalePath, { recursive: true, force: true })
 
       await expect(manager.prepare(worktree)).resolves.toBeUndefined()

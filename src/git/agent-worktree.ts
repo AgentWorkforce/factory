@@ -118,6 +118,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
   async cleanup(worktree: AgentWorktree): Promise<void> {
     await this.#prepares.get(resolve(worktree.worktreePath))
     assertSafeWorktree(worktree)
+    await assertNonSymlinkFactoryRoot(factoryWorktreeRoot(worktree.baseClonePath))
     await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (!await pathExists(worktree.worktreePath)) {
       await removeEmptyWorktreeParents(worktree.worktreePath)
@@ -178,6 +179,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
 
   async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
     assertSafeWorktree(worktree)
+    await assertNonSymlinkFactoryRoot(factoryWorktreeRoot(worktree.baseClonePath))
     // Inspection runs before cleanup, so it must clear unrelated deleted
     // registrations itself. Otherwise #assertRegisteredCheckout can fail on
     // realpath() for a stale sibling and retain every healthy candidate in the
@@ -218,7 +220,9 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
 
   async #assertRegisteredCheckout(worktree: AgentWorktree): Promise<void> {
     const wanted = await realpath(worktree.worktreePath)
-    const expectedRoot = await realpath(factoryWorktreeRoot(worktree.baseClonePath))
+    const expectedRootPath = factoryWorktreeRoot(worktree.baseClonePath)
+    await assertNonSymlinkFactoryRoot(expectedRootPath)
+    const expectedRoot = await realpath(expectedRootPath)
     if (wanted === expectedRoot || !wanted.startsWith(`${expectedRoot}/`)) {
       throw new Error(`Refusing Factory worktree operation outside ${expectedRoot}: resolved target is ${wanted}`)
     }
@@ -230,7 +234,9 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
       .split(/\r?\n/u)
       .filter((line) => line.startsWith('worktree '))
       .map((line) => line.slice('worktree '.length).trim())
-    const registered = await Promise.all(registeredPaths.map(async (path) => await realpath(path)))
+    const registered = (await Promise.allSettled(
+      registeredPaths.map(async (path) => await realpath(path)),
+    )).flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
     if (!registered.includes(wanted)) {
       throw new Error(`Refusing Factory worktree operation for unregistered checkout ${wanted}`)
     }
@@ -363,6 +369,19 @@ const directorySize = async (root: string): Promise<number> => {
     bytes += await directorySize(join(root, child))
   }
   return bytes
+}
+
+const assertNonSymlinkFactoryRoot = async (expectedRoot: string): Promise<void> => {
+  for (const path of [dirname(expectedRoot), expectedRoot]) {
+    try {
+      if ((await lstat(path)).isSymbolicLink()) {
+        throw new Error(`Refusing Factory worktree operation through symbolic-link root ${path}`)
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return
+      throw error
+    }
+  }
 }
 
 const removeEmptyWorktreeParents = async (worktreePath: string): Promise<void> => {
