@@ -6678,7 +6678,15 @@ export class FactoryLoop implements Factory {
         await this.#resumeTrackedAgent(record, previousName, tracked)
         tracked.unreachableWakeResumedSessionRef = tracked.sessionRef
       } else {
-        const invocationId = `${batch.invocationIdFor(record.issue, tracked.spec)}:unreachable:${this.#clock.now()}`
+        // Never derive a recovery id from the prior recovery id: recordSpawn
+        // persists invocationId back into the spec, so doing that recursively
+        // grows the value until telemetry and downstream id contracts reject
+        // it. Recompute the stable logical-agent base every time instead.
+        const recoveryInvocationBase = batch.invocationIdFor(record.issue, {
+          ...tracked.spec,
+          invocationId: undefined,
+        })
+        const invocationId = `${recoveryInvocationBase}:unreachable:${this.#clock.now()}`
         const { sessionRef: _staleSessionRef, ...persistedSpec } = tracked.spec
         const replacementSpec = capabilityChanged
           ? {

@@ -1209,7 +1209,7 @@ class RecoveringBabysitterHarnessClient extends RosterPidHarnessClient {
 class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient {
   babysitterWakeAttempts = 0
   coldStarted = false
-  failUntilNextResume = false
+  recoverySpawnsUntilReachable = 0
 
   override async spawnPty(input: SpawnPtyInput): Promise<{ name: string; session_ref: string }> {
     const priorBabysitterSpawns = this.spawned.filter((spawn) => spawn.name.includes('-babysit')).length
@@ -1217,8 +1217,8 @@ class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient 
     if (input.name.includes('-babysit') && priorBabysitterSpawns > 0 && !input.continueFrom) {
       this.coldStarted = true
     }
-    if (input.name.includes('-babysit') && this.coldStarted && input.continueFrom) {
-      this.failUntilNextResume = false
+    if (input.name.includes('-babysit') && this.coldStarted && this.recoverySpawnsUntilReachable > 0) {
+      this.recoverySpawnsUntilReachable -= 1
     }
     return result
   }
@@ -1226,7 +1226,7 @@ class ResumeThenColdStartBabysitterHarnessClient extends RosterPidHarnessClient 
   override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets?: string[] }> {
     if (input.to.includes('-babysit') && input.text.startsWith('<integration-event')) {
       this.babysitterWakeAttempts += 1
-      if (!this.coldStarted || this.failUntilNextResume) {
+      if (!this.coldStarted || this.recoverySpawnsUntilReachable > 0) {
         throw new Error(
           `Relaycast publish failed: relaycast send_dm failed: API error (agent_not_found): Agent "${input.to}" not found`,
         )
@@ -18433,7 +18433,7 @@ describe('FactoryLoop PR babysitter', () => {
       // The cold start is a fresh session generation. If it later becomes
       // unreachable, it receives one resume of its own instead of inheriting
       // the spent fence from the previous broken session.
-      harness.failUntilNextResume = true
+      harness.recoverySpawnsUntilReachable = 2
       mount.files.set('/github/repos/AgentWorkforce/pear/comments/9427.json', { content: {
         repository: { full_name: 'AgentWorkforce/pear' },
         pull_request: { number: 426 },
@@ -18442,17 +18442,27 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/comments/9427.json', 'comment-9427'))
       await vi.waitFor(
         () => expect(factory.status().counters.babysitterEventWakesDelivered).toBe(2),
-        { timeout: 12_000 },
+        { timeout: 20_000 },
       )
       const nextGenerationSpawns = harness.spawned.filter((spawn) => spawn.name === 'ar-426-babysit')
-      expect(nextGenerationSpawns).toHaveLength(4)
+      expect(nextGenerationSpawns).toHaveLength(5)
       expect(nextGenerationSpawns[3]?.continueFrom).toBe('session-ar-426-babysit')
-      expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(3)
+      expect(nextGenerationSpawns[4]?.continueFrom).toBeUndefined()
+      expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(4)
+      const coldStartInvocationIds = nextGenerationSpawns
+        .filter((spawn) => !spawn.continueFrom)
+        .slice(1)
+        .map((spawn) => spawn.invocationId)
+      expect(coldStartInvocationIds).toHaveLength(2)
+      for (const invocationId of coldStartInvocationIds) {
+        expect(invocationId).toMatch(/^factory:426:[a-z0-9]+:unreachable:\d+$/u)
+        expect(invocationId?.length).toBeLessThanOrEqual(256)
+      }
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
-  }, 20_000)
+  }, 35_000)
 
   it('cold-starts an unreachable babysitter when its configured capability changed', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-capability-recovery-'))
