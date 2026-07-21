@@ -12186,9 +12186,11 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(20), realMergeIssueFile(20))))
     fleet.emitAgentExit('ar-20-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-20-impl-pear', 'ar-20-review']))
-    expect(gate.checks).toHaveLength(12)
+    await vi.waitFor(() => expect(gate.checks).toHaveLength(12))
     expect(gate.merges).toEqual([])
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(20), content: { stateId: done } })
   })
 
   it('aborts a real PR merge when the guarded head commit has drifted', async () => {
@@ -12212,7 +12214,7 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(21), realMergeIssueFile(21))))
     fleet.emitAgentExit('ar-21-impl-pear', 'issue-done')
 
-    await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toEqual(['ar-21-impl-pear', 'ar-21-review']))
+    await vi.waitFor(() => expect(gate.merges).toHaveLength(1))
     expect(gate.merges).toEqual([{
       repo: 'AgentWorkforce/pear',
       number: 21,
@@ -12220,6 +12222,9 @@ describe('FactoryLoop', () => {
     }])
     expect(factory.status().counters.mergeGateMergeAborted).toBe(1)
     expect(factory.status().counters.mergeGateMerged).toBeUndefined()
+    expect(fleet.releases).toEqual([])
+    expect(factory.status().inFlight).toEqual([{ uuid: 'uuid-21', key: 'AR-21', path: issuePath(21) }])
+    expect(mount.writes).not.toContainEqual({ path: issuePath(21), content: { stateId: done } })
   })
 
   it('merges a real PR once checks are green, review is approved, and head still matches', async () => {

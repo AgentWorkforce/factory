@@ -9886,6 +9886,7 @@ export class FactoryLoop implements Factory {
       // state.
       const issueTeam = issue?.team
       const githubIssue = issue ? isGithubIssue(issue) : false
+      const syntheticProbe = issue ? this.#isSyntheticProbeIssue(issue) : false
       const configuredHumanReview = opts.targetState !== 'done' &&
         this.#config.terminalState === 'human-review' &&
         (githubIssue || this.#states.hasHumanReview(issueTeam))
@@ -9909,6 +9910,7 @@ export class FactoryLoop implements Factory {
       if (
         issue &&
         !githubIssue &&
+        !syntheticProbe &&
         !configuredHumanReview &&
         opts.runMergeGate !== false &&
         this.#config.mergePolicy === 'on-green-with-review'
@@ -9971,6 +9973,12 @@ export class FactoryLoop implements Factory {
         } catch (error) {
           this.#markSlackWritebackFailure('completion-thread', error)
         }
+      }
+      // Synthetic canaries are cleanup probes, not merge candidates. Preserve
+      // their close-before-release path under every merge policy without
+      // subjecting them to the required feature verification gate.
+      if (issue && syntheticProbe && !githubIssue && opts.runMergeGate !== false) {
+        await this.#runCompletionMergeGate(issue, record)
       }
       const releaseReason = humanReview ? 'issue-human-review' : 'issue-done'
       releaseReasonForRetry = releaseReason
