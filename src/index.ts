@@ -2,6 +2,7 @@ import type { FactoryConfig } from './config/schema'
 
 export * from './webhook/index.js'
 export * from './state/index.js'
+export * from './cost/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
 export type { FileStateStoreOptions } from './state/file-state-store.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
@@ -311,6 +312,7 @@ export type {
   SendInput,
   SpawnInput,
   SpawnResult,
+  AgentUsage,
   GithubRead,
   GithubIssueStatus,
   GithubWriteback,
@@ -385,6 +387,7 @@ export {
   FactoryCloudEventInputV1Schema,
   FactoryCloudEventV1Schema,
   FactoryCloudInstanceV1Schema,
+  FactoryCloudRunCostV1Schema,
   FactoryCloudVerificationEvidenceV1Schema,
   FactoryCloudSpanIdV1Schema,
   FactoryCloudTraceIdV1Schema,
@@ -414,6 +417,7 @@ export type {
   FactoryCloudEventType,
   FactoryCloudEventV1,
   FactoryCloudInstanceV1,
+  FactoryCloudRunCostV1,
   FactoryCloudVerificationEvidenceV1,
   FactoryCloudReleaseReasonV1,
 } from './observability/events'

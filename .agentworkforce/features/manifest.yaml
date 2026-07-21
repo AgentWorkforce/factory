@@ -2,9 +2,9 @@ version: '1.1'
 updated: '2026-07-21'
 catalog:
   category_count: 25
-  feature_count: 301
+  feature_count: 302
   tier_counts:
-    1: 43
+    1: 44
     2: 123
     3: 11
     4: 51
@@ -1530,7 +1530,7 @@ categories:
       - id: cloud-event-contract
         name: Bounded Cloud Event Contract
         api: FACTORY_CLOUD_EVENT_CONTRACT_V1 / FactoryCloudEventV1Schema
-        description: Admit only a strict bounded operational field set and reject task text, prompts, messages, paths, commands, source, tokens, raw errors, and stack traces
+        description: Admit only a strict bounded operational field set and reject task text, prompts, messages, paths, commands, source content, arbitrary token fields, raw errors, and stack traces
         location: src/observability/events.ts, src/ports/observability.ts
         verify_tier: 1
 
@@ -1568,6 +1568,13 @@ categories:
         description: Persist and flush lifecycle progress without allowing reporter construction, storage, network, retry, or shutdown failure to change Factory orchestration
         location: src/observability/cloud-reporter.ts, src/orchestrator/factory.ts, src/cli/fleet.ts
         verify_tier: 2
+
+      - id: cloud-run-cost-accounting
+        name: Per-Run Role and Model Cost Ledger
+        api: CostLedger / estimateCostUsd() / run.cost.v1
+        description: Attribute reported or explicitly missing agent token usage to each run, role, and model, price known models, retain the aggregate on the durable run, and emit one privacy-bounded completion summary
+        location: src/cost/ledger.ts, src/cost/pricing.ts
+        verify_tier: 1
 
   release-verification:
     name: Release and Feature Verification

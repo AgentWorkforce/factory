@@ -135,6 +135,44 @@ describe('Factory cloud event v1 contract', () => {
     })).toThrow()
   })
 
+  it('admits only the bounded run cost summary shape', () => {
+    const event = createFactoryCloudEventV1({
+      type: 'run.cost.v1',
+      runId: 'cost-run',
+      attributes: { inputTokens: 300, outputTokens: 50, usd: 0.00225 },
+      cost: {
+        inputTokens: 300,
+        outputTokens: 50,
+        usd: 0.00225,
+        byRole: [{
+          role: 'implementer',
+          inputTokens: 300,
+          outputTokens: 50,
+          usd: 0.00225,
+          byModel: [{
+            model: 'openai/gpt-5.4',
+            inputTokens: 300,
+            outputTokens: 50,
+            usd: 0.00225,
+          }],
+        }],
+      },
+    })
+    expect(event.trace?.traceId).toBe(factoryRunTraceIdV1('cost-run'))
+
+    expect(() => FactoryCloudEventInputV1Schema.parse({
+      ...event,
+      cost: { ...event.cost, task: 'inspect /private/customer/repo' },
+    })).toThrow()
+    expect(() => FactoryCloudEventInputV1Schema.parse({
+      ...event,
+      cost: {
+        ...event.cost,
+        byRole: event.cost!.byRole.map((role) => ({ ...role, path: '/private/customer/repo' })),
+      },
+    })).toThrow()
+  })
+
   it('validates the exact authenticated ingestion batch shape', () => {
     const parsed = FactoryCloudEventBatchV1Schema.parse({
       contract: 'factory.telemetry.v1',

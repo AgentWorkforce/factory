@@ -76,7 +76,7 @@
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
     "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
     "test:stack-e2e": "tsx test/e2e/stack-deployer.e2e.ts",
-    "verify:e2e": "node scripts/verify-packed-e2e.mjs",
+    "verify:e2e": "vitest run test/e2e/run-cost-accounting.test.ts && node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
   },
   "dependencies": {

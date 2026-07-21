@@ -47,6 +47,7 @@ export const FACTORY_CLOUD_EVENT_TYPES = [
   'run.succeeded',
   'run.failed',
   'run.cancelled',
+  'run.cost.v1',
   'agent.planned',
   'agent.spawned',
   'agent.adopted',
@@ -64,6 +65,7 @@ export const FACTORY_CLOUD_EVENT_TYPES = [
   'pull_request.ready',
   'pull_request.merged',
   'writeback.applied',
+  'cost.model.unpriced',
   'factory.failure',
   'factory.anomaly',
   'factory.snapshot',
@@ -104,6 +106,10 @@ export const FactoryCloudEventAttributesV1Schema = z.object({
   attempt: nonNegativeInteger.optional(),
   durationMs: nonNegativeInteger.optional(),
   agentRole: categoryString.optional(),
+  model: categoryString.optional(),
+  inputTokens: boundedCount.nullable().optional(),
+  outputTokens: boundedCount.nullable().optional(),
+  usd: z.number().finite().nonnegative().nullable().optional(),
   invocationId: opaqueString.optional(),
   nodeId: opaqueString.optional(),
   previousPhase: categoryString.optional(),
@@ -139,6 +145,29 @@ export const FactoryCloudInstanceV1Schema = z.object({
 }).strict()
 
 export type FactoryCloudInstanceV1 = z.infer<typeof FactoryCloudInstanceV1Schema>
+
+const factoryCloudCostModelV1 = z.object({
+  model: categoryString,
+  inputTokens: boundedCount.nullable(),
+  outputTokens: boundedCount.nullable(),
+  usd: z.number().finite().nonnegative().nullable(),
+}).strict()
+
+/** Bounded, content-free completion aggregate. */
+export const FactoryCloudRunCostV1Schema = z.object({
+  inputTokens: boundedCount.nullable(),
+  outputTokens: boundedCount.nullable(),
+  usd: z.number().finite().nonnegative().nullable(),
+  byRole: z.array(z.object({
+    role: z.enum(['implementer', 'reviewer', 'babysitter', 'triage', 'workflow']),
+    inputTokens: boundedCount.nullable(),
+    outputTokens: boundedCount.nullable(),
+    usd: z.number().finite().nonnegative().nullable(),
+    byModel: z.array(factoryCloudCostModelV1).max(32),
+  }).strict()).max(5),
+}).strict()
+
+export type FactoryCloudRunCostV1 = z.infer<typeof FactoryCloudRunCostV1Schema>
 
 const verificationStageStatus = z.enum(['pass', 'fail', 'skipped', 'timed_out'])
 const verificationMeasurements = z.object({
@@ -210,6 +239,7 @@ const factoryCloudEventShape = {
     recipe: categoryString.optional(),
   }).strict().optional(),
   attributes: FactoryCloudEventAttributesV1Schema.optional(),
+  cost: FactoryCloudRunCostV1Schema.optional(),
   verification: FactoryCloudVerificationEvidenceV1Schema.optional(),
   trace: z.object({
     traceId: FactoryCloudTraceIdV1Schema,
@@ -219,7 +249,7 @@ const factoryCloudEventShape = {
 } as const
 
 const requireRunId = (
-  event: { type: string; runId?: string },
+  event: { type: string; runId?: string; cost?: FactoryCloudRunCostV1 },
   context: z.RefinementCtx,
 ): void => {
   if (event.type.startsWith('run.') && !event.runId) {
@@ -227,6 +257,20 @@ const requireRunId = (
       code: z.ZodIssueCode.custom,
       path: ['runId'],
       message: 'runId is required for run.* events',
+    })
+  }
+  if (event.type === 'run.cost.v1' && !event.cost) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['cost'],
+      message: 'cost is required for run.cost.v1 events',
+    })
+  }
+  if (event.cost && event.type !== 'run.cost.v1') {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['cost'],
+      message: 'cost is allowed only for run.cost.v1 events',
     })
   }
 }

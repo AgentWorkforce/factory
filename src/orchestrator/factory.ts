@@ -12,6 +12,7 @@ import type {
   AgentLifecycleSignal,
   AgentPidResolution,
   AgentSpec,
+  AgentUsage,
   Capability,
   ChangeEvent,
   FleetClient,
@@ -109,6 +110,7 @@ import {
   type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
+import { CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -390,6 +392,7 @@ export class FactoryLoop implements Factory {
   readonly #relayflows?: FactoryPorts['relayflows']
   readonly #worktrees?: AgentWorktreeManager
   readonly #reporter?: FactoryEventReporter
+  readonly #costLedger: CostLedger
   #batchView?: BatchSnapshot
   #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
@@ -523,6 +526,8 @@ export class FactoryLoop implements Factory {
   #offDeliveryFailed?: () => void
   #offAgentMessage?: () => void
   #offAgentLifecycleSignal?: () => void
+  #offAgentUsage?: () => void
+  #offUnpricedModel?: () => void
   // undefined = readiness not yet probed; resolved lazily so the standalone
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
@@ -586,6 +591,10 @@ export class FactoryLoop implements Factory {
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
     this.#reporter = ports.reporter
+    this.#costLedger = ports.costLedger ?? new CostLedger()
+    this.#offUnpricedModel = this.#costLedger.onUnpricedModel((record) => {
+      void this.#reportUnpricedModel(record)
+    })
     this.#state = ports.stateStore ?? new InMemoryStateStore({
       batchSize: config.batchSize,
       agentQuestionDedupeLimit: AGENT_QUESTION_DEDUPE_LIMIT,
@@ -938,12 +947,16 @@ export class FactoryLoop implements Factory {
       this.#offDeliveryFailed?.()
       this.#offAgentMessage?.()
       this.#offAgentLifecycleSignal?.()
+      this.#offAgentUsage?.()
+      this.#offUnpricedModel?.()
       await Promise.allSettled([...this.#agentLifecycleSignalsInFlight.values()])
       await this.#slackConversationTurns.stop()
       this.#offAgentExit = undefined
       this.#offDeliveryFailed = undefined
       this.#offAgentMessage = undefined
       this.#offAgentLifecycleSignal = undefined
+      this.#offAgentUsage = undefined
+      this.#offUnpricedModel = undefined
       await this.#fleet.dispose()
     } finally {
       this.#stoppingHeartbeatRefreshActive = false
@@ -2813,6 +2826,17 @@ export class FactoryLoop implements Factory {
         return handling
       })
     }
+    if (!this.#offAgentUsage) {
+      this.#offAgentUsage = this.#fleet.onAgentUsage?.((usage) => {
+        void this.#handleAgentUsage(usage).catch((error) => {
+          this.#increment('costUsageRecordingFailures')
+          this.#logger.warn?.('[factory] unable to record agent token usage', {
+            agentName: usage.name,
+            errorClass: telemetryErrorClass(error),
+          })
+        })
+      })
+    }
   }
 
   #queueAgentExit(name: string, reason?: string): void {
@@ -3306,6 +3330,72 @@ export class FactoryLoop implements Factory {
     })
   }
 
+  async #handleAgentUsage(usage: AgentUsage): Promise<void> {
+    const record = (await this.#batch()).getIssueByAgent(usage.name)
+    if (!record) return
+    const tracked = record.agents.get(usage.name)
+    if (!tracked) return
+    const lifecycle = await this.#state.getDispatchLifecycle(
+      this.#workspaceId,
+      issueKey(record.issue),
+    )
+    if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) return
+    this.#costLedger.record({
+      runId: lifecycle.runId,
+      role: tracked.spec.role,
+      model: usage.model ?? tracked.spec.model ?? 'unknown',
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+    }, { entryId: costEntryId(lifecycle.runId, usage.name) })
+  }
+
+  async #reportUnpricedModel(record: UnpricedModelCostRecord): Promise<void> {
+    await this.#report({
+      type: 'cost.model.unpriced',
+      level: 'warn',
+      runId: record.runId,
+      attributes: {
+        agentRole: record.role,
+        model: record.model,
+        inputTokens: record.inputTokens,
+        outputTokens: record.outputTokens,
+        usd: null,
+      },
+    })
+  }
+
+  #finalizeRunCost(record: InFlightIssue, runId: string): RunCostTotal {
+    for (const [agentName, tracked] of record.agents) {
+      const entryId = costEntryId(runId, agentName)
+      if (this.#costLedger.hasEntry(entryId)) continue
+      this.#costLedger.record({
+        runId,
+        role: tracked.spec.role,
+        model: tracked.spec.model ?? 'unknown',
+        inputTokens: null,
+        outputTokens: null,
+      }, { entryId })
+    }
+    return this.#costLedger.getRunTotal(runId)
+  }
+
+  async #reportRunCost(lifecycle: DispatchLifecycle): Promise<void> {
+    if (!lifecycle.cost) return
+    const { runId: _runId, ...cost } = lifecycle.cost
+    await this.#report({
+      type: 'run.cost.v1',
+      level: 'info',
+      runId: lifecycle.runId,
+      status: telemetryRunStatus(lifecycle.phase),
+      attributes: {
+        inputTokens: lifecycle.cost.inputTokens,
+        outputTokens: lifecycle.cost.outputTokens,
+        usd: lifecycle.cost.usd,
+      },
+      cost,
+    })
+  }
+
   async #saveDispatchLifecycle(
     record: InFlightIssue,
     phase: DispatchLifecyclePhase,
@@ -3324,14 +3414,19 @@ export class FactoryLoop implements Factory {
     const previous = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     const pullRequests = mergePublishedPullRequests(previous, pullRequest)
     const primaryPullRequest = primaryPublishedPullRequest(previous, pullRequest, pullRequests)
+    const lifecycleRunId = previous?.runId ?? randomUUID()
+    const cost = isTerminalDispatchPhase(phase)
+      ? previous?.cost ?? this.#finalizeRunCost(record, lifecycleRunId)
+      : previous?.cost
     const lifecycle = lifecycleFromInFlightRecord(
       record,
-      previous?.runId ?? randomUUID(),
+      lifecycleRunId,
       phase,
       this.#clock.now(),
       primaryPullRequest,
       pullRequests,
       releaseReason ?? previous?.releaseReason,
+      cost,
     )
     for (const agent of lifecycle.agents) {
       const previouslyReleasedAtMs = previous?.agents.find((candidate) => candidate.name === agent.name)?.releasedAtMs
@@ -3366,6 +3461,7 @@ export class FactoryLoop implements Factory {
             : 'run.phase_changed',
         { previousPhase: previous?.phase, cancellationReason: telemetry.cancellationReason },
       )
+      if (isTerminalDispatchLifecycle(lifecycle)) await this.#reportRunCost(lifecycle)
     }
     if (isTerminalDispatchLifecycle(lifecycle)) {
       this.#dispatchLifecycleEpochs.delete(key)
@@ -15282,6 +15378,12 @@ const durableBabysitterTrackedAgent = (
 const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
+const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): boolean =>
+  phase === 'complete' || phase === 'abandoned'
+
+const costEntryId = (runId: string, agentName: string): string =>
+  `${runId}\0${agentName}`
+
 const publishedPullRequests = (lifecycle: DispatchLifecycle | undefined): GithubPublishPullRequestResult[] => {
   const receipts = [
     ...(lifecycle?.pullRequests ?? []).filter(Boolean),
@@ -15325,6 +15427,7 @@ const lifecycleFromInFlightRecord = (
   pullRequest?: GithubPublishPullRequestResult,
   pullRequests: GithubPublishPullRequestResult[] = [],
   releaseReason?: string,
+  cost?: RunCostTotal,
 ): DispatchLifecycle => ({
   runId,
   issue: { ...record.issue },
@@ -15337,6 +15440,7 @@ const lifecycleFromInFlightRecord = (
   ...(pullRequests.length > 0 ? { pullRequests: pullRequests.map((receipt) => ({ ...receipt })) } : {}),
   ...(pullRequest ? { pullRequest: { ...pullRequest } } : {}),
   ...(releaseReason ? { releaseReason } : {}),
+  ...(cost ? { cost: structuredClone(cost) } : {}),
   updatedAtMs,
 })
 

@@ -8,6 +8,7 @@ import type {
   TrackedAgent,
 } from '../orchestrator/batch-tracker'
 import type { IssueRef, TriageDecision } from '../types'
+import type { RunCostTotal } from '../cost/ledger'
 
 export type CriticalRecord = { issue: IssueRef; input: SendInput }
 
@@ -174,6 +175,8 @@ export type DispatchLifecycle = {
   pullRequests?: import('./mount').GithubPublishPullRequestResult[]
   pullRequest?: import('./mount').GithubPublishPullRequestResult
   releaseReason?: string
+  /** Bounded token/USD aggregate captured before the terminal lifecycle save. */
+  cost?: RunCostTotal
   lease?: DispatchLifecycleLease
   updatedAtMs: number
 }
