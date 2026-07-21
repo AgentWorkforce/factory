@@ -2625,7 +2625,15 @@ export class FactoryLoop implements Factory {
   }
 
   #queueAgentExit(name: string, reason?: string): void {
-    this.#startupRosterExitSignals?.add(name)
+    const startupSignals = this.#startupRosterExitSignals
+    if (startupSignals) {
+      // Fleet reconciliation callbacks are synchronous, while their durable
+      // handlers are async. Defer them until adoption has restored every
+      // lifecycle into the batch; otherwise a fast handler can observe no
+      // record, return, and still suppress the authoritative roster fallback.
+      startupSignals.add(name)
+      return
+    }
     // Broker replay can deliver an old exit immediately when the listener is
     // installed, before durable agents are restored. Queue a later
     // roster-reconciled exit behind it instead of dropping the newer event.
@@ -2726,25 +2734,31 @@ export class FactoryLoop implements Factory {
         this.#logger.info?.('[factory] durable startup roster reconciliation started', {
           agents: agents.map((agent) => agent.name),
         })
-        this.#startupRosterExitSignals = new Set<string>()
+        const signalled = new Set<string>()
+        this.#startupRosterExitSignals = signalled
+        let online = new Set<string>()
         try {
           await this.#fleet.reconcileTrackedAgents?.()
-          const signalled = this.#startupRosterExitSignals
-          const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
-          const missing = [...durableAgentNames]
-            .filter((name) => !online.has(name) && !signalled?.has(name))
-          for (const name of missing) {
-            this.#fleet.markAgentTerminal?.(name, 'reconciled-missing')
-            this.#queueAgentExit(name, 'reconciled-missing')
-          }
-          if (missing.length > 0) {
-            this.#increment('startupRosterMissingExitsSynthesized', missing.length)
-            this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
-              agents: missing,
-            })
-          }
+          online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
         } finally {
           this.#startupRosterExitSignals = undefined
+        }
+        const synthesized = [...durableAgentNames]
+          .filter((name) => !online.has(name) && !signalled.has(name))
+        for (const name of synthesized) {
+          this.#fleet.markAgentTerminal?.(name, 'reconciled-missing')
+          signalled.add(name)
+        }
+        // Every signal collected inside the authoritative startup sweep means
+        // the hydrated durable session is no longer usable. Classify it as a
+        // reconciled miss so remote implementers recover a PR or restart
+        // instead of waiting forever for branch replication after a crash.
+        for (const name of signalled) this.#queueAgentExit(name, 'reconciled-missing')
+        if (synthesized.length > 0) {
+          this.#increment('startupRosterMissingExitsSynthesized', synthesized.length)
+          this.#logger.info?.('[factory] synthesized missing durable startup roster exits', {
+            agents: synthesized,
+          })
         }
         this.#logger.info?.('[factory] durable startup roster reconciliation completed', {
           pendingExits: [...this.#agentExitsInFlight.keys()].filter((name) => agents.some((agent) => agent.name === name)),
