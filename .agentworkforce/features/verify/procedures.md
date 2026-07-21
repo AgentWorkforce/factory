@@ -21,7 +21,7 @@ CONFIG="$TMP/factory.config.json"
 cleanup() {
   status=$?
   if [[ -n "${FACTORY_VERIFY_PID:-}" ]] && kill -0 "$FACTORY_VERIFY_PID" 2>/dev/null; then
-    command="$(ps -p "$FACTORY_VERIFY_PID" -o command= 2>/dev/null || true)"
+    command="$(ps -ww -p "$FACTORY_VERIFY_PID" -o command= 2>/dev/null || true)"
     if printf '%s\n' "$command" | grep -F -- "bin/factory.mjs" >/dev/null && \
        printf '%s\n' "$command" | grep -F -- "$CONFIG" >/dev/null; then
       kill -TERM "$FACTORY_VERIFY_PID" 2>/dev/null || true

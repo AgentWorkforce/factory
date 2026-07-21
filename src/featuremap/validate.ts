@@ -332,7 +332,7 @@ function validateFeatureLocations(
       throw new Error(`Manifest feature ${feature.id} has no valid locations`)
     }
     for (const location of locations) {
-      validateRepositoryPath(location, rootDir, pathExists, `Feature location for ${feature.id}`)
+      validateRepositoryPath(location, rootDir, pathExists, 'Feature location', feature.id)
     }
   }
 }
@@ -342,19 +342,18 @@ function validateRepositoryPath(
   rootDir: string,
   pathExists: (path: string) => boolean,
   label: string,
+  featureId?: string,
 ): void {
   const absolutePath = isAbsolute(path) ? path : resolve(rootDir, path)
   const relativePath = relative(rootDir, absolutePath).replaceAll('\\', '/')
   if (relativePath === '..' || relativePath.startsWith('../') || isAbsolute(relativePath)) {
-    if (label.startsWith('Feature location for ')) {
-      const featureId = label.slice('Feature location for '.length)
+    if (featureId) {
       throw new Error(`Feature location must be inside the repository root for ${featureId}: ${path}`)
     }
     throw new Error(`${label} must be inside the repository root: ${path}`)
   }
   if (!pathExists(absolutePath)) {
-    if (label.startsWith('Feature location for ')) {
-      const featureId = label.slice('Feature location for '.length)
+    if (featureId) {
       throw new Error(`Missing location for ${featureId}: ${path}`)
     }
     throw new Error(`Missing ${label.toLowerCase()}: ${path}`)

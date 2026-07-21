@@ -579,8 +579,9 @@ export async function runGuardian(
     const errMsg = isNotFound
       ? `⚠️ *factory-feature-guardian* can't find the feature manifest in the cloned Factory repository at \`${FACTORY_REPO_RELPATH}/${MANIFEST_RELPATH}\`.`
       : `⚠️ *factory-feature-guardian* failed to load the feature manifest: \`${String(err)}\``;
-    await createSlackClient()
-      .post(channel, errMsg)
+    const slack = createSlackClient();
+    await slack.messages
+      .write({ channelId: channel }, { text: errMsg })
       .catch(() => undefined);
     return;
   }
@@ -590,10 +591,13 @@ export async function runGuardian(
   });
   if (features.length === 0) {
     ctx.log('error', 'factory-feature-guardian.no-features', { reason: 'manifest parsed but empty' });
-    await createSlackClient()
-      .post(
-        channel,
-        '⚠️ *factory-feature-guardian* loaded the manifest but found no features. Check `.agentworkforce/features/manifest.yaml`.'
+    const slack = createSlackClient();
+    await slack.messages
+      .write(
+        { channelId: channel },
+        {
+          text: '⚠️ *factory-feature-guardian* loaded the manifest but found no features. Check `.agentworkforce/features/manifest.yaml`.',
+        }
       )
       .catch(() => undefined);
     return;

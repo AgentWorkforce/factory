@@ -672,6 +672,26 @@ describe('factory-feature-guardian runtime paths', () => {
     }
   });
 
+  it('uses messages.write for manifest failure notifications', async () => {
+    const { ctx } = exactStateContext(JSON.stringify(progressState(2)));
+    ctx.sandbox.readFile = vi.fn(async () => {
+      throw new Error('simulated manifest read failure');
+    });
+    const write = vi.fn(async () => ({
+      path: '/slack/draft.json',
+      absolutePath: '/slack/draft.json',
+      receipt: { ts: '1710000001.000100' },
+    }));
+    const createSlackClient = (() => ({ messages: { write } })) as unknown as typeof slackClient;
+
+    await runGuardian(ctx, { type: 'cron.tick' } as never, { createSlackClient });
+
+    expect(write).toHaveBeenCalledWith(
+      { channelId: 'C0BHWJSF309' },
+      { text: expect.stringContaining('failed to load the feature manifest') }
+    );
+  });
+
   it('fails closed outside invoke simulation when Relayfile credentials are absent', async () => {
     const transport = new IdempotentSlackTransport();
     const restore = bindPreviewTransport(transport);

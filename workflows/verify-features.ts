@@ -17,6 +17,7 @@
  *   FACTORY_VERIFY_FLEET=1
  *   FACTORY_VERIFY_BACKEND=internal|relay
  *   FACTORY_VERIFY_CAPABILITY=spawn:codex|spawn:claude|workflow:run
+ *   FACTORY_VERIFY_WORKFLOW=path/to/workflow.ts # required for workflow:run
  *   FACTORY_VERIFY_CLOUD=1
  */
 import { workflow } from '@relayflows/core'
@@ -341,6 +342,7 @@ LOG="${ARTIFACTS}/tier4.log"
 VERIFY_FLEET=$(printenv FACTORY_VERIFY_FLEET 2>/dev/null || true)
 BACKEND=$(printenv FACTORY_VERIFY_BACKEND 2>/dev/null || true)
 CAPABILITY=$(printenv FACTORY_VERIFY_CAPABILITY 2>/dev/null || true)
+WORKFLOW=$(printenv FACTORY_VERIFY_WORKFLOW 2>/dev/null || true)
 if [ -z "$CAPABILITY" ]; then CAPABILITY=spawn:codex; fi
 AGENT_NAME="${RUN_ID}-fleet"
 SPAWNED=0
@@ -371,14 +373,31 @@ case "$CAPABILITY" in
     exit 1
     ;;
 esac
+if [ "$CAPABILITY" = "workflow:run" ] && [ "$BACKEND" != "relay" ]; then
+  echo "Failure reason: workflow:run verification requires FACTORY_VERIFY_BACKEND=relay" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
+fi
+if [ "$CAPABILITY" = "workflow:run" ] && [ -z "$WORKFLOW" ]; then
+  echo "Failure reason: workflow:run requires FACTORY_VERIFY_WORKFLOW" | tee -a "$LOG"
+  echo "TIER4_FAIL" | tee -a "$LOG"
+  exit 1
+fi
 
 SPAWN_REPORT="${ARTIFACTS}/tier4-spawn.json"
 ROSTER_REPORT="${ARTIFACTS}/tier4-roster.json"
 FINAL_ROSTER="${ARTIFACTS}/tier4-final-roster.json"
 
-if ! node bin/factory.mjs fleet spawn "$CAPABILITY" --backend "$BACKEND" \
+if [ "$CAPABILITY" = "workflow:run" ]; then
+  node bin/factory.mjs fleet spawn "$CAPABILITY" --backend "$BACKEND" \
+    --name "$AGENT_NAME" --workflow "$WORKFLOW" \
+    > "$SPAWN_REPORT" 2>> "$LOG"
+else
+  node bin/factory.mjs fleet spawn "$CAPABILITY" --backend "$BACKEND" \
     --name "$AGENT_NAME" --task "Reply with FACTORY_VERIFY_OK, then exit." \
-    > "$SPAWN_REPORT" 2>> "$LOG"; then
+    > "$SPAWN_REPORT" 2>> "$LOG"
+fi
+if [ "$?" != "0" ]; then
   echo "Failure reason: fleet spawn failed" | tee -a "$LOG"
   echo "TIER4_FAIL" | tee -a "$LOG"
   exit 1
