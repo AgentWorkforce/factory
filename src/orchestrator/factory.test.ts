@@ -9640,6 +9640,42 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('retries a transient stale-name release before resuming the recovered worker', async () => {
+    class TransientReclaimFleet extends FakeFleetClient {
+      reclaimAttempts = 0
+
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name === 'ar-802-impl-pear' && reason === 'reconciled-missing') {
+          this.reclaimAttempts += 1
+          if (this.reclaimAttempts < 3) throw new Error('broker release pressure')
+        }
+        await super.release(name, reason)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(802)]: issueFile(802) })
+    const fleet = new TransientReclaimFleet()
+    fleet.setSessionRef('ar-802-impl-pear', 'session-impl-802')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      clock: { now: Date.now, sleep: async () => {} },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(802), issueFile(802)))
+
+    await factory.dispatch(decision)
+    fleet.emitAgentExit('ar-802-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(() => expect(fleet.resumes).toHaveLength(1))
+    expect(fleet.reclaimAttempts).toBe(3)
+    expect(factory.status().counters.staleLocalAgentNamesReclaimed).toBe(1)
+    expect(factory.status().counters.staleLocalAgentNameReclaimFailures ?? 0).toBe(0)
+    expect(factory.status().counters.resumeNameCollisions ?? 0).toBe(0)
+    await factory.stop()
+  })
+
   it('drains the real internal fleet after an implementer resume collides with a leaked name', async () => {
     const mount = new FakeMountClient({ [issuePath(81)]: issueFile(81) })
     const harness = new ResumeCollisionHarnessClient()

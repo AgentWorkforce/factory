@@ -299,6 +299,8 @@ const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
+const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
+const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
 
@@ -5177,20 +5179,12 @@ export class FactoryLoop implements Factory {
       // resume/respawn; otherwise recovery immediately collides with the dead
       // name and concludes useful work as terminal.
       if (tracingReconciledExit && this.#fleet.placementLocality === 'local') {
-        try {
-          await this.#fleet.release(name, 'reconciled-missing')
-          this.#increment('staleLocalAgentNamesReclaimed')
-          this.#logger.info?.('[factory] reclaimed stale local agent name before recovery', {
-            issue: record.issue.key,
-            name,
-          })
-        } catch (error) {
-          this.#increment('staleLocalAgentNameReclaimFailures')
-          this.#logger.warn?.('[factory] stale local agent name reclaim failed; recovery will still be attempted', {
-            issue: record.issue.key,
-            name,
-            error,
-          })
+        if (!await this.#reclaimStaleLocalAgentName(record, name)) {
+          // Do not immediately collide with a row the broker just refused to
+          // release. Leave durable ownership intact and let the lifecycle retry
+          // re-run reconciliation after broker pressure subsides.
+          this.#scheduleDispatchLifecycleRetry(record)
+          return
         }
       }
 
@@ -5296,6 +5290,36 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       this.#error(error, record.issue)
     }
+  }
+
+  async #reclaimStaleLocalAgentName(record: InFlightIssue, name: string): Promise<boolean> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await this.#fleet.release(name, 'reconciled-missing')
+        this.#increment('staleLocalAgentNamesReclaimed')
+        this.#logger.info?.('[factory] reclaimed stale local agent name before recovery', {
+          issue: record.issue.key,
+          name,
+          attempt,
+        })
+        return true
+      } catch (error) {
+        lastError = error
+        if (attempt < STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS) {
+          await this.#clock.sleep(STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS * attempt)
+        }
+      }
+    }
+
+    this.#increment('staleLocalAgentNameReclaimFailures')
+    this.#logger.warn?.('[factory] stale local agent name reclaim failed; deferring recovery', {
+      issue: record.issue.key,
+      name,
+      attempts: STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS,
+      error: lastError,
+    })
+    return false
   }
 
   // Publish a PR from the implementer's committed branch when it exited without
