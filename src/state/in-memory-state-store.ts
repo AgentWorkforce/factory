@@ -15,6 +15,7 @@ import type {
   WaitingClarification,
   ClarificationReply,
 } from '../ports/state'
+import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
 
 type WorkspaceState = {
   batch: BatchTracker
@@ -78,6 +79,10 @@ export class InMemoryStateStore implements StateStore {
   ): Promise<DispatchLifecycleClaim> {
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     let lifecycle = lifecycles.get(key)
+    if (!lifecycle) {
+      const matching = matchingGithubLifecycleEntry(lifecycles, seed)
+      if (matching) [key, lifecycle] = matching
+    }
     const created = !lifecycle
     if (!lifecycle) {
       lifecycle = cloneDispatchLifecycle(seed)
@@ -87,7 +92,7 @@ export class InMemoryStateStore implements StateStore {
     const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
     const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
     if (terminal || activeOtherOwner) {
-      return { acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
+      return { key, acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
     }
     const epoch = lifecycle.lease?.owner === owner
       ? lifecycle.lease.epoch
@@ -95,6 +100,7 @@ export class InMemoryStateStore implements StateStore {
     lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
     lifecycle.updatedAtMs = nowMs
     return {
+      key,
       acquired: true,
       lifecycle: cloneDispatchLifecycle(lifecycle),
       lease: { ...lifecycle.lease },
