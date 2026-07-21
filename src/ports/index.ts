@@ -38,6 +38,8 @@ export type {
   SendInput,
   SpawnInput,
   SpawnResult,
+  TeammateAgent,
+  TeammateQuery,
 } from './fleet'
 export type {
   GithubRead,

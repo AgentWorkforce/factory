@@ -2,7 +2,8 @@ import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
+import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -52,6 +53,10 @@ export interface RelayFleetClientOptions {
   lifecycleActionName?: string
   /** Engine base URL override. Absent means the SDK default (cast.agentrelay.com). */
   baseUrl?: string
+  /** Card-aware directory seam. Defaults to Relaycast GET /v1/a2a/directory. */
+  teammateDirectory?: TeammateDirectory
+  directoryFetch?: typeof globalThis.fetch
+  directoryTimeoutMs?: number
   /** Timeout for a spawn/release invocation to reach a terminal ack status. */
   spawnAckTimeoutMs?: number
   pollIntervalMs?: number
@@ -174,6 +179,7 @@ export class RelayFleetClient implements FleetClient {
   // therefore createFleet({ backend: 'relay' })) never throws merely because no
   // token is configured.
   #messaging: RelayMessaging | undefined
+  #teammateDirectory: TeammateDirectory | undefined
   #messagingReady: Promise<RelayMessaging> | undefined
   #lifecycleActionReady: Promise<void> | undefined
   #authenticatedAgentName: string
@@ -209,6 +215,7 @@ export class RelayFleetClient implements FleetClient {
     this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
     this.#log = options.log ?? (() => {})
     this.#messaging = options.messaging
+    this.#teammateDirectory = options.teammateDirectory
   }
 
   /** Agents spawned through this client that have not exited or been released. */
@@ -503,6 +510,11 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  async discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]> {
+    this.#teammateDirectory ??= this.#createTeammateDirectory()
+    return await this.#teammateDirectory.discover(query)
+  }
+
   // `from`/`data` are not representable on the agent-scoped messaging surface:
   // every send is authored by the factory's own agent identity.
   async sendMessage(input: SendInput): Promise<void> {
@@ -623,6 +635,26 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
+  }
+
+  #createTeammateDirectory(): TeammateDirectory {
+    const env = this.#options.env
+    const token = resolveRelayWorkspaceKey({
+      workspaceKey: this.#options.workspaceKey,
+      ...(env ? { env, activeWorkspaceKey: () => undefined } : {}),
+    }) ?? resolveRelayAgentToken({
+      agentToken: this.#options.agentToken,
+      ...(env ? { env } : {}),
+    })
+    if (!token) {
+      throw new Error('RelayFleetClient teammate discovery requires a workspace key or agent token')
+    }
+    return new RelaycastTeammateDirectory({
+      baseUrl: this.#options.baseUrl,
+      token,
+      fetch: this.#options.directoryFetch,
+      timeoutMs: this.#options.directoryTimeoutMs,
+    })
   }
 
   #ensureMessaging(): Promise<RelayMessaging> {

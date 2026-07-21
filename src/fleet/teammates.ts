@@ -1,0 +1,305 @@
+import { randomUUID } from 'node:crypto'
+
+import { A2aSkillSchema } from '@relaycast/a2a'
+
+import type { AgentMessage, FleetClient, TeammateAgent, TeammateQuery } from '../ports/fleet'
+
+export const DEFAULT_RELAYCAST_BASE_URL = 'https://cast.agentrelay.com'
+export const DEFAULT_TEAMMATE_DIRECTORY_TIMEOUT_MS = 10_000
+export const DEFAULT_ASK_TEAMMATE_TIMEOUT_MS = 30_000
+
+export interface TeammateDirectory {
+  discover(query: TeammateQuery): Promise<TeammateAgent[]>
+}
+
+export interface RelaycastTeammateDirectoryOptions {
+  baseUrl?: string
+  token?: string
+  fetch?: typeof globalThis.fetch
+  timeoutMs?: number
+}
+
+/** Relaycast-backed, card-aware teammate discovery. */
+export class RelaycastTeammateDirectory implements TeammateDirectory {
+  readonly #baseUrl: string
+  readonly #token?: string
+  readonly #fetch: typeof globalThis.fetch
+  readonly #timeoutMs: number
+
+  constructor(options: RelaycastTeammateDirectoryOptions = {}) {
+    this.#baseUrl = normalizeBaseUrl(options.baseUrl ?? DEFAULT_RELAYCAST_BASE_URL)
+    this.#token = nonEmpty(options.token)
+    this.#fetch = options.fetch ?? globalThis.fetch
+    this.#timeoutMs = positiveTimeout(options.timeoutMs, DEFAULT_TEAMMATE_DIRECTORY_TIMEOUT_MS)
+  }
+
+  async discover(query: TeammateQuery): Promise<TeammateAgent[]> {
+    const normalized = normalizeQuery(query)
+    const url = new URL('/v1/a2a/directory', `${this.#baseUrl}/`)
+    if (normalized.skill) url.searchParams.set('skill', normalized.skill)
+    if (normalized.tag) url.searchParams.set('tag', normalized.tag)
+    if (normalized.q) url.searchParams.set('q', normalized.q)
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.#timeoutMs)
+    let response: Response
+    try {
+      response = await this.#fetch(url, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...(this.#token ? { authorization: `Bearer ${this.#token}` } : {}),
+        },
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`Timed out querying the Relaycast teammate directory after ${this.#timeoutMs}ms`, { cause: error })
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+
+    const payload = await readJson(response)
+    if (!response.ok) {
+      throw new Error(`Relaycast teammate directory returned ${response.status}: ${errorDetail(payload)}`)
+    }
+
+    const rows = directoryRows(payload)
+      .map(parseDirectoryEntry)
+      .filter((entry): entry is TeammateAgent => Boolean(entry))
+      // Keep the client honest even if a server version ignores a filter. This
+      // also makes an unknown exact skill/tag deterministically return [].
+      .filter((entry) => matchesQuery(entry, normalized))
+
+    const unique = new Map<string, TeammateAgent>()
+    for (const entry of rows) unique.set(`${entry.kind}:${entry.address}`, entry)
+    return [...unique.values()]
+  }
+}
+
+export interface AskTeammateInput {
+  /** Worker identity that is asking the question. */
+  from: string
+  question: string
+  /** Use an already-discovered target, or provide a query to resolve one. */
+  teammate?: TeammateAgent
+  skill?: string
+  tag?: string
+  q?: string
+  timeoutMs?: number
+}
+
+export interface AskTeammateResult {
+  requestId: string
+  teammate: TeammateAgent
+  reply: AgentMessage
+}
+
+/**
+ * Resolve a teammate (when needed), deliver a relay DM, and wait for that
+ * teammate's reply. The listener is armed before sending so fast replies cannot
+ * race the waiter; the whole operation has one bounded deadline.
+ */
+export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): Promise<AskTeammateResult> {
+  const timeoutMs = positiveTimeout(input.timeoutMs, DEFAULT_ASK_TEAMMATE_TIMEOUT_MS)
+  const requestId = randomUUID()
+  const from = requiredText(input.from, 'askTeammate.from')
+  const question = requiredText(input.question, 'askTeammate.question')
+  const deadline = Date.now() + timeoutMs
+
+  return await new Promise<AskTeammateResult>((resolve, reject) => {
+    let settled = false
+    let unsubscribe = () => {}
+    const finish = (result: AskTeammateResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      unsubscribe()
+      resolve(result)
+    }
+    const fail = (error: unknown) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      unsubscribe()
+      reject(error)
+    }
+    const timeout = setTimeout(() => {
+      fail(new Error(`Timed out waiting for a reply from a teammate after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    void (async () => {
+      const teammate = input.teammate ?? (await fleet.discoverTeammates({
+        skill: input.skill,
+        tag: input.tag,
+        q: input.q,
+      }))[0]
+      if (settled) return
+      if (!teammate) {
+        throw new Error('No teammate matched the requested skill/tag/query')
+      }
+      if (!fleet.onAgentMessage) {
+        throw new Error('This fleet backend cannot observe teammate replies')
+      }
+      unsubscribe = fleet.onAgentMessage((message) => {
+        if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
+        finish({ requestId, teammate, reply: message })
+      })
+      const send = {
+        to: teammate.address,
+        from,
+        text: question,
+        mode: 'wait' as const,
+        data: {
+          factoryCapability: 'ask-a-teammate',
+          requestId,
+          requester: from,
+        },
+      }
+      if (fleet.waitForInjected) {
+        await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
+      } else {
+        await fleet.sendMessage(send)
+      }
+    })().catch(fail)
+  })
+}
+
+function normalizeQuery(query: TeammateQuery): TeammateQuery {
+  return {
+    skill: nonEmpty(query.skill),
+    tag: nonEmpty(query.tag),
+    q: nonEmpty(query.q),
+  }
+}
+
+function matchesQuery(entry: TeammateAgent, query: TeammateQuery): boolean {
+  const skill = normalizedComparable(query.skill)
+  if (skill && !entry.skills.some((candidate) =>
+    normalizedComparable(candidate.id) === skill || normalizedComparable(candidate.name) === skill)) return false
+
+  const tag = normalizedComparable(query.tag)
+  if (tag) {
+    const tags = [...entry.tags, ...entry.skills.flatMap((candidate) => candidate.tags ?? [])]
+    if (!tags.some((candidate) => normalizedComparable(candidate) === tag)) return false
+  }
+
+  const q = normalizedComparable(query.q)
+  if (q) {
+    const haystack = [
+      entry.name,
+      entry.address,
+      ...entry.tags,
+      ...entry.skills.flatMap((candidate) => [candidate.id ?? '', candidate.name, candidate.description ?? '', ...(candidate.tags ?? [])]),
+    ].join('\n').toLowerCase()
+    if (!haystack.includes(q)) return false
+  }
+  return true
+}
+
+function parseDirectoryEntry(value: unknown): TeammateAgent | undefined {
+  const record = asRecord(value)
+  const name = readString(record, 'name')
+  const url = readString(record, 'url', 'endpoint_url', 'endpointUrl')
+  const kind = readString(record, 'kind')
+  if (!name || !url || (kind !== 'native' && kind !== 'a2a')) return undefined
+  try {
+    new URL(url)
+  } catch {
+    return undefined
+  }
+
+  const rawSkills = Array.isArray(record?.skills) ? record.skills : []
+  const skills = rawSkills.flatMap((value) => {
+    const candidate = typeof value === 'string'
+      ? { id: value, name: value }
+      : value
+    const parsed = A2aSkillSchema.safeParse(candidate)
+    return parsed.success ? [parsed.data] : []
+  })
+  const tags = readStrings(record, 'tags')
+  const address = readString(record, 'address', 'relay_name', 'relayName', 'target') ?? name
+  return {
+    name,
+    skills,
+    url,
+    kind,
+    address,
+    tags,
+    ...(readString(record, 'status') ? { status: readString(record, 'status') } : {}),
+    ...(readString(record, 'certification') ? { certification: readString(record, 'certification') } : {}),
+  }
+}
+
+function directoryRows(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload
+  const record = asRecord(payload)
+  return Array.isArray(record?.data) ? record.data : []
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  const text = await response.text()
+  if (!text) return undefined
+  try {
+    return JSON.parse(text) as unknown
+  } catch (error) {
+    throw new Error('Relaycast teammate directory returned invalid JSON', { cause: error })
+  }
+}
+
+function errorDetail(payload: unknown): string {
+  const record = asRecord(payload)
+  const error = asRecord(record?.error)
+  return readString(error, 'message') ?? readString(record, 'message') ?? 'request failed'
+}
+
+function positiveTimeout(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && (value ?? 0) > 0 ? Math.floor(value as number) : fallback
+}
+
+function normalizeBaseUrl(value: string): string {
+  return value.replace(/\/+$/u, '')
+}
+
+function sameAgent(left: string, right: string): boolean {
+  return left.replace(/^@/u, '').toLowerCase() === right.replace(/^@/u, '').toLowerCase()
+}
+
+function normalizedComparable(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? ''
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed || undefined
+}
+
+function requiredText(value: string, label: string): string {
+  const normalized = nonEmpty(value)
+  if (!normalized) throw new Error(`${label} must be a non-empty string`)
+  return normalized
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function readString(record: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
+  if (!record) return undefined
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function readStrings(record: Record<string, unknown> | undefined, key: string): string[] {
+  const value = record?.[key]
+  return Array.isArray(value)
+    ? [...new Set(value.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim())).map((entry) => entry.trim()))]
+    : []
+}

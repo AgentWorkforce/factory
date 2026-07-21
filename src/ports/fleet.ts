@@ -5,6 +5,7 @@ export type Capability = 'spawn:codex' | 'spawn:claude' | 'workflow:run'
 export type PreviewCapability = 'preview:tailscale-serve'
 export type NodeCapability = Capability | PreviewCapability
 export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput['restartPolicy']
+export type A2aSkill = import('@relaycast/a2a').A2aSkill
 
 export type PreviewReference = {
   id: string
@@ -99,6 +100,30 @@ export interface RosterEntry {
   nodes: Array<{ name: string; capabilities: NodeCapability[]; live: boolean }>
 }
 
+export interface TeammateQuery {
+  /** Exact A2A skill id/name to match. */
+  skill?: string
+  /** Exact agent- or skill-level tag to match. */
+  tag?: string
+  /** Free-text directory query. */
+  q?: string
+}
+
+export interface TeammateAgent {
+  /** Directory identity shown to workers. */
+  name: string
+  /** Canonical A2A skill records from the agent card. */
+  skills: A2aSkill[]
+  /** A2A endpoint advertised by the directory. */
+  url: string
+  kind: 'native' | 'a2a'
+  /** Relay/A2A target used for the discover -> engage hop. */
+  address: string
+  tags: string[]
+  status?: string
+  certification?: string
+}
+
 export type AgentPidResolution =
   | { status: 'found'; pid: number }
   | { status: 'missing' }
@@ -157,6 +182,8 @@ export interface FleetClient {
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
+  /** Find addressable teammate agents by their published A2A cards. */
+  discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]>
   resolveAgentPid?(name: string): Promise<AgentPidResolution>
   protectedPids?(): Promise<number[]>
   sendMessage(input: SendInput): Promise<void>

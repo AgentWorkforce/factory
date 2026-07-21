@@ -11,6 +11,8 @@ import type {
   SendInput,
   SpawnInput,
   SpawnResult,
+  TeammateAgent,
+  TeammateQuery,
   SubscribeOptions,
   Subscription,
   Capability,
@@ -214,6 +216,7 @@ export class FakeFleetClient implements FleetClient {
   readonly previewStarts: PreviewStartInput[] = []
   readonly previewRemovals: PreviewReference[] = []
   readonly previewSweeps: PreviewSweepInput[] = []
+  readonly teammates: TeammateAgent[] = []
 
   #agents = new Set<string>()
   #tracked = new Map<string, { invocationId?: string; node?: string }>()
@@ -254,6 +257,20 @@ export class FakeFleetClient implements FleetClient {
     this.releases.push({ name, reason })
     this.#agents.delete(name)
     this.#tracked.delete(name)
+  }
+
+  async discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]> {
+    const skill = query.skill?.trim().toLowerCase()
+    const tag = query.tag?.trim().toLowerCase()
+    const q = query.q?.trim().toLowerCase()
+    return this.teammates.filter((teammate) => {
+      if (skill && !teammate.skills.some((candidate) =>
+        candidate.id?.toLowerCase() === skill || candidate.name.toLowerCase() === skill)) return false
+      if (tag && ![...teammate.tags, ...teammate.skills.flatMap((candidate) => candidate.tags ?? [])]
+        .some((candidate) => candidate.toLowerCase() === tag)) return false
+      if (q && !JSON.stringify(teammate).toLowerCase().includes(q)) return false
+      return true
+    })
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {

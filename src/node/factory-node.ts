@@ -7,6 +7,7 @@ import type { JsonValue, RestartPolicy, SpawnMode } from '@agent-relay/harness-d
 import type { SpawnPtyInput } from '@agent-relay/harness-driver'
 import { runScriptWorkflow, runWorkflow } from '@relayflows/core'
 import type { WorkflowRunRow } from '@relayflows/core'
+import type { A2aAgentCard } from '@relaycast/a2a'
 import { z } from 'zod'
 
 import { loadFactoryConfig, NodeConfigSchema, type NodeConfig } from '../config/schema'
@@ -18,6 +19,7 @@ import {
 } from '../fleet/internal-fleet-client'
 import type { Capability, PreviewReference } from '../ports/fleet'
 import { TailscalePreviewManager, type PreviewManager } from './tailscale-preview'
+import { deriveFactoryPersonaCard, type FactoryPersonaCardInput } from './factory-persona-card'
 
 export const FACTORY_NODE_CONFIG_ENV = 'FACTORY_NODE_CONFIG'
 export const AGENT_RELAY_FACTORY_NODE_CONFIG_ENV = 'AGENT_RELAY_FACTORY_NODE_CONFIG'
@@ -171,6 +173,12 @@ export interface FactoryNodeDefinitionOptions {
   workflowRunner?: WorkflowRunner
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
   previewManager?: PreviewManager
+  /** Persona hosted by this node; its canonical A2A card is attached for online publication. */
+  persona?: FactoryPersonaCardInput
+}
+
+export interface FactoryNodeDefinition extends FleetNodeDefinition {
+  readonly agentCard?: A2aAgentCard
 }
 
 export interface WorkflowRunnerInput {
@@ -205,7 +213,7 @@ export interface FactoryNodeInventorySync {
   agents: FactoryNodeInventoryAgent[]
 }
 
-export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOptions): FleetNodeDefinition {
+export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOptions): FactoryNodeDefinition {
   const config = options.config
   const capabilities = normalizeCapabilities([
     ...config.capabilities,
@@ -248,13 +256,16 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
     })) as unknown as FleetCapabilityValue
   }
 
-  return defineNode({
+  const definition = defineNode({
     name: options.name ?? defaultFactoryNodeName(),
     ...(options.maxAgents !== undefined ? { maxAgents: options.maxAgents } : {}),
     capabilities: handlers,
     tags: options.tags ?? defaultFactoryNodeTags(config),
     version: options.version ?? 'factory-node-v1',
   })
+  return options.persona
+    ? { ...definition, agentCard: deriveFactoryPersonaCard(options.persona) }
+    : definition
 }
 
 async function runPreviewCapability(

@@ -8,11 +8,12 @@ import { dirname, join } from 'node:path'
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
 import type { PreviewConfig } from '../config/schema'
-import type { AgentMessage, AgentPidResolution, AgentUsage, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentMessage, AgentPidResolution, AgentUsage, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
+import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
 
 const requireForResolve = createRequire(import.meta.url)
 
@@ -64,6 +65,11 @@ export interface InternalFleetClientOptions {
    */
   connect?: (options: { cwd?: string; connectionPath?: string }) => HarnessDriverClientLike
   workspaceKey?: string
+  /** Card-aware directory seam; useful with a local broker plus mock directory. */
+  teammateDirectory?: TeammateDirectory
+  directoryBaseUrl?: string
+  directoryFetch?: typeof globalThis.fetch
+  directoryTimeoutMs?: number
   /** Canonical cloud liveness lookup. Injected by tests; derived from workspaceKey in production. */
   listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
   /** Local process-liveness probe used to preserve workers that intentionally run without Relay MCP presence. */
@@ -129,6 +135,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #cwd?: string
   readonly #connectionPath?: string
   readonly #workspaceKey?: string
+  readonly #teammateDirectory?: TeammateDirectory
   readonly #listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
   readonly #isProcessAlive: (pid: number) => boolean
   readonly #now: () => number
@@ -168,6 +175,15 @@ export class InternalFleetClient implements FleetClient {
     this.#cwd = options.cwd
     this.#connectionPath = options.connectionPath
     this.#workspaceKey = options.workspaceKey
+    const directoryToken = resolveRelayWorkspaceKey({ workspaceKey: options.workspaceKey })
+    this.#teammateDirectory = options.teammateDirectory ?? (directoryToken
+      ? new RelaycastTeammateDirectory({
+          baseUrl: options.directoryBaseUrl ?? process.env.RELAY_BASE_URL,
+          token: directoryToken,
+          fetch: options.directoryFetch,
+          timeoutMs: options.directoryTimeoutMs,
+        })
+      : undefined)
     if (options.listCanonicalOnlineAgentNames) {
       this.#listCanonicalOnlineAgentNames = options.listCanonicalOnlineAgentNames
     } else if (options.workspaceKey) {
@@ -387,6 +403,13 @@ export class InternalFleetClient implements FleetClient {
         live: true,
       }],
     }
+  }
+
+  async discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]> {
+    if (!this.#teammateDirectory) {
+      throw new Error('InternalFleetClient teammate discovery requires a directory or Relay workspace key')
+    }
+    return await this.#teammateDirectory.discover(query)
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
