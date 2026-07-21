@@ -371,3 +371,55 @@ export type {
   TriageDecision,
   TriageEngine,
 } from './types'
+export {
+  LOAD_EVIDENCE_CONTRACT,
+  LoadMeasurementsSchema,
+  evaluateLoadSlo,
+  parseK6LoadMeasurements,
+  runLoad,
+  serializeLoadEvidence,
+} from './environments/load-harness'
+export type {
+  KubernetesLoadJobClient,
+  LatencyHistogramBucket,
+  LoadEnvironment,
+  LoadEvidence,
+  LoadMeasurements,
+  LoadProfile,
+  LoadResult,
+  LoadSloEvaluation,
+  LoadSloMetric,
+  LoadSloViolation,
+  LoadThresholds,
+  RunLoadOptions,
+} from './environments/load-harness'
+export {
+  LoadProfileSchema,
+  LoadTargetSchema,
+  LoadThresholdsSchema,
+  durationToMilliseconds,
+  loadLoadProfile,
+} from './environments/load-profile'
+export type {
+  LoadTarget,
+  ResolvedLoadProfile,
+  ResolvedLoadTargetProfile,
+} from './environments/load-profile'
+export {
+  DEFAULT_K6_IMAGE,
+  K6_EVIDENCE_PREFIX,
+  KubectlLoadJobClient,
+  createK6LoadJobResources,
+  defaultKubectlCommandRunner,
+  k6ScenarioFor,
+  renderK6Script,
+  resolveLoadTargets,
+} from './environments/k6-job'
+export type {
+  CreateK6LoadJobOptions,
+  K6LoadJobResources,
+  KubectlCommandResult,
+  KubectlCommandRunner,
+  KubectlLoadJobClientOptions,
+  ResolvedLoadTarget,
+} from './environments/k6-job'
