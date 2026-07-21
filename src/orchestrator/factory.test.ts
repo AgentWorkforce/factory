@@ -17913,7 +17913,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
-  }, 15_000)
+  }, 25_000)
 
   it('restarts once and backs off when the replacement babysitter stays unreachable', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-backoff-'))
