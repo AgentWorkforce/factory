@@ -707,6 +707,8 @@ describe('InternalFleetClient', () => {
     const fleet = new InternalFleetClient({
       client: harness,
       cwd: '/worktree',
+      // Keep the unit isolated from an AGENT_RELAY_STATE_DIR inherited by the
+      // test process; this assertion is specifically about the injected client.
       connectionPath: '/worktree/.agentworkforce/relay/missing-connection.json',
     })
 

@@ -8,7 +8,12 @@ import {
   type LoadProfile,
 } from '../../src/index.ts'
 
-const kubectl = defaultKubectlCommandRunner()
+const rawKubectl = defaultKubectlCommandRunner()
+let kubeContext = ''
+const kubectl = async (args: string[], input?: string) => await rawKubectl(
+  kubeContext ? ['--context', kubeContext, ...args] : args,
+  input,
+)
 const namespace = `factory-load-e2e-${process.pid}`
 const evidenceDirectory = 'artifacts/load-e2e'
 
@@ -21,9 +26,15 @@ const apply = async (resources: Array<Record<string, unknown>>): Promise<void> =
 
 const provisionEnvironment = async (): Promise<LoadEnvironment> => {
   await kubectl(['create', 'namespace', namespace])
+  await kubectl([
+    'wait', `namespace/${namespace}`,
+    '--for=jsonpath={.status.phase}=Active',
+    '--timeout=30s',
+  ])
   return {
     id: namespace,
     namespace,
+    kubeContext,
     endpoints: {
       api: `http://sample-api.${namespace}.svc.cluster.local:5678`,
     },
@@ -108,6 +119,8 @@ const strictProfile = (): LoadProfile => ({
 
 const main = async (): Promise<void> => {
   await mkdir(evidenceDirectory, { recursive: true })
+  kubeContext = (await rawKubectl(['config', 'current-context'])).stdout.trim()
+  assert.ok(kubeContext, 'load E2E requires a current Kubernetes context')
   let environment: LoadEnvironment | undefined
   try {
     environment = await provisionEnvironment()

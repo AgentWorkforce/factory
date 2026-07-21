@@ -4,7 +4,7 @@ export * from './webhook/index.js'
 export * from './state/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
 export type { FileStateStoreOptions } from './state/file-state-store.js'
-export type { FactoryConfig, FactoryStateRole } from './config/schema'
+export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export {
   resolveFactoryStates,
@@ -196,6 +196,13 @@ export {
   resolveFactoryNodeConfigPath,
   runRelayflowsWorkflow,
 } from './node/factory-node'
+export { TailscalePreviewManager } from './node/tailscale-preview'
+export type {
+  PreviewCommandRunner,
+  PreviewPortProbe,
+  PreviewManager,
+  TailscalePreviewManagerOptions,
+} from './node/tailscale-preview'
 export type {
   FactoryNodeDefinitionOptions,
   FactoryNodeInventoryAgent,
@@ -261,6 +268,12 @@ export type {
 } from './subscriptions'
 export type {
   Capability,
+  NodeCapability,
+  PreviewCapability,
+  PreviewReference,
+  PreviewStartInput,
+  PreviewSweepInput,
+  PreviewSweepResult,
   ChangeEvent,
   Clock,
   EventPage,

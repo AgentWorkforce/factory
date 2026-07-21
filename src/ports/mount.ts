@@ -35,6 +35,8 @@ export interface LocalMountOptions {
   acceptableWorkspaceIds?: readonly string[]
   /** Refresh a stale mount instead of returning a warning. Defaults to true. */
   refreshStaleMount?: boolean
+  /** Suppress routine stale-refresh progress lines so a caller can summarize them. */
+  suppressStaleRefreshLogs?: boolean
   /** Optional readiness controls for constrained environments and tests. */
   stateWaitTimeoutMs?: number
   stateWaitPollMs?: number
