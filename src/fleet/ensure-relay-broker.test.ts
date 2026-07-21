@@ -160,6 +160,28 @@ describe('ensureRelayBroker', () => {
     expect(getStatus).toHaveBeenCalledTimes(2)
   })
 
+  it('spawns at the project root selected by the connection boundary', async () => {
+    const spawn = vi.fn(async () => fakeClient('spawned'))
+
+    await ensureRelayBroker({
+      cwd: '/work/packages/sdk',
+      connectionPath: '/work/.agentworkforce/relay/connection.json',
+      connect: () => { throw new Error('no broker') },
+      spawn,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+    })
+
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/work' }))
+  })
+
+  it('accepts a legacy or malformed empty broker status defensively', async () => {
+    const client = fakeClient('connected')
+    client.getStatus = vi.fn(async () => undefined)
+
+    await expect(ensureRelayBroker({ connect: () => client }))
+      .resolves.toMatchObject({ client, started: false })
+  })
+
   it('does not start a competing broker when a reachable broker has no cloud delivery', async () => {
     const client = fakeClient('connected')
     client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
@@ -189,6 +211,26 @@ describe('ensureRelayBroker', () => {
     })).rejects.toThrow(/cloud node delivery/u)
 
     expect(client.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the node-delivery error when spawned-broker cleanup also fails', async () => {
+    const client = fakeClient('spawned')
+    client.getStatus = vi.fn(async () => ({ node_delivery: { connected: false } }))
+    client.shutdown = vi.fn(async () => { throw new Error('cleanup failed') })
+    const warn = vi.fn()
+
+    await expect(ensureRelayBroker({
+      connect: () => { throw new Error('no broker') },
+      spawn: async () => client,
+      env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+      nodeDeliveryTimeoutMs: 0,
+      logger: { warn },
+    })).rejects.toThrow(/cloud node delivery/u)
+
+    expect(warn).toHaveBeenCalledWith(
+      '[factory] failed to shut down the spawned relay broker during cleanup',
+      { errorClass: 'Error' },
+    )
   })
 
   it('fails with actionable guidance when there is no broker and no workspace key', async () => {

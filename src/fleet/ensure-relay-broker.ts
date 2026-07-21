@@ -1,4 +1,5 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
+import { basename, dirname } from 'node:path'
 
 import type { Logger } from '../ports/system'
 import type { HarnessDriverClientLike } from './internal-fleet-client'
@@ -57,7 +58,7 @@ async function waitForNodeDelivery(
     // Older brokers do not report node delivery. Preserve compatibility with
     // them; current brokers must confirm their Relaycast node connection before
     // Factory can safely spawn workers whose task delivery depends on it.
-    if (!status.node_delivery || status.node_delivery.connected === true) return
+    if (!status || !status.node_delivery || status.node_delivery.connected === true) return
     if (Date.now() >= deadline) {
       throw new Error(
         `Relay broker is reachable, but its cloud node delivery did not become ready within ${timeoutMs}ms`,
@@ -65,6 +66,14 @@ async function waitForNodeDelivery(
     }
     await sleep(pollMs)
   }
+}
+
+function projectCwdForConnectionPath(cwd: string | undefined, connectionPath: string | undefined): string | undefined {
+  if (!connectionPath || basename(connectionPath) !== 'connection.json') return cwd
+  const relayDir = dirname(connectionPath)
+  const agentWorkforceDir = dirname(relayDir)
+  if (basename(relayDir) !== 'relay' || basename(agentWorkforceDir) !== '.agentworkforce') return cwd
+  return dirname(agentWorkforceDir)
 }
 
 // Resolve the relay broker for the internal fleet backend: reuse the broker that
@@ -104,14 +113,20 @@ export async function ensureRelayBroker(options: EnsureRelayBrokerOptions = {}):
     let client: HarnessDriverClientLike | undefined
     try {
       client = await spawn({
-        cwd: options.cwd,
+        cwd: projectCwdForConnectionPath(options.cwd, options.connectionPath),
         workspaceKey,
         ...(stateDir ? { binaryArgs: { persist: true, stateDir } } : {}),
       })
       await waitForNodeDelivery(client, options)
       return { client, started: true, workspaceKey }
     } catch (spawnError) {
-      await client?.shutdown?.()
+      try {
+        await client?.shutdown?.()
+      } catch (shutdownError) {
+        options.logger?.warn?.('[factory] failed to shut down the spawned relay broker during cleanup', {
+          errorClass: shutdownError instanceof Error ? shutdownError.name : 'Error',
+        })
+      }
       if (!workspaceKey) {
         throw new Error(
           'Failed to start a relay broker and no workspace key was available to join the existing workspace. ' +
