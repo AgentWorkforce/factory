@@ -1,6 +1,6 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
-import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, SlackWriteback } from './ports'
+import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
 import type { StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
 import type { FactoryEventReporter } from './ports/observability'
@@ -179,6 +179,7 @@ export interface DispatchResult {
   agents: Array<{ name: string; role: AgentSpec['role'] }>
   comments?: string[]
   stateId?: string
+  previews?: PreviewReference[]
   dryRun: boolean
   hold?: {
     kind: 'capacity' | 'dependency' | 'dependency-cycle'

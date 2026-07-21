@@ -224,6 +224,137 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.repo).toBe('AgentWorkforce/factory')
   })
 
+  it('creates and removes previews on the owning node', async () => {
+    const messaging = new FakeMessaging()
+    const preview = {
+      id: 'preview-1',
+      provider: 'tailscale-serve',
+      namespace: 'factory-test',
+      owner: 'AR-129:uuid:/linear/issues/129',
+      service: 'factory',
+      repo: 'AgentWorkforce/factory',
+      url: 'https://mac-mini.tailnet.ts.net:10129/',
+      targetPort: 3_000,
+      httpsPort: 10_129,
+      access: 'tailnet',
+      lifetime: 'issue',
+      createdAt: '2026-07-20T12:00:00.000Z',
+      startCommand: 'npm run dev',
+      process: {
+        pid: 12_345,
+        startTime: 'started-12345',
+        cmdline: 'factory-preview preview-1',
+        cwd: '/work/factory',
+        marker: 'factory-preview-1',
+      },
+    }
+    messaging.placementAck = { invocationId: 'preview-start', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-start', [{
+      invocationId: 'preview-start',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: { preview },
+    }])
+    const fleet = createClient(messaging)
+
+    const reference = await fleet.createPreview({
+      namespace: preview.namespace,
+      owner: preview.owner,
+      issueKey: 'AR-129',
+      service: preview.service,
+      repo: preview.repo,
+      targetPort: preview.targetPort,
+      preferredHttpsPort: preview.httpsPort,
+      startCommand: preview.startCommand,
+      checkoutPath: '/work/factory',
+      node: 'self',
+    })
+
+    expect(reference).toEqual({ ...preview, node: 'mac-mini' })
+    expect(messaging.placements[0]).toMatchObject({
+      capability: 'preview:tailscale-serve',
+      repo: preview.repo,
+      input: {
+        operation: 'start',
+        namespace: preview.namespace,
+        owner: preview.owner,
+        issueKey: 'AR-129',
+        service: preview.service,
+        repo: preview.repo,
+        targetPort: preview.targetPort,
+        preferredHttpsPort: preview.httpsPort,
+        startCommand: preview.startCommand,
+        checkoutPath: '/work/factory',
+      },
+    })
+    expect(messaging.placements[0]).not.toHaveProperty('node')
+
+    messaging.placementAck = { invocationId: 'preview-remove', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-remove', [{
+      invocationId: 'preview-remove',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: { removed: true },
+    }])
+    await expect(fleet.removePreview(reference)).resolves.toBe(true)
+    expect(messaging.placements[1]).toMatchObject({
+      capability: 'preview:tailscale-serve',
+      node: 'mac-mini',
+      input: { operation: 'remove', preview: reference },
+    })
+  })
+
+  it('sweeps previews on every live preview-capable node', async () => {
+    const messaging = new FakeMessaging()
+    messaging.nodeRows = [{
+      name: 'mac-mini',
+      live: true,
+      capabilities: [{ name: 'preview:tailscale-serve' }],
+    }, {
+      name: 'offline-mini',
+      live: false,
+      capabilities: [{ name: 'preview:tailscale-serve' }],
+    }]
+    messaging.placementAck = { invocationId: 'preview-sweep', status: 'pending', placement: { node: 'mac-mini' } }
+    messaging.invocations.set('preview-sweep', [{
+      invocationId: 'preview-sweep',
+      actionName: 'preview:tailscale-serve',
+      status: 'completed',
+      output: {
+        reaped: [{
+          id: 'preview-orphan',
+          provider: 'tailscale-serve',
+          namespace: 'factory-test',
+          owner: 'owner-orphan',
+          service: 'factory',
+          repo: 'AgentWorkforce/factory',
+          url: 'https://mac-mini.tailnet.ts.net:10129/',
+          targetPort: 3_000,
+          httpsPort: 10_129,
+          access: 'tailnet',
+          lifetime: 'issue',
+          createdAt: '2026-07-20T12:00:00.000Z',
+          startCommand: 'npm run dev',
+        }],
+        skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch' }],
+      },
+    }])
+    const fleet = createClient(messaging)
+
+    await expect(fleet.reapPreviews({
+      namespace: 'factory-test',
+      activeOwners: ['owner-active'],
+    })).resolves.toMatchObject({
+      reaped: [{ id: 'preview-orphan', node: 'mac-mini' }],
+      skipped: [{ id: 'preview-mismatch', reason: 'live route identity mismatch', node: 'mac-mini' }],
+    })
+    expect(messaging.placements).toEqual([expect.objectContaining({
+      capability: 'preview:tailscale-serve',
+      node: 'mac-mini',
+      input: { operation: 'sweep', namespace: 'factory-test', activeOwners: ['owner-active'] },
+    })])
+  })
+
   it('maps resume onto a placement spawn with session_ref', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
@@ -311,7 +442,7 @@ describe('RelayFleetClient', () => {
       {
         name: 'alpha',
         status: 'online',
-        capabilities: [{ name: 'spawn:claude' }, { name: 'workflow:run' }, { name: 'unknown:cap' }],
+        capabilities: [{ name: 'spawn:claude' }, { name: 'workflow:run' }, { name: 'preview:tailscale-serve' }, { name: 'unknown:cap' }],
       },
       { name: 'beta', status: 'offline', live: false, capabilities: [{ name: 'spawn:codex' }] },
     ]
@@ -320,7 +451,7 @@ describe('RelayFleetClient', () => {
     await expect(fleet.roster()).resolves.toEqual({
       agents: [{ name: 'ar-1-impl', node: 'alpha' }],
       nodes: [
-        { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run'], live: true },
+        { name: 'alpha', capabilities: ['spawn:claude', 'workflow:run', 'preview:tailscale-serve'], live: true },
         { name: 'beta', capabilities: ['spawn:codex'], live: false },
       ],
     })
