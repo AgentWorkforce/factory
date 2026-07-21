@@ -45,9 +45,6 @@ export const KubernetesConnectionSchema = z.object({
   tolerations: z.array(tolerationSchema).default([]),
   fidelityCaveat: z.string().trim().min(1).optional(),
 }).strict().superRefine((connection, context) => {
-  if (connection.target === 'managed' && !connection.fidelityCaveat) {
-    connection.fidelityCaveat = DEFAULT_MANAGED_FIDELITY_CAVEAT
-  }
   if (!connection.allowClusterScopedResources && connection.allowedClusterScopedKinds.length > 0) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -55,6 +52,9 @@ export const KubernetesConnectionSchema = z.object({
       message: 'requires allowClusterScopedResources=true',
     })
   }
+}).transform((connection) => {
+  if (connection.target !== 'managed' || connection.fidelityCaveat) return connection
+  return { ...connection, fidelityCaveat: DEFAULT_MANAGED_FIDELITY_CAVEAT }
 })
 
 export const KubernetesGuardrailDefaultsSchema = z.object({
