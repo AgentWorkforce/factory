@@ -16,6 +16,7 @@ import { startFactoryNode } from '../../src/node/factory-node-runtime'
 
 type DirectoryRow = {
   name: string
+  description?: string
   address: string
   skills: Array<{ id?: string; name: string; description?: string; tags?: string[] }>
   tags: string[]
@@ -35,6 +36,7 @@ describe('discover -> ask -> reply', () => {
   it('discovers one skilled teammate, completes a relay round trip, and publishes a hosted persona card', async () => {
     const directoryRows: DirectoryRow[] = [{
       name: 'infra-agent',
+      description: 'Watches production infrastructure.',
       address: 'infra-agent',
       skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
       tags: ['operations'],
@@ -43,6 +45,7 @@ describe('discover -> ask -> reply', () => {
       status: 'online',
     }, {
       name: 'review-agent',
+      description: 'Reviews code changes.',
       address: 'review-agent',
       skills: [{ id: 'code-review', name: 'Code Review' }],
       tags: ['quality'],
@@ -64,9 +67,10 @@ describe('discover -> ask -> reply', () => {
       if (request.method === 'POST' && url.pathname === '/v1/a2a/register') {
         const body = JSON.parse(await requestBody(request)) as { agent_card?: unknown }
         const card = A2aAgentCardSchema.parse(body.agent_card)
+        const relayName = `ext-${card.name}-a1b2c3d4`
         directoryRows.push({
           name: card.name,
-          address: card.name,
+          address: relayName,
           skills: card.skills,
           tags: Array.isArray(card.provider?.tags)
             ? card.provider.tags.filter((value): value is string => typeof value === 'string')
@@ -77,7 +81,7 @@ describe('discover -> ask -> reply', () => {
         })
         json(response, 201, {
           ok: true,
-          data: { relay_name: card.name, certification: 'level_1' },
+          data: { relay_name: relayName, certification: 'level_1' },
         })
         return
       }
@@ -97,6 +101,7 @@ describe('discover -> ask -> reply', () => {
     const infra = await discoveryFleet.discoverTeammates({ skill: 'infra-watch' })
     expect(infra).toEqual([expect.objectContaining({
       name: 'infra-agent',
+      description: 'Watches production infrastructure.',
       address: 'infra-agent',
       skills: [expect.objectContaining({ id: 'infra-watch' })],
     })])
@@ -186,6 +191,7 @@ describe('discover -> ask -> reply', () => {
       skill: 'factory-feature-verification',
     })).resolves.toEqual([expect.objectContaining({
       name: 'factory-feature-guardian',
+      address: 'ext-factory-feature-guardian-a1b2c3d4',
       kind: 'a2a',
     })])
 

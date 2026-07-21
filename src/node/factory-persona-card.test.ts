@@ -19,7 +19,7 @@ describe('Factory persona cards', () => {
       published.push(JSON.parse(String(init?.body)))
       return new Response(JSON.stringify({
         ok: true,
-        data: { relay_name: 'factory-feature-guardian', certification: 'level_1' },
+        data: { relay_name: 'ext-factory-feature-guardian-a1b2c3d4', certification: 'level_1' },
       }), { status: 201 })
     })
     const definition = createFactoryNodeDefinition({
@@ -62,9 +62,55 @@ describe('Factory persona cards', () => {
 
     await expect(running.cardPublished).resolves.toEqual({
       name: 'factory-feature-guardian',
-      address: 'factory-feature-guardian',
+      address: 'ext-factory-feature-guardian-a1b2c3d4',
       certification: 'level_1',
     })
     expect(published).toEqual([{ agent_card: definition.agentCard }])
+  })
+
+  it('verifies an idempotent registration conflict and returns the existing relay address', async () => {
+    const definition = createFactoryNodeDefinition({
+      config: parseFactoryNodeConfig({
+        workspaceId: 'workspace-1',
+        capabilities: ['spawn:codex'],
+        clonePaths: { 'AgentWorkforce/factory': '/work/factory' },
+        dryRun: false,
+      }),
+      persona: {
+        persona,
+        baseUrl: 'https://agent.example',
+        version: '1.0.0',
+      },
+    })
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_url, init) => {
+      if (init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          ok: false,
+          error: { code: 'a2a_agent_already_exists', message: 'already exists' },
+        }), { status: 409 })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        data: [{
+          relay_name: 'ext-factory-feature-guardian-a1b2c3d4',
+          agent_card: definition.agentCard,
+        }],
+      }), { status: 200 })
+    })
+    const publisher = new RelaycastAgentCardPublisher({
+      baseUrl: 'https://relay.example',
+      token: 'rk_live_test',
+      fetch,
+    })
+
+    await expect(publisher.publishAgentCard(definition.agentCard!)).resolves.toEqual({
+      name: 'factory-feature-guardian',
+      address: 'ext-factory-feature-guardian-a1b2c3d4',
+      alreadyPublished: true,
+    })
+    expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://relay.example/v1/a2a/register',
+      'https://relay.example/v1/a2a/agents',
+    ])
   })
 })

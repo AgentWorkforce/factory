@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util'
+
 import { A2aAgentCardSchema, type A2aAgentCard } from '@relaycast/a2a'
 import * as personaKitSpec from '@agentworkforce/persona-kit/spec'
 
@@ -83,9 +85,8 @@ export class RelaycastAgentCardPublisher implements AgentCardPublisher {
     const canonical = A2aAgentCardSchema.parse(card)
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.#timeoutMs)
-    let response: Response
     try {
-      response = await this.#fetch(new URL('/v1/a2a/register', `${this.#baseUrl}/`), {
+      const response = await this.#fetch(new URL('/v1/a2a/register', `${this.#baseUrl}/`), {
         method: 'POST',
         headers: {
           accept: 'application/json',
@@ -95,6 +96,23 @@ export class RelaycastAgentCardPublisher implements AgentCardPublisher {
         body: JSON.stringify({ agent_card: canonical }),
         signal: controller.signal,
       })
+      const payload = await readJson(response)
+      if (response.status === 409) {
+        return await this.#resolveExistingCard(canonical, controller.signal)
+      }
+      if (!response.ok) {
+        throw new Error(`Relaycast rejected Factory persona card (${response.status}): ${errorDetail(payload)}`)
+      }
+      const data = asRecord(asRecord(payload)?.data)
+      const address = readString(data, 'relay_name', 'relayName', 'address')
+      if (!address) {
+        throw new Error('Relaycast accepted the Factory persona card without returning its relay address')
+      }
+      return {
+        name: canonical.name,
+        address,
+        ...(readString(data, 'certification') ? { certification: readString(data, 'certification') } : {}),
+      }
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`Timed out publishing Factory persona card after ${this.#timeoutMs}ms`, { cause: error })
@@ -103,23 +121,46 @@ export class RelaycastAgentCardPublisher implements AgentCardPublisher {
     } finally {
       clearTimeout(timeout)
     }
+  }
 
+  async #resolveExistingCard(
+    canonical: A2aAgentCard,
+    signal: AbortSignal,
+  ): Promise<PublishedAgentCard> {
+    const response = await this.#fetch(new URL('/v1/a2a/agents', `${this.#baseUrl}/`), {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${this.#token}`,
+      },
+      signal,
+    })
     const payload = await readJson(response)
-    if (response.status === 409) {
-      // Registration is create-only in current Relaycast. A conflict means the
-      // deterministic card identity is already present and directory-visible.
-      return { name: canonical.name, address: canonical.name, alreadyPublished: true }
-    }
     if (!response.ok) {
-      throw new Error(`Relaycast rejected Factory persona card (${response.status}): ${errorDetail(payload)}`)
+      throw new Error(
+        `Relaycast reported an existing Factory persona card but its record could not be verified ` +
+        `(${response.status}): ${errorDetail(payload)}`,
+      )
     }
-    const data = asRecord(asRecord(payload)?.data)
-    const address = readString(data, 'relay_name', 'relayName', 'address') ?? canonical.name
-    return {
-      name: canonical.name,
-      address,
-      ...(readString(data, 'certification') ? { certification: readString(data, 'certification') } : {}),
+
+    const records = directoryRows(payload)
+    let sameName = false
+    for (const value of records) {
+      const record = asRecord(value)
+      const parsed = A2aAgentCardSchema.safeParse(record?.agent_card ?? record?.agentCard)
+      if (!parsed.success || parsed.data.name !== canonical.name) continue
+      sameName = true
+      if (!isDeepStrictEqual(parsed.data, canonical)) continue
+      const address = readString(record, 'relay_name', 'relayName', 'address')
+      if (!address) {
+        throw new Error('Relaycast returned the existing Factory persona card without its relay address')
+      }
+      return { name: canonical.name, address, alreadyPublished: true }
     }
+
+    throw new Error(sameName
+      ? `Relaycast already has a different card for Factory persona "${canonical.name}"`
+      : `Relaycast reported a conflict but no card for Factory persona "${canonical.name}" was found`)
   }
 }
 
@@ -205,6 +246,12 @@ function errorDetail(payload: unknown): string {
   const record = asRecord(payload)
   const error = asRecord(record?.error)
   return readString(error, 'message') ?? readString(record, 'message') ?? 'request failed'
+}
+
+function directoryRows(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload
+  const record = asRecord(payload)
+  return Array.isArray(record?.data) ? record.data : []
 }
 
 function positiveTimeout(value: number | undefined, fallback: number): number {

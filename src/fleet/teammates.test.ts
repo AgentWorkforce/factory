@@ -69,6 +69,7 @@ describe('askTeammate', () => {
     })
     await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
     fleet.emitAgentMessage({ from: 'someone-else', target: 'factory-worker', body: 'wrong' })
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'different-worker', body: 'also wrong' })
     fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'All systems green.' })
 
     await expect(asked).resolves.toMatchObject({

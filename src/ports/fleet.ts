@@ -112,6 +112,8 @@ export interface TeammateQuery {
 export interface TeammateAgent {
   /** Directory identity shown to workers. */
   name: string
+  /** Human-readable card description, when the directory provides one. */
+  description?: string
   /** Canonical A2A skill records from the agent card. */
   skills: A2aSkill[]
   /** A2A endpoint advertised by the directory. */

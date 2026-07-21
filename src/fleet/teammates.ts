@@ -42,9 +42,8 @@ export class RelaycastTeammateDirectory implements TeammateDirectory {
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.#timeoutMs)
-    let response: Response
     try {
-      response = await this.#fetch(url, {
+      const response = await this.#fetch(url, {
         method: 'GET',
         headers: {
           accept: 'application/json',
@@ -52,6 +51,21 @@ export class RelaycastTeammateDirectory implements TeammateDirectory {
         },
         signal: controller.signal,
       })
+      const payload = await readJson(response)
+      if (!response.ok) {
+        throw new Error(`Relaycast teammate directory returned ${response.status}: ${errorDetail(payload)}`)
+      }
+
+      const rows = directoryRows(payload)
+        .map(parseDirectoryEntry)
+        .filter((entry): entry is TeammateAgent => Boolean(entry))
+        // Keep the client honest even if a server version ignores a filter. This
+        // also makes an unknown exact skill/tag deterministically return [].
+        .filter((entry) => matchesQuery(entry, normalized))
+
+      const unique = new Map<string, TeammateAgent>()
+      for (const entry of rows) unique.set(`${entry.kind}:${entry.address}`, entry)
+      return [...unique.values()]
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`Timed out querying the Relaycast teammate directory after ${this.#timeoutMs}ms`, { cause: error })
@@ -60,22 +74,6 @@ export class RelaycastTeammateDirectory implements TeammateDirectory {
     } finally {
       clearTimeout(timeout)
     }
-
-    const payload = await readJson(response)
-    if (!response.ok) {
-      throw new Error(`Relaycast teammate directory returned ${response.status}: ${errorDetail(payload)}`)
-    }
-
-    const rows = directoryRows(payload)
-      .map(parseDirectoryEntry)
-      .filter((entry): entry is TeammateAgent => Boolean(entry))
-      // Keep the client honest even if a server version ignores a filter. This
-      // also makes an unknown exact skill/tag deterministically return [].
-      .filter((entry) => matchesQuery(entry, normalized))
-
-    const unique = new Map<string, TeammateAgent>()
-    for (const entry of rows) unique.set(`${entry.kind}:${entry.address}`, entry)
-    return [...unique.values()]
   }
 }
 
@@ -145,6 +143,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       }
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
+        if (!sameAgent(message.target, from)) return
         finish({ requestId, teammate, reply: message })
       })
       const send = {
@@ -223,6 +222,7 @@ function parseDirectoryEntry(value: unknown): TeammateAgent | undefined {
   const address = readString(record, 'address', 'relay_name', 'relayName', 'target') ?? name
   return {
     name,
+    ...(readString(record, 'description') ? { description: readString(record, 'description') } : {}),
     skills,
     url,
     kind,
