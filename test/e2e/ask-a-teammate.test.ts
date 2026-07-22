@@ -17,7 +17,6 @@ import { startFactoryNode } from '../../src/node/factory-node-runtime'
 type DirectoryRow = {
   name: string
   description?: string
-  address: string
   skills: Array<{ id?: string; name: string; description?: string; tags?: string[] }>
   tags: string[]
   url: string
@@ -37,19 +36,17 @@ describe('discover -> ask -> reply', () => {
     const directoryRows: DirectoryRow[] = [{
       name: 'infra-agent',
       description: 'Watches production infrastructure.',
-      address: 'infra-agent',
       skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
       tags: ['operations'],
-      url: 'http://relay.local/a2a/rpc',
+      url: 'http://relay.local/v1/dm',
       kind: 'native',
       status: 'online',
     }, {
       name: 'review-agent',
       description: 'Reviews code changes.',
-      address: 'review-agent',
       skills: [{ id: 'code-review', name: 'Code Review' }],
       tags: ['quality'],
-      url: 'http://relay.local/a2a/rpc',
+      url: 'http://relay.local/v1/dm',
       kind: 'native',
       status: 'online',
     }]
@@ -69,13 +66,14 @@ describe('discover -> ask -> reply', () => {
         const card = A2aAgentCardSchema.parse(body.agent_card)
         const relayName = `ext-${card.name}-a1b2c3d4`
         directoryRows.push({
-          name: card.name,
-          address: relayName,
+          // Relaycast exposes the derived relay proxy identity as `name`; it
+          // does not add a separate address field to directory rows.
+          name: relayName,
           skills: card.skills,
           tags: Array.isArray(card.provider?.tags)
             ? card.provider.tags.filter((value): value is string => typeof value === 'string')
             : [],
-          url: card.url,
+          url: `${origin}/a2a/rpc`,
           kind: 'a2a',
           status: 'active',
         })
@@ -103,6 +101,8 @@ describe('discover -> ask -> reply', () => {
       name: 'infra-agent',
       description: 'Watches production infrastructure.',
       address: 'infra-agent',
+      url: 'http://relay.local/v1/dm',
+      kind: 'native',
       skills: [expect.objectContaining({ id: 'infra-watch' })],
     })])
     await expect(discoveryFleet.discoverTeammates({ skill: 'unknown-skill' })).resolves.toEqual([])
@@ -193,9 +193,10 @@ describe('discover -> ask -> reply', () => {
     await expect(discoveryFleet.discoverTeammates({
       skill: 'factory-feature-verification',
     })).resolves.toEqual([expect.objectContaining({
-      name: 'factory-feature-guardian',
+      name: 'ext-factory-feature-guardian-a1b2c3d4',
       address: 'ext-factory-feature-guardian-a1b2c3d4',
       kind: 'a2a',
+      url: `${baseUrl}/a2a/rpc`,
     })])
 
     stopStub()

@@ -20,6 +20,7 @@ export type {
   Subscription,
 } from './mount'
 export type {
+  A2aSkill,
   AgentLifecycleSignal,
   AgentMessage,
   AgentPidResolution,

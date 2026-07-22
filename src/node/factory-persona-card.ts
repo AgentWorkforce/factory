@@ -184,11 +184,24 @@ function deriveAgentCardCompatibility(persona: PersonaSpec, options: DeriveAgent
   for (const [name, value] of Object.entries(persona.capabilities ?? {})) {
     if (!capabilityEnabled(value)) continue
     const canonicalName = name === 'pullRequest' ? 'review' : name
-    if (skills.some((skill) => skill.id === canonicalName)) continue
+    const existing = skills.find((skill) => skill.id === canonicalName)
+    if (existing) {
+      existing.tags = unique([...(existing.tags ?? []), ...integrationTags])
+      continue
+    }
     skills.push({
       id: canonicalName,
       name: humanize(canonicalName),
-      description: `Persona capability: ${canonicalName}`,
+      description: `Persona capability: ${humanize(canonicalName)}`,
+      tags: unique(integrationTags),
+    })
+  }
+
+  if (skills.length === 0) {
+    skills.push({
+      id: persona.intent,
+      name: humanize(persona.intent),
+      description: persona.description,
       tags: unique(integrationTags),
     })
   }
@@ -202,7 +215,10 @@ function deriveAgentCardCompatibility(persona: PersonaSpec, options: DeriveAgent
     url: options.baseUrl,
     version: options.version,
     skills,
-    capabilities: { streaming: false, pushNotifications: false },
+    capabilities: {
+      streaming: capabilityEnabled(persona.capabilities?.streaming),
+      pushNotifications: capabilityEnabled(persona.capabilities?.pushNotifications),
+    },
     default_input_modes: options.inputModes ?? ['text/plain', 'application/json'],
     default_output_modes: options.outputModes ?? ['text/plain', 'application/json'],
     provider: {

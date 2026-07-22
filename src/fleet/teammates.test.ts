@@ -23,10 +23,15 @@ const directoryRows = [{
 
 describe('RelaycastTeammateDirectory', () => {
   it('sends skill/tag filters and rejects unfiltered server rows client-side', async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(JSON.stringify({
-      ok: true,
-      data: directoryRows,
-    }), { status: 200 }))
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input) => {
+      const url = new URL(String(input))
+      return new Response(JSON.stringify({
+        ok: true,
+        // Relaycast may match a registered card alias that is not repeated in
+        // the returned row. Preserve that server match for free-text queries.
+        data: url.searchParams.has('q') ? [directoryRows[1]] : directoryRows,
+      }), { status: 200 })
+    })
     const directory = new RelaycastTeammateDirectory({
       baseUrl: 'https://relay.example/',
       token: 'rk_live_test',
@@ -40,12 +45,16 @@ describe('RelaycastTeammateDirectory', () => {
     await expect(directory.discover({ tag: 'quality' })).resolves.toEqual([
       expect.objectContaining({ name: 'review-agent', kind: 'a2a' }),
     ])
+    await expect(directory.discover({ q: 'private-card-alias' })).resolves.toEqual([
+      expect.objectContaining({ name: 'review-agent' }),
+    ])
 
     const firstUrl = fetch.mock.calls[0]?.[0]
     expect(String(firstUrl)).toBe('https://relay.example/v1/a2a/directory?skill=infra-watch')
     expect(fetch.mock.calls[0]?.[1]).toMatchObject({
       headers: expect.objectContaining({ authorization: 'Bearer rk_live_test' }),
     })
+    expect(String(fetch.mock.calls[3]?.[0])).toBe('https://relay.example/v1/a2a/directory?q=private-card-alias')
   })
 })
 
@@ -109,5 +118,13 @@ describe('askTeammate', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('refuses to choose an arbitrary teammate without a target or discovery query', async () => {
+    const fleet = new FakeFleetClient()
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker',
+      question: 'Whoever is first, please answer.',
+    })).rejects.toThrow('requires a discovered teammate or a skill/tag/query')
   })
 })

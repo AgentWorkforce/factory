@@ -4,7 +4,7 @@ import { A2aAgentCardSchema } from '@relaycast/a2a'
 import { describe, expect, it, vi } from 'vitest'
 
 import { createFactoryNodeDefinition, parseFactoryNodeConfig } from './factory-node'
-import { RelaycastAgentCardPublisher } from './factory-persona-card'
+import { deriveFactoryPersonaCard, RelaycastAgentCardPublisher } from './factory-persona-card'
 import { startFactoryNode } from './factory-node-runtime'
 
 const persona = JSON.parse(readFileSync(
@@ -13,6 +13,46 @@ const persona = JSON.parse(readFileSync(
 )) as unknown
 
 describe('Factory persona cards', () => {
+  it('matches the canonical mapper for runtime flags and an intent fallback skill', () => {
+    const cardWithRuntimeFlags = deriveFactoryPersonaCard({
+      persona: {
+        ...(persona as Record<string, unknown>),
+        skills: [],
+        capabilities: {
+          streaming: true,
+          pushNotifications: { enabled: true },
+        },
+      },
+      baseUrl: 'https://agent.example',
+      version: '1.2.3',
+    })
+
+    expect(cardWithRuntimeFlags).toMatchObject({
+      capabilities: {
+        streaming: true,
+        pushNotifications: true,
+      },
+    })
+    expect(cardWithRuntimeFlags.skills.map((skill) => skill.id)).toEqual([
+      'streaming',
+      'pushNotifications',
+    ])
+
+    const cardWithoutDeclaredSkills = deriveFactoryPersonaCard({
+      persona: {
+        ...(persona as Record<string, unknown>),
+        skills: [],
+        capabilities: {},
+      },
+      baseUrl: 'https://agent.example',
+      version: '1.2.3',
+    })
+    expect(cardWithoutDeclaredSkills.skills).toEqual([expect.objectContaining({
+      id: 'relay-orchestrator',
+      name: 'Relay Orchestrator',
+    })])
+  })
+
   it('derives a shared-schema card and publishes it on the node-online edge', async () => {
     const published: unknown[] = []
     const fetch = vi.fn<typeof globalThis.fetch>(async (_url, init) => {

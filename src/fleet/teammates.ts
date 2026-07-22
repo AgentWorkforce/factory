@@ -105,6 +105,10 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
   const requestId = randomUUID()
   const from = requiredText(input.from, 'askTeammate.from')
   const question = requiredText(input.question, 'askTeammate.question')
+  const query = normalizeQuery({ skill: input.skill, tag: input.tag, q: input.q })
+  if (!input.teammate && !query.skill && !query.tag && !query.q) {
+    throw new Error('askTeammate requires a discovered teammate or a skill/tag/query')
+  }
   const deadline = Date.now() + timeoutMs
 
   return await new Promise<AskTeammateResult>((resolve, reject) => {
@@ -129,11 +133,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     }, timeoutMs)
 
     void (async () => {
-      const teammate = input.teammate ?? (await fleet.discoverTeammates({
-        skill: input.skill,
-        tag: input.tag,
-        q: input.q,
-      }))[0]
+      const teammate = input.teammate ?? (await fleet.discoverTeammates(query))[0]
       if (settled) return
       if (!teammate) {
         throw new Error('No teammate matched the requested skill/tag/query')
@@ -185,16 +185,11 @@ function matchesQuery(entry: TeammateAgent, query: TeammateQuery): boolean {
     if (!tags.some((candidate) => normalizedComparable(candidate) === tag)) return false
   }
 
-  const q = normalizedComparable(query.q)
-  if (q) {
-    const haystack = [
-      entry.name,
-      entry.address,
-      ...entry.tags,
-      ...entry.skills.flatMap((candidate) => [candidate.id ?? '', candidate.name, candidate.description ?? '', ...(candidate.tags ?? [])]),
-    ].join('\n').toLowerCase()
-    if (!haystack.includes(q)) return false
-  }
+  // Relaycast also searches aliases that are intentionally not exposed in a
+  // directory row (for example, an A2A card name behind its derived ext-* relay
+  // identity). Re-applying q here would discard those valid server matches.
+  // Exact skill/tag filters are fully represented by the row, so those remain
+  // enforced client-side to protect callers from an older unfiltered server.
   return true
 }
 

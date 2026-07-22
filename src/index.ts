@@ -343,6 +343,7 @@ export type {
   ResourceSubscriptionsSdkClientOptions,
 } from './subscriptions'
 export type {
+  A2aSkill,
   Capability,
   Environment,
   EnvironmentProvider,
