@@ -1,14 +1,14 @@
 version: '1.1'
 updated: '2026-07-21'
 catalog:
-  category_count: 24
-  feature_count: 303
+  category_count: 25
+  feature_count: 304
   tier_counts:
     1: 44
     2: 124
     3: 11
     4: 51
-    5: 58
+    5: 59
     6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -50,6 +50,7 @@ verification:
     release-verification: release-verification
     verification-environments: verification-environments
     proactive-health: proactive-health
+    maintainability-review: maintainability-review
     config-intake: triage-and-configuration
     config-repositories: triage-and-configuration
     config-loop: loop-and-recovery
@@ -1714,6 +1715,18 @@ categories:
         api: slack.messages.write({ idempotencyKey })
         description: Retry an ambiguous scheduled run with a stable cycle-and-feature key, require a real provider Slack timestamp, and advance progress only after the confirmed receipt
         location: .agentworkforce/agents/factory-feature-guardian/agent.ts
+        verify_tier: 5
+
+  maintainability-review:
+    name: Maintainability Historian Review
+    description: Read-only, repository-scoped pull-request review against Factory's critical paths and complete git history
+    criticality: hot
+    features:
+      - id: historian-pr-reviewer
+        name: Factory Historian PR Reviewer
+        api: factory-maintainability pull_request.opened / pull_request.synchronize
+        description: Review each non-draft Factory PR once per head revision for invariant drift and lost rationale, using the checked-in charter, exact diff, and full git history without editing or merging
+        location: .agentworkforce/agents/factory-maintainability/agent.ts, .agentworkforce/agents/factory-maintainability/persona.ts, .agentworkforce/agents/factory-maintainability/persona.json, .agentworkforce/workforce/personas/maintainability.md
         verify_tier: 5
 
   config-intake:
