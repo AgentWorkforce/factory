@@ -28,15 +28,15 @@ describe('Factory persona cards', () => {
     })
 
     expect(cardWithRuntimeFlags).toMatchObject({
+      skills: [{
+        id: 'relay-orchestrator',
+        name: 'Relay Orchestrator',
+      }],
       capabilities: {
         streaming: true,
         pushNotifications: true,
       },
     })
-    expect(cardWithRuntimeFlags.skills.map((skill) => skill.id)).toEqual([
-      'streaming',
-      'pushNotifications',
-    ])
 
     const cardWithoutDeclaredSkills = deriveFactoryPersonaCard({
       persona: {

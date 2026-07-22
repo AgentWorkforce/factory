@@ -42,6 +42,7 @@ type DeriveAgentCardOptions = {
   outputModes?: string[]
 }
 type DeriveAgentCard = (persona: PersonaSpec, options: DeriveAgentCardOptions) => A2aAgentCard
+const A2A_TRANSPORT_CAPABILITIES = new Set(['streaming', 'pushNotifications'])
 
 /**
  * Derive and schema-validate the card attached to a Factory-hosted persona.
@@ -183,6 +184,7 @@ function deriveAgentCardCompatibility(persona: PersonaSpec, options: DeriveAgent
   }))
   for (const [name, value] of Object.entries(persona.capabilities ?? {})) {
     if (!capabilityEnabled(value)) continue
+    if (A2A_TRANSPORT_CAPABILITIES.has(name)) continue
     const canonicalName = name === 'pullRequest' ? 'review' : name
     const existing = skills.find((skill) => skill.id === canonicalName)
     if (existing) {
