@@ -104,6 +104,7 @@
     "listr2": "9.0.5"
   },
   "devDependencies": {
+    "@agentworkforce/persona-kit": "^4.1.23",
     "@types/node": "^22.10.2",
     "@types/proper-lockfile": "^4.1.4",
     "esbuild": "^0.28.1",

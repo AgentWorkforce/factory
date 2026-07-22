@@ -165,6 +165,7 @@ function adapters(options: {
       path: '.agentworkforce/features/verify/procedures.md',
       prerequisites: 'source checkout with installed dependencies',
       body: 'npm run build\nnpm test',
+      command: 'npm run build\nnpm test',
     })),
     gateTier: vi.fn(async () => ({ outcome: 'available', reason: 'available' })),
     runProcedure: vi.fn(async () => options.result ?? procedureResult('passed')),
@@ -178,6 +179,7 @@ function adapters(options: {
       if (/test/iu.test(turn.text)) return 'test'
       return 'implementation'
     },
+    isDefectEstablished: (_snapshot, turn) => /concrete evidence/iu.test(turn.text),
     repositoryForFeature: () => 'AgentWorkforce/factory',
     issuePolicy: ({ conversation, defectKind, slackBacklink }) => {
       const dedupeKey = `factory:${feature.id}:${feature.procedure}`
@@ -343,7 +345,7 @@ describe('feature guardian conversation ownership', () => {
 
     await runGuardianConversationTurn(
       f.ctx,
-      reaction('env-3', '1710000003.000100', 'white_check_mark'),
+      reply('env-3', '1710000003.000100', 'I tested it and confirmed it works as expected'),
       a,
       f.deps,
     )
@@ -396,7 +398,7 @@ describe('feature guardian conversation ownership', () => {
     expect(a.runProcedure).toHaveBeenCalledTimes(1)
     expect(f.store.record().status).toBe('confirmed')
     expect([...f.confirmations.records.values()][0]).toMatchObject({
-      verifier: 'factory-feature-guardian:procedure-runner',
+      verifier: 'test-procedure-runner',
       commands: ['npm run build', 'npm test'],
       tests: { passed: 42, failed: 0 },
     })
@@ -412,9 +414,21 @@ describe('feature guardian conversation ownership', () => {
       f.deps,
     )
     expect(a.runProcedure).toHaveBeenCalledTimes(1)
-    expect([...f.confirmations.records.values()][0]?.verifier).toBe(
-      'factory-feature-guardian:procedure-runner',
+    expect([...f.confirmations.records.values()][0]?.verifier).toBe('test-procedure-runner')
+  })
+
+  it('clarifies a bare checkmark instead of treating delivery as confirmation evidence', async () => {
+    const f = await fixture()
+    const a = adapters()
+    await runGuardianConversationTurn(
+      f.ctx,
+      reaction('bare-check', '1710000001.000100', 'white_check_mark'),
+      a,
+      f.deps,
     )
+    expect(f.store.record()).toMatchObject({ status: 'discussing', clarificationCount: 1 })
+    expect(f.confirmations.records).toHaveLength(0)
+    expect(a.runProcedure).not.toHaveBeenCalled()
   })
 
   it('preserves exact SKIP and MANUAL outcomes without confirmation', async () => {
@@ -447,6 +461,55 @@ describe('feature guardian conversation ownership', () => {
     expect(f.slack.posts.at(-1)?.text).toContain('different revision')
   })
 
+  it('revalidates revision and tier gates before resuming a pending verification', async () => {
+    const revision = await fixture()
+    let currentCatalog = catalog
+    const revisionAdapters = adapters()
+    revisionAdapters.loadCatalog = vi.fn(async () => currentCatalog)
+    await runGuardianConversationTurn(
+      revision.ctx,
+      reply('revision-1', '1710000001.000100', 'untested'),
+      revisionAdapters,
+      revision.deps,
+    )
+    revision.store.failSaveCalls.add(revision.store.saveCalls + 3)
+    const retry = reply('revision-2', '1710000002.000100', 'still untested')
+    await expect(
+      runGuardianConversationTurn(revision.ctx, retry, revisionAdapters, revision.deps),
+    ).rejects.toBeInstanceOf(GuardianStateConflictError)
+    expect(revision.store.record()).toMatchObject({ status: 'verifying' })
+    currentCatalog = { ...catalog, procedureRevision: guardianContentRevision('procedures-b') }
+    await runGuardianConversationTurn(revision.ctx, retry, revisionAdapters, revision.deps)
+    expect(revision.store.record().status).toBe('deferred')
+    expect(revision.confirmations.records).toHaveLength(0)
+    expect(revisionAdapters.runProcedure).toHaveBeenCalledTimes(1)
+
+    const gated = await fixture()
+    const gatedAdapters = adapters()
+    const originalRun = gatedAdapters.runProcedure
+    let runAttempts = 0
+    const restartedRun = vi.fn(async (...args: Parameters<typeof originalRun>) => {
+      runAttempts += 1
+      if (runAttempts === 1) throw new Error('restart now')
+      return originalRun(...args)
+    })
+    gatedAdapters.runProcedure = restartedRun
+    await runGuardianConversationTurn(
+      gated.ctx,
+      reply('gate-1', '1710000001.000100', 'untested'),
+      gatedAdapters,
+      gated.deps,
+    )
+    const gatedRetry = reply('gate-2', '1710000002.000100', 'still untested')
+    await expect(
+      runGuardianConversationTurn(gated.ctx, gatedRetry, gatedAdapters, gated.deps),
+    ).rejects.toThrow('restart now')
+    gatedAdapters.gateTier = vi.fn(async () => ({ outcome: 'manual', reason: 'MANUAL: opt-in revoked' }))
+    await runGuardianConversationTurn(gated.ctx, gatedRetry, gatedAdapters, gated.deps)
+    expect(gated.store.record().status).toBe('deferred')
+    expect(restartedRun).toHaveBeenCalledTimes(1)
+  })
+
   it('ignores unrelated channels, threads, bots, and delayed older events', async () => {
     const f = await fixture()
     const a = adapters()
@@ -471,6 +534,36 @@ describe('feature guardian conversation ownership', () => {
     expect(f.slack.posts).toHaveLength(1)
   })
 
+  it('orders same-millisecond reactions by the full provider timestamp', async () => {
+    const f = await fixture({ result: procedureResult('failed') })
+    const a = adapters({ result: procedureResult('failed') })
+    await runGuardianConversationTurn(
+      f.ctx,
+      reaction('same-ms-1', '1710000001.000100', 'question'),
+      a,
+      f.deps,
+    )
+    await runGuardianConversationTurn(
+      f.ctx,
+      reaction('same-ms-2', '1710000001.000200', 'wrench'),
+      a,
+      f.deps,
+    )
+    expect(a.runProcedure).toHaveBeenCalledTimes(1)
+    expect(f.store.record().status).toBe('remediation-open')
+  })
+
+  it('rejects payload identities that disagree with the mounted resource path', async () => {
+    const f = await fixture()
+    const a = adapters()
+    const mismatched = reply('path-mismatch', '1710000001.000100', 'tested and works') as
+      WorkforceEvent & { resource: { path: string } }
+    mismatched.resource.path = `/slack/channels/${CHANNEL}/messages/1719999999_000100`
+    await runGuardianConversationTurn(f.ctx, mismatched, a, f.deps)
+    expect(f.store.record().status).toBe('asked')
+    expect(f.confirmations.records).toHaveLength(0)
+  })
+
   it('replays a clarification after a post-before-CAS conflict without duplicating Slack', async () => {
     const f = await fixture()
     const a = adapters()
@@ -483,6 +576,29 @@ describe('feature guardian conversation ownership', () => {
     await runGuardianConversationTurn(f.ctx, event, a, f.deps)
     expect(f.slack.posts).toHaveLength(1)
     expect(f.store.record()).toMatchObject({ status: 'discussing', turnCount: 1 })
+  })
+
+  it('rejects an explicitly pending Slack reply even when it carries a stale timestamp', async () => {
+    const f = await fixture()
+    const pendingSlack = (() => ({
+      replies: {
+        write: vi.fn(async () => ({
+          path: '/slack/pending.json',
+          absolutePath: '/slack/pending.json',
+          deliveryStatus: 'pending' as const,
+          receipt: { ts: '1710000099.000100' },
+        })),
+      },
+    })) as unknown as typeof slackClient
+    await expect(
+      runGuardianConversationTurn(
+        f.ctx,
+        reply('pending-slack', '1710000001.000100', 'maybe'),
+        adapters(),
+        { ...f.deps, createSlackClient: pendingSlack },
+      ),
+    ).rejects.toThrow('not provider-confirmed')
+    expect(f.store.record().status).toBe('asked')
   })
 
   it('resumes an issue-write failure without rerunning the procedure', async () => {
@@ -540,12 +656,35 @@ describe('feature guardian conversation ownership', () => {
     )
     await runGuardianConversationTurn(
       f.ctx,
-      reply('docs-2', '1710000002.000100', 'the documentation is still wrong'),
+      reply(
+        'docs-2',
+        '1710000002.000100',
+        'the documentation is wrong; concrete evidence: `docs/guardian.md` says expected enabled, but the command outputs disabled',
+      ),
       a,
       f.deps,
     )
     expect(f.store.record().status).toBe('remediation-open')
     expect(f.issueWrites[0]?.defectKind).toBe('documentation')
+  })
+
+  it('does not open remediation from a repeated allegation without concrete evidence', async () => {
+    const f = await fixture()
+    const a = adapters()
+    await runGuardianConversationTurn(
+      f.ctx,
+      reply('unsupported-1', '1710000001.000100', 'the documentation is wrong'),
+      a,
+      f.deps,
+    )
+    await runGuardianConversationTurn(
+      f.ctx,
+      reply('unsupported-2', '1710000002.000100', 'the documentation is still wrong'),
+      a,
+      f.deps,
+    )
+    expect(f.store.record().status).toBe('discussing')
+    expect(f.issueWriter.upsert).not.toHaveBeenCalled()
   })
 })
 
@@ -575,7 +714,7 @@ describe('feature guardian malformed and bounded state', () => {
       }],
     }
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      path: '/memory/workspace/factory-feature-guardian/conversations.json',
+      path: '/memory/workspace/feature-guardian/conversations.json',
       revision: 'rev-1',
       content: `${JSON.stringify(malformed)}\n`,
       encoding: 'utf-8',
@@ -585,6 +724,47 @@ describe('feature guardian malformed and bounded state', () => {
       { fetchImpl },
     )
     await expect(store.load()).rejects.toThrow('asked conversation cannot retain a pending turn')
+  })
+
+  it('rejects a resumable confirmation without a validated confirmation basis', async () => {
+    const id = guardianConversationId(question)
+    const eventId = `slack:${'b'.repeat(64)}`
+    const order = `${slackTime('1710000001.000100')}:1710000001.000100:${eventId}`
+    const malformed = {
+      kind: 'feature-guardian:conversations',
+      version: 1,
+      records: [{
+        ...question,
+        id,
+        status: 'confirmation-recorded',
+        turnCount: 1,
+        clarificationCount: 0,
+        seenEventIds: [],
+        evidence: [{ source: 'actor', result: 'positive', summary: 'yes' }],
+        pending: {
+          eventId,
+          eventOrder: order,
+          eventOccurredAt: slackTime('1710000001.000100'),
+          actorId: 'U-UNTRUSTED',
+          response: 'affirmative',
+          text: 'yes',
+          evidence: { source: 'actor', result: 'positive', summary: 'yes' },
+        },
+        lastProcessedEventOrder: order,
+        updatedAt: slackTime('1710000001.000100'),
+      }],
+    }
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      path: '/memory/workspace/feature-guardian/conversations.json',
+      revision: 'rev-1',
+      content: `${JSON.stringify(malformed)}\n`,
+      encoding: 'utf-8',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const store = createSdkConversationStore(
+      { url: 'https://relayfile.test', token: 'token', workspaceId: 'workspace' },
+      { fetchImpl },
+    )
+    await expect(store.load()).rejects.toThrow('requires a confirmation basis')
   })
 
   it('prunes oldest terminal records to satisfy count and byte bounds', async () => {
@@ -655,6 +835,25 @@ describe('feature guardian GitHub remediation durability', () => {
     expect(client.createIssue).toHaveBeenCalledTimes(1)
   })
 
+  it('admits only one concurrent provider create', async () => {
+    const ctx = context()
+    const createIssue = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      return {
+        status: 'confirmed' as const,
+        id: '1780',
+        url: 'https://github.com/AgentWorkforce/factory/issues/1780',
+        path: '/github/issues/draft.json',
+        receipt: { externalId: '1780' },
+      }
+    })
+    const writer = createGithubIssueWriter(ctx, github({ createIssue }))
+    const results = await Promise.allSettled([writer.upsert(policy), writer.upsert(policy)])
+    expect(createIssue).toHaveBeenCalledTimes(1)
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+  })
+
   it('appends changed evidence to the deduplicated issue exactly once', async () => {
     const ctx = context()
     const client = github({
@@ -688,6 +887,36 @@ describe('feature guardian GitHub remediation durability', () => {
     await expect(writer.upsert(policy)).rejects.toThrow('pending, not provider-confirmed')
     await expect(writer.upsert(policy)).rejects.toThrow('refusing a duplicate issue')
     expect(client.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries after a provider positively drops the prior issue submission', async () => {
+    const ctx = context()
+    let attempt = 0
+    const client = github({
+      createIssue: vi.fn(async () => {
+        attempt += 1
+        if (attempt === 1) {
+          return {
+            status: 'dropped' as const,
+            id: '/github/issues/draft.json',
+            url: '' as const,
+            path: '/github/issues/draft.json',
+            reason: 'provider rejected before admission',
+          }
+        }
+        return {
+          status: 'confirmed' as const,
+          id: '1779',
+          url: 'https://github.com/AgentWorkforce/factory/issues/1779',
+          path: '/github/issues/draft-2.json',
+          receipt: { externalId: '1779' },
+        }
+      }),
+    })
+    const writer = createGithubIssueWriter(ctx, client)
+    await expect(writer.upsert(policy)).rejects.toThrow('dropped before provider admission')
+    await expect(writer.upsert(policy)).resolves.toMatchObject({ number: 1779 })
+    expect(client.createIssue).toHaveBeenCalledTimes(2)
   })
 
   it('finds an existing marker in the canonical nested issue mount', async () => {

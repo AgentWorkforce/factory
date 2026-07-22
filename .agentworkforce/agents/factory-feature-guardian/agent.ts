@@ -115,12 +115,44 @@ export async function loadFactoryGuardianCatalog(
     ctx.sandbox.readFile(resolveProceduresPath(ctx.sandbox.cwd)),
   ]);
   const validated = validateFeatureManifest(raw);
+  if (validated.verificationDocument !== PROCEDURES_RELPATH) {
+    throw new Error(
+      `Factory guardian requires verification.document to be ${PROCEDURES_RELPATH}`,
+    );
+  }
+  const repository = `${ctx.sandbox.cwd}/${FACTORY_REPO_RELPATH}`;
+  const declaredPaths = [
+    validated.verificationDocument,
+    ...validated.features.flatMap(featureLocations),
+  ];
+  for (const path of declaredPaths) {
+    if (!isSafeFactoryRepositoryPath(path)) {
+      throw new Error(`Factory guardian catalog path escapes the repository: ${path}`);
+    }
+  }
+  const uniquePaths = [...new Set(declaredPaths)];
+  const pathProbe = await ctx.sandbox.exec(
+    ['set -eu', ...uniquePaths.map((path) =>
+      `test -e ${shellQuote(path)} || { printf '%s\\n' ${shellQuote(path)}; exit 1; }`),
+    ].join('\n'),
+    { cwd: repository, timeoutMs: 30_000 },
+  );
+  if (pathProbe.exitCode !== 0) {
+    throw new Error(
+      `Factory guardian catalog contains a missing location: ${boundedText(pathProbe.output.trim(), 500)}`,
+    );
+  }
   return {
     manifestRevision: guardianContentRevision(raw),
     manifestVersion: validated.version,
     procedureRevision: guardianContentRevision(procedures),
     features: validated.features.map(factoryFeatureSnapshot),
   };
+}
+
+function isSafeFactoryRepositoryPath(path: string): boolean {
+  if (!path || path.startsWith('/') || path.includes('\\')) return false;
+  return !path.split('/').some((segment) => segment === '' || segment === '.' || segment === '..');
 }
 
 /** Compatibility loader retained for the scheduled feature ordering path. */
@@ -612,6 +644,7 @@ export function featurePostIdempotencyKey(
 
 /** Extract and validate the delivered Slack timestamp from a writeback receipt. */
 export function deliveredSlackTs(result: WritebackResult | null | undefined): string {
+  if (!result || (result.deliveryStatus && result.deliveryStatus !== 'confirmed')) return '';
   const receipt = result?.receipt as { externalId?: unknown; ts?: unknown } | undefined;
   const externalId = typeof receipt?.externalId === 'string' ? receipt.externalId.trim() : '';
   if (isSlackTs(externalId)) return externalId;
@@ -994,9 +1027,10 @@ const FACTORY_PROCEDURE_COMMANDS: Record<string, string> = {
     '  src/node/factory-node.test.ts',
   ].join('\n'),
   'provider-discovery': [
-    'factory triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"',
-    'factory canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"',
-    'factory run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"',
+    'npm run build',
+    'node bin/factory.mjs triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"',
+    'node bin/factory.mjs canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"',
+    'node bin/factory.mjs run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"',
     "node -e 'const r=require(process.argv[1]); if (!r.ok) process.exit(1)' \"$TMP/canary.json\"",
   ].join('\n'),
   'triage-and-configuration': [
@@ -1143,7 +1177,11 @@ export async function resolveFactoryGuardianProcedure(
   if (!prerequisites) {
     throw new Error(`Factory procedure ${feature.procedure} has no explicit prerequisites`);
   }
-  return { name: feature.procedure, path: PROCEDURES_RELPATH, prerequisites, body };
+  const command = body.match(/```bash\s*\n([\s\S]*?)\n```/u)?.[1]?.trim();
+  if (!command) {
+    throw new Error(`Factory procedure ${feature.procedure} has no executable Bash command`);
+  }
+  return { name: feature.procedure, path: PROCEDURES_RELPATH, prerequisites, body, command };
 }
 
 /** Keep live/provider tiers opt-in and never turn missing prerequisites into confirmation. */
@@ -1177,7 +1215,8 @@ export async function gateFactoryGuardianTier(
   if (feature.tier >= 6) {
     return { outcome: 'manual' as const, reason: 'MANUAL: tier 6 requires a selected disposable live issue or pull request.' };
   }
-  if (feature.tier >= 3) {
+  const requiresProvider = procedure.name === 'provider-discovery';
+  if (feature.tier >= 3 || requiresProvider) {
     const optIn = new Set(
       (factoryGuardianInput(ctx, 'GUARDIAN_LIVE_VERIFY_OPT_IN') ?? '')
         .split(',')
@@ -1192,24 +1231,49 @@ export async function gateFactoryGuardianTier(
     }
   }
   if (
-    feature.tier === 3 &&
-    (!process.env.FACTORY_VERIFY_CANARY_ISSUE ||
-      !process.env.FACTORY_VERIFY_CONFIG ||
-      (await ctx.sandbox.exec('command -v factory >/dev/null', {
-        cwd: repository,
-        timeoutMs: 5_000,
-      })).exitCode !== 0)
+    requiresProvider &&
+    (!factoryGuardianInput(ctx, 'FACTORY_VERIFY_CANARY_ISSUE') ||
+      !factoryGuardianInput(ctx, 'FACTORY_VERIFY_CONFIG'))
   ) {
-    return { outcome: 'skip' as const, reason: 'SKIP: the disposable provider issue/config or installed Factory CLI prerequisite is unavailable.' };
+    return { outcome: 'skip' as const, reason: 'SKIP: the disposable provider issue or config prerequisite is unavailable.' };
   }
-  if (feature.tier === 4 && process.env.FACTORY_GUARDIAN_FLEET_OPT_IN !== 'true') {
+  if (requiresProvider) {
+    const configuredPath = factoryGuardianInput(ctx, 'FACTORY_VERIFY_CONFIG') as string;
+    const configPath = configuredPath.startsWith('/')
+      ? configuredPath
+      : `${repository}/${configuredPath}`;
+    const configAvailable = await ctx.sandbox.exec(`test -f ${shellQuote(configPath)}`, {
+      cwd: repository,
+      timeoutMs: 5_000,
+    });
+    if (configAvailable.exitCode !== 0) {
+      return { outcome: 'skip' as const, reason: 'SKIP: the selected disposable provider config is not readable.' };
+    }
+  }
+  if (feature.tier === 3 && !requiresProvider) {
+    return {
+      outcome: 'manual' as const,
+      reason: `MANUAL: ${procedure.name} requires provider assertions beyond its bounded unattended command.`,
+    };
+  }
+  if (feature.tier === 4 && factoryGuardianInput(ctx, 'FACTORY_GUARDIAN_FLEET_OPT_IN') !== 'true') {
     return { outcome: 'skip' as const, reason: 'SKIP: no explicitly authorized disposable fleet is available.' };
   }
-  if (
-    feature.tier === 5 &&
-    (!ctx.credentials.tryRequire() || process.env.FACTORY_GUARDIAN_CLOUD_OPT_IN !== 'true')
-  ) {
+  if (feature.tier === 4) {
+    return {
+      outcome: 'manual' as const,
+      reason: `MANUAL: ${procedure.name} requires a live fleet lifecycle whose provider cleanup cannot be proven by the unattended runner.`,
+    };
+  }
+  if (feature.tier === 5 &&
+    (!ctx.credentials.tryRequire() || factoryGuardianInput(ctx, 'FACTORY_GUARDIAN_CLOUD_OPT_IN') !== 'true')) {
     return { outcome: 'skip' as const, reason: 'SKIP: cloud credentials and writable disposable mount opt-in are unavailable.' };
+  }
+  if (feature.tier === 5) {
+    return {
+      outcome: 'manual' as const,
+      reason: `MANUAL: ${procedure.name} requires provider readback and cleanup in a selected disposable cloud scope.`,
+    };
   }
   return { outcome: 'available' as const, reason: `Tier ${feature.tier} prerequisites are available.` };
 }
@@ -1222,7 +1286,7 @@ export async function runFactoryGuardianProcedure(
   runKey: string,
 ): Promise<GuardianProcedureResult> {
   const command = FACTORY_PROCEDURE_COMMANDS[procedure.name];
-  if (!command || !normalizedWhitespace(procedure.body).includes(normalizedWhitespace(command))) {
+  if (!command || procedure.command.trim() !== command.trim()) {
     return {
       source: 'procedure',
       result: 'negative',
@@ -1238,9 +1302,16 @@ export async function runFactoryGuardianProcedure(
   }
   const run = runKey.replace(/[^a-zA-Z0-9_.-]/gu, '-').slice(-80);
   const repository = `${ctx.sandbox.cwd}/${FACTORY_REPO_RELPATH}`;
+  const tempWorkspace = `/tmp/factory-feature-guardian-${run || randomUUID()}`;
+  const configuredPath = factoryGuardianInput(ctx, 'FACTORY_VERIFY_CONFIG');
+  const configPath = configuredPath
+    ? (configuredPath.startsWith('/') ? configuredPath : `${repository}/${configuredPath}`)
+    : `${tempWorkspace}/factory.config.json`;
   const wrapped = [
     'set -Eeuo pipefail',
-    'TMP="$(mktemp -d)"',
+    `TMP=${shellQuote(tempWorkspace)}`,
+    'rm -rf -- "$TMP"',
+    'mkdir -m 700 "$TMP"',
     'cleanup() {',
     '  status=$?',
     '  cd /',
@@ -1255,23 +1326,55 @@ export async function runFactoryGuardianProcedure(
     '}',
     'trap cleanup EXIT',
     `RUN="${run}"`,
-    'CONFIG="${FACTORY_VERIFY_CONFIG:-$TMP/factory.config.json}"',
+    `CONFIG=${shellQuote(configPath)}`,
     'export TMP RUN CONFIG',
     `SOURCE=${shellQuote(repository)}`,
     'mkdir "$TMP/repo"',
     '(cd "$SOURCE" && tar --exclude=.git --exclude=node_modules --exclude=dist --exclude=artifacts -cf - .) | tar -xf - -C "$TMP/repo"',
-    'ln -s "$SOURCE/node_modules" "$TMP/repo/node_modules"',
+    'mkdir "$TMP/repo/node_modules"',
+    'find "$SOURCE/node_modules" -mindepth 1 -maxdepth 1 ! -name .vite ! -name .cache -exec ln -s {} "$TMP/repo/node_modules/" \\;',
+    'export npm_config_cache="$TMP/npm-cache"',
     'cd "$TMP/repo"',
     command,
   ].join('\n');
-  const execution = await ctx.sandbox.exec(wrapped, {
-    cwd: repository,
-    timeoutMs: 240_000,
-  });
+  let execution: Awaited<ReturnType<WorkforceCtx['sandbox']['exec']>>;
+  try {
+    execution = await ctx.sandbox.exec(wrapped, {
+      cwd: repository,
+      timeoutMs: 240_000,
+    });
+  } catch (error) {
+    const cleanup = await ctx.sandbox.exec(
+      `rm -rf -- ${shellQuote(tempWorkspace)} && test ! -e ${shellQuote(tempWorkspace)}`,
+      { cwd: repository, timeoutMs: 10_000 },
+    );
+    return {
+      source: 'procedure',
+      result: 'negative',
+      outcome: 'failed',
+      verifier: 'factory-feature-guardian:procedure-runner',
+      summary: `${procedure.name} execution failed before a result was returned: ${boundedText(String(error), 1_000)}`,
+      commands: [command],
+      positiveAssertions: [],
+      negativeAssertions: ['The sandbox did not return a completed procedure result.'],
+      tests: { passed: 0, failed: 0 },
+      cleanup: [cleanup.exitCode === 0
+        ? 'Out-of-band cleanup removed the deterministic temporary checkout.'
+        : 'Out-of-band cleanup could not confirm temporary-checkout removal.'],
+    };
+  }
+  const outOfBandCleanup = await ctx.sandbox.exec(
+    `rm -rf -- ${shellQuote(tempWorkspace)} && test ! -e ${shellQuote(tempWorkspace)}`,
+    { cwd: repository, timeoutMs: 10_000 },
+  );
   const counts = parseFactoryGuardianTestCounts(execution.output);
   const output = boundedText(execution.output.trim(), 2_000);
-  const cleaned = execution.output.includes('__FACTORY_GUARDIAN_CLEANUP_OK__');
-  if (execution.exitCode !== 0 || !cleaned) {
+  const cleaned = execution.output.includes('__FACTORY_GUARDIAN_CLEANUP_OK__') &&
+    outOfBandCleanup.exitCode === 0;
+  const expectsTests = /(?:^|\n)(?:npm test|npx vitest)\b/u.test(command);
+  const invalidTestEvidence = counts.failed > 0 ||
+    (expectsTests && counts.passed === 0 && counts.failed === 0);
+  if (execution.exitCode !== 0 || !cleaned || invalidTestEvidence) {
     return {
       source: 'procedure',
       result: 'negative',
@@ -1282,12 +1385,16 @@ export async function runFactoryGuardianProcedure(
       positiveAssertions: ['Exact tier-safe documented command and isolated cleanup trap were selected.'],
       negativeAssertions: [
         `Command exited ${execution.exitCode}.`,
+        ...(counts.failed > 0 ? [`Observed ${counts.failed} failed tests despite the shell exit status.`] : []),
+        ...(expectsTests && counts.passed === 0 && counts.failed === 0
+          ? ['The documented test command emitted no parseable test result.']
+          : []),
         ...(!cleaned ? ['Isolated workspace cleanup was not positively observed.'] : []),
       ],
       tests: counts,
       cleanup: [cleaned
-        ? 'Observed removal of the unique temporary checkout.'
-        : 'Temporary-checkout removal was not confirmed.'],
+        ? 'Observed in-process and out-of-band removal of the unique temporary checkout.'
+        : 'Temporary-checkout removal was not confirmed by both cleanup paths.'],
     };
   }
   return {
@@ -1303,7 +1410,7 @@ export async function runFactoryGuardianProcedure(
     ],
     negativeAssertions: [],
     tests: counts,
-    cleanup: ['Observed removal of the unique temporary checkout.'],
+    cleanup: ['Observed in-process and out-of-band removal of the unique temporary checkout.'],
   };
 }
 
@@ -1326,14 +1433,24 @@ export const factoryFeatureGuardianAdapters: FeatureGuardianAdapters = {
     const focus = turnNumber === 1
       ? 'What exact command or user-visible path did you try, and what did you observe?'
       : 'Please paste the positive and negative assertion results plus any cleanup evidence; if it was not run, say which prerequisite is unavailable.';
+    const verification = turn.verification
+      ? [
+        `Guardian check: ${turn.verification.summary}`,
+        ...(turn.verification.positiveAssertions?.map((value) => `PASS: ${value}`) ?? []),
+        ...(turn.verification.negativeAssertions?.map((value) => `FAIL: ${value}`) ?? []),
+        ...(turn.verification.cleanup?.map((value) => `Cleanup: ${value}`) ?? []),
+      ].join(' ')
+      : '';
     return [
       `I can't confirm *${feature.name}* from that response yet (clarification ${turnNumber}).`,
       `${surface}; source ${feature.locations.map((path) => `\`${path}\``).join(', ')}.`,
       `Use \`${procedure.name}\` at tier ${feature.tier}: ${procedure.prerequisites}`,
+      verification,
       focus,
-    ].join(' ');
+    ].filter(Boolean).join(' ');
   },
   classifyDefect: (_feature, turn, evidence) => classifyFactoryDefect(turn.text, evidence),
+  isDefectEstablished: (_feature, turn) => hasConcreteFactoryDefectEvidence(turn.text),
   repositoryForFeature: () => 'AgentWorkforce/factory',
   issuePolicy: ({ feature, conversation, defectKind, slackBacklink }) =>
     factoryGuardianIssuePolicy(feature, conversation, defectKind, slackBacklink),
@@ -1351,9 +1468,13 @@ function factoryGuardianIssuePolicy(
     .filter((entry) => entry.result === 'negative')
     .map((entry) => `- ${entry.summary}`)
     .join('\n') || '- The scoped guardian response reported a defect.';
-  const evidence = conversation.evidence.map((entry) =>
+  const evidence = conversation.evidence.flatMap((entry) => [
     `- ${entry.source}/${entry.result}: ${entry.summary}`,
-  ).join('\n');
+    ...(entry.positiveAssertions?.map((assertion) => `  - PASS: ${assertion}`) ?? []),
+    ...(entry.negativeAssertions?.map((assertion) => `  - FAIL: ${assertion}`) ?? []),
+    ...(entry.tests ? [`  - Tests: ${entry.tests.passed} passed, ${entry.tests.failed} failed`] : []),
+    ...(entry.cleanup?.map((cleanup) => `  - Cleanup: ${cleanup}`) ?? []),
+  ]).join('\n');
   return {
     repository: 'AgentWorkforce/factory',
     defectKind,
@@ -1420,14 +1541,20 @@ function classifyFactoryDefect(
   return 'implementation';
 }
 
+function hasConcreteFactoryDefectEvidence(text: string): boolean {
+  const normalized = text.trim();
+  if (normalized.length < 32) return false;
+  const hasArtifact = /```[\s\S]+```/u.test(normalized) ||
+    /`[^`\n]+`/u.test(normalized) ||
+    /(?:^|\s)(?:src|test|tests|docs|\.agentworkforce)\/[\w./-]+/u.test(normalized);
+  const hasComparison = /\b(expected|actual|observed|outputs?|returns?|reports?|says?|but|instead)\b/iu.test(normalized);
+  return hasArtifact && hasComparison;
+}
+
 function factoryGuardianInput(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona?.inputSpecs?.[name];
   const value = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default;
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function normalizedWhitespace(value: string): string {
-  return value.replace(/\s+/gu, ' ').trim();
 }
 
 export function parseFactoryGuardianTestCounts(output: string): { passed: number; failed: number } {

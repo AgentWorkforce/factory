@@ -21,11 +21,11 @@ import {
 } from '@relayfile/relay-helpers'
 
 export const GUARDIAN_CONVERSATION_STATE_PATH =
-  '/memory/workspace/factory-feature-guardian/conversations.json'
+  '/memory/workspace/feature-guardian/conversations.json'
 export const GUARDIAN_CONFIRMATIONS_PATH =
-  '/memory/workspace/factory-feature-guardian/confirmations'
+  '/memory/workspace/feature-guardian/confirmations'
 export const GUARDIAN_REMEDIATIONS_PATH =
-  '/memory/workspace/factory-feature-guardian/remediations'
+  '/memory/workspace/feature-guardian/remediations'
 
 export const GUARDIAN_STATE_TIMEOUT_MS = 5_000
 export const GUARDIAN_WRITEBACK_TIMEOUT_MS = 15_000
@@ -36,7 +36,9 @@ const MAX_CONVERSATIONS = 512
 const MAX_SEEN_EVENTS = 128
 const MAX_EVIDENCE_ITEMS = 32
 const MAX_TURNS = 12
+const MAX_REMEDIATION_ATTEMPTS = 8
 const UTF8_ENCODER = new TextEncoder()
+const PREVIEW_IMMUTABLE_CLAIMS = new WeakMap<object, Set<string>>()
 
 export type GuardianConversationStatus =
   | 'asked'
@@ -126,6 +128,11 @@ export interface GuardianIssueReceipt {
   dedupeKey: string
 }
 
+export interface GuardianConfirmationBasis {
+  kind: 'actor' | 'procedure'
+  verifier: string
+}
+
 export interface GuardianConversationRecord extends GuardianQuestion {
   id: string
   status: GuardianConversationStatus
@@ -134,6 +141,7 @@ export interface GuardianConversationRecord extends GuardianQuestion {
   seenEventIds: string[]
   evidence: GuardianEvidence[]
   pending?: GuardianPendingTurn
+  confirmationBasis?: GuardianConfirmationBasis
   confirmationPath?: string
   issue?: GuardianIssueReceipt
   finalReplyTs?: string
@@ -181,6 +189,7 @@ export interface GuardianProcedure {
   path: string
   prerequisites: string
   body: string
+  command: string
 }
 
 export interface GuardianTierGate {
@@ -226,6 +235,11 @@ export interface FeatureGuardianAdapters {
     turn: GuardianPendingTurn,
     evidence: readonly GuardianEvidence[],
   ): GuardianDefectKind
+  isDefectEstablished(
+    feature: GuardianFeatureSnapshot,
+    turn: GuardianPendingTurn,
+    evidence: readonly GuardianEvidence[],
+  ): boolean
   repositoryForFeature(feature: GuardianFeatureSnapshot): string
   issuePolicy(input: {
     feature: GuardianFeatureSnapshot
@@ -433,12 +447,21 @@ export async function parseGuardianSlackEvent(
     nonEmptyString(event.summary?.actor?.id)
   if (!channelId || !messageTs || !threadTs || !actorId) return null
   if (!isReaction && messageTs === threadTs) return null
+  const providerEventTs = nonEmptyString(payload.event_ts) ?? (isReaction ? undefined : messageTs)
   const occurredAt =
     canonicalTimestamp(event.occurredAt) ??
-    timestampFromSlackTs(nonEmptyString(payload.event_ts) ?? messageTs)
+    timestampFromSlackTs(providerEventTs ?? messageTs)
   if (!occurredAt) return null
+  const resourceChannelId = channelFromPath(event.resource?.path)
+  const resourceMessageTs = messageTsFromPath(event.resource?.path)
+  if (resourceChannelId && resourceChannelId !== channelId) return null
+  if (
+    resourceMessageTs &&
+    resourceMessageTs !== messageTs &&
+    (!isReaction && resourceMessageTs !== threadTs)
+  ) return null
   const providerIdentity = isReaction
-    ? nonEmptyString(payload.event_ts) ?? envelopeId
+    ? providerEventTs ?? envelopeId
     : messageTs
   const eventId = `slack:${createHash('sha256')
     .update(
@@ -452,7 +475,9 @@ export async function parseGuardianSlackEvent(
       ].join(':'),
     )
     .digest('hex')}`
-  const eventOrder = [occurredAt, messageTs, eventId].join(':')
+  const eventOrder = [occurredAt, slackTsOrder(providerEventTs ?? messageTs), messageTs, eventId].join(
+    ':',
+  )
 
   return {
     eventId,
@@ -573,7 +598,7 @@ export async function runGuardianConversationTurn(
     if (pendingBeforeResume.eventId === parsed.eventId || record.seenEventIds.includes(parsed.eventId)) {
       return
     }
-    if (Date.parse(parsed.occurredAt) <= Date.parse(pendingBeforeResume.eventOccurredAt)) {
+    if (parsed.eventOrder <= pendingBeforeResume.eventOrder) {
       ctx.log('info', 'feature-guardian.event-ignored', {
         reason: 'superseded-out-of-order-event',
         eventId: parsed.eventId,
@@ -639,7 +664,18 @@ export async function runGuardianConversationTurn(
   }
 
   if (response === 'affirmative' && adapters.isAuthorizedConfirmer(ctx, parsed.actorId)) {
-    snapshot = await checkpointPending(snapshot, record, turn, 'confirmation-recorded', true)
+    if (!hasActorConfirmationEvidence(parsed.text)) {
+      await clarify(turn)
+      return
+    }
+    snapshot = await checkpointPending(
+      snapshot,
+      record,
+      turn,
+      'confirmation-recorded',
+      true,
+      { kind: 'actor', verifier: parsed.actorId },
+    )
     record = requireRecordById(snapshot.state, record.id)
     await finishConfirmation(record, turn)
     return
@@ -669,9 +705,12 @@ export async function runGuardianConversationTurn(
 
   snapshot = await checkpointPending(snapshot, record, turn, 'verifying', true)
   record = requireRecordById(snapshot.state, record.id)
-  await resumePendingTurn(procedure)
+  await resumePendingTurn(procedure, true)
 
-  async function resumePendingTurn(preResolvedProcedure?: GuardianProcedure): Promise<void> {
+  async function resumePendingTurn(
+    preResolvedProcedure?: GuardianProcedure,
+    prerequisitesValidated = false,
+  ): Promise<void> {
     if (!snapshot || !record.pending) return
     const pending = record.pending
     if (record.status === 'confirmation-recorded') {
@@ -689,7 +728,27 @@ export async function runGuardianConversationTurn(
     }
     if (record.status !== 'verifying') return
 
+    if (!prerequisitesValidated) {
+      const currentCatalog = await adapters.loadCatalog(ctx)
+      if (
+        currentCatalog.manifestRevision !== record.manifestRevision ||
+        currentCatalog.procedureRevision !== record.procedureRevision
+      ) {
+        await deferPendingVerification(
+          'The manifest or procedure changed while verification was pending; refusing to run or confirm a different revision.',
+          'manual',
+        )
+        return
+      }
+    }
     const procedure = preResolvedProcedure ?? await adapters.resolveProcedure(ctx, record.feature)
+    if (!pending.verification && !prerequisitesValidated) {
+      const gate = await adapters.gateTier(ctx, record.feature, procedure)
+      if (gate.outcome !== 'available') {
+        await deferPendingVerification(gate.reason, gate.outcome)
+        return
+      }
+    }
     const result = pending.verification ?? await adapters.runProcedure(
       ctx,
       record.feature,
@@ -712,7 +771,8 @@ export async function runGuardianConversationTurn(
         const reportedDefect = adapters.classifyDefect(record.feature, pending, evidence)
         if (
           record.clarificationCount >= 1 &&
-          ['test', 'manifest', 'procedure', 'documentation'].includes(reportedDefect)
+          ['test', 'manifest', 'procedure', 'documentation'].includes(reportedDefect) &&
+          adapters.isDefectEstablished(record.feature, pending, evidence)
         ) {
           await recordRemediation(result, reportedDefect)
           return
@@ -728,7 +788,7 @@ export async function runGuardianConversationTurn(
           createSlackClient,
           record,
           text,
-          guardianReplyIdempotencyKey(record, pending.eventId, `post-check-clarification-${clarificationNumber}`),
+          guardianReplyIdempotencyKey(record, pending.eventId, 'post-check-clarification'),
         )
         const next = replaceRecord(snapshot.state, record.id, {
           ...record,
@@ -747,6 +807,7 @@ export async function runGuardianConversationTurn(
       const next = replaceRecord(snapshot.state, record.id, {
         ...record,
         status: 'confirmation-recorded',
+        confirmationBasis: { kind: 'procedure', verifier: result.verifier },
         updatedAt: now().toISOString(),
       })
       snapshot = await store.save(next, snapshot)
@@ -769,6 +830,28 @@ export async function runGuardianConversationTurn(
 
     const defectKind = adapters.classifyDefect(record.feature, pending, evidence)
     await recordRemediation(result, defectKind)
+  }
+
+  async function deferPendingVerification(
+    reason: string,
+    outcome: 'skip' | 'manual',
+  ): Promise<void> {
+    if (!snapshot || !record.pending) return
+    const deferredPending: GuardianPendingTurn = {
+      ...record.pending,
+      response: 'deferred',
+      evidence: { source: 'system', result: outcome, summary: reason },
+    }
+    const next = replaceRecord(snapshot.state, record.id, {
+      ...record,
+      status: 'deferred-recorded',
+      pending: deferredPending,
+      evidence: appendEvidence(record.evidence, deferredPending.evidence),
+      updatedAt: now().toISOString(),
+    })
+    snapshot = await store.save(next, snapshot)
+    record = requireRecordById(snapshot.state, record.id)
+    await finishDeferred(record, reason)
   }
 
   async function recordRemediation(
@@ -829,7 +912,7 @@ export async function runGuardianConversationTurn(
       createSlackClient,
       record,
       text,
-      guardianReplyIdempotencyKey(record, turn.eventId, `clarification-${clarificationNumber}`),
+      guardianReplyIdempotencyKey(record, turn.eventId, 'clarification'),
     )
     const nextRecord: GuardianConversationRecord = {
       ...record,
@@ -869,7 +952,7 @@ export async function runGuardianConversationTurn(
       .reverse()
       .find((entry) => entry.source === 'procedure')
     const summary = procedureEvidence
-      ? `✅ Confirmed *${current.feature.name}* for manifest \`${shortRevision(current.manifestRevision)}\`. ${procedureEvidence.summary}`
+      ? `✅ Confirmed *${current.feature.name}* for manifest \`${shortRevision(current.manifestRevision)}\`. ${formatEvidenceForSlack(procedureEvidence)}`
       : `✅ Confirmed *${current.feature.name}* for manifest \`${shortRevision(current.manifestRevision)}\` from ${turn.actorId}'s response.`
     const replyTs = await postThreadReply(
       createSlackClient,
@@ -946,12 +1029,14 @@ export async function runGuardianConversationTurn(
     turn: GuardianPendingTurn,
     status: GuardianConversationStatus,
     countTurn = false,
+    confirmationBasis?: GuardianConfirmationBasis,
   ): Promise<ConversationSnapshot> {
     const nextRecord: GuardianConversationRecord = {
       ...current,
       status,
       turnCount: current.turnCount + (countTurn ? 1 : 0),
       pending: turn,
+      ...(confirmationBasis ? { confirmationBasis } : {}),
       lastProcessedEventOrder: turn.eventOrder,
       evidence: appendEvidence(current.evidence, turn.evidence),
       updatedAt: now().toISOString(),
@@ -1166,40 +1251,57 @@ export function createGithubIssueWriter(
         await appendImmutableJson(ctx, receiptPath, { ...receipt, bodyRevision })
         return receipt
       }
-      const intentPath = remediationIntentPath(policy.dedupeKey)
-      const existingIntent = await readImmutableJson(ctx, intentPath)
-      if (existingIntent) {
-        throw new Error(
-          'GitHub remediation submission is pending provider correlation; refusing a duplicate issue',
-        )
+      for (let attempt = 1; attempt <= MAX_REMEDIATION_ATTEMPTS; attempt += 1) {
+        const intentPath = remediationIntentPath(policy.dedupeKey, attempt)
+        const droppedPath = remediationDroppedPath(policy.dedupeKey, attempt)
+        if (await readImmutableJson(ctx, droppedPath)) continue
+        const claimed = await claimImmutableJson(ctx, intentPath, {
+          kind: 'feature-guardian:remediation-intent',
+          version: 1,
+          repository: policy.repository,
+          dedupeKey: policy.dedupeKey,
+          bodyRevision,
+          ...(attempt === 1 ? {} : { attempt }),
+        })
+        if (!claimed) {
+          if (await readImmutableJson(ctx, droppedPath)) continue
+          throw new Error(
+            'GitHub remediation submission is pending provider correlation; refusing a duplicate issue',
+          )
+        }
+        const created = await client.createIssue({
+          owner,
+          repo,
+          title: policy.title,
+          body: policy.body,
+          labels: policy.labels,
+        })
+        if (created.status === 'dropped') {
+          await appendImmutableJson(ctx, droppedPath, {
+            kind: 'feature-guardian:remediation-drop',
+            version: 1,
+            repository: policy.repository,
+            dedupeKey: policy.dedupeKey,
+            attempt,
+            reason: created.reason ?? 'provider dropped the remediation draft',
+          })
+          throw new Error('GitHub remediation issue create was dropped before provider admission')
+        }
+        if (created.status !== 'confirmed' || !created.url) {
+          throw new Error(`GitHub remediation issue create was ${created.status}, not provider-confirmed`)
+        }
+        const number = issueNumberFromCreated(created.id, created.url)
+        if (!number) throw new Error('GitHub remediation issue receipt is missing its issue number')
+        const receipt = {
+          repository: policy.repository,
+          number,
+          url: created.url,
+          dedupeKey: policy.dedupeKey,
+        }
+        await appendImmutableJson(ctx, receiptPath, { ...receipt, bodyRevision })
+        return receipt
       }
-      await appendImmutableJson(ctx, intentPath, {
-        kind: 'feature-guardian:remediation-intent',
-        version: 1,
-        repository: policy.repository,
-        dedupeKey: policy.dedupeKey,
-        bodyRevision,
-      })
-      const created = await client.createIssue({
-        owner,
-        repo,
-        title: policy.title,
-        body: policy.body,
-        labels: policy.labels,
-      })
-      if (created.status !== 'confirmed' || !created.url) {
-        throw new Error(`GitHub remediation issue create was ${created.status}, not provider-confirmed`)
-      }
-      const number = issueNumberFromCreated(created.id, created.url)
-      if (!number) throw new Error('GitHub remediation issue receipt is missing its issue number')
-      const receipt = {
-        repository: policy.repository,
-        number,
-        url: created.url,
-        dedupeKey: policy.dedupeKey,
-      }
-      await appendImmutableJson(ctx, receiptPath, { ...receipt, bodyRevision })
-      return receipt
+      throw new Error('GitHub remediation retry limit was exhausted after provider drops')
     },
   }
 }
@@ -1208,8 +1310,13 @@ export function remediationMarker(dedupeKey: string): string {
   return `<!-- feature-guardian-remediation:${dedupeKey} -->`
 }
 
-function remediationIntentPath(dedupeKey: string): string {
-  return `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(`intent:${dedupeKey}`).digest('hex')}.json`
+function remediationIntentPath(dedupeKey: string, attempt: number): string {
+  const identity = attempt === 1 ? `intent:${dedupeKey}` : `intent:${dedupeKey}:${attempt}`
+  return `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(identity).digest('hex')}.json`
+}
+
+function remediationDroppedPath(dedupeKey: string, attempt: number): string {
+  return `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(`drop:${dedupeKey}:${attempt}`).digest('hex')}.json`
 }
 
 function remediationReceiptPath(dedupeKey: string): string {
@@ -1238,19 +1345,40 @@ async function updateExistingIssueEvidence(
     await appendImmutableJson(ctx, receiptPath, { issueNumber, bodyRevision })
     return
   }
-  const intentPath = `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(`update-intent:${ledgerKey}`).digest('hex')}.json`
-  if (await readImmutableJson(ctx, intentPath)) {
-    throw new Error('GitHub remediation evidence update is pending; refusing a duplicate comment')
+  for (let attempt = 1; attempt <= MAX_REMEDIATION_ATTEMPTS; attempt += 1) {
+    const suffix = attempt === 1 ? '' : `:${attempt}`
+    const intentPath = `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(`update-intent:${ledgerKey}${suffix}`).digest('hex')}.json`
+    const droppedPath = `${GUARDIAN_REMEDIATIONS_PATH}/${createHash('sha256').update(`update-drop:${ledgerKey}:${attempt}`).digest('hex')}.json`
+    if (await readImmutableJson(ctx, droppedPath)) continue
+    const claimed = await claimImmutableJson(ctx, intentPath, {
+      issueNumber,
+      bodyRevision,
+      ...(attempt === 1 ? {} : { attempt }),
+    })
+    if (!claimed) {
+      if (await readImmutableJson(ctx, droppedPath)) continue
+      throw new Error('GitHub remediation evidence update is pending; refusing a duplicate comment')
+    }
+    const updated = await client.comment(
+      { owner, repo, number: issueNumber },
+      `${marker}\n${policy.body}`,
+    )
+    if (updated.status === 'dropped') {
+      await appendImmutableJson(ctx, droppedPath, {
+        issueNumber,
+        bodyRevision,
+        attempt,
+        reason: updated.reason ?? 'provider dropped the evidence update',
+      })
+      throw new Error('GitHub remediation evidence update was dropped before provider admission')
+    }
+    if (updated.status !== 'confirmed') {
+      throw new Error(`GitHub remediation evidence update was ${updated.status}, not provider-confirmed`)
+    }
+    await appendImmutableJson(ctx, receiptPath, { issueNumber, bodyRevision })
+    return
   }
-  await appendImmutableJson(ctx, intentPath, { issueNumber, bodyRevision })
-  const updated = await client.comment(
-    { owner, repo, number: issueNumber },
-    `${marker}\n${policy.body}`,
-  )
-  if (updated.status !== 'confirmed') {
-    throw new Error(`GitHub remediation evidence update was ${updated.status}, not provider-confirmed`)
-  }
-  await appendImmutableJson(ctx, receiptPath, { issueNumber, bodyRevision })
+  throw new Error('GitHub remediation evidence retry limit was exhausted after provider drops')
 }
 
 function parseDurableIssueReceipt(
@@ -1381,6 +1509,56 @@ async function appendImmutableJson(
   }
 }
 
+/** Atomically claim one immutable provider submission. Only the CAS winner may write. */
+async function claimImmutableJson(
+  ctx: WorkforceCtx,
+  path: string,
+  value: unknown,
+): Promise<boolean> {
+  const content = `${JSON.stringify(value)}\n`
+  assertBoundedContent(content, 'guardian immutable claim')
+  const existing = await readImmutableJson(ctx, path)
+  if (existing !== null) {
+    if (`${JSON.stringify(existing)}\n` !== content) {
+      throw new Error('immutable guardian claim already differs')
+    }
+    return false
+  }
+  const credentials = ctx.credentials.tryRequire()
+  if (credentials) {
+    const client = relayfileClient(credentials.relayfile)
+    try {
+      await withDeadline('guardian immutable claim', GUARDIAN_STATE_TIMEOUT_MS, (signal) =>
+        writeExactFile(client, credentials.relayfile.workspaceId, path, '0', content, signal),
+      )
+    } catch (error) {
+      if (
+        !(error instanceof RevisionConflictError) &&
+        !(error instanceof RelayFileApiError && error.status === 409)
+      ) throw error
+      const winner = await readImmutableJson(ctx, path)
+      if (winner === null || `${JSON.stringify(winner)}\n` !== content) {
+        throw new Error('guardian immutable claim conflict did not match the winning intent')
+      }
+      return false
+    }
+  } else if (ctx.agent.id === 'sim-agent' && ctx.deployment.id === 'sim-deployment') {
+    const claimOwner = ctx.files as object
+    const claims = PREVIEW_IMMUTABLE_CLAIMS.get(claimOwner) ?? new Set<string>()
+    if (claims.has(path)) return false
+    claims.add(path)
+    PREVIEW_IMMUTABLE_CLAIMS.set(claimOwner, claims)
+    await ctx.files.write(path, content)
+  } else {
+    throw new Error('exact Relayfile credentials are required for guardian remediation claims')
+  }
+  const readBack = await readImmutableJson(ctx, path)
+  if (readBack === null || `${JSON.stringify(readBack)}\n` !== content) {
+    throw new Error('guardian immutable claim read-back did not match')
+  }
+  return true
+}
+
 export function slackThreadBacklink(channelId: string, threadTs: string): string {
   return `https://slack.com/archives/${channelId}/p${threadTs.replace('.', '')}`
 }
@@ -1403,6 +1581,9 @@ async function postThreadReply(
 }
 
 function requireSlackReceiptTs(result: WritebackResult): string {
+  if (result.deliveryStatus && result.deliveryStatus !== 'confirmed') {
+    throw new Error(`guardian Slack reply was ${result.deliveryStatus}, not provider-confirmed`)
+  }
   const receipt = asRecord(result.receipt)
   const externalId = nonEmptyString(receipt?.externalId)
   const fallbackTs = nonEmptyString(receipt?.ts)
@@ -1418,6 +1599,9 @@ function confirmationRecord(
   turn: GuardianPendingTurn,
   timestamp: string,
 ): GuardianConfirmationRecord {
+  if (!record.confirmationBasis) {
+    throw new Error('guardian confirmation record is missing its confirmation basis')
+  }
   const evidence = record.evidence
   const commands = evidence.flatMap((entry) => entry.commands ?? [])
   const tests = evidence.reduce(
@@ -1426,9 +1610,6 @@ function confirmationRecord(
       failed: total.failed + (entry.tests?.failed ?? 0),
     }),
     { passed: 0, failed: 0 },
-  )
-  const automated = evidence.some(
-    (entry) => entry.source === 'procedure' && entry.result === 'positive',
   )
   return {
     kind: 'feature-guardian:confirmation',
@@ -1440,7 +1621,7 @@ function confirmationRecord(
     generation: record.generation,
     result: 'confirmed',
     ...(turn.actorId ? { actor: { id: turn.actorId } } : {}),
-    verifier: automated ? 'factory-feature-guardian:procedure-runner' : turn.actorId,
+    verifier: record.confirmationBasis.verifier,
     timestamp,
     evidence,
     commands,
@@ -1506,6 +1687,9 @@ function parseConversationRecord(value: unknown): GuardianConversationRecord {
     updatedAt: requireTimestamp(record.updatedAt, 'updatedAt'),
   }
   if (record.pending !== undefined) parsed.pending = parsePending(record.pending)
+  if (record.confirmationBasis !== undefined) {
+    parsed.confirmationBasis = parseConfirmationBasis(record.confirmationBasis)
+  }
   if (record.confirmationPath !== undefined) {
     parsed.confirmationPath = requireString(record.confirmationPath, 'confirmation path')
   }
@@ -1548,6 +1732,49 @@ function parseConversationRecord(value: unknown): GuardianConversationRecord {
     throw new Error('confirmed guardian conversation requires a confirmation path')
   }
   if (
+    (parsed.status === 'confirmation-recorded' || parsed.status === 'confirmed') &&
+    !parsed.confirmationBasis
+  ) {
+    throw new Error(`guardian ${parsed.status} conversation requires a confirmation basis`)
+  }
+  if (
+    parsed.confirmationBasis &&
+    parsed.status !== 'confirmation-recorded' &&
+    parsed.status !== 'confirmed'
+  ) {
+    throw new Error('guardian confirmation basis is invalid for the conversation status')
+  }
+  if (parsed.status === 'confirmation-recorded' && parsed.pending && parsed.confirmationBasis) {
+    if (
+      parsed.confirmationBasis.kind === 'actor' &&
+      (parsed.pending.response !== 'affirmative' ||
+        parsed.pending.actorId !== parsed.confirmationBasis.verifier ||
+        parsed.pending.evidence?.result !== 'positive')
+    ) {
+      throw new Error('guardian actor confirmation basis is inconsistent with its pending turn')
+    }
+    if (
+      parsed.confirmationBasis.kind === 'procedure' &&
+      (parsed.pending.verification?.outcome !== 'passed' ||
+        parsed.pending.verification.verifier !== parsed.confirmationBasis.verifier ||
+        (parsed.pending.verification.tests?.failed ?? 0) !== 0)
+    ) {
+      throw new Error('guardian procedure confirmation basis is inconsistent with its pending turn')
+    }
+  }
+  if (parsed.status === 'confirmed' && parsed.confirmationBasis) {
+    const matchingEvidence = parsed.evidence.some((entry) =>
+      parsed.confirmationBasis?.kind === 'actor'
+        ? entry.source === 'actor' && entry.result === 'positive'
+        : entry.source === 'procedure' &&
+          entry.result === 'positive' &&
+          (entry.tests?.failed ?? 0) === 0,
+    )
+    if (!matchingEvidence) {
+      throw new Error('confirmed guardian conversation has no evidence for its confirmation basis')
+    }
+  }
+  if (
     parsed.confirmationPath &&
     parsed.status !== 'confirmation-recorded' &&
     parsed.status !== 'confirmed'
@@ -1575,6 +1802,8 @@ function parseConfirmationRecord(value: unknown): GuardianConfirmationRecord {
   if (record.result !== 'confirmed' || !slack || !tests) {
     throw new Error('guardian confirmation result/evidence is invalid')
   }
+  const failed = requireNonNegativeInteger(tests.failed, 'failed tests')
+  if (failed !== 0) throw new Error('confirmed guardian evidence cannot contain failed tests')
   return {
     kind: 'feature-guardian:confirmation',
     version: 1,
@@ -1591,7 +1820,7 @@ function parseConfirmationRecord(value: unknown): GuardianConfirmationRecord {
     commands: stringArray(record.commands, 128, 'commands'),
     tests: {
       passed: requireNonNegativeInteger(tests.passed, 'passed tests'),
-      failed: requireNonNegativeInteger(tests.failed, 'failed tests'),
+      failed,
     },
     slack: {
       channelId: requireString(slack.channelId, 'Slack channel id'),
@@ -1599,6 +1828,14 @@ function parseConfirmationRecord(value: unknown): GuardianConfirmationRecord {
       questionTs: requireSlackTs(slack.questionTs, 'Slack question ts'),
     },
   }
+}
+
+function parseConfirmationBasis(value: unknown): GuardianConfirmationBasis {
+  const basis = asRecord(value)
+  if (!basis || (basis.kind !== 'actor' && basis.kind !== 'procedure')) {
+    throw new Error('guardian confirmation basis is invalid')
+  }
+  return { kind: basis.kind, verifier: requireString(basis.verifier, 'confirmation verifier') }
 }
 
 function assertConversationTransition(
@@ -1634,6 +1871,12 @@ function assertConversationTransition(
       current.confirmationPath !== prior.confirmationPath
     ) {
       throw new Error('guardian conversation confirmation path is immutable')
+    }
+    if (
+      prior.confirmationBasis !== undefined &&
+      JSON.stringify(current.confirmationBasis) !== JSON.stringify(prior.confirmationBasis)
+    ) {
+      throw new Error('guardian conversation confirmation basis is immutable')
     }
     if (prior.issue !== undefined && JSON.stringify(current.issue) !== JSON.stringify(prior.issue)) {
       throw new Error('guardian conversation issue receipt is immutable')
@@ -1999,6 +2242,21 @@ function shortRevision(revision: string): string {
   return revision.replace(/^sha256:/u, '').slice(0, 12)
 }
 
+function hasActorConfirmationEvidence(text: string): boolean {
+  return /\b(tested|verified|confirmed)\b/iu.test(text) &&
+    /\b(works?|working|passes?|passed|expected|good)\b/iu.test(text)
+}
+
+function formatEvidenceForSlack(evidence: GuardianEvidence): string {
+  return [
+    evidence.summary,
+    ...(evidence.positiveAssertions?.map((value) => `PASS: ${value}`) ?? []),
+    ...(evidence.negativeAssertions?.map((value) => `FAIL: ${value}`) ?? []),
+    ...(evidence.tests ? [`Tests: ${evidence.tests.passed} passed, ${evidence.tests.failed} failed.`] : []),
+    ...(evidence.cleanup?.map((value) => `Cleanup: ${value}`) ?? []),
+  ].join(' ')
+}
+
 function resolvedInput(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona?.inputSpecs?.[name]
   const value = process.env[spec?.env ?? name] ?? ctx.persona?.inputs?.[name] ?? spec?.default
@@ -2195,6 +2453,12 @@ function timestampFromSlackTs(value: string | undefined): string | undefined {
   return new Date(seconds * 1_000).toISOString()
 }
 
+function slackTsOrder(value: string): string {
+  const match = value.match(/^(\d+)\.(\d{1,9})$/u)
+  if (!match) return '00000000000000000000.000000000'
+  return `${match[1].padStart(20, '0')}.${match[2].padEnd(9, '0')}`
+}
+
 function requireTimestamp(value: unknown, field: string): string {
   const timestamp = canonicalTimestamp(value)
   if (!timestamp || timestamp !== value) throw new Error(`guardian ${field} is invalid`)
@@ -2210,9 +2474,11 @@ function requireSlackTs(value: unknown, field: string): string {
 function requireEventOrder(value: unknown, field: string): string {
   const order = requireString(value, field)
   // Event order is internal and compared lexicographically. Its exact shape
-  // is ISO timestamp + Slack ts + stable response identity.
+  // is ISO timestamp + normalized provider ts + Slack message ts + stable
+  // response identity. Accept the prior three-part form so pre-upgrade state
+  // remains readable.
   const match = order.match(
-    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z):\d+\.\d+:slack:[a-f0-9]{64}$/u,
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z):(?:(?:\d{20}\.\d{9}):)?\d+\.\d+:slack:[a-f0-9]{64}$/u,
   )
   if (!match || canonicalTimestamp(match[1]) !== match[1]) {
     throw new Error(`guardian ${field} is invalid`)

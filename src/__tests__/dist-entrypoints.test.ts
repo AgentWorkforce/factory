@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 describe('published dist entrypoints', () => {
   it('are importable by Node ESM consumers', async () => {
     const featuremap = await import('../../dist/featuremap/index.js')
+    const featureGuardian = await import('../../dist/feature-guardian/index.js')
     const main = await import('../../dist/index.js')
     const hosted = await import('../../dist/hosted/index.js')
     const environments = await import('../../dist/environments/index.js')
@@ -17,6 +18,8 @@ describe('published dist entrypoints', () => {
     expect(featuremap.checkFeatureMap).toBeTypeOf('function')
     expect(featuremap.generateFeatureMap).toBeTypeOf('function')
     expect(featuremap.validateFeatureManifestFile).toBeTypeOf('function')
+    expect(featureGuardian.defineFeatureGuardianAgent).toBeTypeOf('function')
+    expect(featureGuardian.runGuardianConversationTurn).toBeTypeOf('function')
     expect(main.FactoryConfigSchema).toBeDefined()
     expect(main.createFactory).toBeTypeOf('function')
     expect(main.createFleet).toBeTypeOf('function')

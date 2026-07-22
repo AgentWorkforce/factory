@@ -14,7 +14,7 @@
     "github": {
       "scope": {
         "repo": "AgentWorkforce/factory",
-        "resources": ["issues"]
+        "resources": "issues"
       },
       "relayfileMount": {
         "requiredReadPaths": [

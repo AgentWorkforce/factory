@@ -428,7 +428,11 @@ npx vitest run \
   src/fleet/internal-fleet-client.test.ts \
   src/fleet/relay-fleet-client.test.ts \
   src/node/factory-node.test.ts
+```
 
+With the explicitly selected disposable internal fleet, run the live extension:
+
+```bash
 NAME="factory-vf-$RUN"
 node bin/factory.mjs fleet roster --backend internal | tee "$TMP/roster-before.json"
 node bin/factory.mjs fleet spawn spawn:codex --backend internal \
@@ -461,9 +465,10 @@ connected integrations. Copy the real config to `$CONFIG` and change only test
 scope to records named with `$RUN`.
 
 ```bash
-factory triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"
-factory canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"
-factory run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"
+npm run build
+node bin/factory.mjs triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"
+node bin/factory.mjs canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"
+node bin/factory.mjs run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"
 node -e 'const r=require(process.argv[1]); if (!r.ok) process.exit(1)' "$TMP/canary.json"
 ```
 
@@ -518,6 +523,11 @@ npx vitest run \
   src/git/agent-worktree.test.ts \
   src/state/file-state-store.test.ts \
   src/state/github-lifecycle-identity.test.ts
+```
+
+With the provider and fleet prerequisites selected, run the dry-run extension:
+
+```bash
 factory dispatch "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" --dry-run \
   | tee "$TMP/dispatch-dry.json"
 ```
@@ -633,6 +643,11 @@ npx vitest run \
   src/mount/relayfile-github-connection-write.test.ts \
   src/mount/relayfile-integration-preflight.test.ts \
   src/writeback/writeback.test.ts
+```
+
+With the disposable cloud/provider scope selected, run the live preflight extension:
+
+```bash
 factory run-once --config "$CONFIG" --dry-run | tee "$TMP/mount-preflight.json"
 ```
 
@@ -715,6 +730,11 @@ npx vitest run \
   src/hosted/orchestrator.test.ts \
   src/hosted/state-store.test.ts \
   src/hosted/worker-safety.test.ts
+```
+
+With the disposable deployed control plane selected, run the live extension:
+
+```bash
 npm run verify:e2e
 ```
 
@@ -768,6 +788,11 @@ npm run build
 npm run featuremap:check
 npm test
 node bin/factory.mjs --help >/dev/null
+```
+
+With exact reviewed head/base SHAs available, run the PR-evidence extension:
+
+```bash
 FACTORY_E2E_HEAD_SHA="$(git rev-parse HEAD)" \
 FACTORY_E2E_BASE_SHA="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" \
   npm run verify:e2e
@@ -830,13 +855,18 @@ state checkpoint advances.
 `$TMP`; a live manual check may start one exact process using `$CONFIG`.
 
 ```bash
-node bin/factory.mjs loop --config "$CONFIG" --dry-run
-node bin/factory.mjs loop-status --config "$CONFIG" | tee "$TMP/liveness.json"
 npx vitest run \
   src/orchestrator/factory.test.ts \
   src/orchestrator/process-identity.test.ts \
   src/orchestrator/reaper.test.ts \
   src/state/file-state-store.test.ts
+```
+
+With the disposable fixture config prepared, run the process extension:
+
+```bash
+node bin/factory.mjs loop --config "$CONFIG" --dry-run
+node bin/factory.mjs loop-status --config "$CONFIG" | tee "$TMP/liveness.json"
 ```
 
 Assert iteration/failure limits, heartbeat/registry aliases and paths, stale
@@ -865,7 +895,11 @@ npx vitest run \
   src/environments/load-harness.test.ts \
   src/environments/verification-pipeline.test.ts \
   src/orchestrator/environment-reaper.test.ts
+```
 
+With a disposable Docker/kind environment selected, run the live extension:
+
+```bash
 kind create cluster --name factory-gate-e2e
 npm run test:e2e:verification
 kind delete cluster --name factory-gate-e2e

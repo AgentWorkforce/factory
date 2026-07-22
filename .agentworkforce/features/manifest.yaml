@@ -1718,7 +1718,7 @@ categories:
 
       - id: guardian-confirmation-evidence
         name: Immutable Guardian Confirmation Evidence
-        api: /memory/workspace/factory-feature-guardian/confirmations/*.json
+        api: /memory/workspace/feature-guardian/confirmations/*.json
         description: Append one exact-revision confirmation containing feature, generation, actor or verifier, provider event time, command and test evidence, and Slack thread identity before posting the final summary
         location: src/feature-guardian/conversation.ts, .agentworkforce/agents/factory-feature-guardian/agent.ts
         verify_tier: 5
