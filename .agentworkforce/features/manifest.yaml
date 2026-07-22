@@ -1631,7 +1631,7 @@ categories:
         name: Cloudflare Ephemeral Environment Provider
         api: EnvironmentProvider / CloudflareEnvironmentProvider / CloudflareEnvironmentReaper
         description: Provision identity-bound Workers for Platforms dispatch namespaces, per-environment bindings and referenced secrets, Wrangler-backed Workers and Containers, reachable dispatch ingress, idempotent teardown, and TTL or dead-owner reaping
-        location: src/ports/environment.ts, src/environments/cloudflare-provider.ts, src/environments/cloudflare-provider.test.ts
+        location: src/ports/environment.ts, src/environments/cloudflare-provider.ts, src/environments/cloudflare-provider.test.ts, src/environments/cloudflare-miniflare.test.ts
         verify_tier: 1
 
       - id: verification-stack-deployer
@@ -1687,7 +1687,7 @@ categories:
         name: Cloudflare Provider Binding E2E
         cli: npm run test:e2e:cloudflare
         description: Against a real Cloudflare account, create a dispatch namespace, verify environment bindings and secrets through a reachable Worker, destroy all resources idempotently, and prove a short-TTL environment is reaped
-        location: test/e2e/environment-provider.e2e.ts, src/environments/cloudflare-provider.ts, package.json
+        location: test/e2e/environment-provider.e2e.ts, test/fixtures/cloudflare-container/, src/environments/cloudflare-provider.ts, .github/workflows/cloudflare-environment-provider.yml, package.json
         verify_tier: 5
 
   proactive-health:

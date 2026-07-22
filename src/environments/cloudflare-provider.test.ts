@@ -4,6 +4,8 @@ import {
   CLOUDFLARE_ENVIRONMENT_METADATA_BINDING,
   CLOUDFLARE_ENVIRONMENT_METADATA_WORKER,
   CloudflareEnvironmentProvider,
+  CloudflareEnvironmentStackSchema,
+  FetchCloudflareApi,
   ResourceCloudflareCredentialResolver,
   WranglerCloudflareRuntime,
   type CloudflareApi,
@@ -30,7 +32,13 @@ class FakeCloudflareApi implements CloudflareApi {
 
   async createDispatchNamespace(name: string): Promise<CloudflareDispatchNamespace> {
     if (this.namespaces.has(name)) throw new Error('namespace collision')
-    const namespace = { id: `namespace-${this.nextNamespaceId++}`, name, createdAt: new Date().toISOString() }
+    const namespace = {
+      id: `namespace-${this.nextNamespaceId++}`,
+      name,
+      createdAt: new Date().toISOString(),
+      scriptCount: 0,
+      trustedWorkers: false,
+    }
     this.namespaces.set(name, namespace)
     this.workers.set(name, new Map())
     return namespace
@@ -38,11 +46,14 @@ class FakeCloudflareApi implements CloudflareApi {
 
   async getDispatchNamespace(name: string): Promise<CloudflareDispatchNamespace | undefined> {
     const namespace = this.namespaces.get(name)
-    return namespace ? { ...namespace } : undefined
+    return namespace ? { ...namespace, scriptCount: this.workers.get(name)?.size ?? 0 } : undefined
   }
 
   async listDispatchNamespaces(): Promise<CloudflareDispatchNamespace[]> {
-    return [...this.namespaces.values()].map((namespace) => ({ ...namespace }))
+    return [...this.namespaces.values()].map((namespace) => ({
+      ...namespace,
+      scriptCount: this.workers.get(namespace.name)?.size ?? 0,
+    }))
   }
 
   async deleteDispatchNamespace(name: string): Promise<void> {
@@ -59,10 +70,6 @@ class FakeCloudflareApi implements CloudflareApi {
 
   async dispatchWorkerExists(namespace: string, worker: string): Promise<boolean> {
     return this.workers.get(namespace)?.has(worker) ?? false
-  }
-
-  async listDispatchWorkers(namespace: string): Promise<string[]> {
-    return [...(this.workers.get(namespace)?.keys() ?? [])]
   }
 
   async getDispatchWorkerBindings(
@@ -166,6 +173,34 @@ describe('ResourceCloudflareCredentialResolver', () => {
   })
 })
 
+describe('CloudflareEnvironmentStackSchema', () => {
+  it('rejects reserved metadata identities and binding collisions', () => {
+    expect(() => CloudflareEnvironmentStackSchema.parse({
+      workers: [{ name: CLOUDFLARE_ENVIRONMENT_METADATA_WORKER, script: 'export default {}' }],
+    })).toThrow(/reserved/u)
+    expect(() => CloudflareEnvironmentStackSchema.parse({
+      workers: [{
+        name: 'api',
+        script: 'export default {}',
+        secrets: [{ name: 'FACTORY_ENVIRONMENT_ID', secretRef: 'Resource.WorkerSecret' }],
+      }],
+    })).toThrow(/reserved/u)
+    expect(() => CloudflareEnvironmentStackSchema.parse({
+      workers: [{
+        name: 'api',
+        script: 'export default {}',
+        bindings: [{ type: 'plain_text', name: 'DUPLICATE', text: 'one' }],
+        secrets: [{ name: 'DUPLICATE', secretRef: 'Resource.WorkerSecret' }],
+      }],
+    })).toThrow(/duplicate Worker binding/u)
+    expect(() => CloudflareEnvironmentStackSchema.parse({
+      wranglerProjects: [{
+        name: 'app', cwd: '.', secrets: [{ name: 'FACTORY_OWNER_ID', secretRef: 'Resource.WorkerSecret' }],
+      }],
+    })).toThrow(/reserved/u)
+  })
+})
+
 describe('CloudflareEnvironmentProvider', () => {
   it('provisions a namespace with per-environment bindings, secrets, ingress, and Containers', async () => {
     const api = new FakeCloudflareApi()
@@ -232,6 +267,55 @@ describe('CloudflareEnvironmentProvider', () => {
     await expect(provider.endpoints(environment.id)).resolves.toEqual(environment.endpoints)
   })
 
+  it('keeps namespace names within Cloudflare limits and exposes only endpoint-declared Workers', async () => {
+    const api = new FakeCloudflareApi()
+    const provider = new CloudflareEnvironmentProvider({
+      config: config({ namespacePrefix: 'abcdefghijklmnop' }),
+      credentialResolver: resources(),
+      api,
+      wrangler: new FakeWranglerRuntime(api),
+      randomId: () => 'abcdefghijkl',
+    })
+
+    const environment = await provider.provision({
+      customerId: 'customer',
+      repository: 'AgentWorkforce/a-very-long-repository-name',
+      ownerId: 'run',
+      stack: {
+        workers: [
+          { name: 'public', script: 'export default {}', endpoint: { name: 'public' } },
+          { name: 'internal', script: 'export default {}' },
+        ],
+      },
+    })
+
+    expect(environment.id.length).toBeLessThanOrEqual(32)
+    const ingress = [...api.ingress.values()][0]
+    expect(ingress?.script).toContain('["public"]')
+    expect(ingress?.script).not.toContain('internal')
+  })
+
+  it('serializes and reconciles concurrent admission at the active-environment cap', async () => {
+    const api = new FakeCloudflareApi()
+    const first = new CloudflareEnvironmentProvider({
+      config: config({ limits: { maxActiveEnvironments: 1 } }),
+      credentialResolver: resources(), api, wrangler: new FakeWranglerRuntime(),
+      randomId: () => 'first',
+    })
+    const second = new CloudflareEnvironmentProvider({
+      config: config({ limits: { maxActiveEnvironments: 1 } }),
+      credentialResolver: resources(), api, wrangler: new FakeWranglerRuntime(),
+      randomId: () => 'second',
+    })
+    const spec = { customerId: 'c', repository: 'o/r', ownerId: 'owner', stack: { workers: [] } }
+
+    const results = await Promise.allSettled([first.provision(spec), second.provision(spec)])
+
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter(({ status }) => status === 'rejected')).toHaveLength(1)
+    expect(api.namespaces.size).toBe(1)
+  })
+
   it('destroys Container applications, ingress, scripts, and namespace idempotently', async () => {
     const api = new FakeCloudflareApi()
     const wrangler = new FakeWranglerRuntime(api)
@@ -284,7 +368,13 @@ describe('CloudflareEnvironmentProvider', () => {
     })
     now += 2_000
 
-    const report = await provider.reap()
+    const restarted = new CloudflareEnvironmentProvider({
+      config: config({ limits: { maxActiveEnvironments: 5 } }),
+      credentialResolver: resources(), api, wrangler,
+      now: () => new Date(now),
+      ownerIsAlive: async (owner) => liveOwners.has(owner),
+    })
+    const report = await restarted.reap()
 
     expect(report.reaped).toEqual(expect.arrayContaining([
       { id: expired.id, reason: 'ttl-expired' },
@@ -340,6 +430,67 @@ describe('CloudflareEnvironmentProvider', () => {
   })
 })
 
+describe('FetchCloudflareApi', () => {
+  it('explicitly creates an untrusted dispatch namespace', async () => {
+    let requestBody: unknown
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body))
+      return Response.json({
+        success: true,
+        result: { namespace_id: 'namespace-id', namespace_name: 'namespace', trusted_workers: false },
+      })
+    })
+    const api = new FetchCloudflareApi(
+      { accountId: 'account', apiToken: 'token' },
+      { fetch: fetch as typeof globalThis.fetch },
+    )
+
+    await expect(api.createDispatchNamespace('namespace')).resolves.toMatchObject({
+      id: 'namespace-id',
+      name: 'namespace',
+      trustedWorkers: false,
+    })
+    expect(requestBody).toEqual({ name: 'namespace', trusted_workers: false })
+  })
+
+  it('uses supported per-script bindings and delete endpoints', async () => {
+    const requests: Array<{ method: string; path: string }> = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+      const method = init?.method ?? 'GET'
+      requests.push({ method, path: url.pathname })
+      if (url.pathname.endsWith('/bindings')) {
+        return Response.json({
+          success: true,
+          result: [{ type: 'plain_text', name: 'FACTORY_ENVIRONMENT_ID', text: 'environment' }],
+        })
+      }
+      return new Response(null, { status: 204 })
+    })
+    const api = new FetchCloudflareApi(
+      { accountId: 'account', apiToken: 'token' },
+      { fetch: fetch as typeof globalThis.fetch },
+    )
+
+    await expect(api.getDispatchWorkerBindings('namespace', 'worker')).resolves.toEqual([
+      { type: 'plain_text', name: 'FACTORY_ENVIRONMENT_ID', text: 'environment' },
+    ])
+    await api.deleteDispatchWorker('namespace', 'worker')
+
+    expect(requests).toEqual([
+      {
+        method: 'GET',
+        path: '/client/v4/accounts/account/workers/dispatch/namespaces/namespace/scripts/worker/bindings',
+      },
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/workers/dispatch/namespaces/namespace/scripts/worker',
+      },
+    ])
+    expect(requests.some(({ path }) => path.endsWith('/scripts'))).toBe(false)
+  })
+})
+
 describe('WranglerCloudflareRuntime', () => {
   const credentials = { accountId: 'account-id', apiToken: 'api-token' }
   const project = {
@@ -356,10 +507,11 @@ describe('WranglerCloudflareRuntime', () => {
       run: async (args, options) => {
         calls.push(args)
         expect(options.env.CLOUDFLARE_API_TOKEN).toBe('api-token')
+        expect(options.env.GITHUB_TOKEN).toBeUndefined()
         if (args[0] === 'containers' && args[1] === 'list') {
           listCalls += 1
           return {
-            stdout: JSON.stringify(listCalls === 1 ? [] : [{ id: 'app-id', name: 'container-app' }]),
+            stdout: JSON.stringify(listCalls === 1 ? [] : [{ id: 'app-id', name: 'container-app', state: 'ready' }]),
             stderr: '',
           }
         }
@@ -374,11 +526,30 @@ describe('WranglerCloudflareRuntime', () => {
       bindings: { FACTORY_ENVIRONMENT_ID: 'factory-environment' },
       secrets: {},
       credentials,
-    })).resolves.toEqual([{ id: 'app-id', name: 'container-app' }])
+    })).resolves.toEqual([{ id: 'app-id', name: 'container-app', state: 'ready' }])
     expect(calls).toContainEqual(expect.arrayContaining([
       'deploy', '--name', 'container-worker', '--dispatch-namespace', 'factory-environment',
       '--var', 'FACTORY_ENVIRONMENT_ID:factory-environment', '--containers-rollout', 'immediate',
     ]))
+    expect(calls.find(([command]) => command === 'deploy')).not.toContain('--yes')
+  })
+
+  it('maps Container deployment state instead of treating existence as readiness', async () => {
+    let state: 'provisioning' | 'ready' | 'degraded' = 'provisioning'
+    const runner: WranglerCommandRunner = {
+      run: async (args) => {
+        expect(args).toEqual(['containers', 'list', '--json', '--per-page', '1000'])
+        return { stdout: JSON.stringify([{ id: 'app-id', name: 'container-app', state }]), stderr: '' }
+      },
+    }
+    const runtime = new WranglerCloudflareRuntime({ command: 'wrangler', runner })
+    const application = { id: 'app-id', name: 'container-app' }
+
+    await expect(runtime.containerStatus(application, credentials)).resolves.toBe('provisioning')
+    state = 'ready'
+    await expect(runtime.containerStatus(application, credentials)).resolves.toBe('ready')
+    state = 'degraded'
+    await expect(runtime.containerStatus(application, credentials)).resolves.toBe('failed')
   })
 
   it('refuses pre-existing Container names and cleans newly-created apps after an ambiguous deploy failure', async () => {

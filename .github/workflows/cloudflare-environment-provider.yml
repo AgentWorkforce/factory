@@ -1,0 +1,65 @@
+name: Cloudflare environment provider E2E
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cloudflare-environment-provider.yml
+      - package.json
+      - package-lock.json
+      - src/environments/cloudflare-**
+      - src/ports/environment.ts
+      - test/e2e/environment-provider.e2e.ts
+      - test/fixtures/cloudflare-container/**
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: Cloudflare API token resolved from the factory-test-infra Resource
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        description: Cloudflare account ID; optional when the token resolves exactly one account
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-environment-provider-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  miniflare:
+    name: Miniflare binding fast path
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run src/environments/cloudflare-provider.test.ts src/environments/cloudflare-miniflare.test.ts
+
+  real-cloudflare:
+    name: Real dispatch namespace and Container
+    needs: miniflare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: factory-test-infra
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Require the protected Cloudflare Resource secret
+        run: test -n "$CLOUDFLARE_API_TOKEN"
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify Docker for the Container image build
+        run: docker info
+      - name: Provision, reach, destroy, and reap
+        run: npm run test:e2e:cloudflare

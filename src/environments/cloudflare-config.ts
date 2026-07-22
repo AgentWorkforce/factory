@@ -20,7 +20,10 @@ export const CloudflareEnvironmentLimitsSchema = z.object({
 export const CloudflareEnvironmentConfigSchema = z.object({
   accountId: resourceReferenceSchema,
   apiToken: resourceReferenceSchema,
-  namespacePrefix: z.string().trim().min(1).max(24).regex(
+  // Cloudflare caps dispatch namespace names at 32 characters. Reserving
+  // space here for separators, a repository fragment, and the random suffix
+  // lets every provider-generated name satisfy the upstream limit.
+  namespacePrefix: z.string().trim().min(1).max(16).regex(
     /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/u,
     'must be a lowercase DNS label',
   ).default('factory'),

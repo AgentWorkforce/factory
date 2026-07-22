@@ -26,6 +26,13 @@ export const CLOUDFLARE_ENVIRONMENT_TAG = 'factory-environment'
 
 const WORKER_NAME_PATTERN = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/u
 const BINDING_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
+const ENVIRONMENT_BINDING_NAMES = [
+  'FACTORY_ENVIRONMENT_ID',
+  'FACTORY_OWNER_ID',
+  'FACTORY_CUSTOMER_ID',
+  'FACTORY_REPOSITORY',
+] as const
+const RESERVED_ENVIRONMENT_BINDINGS = new Set<string>(ENVIRONMENT_BINDING_NAMES)
 
 const endpointSchema = z.object({
   name: z.string().trim().min(1).max(64),
@@ -58,7 +65,16 @@ const workerSchema = z.object({
   bindings: z.array(bindingSchema).default([]),
   secrets: z.array(secretSchema).default([]),
   endpoint: endpointSchema.optional(),
-}).strict()
+}).strict().superRefine((worker, context) => {
+  if (worker.name === CLOUDFLARE_ENVIRONMENT_METADATA_WORKER) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['name'],
+      message: `${CLOUDFLARE_ENVIRONMENT_METADATA_WORKER} is reserved for Factory ownership metadata`,
+    })
+  }
+  validateBindingNames(worker.bindings, worker.secrets, context)
+})
 
 const wranglerProjectSchema = z.object({
   name: z.string().trim().min(1).max(63).regex(WORKER_NAME_PATTERN),
@@ -67,7 +83,23 @@ const wranglerProjectSchema = z.object({
   containerApplications: z.array(z.string().trim().min(1)).default([]),
   secrets: z.array(secretSchema).default([]),
   endpoint: endpointSchema.optional(),
-}).strict()
+}).strict().superRefine((project, context) => {
+  if (project.name === CLOUDFLARE_ENVIRONMENT_METADATA_WORKER) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['name'],
+      message: `${CLOUDFLARE_ENVIRONMENT_METADATA_WORKER} is reserved for Factory ownership metadata`,
+    })
+  }
+  validateBindingNames([], project.secrets, context)
+  if (new Set(project.containerApplications).size !== project.containerApplications.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['containerApplications'],
+      message: 'Container application names must be unique',
+    })
+  }
+})
 
 export const CloudflareEnvironmentStackSchema = z.object({
   workers: z.array(workerSchema).default([]),
@@ -75,6 +107,7 @@ export const CloudflareEnvironmentStackSchema = z.object({
 }).strict().superRefine((stack, context) => {
   const names = new Set<string>()
   const endpoints = new Set<string>()
+  const containers = new Set<string>()
   ;[...stack.workers, ...stack.wranglerProjects].forEach((worker, index) => {
     if (names.has(worker.name)) {
       context.addIssue({
@@ -94,6 +127,18 @@ export const CloudflareEnvironmentStackSchema = z.object({
       }
       endpoints.add(worker.endpoint.name)
     }
+  })
+  stack.wranglerProjects.forEach((project, projectIndex) => {
+    project.containerApplications.forEach((container, containerIndex) => {
+      if (containers.has(container)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['wranglerProjects', projectIndex, 'containerApplications', containerIndex],
+          message: `duplicate Container application ${JSON.stringify(container)}`,
+        })
+      }
+      containers.add(container)
+    })
   })
 })
 
@@ -141,6 +186,7 @@ export interface CloudflareDispatchNamespace {
   name: string
   createdAt?: string
   scriptCount?: number
+  trustedWorkers?: boolean
 }
 
 export interface CloudflareDispatchWorkerUpload {
@@ -160,7 +206,6 @@ export interface CloudflareApi {
   deleteDispatchNamespace(name: string): Promise<void>
   uploadDispatchWorker(namespace: string, worker: CloudflareDispatchWorkerUpload): Promise<void>
   dispatchWorkerExists(namespace: string, worker: string): Promise<boolean>
-  listDispatchWorkers(namespace: string): Promise<string[]>
   getDispatchWorkerBindings(namespace: string, worker: string): Promise<CloudflareWorkerBinding[] | undefined>
   putDispatchWorkerSecret(namespace: string, worker: string, name: string, value: string): Promise<void>
   deleteDispatchWorker(namespace: string, worker: string): Promise<void>
@@ -174,6 +219,7 @@ export interface CloudflareApi {
 export interface CloudflareContainerApplication {
   id: string
   name: string
+  state?: 'degraded' | 'provisioning' | 'active' | 'ready'
 }
 
 export interface CloudflareWranglerDeployInput {
@@ -192,6 +238,7 @@ export interface CloudflareWranglerRuntime {
 
 interface CloudflareEnvironmentMetadata {
   version: 1
+  namespacePrefix: string
   namespaceId: string
   environment: Environment
   ownerId: string
@@ -236,6 +283,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
   readonly #logger?: Logger
   readonly #records = new Map<string, EnvironmentRecord>()
   #servicesPromise?: Promise<{ credentials: CloudflareCredentials; api: CloudflareApi; wrangler: CloudflareWranglerRuntime }>
+  #provisionLock: Promise<void> = Promise.resolve()
 
   constructor(options: CloudflareEnvironmentProviderOptions) {
     this.#config = CloudflareEnvironmentConfigSchema.parse(options.config)
@@ -251,6 +299,10 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
   }
 
   async provision(specInput: CloudflareProvisionSpec): Promise<Environment> {
+    return await this.#withProvisionLock(async () => await this.#provision(specInput))
+  }
+
+  async #provision(specInput: CloudflareProvisionSpec): Promise<Environment> {
     const stack = CloudflareEnvironmentStackSchema.parse(specInput.stack)
     const ttl = specInput.ttl ?? this.#config.ttlMs
     if (!Number.isInteger(ttl) || ttl < this.#config.minTtlMs || ttl > this.#config.maxTtlMs) {
@@ -298,11 +350,46 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
     }
 
     let namespace: CloudflareDispatchNamespace | undefined
-    const workerNames: string[] = []
+    const workerNames = [...stack.workers, ...stack.wranglerProjects].map(({ name }) => name)
     const containers: CloudflareContainerApplication[] = []
-    let ingressWorker: string | undefined
+    const metadata: CloudflareEnvironmentMetadata = {
+      version: 1,
+      namespacePrefix: this.#config.namespacePrefix,
+      namespaceId: '',
+      environment: cloneEnvironment(environment),
+      ownerId: specInput.ownerId,
+      workers: workerNames,
+      containers,
+    }
     try {
       namespace = await api.createDispatchNamespace(id)
+      if (namespace.name !== id) {
+        throw new Error(`Cloudflare returned dispatch namespace ${namespace.name} for requested identity ${id}`)
+      }
+      if (namespace.trustedWorkers === true) {
+        throw new Error(`Cloudflare dispatch namespace ${id} is trusted; verification namespaces must be untrusted`)
+      }
+      metadata.namespaceId = namespace.id
+      await api.uploadDispatchWorker(id, metadataWorkerUpload(metadata, createdAt))
+      this.#records.set(id, { metadata })
+
+      // Serialize same-process provisions and reconcile after creation so
+      // independent providers that observed the same free slot cannot both
+      // retain it. Existing namespaces always keep priority.
+      const preexisting = new Set(active.map(({ name }) => name))
+      const reconciled = (await api.listDispatchNamespaces())
+        .filter(({ name }) => name.startsWith(`${this.#config.namespacePrefix}-`))
+        .sort((left, right) => (
+          Number(preexisting.has(right.name)) - Number(preexisting.has(left.name)) ||
+          compareDispatchNamespaces(left, right)
+        ))
+      if (reconciled.length > this.#config.limits.maxActiveEnvironments &&
+        reconciled.findIndex(({ name }) => name === id) >= this.#config.limits.maxActiveEnvironments) {
+        throw new Error(
+          `Cloudflare active environment limit ${this.#config.limits.maxActiveEnvironments} was exceeded by a concurrent provision`,
+        )
+      }
+
       for (const worker of stack.workers) {
         const bindings = mergeEnvironmentBindings(worker.bindings, environmentBindings)
         await api.uploadDispatchWorker(id, {
@@ -317,7 +404,6 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
             subrequests: this.#config.limits.workerSubrequests,
           },
         })
-        workerNames.push(worker.name)
         for (const secret of worker.secrets) {
           const value = await this.#secretResolver.resolve(secret.secretRef)
           await api.putDispatchWorkerSecret(id, worker.name, secret.name, value)
@@ -336,17 +422,27 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
           credentials,
         })
         containers.push(...deployedContainers)
-        workerNames.push(project.name)
+        metadata.containers = containers.map((container) => ({ ...container }))
+        await api.uploadDispatchWorker(id, metadataWorkerUpload(metadata, createdAt))
         for (const key of Object.keys(environmentBindings)) environment.bindings[`${project.name}.${key}`] = 'plain_text'
         for (const key of Object.keys(secrets)) environment.bindings[`${project.name}.${key}`] = 'secret_text'
+        for (const container of deployedContainers) {
+          environment.bindings[`cloudflare.container.${container.name}`] = container.id
+        }
       }
 
       const endpointTargets = [...stack.workers, ...stack.wranglerProjects].filter(
         (worker): worker is typeof worker & { endpoint: NonNullable<typeof worker.endpoint> } => Boolean(worker.endpoint),
       )
       if (endpointTargets.length > 0) {
-        ingressWorker = ingressWorkerName(id)
-        await api.uploadIngressWorker(ingressWorker, id, dispatchWorkerSource(workerNames))
+        const ingressWorker = ingressWorkerName(id)
+        metadata.ingressWorker = ingressWorker
+        await api.uploadDispatchWorker(id, metadataWorkerUpload(metadata, createdAt))
+        await api.uploadIngressWorker(
+          ingressWorker,
+          id,
+          dispatchWorkerSource(endpointTargets.map(({ name }) => name)),
+        )
         await api.enableIngressSubdomain(ingressWorker)
         const baseUrl = `https://${ingressWorker}.${await api.workersSubdomain()}.workers.dev`
         for (const worker of endpointTargets) {
@@ -354,16 +450,12 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
         }
       }
 
-      environment.status = 'ready'
-      const metadata: CloudflareEnvironmentMetadata = {
-        version: 1,
-        namespaceId: namespace.id,
-        environment: cloneEnvironment(environment),
-        ownerId: specInput.ownerId,
-        ...(ingressWorker ? { ingressWorker } : {}),
-        workers: workerNames,
-        containers,
+      environment.status = await containerEnvironmentStatus(containers, wrangler, credentials)
+      if (environment.status === 'failed') {
+        throw new Error(`Cloudflare Container deployment failed for ${id}`)
       }
+      metadata.environment = cloneEnvironment(environment)
+      metadata.containers = containers.map((container) => ({ ...container }))
       await api.uploadDispatchWorker(id, metadataWorkerUpload(metadata, createdAt))
       this.#records.set(id, { metadata })
       this.#logger?.info?.('[cloudflare-environment] provisioned environment', {
@@ -374,14 +466,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
       return cloneEnvironment(environment)
     } catch (error) {
       if (namespace) {
-        const cleanupErrors = await this.#cleanupPartial({
-          namespace,
-          ingressWorker,
-          containers,
-          credentials,
-          api,
-          wrangler,
-        })
+        const cleanupErrors = await this.#cleanupPartial({ namespace, metadata, credentials, api, wrangler })
         if (cleanupErrors.length > 0) {
           throw new AggregateError([error, ...cleanupErrors], `Cloudflare provision failed and cleanup also failed for ${id}`)
         }
@@ -394,11 +479,12 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
     const { api, credentials, wrangler } = await this.#services()
     const namespace = await api.getDispatchNamespace(id)
     if (!namespace) {
-      this.#records.delete(id)
+      // Retain an in-memory record so a subsequent idempotent destroy can
+      // still reconcile account-global ingress and Container resources.
       return 'destroyed'
     }
     const record = await this.#loadRecord(id, api)
-    assertMetadataIdentity(record.metadata, namespace)
+    assertMetadataIdentity(record.metadata, namespace, this.#config.namespacePrefix)
     for (const worker of [CLOUDFLARE_ENVIRONMENT_METADATA_WORKER, ...record.metadata.workers]) {
       if (!await api.dispatchWorkerExists(id, worker)) return 'failed'
     }
@@ -419,7 +505,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
     const namespace = await api.getDispatchNamespace(id)
     if (!namespace) throw new Error(`Cloudflare environment ${id} does not exist`)
     const record = await this.#loadRecord(id, api)
-    assertMetadataIdentity(record.metadata, namespace)
+    assertMetadataIdentity(record.metadata, namespace, this.#config.namespacePrefix)
     return { ...record.metadata.environment.endpoints }
   }
 
@@ -427,11 +513,12 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
     const { api, credentials, wrangler } = await this.#services()
     const namespace = await api.getDispatchNamespace(id)
     if (!namespace) {
-      this.#records.delete(id)
+      const known = this.#records.get(id)
+      if (known) await this.#destroyKnown(known.metadata, api, wrangler, credentials)
       return
     }
     const record = await this.#loadRecord(id, api)
-    assertMetadataIdentity(record.metadata, namespace)
+    assertMetadataIdentity(record.metadata, namespace, this.#config.namespacePrefix)
     await this.#destroyKnown(record.metadata, api, wrangler, credentials)
   }
 
@@ -446,7 +533,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
       let metadata: CloudflareEnvironmentMetadata
       try {
         metadata = (await this.#loadRecord(namespace.name, api)).metadata
-        assertMetadataIdentity(metadata, namespace)
+        assertMetadataIdentity(metadata, namespace, this.#config.namespacePrefix)
       } catch (error) {
         report.skipped.push({ id: namespace.name, reason: `identity check failed: ${errorMessage(error)}` })
         continue
@@ -517,11 +604,7 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
   ): Promise<void> {
     const id = metadata.environment.id
     const current = await api.getDispatchNamespace(id)
-    if (!current) {
-      this.#records.delete(id)
-      return
-    }
-    assertMetadataIdentity(metadata, current)
+    if (current) assertMetadataIdentity(metadata, current, this.#config.namespacePrefix)
     const cleanupErrors: unknown[] = []
     for (const container of [...metadata.containers].reverse()) {
       try {
@@ -537,20 +620,49 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
         cleanupErrors.push(error)
       }
     }
-    let scripts: string[] = []
-    try {
-      scripts = await api.listDispatchWorkers(id)
-      for (const script of scripts.filter((name) => name !== CLOUDFLARE_ENVIRONMENT_METADATA_WORKER)) {
-        await api.deleteDispatchWorker(id, script)
+    if (current) {
+      for (const script of metadata.workers) {
+        try {
+          await api.deleteDispatchWorker(id, script)
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
       }
-    } catch (error) {
-      cleanupErrors.push(error)
     }
     if (cleanupErrors.length > 0) {
       throw new AggregateError(cleanupErrors, `Cloudflare environment cleanup failed for ${id}`)
     }
+
+    if (!current) {
+      metadata.environment.status = 'destroyed'
+      this.#records.delete(id)
+      return
+    }
+
+    const beforeNamespaceDelete = await this.#waitForMetadataOnlyNamespace(metadata, api)
+    if (!beforeNamespaceDelete) {
+      metadata.environment.status = 'destroyed'
+      this.#records.delete(id)
+      return
+    }
     await api.deleteDispatchWorker(id, CLOUDFLARE_ENVIRONMENT_METADATA_WORKER)
-    await api.deleteDispatchNamespace(id)
+    try {
+      await api.deleteDispatchNamespace(id)
+    } catch (error) {
+      const afterFailure = await api.getDispatchNamespace(id)
+      if (afterFailure) {
+        assertMetadataIdentity(metadata, afterFailure, this.#config.namespacePrefix)
+        try {
+          await api.uploadDispatchWorker(id, metadataWorkerUpload(metadata, new Date(metadata.environment.createdAt)))
+        } catch (restoreError) {
+          throw new AggregateError(
+            [error, restoreError],
+            `Cloudflare namespace deletion and ownership metadata restoration failed for ${id}`,
+          )
+        }
+        throw error
+      }
+    }
     metadata.environment.status = 'destroyed'
     this.#records.delete(id)
     this.#logger?.info?.('[cloudflare-environment] destroyed environment', { id, namespaceId: metadata.namespaceId })
@@ -558,48 +670,82 @@ export class CloudflareEnvironmentProvider implements EnvironmentProvider {
 
   async #cleanupPartial(input: {
     namespace: CloudflareDispatchNamespace
-    ingressWorker?: string
-    containers: CloudflareContainerApplication[]
+    metadata: CloudflareEnvironmentMetadata
     credentials: CloudflareCredentials
     api: CloudflareApi
     wrangler: CloudflareWranglerRuntime
   }): Promise<unknown[]> {
-    const errors: unknown[] = []
-    for (const container of [...input.containers].reverse()) {
-      try { await input.wrangler.deleteContainer(container, input.credentials) } catch (error) { errors.push(error) }
-    }
-    if (input.ingressWorker) {
-      try { await input.api.deleteIngressWorker(input.ingressWorker) } catch (error) { errors.push(error) }
-    }
     try {
-      for (const worker of await input.api.listDispatchWorkers(input.namespace.name)) {
-        await input.api.deleteDispatchWorker(input.namespace.name, worker)
+      const current = await input.api.getDispatchNamespace(input.namespace.name)
+      if (!current || current.id !== input.namespace.id) {
+        throw new Error(
+          `Refusing partial cleanup for Cloudflare namespace ${input.namespace.name}: ownership identity changed`,
+        )
       }
+      if (!await input.api.dispatchWorkerExists(
+        input.namespace.name,
+        CLOUDFLARE_ENVIRONMENT_METADATA_WORKER,
+      )) {
+        await input.api.uploadDispatchWorker(
+          input.namespace.name,
+          metadataWorkerUpload(input.metadata, new Date(input.metadata.environment.createdAt)),
+        )
+      }
+      await this.#destroyKnown(input.metadata, input.api, input.wrangler, input.credentials)
+      return []
     } catch (error) {
-      errors.push(error)
+      return [error]
     }
-    if (errors.length === 0) {
-      try {
-        const current = await input.api.getDispatchNamespace(input.namespace.name)
-        if (current && current.id === input.namespace.id) await input.api.deleteDispatchNamespace(input.namespace.name)
-      } catch (error) {
-        errors.push(error)
+  }
+
+  async #waitForMetadataOnlyNamespace(
+    metadata: CloudflareEnvironmentMetadata,
+    api: CloudflareApi,
+  ): Promise<CloudflareDispatchNamespace | undefined> {
+    const id = metadata.environment.id
+    let current: CloudflareDispatchNamespace | undefined
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      current = await api.getDispatchNamespace(id)
+      if (!current) return undefined
+      assertMetadataIdentity(metadata, current, this.#config.namespacePrefix)
+      if (current.scriptCount === 1 &&
+        await api.dispatchWorkerExists(id, CLOUDFLARE_ENVIRONMENT_METADATA_WORKER)) {
+        return current
       }
+      if (attempt < 19) await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
     }
-    return errors
+    throw new Error(
+      `Refusing to delete Cloudflare namespace ${id}: expected only the ownership metadata Worker, ` +
+      `found ${String(current?.scriptCount)} scripts`,
+    )
+  }
+
+  async #withProvisionLock<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.#provisionLock
+    let release = (): void => undefined
+    this.#provisionLock = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    await previous
+    try {
+      return await work()
+    } finally {
+      release()
+    }
   }
 }
 
 export class CloudflareEnvironmentReaper {
   readonly #provider: CloudflareEnvironmentProvider
   readonly #intervalMs: number
+  readonly #logger?: Logger
   #timer?: ReturnType<typeof setTimeout>
+  #inFlight?: Promise<void>
   #running = false
   #stopped = false
 
-  constructor(provider: CloudflareEnvironmentProvider, options: { intervalMs?: number } = {}) {
+  constructor(provider: CloudflareEnvironmentProvider, options: { intervalMs?: number; logger?: Logger } = {}) {
     this.#provider = provider
     this.#intervalMs = options.intervalMs ?? 60_000
+    this.#logger = options.logger ? normalizeLogger(options.logger) : undefined
   }
 
   start(): void {
@@ -610,12 +756,17 @@ export class CloudflareEnvironmentReaper {
     this.#stopped = true
     if (this.#timer) clearTimeout(this.#timer)
     this.#timer = undefined
+    await this.#inFlight
   }
 
   #schedule(delay: number): void {
     this.#timer = setTimeout(() => {
       this.#timer = undefined
-      void this.#tick()
+      const tick = this.#tick()
+      this.#inFlight = tick
+      void tick.finally(() => {
+        if (this.#inFlight === tick) this.#inFlight = undefined
+      })
     }, delay)
   }
 
@@ -624,6 +775,8 @@ export class CloudflareEnvironmentReaper {
     this.#running = true
     try {
       await this.#provider.reap()
+    } catch (error) {
+      this.#logger?.error?.('[cloudflare-environment] reaper sweep failed', { error: errorMessage(error) })
     } finally {
       this.#running = false
       if (!this.#stopped) this.#schedule(this.#intervalMs)
@@ -654,7 +807,7 @@ export class FetchCloudflareApi implements CloudflareApi {
 
   async createDispatchNamespace(name: string): Promise<CloudflareDispatchNamespace> {
     const result = await this.#json<Record<string, unknown>>(
-      'POST', this.#dispatchPath(), { json: { name } },
+      'POST', this.#dispatchPath(), { json: { name, trusted_workers: false } },
     )
     return namespaceFromApi(result, name)
   }
@@ -684,29 +837,15 @@ export class FetchCloudflareApi implements CloudflareApi {
     return await this.#exists(this.#dispatchScriptPath(namespace, worker))
   }
 
-  async listDispatchWorkers(namespace: string): Promise<string[]> {
-    const result = await this.#json<Array<Record<string, unknown>>>(
-      'GET', `${this.#dispatchPath(namespace)}/scripts`,
-    )
-    return result.flatMap((entry) => {
-      const id = typeof entry.id === 'string'
-        ? entry.id
-        : typeof asRecord(entry.script).id === 'string' ? asRecord(entry.script).id as string : undefined
-      return id ? [id] : []
-    })
-  }
-
   async getDispatchWorkerBindings(
     namespace: string,
     worker: string,
   ): Promise<CloudflareWorkerBinding[] | undefined> {
-    const result = await this.#json<Record<string, unknown>>(
-      'GET', `${this.#dispatchScriptPath(namespace, worker)}/settings`, { allowNotFound: true },
+    const result = await this.#json<CloudflareWorkerBinding[]>(
+      'GET', `${this.#dispatchScriptPath(namespace, worker)}/bindings`, { allowNotFound: true },
     )
     if (!result) return undefined
-    return Array.isArray(result.bindings)
-      ? result.bindings.filter(isRecord).map((binding) => binding as CloudflareWorkerBinding)
-      : []
+    return Array.isArray(result) ? result.filter(isRecord).map((binding) => binding as CloudflareWorkerBinding) : []
   }
 
   async putDispatchWorkerSecret(namespace: string, worker: string, name: string, value: string): Promise<void> {
@@ -842,7 +981,7 @@ export class WranglerCloudflareRuntime implements CloudflareWranglerRuntime {
   async deploy(input: CloudflareWranglerDeployInput): Promise<CloudflareContainerApplication[]> {
     const cwd = resolve(input.project.cwd)
     const expectedContainers = new Set(input.project.containerApplications)
-    const before = expectedContainers.size > 0 ? await this.#listContainers(input.credentials) : []
+    const before = await this.#listContainers(input.credentials)
     const collisions = before.filter((container) => expectedContainers.has(container.name))
     if (collisions.length > 0) {
       throw new Error(
@@ -852,7 +991,7 @@ export class WranglerCloudflareRuntime implements CloudflareWranglerRuntime {
     const beforeIds = new Set(before.map(({ id }) => id))
     const temporary = await mkdtemp(join(tmpdir(), 'factory-cloudflare-secrets-'))
     try {
-      const args = ['deploy', '--name', input.project.name, '--dispatch-namespace', input.namespace, '--yes']
+      const args = ['deploy', '--name', input.project.name, '--dispatch-namespace', input.namespace]
       if (input.project.configPath) {
         const configPath = isAbsolute(input.project.configPath)
           ? input.project.configPath
@@ -868,11 +1007,16 @@ export class WranglerCloudflareRuntime implements CloudflareWranglerRuntime {
       if (expectedContainers.size > 0) args.push('--containers-rollout', 'immediate')
       try {
         await this.#run(args, input.credentials, cwd)
-        if (expectedContainers.size === 0) return []
         const after = await this.#listContainers(input.credentials)
-        const matched = after.filter((container) => (
-          expectedContainers.has(container.name) && !beforeIds.has(container.id)
-        ))
+        const created = after.filter((container) => !beforeIds.has(container.id))
+        const matched = created.filter((container) => expectedContainers.has(container.name))
+        const unexpected = created.filter((container) => !expectedContainers.has(container.name))
+        if (unexpected.length > 0) {
+          throw new Error(
+            `Wrangler deployed undeclared Container applications for ${input.project.name}: ` +
+            unexpected.map(({ name }) => name).join(', '),
+          )
+        }
         for (const name of expectedContainers) {
           if (!matched.some((container) => container.name === name)) {
             throw new Error(`Wrangler deployed ${input.project.name} but Container application ${name} was not found`)
@@ -908,7 +1052,10 @@ export class WranglerCloudflareRuntime implements CloudflareWranglerRuntime {
     credentials: CloudflareCredentials,
   ): Promise<EnvironmentStatus> {
     const containers = await this.#listContainers(credentials)
-    return containers.some(({ id }) => id === application.id) ? 'ready' : 'failed'
+    const current = containers.find(({ id }) => id === application.id)
+    if (!current || current.name !== application.name || current.state === 'degraded') return 'failed'
+    if (current.state === 'provisioning') return 'provisioning'
+    return 'ready'
   }
 
   async deleteContainer(
@@ -925,22 +1072,36 @@ export class WranglerCloudflareRuntime implements CloudflareWranglerRuntime {
   }
 
   async #listContainers(credentials: CloudflareCredentials): Promise<CloudflareContainerApplication[]> {
-    const result = await this.#run(['containers', 'list', '--json'], credentials)
+    const result = await this.#run(['containers', 'list', '--json', '--per-page', '1000'], credentials)
     return parseContainerList(result.stdout)
   }
 
   async #run(args: string[], credentials: CloudflareCredentials, cwd?: string): Promise<WranglerCommandResult> {
+    const inheritedEnvironment = inheritedWranglerEnvironment(process.env)
     return await this.#runner.run(args, {
       cwd,
       env: {
-        // Preserve PATH and non-credential process settings needed by Wrangler
-        // and Docker. Credential values always override from Resource.*.
-        ...process.env,
+        // Do not expose unrelated host secrets to repository-controlled build
+        // commands. Credentials come only from the scoped Resource.* values.
+        ...inheritedEnvironment,
         CLOUDFLARE_ACCOUNT_ID: credentials.accountId,
         CLOUDFLARE_API_TOKEN: credentials.apiToken,
       },
     })
   }
+}
+
+function inheritedWranglerEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowed = [
+    'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP',
+    'DOCKER_HOST', 'DOCKER_CONFIG',
+    'CI', 'NO_COLOR', 'FORCE_COLOR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+    'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE',
+  ]
+  return Object.fromEntries(allowed.flatMap((name) => (
+    environment[name] === undefined ? [] : [[name, environment[name]]]
+  )))
 }
 
 function defaultWranglerCommandRunner(command: string, commandArgs: string[]): WranglerCommandRunner {
@@ -991,6 +1152,7 @@ function namespaceFromApi(value: Record<string, unknown>, fallbackName?: string)
     name,
     ...(typeof value.created_on === 'string' ? { createdAt: value.created_on } : {}),
     ...(typeof value.script_count === 'number' ? { scriptCount: value.script_count } : {}),
+    ...(typeof value.trusted_workers === 'boolean' ? { trustedWorkers: value.trusted_workers } : {}),
   }
 }
 
@@ -1016,7 +1178,16 @@ function parseContainerList(stdout: string): CloudflareContainerApplication[] {
     const record = asRecord(entry)
     const id = record.id
     const name = record.name
-    return typeof id === 'string' && typeof name === 'string' ? [{ id, name }] : []
+    const state = record.state
+    return typeof id === 'string' && typeof name === 'string'
+      ? [{
+          id,
+          name,
+          ...(state === 'degraded' || state === 'provisioning' || state === 'active' || state === 'ready'
+            ? { state }
+            : {}),
+        }]
+      : []
   })
 }
 
@@ -1032,6 +1203,48 @@ function mergeEnvironmentBindings(
     ...bindings,
     ...Object.entries(values).map(([name, text]) => ({ type: 'plain_text', name, text })),
   ]
+}
+
+function validateBindingNames(
+  bindings: Array<{ name?: string }>,
+  secrets: Array<{ name?: string }>,
+  context: z.RefinementCtx,
+): void {
+  const seen = new Set<string>()
+  for (const [kind, entries] of [['bindings', bindings], ['secrets', secrets]] as const) {
+    entries.forEach(({ name }, index) => {
+      if (typeof name !== 'string') return
+      if (RESERVED_ENVIRONMENT_BINDINGS.has(name)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [kind, index, 'name'],
+          message: `${name} is reserved for Factory environment identity`,
+        })
+      }
+      if (seen.has(name)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [kind, index, 'name'],
+          message: `duplicate Worker binding ${JSON.stringify(name)}`,
+        })
+      }
+      seen.add(name)
+    })
+  }
+}
+
+async function containerEnvironmentStatus(
+  containers: CloudflareContainerApplication[],
+  wrangler: CloudflareWranglerRuntime,
+  credentials: CloudflareCredentials,
+): Promise<EnvironmentStatus> {
+  let status: EnvironmentStatus = 'ready'
+  for (const container of containers) {
+    const current = await wrangler.containerStatus(container, credentials)
+    if (current === 'failed') return 'failed'
+    if (current !== 'ready') status = 'provisioning'
+  }
+  return status
 }
 
 async function resolveSecrets(
@@ -1066,6 +1279,7 @@ function parseMetadata(value: unknown): CloudflareEnvironmentMetadata {
   const environment = asRecord(record.environment)
   if (
     record.version !== 1 ||
+    typeof record.namespacePrefix !== 'string' ||
     typeof record.namespaceId !== 'string' ||
     typeof record.ownerId !== 'string' ||
     typeof environment.id !== 'string' ||
@@ -1082,6 +1296,7 @@ function parseMetadata(value: unknown): CloudflareEnvironmentMetadata {
   })
   return {
     version: 1,
+    namespacePrefix: record.namespacePrefix,
     namespaceId: record.namespaceId,
     ownerId: record.ownerId,
     ...(typeof record.ingressWorker === 'string' ? { ingressWorker: record.ingressWorker } : {}),
@@ -1114,8 +1329,10 @@ function valueEnvironment(value: Record<string, unknown>): Environment {
 function assertMetadataIdentity(
   metadata: CloudflareEnvironmentMetadata,
   namespace: CloudflareDispatchNamespace,
+  namespacePrefix: string,
 ): void {
   if (
+    metadata.namespacePrefix !== namespacePrefix ||
     metadata.environment.id !== namespace.name ||
     metadata.environment.dispatchNamespace !== namespace.name ||
     metadata.namespaceId !== namespace.id
@@ -1141,8 +1358,16 @@ export default {
 function environmentName(prefix: string, repository: string, suffix: string): string {
   const repo = repository.split('/').at(-1)?.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '') || 'environment'
   const safeSuffix = suffix.toLowerCase().replace(/[^a-z0-9]+/gu, '').slice(0, 12) || randomUUID().replaceAll('-', '').slice(0, 10)
-  const available = 62 - prefix.length - safeSuffix.length
+  const available = 30 - prefix.length - safeSuffix.length
+  if (available < 1) throw new Error('Cloudflare namespace prefix and random identity leave no room for a repository name')
   return `${prefix}-${repo.slice(0, Math.max(1, available)).replace(/-$/u, '')}-${safeSuffix}`
+}
+
+function compareDispatchNamespaces(
+  left: CloudflareDispatchNamespace,
+  right: CloudflareDispatchNamespace,
+): number {
+  return (left.createdAt ?? '').localeCompare(right.createdAt ?? '') || left.name.localeCompare(right.name)
 }
 
 function ingressWorkerName(id: string): string {
