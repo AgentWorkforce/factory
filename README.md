@@ -173,6 +173,13 @@ only then checkpoints progress. Manifest/state/delivery ambiguity fails closed
 instead of silently skipping a feature. Configure its Slack channel and deploy
 the persona through the normal Agent Workforce proactive-agent path.
 
+The checked-in `factory-maintainability` reviewer applies the same catalog as a
+historian on every non-draft PR revision. It reads the exact PR diff and full git
+history, follows the repository-owned maintainability charter, and posts one
+bounded advisory review without editing the checkout or merging. Its compiled
+persona is scoped to `AgentWorkforce/factory`; deploy it through the normal
+Agent Workforce cloud-persona path.
+
 ### Cloud progress and trace correlation
 
 Authenticated Cloud progress reporting is enabled by default. Factory persists
