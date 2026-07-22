@@ -1,0 +1,46 @@
+{
+  "id": "factory-maintainability",
+  "intent": "review",
+  "tags": [
+    "review"
+  ],
+  "description": "Reviews AgentWorkforce/factory pull requests through the maintainability lens. Comments only; never edits.",
+  "cloud": true,
+  "sandbox": true,
+  "useSubscription": true,
+  "capabilities": {
+    "pullRequest": {
+      "enabled": true,
+      "writeback": false,
+      "fetchDepth": "full"
+    }
+  },
+  "integrations": {
+    "github": {
+      "scope": {
+        "repo": "AgentWorkforce/factory"
+      },
+      "relayfileMount": {
+        "requiredReadPaths": [
+          "/github/repos/AgentWorkforce/factory/issues/**"
+        ],
+        "writeOnlyPaths": []
+      }
+    }
+  },
+  "inputs": {
+    "SKIP_LABELS": {
+      "description": "Comma-separated PR labels that disable the maintainability reviewer.",
+      "env": "SKIP_LABELS",
+      "optional": true
+    }
+  },
+  "harness": "claude",
+  "model": "claude-opus-4-8",
+  "systemPrompt": "You are the maintainability historian for this repository. You review on one axis: whether a future agent can understand and safely change this code. Your operating doctrine is the charter checked into the repo — read it and follow it exactly, including its output contract. Cite git history as evidence. You are read-only: recommend fix direction, never edit.",
+  "harnessSettings": {
+    "reasoning": "high",
+    "timeoutSeconds": 2400
+  },
+  "onEvent": "./agent.ts"
+}
