@@ -1098,23 +1098,46 @@ describe('factory-feature-guardian delayed Slack receipts', () => {
   });
 
   it('keeps a delayed receipt retryable and replays the stable key without a second Slack post', async () => {
-    const formerFatalError = 'Slack post failed: no timestamp returned for feature broker-status';
+    const capabilityFeatures = [
+      manifestFeatures[0]!,
+      {
+        id: 'capabilities-register',
+        name: 'Register Capabilities',
+        cli: 'relay capabilities register',
+        description: 'Registers broker capabilities.',
+        tier: 1,
+      },
+    ];
+    const capabilityState: ProgressState = {
+      kind: 'factory-feature-guardian:progress',
+      version: 3,
+      generation: 1,
+      checkedIds: ['broker-up'],
+      cycleStartedAt: '2026-07-18T10:26:47.981Z',
+      totalFeatures: capabilityFeatures.length,
+      lastPost: { featureId: 'broker-up', ts: '17843701.029509' },
+    };
+    const formerFatalError =
+      'Slack post failed: no timestamp returned for feature capabilities-register';
     const transport = new LateReceiptReplaySlackTransport();
     const restore = bindPreviewTransport(transport);
-    const { ctx, files } = exactStateContext(JSON.stringify(progressState(1)));
+    const { ctx, files } = exactStateContext(
+      JSON.stringify(capabilityState),
+      renderManifest(capabilityFeatures)
+    );
     try {
       await expect(guardian.handler(ctx, { type: 'cron.tick' } as never)).resolves.toBeUndefined();
       expect(JSON.parse(files.get(CYCLE_STATE_PATH) ?? '{}').checkedIds).toEqual(['broker-up']);
       expect(ctx.log).toHaveBeenCalledWith('warn', 'factory-feature-guardian.post-receipt-pending', {
         channel: 'C0BHWJSF309',
-        feature: 'broker-status',
+        feature: 'capabilities-register',
         path: expect.any(String),
       });
       expect(JSON.stringify(vi.mocked(ctx.log).mock.calls)).not.toContain(formerFatalError);
 
       await expect(guardian.handler(ctx, { type: 'cron.tick' } as never)).resolves.toBeUndefined();
       const state = JSON.parse(files.get(CYCLE_STATE_PATH) ?? '{}') as ProgressState;
-      expect(state.checkedIds).toEqual(['broker-up', 'broker-status']);
+      expect(state.checkedIds).toEqual(['broker-up', 'capabilities-register']);
       expect(state.lastPost?.ts).toBe('1710000001.000100');
       expect(transport.providerCreates).toBe(1);
       expect(transport.attempts).toHaveLength(2);
