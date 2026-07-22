@@ -161,6 +161,25 @@ export type DispatchLifecycleLease = {
   leaseUntilMs: number
 }
 
+/** Latest cumulative usage reported by one durable agent, keyed by model. */
+export type DispatchLifecycleAgentUsage = {
+  model: string
+  inputTokens: number | null
+  outputTokens: number | null
+}
+
+export type DispatchLifecycleAgent = {
+  name: string
+  tracked: TrackedAgent
+  releasedAtMs?: number
+  /**
+   * Durable source for cost-ledger rehydration after a Factory owner restart.
+   * Entries are replaced by model, so cumulative runtime reports do not double
+   * count when they are replayed.
+   */
+  costUsage?: DispatchLifecycleAgentUsage[]
+}
+
 export type DispatchLifecycle = {
   /** Stable for one dispatch attempt and reused by crash takeover; new after a true reopen. */
   runId: string
@@ -168,14 +187,14 @@ export type DispatchLifecycle = {
   decision: TriageDecision
   dryRun: boolean
   phase: DispatchLifecyclePhase
-  agents: Array<{ name: string; tracked: TrackedAgent; releasedAtMs?: number }>
+  agents: DispatchLifecycleAgent[]
   invocationIds: string[]
   result?: import('../types').DispatchResult
   /** All repository-specific PR receipts for team dispatches. `pullRequest` remains the primary receipt for compatibility. */
   pullRequests?: import('./mount').GithubPublishPullRequestResult[]
   pullRequest?: import('./mount').GithubPublishPullRequestResult
   releaseReason?: string
-  /** Bounded token/USD aggregate captured before the terminal lifecycle save. */
+  /** Bounded token/USD aggregate updated with durable usage and finalized at terminal save. */
   cost?: RunCostTotal
   lease?: DispatchLifecycleLease
   updatedAtMs: number

@@ -269,16 +269,129 @@ describe('run cost accounting e2e', () => {
       await factory.stop()
     }
   })
+
+  it('restores persisted attribution when a running lifecycle is adopted after restart', async () => {
+    const workspaceId = 'cost-e2e-adoption'
+    const first = costScenario(workspaceId)
+    let restarted: ReturnType<typeof costScenario> | undefined
+
+    try {
+      const issue = parseLinearIssue(ISSUE_PATH, first.issueRecord)
+      const decision = await first.factory.triageIssue(issue)
+      await first.factory.dispatch(decision)
+      first.harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 1_000_000, 100_000)
+
+      // A replacement owner has no access to the previous process's in-memory
+      // ledger. The usage itself must therefore be durable before the owner
+      // releases the lifecycle lease.
+      await vi.waitFor(async () => {
+        const [[, lifecycle]] = await first.stateStore.listDispatchLifecycles(workspaceId)
+        const implementer = lifecycle.agents.find((agent) => agent.name === 'ar-185-impl-factory') as
+          | { costUsage?: unknown }
+          | undefined
+        expect(implementer?.costUsage).toEqual([
+          { model: 'openai/gpt-5.4', inputTokens: 1_000_000, outputTokens: 100_000 },
+        ])
+      })
+
+      await first.factory.stop()
+      restarted = costScenario(workspaceId, {
+        issueRecord: first.issueRecord,
+        mount: first.mount,
+        harness: first.harness,
+        stateStore: first.stateStore,
+      })
+      await restarted.factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      first.harness.emitExit('ar-185-impl-factory')
+      await expect(restarted.factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+
+      const [[, completed]] = await first.stateStore.listDispatchLifecycles(workspaceId)
+      expect(completed.cost?.byRole.find((entry) => entry.role === 'implementer')).toMatchObject({
+        inputTokens: 1_000_000,
+        outputTokens: 100_000,
+        usd: 6.5,
+        byModel: [{
+          model: 'openai/gpt-5.4',
+          inputTokens: 1_000_000,
+          outputTokens: 100_000,
+          usd: 6.5,
+        }],
+      })
+      expect(restarted.reporter.events.filter((event) => event.type === 'run.cost.v1')).toHaveLength(1)
+    } finally {
+      await first.factory.stop()
+      await restarted?.factory.stop()
+    }
+  })
+
+  it('makes token usage that races a terminal lifecycle observable', async () => {
+    const stateStore = new TerminalUsageRaceStateStore({ batchSize: 2 })
+    const scenario = costScenario('cost-e2e-terminal-race', { stateStore })
+
+    try {
+      const issue = parseLinearIssue(ISSUE_PATH, scenario.issueRecord)
+      const decision = await scenario.factory.triageIssue(issue)
+      await scenario.factory.dispatch(decision)
+      stateStore.onTerminalSave = () => {
+        stateStore.onTerminalSave = undefined
+        scenario.harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 2_000_000, 200_000)
+      }
+
+      scenario.harness.emitExit('ar-185-impl-factory')
+      await expect(scenario.factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(scenario.factory.status().counters.costUsageDroppedAfterTerminal).toBe(1))
+      expect(scenario.reporter.events).toContainEqual(expect.objectContaining({
+        type: 'factory.anomaly',
+        level: 'warn',
+        attributes: expect.objectContaining({
+          errorCode: 'cost_usage_after_terminal',
+          agentRole: 'implementer',
+          model: 'openai/gpt-5.4',
+          inputTokens: 2_000_000,
+          outputTokens: 200_000,
+        }),
+      }))
+      expect(scenario.reporter.events.filter((event) => event.type === 'run.cost.v1')).toHaveLength(1)
+    } finally {
+      await scenario.factory.stop()
+    }
+  })
 })
 
-const costScenario = (workspaceId: string) => {
-  const issueRecord = linearIssueRecord()
-  const mount = new FakeMountClient({ [ISSUE_PATH]: issueRecord })
-  const harness = new UsageHarness()
-  const stateStore = new InMemoryStateStore({ batchSize: 2 })
-  const ledger = new CostLedger()
-  const reporter = new RecordingReporter()
-  const stateWrites: string[] = []
+class TerminalUsageRaceStateStore extends InMemoryStateStore {
+  onTerminalSave?: () => void
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    const saved = await super.saveDispatchLifecycle(...args)
+    const lifecycle = args[5]
+    if (saved && (lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned')) {
+      this.onTerminalSave?.()
+    }
+    return saved
+  }
+}
+
+type CostScenarioOverrides = {
+  issueRecord?: ReturnType<typeof linearIssueRecord>
+  mount?: FakeMountClient
+  harness?: UsageHarness
+  stateStore?: InMemoryStateStore
+  ledger?: CostLedger
+  reporter?: RecordingReporter
+  stateWrites?: string[]
+}
+
+const costScenario = (workspaceId: string, overrides: CostScenarioOverrides = {}) => {
+  const issueRecord = overrides.issueRecord ?? linearIssueRecord()
+  const mount = overrides.mount ?? new FakeMountClient({ [ISSUE_PATH]: issueRecord })
+  const harness = overrides.harness ?? new UsageHarness()
+  const stateStore = overrides.stateStore ?? new InMemoryStateStore({ batchSize: 2 })
+  const ledger = overrides.ledger ?? new CostLedger()
+  const reporter = overrides.reporter ?? new RecordingReporter()
+  const stateWrites = overrides.stateWrites ?? []
   const factory = createFactory(factoryConfig(workspaceId), {
     mount,
     fleet: new InternalFleetClient({

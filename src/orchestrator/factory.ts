@@ -33,6 +33,7 @@ import type {
 import type {
   BatchSnapshot,
   BabysitterSessionState,
+  DispatchLifecycleAgentUsage,
   DispatchLifecycle,
   DispatchLifecyclePhase,
   GithubIssueCommentWatchPending,
@@ -489,6 +490,7 @@ export class FactoryLoop implements Factory {
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
   readonly #agentUsageInFlight = new Set<Promise<void>>()
+  #agentUsageSerial: Promise<void> = Promise.resolve()
   readonly #agentUsageGroups = new Set<string>()
   #startupAgentAdoptionActive = false
   #startupRosterExitSignals?: Set<string>
@@ -2906,6 +2908,7 @@ export class FactoryLoop implements Factory {
           continue
         }
         this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+        this.#hydrateCostLedger(claim.lifecycle)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
         if (
@@ -3227,6 +3230,7 @@ export class FactoryLoop implements Factory {
       throw new Error(`Refusing to dispatch ${decision.issue.key}: ${reason}`)
     }
     this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+    this.#hydrateCostLedger(claim.lifecycle)
     this.#scheduleDispatchLifecycleRenewal()
     if (claim.created) {
       await this.#reportLifecycle(claim.lifecycle, 'run.started')
@@ -3327,14 +3331,46 @@ export class FactoryLoop implements Factory {
 
   async #handleAgentUsage(usage: AgentUsage): Promise<void> {
     const record = (await this.#batch()).getIssueByAgent(usage.name)
-    if (!record) return
-    const tracked = record.agents.get(usage.name)
-    if (!tracked) return
-    const lifecycle = await this.#state.getDispatchLifecycle(
-      this.#workspaceId,
-      issueKey(record.issue),
-    )
-    if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) return
+    let key = record ? issueKey(record.issue) : undefined
+    let tracked = record?.agents.get(usage.name)
+    let lifecycle = key
+      ? await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      : undefined
+    // Completion removes the in-memory batch record immediately after the
+    // terminal lifecycle write. A broker usage snapshot can arrive in that
+    // narrow window; consult durable state so the drop is observable instead
+    // of silently looking like an unknown agent.
+    if (!tracked || !lifecycle) {
+      const durable = await this.#findDispatchLifecycleAgent(usage.name)
+      if (!durable) return
+      key = durable.key
+      lifecycle = durable.lifecycle
+      tracked = durable.tracked
+    }
+    if (!key || !tracked || !lifecycle) return
+    if (isTerminalDispatchLifecycle(lifecycle)) {
+      await this.#noteDroppedTerminalCostUsage(lifecycle, tracked, usage)
+      return
+    }
+    const activeRecord = record ?? inFlightRecordFromLifecycle(lifecycle)
+    const epoch = this.#dispatchLifecycleEpochs.get(key)
+    if (epoch === undefined) {
+      this.#increment('costUsagePersistenceUnavailable')
+      this.#logger.warn?.('[factory] unable to persist agent token usage without a durable lifecycle lease', {
+        agentName: usage.name,
+        issue: lifecycle.issue.key,
+      })
+      return
+    }
+    const lifecycleAgent = lifecycle.agents.find((agent) => agent.name === usage.name)
+    if (!lifecycleAgent) {
+      this.#increment('costUsageLifecycleAgentMissing')
+      this.#logger.warn?.('[factory] unable to persist agent token usage for an untracked durable agent', {
+        agentName: usage.name,
+        issue: lifecycle.issue.key,
+      })
+      return
+    }
     const model = usage.model ?? tracked.spec.model ?? 'unknown'
     const groupId = costUsageGroupId(lifecycle.runId, tracked)
     this.#costLedger.record({
@@ -3344,11 +3380,69 @@ export class FactoryLoop implements Factory {
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
     }, { entryId: costEntryId(groupId, model) })
+    const nextUsage = mergeDispatchLifecycleAgentUsage(lifecycleAgent.costUsage, {
+      model,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+    })
+    const nextLifecycle: DispatchLifecycle = {
+      ...lifecycle,
+      agents: lifecycle.agents.map((agent) => agent.name === usage.name
+        ? { ...agent, costUsage: nextUsage }
+        : agent),
+      cost: boundedRunCostTotal(this.#costLedger.getRunTotal(lifecycle.runId)),
+      updatedAtMs: this.#clock.now(),
+    }
+    const saved = await this.#state.saveDispatchLifecycle(
+      this.#workspaceId,
+      key,
+      this.#dispatchLifecycleOwner,
+      epoch,
+      this.#clock.now(),
+      nextLifecycle,
+    )
+    if (!saved) {
+      this.#dispatchLifecycleEpochs.delete(key)
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      if (latest && isTerminalDispatchLifecycle(latest)) {
+        await this.#noteDroppedTerminalCostUsage(latest, tracked, usage)
+      } else {
+        this.#increment('costUsagePersistenceFailures')
+        this.#logger.warn?.('[factory] unable to persist agent token usage', {
+          agentName: usage.name,
+          issue: lifecycle.issue.key,
+          reason: 'fence_rejected',
+        })
+        this.#scheduleDispatchLifecycleRetry(activeRecord)
+      }
+      return
+    }
     this.#agentUsageGroups.add(groupId)
   }
 
+  async #findDispatchLifecycleAgent(name: string): Promise<{
+    key: string
+    lifecycle: DispatchLifecycle
+    tracked: TrackedAgent
+  } | undefined> {
+    let match: { key: string; lifecycle: DispatchLifecycle; tracked: TrackedAgent } | undefined
+    for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+      const agent = lifecycle.agents.find((candidate) => candidate.name === name)
+      if (!agent || (match && match.lifecycle.updatedAtMs >= lifecycle.updatedAtMs)) continue
+      match = { key, lifecycle, tracked: agent.tracked }
+    }
+    return match
+  }
+
   #queueAgentUsage(usage: AgentUsage): Promise<void> {
-    const handling = this.#handleAgentUsage(usage).catch((error) => {
+    // Usage reports are cumulative snapshots. Serializing their read/modify/
+    // save cycle prevents two reports from replacing each other's durable
+    // per-agent model entry just before an owner restart.
+    const queued = this.#agentUsageSerial
+      .catch(() => undefined)
+      .then(() => this.#handleAgentUsage(usage))
+    this.#agentUsageSerial = queued.catch(() => undefined)
+    const handling = queued.catch((error) => {
       this.#increment('costUsageRecordingFailures')
       this.#logger.warn?.('[factory] unable to record agent token usage', {
         agentName: usage.name,
@@ -3359,6 +3453,47 @@ export class FactoryLoop implements Factory {
     })
     this.#agentUsageInFlight.add(handling)
     return handling
+  }
+
+  async #noteDroppedTerminalCostUsage(
+    lifecycle: DispatchLifecycle,
+    tracked: TrackedAgent,
+    usage: AgentUsage,
+  ): Promise<void> {
+    this.#increment('costUsageDroppedAfterTerminal')
+    await this.#report({
+      type: 'factory.anomaly',
+      level: 'warn',
+      runId: lifecycle.runId,
+      attributes: {
+        errorCode: 'cost_usage_after_terminal',
+        agentRole: tracked.spec.role,
+        model: usage.model ?? tracked.spec.model ?? 'unknown',
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+      },
+    })
+  }
+
+  #hydrateCostLedger(lifecycle: DispatchLifecycle): void {
+    for (const agent of lifecycle.agents) {
+      const usage = agent.costUsage ?? []
+      if (usage.length === 0) continue
+      const groupId = costUsageGroupId(lifecycle.runId, agent.tracked)
+      for (const entry of usage) {
+        this.#costLedger.record({
+          runId: lifecycle.runId,
+          role: agent.tracked.spec.role,
+          model: entry.model,
+          inputTokens: entry.inputTokens,
+          outputTokens: entry.outputTokens,
+        }, {
+          entryId: costEntryId(groupId, entry.model),
+          notifyUnpriced: false,
+        })
+      }
+      this.#agentUsageGroups.add(groupId)
+    }
   }
 
   async #drainAgentUsage(): Promise<void> {
@@ -3435,7 +3570,7 @@ export class FactoryLoop implements Factory {
     const primaryPullRequest = primaryPublishedPullRequest(previous, pullRequest, pullRequests)
     const lifecycleRunId = previous?.runId ?? randomUUID()
     const cost = isTerminalDispatchPhase(phase)
-      ? previous?.cost ?? this.#finalizeRunCost(record, lifecycleRunId)
+      ? this.#finalizeRunCost(record, lifecycleRunId)
       : previous?.cost
     const lifecycle = lifecycleFromInFlightRecord(
       record,
@@ -3448,8 +3583,9 @@ export class FactoryLoop implements Factory {
       cost,
     )
     for (const agent of lifecycle.agents) {
-      const previouslyReleasedAtMs = previous?.agents.find((candidate) => candidate.name === agent.name)?.releasedAtMs
-      if (previouslyReleasedAtMs !== undefined) agent.releasedAtMs = previouslyReleasedAtMs
+      const previousAgent = previous?.agents.find((candidate) => candidate.name === agent.name)
+      if (previousAgent?.releasedAtMs !== undefined) agent.releasedAtMs = previousAgent.releasedAtMs
+      if (previousAgent?.costUsage) agent.costUsage = structuredClone(previousAgent.costUsage)
       if (releasedAgentNames.has(agent.name)) agent.releasedAtMs ??= this.#clock.now()
     }
     const saved = await this.#state.saveDispatchLifecycle(
@@ -3592,6 +3728,7 @@ export class FactoryLoop implements Factory {
         throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
       this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+      this.#hydrateCostLedger(claim.lifecycle)
       this.#scheduleDispatchLifecycleRenewal()
       lifecycle = claim.lifecycle
       acquiredNow = true
@@ -15440,6 +15577,14 @@ const primaryPublishedPullRequest = (
   ) return receipt
   return previous?.pullRequest ?? receipt ?? receipts[0]
 }
+
+const mergeDispatchLifecycleAgentUsage = (
+  current: DispatchLifecycleAgentUsage[] | undefined,
+  next: DispatchLifecycleAgentUsage,
+): DispatchLifecycleAgentUsage[] => [
+  ...(current ?? []).filter((entry) => entry.model !== next.model),
+  structuredClone(next),
+].sort((left, right) => left.model.localeCompare(right.model))
 
 const lifecycleFromInFlightRecord = (
   record: InFlightIssue,

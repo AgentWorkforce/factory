@@ -61,6 +61,8 @@ export interface CostLedgerRecordOptions {
    * the same spawned agent.
    */
   entryId?: string
+  /** Rehydrating durable usage must not emit a duplicate unpriced-model notice. */
+  notifyUnpriced?: boolean
 }
 
 /**
@@ -83,7 +85,7 @@ export class CostLedger {
     const entryId = options.entryId ?? `entry:${this.#nextEntry++}`
     this.#records.set(entryId, record)
 
-    if (unpriced) this.#emitUnpriced(record as UnpricedModelCostRecord)
+    if (unpriced && options.notifyUnpriced !== false) this.#emitUnpriced(record as UnpricedModelCostRecord)
     return structuredClone(record)
   }
 
