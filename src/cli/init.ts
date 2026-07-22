@@ -9,7 +9,10 @@ import {
   type MountClient,
   type ResolvedFactoryWorkspace,
 } from '../index'
-import { ensureLocalMount } from '../mount/local-mount-preflight'
+
+type FactoryInitMount = MountClient & {
+  ensureLocalMount?: (startDir: string, options?: { acceptableWorkspaceIds?: readonly string[] }) => Promise<void>
+}
 
 export interface FactoryInitOptions {
   cwd?: string
@@ -20,7 +23,7 @@ export interface FactoryInitOptions {
   commandExists?: (command: string) => Promise<boolean>
   gitRemote?: (cwd: string) => Promise<string | undefined>
   resolveWorkspace?: () => Promise<ResolvedFactoryWorkspace>
-  cloudMountFromConfig?: (config: { workspaceId: string }) => Promise<MountClient>
+  cloudMountFromConfig?: (config: { workspaceId: string }) => Promise<FactoryInitMount>
   ensureLocalMount?: (workspaceId: string, cwd: string, options?: { acceptableWorkspaceIds?: readonly string[] }) => Promise<void>
 }
 
@@ -63,10 +66,17 @@ export async function initializeFactory(options: FactoryInitOptions = {}): Promi
   await assertAbsent(configPath)
 
   out.write(`Checking ${repo} in Relay workspace ${workspaceId}…\n`)
-  await (options.ensureLocalMount ?? ensureLocalMount)(workspaceId, cwd, {
-    acceptableWorkspaceIds: 'cloudWorkspaceId' in workspace && workspace.cloudWorkspaceId ? [workspace.cloudWorkspaceId] : undefined,
-  })
   const mount = await (options.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({ workspaceId })
+  const mountOptions = {
+    acceptableWorkspaceIds: 'cloudWorkspaceId' in workspace && workspace.cloudWorkspaceId ? [workspace.cloudWorkspaceId] : undefined,
+  }
+  if (options.ensureLocalMount) {
+    await options.ensureLocalMount(workspaceId, cwd, mountOptions)
+  } else if (mount.ensureLocalMount) {
+    await mount.ensureLocalMount(cwd, mountOptions)
+  } else {
+    throw new Error('The connected Relay workspace cannot start a local mount. Update @agent-relay/factory and run `factory init` again.')
+  }
   const githubStatus = await mount.ensureSubRoot(`/github/repos/${repo}`, { timeoutMs: 90_000 })
   if (githubStatus !== 'ready') {
     err.write(`GitHub repository ${repo} is not connected to this Relay workspace.\n`)
