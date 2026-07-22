@@ -1134,6 +1134,10 @@ const FACTORY_PROCEDURE_COMMANDS: Record<string, string> = {
     '  .agentworkforce/agents/factory-feature-guardian/agent.test.ts \\',
     '  src/feature-guardian/conversation.test.ts',
   ].join('\n'),
+  'maintainability-review': [
+    'npx vitest run \\',
+    '  .agentworkforce/agents/factory-maintainability/persona.test.ts',
+  ].join('\n'),
   'loop-and-recovery': [
     'npx vitest run \\',
     '  src/orchestrator/factory.test.ts \\',

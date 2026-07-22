@@ -847,6 +847,28 @@ execution, Slack reads and writes only `${SLACK_CHANNEL}/messages/**`, and one
 scheduled tick posts one question with a real provider `ts` before the exact
 state checkpoint advances.
 
+## maintainability-review
+
+**Categories:** `maintainability-review`.
+
+**Prerequisites:** source checkout for the deterministic contract test. A live
+check additionally requires the compiled persona deployed with the scoped
+GitHub integration.
+
+```bash
+npx vitest run \
+  .agentworkforce/agents/factory-maintainability/persona.test.ts
+```
+
+Assert the source and compiled persona both identify `AgentWorkforce/factory`,
+request full PR history, disable checkout writeback, and mount only the Factory
+issue-comment tree. The handler must subscribe only to opened and synchronized
+Factory PRs, with both the exact pull and issue companion paths retained. The
+charter must point reviewers to the canonical critical-path catalog, remain
+Factory-specific, and preserve the bounded verdict-first output contract. For a
+deployed preview, deliver the same non-draft head revision twice and confirm one
+review comment; deliver a new head and confirm exactly one additional review.
+
 ## loop-and-recovery
 
 **Categories:** `config-loop`.

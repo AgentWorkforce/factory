@@ -217,6 +217,7 @@ describe('Factory feature manifest contract', () => {
       'src/mount/relayfile-integration-preflight.ts',
       'src/state/github-lifecycle-identity.ts',
       '.agentworkforce/agents/factory-feature-guardian/',
+      '.agentworkforce/agents/factory-maintainability/',
       '.claude/skills/verify-features.md',
       'workflows/verify-features.ts',
       'scripts/verify-packed-e2e.mjs',
