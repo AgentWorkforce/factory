@@ -5,6 +5,7 @@ import type {
   GithubConnectionWrite,
   AgentLifecycleSignal,
   AgentMessage,
+  AgentUsage,
   MountClient,
   RosterEntry,
   SendInput,
@@ -24,6 +25,7 @@ type ExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
 type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Promise<void>
+type AgentUsageListener = (usage: AgentUsage) => void | Promise<void>
 
 export class FakeMountClient implements MountClient {
   readonly writebackTransport = 'test'
@@ -211,6 +213,7 @@ export class FakeFleetClient implements FleetClient {
   #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   #agentMessageListeners = new Set<AgentMessageListener>()
   #agentLifecycleSignalListeners = new Set<AgentLifecycleSignalListener>()
+  #agentUsageListeners = new Set<AgentUsageListener>()
   #sessionRefs = new Map<string, string | undefined>()
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
@@ -357,6 +360,13 @@ export class FakeFleetClient implements FleetClient {
     }
   }
 
+  onAgentUsage(listener: AgentUsageListener): () => void {
+    this.#agentUsageListeners.add(listener)
+    return () => {
+      this.#agentUsageListeners.delete(listener)
+    }
+  }
+
   preserveInfrastructureOnDispose(): void {
     this.preservedInfrastructure += 1
   }
@@ -390,6 +400,12 @@ export class FakeFleetClient implements FleetClient {
   async emitAgentLifecycleSignal(signal: AgentLifecycleSignal): Promise<void> {
     for (const listener of this.#agentLifecycleSignalListeners) {
       await listener(signal)
+    }
+  }
+
+  async emitAgentUsage(usage: AgentUsage): Promise<void> {
+    for (const listener of this.#agentUsageListeners) {
+      await listener(usage)
     }
   }
 }

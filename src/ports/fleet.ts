@@ -118,6 +118,16 @@ export type AgentLifecycleSignal = {
   question?: string
   invocationId?: string
 }
+/** Latest cumulative runtime totals for one spawned agent and model. */
+export type AgentUsage = {
+  name: string
+  /** Runtime-reported model wins over the spawn request when the provider supplies it. */
+  model?: string
+  /** Null means the runtime did not report that token count; Factory never infers it. */
+  inputTokens: number | null
+  /** Null means the runtime did not report that token count; Factory never infers it. */
+  outputTokens: number | null
+}
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
 export interface FleetClient {
@@ -152,6 +162,7 @@ export interface FleetClient {
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
+  onAgentUsage?(listener: (usage: AgentUsage) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
   // Durable backends track spawned-and-not-exited agents so the orchestrator
   // can persist them for crash recovery and re-adopt them after a restart.

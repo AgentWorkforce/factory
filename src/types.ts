@@ -10,6 +10,7 @@ import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 import type { VerificationGate } from './environments/verification-pipeline'
+import type { CostLedger } from './cost/ledger'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -32,6 +33,8 @@ export interface FactoryPorts {
   logger?: Logger
   /** Optional durable, no-throw progress reporter for the authenticated Cloud dashboard. */
   reporter?: FactoryEventReporter
+  /** Optional shared accounting seam; Factory creates an isolated ledger when omitted. */
+  costLedger?: CostLedger
   clock?: Clock
   processIdentityReader?: (pid: number) => Promise<ProcessIdentity | undefined>
   processFinder?: AgentProcessFinder

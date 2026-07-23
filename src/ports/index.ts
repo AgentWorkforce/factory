@@ -19,6 +19,7 @@ export type {
   AgentMessage,
   AgentPidResolution,
   AgentSpec,
+  AgentUsage,
   Capability,
   NodeCapability,
   PreviewCapability,

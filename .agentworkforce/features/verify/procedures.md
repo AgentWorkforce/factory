@@ -741,11 +741,17 @@ npx vitest run \
   src/observability/instance-identity.test.ts \
   src/observability/outbox.test.ts \
   src/observability/cloud-reporter.test.ts \
+  src/cost/pricing.test.ts \
+  src/cost/ledger.test.ts \
+  test/e2e/run-cost-accounting.test.ts \
   src/cli/fleet.test.ts
 ```
 
-Attempt forbidden task, prompt, message, path, command, source, token, raw error,
-and stack fields and require schema rejection. Assert stable nonzero trace IDs
+Attempt forbidden task, prompt, message, path, command, source, arbitrary token,
+raw error, and stack fields and require schema rejection. Drive the fake internal
+fleet with two reported model usages, assert exact role/model prices plus null
+usage when absent, one bounded `run.cost.v1` event, and one non-fatal unpriced
+model event without any task or path sentinel. Assert stable nonzero trace IDs
 for the same durable run and different IDs for different runs without span
 claims. Concurrent identity creation must converge on one mode-0600 opaque UUID
 and never derive it from host/user/path. Restart the outbox, compact beyond

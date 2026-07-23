@@ -2,7 +2,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -16,6 +16,7 @@ type AgentExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
 type AgentLifecycleSignalListener = (signal: AgentLifecycleSignal) => void | Promise<void>
+type AgentUsageListener = (usage: AgentUsage) => void | Promise<void>
 
 export interface TrackedAgent {
   invocationId?: string
@@ -99,6 +100,7 @@ export class RelayFleetClient implements FleetClient {
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
   readonly #agentLifecycleSignalListeners = new Set<AgentLifecycleSignalListener>()
+  readonly #agentUsageListeners = new Set<AgentUsageListener>()
   readonly #lifecycleInvocationsInFlight = new Set<string>()
   readonly #eventUnsubscribers: Array<() => void> = []
   readonly #tracked = new Map<string, TrackedAgent>()
@@ -381,6 +383,14 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  onAgentUsage(listener: AgentUsageListener): () => void {
+    this.#ensureEventSubscription()
+    this.#agentUsageListeners.add(listener)
+    return () => {
+      this.#agentUsageListeners.delete(listener)
+    }
+  }
+
   onAgentExit(listener: AgentExitListener): () => void {
     this.#ensureEventSubscription()
     this.#agentExitListeners.add(listener)
@@ -405,6 +415,7 @@ export class RelayFleetClient implements FleetClient {
     this.#deliveryFailedListeners.clear()
     this.#agentMessageListeners.clear()
     this.#agentLifecycleSignalListeners.clear()
+    this.#agentUsageListeners.clear()
     this.#lifecycleInvocationsInFlight.clear()
     this.#tracked.clear()
     if (this.#eventsStarted) {
@@ -668,6 +679,15 @@ export class RelayFleetClient implements FleetClient {
             issueKey: { type: 'string' },
             role: { type: 'string', enum: ['implementer', 'reviewer', 'babysitter', 'workflow'] },
             question: { type: 'string' },
+            usage: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                model: { type: 'string' },
+                inputTokens: { type: 'integer', minimum: 0 },
+                outputTokens: { type: 'integer', minimum: 0 },
+              },
+            },
           },
           required: ['kind', 'issueKey', 'role'],
         },
@@ -702,6 +722,8 @@ export class RelayFleetClient implements FleetClient {
       if (!signal) {
         throw new Error(`Invalid ${this.lifecycleActionName} input for invocation ${event.invocationId}`)
       }
+      const usage = lifecycleUsageFromInvocation(invocation.input, signal.name)
+      if (usage) await this.#emitAgentUsage(usage)
       if (this.#agentLifecycleSignalListeners.size === 0) {
         throw new Error('Factory lifecycle handler is not active')
       }
@@ -722,6 +744,15 @@ export class RelayFleetClient implements FleetClient {
       this.#log(`relay lifecycle invocation ${event.invocationId} rejected: ${errorMessage(error)}`)
     } finally {
       this.#lifecycleInvocationsInFlight.delete(event.invocationId)
+    }
+  }
+
+  async #emitAgentUsage(usage: AgentUsage): Promise<void> {
+    const results = await Promise.allSettled(
+      [...this.#agentUsageListeners].map(async (listener) => listener({ ...usage })),
+    )
+    if (results.some((result) => result.status === 'rejected')) {
+      this.#log(`relay usage listener rejected an update for ${usage.name}`)
     }
   }
 }
@@ -802,6 +833,30 @@ function lifecycleSignalFromInvocation(
     ...(question ? { question } : {}),
     invocationId,
   }
+}
+
+function lifecycleUsageFromInvocation(
+  input: Record<string, unknown> | undefined,
+  name: string,
+): AgentUsage | undefined {
+  const usage = asRecord(input?.usage)
+  if (!usage) return undefined
+  const model = readString(usage, 'model', 'model_id', 'modelId')
+  return {
+    name,
+    ...(model ? { model } : {}),
+    inputTokens: nullableTokenCount(usage, 'inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
+    outputTokens: nullableTokenCount(usage, 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
+  }
+}
+
+function nullableTokenCount(record: Record<string, unknown>, ...keys: string[]): number | null {
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue
+    const value = record[key]
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+  }
+  return null
 }
 
 function normalizeCapabilities(capabilities: RelayNodeCapability[] | undefined): NodeCapability[] {
