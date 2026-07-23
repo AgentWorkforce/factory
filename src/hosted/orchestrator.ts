@@ -1,6 +1,11 @@
 import { TieredTriage } from '../triage/tiered'
 import { isInFactoryScope } from '../safety/factory-scope'
+import { createFactoryCloudEventV1 } from '../observability/events'
 
+import type {
+  FactoryCloudEventInputV1,
+  FactoryCloudReleaseReasonV1,
+} from '../observability/events'
 import type { AgentSpec } from '../ports/fleet'
 import type { RepoMapEntry, TriageDecision } from '../types'
 import type {
@@ -101,6 +106,8 @@ export class HostedFactoryLoop implements HostedFactory {
           }
 
           const now = this.#timestamp()
+          const previousPhase = record?.phase
+          const created = !record
           record = record
             ? { ...record, issue: structuredClone(issue), phase: 'triaging', updatedAt: now }
             : {
@@ -112,6 +119,11 @@ export class HostedFactoryLoop implements HostedFactory {
                 updatedAt: now,
               }
           await this.#save(record, lease)
+          if (created) {
+            await this.#reportLifecycle(record, 'run.started')
+          } else if (previousPhase !== record.phase) {
+            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase })
+          }
           const decision = await this.#triage.triage(issue, {
             config: this.#options.config,
             repoMap: repoMapFromConfig(this.#options.config),
@@ -129,6 +141,12 @@ export class HostedFactoryLoop implements HostedFactory {
               updatedAt: this.#timestamp(),
             }
             await this.#save(record, lease)
+            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
+            await this.#reportLifecycle(record, 'run.waiting')
+            await this.#reportLifecycle(record, 'clarification.requested', {
+              component: 'writeback',
+              operation: 'request_clarification',
+            })
             lease = await this.#ensureWriteback(record, lease, 'clarification')
             report.awaitingClarification.push(issue.key)
             records = replaceRecord(records, record)
@@ -150,6 +168,12 @@ export class HostedFactoryLoop implements HostedFactory {
               updatedAt: this.#timestamp(),
             }
             await this.#save(record, lease)
+            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
+            await this.#reportLifecycle(record, 'run.waiting')
+            await this.#reportLifecycle(record, 'clarification.requested', {
+              component: 'writeback',
+              operation: 'request_clarification',
+            })
             lease = await this.#ensureWriteback(record, lease, 'clarification')
             report.awaitingClarification.push(issue.key)
             records = replaceRecord(records, record)
@@ -165,12 +189,24 @@ export class HostedFactoryLoop implements HostedFactory {
             updatedAt: this.#timestamp(),
           }
           await this.#save(record, lease)
+          await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
+          for (const invocation of record.invocations) {
+            await this.#reportAgent(record, invocation, 'agent.planned')
+          }
           activeCount += 1
           lease = await this.#dispatchRecord(record, lease, report)
           records = replaceRecord(records, record)
         } catch (error) {
           if (error instanceof HostedFactoryLeaseLostError) throw error
           report.errors.push({ issueKey: issue.key, message: errorMessage(error) })
+          if (record) {
+            await this.#reportLifecycle(record, 'factory.failure', {
+              component: 'orchestrator',
+              operation: 'issue_sweep',
+              errorClass: telemetryErrorClass(error),
+              retryable: true,
+            })
+          }
           this.#ports.logger?.error?.('[factory:hosted] issue sweep failed', {
             workspaceId: this.#options.workspaceId,
             issueKey: issue.key,
@@ -196,8 +232,9 @@ export class HostedFactoryLoop implements HostedFactory {
       return { status: 'fenced', invocationId: completion.invocationId }
     }
     let lease = claim.lease
+    let record: HostedFactoryIssueRecord | null = null
     try {
-      const record = await this.#ports.state.findIssueByInvocation(
+      record = await this.#ports.state.findIssueByInvocation(
         this.#options.workspaceId,
         completion.invocationId,
       )
@@ -210,8 +247,15 @@ export class HostedFactoryLoop implements HostedFactory {
           phase: record.phase,
         }
       }
+      const invocation = record.invocations.find(
+        (candidate) => candidate.invocationId === completion.invocationId,
+      )
+      const wasTerminal = invocation ? isTerminalInvocation(invocation) : false
       applyCompletion(record, completion, this.#timestamp())
       await this.#save(record, lease)
+      if (invocation && !wasTerminal && isTerminalInvocation(invocation)) {
+        await this.#reportAgent(record, invocation, 'agent.exited')
+      }
       if (record.invocations.every(isTerminalInvocation)) {
         lease = await this.#finishRecord(record, lease)
       }
@@ -224,6 +268,14 @@ export class HostedFactoryLoop implements HostedFactory {
     } catch (error) {
       if (error instanceof HostedFactoryLeaseLostError) {
         return { status: 'fenced', invocationId: completion.invocationId }
+      }
+      if (record) {
+        await this.#reportLifecycle(record, 'factory.failure', {
+          component: 'orchestrator',
+          operation: 'completion_ingest',
+          errorClass: telemetryErrorClass(error),
+          retryable: true,
+        })
       }
       throw error
     } finally {
@@ -254,6 +306,7 @@ export class HostedFactoryLoop implements HostedFactory {
           lease = await this.#ensureWriteback(record, lease, 'dispatch')
         }
         let changed = false
+        const exited: HostedFactoryInvocation[] = []
         for (const invocation of record.invocations) {
           if (isTerminalInvocation(invocation)) continue
           const completion = await this.#ports.completions.getInvocation({
@@ -262,10 +315,14 @@ export class HostedFactoryLoop implements HostedFactory {
           })
           if (!completion || completion.status === invocation.status) continue
           applyCompletion(record, completion, this.#timestamp())
+          if (isTerminalInvocation(invocation)) exited.push(invocation)
           changed = true
         }
         if (changed) {
           await this.#save(record, lease)
+          for (const invocation of exited) {
+            await this.#reportAgent(record, invocation, 'agent.exited')
+          }
           report.reconciled.push(record.issue.key)
         }
         if (record.invocations.every(isTerminalInvocation)) {
@@ -274,6 +331,12 @@ export class HostedFactoryLoop implements HostedFactory {
       } catch (error) {
         if (error instanceof HostedFactoryLeaseLostError) throw error
         report.errors.push({ issueKey: record.issue.key, message: errorMessage(error) })
+        await this.#reportLifecycle(record, 'factory.failure', {
+          component: 'orchestrator',
+          operation: 'reconciliation',
+          errorClass: telemetryErrorClass(error),
+          retryable: true,
+        })
         this.#ports.logger?.error?.('[factory:hosted] reconciliation failed', {
           workspaceId: this.#options.workspaceId,
           issueKey: record.issue.key,
@@ -309,11 +372,16 @@ export class HostedFactoryLoop implements HostedFactory {
       record.updatedAt = this.#timestamp()
       lease = await this.#renew(lease)
       await this.#save(record, lease)
+      await this.#reportAgent(record, invocation, 'agent.spawned')
     }
     if (record.invocations.every((invocation) => invocation.status !== 'pending')) {
+      const previousPhase = record.phase
       record.phase = 'running'
       record.updatedAt = this.#timestamp()
       await this.#save(record, lease)
+      if (previousPhase !== record.phase) {
+        await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase })
+      }
       lease = await this.#ensureWriteback(record, lease, 'dispatch')
       if (!report.dispatched.includes(record.issue.key)) report.dispatched.push(record.issue.key)
     }
@@ -325,9 +393,13 @@ export class HostedFactoryLoop implements HostedFactory {
     initialLease: HostedFactoryLease,
   ): Promise<HostedFactoryLease> {
     let lease = await this.#renew(initialLease)
+    const previousPhase = record.phase
     record.phase = 'merge-gate'
     record.updatedAt = this.#timestamp()
     await this.#save(record, lease)
+    if (previousPhase !== record.phase) {
+      await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase })
+    }
     const mergeGate = await (this.#ports.mergeGate?.evaluate({
       workspaceId: this.#options.workspaceId,
       record: structuredClone(record),
@@ -346,6 +418,11 @@ export class HostedFactoryLoop implements HostedFactory {
       record.phase = mergeGate.status === 'ready' ? 'complete' : 'blocked'
       record.updatedAt = this.#timestamp()
       await this.#save(record, lease)
+      await this.#reportLifecycle(
+        record,
+        record.phase === 'complete' ? 'run.succeeded' : 'run.failed',
+        { previousPhase: 'merge-gate' },
+      )
     }
     return lease
   }
@@ -362,6 +439,7 @@ export class HostedFactoryLoop implements HostedFactory {
     record.updatedAt = this.#timestamp()
     await this.#save(record, initialLease)
     let lease = await this.#renew(initialLease)
+    let applied = false
     try {
       const input = {
         workspaceId: this.#options.workspaceId,
@@ -381,6 +459,7 @@ export class HostedFactoryLoop implements HostedFactory {
       }
       lease = await this.#renew(lease)
       record[field] = { status: 'posted', attempts, postedAt: this.#timestamp() }
+      applied = true
     } catch (error) {
       record[field] = { status: 'failed', attempts, error: errorMessage(error) }
       this.#ports.logger?.warn?.('[factory:hosted] writeback failed', {
@@ -392,7 +471,96 @@ export class HostedFactoryLoop implements HostedFactory {
     }
     record.updatedAt = this.#timestamp()
     await this.#save(record, lease)
+    if (applied) {
+      await this.#reportLifecycle(record, 'writeback.applied', {
+        component: 'writeback',
+        operation: kind,
+      })
+    }
     return lease
+  }
+
+  async #report(
+    input: Parameters<typeof createFactoryCloudEventV1>[0],
+  ): Promise<void> {
+    if (!this.#ports.reporter) return
+    try {
+      await this.#ports.reporter.report(createFactoryCloudEventV1(input, {
+        now: this.#now,
+      }))
+    } catch (error) {
+      this.#ports.logger?.warn?.('[factory:hosted] progress reporter rejected an event', {
+        eventType: input.type,
+        errorClass: telemetryErrorClass(error),
+      })
+    }
+  }
+
+  async #reportLifecycle(
+    record: HostedFactoryIssueRecord,
+    type: FactoryCloudEventInputV1['type'],
+    options: {
+      level?: FactoryCloudEventInputV1['level']
+      previousPhase?: HostedFactoryIssueRecord['phase']
+      component?: string
+      operation?: string
+      errorClass?: string
+      errorCode?: string
+      retryable?: boolean
+    } = {},
+  ): Promise<void> {
+    await this.#report({
+      type,
+      level: options.level ?? (
+        type === 'run.failed' || type === 'factory.failure' ? 'error' : 'info'
+      ),
+      runId: record.runId ?? hostedFactoryRunId(record.workspaceId, record.issue.uuid),
+      phase: record.phase,
+      status: hostedTelemetryRunStatus(record.phase, type),
+      run: hostedTelemetryRun(record),
+      attributes: {
+        backend: 'hosted',
+        component: options.component ?? 'orchestrator',
+        operation: options.operation ?? 'save_lifecycle',
+        previousPhase: options.previousPhase,
+        errorClass: options.errorClass,
+        errorCode: options.errorCode,
+        retryable: options.retryable,
+        trackedAgents: record.invocations.length,
+      },
+    })
+  }
+
+  async #reportAgent(
+    record: HostedFactoryIssueRecord,
+    invocation: HostedFactoryInvocation,
+    type: 'agent.planned' | 'agent.spawned' | 'agent.exited',
+  ): Promise<void> {
+    await this.#report({
+      type,
+      level: invocation.status === 'failed' ? 'error' : 'info',
+      runId: record.runId ?? hostedFactoryRunId(record.workspaceId, record.issue.uuid),
+      phase: record.phase,
+      status: hostedTelemetryRunStatus(record.phase, type),
+      run: {
+        ...hostedTelemetryRun(record),
+        repository: invocation.spec.repo,
+      },
+      attributes: {
+        backend: 'hosted',
+        component: 'fleet',
+        operation: type.slice('agent.'.length),
+        agentRole: invocation.spec.role,
+        invocationId: invocation.invocationId,
+        nodeId: invocation.node,
+        releaseReason: hostedInvocationReleaseReason(invocation),
+        errorCode: invocation.status === 'failed'
+          ? 'agent_failed'
+          : invocation.status === 'cancelled'
+            ? 'agent_cancelled'
+            : undefined,
+      },
+    })
   }
 
   async #claim(operation: string) {
@@ -411,6 +579,7 @@ export class HostedFactoryLoop implements HostedFactory {
   }
 
   async #save(record: HostedFactoryIssueRecord, lease: HostedFactoryLease): Promise<void> {
+    record.runId ??= hostedFactoryRunId(record.workspaceId, record.issue.uuid)
     if (!await this.#ports.state.saveIssue(record, lease)) {
       throw new HostedFactoryLeaseLostError()
     }
@@ -453,6 +622,14 @@ export function hostedFactoryInvocationId(
     spec.workflow ?? '',
   ].join(':')
   return `factory:${stableHash(identity)}`
+}
+
+export function hostedFactoryRunId(workspaceId: string, issueUuid: string): string {
+  return `factory:hosted:${stableHash(JSON.stringify([
+    'agent-relay.factory.hosted-run.v1',
+    workspaceId,
+    issueUuid,
+  ]))}`
 }
 
 function defaultMergeGate(
@@ -545,6 +722,48 @@ function isTerminalInvocation(invocation: HostedFactoryInvocation): boolean {
 
 function isTerminalIssue(record: HostedFactoryIssueRecord): boolean {
   return record.phase === 'complete' || record.phase === 'blocked'
+}
+
+function hostedTelemetryRun(
+  record: HostedFactoryIssueRecord,
+): NonNullable<FactoryCloudEventInputV1['run']> {
+  return {
+    source: 'linear',
+    repository: record.decision?.routes[0]?.repo ?? record.invocations[0]?.spec.repo,
+    issueKey: record.issue.key,
+    recipe: record.decision?.scope,
+  }
+}
+
+function hostedTelemetryRunStatus(
+  phase: HostedFactoryIssueRecord['phase'],
+  type: FactoryCloudEventInputV1['type'],
+): NonNullable<FactoryCloudEventInputV1['status']> {
+  if (type === 'run.failed') return 'failed'
+  if (type === 'run.succeeded') return 'succeeded'
+  switch (phase) {
+    case 'awaiting-clarification':
+      return 'waiting'
+    case 'blocked':
+      return 'blocked'
+    case 'complete':
+      return 'succeeded'
+    default:
+      return 'running'
+  }
+}
+
+function hostedInvocationReleaseReason(
+  invocation: HostedFactoryInvocation,
+): FactoryCloudReleaseReasonV1 | undefined {
+  if (invocation.status === 'completed') return 'completed'
+  if (invocation.status === 'failed' || invocation.status === 'cancelled') return 'other'
+  return undefined
+}
+
+function telemetryErrorClass(error: unknown): string {
+  const name = error instanceof Error ? error.name : ''
+  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 function dedupeIssues<T extends { uuid: string }>(issues: T[]): T[] {

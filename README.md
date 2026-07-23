@@ -434,11 +434,19 @@ import {
 const state = new DurableObjectHostedFactoryStateStore(durableObjectState.storage)
 const factory = createHostedFactory(
   { workspaceId, ownerId: isolateId, config },
-  { state, discovery, fleet, completions, mergeGate, writeback },
+  { state, discovery, fleet, completions, mergeGate, writeback, reporter },
 )
 
 await factory.runOnce() // invoke from cron/alarm and safe webhook wakeups
 ```
+
+The optional `reporter` implements the canonical `FactoryEventReporter`.
+Hosted runs persist a deterministic run ID per workspace and issue, then emit
+lifecycle events only after the corresponding fenced state write. Worker hosts
+that only need the Factory-owned wire schema, event creator, and reporter types
+should import `@agent-relay/factory/telemetry`; unlike the broader
+`@agent-relay/factory/observability` surface, it does not export the
+filesystem-backed outbox or instance identity helpers.
 
 The Durable Object adapter stores each workspace independently and performs
 lease claims plus lifecycle writes in storage transactions. Every mutation is

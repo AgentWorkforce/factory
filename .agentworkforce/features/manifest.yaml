@@ -1,11 +1,11 @@
 version: '1.1'
-updated: '2026-07-21'
+updated: '2026-07-23'
 catalog:
   category_count: 25
-  feature_count: 302
+  feature_count: 304
   tier_counts:
-    1: 44
-    2: 123
+    1: 45
+    2: 124
     3: 11
     4: 51
     5: 58
@@ -1454,6 +1454,13 @@ categories:
         location: src/observability/, src/index.ts, package.json
         verify_tier: 1
 
+      - id: api-telemetry-contract
+        name: Worker-Safe Telemetry Contract API
+        api: '@agent-relay/factory/telemetry'
+        description: Export only the Factory-owned event schemas, creator, and reporter types without pulling filesystem-backed outbox or instance identity modules into Worker consumers
+        location: src/telemetry.ts, src/observability/events.ts, src/ports/observability.ts, package.json
+        verify_tier: 1
+
       - id: api-hosted-control-plane
         name: Hosted Factory API
         api: '@agent-relay/factory/hosted'
@@ -1492,6 +1499,13 @@ categories:
         api: hostedFactoryInvocationId()
         description: Derive stable workspace, issue, role, and route invocation IDs so an at-least-once spawn retry cannot create a second worker
         location: src/hosted/orchestrator.ts
+        verify_tier: 2
+
+      - id: hosted-durable-run-telemetry
+        name: Durable Hosted Run Telemetry
+        api: hostedFactoryRunId() / HostedFactoryPorts.reporter
+        description: Persist one deterministic run identity per issue and report lifecycle, agent, clarification, writeback, success, and failure events only after their fenced hosted state writes
+        location: src/hosted/orchestrator.ts, src/hosted/types.ts, src/telemetry.ts
         verify_tier: 2
 
       - id: hosted-merge-gate-writeback

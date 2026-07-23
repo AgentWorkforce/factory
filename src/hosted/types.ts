@@ -1,5 +1,6 @@
 import type { FactoryConfig } from '../config/schema'
 import type { AgentSpec, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { FactoryEventReporter } from '../ports/observability'
 import type { Logger } from '../ports/system'
 import type { LinearIssue, TriageDecision, TriageEngine } from '../types'
 
@@ -63,6 +64,8 @@ export type HostedFactoryWritebackRecord = {
 
 export type HostedFactoryIssueRecord = {
   workspaceId: string
+  /** Deterministic durable-run identity. Optional only for rows written before hosted telemetry existed. */
+  runId?: string
   issue: LinearIssue
   phase: HostedFactoryIssuePhase
   decision?: TriageDecision
@@ -167,6 +170,7 @@ export type HostedFactoryPorts = {
   writeback: HostedFactoryWriteback
   triage?: TriageEngine
   mergeGate?: HostedFactoryMergeGate
+  reporter?: FactoryEventReporter
   logger?: Logger
   now?: () => Date
 }
