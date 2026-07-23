@@ -325,6 +325,72 @@ describe('run cost accounting e2e', () => {
     }
   })
 
+  it('does not let a racing nonterminal phase save clobber durable token usage', async () => {
+    const stateStore = new NonterminalUsageRaceStateStore({ batchSize: 2 })
+    const scenario = costScenario('cost-e2e-nonterminal-race', { stateStore })
+
+    try {
+      const issue = parseLinearIssue(ISSUE_PATH, scenario.issueRecord)
+      const decision = await scenario.factory.triageIssue(issue)
+      const dispatching = scenario.factory.dispatch(decision)
+
+      await stateStore.runningSaveStarted
+      scenario.harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 1_000_000, 100_000)
+      // Give the usage callback a chance to complete its read/modify/write
+      // while the stale running-phase snapshot is held at the persistence
+      // boundary. A shared lifecycle serializer keeps it queued instead.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      stateStore.releaseRunningSave()
+      await dispatching
+
+      await vi.waitFor(async () => {
+        const [[, lifecycle]] = await stateStore.listDispatchLifecycles('cost-e2e-nonterminal-race')
+        expect(lifecycle.agents.find((agent) => agent.name === 'ar-185-impl-factory')?.costUsage).toEqual([
+          { model: 'openai/gpt-5.4', inputTokens: 1_000_000, outputTokens: 100_000 },
+        ])
+      })
+    } finally {
+      stateStore.releaseRunningSave()
+      await scenario.factory.stop()
+    }
+  })
+
+  it('emits anomalies when usage persistence loses its fence and lease', async () => {
+    const stateStore = new RejectFirstUsageSaveStateStore({ batchSize: 2 })
+    const scenario = costScenario('cost-e2e-persistence-failures', { stateStore })
+
+    try {
+      const issue = parseLinearIssue(ISSUE_PATH, scenario.issueRecord)
+      const decision = await scenario.factory.triageIssue(issue)
+      await scenario.factory.dispatch(decision)
+
+      scenario.harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 100, 20)
+      scenario.harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 200, 40)
+
+      await vi.waitFor(() => {
+        expect(scenario.reporter.events.filter((event) => event.type === 'factory.anomaly')).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              level: 'error',
+              attributes: expect.objectContaining({ errorCode: 'cost_usage_persistence_failed' }),
+            }),
+            expect.objectContaining({
+              level: 'error',
+              attributes: expect.objectContaining({ errorCode: 'cost_usage_lease_unavailable' }),
+            }),
+          ]),
+        )
+      })
+      expect(scenario.factory.status().counters).toMatchObject({
+        costUsagePersistenceFailures: 1,
+        costUsagePersistenceUnavailable: 1,
+      })
+    } finally {
+      await scenario.factory.stop()
+    }
+  })
+
   it('makes token usage that races a terminal lifecycle observable', async () => {
     const stateStore = new TerminalUsageRaceStateStore({ batchSize: 2 })
     const scenario = costScenario('cost-e2e-terminal-race', { stateStore })
@@ -371,6 +437,55 @@ class TerminalUsageRaceStateStore extends InMemoryStateStore {
       this.onTerminalSave?.()
     }
     return saved
+  }
+}
+
+class RejectFirstUsageSaveStateStore extends InMemoryStateStore {
+  #rejectedUsageSave = false
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    const lifecycle = args[5]
+    if (!this.#rejectedUsageSave && lifecycle.agents.some((agent) => agent.costUsage?.length)) {
+      this.#rejectedUsageSave = true
+      return false
+    }
+    return super.saveDispatchLifecycle(...args)
+  }
+}
+
+class NonterminalUsageRaceStateStore extends InMemoryStateStore {
+  readonly runningSaveStarted: Promise<void>
+  #markRunningSaveStarted!: () => void
+  #releaseRunningSave!: () => void
+  #runningSaveReleased: Promise<void>
+  #heldRunningSave = false
+
+  constructor(...args: ConstructorParameters<typeof InMemoryStateStore>) {
+    super(...args)
+    this.runningSaveStarted = new Promise((resolve) => {
+      this.#markRunningSaveStarted = resolve
+    })
+    this.#runningSaveReleased = new Promise((resolve) => {
+      this.#releaseRunningSave = resolve
+    })
+  }
+
+  releaseRunningSave(): void {
+    this.#releaseRunningSave()
+  }
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    const lifecycle = args[5]
+    if (!this.#heldRunningSave && lifecycle.phase === 'running') {
+      this.#heldRunningSave = true
+      this.#markRunningSaveStarted()
+      await this.#runningSaveReleased
+    }
+    return super.saveDispatchLifecycle(...args)
   }
 }
 
