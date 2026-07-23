@@ -121,8 +121,6 @@ export class HostedFactoryLoop implements HostedFactory {
           await this.#save(record, lease)
           if (created) {
             await this.#reportLifecycle(record, 'run.started')
-          } else if (previousPhase !== record.phase) {
-            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase })
           }
           const decision = await this.#triage.triage(issue, {
             config: this.#options.config,
@@ -141,12 +139,16 @@ export class HostedFactoryLoop implements HostedFactory {
               updatedAt: this.#timestamp(),
             }
             await this.#save(record, lease)
-            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
-            await this.#reportLifecycle(record, 'run.waiting')
-            await this.#reportLifecycle(record, 'clarification.requested', {
-              component: 'writeback',
-              operation: 'request_clarification',
-            })
+            if (previousPhase !== 'awaiting-clarification') {
+              await this.#reportLifecycle(record, 'run.phase_changed', {
+                previousPhase: previousPhase ?? 'triaging',
+              })
+              await this.#reportLifecycle(record, 'run.waiting')
+              await this.#reportLifecycle(record, 'clarification.requested', {
+                component: 'writeback',
+                operation: 'request_clarification',
+              })
+            }
             lease = await this.#ensureWriteback(record, lease, 'clarification')
             report.awaitingClarification.push(issue.key)
             records = replaceRecord(records, record)
@@ -168,12 +170,16 @@ export class HostedFactoryLoop implements HostedFactory {
               updatedAt: this.#timestamp(),
             }
             await this.#save(record, lease)
-            await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
-            await this.#reportLifecycle(record, 'run.waiting')
-            await this.#reportLifecycle(record, 'clarification.requested', {
-              component: 'writeback',
-              operation: 'request_clarification',
-            })
+            if (previousPhase !== 'awaiting-clarification') {
+              await this.#reportLifecycle(record, 'run.phase_changed', {
+                previousPhase: previousPhase ?? 'triaging',
+              })
+              await this.#reportLifecycle(record, 'run.waiting')
+              await this.#reportLifecycle(record, 'clarification.requested', {
+                component: 'writeback',
+                operation: 'request_clarification',
+              })
+            }
             lease = await this.#ensureWriteback(record, lease, 'clarification')
             report.awaitingClarification.push(issue.key)
             records = replaceRecord(records, record)
@@ -189,7 +195,9 @@ export class HostedFactoryLoop implements HostedFactory {
             updatedAt: this.#timestamp(),
           }
           await this.#save(record, lease)
-          await this.#reportLifecycle(record, 'run.phase_changed', { previousPhase: 'triaging' })
+          await this.#reportLifecycle(record, 'run.phase_changed', {
+            previousPhase: previousPhase ?? 'triaging',
+          })
           for (const invocation of record.invocations) {
             await this.#reportAgent(record, invocation, 'agent.planned')
           }

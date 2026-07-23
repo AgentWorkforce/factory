@@ -532,11 +532,30 @@ describe('HostedFactoryLoop', () => {
       'writeback.applied',
     ])
 
+    const waitingEventCount = reporter.events.length
+    const unchanged = await factory.runOnce()
+    expect(unchanged.awaitingClarification).toEqual(['AR-2778'])
+    expect(writeback.clarifications).toHaveLength(1)
+    expect(reporter.events).toHaveLength(waitingEventCount)
+
     discovery.issues = [issue()]
     const resumed = await factory.runOnce()
     expect(resumed.dispatched).toEqual(['AR-2778'])
     expect((fleet as Fleet).calls).toHaveLength(2)
     expect(writeback.clarifications).toHaveLength(1)
+    expect(reporter.events.slice(waitingEventCount).map(({ type }) => type)).toEqual([
+      'run.phase_changed',
+      'agent.planned',
+      'agent.planned',
+      'agent.spawned',
+      'agent.spawned',
+      'run.phase_changed',
+      'writeback.applied',
+    ])
+    expect(reporter.events[waitingEventCount]).toMatchObject({
+      phase: 'dispatching',
+      attributes: { previousPhase: 'awaiting-clarification' },
+    })
   })
 
   it('isolates a rejecting reporter from dispatch, durable state, and dedupe', async () => {
