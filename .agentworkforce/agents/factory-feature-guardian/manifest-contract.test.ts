@@ -185,6 +185,7 @@ describe('Factory feature manifest contract', () => {
     const expected: Record<string, string> = {
       '.': 'createFactory()',
       './observability': '@agent-relay/factory/observability',
+      './telemetry': '@agent-relay/factory/telemetry',
       './testing': '@agent-relay/factory/testing',
       './writeback': 'LinearWriteback / GithubWriteback / SlackWriteback',
       './node': 'createFactoryNodeDefinition()',

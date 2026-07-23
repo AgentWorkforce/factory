@@ -688,7 +688,7 @@ mkdir "$TMP/consumer" && cd "$TMP/consumer"
 npm init -y >/dev/null
 npm install --ignore-scripts "$TMP"/*.tgz >/dev/null
 node --input-type=module <<'NODE'
-for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/hosted', '/environments']) {
+for (const subpath of ['', '/observability', '/telemetry', '/testing', '/writeback', '/featuremap', '/hosted', '/environments']) {
   const mod = await import(`@agent-relay/factory${subpath}`)
   if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)
 }
@@ -698,7 +698,7 @@ NODE
 ```
 
 Back in the checkout, run the focused tests named by each API entry. Assert root
-types and all eight package export keys resolve, hosted remains worker-safe,
+types and all nine JavaScript package entrypoints resolve, hosted remains worker-safe,
 feature-map validation includes procedure routing, dependency/worktree ports are
 exported, and fake clients support a hermetic consumer. Clean only `$TMP`.
 
@@ -718,8 +718,11 @@ npm run verify:e2e
 ```
 
 Assert reconciliation precedes discovery; scope, dedupe, batch capacity, triage,
-deterministic invocation IDs, clarification, spawn, pushed completion, polling
-completion, merge gate, and every provider writeback transition. Repeat each
+deterministic run and invocation IDs, clarification, spawn, pushed completion,
+polling completion, merge gate, and every provider writeback transition. Require
+the exact persisted lifecycle event order, no second start or spawn event on a
+duplicate sweep, correct succeeded/failed terminal status, and unchanged
+dispatch/state when a custom reporter rejects. Repeat each
 external success immediately before a simulated fenced save and require the
 same invocation or idempotency key after takeover. Two owners must yield one
 live epoch; expired owners cannot save. Run the same matrix through in-memory

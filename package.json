@@ -38,6 +38,10 @@
       "types": "./dist/observability/index.d.ts",
       "import": "./dist/observability/index.js"
     },
+    "./telemetry": {
+      "types": "./dist/telemetry.d.ts",
+      "import": "./dist/telemetry.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"

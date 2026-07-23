@@ -4,6 +4,7 @@ import {
   createHostedFactory,
   InMemoryHostedFactoryStateStore,
 } from '@agent-relay/factory/hosted'
+import { FactoryCloudEventInputV1Schema } from '@agent-relay/factory/telemetry'
 
 const checks = ['public-exports-import']
 const workspaceId = 'factory-e2e-workspace'
@@ -53,6 +54,7 @@ const state = new InMemoryHostedFactoryStateStore({ now: () => nowMs })
 const spawned = []
 const invocationStatus = new Map()
 const writebacks = { clarification: [], dispatched: [], completed: [] }
+const telemetryEvents = []
 const ports = {
   discovery: { discoverReady: async () => [structuredClone(issue), structuredClone(issue)] },
   state,
@@ -72,6 +74,15 @@ const ports = {
     dispatched: async (input) => writebacks.dispatched.push(structuredClone(input)),
     completed: async (input) => writebacks.completed.push(structuredClone(input)),
   },
+  reporter: {
+    report: async (event) => telemetryEvents.push(FactoryCloudEventInputV1Schema.parse(event)),
+    flush: async () => ({
+      delivered: telemetryEvents.length,
+      pending: 0,
+      attempts: telemetryEvents.length,
+      stoppedReason: 'empty',
+    }),
+  },
   now: () => new Date(nowMs),
 }
 const factory = createHostedFactory({
@@ -87,14 +98,28 @@ assert.equal(dispatched.discovered, 1, 'duplicate discovery entries must collaps
 assert.equal(spawned.length, 2, 'single scope must dispatch implementer plus reviewer')
 assert.equal(new Set(spawned.map(({ invocationId }) => invocationId)).size, 2)
 assert.equal(writebacks.dispatched.length, 1)
+assert.deepEqual(telemetryEvents.map(({ type }) => type), [
+  'run.started',
+  'run.phase_changed',
+  'agent.planned',
+  'agent.planned',
+  'agent.spawned',
+  'agent.spawned',
+  'run.phase_changed',
+  'writeback.applied',
+])
+assert.equal(new Set(telemetryEvents.map(({ runId }) => runId)).size, 1)
 checks.push('discover-triage-dispatch-writeback')
+checks.push('hosted-telemetry-dispatch-lifecycle')
 
+const eventCountAfterDispatch = telemetryEvents.length
 const duplicateSweep = await factory.runOnce()
 assert.equal(spawned.length, 2, 'repeat discovery must not duplicate fleet spawns')
 assert.ok(duplicateSweep.skipped.some(({ issueKey, reason }) =>
   issueKey === issue.key && reason === 'already running'
 ))
 assert.equal(writebacks.dispatched.length, 1, 'dispatch writeback must be idempotent')
+assert.equal(telemetryEvents.length, eventCountAfterDispatch, 'repeat discovery must not duplicate lifecycle events')
 checks.push('at-least-once-deduplication')
 
 nowMs += 5_000
@@ -112,6 +137,14 @@ const terminal = await state.getIssue(workspaceId, issue.uuid)
 assert.equal(terminal?.phase, 'complete')
 assert.equal(terminal?.mergeGate?.status, 'ready')
 assert.equal(writebacks.completed.length, 1)
+assert.deepEqual(telemetryEvents.slice(eventCountAfterDispatch).map(({ type }) => type), [
+  'agent.exited',
+  'agent.exited',
+  'run.phase_changed',
+  'writeback.applied',
+  'run.succeeded',
+])
+assert.equal(telemetryEvents.at(-1)?.status, 'succeeded')
 checks.push('completion-merge-gate-writeback')
 
 const replayed = await factory.ingestCompletion({
