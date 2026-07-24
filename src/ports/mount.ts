@@ -108,6 +108,14 @@ export interface MountClient {
   readonly integrationConnections?: FactoryIntegrationConnections
   /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
   ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
+  /**
+   * Whether a local mount is terminally degraded because the cloud session
+   * lacks the filesystem scope the mount needs. When true, the mirror is
+   * read-denied and cannot recover without re-auth + restart, so consumers must
+   * refuse to spawn or resume agents against it. Absent on mounts that cannot
+   * report scope health (e.g. the test transport).
+   */
+  isLocalMountAuthDegraded?(): boolean
   /** Stop SDK-owned local mount processes created by this client. */
   dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>

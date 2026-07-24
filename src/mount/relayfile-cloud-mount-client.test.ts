@@ -21,6 +21,7 @@ import {
   type RelayFileClientLike,
 } from './relayfile-cloud-mount-client'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import { MountAuthScopeError } from './mount-auth-error'
 
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
@@ -460,6 +461,51 @@ describe('RelayfileCloudMountClient', () => {
     }
   })
 
+  it('treats a MountAuthScopeError as terminal: no retry, marks auth-degraded', async () => {
+    vi.useFakeTimers()
+    const fake = new FakeRelayFileClient()
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
+    const localMountPreflight = vi.fn(async () => {
+      throw new MountAuthScopeError('missing fs:read', { missingScope: 'fs:read' })
+    })
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: {
+        joinWorkspace: vi.fn(),
+        ensureMountedWorkspace,
+      },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await expect(mount.ensureLocalMount('/work/repo')).rejects.toBeInstanceOf(MountAuthScopeError)
+      expect(mount.isLocalMountAuthDegraded()).toBe(true)
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_auth_scope',
+        degradedMounts: 1,
+      }])
+
+      // The supervisor must NOT re-run the preflight for a terminal failure.
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(localMountPreflight).toHaveBeenCalledTimes(1)
+    } finally {
+      await mount.dispose()
+      vi.useRealTimers()
+    }
+  })
+
   it('coalesces concurrent mount checks for the same checkout', async () => {
     const fake = new FakeRelayFileClient()
     let releasePreflight!: () => void
@@ -726,7 +772,10 @@ describe('RelayfileCloudMountClient', () => {
     expect(joinOptions.scopes).not.toContain('relayfile:fs:read:/**')
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/linear/states/**')
-    expect(joinOptions.scopes).toContain('relayfile:fs:write:/github/repos/**')
+    // github uses the provider root `/github/**`; `/github/repos/**` is rejected
+    // by RelayAuth's path-token validator and would fail the whole batch mint.
+    expect(joinOptions.scopes).toContain('relayfile:fs:write:/github/**')
+    expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/github/repos/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:write:/factory/observability/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')
     expect(mount.githubWrite).toBeDefined()

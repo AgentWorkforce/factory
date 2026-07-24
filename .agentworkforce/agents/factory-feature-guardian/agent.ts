@@ -940,8 +940,16 @@ export async function runGuardian(
   }
   const ts = deliveredSlackTs(result);
   if (!ts) {
-    ctx.log('error', 'factory-feature-guardian.post-failed', { channel, feature: feature.id });
-    throw new Error(`Slack post failed: no timestamp returned for feature ${feature.id}`);
+    // A successful helper return means the draft was admitted, not that the
+    // provider receipt is already visible. Leave the exact checkpoint alone so
+    // the next tick replays the stable idempotency key instead of turning an
+    // eventually-consistent receipt into a terminal handler failure.
+    ctx.log('warn', 'factory-feature-guardian.post-receipt-pending', {
+      channel,
+      feature: feature.id,
+      path: result.path,
+    });
+    return;
   }
 
   // Bind the exact provider thread to the exact manifest/procedure revisions
@@ -1100,7 +1108,7 @@ const FACTORY_PROCEDURE_COMMANDS: Record<string, string> = {
     'npm init -y >/dev/null',
     'npm install --ignore-scripts "$TMP"/*.tgz >/dev/null',
     "node --input-type=module <<'NODE'",
-    "for (const subpath of ['', '/observability', '/testing', '/writeback', '/featuremap', '/feature-guardian', '/hosted', '/environments']) {",
+    "for (const subpath of ['', '/observability', '/telemetry', '/testing', '/writeback', '/featuremap', '/feature-guardian', '/hosted', '/environments']) {",
     '  const mod = await import(`@agent-relay/factory${subpath}`)',
     "  if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)",
     '}',
@@ -1120,6 +1128,9 @@ const FACTORY_PROCEDURE_COMMANDS: Record<string, string> = {
     '  src/observability/instance-identity.test.ts \\',
     '  src/observability/outbox.test.ts \\',
     '  src/observability/cloud-reporter.test.ts \\',
+    '  src/cost/pricing.test.ts \\',
+    '  src/cost/ledger.test.ts \\',
+    '  test/e2e/run-cost-accounting.test.ts \\',
     '  src/cli/fleet.test.ts',
   ].join('\n'),
   'release-verification': [

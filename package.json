@@ -1,6 +1,6 @@
 {
   "name": "@agent-relay/factory",
-  "version": "0.1.55",
+  "version": "0.1.57",
   "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
   "license": "Apache-2.0",
   "repository": {
@@ -37,6 +37,10 @@
     "./observability": {
       "types": "./dist/observability/index.d.ts",
       "import": "./dist/observability/index.js"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry.d.ts",
+      "import": "./dist/telemetry.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
@@ -80,7 +84,7 @@
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
     "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
     "test:stack-e2e": "tsx test/e2e/stack-deployer.e2e.ts",
-    "verify:e2e": "node scripts/verify-packed-e2e.mjs",
+    "verify:e2e": "vitest run test/e2e/run-cost-accounting.test.ts && node scripts/verify-packed-e2e.mjs",
     "factory-build": "factory-build/run-factory-build.sh"
   },
   "dependencies": {

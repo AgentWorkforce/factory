@@ -55,6 +55,21 @@ From a source checkout instead of an npm install, run
 
 ## Quick start
 
+From the repository checkout you want Factory to work in, the quickest setup is:
+
+```bash
+factory init
+```
+
+It derives the repository from `origin`, checks for `agent-relay` and
+`relayfile`, finds the active Relay workspace, starts the local mount, verifies
+GitHub access, and creates `factory.config.json` for GitHub-native issues. If
+something is missing, it explains what to do and writes no partial config. Use
+`factory init owner/repo` when the checkout has no GitHub `origin`, or add
+`--workspace <id>` to choose a workspace explicitly.
+
+After init, add the `factory` label to an open issue and run a dry run below.
+
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
    open pull requests by default. A local `gh` installation and `gh auth login`
@@ -116,6 +131,7 @@ From a source checkout instead of an npm install, run
 
 | Command | What it does |
 |---|---|
+| `factory init [owner/repo]` | Verify local Relay prerequisites and GitHub access, then configure the current checkout for GitHub-native issue dispatch. |
 | `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
@@ -418,11 +434,19 @@ import {
 const state = new DurableObjectHostedFactoryStateStore(durableObjectState.storage)
 const factory = createHostedFactory(
   { workspaceId, ownerId: isolateId, config },
-  { state, discovery, fleet, completions, mergeGate, writeback },
+  { state, discovery, fleet, completions, mergeGate, writeback, reporter },
 )
 
 await factory.runOnce() // invoke from cron/alarm and safe webhook wakeups
 ```
+
+The optional `reporter` implements the canonical `FactoryEventReporter`.
+Hosted runs persist a deterministic run ID per workspace and issue, then emit
+lifecycle events only after the corresponding fenced state write. Worker hosts
+that only need the Factory-owned wire schema, event creator, and reporter types
+should import `@agent-relay/factory/telemetry`; unlike the broader
+`@agent-relay/factory/observability` surface, it does not export the
+filesystem-backed outbox or instance identity helpers.
 
 The Durable Object adapter stores each workspace independently and performs
 lease claims plus lifecycle writes in storage transactions. Every mutation is

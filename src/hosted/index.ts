@@ -2,6 +2,7 @@ export {
   createHostedFactory,
   HostedFactoryLoop,
   hostedFactoryInvocationId,
+  hostedFactoryRunId,
 } from './orchestrator.js'
 export {
   DurableObjectHostedFactoryStateStore,

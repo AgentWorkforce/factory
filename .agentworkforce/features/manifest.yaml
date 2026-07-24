@@ -1,11 +1,11 @@
 version: '1.1'
-updated: '2026-07-21'
+updated: '2026-07-23'
 catalog:
   category_count: 25
-  feature_count: 305
+  feature_count: 308
   tier_counts:
-    1: 45
-    2: 123
+    1: 47
+    2: 124
     3: 11
     4: 51
     5: 60
@@ -1461,6 +1461,13 @@ categories:
         location: src/observability/, src/index.ts, package.json
         verify_tier: 1
 
+      - id: api-telemetry-contract
+        name: Worker-Safe Telemetry Contract API
+        api: '@agent-relay/factory/telemetry'
+        description: Export only the Factory-owned event schemas, creator, and reporter types without pulling filesystem-backed outbox or instance identity modules into Worker consumers
+        location: src/telemetry.ts, src/observability/events.ts, src/ports/observability.ts, package.json
+        verify_tier: 1
+
       - id: api-hosted-control-plane
         name: Hosted Factory API
         api: '@agent-relay/factory/hosted'
@@ -1501,6 +1508,13 @@ categories:
         location: src/hosted/orchestrator.ts
         verify_tier: 2
 
+      - id: hosted-durable-run-telemetry
+        name: Durable Hosted Run Telemetry
+        api: hostedFactoryRunId() / HostedFactoryPorts.reporter
+        description: Persist one deterministic run identity per issue and report lifecycle, agent, clarification, writeback, success, and failure events only after their fenced hosted state writes
+        location: src/hosted/orchestrator.ts, src/hosted/types.ts, src/telemetry.ts
+        verify_tier: 2
+
       - id: hosted-merge-gate-writeback
         name: Hosted Merge Gate and Idempotent Writeback
         api: HostedFactoryMergeGate / HostedFactoryWriteback
@@ -1537,7 +1551,7 @@ categories:
       - id: cloud-event-contract
         name: Bounded Cloud Event Contract
         api: FACTORY_CLOUD_EVENT_CONTRACT_V1 / FactoryCloudEventV1Schema
-        description: Admit only a strict bounded operational field set and reject task text, prompts, messages, paths, commands, source, tokens, raw errors, and stack traces
+        description: Admit only a strict bounded operational field set and reject task text, prompts, messages, paths, commands, source content, arbitrary token fields, raw errors, and stack traces
         location: src/observability/events.ts, src/ports/observability.ts
         verify_tier: 1
 
@@ -1575,6 +1589,13 @@ categories:
         description: Persist and flush lifecycle progress without allowing reporter construction, storage, network, retry, or shutdown failure to change Factory orchestration
         location: src/observability/cloud-reporter.ts, src/orchestrator/factory.ts, src/cli/fleet.ts
         verify_tier: 2
+
+      - id: cloud-run-cost-accounting
+        name: Per-Run Role and Model Cost Ledger
+        api: CostLedger / estimateCostUsd() / run.cost.v1
+        description: Attribute reported or explicitly missing agent token usage to each run, role, and model, price known models, retain the aggregate on the durable run, and emit one privacy-bounded completion summary
+        location: src/cost/ledger.ts, src/cost/pricing.ts
+        verify_tier: 1
 
   release-verification:
     name: Release and Feature Verification

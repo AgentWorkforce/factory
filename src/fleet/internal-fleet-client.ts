@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path'
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
 import type { PreviewConfig } from '../config/schema'
-import type { AgentMessage, AgentPidResolution, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentMessage, AgentPidResolution, AgentUsage, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
@@ -66,6 +66,7 @@ export interface InternalFleetClientOptions {
 type AgentExitListener = (name: string, reason?: string) => void
 type DeliveryFailedListener = (info: { to: string; msgId?: string; reason?: string }) => void
 type AgentMessageListener = (message: AgentMessage) => void
+type AgentUsageListener = (usage: AgentUsage) => void | Promise<void>
 type PendingInjectedWait = {
   input: SendInput
   eventIds: Set<string>
@@ -120,6 +121,7 @@ export class InternalFleetClient implements FleetClient {
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
+  readonly #agentUsageListeners = new Set<AgentUsageListener>()
   readonly #eventUnsubscribers: Array<() => void> = []
   readonly #seenEvents: string[] = []
   readonly #seenEventKeys = new Set<string>()
@@ -543,6 +545,14 @@ export class InternalFleetClient implements FleetClient {
     }
   }
 
+  onAgentUsage(listener: AgentUsageListener): () => void {
+    this.#ensureEventSubscription()
+    this.#agentUsageListeners.add(listener)
+    return () => {
+      this.#agentUsageListeners.delete(listener)
+    }
+  }
+
   onAgentExit(listener: AgentExitListener): () => void {
     this.#ensureEventSubscription()
     this.#agentExitListeners.add(listener)
@@ -585,6 +595,7 @@ export class InternalFleetClient implements FleetClient {
     this.#agentExitListeners.clear()
     this.#deliveryFailedListeners.clear()
     this.#agentMessageListeners.clear()
+    this.#agentUsageListeners.clear()
     this.#failedDeliveries.clear()
     this.#failedDeliveryIds.length = 0
     this.#readyAgentNames.clear()
@@ -630,6 +641,12 @@ export class InternalFleetClient implements FleetClient {
   }
 
   #handleBrokerEvent(event: BrokerEvent): void {
+    const usage = agentUsageFromRuntimeEvent(event)
+    if (usage) {
+      this.#emitAgentUsage(usage, eventIdentity(event))
+      return
+    }
+
     if (event.kind === 'worker_ready') {
       this.#markAgentReady(event.name)
       return
@@ -855,6 +872,25 @@ export class InternalFleetClient implements FleetClient {
 
     for (const listener of this.#agentMessageListeners) {
       listener(message)
+    }
+  }
+
+  #emitAgentUsage(usage: AgentUsage, identity: EventIdentity): void {
+    if (this.#rememberEvent(identity)) return
+    for (const listener of this.#agentUsageListeners) {
+      try {
+        void Promise.resolve(listener({ ...usage })).catch((error) => {
+          this.#logger?.warn?.('[factory-sdk] agent usage listener rejected an update', {
+            name: usage.name,
+            error,
+          })
+        })
+      } catch (error) {
+        this.#logger?.warn?.('[factory-sdk] agent usage listener rejected an update', {
+          name: usage.name,
+          error,
+        })
+      }
     }
   }
 
@@ -1229,6 +1265,61 @@ function messageInputFrom(input: SendInput): SendMessageInput {
     ...(input.mode ? { mode: input.mode } : {}),
   }
 }
+
+/**
+ * Harness Driver versions predating the typed usage event still forward
+ * provider events through onEvent. Normalize the stable field aliases here so
+ * upgrading the runtime does not require an orchestration rewrite.
+ */
+function agentUsageFromRuntimeEvent(event: unknown): AgentUsage | undefined {
+  const record = runtimeRecord(event)
+  const kind = runtimeString(record, 'kind', 'type')
+  if (!kind || !['agent_usage', 'usage_updated', 'usage.updated', 'token_usage'].includes(kind)) {
+    return undefined
+  }
+  const agent = runtimeRecord(record?.agent)
+  const usage = runtimeRecord(record?.usage)
+  const name = runtimeString(record, 'name', 'agent_name', 'agentName')
+    ?? runtimeString(agent, 'name', 'agent_name', 'agentName')
+  if (!name) return undefined
+  const model = runtimeString(record, 'model', 'model_id', 'modelId')
+    ?? runtimeString(usage, 'model', 'model_id', 'modelId')
+  return {
+    name,
+    ...(model ? { model } : {}),
+    inputTokens: runtimeTokenCount(
+      runtimeValue(record, 'inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens')
+      ?? runtimeValue(usage, 'inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
+    ),
+    outputTokens: runtimeTokenCount(
+      runtimeValue(record, 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens')
+      ?? runtimeValue(usage, 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
+    ),
+  }
+}
+
+const runtimeRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+
+const runtimeString = (record: Record<string, unknown> | undefined, ...keys: string[]): string | undefined => {
+  for (const key of keys) {
+    const value = record?.[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+const runtimeValue = (record: Record<string, unknown> | undefined, ...keys: string[]): unknown => {
+  for (const key of keys) {
+    if (record && Object.prototype.hasOwnProperty.call(record, key)) return record[key]
+  }
+  return undefined
+}
+
+const runtimeTokenCount = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
 
 type EventIdentity = { key: string; hasStableId: boolean }
 

@@ -7,6 +7,7 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
+import { initializeFactory } from './init'
 import {
   FileStateStore,
   RelayfileCloudMountClient,
@@ -68,6 +69,7 @@ import {
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider } from '../ports'
 import { checkMountStaleness } from '../mount/relayfile-binary'
+import { MountAuthScopeError } from '../mount/mount-auth-error'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -134,6 +136,7 @@ type ParsedCommand =
   | { kind: 'factory-babysit'; prNumber: number; repo?: string; url?: string }
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
+  | { kind: 'factory-init'; repo?: string; workspaceId?: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -160,6 +163,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         ...(command.baseRef ? { baseRef: command.baseRef } : {}),
       })
       writeJson(out, report)
+      return 0
+    }
+
+    if (command.kind === 'factory-init') {
+      await initializeFactory({ repo: command.repo, workspaceId: command.workspaceId, stdout: out, stderr: err })
       return 0
     }
 
@@ -516,22 +524,6 @@ async function runFactoryCommand(
   const debugMountRefreshes = (deps.env ?? process.env).FACTORY_LOG_LEVEL?.toLowerCase() === 'debug'
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      // Local mirrors are a writeback aid, not the source of truth for remote
-      // issue discovery. Start their SDK-backed supervisors immediately, but
-      // do not serialize durable recovery behind a stale checkout's readiness
-      // timeout. The mount client reports degradation and keeps retrying.
-      void warmStartPathMounts(
-        mountFn,
-        workspaceId,
-        config,
-        acceptableMountIds,
-        mountStderr,
-        debugMountRefreshes,
-      )
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error)
-          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
-        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
@@ -541,6 +533,33 @@ async function runFactoryCommand(
           waiter.resolve(code)
         }
       }
+      // Local mirrors are a writeback aid, not the source of truth for remote
+      // issue discovery. Start their SDK-backed supervisors immediately, but
+      // do not serialize durable recovery behind a stale checkout's readiness
+      // timeout. The mount client reports degradation and keeps retrying.
+      //
+      // A MountAuthScopeError is the exception: it is terminal (the cloud
+      // session lacks the filesystem scope the mount needs), so limping on
+      // would only spawn agents against a read-denied mirror. Fail fast with the
+      // remediation and resolve the command with a non-zero code.
+      void warmStartPathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
+        .catch((error: unknown) => {
+          if (error instanceof MountAuthScopeError) {
+            mountStderr.write(`${error.message}\n`)
+            mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
+            void flushAndResolve(1)
+            return
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
@@ -810,6 +829,9 @@ async function ensureStandaloneBabysitMount(
   try {
     await mountFn(workspaceId, startDir, options)
   } catch (error) {
+    // Terminal scope shortfall: propagate so the command aborts with the
+    // remediation rather than silently falling back to a read-denied mirror.
+    if (error instanceof MountAuthScopeError) throw error
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(
       `[factory] warning: could not start relayfile mount for standalone babysitter at ${resolve(startDir)}; ` +
@@ -905,6 +927,10 @@ async function ensureMountPath(
       return { path: resolved, reason: staleBefore.reason }
     }
   } catch (error) {
+    // A scope shortfall is terminal and identical across every clone path;
+    // propagate it so startup fails fast with one remediation instead of
+    // logging the same unfixable warning per path.
+    if (error instanceof MountAuthScopeError) throw error
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
   }
@@ -948,6 +974,22 @@ function resolveLocalMountFn(
 
 function parseFactoryCommand(args: string[]): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
+  if (action === 'init') {
+    const values = [issueOrPr, ...flags].filter((value): value is string => Boolean(value))
+    let repo: string | undefined
+    let workspaceId: string | undefined
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index]
+      if (value === '--workspace') {
+        workspaceId = requireValue(values, ++index, '--workspace')
+        continue
+      }
+      if (value.startsWith('-')) throw new Error(`Unknown factory init option: ${value}`)
+      if (repo) throw new Error('factory init accepts at most one owner/repo argument')
+      repo = value
+    }
+    return { kind: 'factory-init', repo, workspaceId }
+  }
   if (action === 'start') {
     return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
   }
@@ -1707,7 +1749,8 @@ function isCapability(value: string | undefined): value is Capability {
 }
 
 function isFactoryAction(value: string): boolean {
-  return value === 'start' ||
+  return value === 'init' ||
+    value === 'start' ||
     value === 'run-once' ||
     value === 'loop' ||
     value === 'status' ||
@@ -1783,6 +1826,7 @@ function helpText(): string {
   return `${usage()}
 
 Commands:
+  init [owner/repo]     Set up this checkout for GitHub-native issue dispatch
   run-once              Run one discovery -> triage -> dispatch cycle
   start                 Run the live factory daemon
   status                Print current factory status as JSON
@@ -1799,6 +1843,7 @@ Commands:
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
+  --workspace <id>      Relay workspace to use with init (otherwise active workspace)
   --config <path>       Factory config JSON path (default: ./factory.config.json)
   --dry-run             Discover and triage without writes or agent spawns
   --backend <backend>   Fleet backend: internal or relay
