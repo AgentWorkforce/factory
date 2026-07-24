@@ -6848,6 +6848,21 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // Never resume an agent against a read-denied mirror: the mount lacks the
+    // filesystem scope it needs, so the spawn would fail opaquely (roster PID
+    // never resolves) and risk operating on stale integration state. Skip with
+    // one clear message; a later attempt succeeds once the session is re-authed
+    // and Factory restarted.
+    if (this.#mount.isLocalMountAuthDegraded?.()) {
+      this.#increment('resumeSkippedMountAuthDegraded')
+      this.#logger.warn?.('[factory] tracked agent resume skipped: local mount is auth-degraded (cloud session missing relayfile fs scope); re-authenticate and restart Factory', {
+        issue: record.issue.key,
+        name,
+        role: tracked.spec.role,
+      })
+      return
+    }
+
     this.#logger.debug?.('[factory] tracked agent resume preparation started', {
       issue: record.issue.key,
       name,

@@ -69,6 +69,7 @@ import {
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider } from '../ports'
 import { checkMountStaleness } from '../mount/relayfile-binary'
+import { MountAuthScopeError } from '../mount/mount-auth-error'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -523,22 +524,6 @@ async function runFactoryCommand(
   const debugMountRefreshes = (deps.env ?? process.env).FACTORY_LOG_LEVEL?.toLowerCase() === 'debug'
   if (command.kind === 'factory') {
     if (command.action === 'start') {
-      // Local mirrors are a writeback aid, not the source of truth for remote
-      // issue discovery. Start their SDK-backed supervisors immediately, but
-      // do not serialize durable recovery behind a stale checkout's readiness
-      // timeout. The mount client reports degradation and keeps retrying.
-      void warmStartPathMounts(
-        mountFn,
-        workspaceId,
-        config,
-        acceptableMountIds,
-        mountStderr,
-        debugMountRefreshes,
-      )
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error)
-          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
-        })
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
       const flushAndResolve = async (code: number): Promise<void> => {
@@ -548,6 +533,33 @@ async function runFactoryCommand(
           waiter.resolve(code)
         }
       }
+      // Local mirrors are a writeback aid, not the source of truth for remote
+      // issue discovery. Start their SDK-backed supervisors immediately, but
+      // do not serialize durable recovery behind a stale checkout's readiness
+      // timeout. The mount client reports degradation and keeps retrying.
+      //
+      // A MountAuthScopeError is the exception: it is terminal (the cloud
+      // session lacks the filesystem scope the mount needs), so limping on
+      // would only spawn agents against a read-denied mirror. Fail fast with the
+      // remediation and resolve the command with a non-zero code.
+      void warmStartPathMounts(
+        mountFn,
+        workspaceId,
+        config,
+        acceptableMountIds,
+        mountStderr,
+        debugMountRefreshes,
+      )
+        .catch((error: unknown) => {
+          if (error instanceof MountAuthScopeError) {
+            mountStderr.write(`${error.message}\n`)
+            mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
+            void flushAndResolve(1)
+            return
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        })
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
@@ -817,6 +829,9 @@ async function ensureStandaloneBabysitMount(
   try {
     await mountFn(workspaceId, startDir, options)
   } catch (error) {
+    // Terminal scope shortfall: propagate so the command aborts with the
+    // remediation rather than silently falling back to a read-denied mirror.
+    if (error instanceof MountAuthScopeError) throw error
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(
       `[factory] warning: could not start relayfile mount for standalone babysitter at ${resolve(startDir)}; ` +
@@ -912,6 +927,10 @@ async function ensureMountPath(
       return { path: resolved, reason: staleBefore.reason }
     }
   } catch (error) {
+    // A scope shortfall is terminal and identical across every clone path;
+    // propagate it so startup fails fast with one remediation instead of
+    // logging the same unfixable warning per path.
+    if (error instanceof MountAuthScopeError) throw error
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
   }
