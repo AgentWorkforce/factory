@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import type { WorkforceCtx } from '@agentworkforce/runtime';
+import { parsePersonaSpec } from '@agentworkforce/persona-kit';
 import {
   bindPreviewTransport,
   slackClient,
@@ -16,9 +17,16 @@ import guardian, {
   SLACK_WRITEBACK_TIMEOUT_MS,
   createSdkProgressStore,
   deliveredSlackTs,
+  factoryFeatureGuardianAdapters,
   featurePostIdempotencyKey,
+  gateFactoryGuardianTier,
+  loadFactoryGuardianCatalog,
+  parseFactoryGuardianTestCounts,
+  parseManifestFeatures,
   resolveManifestPath,
+  resolveFactoryGuardianProcedure,
   runGuardian,
+  runFactoryGuardianProcedure,
   type ProgressState,
 } from './agent.js';
 
@@ -309,6 +317,7 @@ function guardianContext(failWriteCall: number): {
     sandbox: {
       cwd: '/home/daytona/workspace',
       readFile: vi.fn(async () => manifest),
+      exec: vi.fn(async () => ({ output: '', exitCode: 0 })),
     },
     files: {
       read: vi.fn(async (path: string) => {
@@ -355,6 +364,7 @@ function exactStateContext(
     sandbox: {
       cwd: '/home/daytona/workspace',
       readFile: vi.fn(async () => manifestText),
+      exec: vi.fn(async () => ({ output: '', exitCode: 0 })),
     },
     files: {
       read: vi.fn(async (path: string) => {
@@ -388,8 +398,28 @@ describe('factory-feature-guardian runtime paths', () => {
     );
   });
 
+  it('fails closed on missing or escaping manifest locations', async () => {
+    const missing = exactStateContext(JSON.stringify(progressState(1)));
+    missing.ctx.sandbox.exec = vi.fn(async () => ({ output: 'src/index.ts', exitCode: 1 }));
+    await expect(loadFactoryGuardianCatalog(missing.ctx)).rejects.toThrow(
+      'missing location: src/index.ts',
+    );
+
+    const escaping = exactStateContext(
+      JSON.stringify(progressState(1)),
+      manifest.replace('        location: src/index.ts', '        location: ../outside'),
+    );
+    await expect(loadFactoryGuardianCatalog(escaping.ctx)).rejects.toThrow(
+      'path escapes the repository',
+    );
+  });
+
   it('defaults delivery to the factory feature-check channel', () => {
     expect(persona.inputs.SLACK_CHANNEL.default).toBe('C0BHWJSF309');
+  });
+
+  it('is a deployable relay-orchestrator persona', () => {
+    expect(() => parsePersonaSpec(persona, 'relay-orchestrator')).not.toThrow();
   });
 
   it('falls back with every declared Factory surface when quiz generation fails', async () => {
@@ -426,8 +456,8 @@ describe('factory-feature-guardian runtime paths', () => {
 
   it('declares bounded manifest and memory reads plus configured Slack output', () => {
     expect(persona.integrations.github?.relayfileMount).toEqual({
-      requiredReadPaths: ['/github/repos/AgentWorkforce/factory/.agentworkforce/features/**'],
-      writeOnlyPaths: [],
+      requiredReadPaths: ['/github/repos/AgentWorkforce/factory/**'],
+      writeOnlyPaths: ['/github/repos/AgentWorkforce/factory/issues/**'],
     });
     expect(persona.memory).toEqual({
       enabled: true,
@@ -438,8 +468,8 @@ describe('factory-feature-guardian runtime paths', () => {
       optional: true,
       enabledByInput: 'SLACK_CHANNEL',
       relayfileMount: {
-        requiredReadPaths: [],
-        writeOnlyPaths: ['/slack/channels/${SLACK_CHANNEL}/**'],
+        requiredReadPaths: ['/slack/channels/${SLACK_CHANNEL}/messages/**'],
+        writeOnlyPaths: ['/slack/channels/${SLACK_CHANNEL}/messages/**'],
       },
     });
   });
@@ -585,7 +615,7 @@ describe('factory-feature-guardian runtime paths', () => {
         featureId: 'broker-status',
         ts: '1710000001.000100',
       });
-      expect(ctx.files.write).toHaveBeenCalledTimes(2);
+      expect(ctx.files.write).toHaveBeenCalledTimes(3);
     } finally {
       restore();
     }
@@ -751,13 +781,23 @@ describe('factory-feature-guardian runtime paths', () => {
     }
   });
 
-  it('scopes provider idempotency to a feature within one cycle', () => {
-    expect(featurePostIdempotencyKey('cycle-a', 'start-broker')).toBe(
-      featurePostIdempotencyKey('cycle-a', 'start-broker')
-    );
-    expect(featurePostIdempotencyKey('cycle-a', 'start-broker')).not.toBe(
-      featurePostIdempotencyKey('cycle-b', 'start-broker')
-    );
+  it('scopes provider idempotency to an exact feature revision and generation', () => {
+    const revision = { manifestRevision: 'manifest-a', procedureRevision: 'procedures-a', generation: 1 };
+    const key = featurePostIdempotencyKey('cycle-a', 'start-broker', revision);
+    expect(key).toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', revision));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-b', 'start-broker', revision));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      manifestRevision: 'manifest-b',
+    }));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      procedureRevision: 'procedures-b',
+    }));
+    expect(key).not.toBe(featurePostIdempotencyKey('cycle-a', 'start-broker', {
+      ...revision,
+      generation: 2,
+    }));
   });
 
   it('requires a delivered Slack ts instead of a draft receipt id', () => {
@@ -791,6 +831,22 @@ describe('factory-feature-guardian runtime paths', () => {
         receipt: { externalId: 'mountcmd-not-a-ts', ts: '1710000003.000300' },
       })
     ).toBe('1710000003.000300');
+    expect(
+      deliveredSlackTs({
+        path: '/pending.json',
+        absolutePath: '/pending.json',
+        deliveryStatus: 'pending',
+        receipt: { ts: '1710000004.000400' },
+      })
+    ).toBe('');
+    expect(
+      deliveredSlackTs({
+        path: '/dropped.json',
+        absolutePath: '/dropped.json',
+        deliveryStatus: 'dropped',
+        receipt: { ts: '1710000005.000500' },
+      })
+    ).toBe('');
   });
 });
 
@@ -1145,5 +1201,188 @@ describe('factory-feature-guardian delayed Slack receipts', () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe('Factory feature guardian conversation adapters', () => {
+  const snapshot = {
+    id: 'verification-procedure-routing',
+    name: 'Manifest-to-Procedure Routing',
+    category: 'release-verification',
+    api: 'manifest.yaml#verification.categories',
+    description: 'Routes features to exact procedures.',
+    locations: ['.agentworkforce/features/manifest.yaml'],
+    procedure: 'release-verification',
+    tier: 1,
+    criticality: 'critical',
+  };
+
+  it.each([
+    ['all passing', ' Test Files  2 passed (2)\n      Tests  42 passed (42)', { passed: 42, failed: 0 }],
+    ['mixed', ' Test Files  1 failed | 2 passed (3)\n      Tests  3 failed | 39 passed (42)', { passed: 39, failed: 3 }],
+    ['build only', 'compiled successfully', { passed: 0, failed: 0 }],
+    ['ANSI summary', '\u001b[32m      Tests  7 passed (7)\u001b[39m', { passed: 7, failed: 0 }],
+  ])('parses %s test evidence without inventing failures', (_label, output, expected) => {
+    expect(parseFactoryGuardianTestCounts(output)).toEqual(expected);
+  });
+
+  it('fails confirmation authority closed until a configured actor matches', () => {
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-ANY')).toBe(false);
+    (ctx.persona.inputs as Record<string, string>).SLACK_USER_KHALIQ = 'U-KHALIQ';
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-KHALIQ')).toBe(true);
+    expect(factoryFeatureGuardianAdapters.isAuthorizedConfirmer(ctx, 'U-ANY')).toBe(false);
+  });
+
+  it('reports missing installed dependencies as SKIP instead of a defect', async () => {
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.exec = vi.fn(async () => ({ output: '', exitCode: 1 }));
+    const gate = await gateFactoryGuardianTier(ctx, snapshot, {
+      name: 'cli-and-package',
+      path: '.agentworkforce/features/verify/procedures.md',
+      prerequisites: 'source checkout and npm ci',
+      body: 'npm run build',
+      command: 'npm run build',
+    });
+    expect(gate).toEqual({
+      outcome: 'skip',
+      reason: expect.stringContaining('installed Node dependencies'),
+    });
+  });
+
+  it('gates provider, fleet, cloud, and live-work procedures without turning absence into confirmation', async () => {
+    const procedure = {
+      name: 'provider-discovery',
+      path: '.agentworkforce/features/verify/procedures.md',
+      prerequisites: 'a disposable provider issue and config',
+      body: 'npm run build',
+      command: 'npm run build',
+    };
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.exec = vi.fn(async () => ({ output: '', exitCode: 0 }));
+    (ctx.persona.inputs as Record<string, string>).GUARDIAN_LIVE_VERIFY_OPT_IN =
+      'verification-procedure-routing,provider-discovery';
+
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 2 }, procedure)).resolves
+      .toMatchObject({ outcome: 'skip', reason: expect.stringContaining('provider issue or config') });
+
+    Object.assign(ctx.persona.inputs as Record<string, string>, {
+      FACTORY_VERIFY_CANARY_ISSUE: 'AR-VERIFY',
+      FACTORY_VERIFY_CONFIG: '/tmp/factory-guardian.json',
+    });
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 2 }, procedure)).resolves
+      .toMatchObject({ outcome: 'available' });
+
+    const fixtureProcedure = { ...procedure, name: 'fleet-execution' };
+    (ctx.persona.inputs as Record<string, string>).GUARDIAN_VERIFY_MAX_TIER = '6';
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 4 }, fixtureProcedure)).resolves
+      .toMatchObject({ outcome: 'skip', reason: expect.stringContaining('disposable fleet') });
+    (ctx.persona.inputs as Record<string, string>).FACTORY_GUARDIAN_FLEET_OPT_IN = 'true';
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 4 }, fixtureProcedure)).resolves
+      .toMatchObject({ outcome: 'manual', reason: expect.stringContaining('live fleet lifecycle') });
+
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 5 }, fixtureProcedure)).resolves
+      .toMatchObject({ outcome: 'skip', reason: expect.stringContaining('cloud credentials') });
+    await expect(gateFactoryGuardianTier(ctx, { ...snapshot, tier: 6 }, fixtureProcedure)).resolves
+      .toMatchObject({ outcome: 'manual', reason: expect.stringContaining('tier 6') });
+  });
+
+  it('selects the complete documented command and runs it in a disposable checkout', async () => {
+    const procedures = readFileSync(
+      new URL('../../features/verify/procedures.md', import.meta.url),
+      'utf8',
+    );
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.readFile = vi.fn(async () => procedures);
+    const exec = vi.fn(async () => ({
+      output: ' Test Files  2 passed (2)\n      Tests  42 passed (42)\n__FACTORY_GUARDIAN_CLEANUP_OK__\n',
+      exitCode: 0,
+    }));
+    ctx.sandbox.exec = exec;
+    const procedure = await resolveFactoryGuardianProcedure(ctx, snapshot);
+    const result = await runFactoryGuardianProcedure(ctx, snapshot, procedure, 'adapter-test');
+
+    expect(result).toMatchObject({
+      outcome: 'passed',
+      result: 'positive',
+      tests: { passed: 42, failed: 0 },
+      cleanup: ['Observed in-process and out-of-band removal of the unique temporary checkout.'],
+    });
+    const script = String(exec.mock.calls[0]?.[0]);
+    expect(script).toContain('tar --exclude=.git --exclude=node_modules')
+    expect(script).toContain('cd "$TMP/repo"')
+    expect(script).toContain('node bin/factory.mjs --help')
+    expect(script).toContain('npm run featuremap:check')
+  });
+
+  it('keeps every allowlisted command equal to the procedure first Bash block', async () => {
+    const procedures = readFileSync(
+      new URL('../../features/verify/procedures.md', import.meta.url),
+      'utf8',
+    );
+    const manifestText = readFileSync(
+      new URL('../../features/manifest.yaml', import.meta.url),
+      'utf8',
+    );
+    const features = parseManifestFeatures(manifestText);
+    const firstByProcedure = new Map(
+      features.map((feature) => [feature.procedure as string, feature]),
+    );
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.readFile = vi.fn(async () => procedures);
+    ctx.sandbox.exec = vi.fn(async () => ({
+      output: '      Tests  42 passed (42)\n__FACTORY_GUARDIAN_CLEANUP_OK__\n',
+      exitCode: 0,
+    }));
+
+    for (const feature of firstByProcedure.values()) {
+      const featureSnapshot = {
+        id: feature.id,
+        name: feature.name,
+        category: feature.category,
+        ...(feature.cli ? { cli: feature.cli } : {}),
+        ...(feature.api ? { api: feature.api } : {}),
+        description: feature.desc,
+        locations: feature.location.split(',').map((value) => value.trim()),
+        procedure: feature.procedure as string,
+        tier: feature.tier,
+        criticality: feature.criticality,
+      };
+      const procedure = await resolveFactoryGuardianProcedure(ctx, featureSnapshot);
+      await expect(
+        runFactoryGuardianProcedure(ctx, featureSnapshot, procedure, `all-${feature.procedure}`),
+      ).resolves.toMatchObject({ outcome: 'passed' });
+    }
+  });
+
+  it('fails closed when test output reports failures despite a zero shell exit', async () => {
+    const procedures = readFileSync(
+      new URL('../../features/verify/procedures.md', import.meta.url),
+      'utf8',
+    );
+    const { ctx } = exactStateContext(JSON.stringify(progressState(1)));
+    ctx.sandbox.readFile = vi.fn(async () => procedures);
+    ctx.sandbox.exec = vi.fn(async () => ({
+      output: '      Tests  3 failed | 39 passed (42)\n__FACTORY_GUARDIAN_CLEANUP_OK__\n',
+      exitCode: 0,
+    }));
+    const procedure = await resolveFactoryGuardianProcedure(ctx, {
+      ...snapshot,
+      procedure: 'cli-and-package',
+    });
+    await expect(
+      runFactoryGuardianProcedure(ctx, snapshot, procedure, 'failed-counts'),
+    ).resolves.toMatchObject({
+      outcome: 'failed',
+      result: 'negative',
+      tests: { passed: 39, failed: 3 },
+      negativeAssertions: expect.arrayContaining([expect.stringContaining('3 failed tests')]),
+    });
+  });
+
+  it('routes every remediation only to the Factory repository', () => {
+    expect(factoryFeatureGuardianAdapters.repositoryForFeature(snapshot)).toBe(
+      'AgentWorkforce/factory',
+    );
   });
 });

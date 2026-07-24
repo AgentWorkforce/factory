@@ -428,7 +428,11 @@ npx vitest run \
   src/fleet/internal-fleet-client.test.ts \
   src/fleet/relay-fleet-client.test.ts \
   src/node/factory-node.test.ts
+```
 
+With the explicitly selected disposable internal fleet, run the live extension:
+
+```bash
 NAME="factory-vf-$RUN"
 node bin/factory.mjs fleet roster --backend internal | tee "$TMP/roster-before.json"
 node bin/factory.mjs fleet spawn spawn:codex --backend internal \
@@ -461,9 +465,10 @@ connected integrations. Copy the real config to `$CONFIG` and change only test
 scope to records named with `$RUN`.
 
 ```bash
-factory triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"
-factory canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"
-factory run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"
+npm run build
+node bin/factory.mjs triage "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/triage.json"
+node bin/factory.mjs canary "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" | tee "$TMP/canary.json"
+node bin/factory.mjs run-once --config "$CONFIG" --dry-run | tee "$TMP/discovery.json"
 node -e 'const r=require(process.argv[1]); if (!r.ok) process.exit(1)' "$TMP/canary.json"
 ```
 
@@ -518,6 +523,11 @@ npx vitest run \
   src/git/agent-worktree.test.ts \
   src/state/file-state-store.test.ts \
   src/state/github-lifecycle-identity.test.ts
+```
+
+With the provider and fleet prerequisites selected, run the dry-run extension:
+
+```bash
 factory dispatch "$FACTORY_VERIFY_CANARY_ISSUE" --config "$CONFIG" --dry-run \
   | tee "$TMP/dispatch-dry.json"
 ```
@@ -633,6 +643,11 @@ npx vitest run \
   src/mount/relayfile-github-connection-write.test.ts \
   src/mount/relayfile-integration-preflight.test.ts \
   src/writeback/writeback.test.ts
+```
+
+With the disposable cloud/provider scope selected, run the live preflight extension:
+
+```bash
 factory run-once --config "$CONFIG" --dry-run | tee "$TMP/mount-preflight.json"
 ```
 
@@ -688,7 +703,7 @@ mkdir "$TMP/consumer" && cd "$TMP/consumer"
 npm init -y >/dev/null
 npm install --ignore-scripts "$TMP"/*.tgz >/dev/null
 node --input-type=module <<'NODE'
-for (const subpath of ['', '/observability', '/telemetry', '/testing', '/writeback', '/featuremap', '/hosted', '/environments']) {
+for (const subpath of ['', '/observability', '/telemetry', '/testing', '/writeback', '/featuremap', '/feature-guardian', '/hosted', '/environments']) {
   const mod = await import(`@agent-relay/factory${subpath}`)
   if (Object.keys(mod).length === 0) throw new Error(`empty export ${subpath || '/'}`)
 }
@@ -698,9 +713,10 @@ NODE
 ```
 
 Back in the checkout, run the focused tests named by each API entry. Assert root
-types and all nine JavaScript package entrypoints resolve, hosted remains worker-safe,
-feature-map validation includes procedure routing, dependency/worktree ports are
-exported, and fake clients support a hermetic consumer. Clean only `$TMP`.
+types and all ten JavaScript package entrypoints resolve, hosted remains worker-safe,
+feature-map validation includes procedure routing, the reusable feature guardian
+is exported, dependency/worktree ports are exported, and fake clients support a
+hermetic consumer. Clean only `$TMP`.
 
 ## hosted-control-plane
 
@@ -714,6 +730,11 @@ npx vitest run \
   src/hosted/orchestrator.test.ts \
   src/hosted/state-store.test.ts \
   src/hosted/worker-safety.test.ts
+```
+
+With the disposable deployed control plane selected, run the live extension:
+
+```bash
 npm run verify:e2e
 ```
 
@@ -775,6 +796,12 @@ SHAs from the reviewed event.
 npm run build
 npm run featuremap:check
 npm test
+node bin/factory.mjs --help >/dev/null
+```
+
+With exact reviewed head/base SHAs available, run the PR-evidence extension:
+
+```bash
 FACTORY_E2E_HEAD_SHA="$(git rev-parse HEAD)" \
 FACTORY_E2E_BASE_SHA="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" \
   npm run verify:e2e
@@ -806,7 +833,8 @@ Slack channel.
 ```bash
 npx vitest run \
   .agentworkforce/agents/factory-feature-guardian/manifest-contract.test.ts \
-  .agentworkforce/agents/factory-feature-guardian/agent.test.ts
+  .agentworkforce/agents/factory-feature-guardian/agent.test.ts \
+  src/feature-guardian/conversation.test.ts
 ```
 
 In preview, begin with no state, inject a checkpoint failure after a confirmed
@@ -818,10 +846,15 @@ shrink/multiple retirements fail closed, and complete cycles increment exactly
 once. Reject malformed, duplicate, oversized, stale-revision, authorization,
 timeout, corrupt-readback, and receiptless states without advancing. Force LLM
 failure and require the fallback to retain CLI/API, source, tier, and procedure.
-In deployment, assert the manifest is read only from
-`/github/repos/AgentWorkforce/factory/.agentworkforce/features/**`, Slack can
-write only to `${SLACK_CHANNEL}`, and one scheduled tick posts one question with
-a real provider `ts` before the exact state checkpoint advances.
+Exercise affirmative, wrench, untested, ambiguous, duplicate, delayed,
+unauthorized, two-turn restart, confirmation, deferral, and remediation paths,
+including provider-write-before-CAS retries and manifest/procedure revision
+changes.
+In deployment, assert the catalog comes from the scoped Factory checkout, the
+procedure runner copies that checkout into a disposable workspace before
+execution, Slack reads and writes only `${SLACK_CHANNEL}/messages/**`, and one
+scheduled tick posts one question with a real provider `ts` before the exact
+state checkpoint advances.
 
 ## maintainability-review
 
@@ -853,13 +886,18 @@ review comment; deliver a new head and confirm exactly one additional review.
 `$TMP`; a live manual check may start one exact process using `$CONFIG`.
 
 ```bash
-node bin/factory.mjs loop --config "$CONFIG" --dry-run
-node bin/factory.mjs loop-status --config "$CONFIG" | tee "$TMP/liveness.json"
 npx vitest run \
   src/orchestrator/factory.test.ts \
   src/orchestrator/process-identity.test.ts \
   src/orchestrator/reaper.test.ts \
   src/state/file-state-store.test.ts
+```
+
+With the disposable fixture config prepared, run the process extension:
+
+```bash
+node bin/factory.mjs loop --config "$CONFIG" --dry-run
+node bin/factory.mjs loop-status --config "$CONFIG" | tee "$TMP/liveness.json"
 ```
 
 Assert iteration/failure limits, heartbeat/registry aliases and paths, stale
@@ -888,7 +926,11 @@ npx vitest run \
   src/environments/load-harness.test.ts \
   src/environments/verification-pipeline.test.ts \
   src/orchestrator/environment-reaper.test.ts
+```
 
+With a disposable Docker/kind environment selected, run the live extension:
+
+```bash
 kind create cluster --name factory-gate-e2e
 npm run test:e2e:verification
 kind delete cluster --name factory-gate-e2e

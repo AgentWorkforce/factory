@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { FactoryConfigSchema } from '@agent-relay/factory'
+import { defineFeatureGuardianAgent } from '@agent-relay/factory/feature-guardian'
 import {
   createHostedFactory,
   InMemoryHostedFactoryStateStore,
@@ -7,6 +8,8 @@ import {
 import { FactoryCloudEventInputV1Schema } from '@agent-relay/factory/telemetry'
 
 const checks = ['public-exports-import']
+assert.equal(typeof defineFeatureGuardianAgent, 'function')
+checks.push('feature-guardian-subpath-import')
 const workspaceId = 'factory-e2e-workspace'
 const issue = {
   uuid: 'factory-e2e-issue-1',

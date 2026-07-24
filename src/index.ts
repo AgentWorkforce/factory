@@ -37,6 +37,7 @@ export type {
   TemplateRoute,
 } from './dispatch/templates'
 export * from './featuremap/index'
+export * from './feature-guardian/index.js'
 export {
   createRelayflowPolicyRegistry,
   dispatchRelayflowForChangeEvent,

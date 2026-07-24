@@ -58,6 +58,10 @@
       "types": "./dist/featuremap/index.d.ts",
       "import": "./dist/featuremap/index.js"
     },
+    "./feature-guardian": {
+      "types": "./dist/feature-guardian/index.d.ts",
+      "import": "./dist/feature-guardian/index.js"
+    },
     "./hosted": {
       "types": "./dist/hosted/index.d.ts",
       "import": "./dist/hosted/index.js"
@@ -105,6 +109,7 @@
     "listr2": "9.0.5"
   },
   "devDependencies": {
+    "@agentworkforce/persona-kit": "^4.1.23",
     "@types/node": "^22.10.2",
     "@types/proper-lockfile": "^4.1.4",
     "esbuild": "^0.28.1",
