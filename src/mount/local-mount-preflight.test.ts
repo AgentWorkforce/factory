@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ensureLocalMount } from './local-mount-preflight'
+import { MountAuthScopeError } from './mount-auth-error'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -204,6 +205,74 @@ describe('ensureLocalMount', () => {
         stateWaitTimeoutMs: 5,
         stateWaitPollMs: 1,
       })).rejects.toThrow(/relayfile mount did not become ready/u)
+    })
+  })
+
+  const SCOPE_403 = {
+    kind: 'bootstrap_stalled',
+    code: 'bootstrap_stall_cycle_limit',
+    message: 'http 403 forbidden: missing required scope: fs:read',
+  }
+
+  async function writeMountStateWithError(
+    dir: string,
+    state: { workspaceId: string; lastReconcileAt: string; pid?: number },
+    lastError: unknown,
+  ): Promise<void> {
+    const stateDir = join(dir, '.integrations', '.relay')
+    await mkdir(stateDir, { recursive: true })
+    await writeFile(join(stateDir, 'state.json'), JSON.stringify({ ...state, lastError }), 'utf8')
+  }
+
+  it('throws a terminal MountAuthScopeError for a stale mount with a scope-403, without refreshing', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountStateWithError(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      }, SCOPE_403)
+      const startMount = vi.fn(async () => {})
+
+      await expect(ensureLocalMount('rw_test', dir, { startMount }))
+        .rejects.toThrow(MountAuthScopeError)
+      // A re-launch would 403 again — the preflight must not attempt it.
+      expect(startMount).not.toHaveBeenCalled()
+    })
+  })
+
+  it('surfaces the remediation but does not tear down a still-reconciling mount that reports a scope-403', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountStateWithError(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
+      }, SCOPE_403)
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+      const startMount = vi.fn(async () => {})
+
+      await expect(ensureLocalMount('rw_test', dir, { startMount })).resolves.toBeUndefined()
+      expect(startMount).not.toHaveBeenCalled()
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('lacks the filesystem scope'))
+    })
+  })
+
+  it('escalates a first-ever bootstrap that 403s into a terminal MountAuthScopeError', async () => {
+    await withTempDir(async (dir) => {
+      // No state file at start; the bootstrap "succeeds" but writes a stale
+      // state recording the scope 403 and never becomes ready.
+      const startMount = vi.fn(async () => {
+        await writeMountStateWithError(dir, {
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+          pid: process.pid,
+        }, SCOPE_403)
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        startMount,
+        stateWaitTimeoutMs: 5,
+        stateWaitPollMs: 1,
+      })).rejects.toThrow(MountAuthScopeError)
     })
   })
 })

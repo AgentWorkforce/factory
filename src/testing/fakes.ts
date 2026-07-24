@@ -34,6 +34,9 @@ export class FakeMountClient implements MountClient {
   readonly deletes: string[] = []
   readonly reads: string[] = []
   subscribeCount = 0
+  /** Test toggle: when true, `isLocalMountAuthDegraded()` reports the terminal
+   * scope-shortfall state so consumers (e.g. resume gating) can be exercised. */
+  authDegraded = false
 
   #subscribers = new Set<(event: ChangeEvent) => void>()
   #events: ChangeEvent[] = []
@@ -76,6 +79,10 @@ export class FakeMountClient implements MountClient {
 
   async listTree(prefix: string): Promise<string[]> {
     return [...this.files.keys()].filter((path) => path.startsWith(prefix)).sort()
+  }
+
+  isLocalMountAuthDegraded(): boolean {
+    return this.authDegraded
   }
 
   subscribe(_globs: string[], onChange: (event: ChangeEvent) => void, _opts?: SubscribeOptions): Subscription {

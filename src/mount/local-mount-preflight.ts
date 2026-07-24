@@ -3,6 +3,12 @@ import { join } from 'node:path'
 
 import type { LocalMountOptions } from '../ports'
 import { checkMountStaleness } from './relayfile-binary'
+import {
+  classifyMountAuthError,
+  MountAuthScopeError,
+  mountAuthRemediation,
+  readMountAuthErrorFromState,
+} from './mount-auth-error'
 
 const STATE_FILE = '.integrations/.relay/state.json'
 
@@ -32,22 +38,56 @@ export async function ensureLocalMount(
   const stateFilePath = join(startDir, STATE_FILE)
 
   if (!(await isMountStatePresent(stateFilePath))) {
-    await options.startMount()
-    await waitForStateFile(
-      stateFilePath,
-      workspaceId,
-      options.stateWaitTimeoutMs,
-      options.stateWaitPollMs,
-      options.acceptableWorkspaceIds,
-    )
+    try {
+      await options.startMount()
+      await waitForStateFile(
+        stateFilePath,
+        workspaceId,
+        options.stateWaitTimeoutMs,
+        options.stateWaitPollMs,
+        options.acceptableWorkspaceIds,
+      )
+    } catch (error) {
+      if (error instanceof MountAuthScopeError) throw error
+      // A first-ever bootstrap that 403s writes a state.json recording the
+      // scope shortfall but never becomes ready. Convert that into the typed,
+      // terminal error so startup fails fast with a clear remediation.
+      const reason = error instanceof Error ? error.message : String(error)
+      const authError = readMountAuthErrorFromState(stateFilePath) ?? classifyMountAuthError(reason)
+      if (authError) {
+        throw new MountAuthScopeError(mountAuthRemediation(authError), {
+          missingScope: authError.missingScope,
+          cause: error,
+        })
+      }
+      throw error
+    }
     return
   }
 
   const staleness = checkMountStaleness(stateFilePath, workspaceId, options.acceptableWorkspaceIds)
-  if (!staleness.stale) return
+
+  // A filesystem-scope shortfall is terminal: the mount records a 403 in its
+  // state.json, and re-launching only 403s again. Detect it up front so we
+  // neither loop refreshing a doomed mount nor let the degradation stay silent.
+  const authError = readMountAuthErrorFromState(stateFilePath)
+
+  if (!staleness.stale) {
+    // The mount is reconciling. If it still reports a scope shortfall (e.g. a
+    // root bootstrap that 403s while scoped subtrees sync), surface it once —
+    // but never tear down a working mount over it.
+    if (authError) process.stderr.write(`${mountAuthRemediation(authError)}\n`)
+    return
+  }
 
   const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
   const manualHint = 'Restart Factory after restoring the Agent Relay Cloud session'
+
+  // Stale AND under-scoped: refreshing cannot help. Fail fast and terminal so
+  // the supervisor stops retrying and startup surfaces one actionable error.
+  if (authError) {
+    throw new MountAuthScopeError(mountAuthRemediation(authError), { missingScope: authError.missingScope })
+  }
 
   if (options.refreshStaleMount === false) {
     process.stderr.write(`[factory] local mount is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
@@ -72,7 +112,18 @@ export async function ensureLocalMount(
       process.stderr.write('[factory] local mount refreshed\n')
     }
   } catch (error) {
+    if (error instanceof MountAuthScopeError) throw error
     const reason = error instanceof Error ? error.message : String(error)
+    // The failed refresh may have written a fresh 403 into state.json, or the
+    // failure reason itself may name the missing scope. Either way it is
+    // terminal — escalate so the supervisor stops retrying.
+    const postAuthError = readMountAuthErrorFromState(stateFilePath) ?? classifyMountAuthError(reason)
+    if (postAuthError) {
+      throw new MountAuthScopeError(mountAuthRemediation(postAuthError), {
+        missingScope: postAuthError.missingScope,
+        cause: error,
+      })
+    }
     process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
   }
 }

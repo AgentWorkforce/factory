@@ -50,6 +50,7 @@ import {
   type EnsureLocalMountOptions,
 } from './local-mount-preflight'
 import { checkMountStaleness } from './relayfile-binary'
+import { MountAuthScopeError } from './mount-auth-error'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
@@ -59,8 +60,15 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/issues/**',
   'relayfile:fs:read:/linear/states/**',
   'relayfile:fs:write:/linear/issues/**',
-  'relayfile:fs:read:/github/repos/**',
-  'relayfile:fs:write:/github/repos/**',
+  // RelayAuth's path-token validator rejects `/github/repos/**` as an invalid
+  // relayfile path (github paths must be the provider root or carry an owner
+  // segment), and because all scopes mint in one batch that single bad path
+  // fails the ENTIRE delegated-token mint with `invalid_paths` — leaving the
+  // mount with no fs token and a `403 missing required scope: fs:read` on every
+  // read. `/github/**` is the github provider root (a valid superset) and mints
+  // cleanly. Do NOT narrow this back to `/github/repos/**`.
+  'relayfile:fs:read:/github/**',
+  'relayfile:fs:write:/github/**',
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
@@ -140,7 +148,10 @@ export interface MountedWorkspaceHandleLike {
 
 export interface LocalMountHealthEvent {
   state: 'degraded' | 'recovered'
-  reason: 'mount_stale' | 'mount_refresh_failed'
+  // `mount_auth_scope` is terminal: the cloud session lacks the filesystem
+  // scope the mount needs, so — unlike `mount_stale`/`mount_refresh_failed` —
+  // the supervisor stops retrying rather than looping against a doomed refresh.
+  reason: 'mount_stale' | 'mount_refresh_failed' | 'mount_auth_scope'
   degradedMounts: number
 }
 
@@ -266,6 +277,10 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #localMountOperations = new Map<string, Promise<void>>()
   readonly #localMountOperationWaiters: Array<() => void> = []
   readonly #degradedLocalMounts = new Set<string>()
+  // Mounts that failed with a terminal auth-scope shortfall. These are NOT
+  // rescheduled for refresh (a re-launch just 403s again); recovery requires
+  // re-authenticating and restarting Factory.
+  readonly #authDegradedLocalMounts = new Set<string>()
   #activeLocalMountOperations = 0
   #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
@@ -410,6 +425,13 @@ export class RelayfileCloudMountClient implements MountClient {
         },
       })
     } catch (error) {
+      // A terminal auth-scope shortfall cannot be healed by re-launching, so
+      // mark it distinctly and do NOT arm the retry supervisor — just surface it
+      // to startup, which fails fast with the remediation.
+      if (error instanceof MountAuthScopeError) {
+        this.#markLocalMountAuthDegraded(localDir)
+        throw error
+      }
       // A first-ever mount has no state file from which staleness can be
       // inferred. Surface the launch failure and arm the same retry supervisor
       // used for later stale sessions before returning control to startup.
@@ -463,6 +485,7 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountHealthTimers.clear()
     this.#localMountSupervisions.clear()
     this.#degradedLocalMounts.clear()
+    this.#authDegradedLocalMounts.clear()
     const mounted = [...this.#localMounts.values()]
     this.#localMounts.clear()
     await Promise.allSettled(mounted.map(async (handle) => handle.stop()))
@@ -608,6 +631,9 @@ export class RelayfileCloudMountClient implements MountClient {
 
   #scheduleLocalMountHealthCheck(localDir: string): void {
     if (this.#disposed || this.#localMountHealthTimers.has(localDir)) return
+    // A terminal auth-scope failure is never retried — recovery requires
+    // re-auth + restart, not another refresh cycle.
+    if (this.#authDegradedLocalMounts.has(localDir)) return
     const supervision = this.#localMountSupervisions.get(localDir)
     if (!supervision) return
     const untilRefresh = supervision.suggestedRefreshAtMs === undefined
@@ -641,12 +667,20 @@ export class RelayfileCloudMountClient implements MountClient {
         await this.ensureLocalMount(supervision.startDir, supervision.options)
       }
     } catch (error) {
+      if (error instanceof MountAuthScopeError) {
+        // Terminal: stop the retry loop for this mount entirely.
+        this.#markLocalMountAuthDegraded(localDir)
+        return
+      }
       this.#logger?.warn?.('[factory] supervised Relayfile mount refresh failed', {
         errorClass: error instanceof Error ? error.name : 'Error',
       })
       this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
     } finally {
-      this.#scheduleLocalMountHealthCheck(localDir)
+      // Never re-arm the supervisor for a terminally auth-degraded mount.
+      if (!this.#authDegradedLocalMounts.has(localDir)) {
+        this.#scheduleLocalMountHealthCheck(localDir)
+      }
     }
   }
 
@@ -661,7 +695,38 @@ export class RelayfileCloudMountClient implements MountClient {
     })
   }
 
+  /**
+   * Whether any local mount is terminally degraded by a filesystem-scope
+   * shortfall. Consumers (e.g. the factory loop) use this to refuse to spawn or
+   * resume agents against a read-denied mirror.
+   */
+  isLocalMountAuthDegraded(): boolean {
+    return this.#authDegradedLocalMounts.size > 0
+  }
+
+  #markLocalMountAuthDegraded(localDir: string): void {
+    // Stop any pending refresh for this mount; it is terminal.
+    const timer = this.#localMountHealthTimers.get(localDir)
+    if (timer) {
+      clearTimeout(timer)
+      this.#localMountHealthTimers.delete(localDir)
+    }
+    const wasHealthy = this.#degradedLocalMounts.size === 0
+    const wasAuthDegraded = this.#authDegradedLocalMounts.has(localDir)
+    this.#degradedLocalMounts.add(localDir)
+    this.#authDegradedLocalMounts.add(localDir)
+    // Emit once per transition into the auth-degraded state.
+    if (wasHealthy || !wasAuthDegraded) {
+      this.#emitLocalMountHealth({
+        state: 'degraded',
+        reason: 'mount_auth_scope',
+        degradedMounts: this.#degradedLocalMounts.size,
+      })
+    }
+  }
+
   #markLocalMountRecovered(localDir: string): void {
+    this.#authDegradedLocalMounts.delete(localDir)
     if (!this.#degradedLocalMounts.delete(localDir) || this.#degradedLocalMounts.size > 0) return
     this.#emitLocalMountHealth({
       state: 'recovered',
