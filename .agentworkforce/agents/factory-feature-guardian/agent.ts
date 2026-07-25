@@ -579,10 +579,15 @@ export function createSdkProgressStore(
           }
           throw error;
         }
-        if (!queued || typeof queued.opId !== 'string' || !queued.opId.trim()) {
-          throw new Error('cycle state SDK write did not return a valid operation ID');
+        const opId =
+          queued && typeof queued.opId === 'string'
+            ? queued.opId.trim()
+            : '';
+        // Hosted synchronous acknowledgements can omit the queued-operation
+        // shape. The exact read-back below remains mandatory in both branches.
+        if (opId) {
+          await waitForSdkWrite(client, credentials.workspaceId, opId, signal, correlationId);
         }
-        await waitForSdkWrite(client, credentials.workspaceId, queued.opId, signal, correlationId);
         const readBack = await readSdkSnapshot(
           client,
           credentials.workspaceId,

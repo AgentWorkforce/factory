@@ -156,7 +156,9 @@ class RelayfileStateServer {
   corruptReadBack = false;
   invalidFileResponse = false;
   invalidOperationResponse = false;
-  invalidQueuedResponse = false;
+  synchronousAckResponse = false;
+  uncommittedSynchronousAckResponse = false;
+  operationPolls = 0;
   readonly requests: Array<{ method: string; ifMatch: string | null }> = [];
 
   constructor(seed: object | null) {
@@ -172,6 +174,7 @@ class RelayfileStateServer {
     expect(headers.get('x-correlation-id')).toMatch(/^guardian-state-/);
 
     if (url.pathname.includes('/ops/')) {
+      this.operationPolls += 1;
       if (this.invalidOperationResponse) return jsonResponse(null);
       return jsonResponse({
         opId: url.pathname.split('/').at(-1),
@@ -217,9 +220,17 @@ class RelayfileStateServer {
     }
     const body = JSON.parse(String(init.body)) as { content?: unknown };
     expect(body).toMatchObject({ contentType: 'application/json', encoding: 'utf-8' });
+    if (this.uncommittedSynchronousAckResponse) {
+      return new Response(null, { status: 204 });
+    }
     this.content = String(body.content);
     this.revision += 1;
-    if (this.invalidQueuedResponse) return jsonResponse(null, 202);
+    if (this.synchronousAckResponse) {
+      return new Response(null, {
+        status: 204,
+        headers: { etag: `rev-${this.revision}` },
+      });
+    }
     return jsonResponse({
       opId: `op-${this.revision}`,
       status: 'queued',
@@ -743,6 +754,7 @@ describe('factory-feature-guardian exact SDK state', () => {
       { method: 'PUT', ifMatch: '0' },
       { method: 'PUT', ifMatch: initial.revision },
     ]);
+    expect(server.operationPolls).toBe(2);
   });
 
   it('rejects a stale writer after newer runs checkpoint positions 2 and 3', async () => {
@@ -876,22 +888,42 @@ describe('factory-feature-guardian exact SDK state', () => {
     );
   });
 
-  it('fails closed on malformed SDK file, queued-write, and operation responses', async () => {
+  it('accepts a committed synchronous 2xx acknowledgement after exact read-back', async () => {
+    const server = new RelayfileStateServer(progressState(1));
+    server.synchronousAckResponse = true;
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
+    const loaded = await store.load(storeFeatures);
+    expect(loaded).not.toBeNull();
+
+    const saved = await store.save(progressState(2), loaded, storeFeatures);
+
+    expect(saved.state).toEqual(progressState(2));
+    expect(server.state()).toEqual(progressState(2));
+    expect(server.content).toBe(`${JSON.stringify(progressState(2))}\n`);
+    expect(server.operationPolls).toBe(0);
+  });
+
+  it('rejects an uncommitted synchronous 2xx acknowledgement after exact read-back', async () => {
+    const server = new RelayfileStateServer(progressState(1));
+    server.uncommittedSynchronousAckResponse = true;
+    const store = createSdkProgressStore(credentials, { fetchImpl: server.fetch });
+    const loaded = await store.load(storeFeatures);
+    expect(loaded).not.toBeNull();
+
+    await expect(store.save(progressState(2), loaded, storeFeatures)).rejects.toThrow(
+      'cycle state read-back did not match the saved state'
+    );
+    expect(server.state()).toEqual(progressState(1));
+    expect(server.content).toBe(`${JSON.stringify(progressState(1))}\n`);
+    expect(server.operationPolls).toBe(0);
+  });
+
+  it('fails closed on malformed SDK file and operation responses', async () => {
     const invalidFile = new RelayfileStateServer(progressState(1));
     invalidFile.invalidFileResponse = true;
     await expect(
       createSdkProgressStore(credentials, { fetchImpl: invalidFile.fetch }).load(storeFeatures)
     ).rejects.toThrow('cycle state SDK read returned an invalid file');
-
-    const invalidQueued = new RelayfileStateServer(null);
-    invalidQueued.invalidQueuedResponse = true;
-    await expect(
-      createSdkProgressStore(credentials, { fetchImpl: invalidQueued.fetch }).save(
-        progressState(0),
-        null,
-        storeFeatures
-      )
-    ).rejects.toThrow('cycle state SDK write did not return a valid operation ID');
 
     const invalidOperation = new RelayfileStateServer(null);
     invalidOperation.invalidOperationResponse = true;
