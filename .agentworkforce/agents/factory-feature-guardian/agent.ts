@@ -149,7 +149,11 @@ export async function loadFactoryGuardianCatalog(
 
 function isSafeFactoryRepositoryPath(path: string): boolean {
   if (!path || path.startsWith('/') || path.includes('\\')) return false;
-  return !path.split('/').some((segment) => segment === '' || segment === '.' || segment === '..');
+  const pathWithoutTrailingSlash = path.endsWith('/') ? path.slice(0, -1) : path;
+  if (!pathWithoutTrailingSlash) return false;
+  return !pathWithoutTrailingSlash
+    .split('/')
+    .some((segment) => segment === '' || segment === '.' || segment === '..');
 }
 
 /** Compatibility loader retained for the scheduled feature ordering path. */
