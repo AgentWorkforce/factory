@@ -106,6 +106,10 @@ function renderManifest(features: typeof manifestFeatures): string {
 }
 
 const manifest = renderManifest(manifestFeatures);
+const productionManifest = readFileSync(
+  new URL('../../features/manifest.yaml', import.meta.url),
+  'utf8'
+);
 
 const cycleStatePath = '/memory/workspace/factory-feature-guardian/cycle-state.json';
 
@@ -644,6 +648,49 @@ describe('factory-feature-guardian runtime paths', () => {
       manifest.replace('        location: src/index.ts', '        location: ../outside')
     );
     await expect(loadFactoryGuardianCatalog(escaping.ctx)).rejects.toThrow(
+      'path escapes the repository'
+    );
+  });
+
+  it('accepts repository directory locations with one trailing slash', async () => {
+    const trailingDirectory = exactStateContext(
+      JSON.stringify(progressState(1)),
+      manifest.replace('        location: src/index.ts', '        location: src/environments/')
+    );
+
+    const catalog = await loadFactoryGuardianCatalog(trailingDirectory.ctx);
+
+    expect(catalog.features[0]).toMatchObject({ locations: ['src/environments/'] });
+    expect(trailingDirectory.ctx.sandbox.exec).toHaveBeenCalledWith(
+      expect.stringContaining("'src/environments/'"),
+      expect.objectContaining({ cwd: expect.stringContaining('/github/repos/AgentWorkforce/factory') })
+    );
+  });
+
+  it('accepts every repository-relative location in the production manifest', async () => {
+    const production = exactStateContext(JSON.stringify(progressState(1)), productionManifest);
+
+    const catalog = await loadFactoryGuardianCatalog(production.ctx);
+
+    expect(catalog.features).toHaveLength(308);
+    expect(catalog.features.flatMap((feature) => feature.locations)).toEqual(
+      expect.arrayContaining(['src/environments/', 'src/triage/', 'src/fleet/', 'src/writeback/'])
+    );
+  });
+
+  it.each([
+    ['/absolute/path', 'absolute paths'],
+    ['src\\windows', 'backslashes'],
+    ['.', 'dot segments'],
+    ['src/../outside', 'parent traversal'],
+    ['src//nested', 'doubled interior slashes'],
+  ])('rejects repository locations with %s (%s)', async (unsafePath) => {
+    const unsafe = exactStateContext(
+      JSON.stringify(progressState(1)),
+      manifest.replace('        location: src/index.ts', `        location: ${unsafePath}`)
+    );
+
+    await expect(loadFactoryGuardianCatalog(unsafe.ctx)).rejects.toThrow(
       'path escapes the repository'
     );
   });
