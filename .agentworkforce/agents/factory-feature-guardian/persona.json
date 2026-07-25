@@ -2,7 +2,7 @@
   "id": "factory-feature-guardian",
   "intent": "relay-orchestrator",
   "tags": ["factory", "verification", "proactive", "health", "release-safety", "durability"],
-  "description": "Cycles through every Factory feature hourly, then owns exact-message Slack reactions and replies through clarification, safely gated procedure evidence, immutable exact-revision confirmation, or one deduplicated factory-ready remediation issue.",
+  "description": "Traverses the Factory feature catalog hourly to exercise the manifest/model/state chain with log-only healthy evidence, without claiming per-feature E2E verification; genuine run failures surface through deployment monitoring, while scoped Slack response events retain exact-revision incident handling.",
   "cloud": true,
   "harness": "opencode",
   "model": "deepseek-v4-flash-free",
@@ -43,7 +43,7 @@
   },
   "inputs": {
     "SLACK_CHANNEL": {
-      "description": "Slack channel to post Factory feature checks to (for example factory-health or general).",
+      "description": "Slack channel whose existing guardian response events may be handled (for example factory-health or general). Scheduled healthy checks do not post.",
       "env": "SLACK_CHANNEL",
       "default": "C0BHWJSF309",
       "picker": {
@@ -52,7 +52,7 @@
       }
     },
     "SLACK_USER_WILL": {
-      "description": "Slack user ID for Will, used for optional mentions in feature checks.",
+      "description": "Slack user ID for Will, authorized to confirm an existing guardian response thread.",
       "env": "SLACK_USER_WILL",
       "optional": true,
       "picker": {
@@ -61,7 +61,7 @@
       }
     },
     "SLACK_USER_KHALIQ": {
-      "description": "Slack user ID for Khaliq, used for optional mentions in feature checks.",
+      "description": "Slack user ID for Khaliq, authorized to confirm an existing guardian response thread.",
       "env": "SLACK_USER_KHALIQ",
       "optional": true,
       "picker": {
