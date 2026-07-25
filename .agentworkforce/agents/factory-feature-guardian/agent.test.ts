@@ -363,6 +363,7 @@ describe('factory-feature-guardian runtime paths', () => {
     const transport = new IdempotentSlackTransport();
     const restore = bindPreviewTransport(transport);
     const { ctx, files } = exactStateContext(JSON.stringify(progressState(0)));
+    (ctx.persona as { inputs: Record<string, unknown> }).inputs = {};
 
     try {
       await guardian.handler(ctx, { type: 'cron.tick' } as never);
