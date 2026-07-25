@@ -11360,6 +11360,51 @@ describe('FactoryLoop', () => {
     expect(comments[0]).not.toContain('Too many repo labels')
   })
 
+  // Companion to the single/workflow guard tests: an explicit swarm-scope issue
+  // shares one checkout across a lead + worker (unlike team, which fans out one
+  // implementer per repo label) and puts every member on the same relay channel
+  // so they can coordinate live, even when extra repo labels are present.
+  it('dispatches explicit swarm labels as a lead and worker sharing one checkout and channel', async () => {
+    const routedIssue = realIssueFile(729, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(729)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(729), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual([
+      'ar-729-impl-lead',
+      'ar-729-impl-worker-1',
+      'ar-729-review',
+    ])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd, spawn.channel])).toEqual([
+      ['ar-729-impl-lead', '/work/pear', 'swarm-ar-729'],
+      ['ar-729-impl-worker-1', '/work/pear', 'swarm-ar-729'],
+      ['ar-729-review', '/work/pear', undefined],
+    ])
+    const [lead, worker] = fleet.spawns
+    expect(lead?.task).toMatch(/SWARM LEAD/)
+    expect(lead?.task).toContain('#swarm-ar-729')
+    expect(worker?.task).toMatch(/SWARM WORKER/)
+  })
+
   it('fails dispatch loudly when no labels are present and no default repo is configured', async () => {
     const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })

@@ -69,6 +69,56 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Merge policy: never')
   })
 
+  it('renders swarm lead coordination clauses naming the workers and shared channel', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/work/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl-lead',
+      swarm: { role: 'lead', channel: 'swarm-ar-123', otherMemberNames: ['ar-123-impl-worker-1'] },
+    })
+
+    expect(task).toContain('SWARM LEAD')
+    expect(task).toContain('ar-123-impl-worker-1 (workers) are collaborating with you live in this SAME checkout.')
+    expect(task).toContain('#swarm-ar-123')
+    expect(task).toContain('Integrate everyone\'s changes into one coherent result')
+    expect(task).not.toContain('SWARM WORKER')
+  })
+
+  it('renders swarm worker coordination clauses naming the lead and forbidding its own PR', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/work/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl-worker-1',
+      swarm: { role: 'worker', channel: 'swarm-ar-123', otherMemberNames: ['ar-123-impl-lead'] },
+    })
+
+    expect(task).toContain('SWARM WORKER')
+    expect(task).toContain('a lead (ar-123-impl-lead) live in this SAME checkout')
+    expect(task).toContain('#swarm-ar-123')
+    expect(task).toContain('Do not open your own pull request')
+    expect(task).not.toContain('SWARM LEAD')
+  })
+
+  it('omits swarm clauses entirely for non-swarm dispatch', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/work/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl',
+    })
+
+    expect(task).not.toContain('SWARM')
+    expect(task).not.toContain('#swarm-')
+  })
+
   it('renders reviewer coordination clauses for team dispatch', () => {
     const task = renderAgentTask({
       issue,

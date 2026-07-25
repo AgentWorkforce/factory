@@ -75,6 +75,13 @@ export interface RenderAgentTaskInput {
   branchPrepared?: boolean
   /** Registered relay identity used in durable human-input request comments. */
   agentName?: string
+  /** Set only for scope 'swarm': this implementer collaborates live with named others over a shared relay channel. */
+  swarm?: {
+    role: 'lead' | 'worker'
+    channel: string
+    /** The other swarm members sharing this checkout and channel (excludes this agent). */
+    otherMemberNames: string[]
+  }
   /** Durable Relay action owned by the active Factory process. */
   lifecycleActionName?: string
   /**
@@ -119,8 +126,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ] : []),
   ]
 
+  const swarmInstructions = input.swarm ? renderSwarmInstructions(input.swarm) : []
+
   const common = [
     ...header,
+    ...swarmInstructions,
     '',
     input.branchName && input.branchPrepared
       ? `Factory already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; commit and push only this branch.`
@@ -317,6 +327,24 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ...(input.testGuidance ? ['', input.testGuidance] : []),
   ].join('\n')
+}
+
+function renderSwarmInstructions(swarm: NonNullable<RenderAgentTaskInput['swarm']>): string[] {
+  const others = swarm.otherMemberNames.length > 0 ? swarm.otherMemberNames.join(', ') : 'the rest of the swarm'
+  if (swarm.role === 'lead') {
+    return [
+      '',
+      `You are the SWARM LEAD. ${others} (workers) are collaborating with you live in this SAME checkout.`,
+      `Coordinate over the shared relay channel #${swarm.channel}: break the work into subtasks, assign them to workers by name, and check their progress before you finish.`,
+      `Integrate everyone's changes into one coherent result before handing off to review. Do not finish until you've confirmed on #${swarm.channel} that every worker is done or blocked.`,
+    ]
+  }
+  return [
+    '',
+    `You are a SWARM WORKER collaborating with a lead (${others}) live in this SAME checkout.`,
+    `Watch the shared relay channel #${swarm.channel} for direction from the lead. Announce what you're starting, ask there if scope is ambiguous, and post when a subtask is done or blocked.`,
+    'Do not open your own pull request or push to origin yourself — the lead integrates everyone\'s work and finishes it.',
+  ]
 }
 
 function lifecycleInstructions(

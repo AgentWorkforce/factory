@@ -66,7 +66,7 @@ import {
   type GithubHumanInputRequest,
 } from '../dispatch/templates'
 import { resolveTestGuidance } from '../dispatch/test-guidance'
-import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from '../triage'
+import { HeuristicTriage, TieredTriage, babysitterSpec, isShapeLabel, scopeFromLabels, swarmChannel, swarmMemberSlugs, swarmTaskFor } from '../triage'
 import { agentNameForRole, sanitizeAgentSlug } from '../triage/agent-names'
 import { isResourceSubscriptionsUnavailable, type ResourceSubscription } from '../subscriptions'
 import type {
@@ -10397,6 +10397,15 @@ export class FactoryLoop implements Factory {
             previewStartCommand: spec.preview?.startCommand,
           } : {}),
           ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
+          ...(spec.swarmRole && spec.channel ? {
+            swarm: {
+              role: spec.swarmRole,
+              channel: spec.channel,
+              otherMemberNames: decision.implementers
+                .filter((implementer) => implementer.channel === spec.channel && implementer.name !== spec.name)
+                .map((implementer) => implementer.name),
+            },
+          } : {}),
         }),
       }
     }
@@ -15837,15 +15846,19 @@ function labelDerivedDispatchDecision(
     }
   }
 
-  const implementers = routesByLabel.routes.map(({ slug, route }) =>
-    routeImplementerSpec(liveIssue, config, slug, route),
-  )
-  const selectedRoutes = scope === 'single' ? routesByLabel.routes.slice(0, 1) : routesByLabel.routes
+  // Swarm always shares one checkout (lead + workers collaborate live over a
+  // shared relay channel), so — like single/workflow — only the first matched
+  // label route is used; it is never fanned out across repo labels like team.
+  const selectedRoutes = scope === 'single' || scope === 'swarm'
+    ? routesByLabel.routes.slice(0, 1)
+    : routesByLabel.routes
   const selectedImplementers = scope === 'team'
-    ? implementers
+    ? routesByLabel.routes.map(({ slug, route }) => routeImplementerSpec(liveIssue, config, slug, route))
     : scope === 'single'
-      ? implementers.slice(0, 1)
-      : []
+      ? routesByLabel.routes.slice(0, 1).map(({ slug, route }) => routeImplementerSpec(liveIssue, config, slug, route))
+      : scope === 'swarm'
+        ? routeSwarmImplementerSpecs(liveIssue, config, selectedRoutes[0]?.route, maxImplementers)
+        : []
   const routes = selectedRoutes.map(({ route }) => route)
   const workflow = scope === 'workflow'
     ? routeWorkflowSpec(liveIssue, config, selectedRoutes, decision.workflow)
@@ -16001,6 +16014,30 @@ function routeImplementerSpec(
     clonePath: route.clonePath,
     node: 'self',
   }
+}
+
+function routeSwarmImplementerSpecs(
+  issue: LinearIssue,
+  config: FactoryConfig,
+  route: TriageDecision['routes'][number] | undefined,
+  maxImplementers: number,
+): AgentSpec[] {
+  if (!route) {
+    return []
+  }
+  const channel = swarmChannel(issue)
+  return swarmMemberSlugs(maxImplementers).map((slug) => ({
+    name: agentNameForRole(issue, 'impl', { repo: route.repo, discriminator: slug }),
+    role: 'implementer' as const,
+    capability: config.agentCapabilities.implementer,
+    model: config.models.implementer,
+    task: swarmTaskFor(issue, route, slug, channel),
+    repo: route.repo,
+    clonePath: route.clonePath,
+    channel,
+    swarmRole: slug === 'lead' ? 'lead' as const : 'worker' as const,
+    node: 'self',
+  }))
 }
 
 function decisionWithLifecycleBranches(

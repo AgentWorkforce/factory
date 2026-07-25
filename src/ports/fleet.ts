@@ -225,4 +225,6 @@ export type AgentSpec = {
   existingPullRequestBranch?: boolean
   /** Shared live preview owned by the issue lifecycle, not this agent process. */
   preview?: PreviewReference
+  /** Set only for scope 'swarm': this implementer's position in the live-collaborating team. */
+  swarmRole?: 'lead' | 'worker'
 }
