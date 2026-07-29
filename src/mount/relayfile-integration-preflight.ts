@@ -125,6 +125,13 @@ const notReadyMessage = (
   const details = [observation.state, observation.initialSyncState]
     .filter((value): value is string => Boolean(value))
     .join(', ')
+  const state = observation.state?.trim().toLowerCase()
+  const initialSyncState = observation.initialSyncState?.trim().toLowerCase()
+  if (state === 'degraded' && initialSyncState === 'complete') {
+    return `[factory] ${provider} is connected but degraded after its initial sync completed` +
+      `${details ? ` (${details})` : ''}; ask an Agent Relay workspace owner to repair or reconnect ` +
+      `${provider}, then retry.`
+  }
   return `[factory] ${provider} is connected but not ready${details ? ` (${details})` : ''}; wait for its initial sync, then retry.`
 }
 

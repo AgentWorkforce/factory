@@ -131,4 +131,26 @@ describe('Relayfile integration preflight', () => {
     expect(terminal.confirm).not.toHaveBeenCalled()
     expect(relayfile.connect).not.toHaveBeenCalled()
   })
+
+  it('directs completed-but-degraded integrations to an authorized repair instead of waiting', async () => {
+    const relayfile = connections(async () => ({
+      ready: false,
+      state: 'degraded',
+      initialSyncState: 'complete',
+    }))
+    const terminal = io()
+
+    await expect(ensureFactoryIntegrations({
+      connections: relayfile,
+      providers: ['github'],
+      workspaceId: 'rw_test',
+      interactive: false,
+      dryRun: true,
+      io: terminal,
+    })).rejects.toThrow(
+      /degraded after its initial sync completed \(degraded, complete\).*workspace owner.*repair or reconnect github/u,
+    )
+    expect(relayfile.connect).not.toHaveBeenCalled()
+    expect(relayfile.waitForConnection).not.toHaveBeenCalled()
+  })
 })
