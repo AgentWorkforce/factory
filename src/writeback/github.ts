@@ -5,6 +5,7 @@ import type { MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
+import { FACTORY_CODERABBIT_REVIEW_BODY, containsCoderabbitReviewRequest } from '../github/review-request'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
 
@@ -74,6 +75,7 @@ export interface GhCliGithubWritebackConfig {
 export class GhCliGithubWriteback implements GithubWriteback {
   readonly #run: GhRunner
   readonly #git: GhRunner
+  readonly #reviewRequests = new Map<string, Promise<void>>()
 
   constructor(config: GhCliGithubWritebackConfig = {}) {
     this.#run = config.runner ?? defaultGhRunner
@@ -153,6 +155,38 @@ export class GhCliGithubWriteback implements GithubWriteback {
       ...(confirmedHeadSha ?? headSha ? { headSha: confirmedHeadSha ?? headSha } : {}),
       author,
     }
+  }
+
+  async requestPullRequestReview(input: { repo: string; number: number }): Promise<void> {
+    const requestKey = `${input.repo.toLowerCase()}#${input.number}`
+    const existing = this.#reviewRequests.get(requestKey)
+    if (existing) return existing
+    const request = this.#requestPullRequestReview(input)
+      .catch((error: unknown) => {
+        this.#reviewRequests.delete(requestKey)
+        throw error
+      })
+    this.#reviewRequests.set(requestKey, request)
+    return request
+  }
+
+  async #requestPullRequestReview(input: { repo: string; number: number }): Promise<void> {
+    const comments = await this.#run([
+      'api',
+      '--paginate',
+      '--slurp',
+      `repos/${input.repo}/issues/${input.number}/comments`,
+    ])
+    if (githubCommentBodies(comments.stdout).some(containsCoderabbitReviewRequest)) return
+    await this.#run([
+      'pr',
+      'comment',
+      String(input.number),
+      '--repo',
+      input.repo,
+      '--body',
+      FACTORY_CODERABBIT_REVIEW_BODY,
+    ])
   }
 
   async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
@@ -294,6 +328,21 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     throw new Error(`Unable to resolve ${description} for GitHub user PR publication`)
   }
+}
+
+const githubCommentBodies = (stdout: string): string[] => {
+  const payload: unknown = JSON.parse(stdout)
+  const bodies: string[] = []
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    const body = asRecord(value)?.body
+    if (typeof body === 'string') bodies.push(body)
+  }
+  visit(payload)
+  return bodies
 }
 
 const defaultGitRunner: GhRunner = async (args) => {

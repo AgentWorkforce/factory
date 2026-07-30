@@ -65,6 +65,11 @@ export interface GithubPublishPullRequestResult {
   author?: string
 }
 
+export interface GithubPullRequestRef {
+  repo: string
+  number: number
+}
+
 export type FactoryIntegrationProvider = 'github' | 'linear'
 
 export interface FactoryIntegrationConnectionStatus {
@@ -93,6 +98,7 @@ export interface FactoryIntegrationConnections {
  */
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
+  requestPullRequestReview?(input: GithubPullRequestRef): Promise<void>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
 }
 
@@ -124,12 +130,18 @@ export interface MountClient {
   setDefaultAllowedDraftPredicate?(
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
   ): void
+  setDefaultAllowedDeletePredicate?(
+    predicate: (path: string, content: unknown) => boolean | Promise<boolean>,
+  ): void
   listTree(prefix: string): Promise<string[]>
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription
   getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage>
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
-  confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
+  confirmWrite(
+    path: string,
+    opts?: { timeoutMs?: number; returnFailed?: boolean },
+  ): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
   /** Provider failure detail retained for a completed failed write, when available. */
   getConfirmedWriteFailureReason?(path: string): Promise<string | undefined>
   /** Provider object id returned by the acknowledged write operation, when available. */

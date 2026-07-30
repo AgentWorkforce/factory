@@ -6,6 +6,7 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { isAllowedFactoryGithubWritebackDraft } from '../github/review-request'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
@@ -20,6 +21,7 @@ import type {
   GithubConnectionWrite,
   GithubIssueStatus,
   GithubPublishPullRequestResult,
+  GithubPullRequestRef,
   GithubRead,
   GithubWriteback,
   LinearWriteback,
@@ -518,6 +520,7 @@ export class FactoryLoop implements Factory {
   // is active, but the PTY submit must never land in that critical window.
   readonly #babysitterCriticalAgents = new Set<string>()
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
+  readonly #reviewRequestedPullRequests = new Set<string>()
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
@@ -1561,6 +1564,10 @@ export class FactoryLoop implements Factory {
               this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
               return undefined
             }
+            await this.#requestAutomatedPullRequestReview({
+              repo: pr.repo,
+              number: pr.prNumber,
+            })
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
               this.#increment('completionSweepMissingPr')
               return undefined
@@ -6094,10 +6101,12 @@ export class FactoryLoop implements Factory {
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
-    const cached = this.#publishedPullRequests.get(key)
-    if (cached) return cached
-
     const { identity, publisher } = this.#githubPullRequestPublisher()
+    const cached = this.#publishedPullRequests.get(key)
+    if (cached) {
+      await this.#requestAutomatedPullRequestReview(cached)
+      return cached
+    }
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
       ? implementer.spec.branch
       : undefined
@@ -6123,11 +6132,16 @@ export class FactoryLoop implements Factory {
     if (
       durableReceipt &&
       (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
-    ) return durableReceipt
+    ) {
+      this.#publishedPullRequests.set(key, durableReceipt)
+      await this.#requestAutomatedPullRequestReview(durableReceipt)
+      return durableReceipt
+    }
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
         this.#publishedPullRequests.set(key, existing)
+        await this.#requestAutomatedPullRequestReview(existing)
         this.#increment('githubPullRequestsReconciled')
         this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
           issue: issue.key,
@@ -6171,7 +6185,42 @@ export class FactoryLoop implements Factory {
       identity,
       author: published.author,
     })
+    await this.#requestAutomatedPullRequestReview(published)
     return published
+  }
+
+  async #requestAutomatedPullRequestReview(
+    published: GithubPullRequestRef,
+  ): Promise<void> {
+    const key = `${published.repo.toLowerCase()}#${published.number}`
+    if (this.#reviewRequestedPullRequests.has(key)) return
+    try {
+      const requestReview = this.#githubPullRequestReviewRequester()
+      if (!requestReview) return
+      await requestReview({ repo: published.repo, number: published.number })
+      this.#reviewRequestedPullRequests.add(key)
+    } catch (error) {
+      this.#increment('githubPullRequestReviewRequestFailures')
+      this.#logger.warn?.('[factory] automated PR review request failed; lifecycle completion remains independent', {
+        repo: published.repo,
+        prNumber: published.number,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
+  #githubPullRequestReviewRequester(): ((input: GithubPullRequestRef) => Promise<void>) | undefined {
+    const configured = this.#config.github.identity
+    if (configured !== 'user' && this.#mount.githubWrite) {
+      return this.#mount.githubWrite.requestPullRequestReview?.bind(this.#mount.githubWrite)
+    }
+    if (configured === 'app') {
+      throw new Error(
+        'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+      )
+    }
+    if (this.#mount.writebackTransport === 'test' && !this.#githubWritebackProvided) return undefined
+    return this.#githubWriteback.requestPullRequestReview?.bind(this.#githubWriteback)
   }
 
   #githubPullRequestPublisher(): {
@@ -6180,7 +6229,10 @@ export class FactoryLoop implements Factory {
   } {
     const configured = this.#config.github.identity
     if (configured !== 'user' && this.#mount.githubWrite) {
-      return { identity: 'app', publisher: this.#mount.githubWrite }
+      return {
+        identity: 'app',
+        publisher: this.#mount.githubWrite,
+      }
     }
     if (configured === 'app') {
       throw new Error(
@@ -6804,10 +6856,19 @@ export class FactoryLoop implements Factory {
           : undefined
         const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
         const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
-        if (publishedPullRequests(lifecycle).some((receipt) =>
+        const durableReceipt = publishedPullRequests(lifecycle).find((receipt) =>
           receipt.repo.toLowerCase() === repo.toLowerCase()
-        )) return true
-        return Boolean(await this.#openPullRequestByHead(repo, implementer.spec.branch))
+        )
+        if (durableReceipt) {
+          await this.#requestAutomatedPullRequestReview(durableReceipt)
+          return true
+        }
+        const existing = await this.#openPullRequestByHead(repo, implementer.spec.branch)
+        if (existing) {
+          await this.#requestAutomatedPullRequestReview(existing)
+          return true
+        }
+        return false
       }
       // Only a NON-DRAFT (ready) PR counts as completion. A draft PR means the
       // work isn't review-ready, so an implementer exiting with only a draft PR
@@ -6816,7 +6877,12 @@ export class FactoryLoop implements Factory {
       const pr = opts.openOnly
         ? await this.#openPrForIssue(issue)
         : await this.#completionPrForIssue(issue)
-      return Boolean(pr && !pr.draft)
+      if (!pr || pr.draft) return false
+      await this.#requestAutomatedPullRequestReview({
+        repo: pr.repo,
+        number: pr.prNumber,
+      })
+      return true
     } catch (error) {
       this.#logger.warn?.('[factory] PR probe failed after implementer exit; preserving restart behavior', {
         issue: record.issue.key,
@@ -15096,6 +15162,8 @@ const liveHeartbeatIntervalMs = (staleMs: number): number =>
 const installFactoryDraftPredicate = (mount: MountClient, config: FactoryConfig): void => {
   mount.setDefaultAllowedDraftPredicate?.((path, content, opts) =>
     isAllowedFactoryDraft(path, content, opts, mount, config))
+  mount.setDefaultAllowedDeletePredicate?.((path, content) =>
+    isAllowedFactoryGithubWritebackDraft(path, content))
 }
 
 const isAllowedFactoryDraft = async (
@@ -15123,15 +15191,12 @@ const isAllowedFactoryDraft = async (
     return true
   }
 
-  if (isFactoryGithubWritebackPath(path)) {
+  if (isAllowedFactoryGithubWritebackDraft(path, content)) {
     return true
   }
 
   return false
 }
-
-const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,

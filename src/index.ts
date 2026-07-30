@@ -301,6 +301,7 @@ export type {
   FactoryIntegrationProvider,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  GithubPullRequestRef,
   LocalMountOptions,
   MountClient,
   ProviderSyncStatus,

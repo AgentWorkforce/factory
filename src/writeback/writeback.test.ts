@@ -887,6 +887,89 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  it('requests CodeRabbit review once through the authenticated gh user', async () => {
+    const calls: string[][] = []
+    let comments = '[[]]'
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api') return { stdout: comments }
+        comments = JSON.stringify([[
+          { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+        ]])
+        return { stdout: '' }
+      },
+    })
+
+    const input = { repo: 'AgentWorkforce/factory', number: 124 }
+    await Promise.all([
+      github.requestPullRequestReview(input),
+      github.requestPullRequestReview(input),
+    ])
+    await github.requestPullRequestReview(input)
+
+    expect(calls).toEqual([
+      [
+        'api', '--paginate', '--slurp',
+        'repos/AgentWorkforce/factory/issues/124/comments',
+      ],
+      [
+        'pr', 'comment', '124', '--repo', 'AgentWorkforce/factory',
+        '--body', '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+      ],
+    ])
+  })
+
+  it('does not let a marker-only public comment suppress the review command', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return {
+          stdout: args[0] === 'api'
+            ? JSON.stringify([[
+              { body: '<!-- factory-coderabbit-review-request -->' },
+            ]])
+            : '',
+        }
+      },
+    })
+
+    await github.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 124,
+    })
+
+    expect(calls.at(-1)).toEqual([
+      'pr', 'comment', '124', '--repo', 'AgentWorkforce/factory',
+      '--body', '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+    ])
+  })
+
+  it('does not combine the review command and marker across public comments', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        return {
+          stdout: args[0] === 'api'
+            ? JSON.stringify([[
+              { body: '@coderabbitai review' },
+              { body: '<!-- factory-coderabbit-review-request -->' },
+            ]])
+            : '',
+        }
+      },
+    })
+
+    await github.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 124,
+    })
+
+    expect(calls.at(-1)?.slice(0, 2)).toEqual(['pr', 'comment'])
+  })
+
   it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
     const calls: string[][] = []
     const github = new GhCliGithubWriteback({

@@ -291,12 +291,14 @@ class RecordingGithubWriteback implements GithubWriteback {
 
 class PublishingGithubWriteback extends RecordingGithubWriteback {
   readonly publishInputs: GithubPublishPullRequestInput[] = []
+  readonly reviewRequests: Array<{ repo: string; number: number }> = []
 
   constructor(
     private readonly receipt: {
       number: number
       author: string
     },
+    private readonly failReviewRequest = false,
   ) {
     super()
   }
@@ -310,6 +312,11 @@ class PublishingGithubWriteback extends RecordingGithubWriteback {
       headRef: input.headRef ?? `factory/${this.receipt.number}-user`,
       author: this.receipt.author,
     }
+  }
+
+  async requestPullRequestReview(input: { repo: string; number: number }) {
+    this.reviewRequests.push(input)
+    if (this.failReviewRequest) throw new Error('transient review request failure')
   }
 }
 
@@ -3698,14 +3705,17 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.statuses).toEqual([])
   })
 
-  it('does not treat an accepted merge command as proof that a GitHub-native PR merged', async () => {
+  it('does not let an accepted merge command or review-request failure falsely complete a GitHub-native issue', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 50)
     const mount = new FakeMountClient({
       [path]: githubIssueFile(50, { labels: ['factory'] }),
     })
     mount.setSubRoot('/linear/issues', 'absent')
     const fleet = new FakeFleetClient()
-    const githubWriteback = new RecordingGithubWriteback()
+    const githubWriteback = new PublishingGithubWriteback(
+      { number: 50, author: 'operator-user' },
+      true,
+    )
     const mergeGate = new ScriptedGithubMergeGate([readyMergeVerdict('github-head')])
     const factory = createFactory(config({
       issueSource: 'github',
@@ -3727,6 +3737,7 @@ describe('FactoryLoop', () => {
 
     expect(mergeGate.checks).toEqual([{ repo: 'AgentWorkforce/pear', number: 50 }])
     expect(mergeGate.merges).toEqual([{ repo: 'AgentWorkforce/pear', number: 50, expectedHeadSha: 'github-head' }])
+    expect(githubWriteback.reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 50 }])
     expect(githubWriteback.closes).toEqual([])
     expect(githubWriteback.statuses).toEqual([
       { key: '50', status: 'in-progress' },
@@ -6179,8 +6190,12 @@ describe('FactoryLoop', () => {
     const publishPullRequest = vi.fn(async () => {
       throw new Error('must reconcile the exact existing branch')
     })
+    const reviewRequests: Array<{ repo: string; number: number }> = []
     const mount = new FakeMountClient({ [issuePath(597)]: issue }, {
       publishPullRequest,
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
       closePullRequest: async () => undefined,
     })
     const fleet = new DurableRemoteLifecycleFleetClient()
@@ -6222,8 +6237,10 @@ describe('FactoryLoop', () => {
         },
       })
     })
-    expect(ghCalls.length).toBeGreaterThan(0)
-    expect(ghCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    const lookupCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'list')
+    expect(lookupCalls.length).toBeGreaterThan(0)
+    expect(lookupCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 1597 }])
     expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
@@ -6622,6 +6639,7 @@ describe('FactoryLoop', () => {
         }
       },
       closePullRequest: async () => undefined,
+      requestPullRequestReview: async () => undefined,
     }
     const mount = new ConfirmingMount({
       [issuePath(885)]: issueFile(885),
@@ -9943,6 +9961,7 @@ describe('FactoryLoop', () => {
     async ({ identity, appAvailable, expectedIdentity }) => {
       const number = identity === 'app' ? 520 : identity === 'user' ? 521 : appAvailable ? 522 : 523
       const appInputs: GithubPublishPullRequestInput[] = []
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
       const appWrite: GithubConnectionWrite = {
         publishPullRequest: async (input) => {
           appInputs.push(input)
@@ -9953,6 +9972,9 @@ describe('FactoryLoop', () => {
             headRef: `factory/${number}-app`,
             author: 'relayfile[bot]',
           }
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
         },
         closePullRequest: async () => undefined,
       }
@@ -9982,6 +10004,12 @@ describe('FactoryLoop', () => {
 
       expect(appInputs).toHaveLength(expectedIdentity === 'app' ? 1 : 0)
       expect(userWriteback.publishInputs).toHaveLength(expectedIdentity === 'user' ? 1 : 0)
+      expect(appReviewRequests).toEqual(
+        expectedIdentity === 'app' ? [{ repo: 'AgentWorkforce/pear', number }] : [],
+      )
+      expect(userWriteback.reviewRequests).toEqual(
+        expectedIdentity === 'user' ? [{ repo: 'AgentWorkforce/pear', number }] : [],
+      )
       expect(infoLogs).toContainEqual([
         '[factory] published PR',
         expect.objectContaining({
@@ -10059,7 +10087,7 @@ describe('FactoryLoop', () => {
         },
       },
       probePrResolver: async () => undefined,
-      probePrGhRunner: async () => { throw new Error('gh must not be invoked for PR publication') },
+      probePrGhRunner: async () => { throw new Error('gh must not be invoked for app publication') },
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))

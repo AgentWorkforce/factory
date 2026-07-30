@@ -12,7 +12,9 @@ import {
   type EventFeedResponse,
   type FileReadResponse,
   type GetEventsOptions,
+  type GetOperationsOptions,
   type ListTreeOptions,
+  type OperationFeedResponse,
   type ResourceAtEventResult,
   type OperationStatusResponse,
   type Subscription,
@@ -223,6 +225,7 @@ export type RelayFileClientLike = {
     listLastNChanges?(limit: number, context?: { workspaceId: string; token?: string }): Promise<{ events: ChangeEvent[] }>
     getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
     getOp?(workspaceId: string, opId: string): Promise<OperationStatusResponse>
+    listOps?(workspaceId: string, options?: GetOperationsOptions): Promise<OperationFeedResponse>
     getSyncStatus?(workspaceId: string, options?: { provider?: string }): Promise<unknown>
     getToken?(): Promise<string> | string
     getBaseUrl?(): string
@@ -284,7 +287,7 @@ export class RelayfileCloudMountClient implements MountClient {
   #activeLocalMountOperations = 0
   #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
-  readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
+  #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #lastOpByPath = new Map<string, string>()
   readonly #confirmedExternalIdByPath = new Map<string, string>()
   readonly #confirmedFailureReasonByPath = new Map<string, string>()
@@ -334,6 +337,12 @@ export class RelayfileCloudMountClient implements MountClient {
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
   ): void {
     this.#isAllowedDraft ??= predicate
+  }
+
+  setDefaultAllowedDeletePredicate(
+    predicate: (path: string, content: unknown) => boolean | Promise<boolean>,
+  ): void {
+    this.#isAllowedDelete ??= predicate
   }
 
   static async fromConfig(config: RelayfileCloudMountClientConfig = {}): Promise<RelayfileCloudMountClient> {
@@ -777,9 +786,9 @@ export class RelayfileCloudMountClient implements MountClient {
 
   async confirmWrite(
     path: string,
-    opts: { timeoutMs?: number } = {},
+    opts: { timeoutMs?: number; returnFailed?: boolean } = {},
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
-    const opId = this.#lastOpByPath.get(path)
+    const opId = this.#lastOpByPath.get(path) ?? await this.#recoverLatestWriteOperation(path)
     if (!opId || !this.#client.getOp) return 'timeout'
 
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
@@ -790,6 +799,12 @@ export class RelayfileCloudMountClient implements MountClient {
         status = mapOperationStatus(operation)
       } catch (error) {
         this.#confirmedFailureReasonByPath.set(path, providerResultError(operation))
+        if (
+          opts.returnFailed &&
+          (operation.status === 'failed' ||
+            operation.status === 'dead_lettered' ||
+            operation.status === 'canceled')
+        ) return 'failed'
         throw error
       }
       if (status !== 'pending') {
@@ -806,6 +821,27 @@ export class RelayfileCloudMountClient implements MountClient {
       if (Date.now() >= deadline) return 'timeout'
       await sleep(Math.min(500, Math.max(25, deadline - Date.now())))
     }
+  }
+
+  async #recoverLatestWriteOperation(path: string): Promise<string | undefined> {
+    if (!this.#client.listOps) return undefined
+    let cursor: string | undefined
+    const matching: OperationStatusResponse[] = []
+    do {
+      const page = await this.#client.listOps(this.workspaceId, {
+        action: 'file_upsert',
+        provider: providerForPath(path),
+        cursor,
+        limit: 100,
+      })
+      for (const operation of page.items) {
+        if (operation.path === path) matching.push(operation)
+      }
+      cursor = page.nextCursor ?? undefined
+    } while (cursor)
+    const latest = uniquelyLatestOperation(matching)
+    if (latest) this.#lastOpByPath.set(path, latest.opId)
+    return latest?.opId
   }
 
   async getConfirmedWriteFailureReason(path: string): Promise<string | undefined> {
@@ -1052,6 +1088,26 @@ const isProviderWritebackPath = (path: string): boolean =>
 
 const isProviderPath = (path: string): boolean =>
   path.startsWith('/linear/') || path.startsWith('/github/') || path.startsWith('/slack/')
+
+const providerForPath = (path: string): string | undefined =>
+  /^\/([^/]+)\//u.exec(path)?.[1]
+
+const uniquelyLatestOperation = (
+  operations: OperationStatusResponse[],
+): OperationStatusResponse | undefined => {
+  if (operations.length === 1) return operations[0]
+  const dated = operations
+    .map((operation) => ({ operation, time: Date.parse(operation.createdAt ?? '') }))
+  // Multiple operations can only be ordered when every candidate carries the
+  // sole authoritative ordering field. An undated retry might be newest.
+  if (dated.some((candidate) => !Number.isFinite(candidate.time))) return undefined
+  const latestTime = Math.max(...dated.map((candidate) => candidate.time))
+  const latest = dated.filter((candidate) => candidate.time === latestTime)
+  // createdAt is the only authoritative ordering field exposed by listOps.
+  // Equal latest timestamps cannot establish which retry came last, so fail
+  // closed rather than confirming or deleting against an arbitrary operation.
+  return latest.length === 1 ? latest[0]?.operation : undefined
+}
 
 const providerContentLooksLinked = (content: unknown): boolean => {
   const record = content !== null && typeof content === 'object' && !Array.isArray(content)

@@ -16,6 +16,308 @@ const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (ar
 })
 
 describe('RelayfileGithubConnectionWrite', () => {
+  it('requests CodeRabbit review once through the connected app write path', async () => {
+    const mount = new FakeMountClient()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+    const input = { repo: 'AgentWorkforce/factory', number: 85 }
+
+    await Promise.all([
+      write.requestPullRequestReview(input),
+      write.requestPullRequestReview(input),
+    ])
+
+    const draftPath = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    expect(mount.writes).toEqual([{
+      path: draftPath,
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+
+    mount.files.delete(draftPath)
+    mount.files.set('/github/repos/AgentWorkforce/factory/pulls/85__title/comments/9001.json', {
+      content: {
+        payload: {
+          comment: {
+            body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+          },
+        },
+      },
+    })
+    const restarted = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+    await restarted.requestPullRequestReview(input)
+    expect(mount.writes).toHaveLength(1)
+  })
+
+  it('treats missing fresh-PR comment trees as empty and posts the first request', async () => {
+    class MissingCommentTreesMount extends FakeMountClient {
+      override async listTree(): Promise<string[]> {
+        throw Object.assign(new Error('not found'), { status: 404 })
+      }
+    }
+    const mount = new MissingCommentTreesMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 85,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([{
+      path: '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json',
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+  })
+
+  it('propagates non-not-found tree scan failures without posting a request', async () => {
+    class FailedCommentTreeMount extends FakeMountClient {
+      override async listTree(): Promise<string[]> {
+        throw Object.assign(new Error('service unavailable'), { status: 503 })
+      }
+    }
+    const mount = new FailedCommentTreeMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 85,
+    })).rejects.toThrow('service unavailable')
+
+    expect(mount.writes).toEqual([])
+  })
+
+  it('retries a review request after a failed provider confirmation', async () => {
+    const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
+    class FailedThenAcknowledgedMount extends FakeMountClient {
+      confirmationCount = 0
+
+      override async confirmWrite(path: string): Promise<'acked' | 'failed'> {
+        if (path !== draftPath) return 'acked'
+        this.confirmationCount += 1
+        return this.confirmationCount < 3 ? 'failed' : 'acked'
+      }
+    }
+    const mount = new FailedThenAcknowledgedMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+    const input = { repo: 'AgentWorkforce/factory', number: 86 }
+
+    await expect(write.requestPullRequestReview(input))
+      .rejects.toThrow(`GitHub writeback did not complete for ${draftPath}: failed`)
+
+    await expect(write.requestPullRequestReview(input)).resolves.toBeUndefined()
+    expect(mount.writes.filter((entry) => entry.path === draftPath)).toHaveLength(2)
+    expect(mount.deletes).toEqual([draftPath])
+  })
+
+  it('recognizes an acknowledged review draft before provider reconciliation', async () => {
+    const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
+    const mount = new FakeMountClient({
+      [draftPath]: {
+        body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 86,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.deletes).toEqual([])
+  })
+
+  it('fails closed on an indeterminate review draft instead of posting a duplicate', async () => {
+    const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
+    const mount = new FakeMountClient({
+      [draftPath]: {
+        body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+      },
+    })
+    mount.setConfirmWrite(draftPath, 'timeout')
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 86,
+    })).rejects.toThrow(
+      `GitHub review request draft has indeterminate provider status for ${draftPath}: timeout`,
+    )
+
+    expect(mount.writes).toEqual([])
+    expect(mount.deletes).toEqual([])
+  })
+
+  it('fails an indeterminate comment scan instead of posting a duplicate request', async () => {
+    const stalePath = '/github/repos/AgentWorkforce/factory/pulls/87__renamed/comments/9001.json'
+    class RacingMount extends FakeMountClient {
+      readonly listPrefixes: string[] = []
+      failRead = true
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.listPrefixes.push(prefix)
+        if (prefix.endsWith('/pulls')) {
+          return ['/github/repos/AgentWorkforce/factory/pulls/87__renamed']
+        }
+        if (prefix.endsWith('/pulls/87__renamed/comments')) return [stalePath]
+        return []
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === stalePath && this.failRead) throw new Error('reconciled path moved')
+        return {
+          content: {
+            payload: {
+              comment: {
+                body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+              },
+            },
+          },
+        }
+      }
+    }
+    const mount = new RacingMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+    const input = { repo: 'AgentWorkforce/factory', number: 87 }
+
+    await expect(write.requestPullRequestReview(input)).rejects.toThrow('reconciled path moved')
+    expect(mount.writes).toEqual([])
+
+    mount.failRead = false
+    await expect(write.requestPullRequestReview(input)).resolves.toBeUndefined()
+    expect(mount.writes).toEqual([])
+    expect(mount.listPrefixes).toEqual([
+      '/github/repos/AgentWorkforce/factory/pulls',
+      '/github/repos/AgentWorkforce/factory/pulls/87/comments',
+      '/github/repos/AgentWorkforce/factory/pulls/87__renamed/comments',
+      '/github/repos/AgentWorkforce/factory/pulls',
+      '/github/repos/AgentWorkforce/factory/pulls/87/comments',
+      '/github/repos/AgentWorkforce/factory/pulls/87__renamed/comments',
+    ])
+  })
+
+  it('finds a reconciled request in nested comment metadata', async () => {
+    const nestedPath =
+      '/github/repos/AgentWorkforce/factory/pulls/88__renamed/comments/9002/meta.json'
+    const mount = new FakeMountClient({
+      [nestedPath]: {
+        payload: {
+          comment: {
+            body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+          },
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 88,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.reads).toEqual([nestedPath])
+  })
+
+  it('does not let a marker-only mounted comment suppress the review command', async () => {
+    const markerOnlyPath =
+      '/github/repos/AgentWorkforce/factory/pulls/88__renamed/comments/9002.json'
+    const mount = new FakeMountClient({
+      [markerOnlyPath]: {
+        body: '<!-- factory-coderabbit-review-request -->',
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 88,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([{
+      path: '/github/repos/AgentWorkforce/factory/pulls/88/comments/factory-coderabbit-review.json',
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+  })
+
+  it('finds a reconciled request in the flat repository layout', async () => {
+    const flatPath =
+      '/github/repos/AgentWorkforce__factory/pulls/89__renamed/comments/9003.json'
+    const mount = new FakeMountClient({
+      [flatPath]: {
+        repository: { full_name: 'AgentWorkforce/factory' },
+        pull_request: { number: 89 },
+        comment: {
+          body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 89,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.reads).toEqual([flatPath])
+  })
+
+  it('finds a request in the canonical repository-level comment layout after restart', async () => {
+    const canonicalPath =
+      '/github/repos/AgentWorkforce/factory/comments/9004.json'
+    const unrelatedPath =
+      '/github/repos/AgentWorkforce/factory/comments/9003.json'
+    const mount = new FakeMountClient({
+      [unrelatedPath]: {
+        repository: { full_name: 'AgentWorkforce/other' },
+        pull_request: { number: 90 },
+        comment: {
+          body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+        },
+      },
+      [canonicalPath]: {
+        repository: { full_name: 'AgentWorkforce/factory' },
+        pull_request: { number: 90 },
+        comment: {
+          body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 90,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.reads).toEqual([unrelatedPath, canonicalPath])
+  })
+
+  it('does not let another pull request canonical comment suppress a request', async () => {
+    const canonicalPath =
+      '/github/repos/AgentWorkforce/factory/comments/9006.json'
+    const mount = new FakeMountClient({
+      [canonicalPath]: {
+        repository: { full_name: 'AgentWorkforce/factory' },
+        pull_request: { number: 91 },
+        comment: {
+          body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 92,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([{
+      path: '/github/repos/AgentWorkforce/factory/pulls/92/comments/factory-coderabbit-review.json',
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+  })
+
   it('publishes an already-pushed remote branch without reading an orchestrator-local clone', async () => {
     const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-85-agentworkforce-factory-pushed.json'
     class ReceiptMount extends FakeMountClient {
