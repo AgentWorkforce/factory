@@ -1281,6 +1281,43 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
   })
 
+  it('observes an already-acked operation during a zero-timeout status probe', async () => {
+    const fake = new FakeRelayFileClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 0 })).resolves.toBe('acked')
+    expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
+  })
+
+  it('observes an already-failed operation during a zero-timeout status probe', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'provider rejected the request',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', {
+      timeoutMs: 0,
+      returnFailed: true,
+    })).resolves.toBe('failed')
+    expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
+  })
+
   it('preserves create-only revision conflicts instead of updating the winner', async () => {
     class RevisionCheckingClient extends FakeRelayFileClient {
       override async writeFile(input: Parameters<FakeRelayFileClient['writeFile']>[0]) {

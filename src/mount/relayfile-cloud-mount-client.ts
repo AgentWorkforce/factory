@@ -848,12 +848,17 @@ export class RelayfileCloudMountClient implements MountClient {
       : await this.#recoverLatestWriteOperation(path, deadline, opts.correlationId)
     if (!opId || !this.#client.getOp) return 'timeout'
 
+    let firstPoll = true
     for (;;) {
-      if (Date.now() >= deadline) return 'timeout'
-      const operation = await settleBeforeDeadline(
-        this.#client.getOp(this.workspaceId, opId),
-        deadline,
-      )
+      const immediateStatusProbe = firstPoll && opts.timeoutMs === 0
+      if (!immediateStatusProbe && Date.now() >= deadline) return 'timeout'
+      const operation = immediateStatusProbe
+        ? await this.#client.getOp(this.workspaceId, opId)
+        : await settleBeforeDeadline(
+          this.#client.getOp(this.workspaceId, opId),
+          deadline,
+        )
+      firstPoll = false
       if (!operation) return 'timeout'
       let status: 'acked' | 'pending' | 'failed'
       try {
