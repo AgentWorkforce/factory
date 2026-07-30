@@ -15,12 +15,6 @@ const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (ar
   throw new Error(`unexpected git args: ${args.join(' ')}`)
 })
 
-const githubEvent = (id: string, path: string): Parameters<FakeMountClient['emit']>[0] => ({
-  id,
-  type: 'relayfile.changed',
-  resource: { provider: 'github', path },
-} as Parameters<FakeMountClient['emit']>[0])
-
 describe('RelayfileGithubConnectionWrite', () => {
   it('requests CodeRabbit review once through the connected app write path', async () => {
     const mount = new FakeMountClient()
@@ -401,6 +395,60 @@ describe('RelayfileGithubConnectionWrite', () => {
 
     expect(mount.writes).toEqual([{
       path: '/github/repos/AgentWorkforce/factory/pulls/92/comments/factory-coderabbit-review.json',
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+  })
+
+  it('finds a URL-shaped canonical request after adapter reconciliation', async () => {
+    const canonicalPath =
+      '/github/repos/AgentWorkforce/factory/comments/9009.json'
+    const mount = new FakeMountClient({
+      [canonicalPath]: {
+        payload: {
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          pull_request_url: 'https://api.github.com/repos/AgentWorkforce/factory/pulls/93',
+          comment: {
+            body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+          },
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 93,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.reads).toEqual([canonicalPath])
+  })
+
+  it('fails closed when canonical identity fields conflict with the pull request URL', async () => {
+    const canonicalPath =
+      '/github/repos/AgentWorkforce/factory/comments/9010.json'
+    const mount = new FakeMountClient({
+      [canonicalPath]: {
+        payload: {
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          pull_request_url: 'https://api.github.com/repos/AgentWorkforce/other/pulls/94',
+          comment: {
+            body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+          },
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 94,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([{
+      path: '/github/repos/AgentWorkforce/factory/pulls/94/comments/factory-coderabbit-review.json',
       content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
     }])
   })

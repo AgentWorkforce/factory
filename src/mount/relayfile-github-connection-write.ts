@@ -397,6 +397,7 @@ const canonicalGithubCommentMatches = (
   expectedNumber: number,
 ): boolean => {
   const payload = record(content.payload)
+  const comment = record(payload.comment)
   const repository = record(
     Object.keys(record(payload.repository)).length > 0
       ? payload.repository
@@ -407,9 +408,44 @@ const canonicalGithubCommentMatches = (
       ? payload.pull_request
       : content.pull_request,
   )
+  const identities = new Set<string>()
+  const numbers = new Set<number>()
   const fullName = stringValue(repository.full_name)
-  const number = positiveInteger(pullRequest.number)
-  return fullName?.toLowerCase() === expectedRepo.toLowerCase() && number === expectedNumber
+  if (fullName) identities.add(fullName.toLowerCase())
+  const owner = stringValue(payload.owner) ?? stringValue(content.owner)
+  const repo = stringValue(payload.repo) ?? stringValue(content.repo)
+  if (owner || repo) {
+    if (!owner || !repo) return false
+    identities.add(`${owner}/${repo}`.toLowerCase())
+  }
+  const directNumber = positiveInteger(pullRequest.number)
+  if (directNumber) numbers.add(directNumber)
+  for (const value of [
+    content.pull_request_url,
+    payload.pull_request_url,
+    comment.pull_request_url,
+    comment.html_url,
+  ]) {
+    const parsed = githubPullRequestFromUrl(stringValue(value))
+    if (!parsed) continue
+    identities.add(parsed.repo.toLowerCase())
+    numbers.add(parsed.number)
+  }
+  return identities.size === 1 &&
+    identities.has(expectedRepo.toLowerCase()) &&
+    numbers.size === 1 &&
+    numbers.has(expectedNumber)
+}
+
+const githubPullRequestFromUrl = (value: string | undefined): { repo: string; number: number } | undefined => {
+  if (!value) return undefined
+  const match = value.match(
+    /^https:\/\/(?:api\.)?github\.com\/(?:repos\/)?([^/]+)\/([^/]+)\/pulls?\/(\d+)(?:[#/?].*)?$/iu,
+  )
+  const number = positiveInteger(match?.[3])
+  return match?.[1] && match[2] && number
+    ? { repo: `${match[1]}/${match[2]}`, number }
+    : undefined
 }
 
 const positiveInteger = (value: unknown): number | undefined => {
