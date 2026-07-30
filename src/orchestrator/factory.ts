@@ -234,6 +234,7 @@ class ClarificationWakeLeaseLostError extends Error {}
 class ClarificationQuestionDeliveryLeaseLostError extends Error {}
 class GithubEscalationReconciliationUnavailableError extends Error {}
 class GithubEscalationPostAmbiguousError extends Error {}
+class AutomatedReviewRequestDrainError extends Error {}
 
 type GithubEscalationReconciliation = 'found' | 'absent' | 'unavailable'
 class ClarificationWakeStoppedError extends Error {}
@@ -268,6 +269,9 @@ const PROBE_PR_GH_CANDIDATE_LIMIT = 200
 const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const AUTOMATED_REVIEW_REQUEST_RETRY_MS = 5_000
+const AUTOMATED_REVIEW_REQUEST_MAX_DELAY_MS = 60_000
+const AUTOMATED_REVIEW_REQUEST_RUN_ONCE_ATTEMPTS = 5
+const AUTOMATED_REVIEW_REQUEST_RUN_ONCE_DRAIN_MS = 10_000
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 const SLACK_IDENTITY_MESSAGE_SCAN_LIMIT = 250
@@ -393,6 +397,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
   readonly #reviewRequestRetryMs: number
+  readonly #reviewRequestRunOnceDrainMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -525,7 +530,12 @@ export class FactoryLoop implements Factory {
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
   readonly #reviewRequestedPullRequests = new Set<string>()
   readonly #reviewRequestVerifications = new Set<string>()
-  readonly #reviewRequestRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #reviewRequestAttempts = new Map<string, number>()
+  readonly #reviewRequestWork = new Set<Promise<void>>()
+  readonly #reviewRequestRetryTimers = new Map<string, {
+    timer: ReturnType<typeof setTimeout>
+    published: AutomatedReviewRequestTarget
+  }>()
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
@@ -600,6 +610,8 @@ export class FactoryLoop implements Factory {
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
     this.#reviewRequestRetryMs = ports.reviewRequestRetryMs ?? AUTOMATED_REVIEW_REQUEST_RETRY_MS
+    this.#reviewRequestRunOnceDrainMs =
+      ports.reviewRequestRunOnceDrainMs ?? AUTOMATED_REVIEW_REQUEST_RUN_ONCE_DRAIN_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -896,7 +908,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
-    for (const timer of this.#reviewRequestRetryTimers.values()) clearTimeout(timer)
+    for (const retry of this.#reviewRequestRetryTimers.values()) clearTimeout(retry.timer)
     this.#reviewRequestRetryTimers.clear()
     this.#abandonedDispatchReasons.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
@@ -1847,6 +1859,10 @@ export class FactoryLoop implements Factory {
       })
       throw error
     } finally {
+      // A daemon leaves delay-capped retries on their backoff timers. A true
+      // one-shot invocation has no later loop iteration, so drain them before
+      // its caller is allowed to dispose the mount and exit.
+      if (report && !this.#started) await this.#drainAutomatedPullRequestReviewRetriesForRunOnce()
       if (report) {
         this.#logger.info?.('[factory] run-once completed', {
           dryRun,
@@ -6209,8 +6225,11 @@ export class FactoryLoop implements Factory {
       const requestReview = this.#githubPullRequestReviewRequester()
       if (!requestReview) return
       this.#reviewRequestedPullRequests.add(key)
-      void Promise.resolve()
+      this.#trackAutomatedPullRequestReviewWork(Promise.resolve()
         .then(() => requestReview({ repo: published.repo, number: published.number }))
+        .then(() => {
+          this.#reviewRequestAttempts.delete(key)
+        })
         .catch((error: unknown) => {
           this.#reviewRequestedPullRequests.delete(key)
           this.#increment('githubPullRequestReviewRequestFailures')
@@ -6220,7 +6239,7 @@ export class FactoryLoop implements Factory {
             error: describeError(error).errorMessage,
           })
           this.#scheduleAutomatedPullRequestReviewRetry(published)
-        })
+        }))
     } catch (error) {
       this.#increment('githubPullRequestReviewRequestFailures')
       this.#logger.warn?.('[factory] automated PR review request failed; lifecycle completion remains independent', {
@@ -6228,6 +6247,7 @@ export class FactoryLoop implements Factory {
         prNumber: published.number,
         error: describeError(error).errorMessage,
       })
+      this.#scheduleAutomatedPullRequestReviewRetry(published)
     }
   }
 
@@ -6238,12 +6258,18 @@ export class FactoryLoop implements Factory {
       this.#reviewRequestedPullRequests.has(key) ||
       this.#reviewRequestRetryTimers.has(key)
     ) return
+    const attempt = (this.#reviewRequestAttempts.get(key) ?? 0) + 1
+    this.#reviewRequestAttempts.set(key, attempt)
+    const delayMs = Math.min(
+      this.#reviewRequestRetryMs * (2 ** (attempt - 1)),
+      AUTOMATED_REVIEW_REQUEST_MAX_DELAY_MS,
+    )
     const timer = setTimeout(() => {
       this.#reviewRequestRetryTimers.delete(key)
       if (!this.#stopping) this.#requestAutomatedPullRequestReviewForOpenReceipt(published)
-    }, this.#reviewRequestRetryMs)
+    }, delayMs)
     timer.unref?.()
-    this.#reviewRequestRetryTimers.set(key, timer)
+    this.#reviewRequestRetryTimers.set(key, { timer, published })
   }
 
   #requestAutomatedPullRequestReviewForOpenReceipt(
@@ -6260,13 +6286,15 @@ export class FactoryLoop implements Factory {
     // head-based discovery helper may fall back to webhook-fed mount metadata,
     // which is useful for reconciliation but cannot prove a PR remains open.
     const openLookup = this.#openPullRequestByNumber(published.repo, published.number)
-    void openLookup
+    this.#trackAutomatedPullRequestReviewWork(openLookup
       .then((open) => {
         if (
           open?.number === published.number &&
           (!published.headRef || open.headRef === published.headRef)
         ) {
           this.#requestAutomatedPullRequestReview(open)
+        } else {
+          this.#reviewRequestAttempts.delete(key)
         }
       })
       .catch((error: unknown) => {
@@ -6278,7 +6306,61 @@ export class FactoryLoop implements Factory {
         })
         this.#scheduleAutomatedPullRequestReviewRetry(published)
       })
-      .finally(() => this.#reviewRequestVerifications.delete(key))
+      .finally(() => this.#reviewRequestVerifications.delete(key)))
+  }
+
+  #trackAutomatedPullRequestReviewWork(work: Promise<void>): void {
+    this.#reviewRequestWork.add(work)
+    void work.finally(() => this.#reviewRequestWork.delete(work))
+  }
+
+  async #drainAutomatedPullRequestReviewRetriesForRunOnce(): Promise<void> {
+    const deadline = Date.now() + this.#reviewRequestRunOnceDrainMs
+    const attempts = new Map<string, number>()
+    for (;;) {
+      const work = [...this.#reviewRequestWork]
+      if (work.length > 0) {
+        const remainingMs = deadline - Date.now()
+        if (remainingMs <= 0) break
+        let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.allSettled(work),
+            new Promise<void>((resolve) => {
+              deadlineTimer = setTimeout(resolve, remainingMs)
+            }),
+          ])
+        } finally {
+          if (deadlineTimer) clearTimeout(deadlineTimer)
+        }
+      }
+      if (Date.now() >= deadline) break
+      const retries = [...this.#reviewRequestRetryTimers.entries()]
+      if (retries.length === 0) {
+        if (this.#reviewRequestWork.size === 0) return
+        continue
+      }
+      for (const [key, retry] of retries) {
+        const attempt = (attempts.get(key) ?? 0) + 1
+        attempts.set(key, attempt)
+        if (attempt >= AUTOMATED_REVIEW_REQUEST_RUN_ONCE_ATTEMPTS) break
+        clearTimeout(retry.timer)
+        this.#reviewRequestRetryTimers.delete(key)
+        this.#requestAutomatedPullRequestReviewForOpenReceipt(retry.published)
+      }
+      if ([...attempts.values()].some((attempt) =>
+        attempt >= AUTOMATED_REVIEW_REQUEST_RUN_ONCE_ATTEMPTS)) break
+    }
+    for (const retry of this.#reviewRequestRetryTimers.values()) clearTimeout(retry.timer)
+    this.#reviewRequestRetryTimers.clear()
+    const details = {
+      pendingWork: this.#reviewRequestWork.size,
+      attempts: Object.fromEntries(attempts),
+    }
+    this.#logger.error?.('[factory] run-once automated PR review request drain failed', details)
+    throw new AutomatedReviewRequestDrainError(
+      'Run-once automated PR review request drain failed; review remains unrequested',
+    )
   }
 
   #githubPullRequestReviewRequester(): ((input: GithubPullRequestRef) => Promise<void>) | undefined {
@@ -6424,36 +6506,30 @@ export class FactoryLoop implements Factory {
     repo: string,
     number: number,
   ): Promise<AutomatedReviewRequestTarget | undefined> {
-    if (this.#hasProbePrGhRunner) {
-      const result = await this.#probePrGhRunner([
-        'pr',
-        'view',
-        String(number),
-        '--repo',
-        repo,
-        '--json',
-        'number,headRefName,isDraft,state',
-      ])
-      const candidate = asRecord(parseJsonContent(result.stdout))
-      const candidateNumber = numberValue(candidate?.number)
-      if (
-        candidateNumber !== number ||
-        Boolean(candidate?.isDraft) ||
-        normalizePrState(stringValue(candidate?.state)) !== 'OPEN'
-      ) return undefined
-      const headRef = stringValue(candidate?.headRefName)
-      return {
-        repo,
-        number,
-        ...(headRef ? { headRef } : {}),
-      }
+    if (!this.#hasProbePrGhRunner) {
+      throw new Error('Authoritative GitHub pull request lookup is unavailable')
     }
-    const snapshot = await this.#github.getPr(repo, number)
-    if (snapshot.number !== number || normalizePrState(snapshot.state) !== 'OPEN') return undefined
+    const result = await this.#probePrGhRunner([
+      'pr',
+      'view',
+      String(number),
+      '--repo',
+      repo,
+      '--json',
+      'number,headRefName,isDraft,state',
+    ])
+    const candidate = asRecord(parseJsonContent(result.stdout))
+    const candidateNumber = numberValue(candidate?.number)
+    if (
+      candidateNumber !== number ||
+      Boolean(candidate?.isDraft) ||
+      normalizePrState(stringValue(candidate?.state)) !== 'OPEN'
+    ) return undefined
+    const headRef = stringValue(candidate?.headRefName)
     return {
       repo,
       number,
-      ...(snapshot.headRef ? { headRef: snapshot.headRef } : {}),
+      ...(headRef ? { headRef } : {}),
     }
   }
 

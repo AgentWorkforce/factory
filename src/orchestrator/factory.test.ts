@@ -10063,7 +10063,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('retries a rejected automated review request after issue completion', async () => {
+  it('backs off rejected automated review requests after issue completion', async () => {
     const number = 527
     const reviewRequests: Array<{ repo: string; number: number }> = []
     let attempts = 0
@@ -10078,7 +10078,7 @@ describe('FactoryLoop', () => {
       requestPullRequestReview: async (input) => {
         reviewRequests.push(input)
         attempts += 1
-        if (attempts === 1) throw new Error('transient provider failure')
+        if (attempts <= 2) throw new Error('transient provider failure')
       },
       closePullRequest: async () => undefined,
     }
@@ -10104,7 +10104,7 @@ describe('FactoryLoop', () => {
           }),
         }
       },
-      reviewRequestRetryMs: 5,
+      reviewRequestRetryMs: 10,
     })
 
     try {
@@ -10116,16 +10116,84 @@ describe('FactoryLoop', () => {
         { repo: 'AgentWorkforce/pear', number },
         { repo: 'AgentWorkforce/pear', number },
       ]))
-      expect(openLookups).toBe(2)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(reviewRequests).toHaveLength(2)
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+      expect(openLookups).toBe(3)
     } finally {
       await factory.stop()
     }
   })
 
-  it('does not let stale mounted metadata authorize a review retry when GitHub lookup fails', async () => {
+  it('makes an unmet bounded run-once review drain a named terminal failure', async () => {
+    const number = 530
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('persistent provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      // A normal timer cannot fire during this test; runOnce must explicitly
+      // drain the pending obligation.
+      reviewRequestRetryMs: 60_000,
+      reviewRequestRunOnceDrainMs: 1_000,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+
+      await expect(factory.runOnce({ dryRun: true }))
+        .rejects.toThrow('Run-once automated PR review request drain failed')
+
+      expect(reviewRequests).toHaveLength(5)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(reviewRequests).toHaveLength(5)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each([
+    ['is unavailable', undefined],
+    ['fails', async () => { throw new Error('authoritative GitHub lookup unavailable') }],
+  ] as const)('does not let stale mounted metadata authorize a review retry when GitHub lookup %s', async (
+    _condition,
+    probePrGhRunner,
+  ) => {
     const number = 529
     const reviewRequests: Array<{ repo: string; number: number }> = []
-    let openLookups = 0
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => ({
         repo: input.repo,
@@ -10155,10 +10223,7 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       probePrResolver: async () => undefined,
-      probePrGhRunner: async () => {
-        openLookups += 1
-        throw new Error('authoritative GitHub lookup unavailable')
-      },
+      probePrGhRunner,
       reviewRequestRetryMs: 5,
     })
 
@@ -10167,7 +10232,8 @@ describe('FactoryLoop', () => {
       fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
 
       await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
-      await vi.waitFor(() => expect(openLookups).toBeGreaterThan(1))
+      await vi.waitFor(() =>
+        expect(factory.status().counters.githubPullRequestReviewRequestFailures).toBeGreaterThan(1))
       expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
     } finally {
       await factory.stop()
