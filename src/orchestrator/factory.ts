@@ -1588,7 +1588,7 @@ export class FactoryLoop implements Factory {
               return undefined
             }
             if (normalizePrState(pr.state) === 'OPEN') {
-              this.#requestAutomatedPullRequestReview({
+              this.#requestAutomatedPullRequestReviewForOpenReceipt({
                 repo: pr.repo,
                 number: pr.prNumber,
                 headRef: pr.headRef,
@@ -6185,7 +6185,7 @@ export class FactoryLoop implements Factory {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
         this.#publishedPullRequests.set(key, existing)
-        this.#requestAutomatedPullRequestReview(existing)
+        this.#requestAutomatedPullRequestReviewForOpenReceipt(existing)
         this.#increment('githubPullRequestsReconciled')
         this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
           issue: issue.key,
@@ -7104,7 +7104,7 @@ export class FactoryLoop implements Factory {
         }
         const existing = await this.#openPullRequestByHead(repo, implementer.spec.branch)
         if (existing) {
-          this.#requestAutomatedPullRequestReview(existing)
+          this.#requestAutomatedPullRequestReviewForOpenReceipt(existing)
           return true
         }
         return false
@@ -7118,7 +7118,7 @@ export class FactoryLoop implements Factory {
         : await this.#completionPrForIssue(issue)
       if (!pr || pr.draft) return false
       if (normalizePrState(pr.state) === 'OPEN') {
-        this.#requestAutomatedPullRequestReview({
+        this.#requestAutomatedPullRequestReviewForOpenReceipt({
           repo: pr.repo,
           number: pr.prNumber,
           headRef: pr.headRef,

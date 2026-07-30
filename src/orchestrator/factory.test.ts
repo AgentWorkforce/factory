@@ -6217,7 +6217,12 @@ describe('FactoryLoop', () => {
                 headRefName: branch,
                 isDraft: false,
               }])
-            : '[]',
+            : JSON.stringify({
+                number: 1597,
+                headRefName: branch,
+                isDraft: false,
+                state: 'OPEN',
+              }),
         }
       },
     })
@@ -6241,6 +6246,70 @@ describe('FactoryLoop', () => {
     expect(lookupCalls.length).toBeGreaterThan(0)
     expect(lookupCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
     expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 1597 }])
+    expect(publishPullRequest).not.toHaveBeenCalled()
+    await factory.stop()
+  })
+
+  it('reverifies a reconciled PR before requesting review when it closes after head lookup', async () => {
+    const issue = issueFile(598)
+    const publishPullRequest = vi.fn(async () => {
+      throw new Error('must reconcile the existing PR instead of publishing another')
+    })
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const mount = new FakeMountClient({ [issuePath(598)]: issue }, {
+      publishPullRequest,
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new DurableRemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const ghCalls: string[][] = []
+    let branch = ''
+    const factory = createFactory(config({ babysitter: { enabled: true } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: args[1] === 'view'
+            ? JSON.stringify({
+                number: 1598,
+                headRefName: branch,
+                isDraft: false,
+                state: 'CLOSED',
+              })
+            : JSON.stringify([{
+                number: 1598,
+                url: 'https://github.com/AgentWorkforce/pear/pull/1598',
+                headRefName: branch,
+                isDraft: false,
+              }]),
+        }
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(598), issue))
+
+    await factory.dispatch(decision)
+    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      .decision.implementers[0]!.branch!
+    fleet.emitAgentExit('ar-598-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 1598,
+          headRef: branch,
+        },
+      })
+    })
+    await vi.waitFor(() =>
+      expect(ghCalls.some((args) => args[0] === 'pr' && args[1] === 'view')).toBe(true))
+    expect(reviewRequests).toEqual([])
     expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
