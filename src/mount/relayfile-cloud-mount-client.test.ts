@@ -5,6 +5,7 @@ import type {
   ChangeEvent,
   ClaimDurableSubscriptionDeliveriesInput,
   CreateOrRenewDurableResourceSubscriptionInput,
+  OperationFeedResponse,
   OperationStatusResponse,
 } from '@relayfile/sdk'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -1343,6 +1344,44 @@ describe('RelayfileCloudMountClient', () => {
       { workspaceId: 'rw_test', opId: 'op-latest' },
     ])
     expect(fake.deleteFileCalls).toHaveLength(1)
+  })
+
+  it('bounds restarted operation recovery by the confirmation timeout', async () => {
+    class HangingListOpsClient extends FakeRelayFileClient {
+      override async listOps(): Promise<OperationFeedResponse> {
+        await new Promise<never>(() => undefined)
+      }
+    }
+    const fake = new HangingListOpsClient()
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
+      timeoutMs: 5,
+    })).resolves.toBe('timeout')
+    expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('treats restarted operation lookup failures as unavailable recovery data', async () => {
+    class FailingListOpsClient extends FakeRelayFileClient {
+      override async listOps(): Promise<OperationFeedResponse> {
+        throw new Error('relayfile unavailable')
+      }
+    }
+    const fake = new FailingListOpsClient()
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
+      timeoutMs: 5,
+    })).resolves.toBe('timeout')
+    expect(fake.getOpCalls).toEqual([])
   })
 
   it('fails closed when restarted write operations have the same latest timestamp', async () => {

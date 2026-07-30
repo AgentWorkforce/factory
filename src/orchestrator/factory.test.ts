@@ -3727,7 +3727,7 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       githubWriteback,
       mergeGate,
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50 }),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50, state: 'OPEN' }),
     })
 
     await factory.runOnce()
@@ -10058,6 +10058,91 @@ describe('FactoryLoop', () => {
         number,
       }]))
       await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('keeps provider delete authorization aligned with guarded draft authorization', async () => {
+    class DeletePredicateMount extends FakeMountClient {
+      deletePredicate?: (path: string, content: unknown) => boolean | Promise<boolean>
+
+      setDefaultAllowedDeletePredicate(
+        predicate: (path: string, content: unknown) => boolean | Promise<boolean>,
+      ): void {
+        this.deletePredicate ??= predicate
+      }
+    }
+    const number = 525
+    const mount = new DeletePredicateMount({
+      [issuePath(number)]: issueFile(number),
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+
+    try {
+      expect(await mount.deletePredicate?.(
+        `/linear/issues/AR-${number}__uuid-${number}/comments/factory-draft.json`,
+        { body: 'status update' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.(
+        '/slack/channels/C123/messages/factory-draft.json',
+        { text: 'status update' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.(
+        '/github/repos/AgentWorkforce/factory/pulls/525/comments/factory-coderabbit-review.json',
+        { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.('/github/repos/AgentWorkforce/factory/arbitrary.json', {}))
+        .toBe(false)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not request automated review for an already-closed completion PR', async () => {
+    const number = 526
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+    }, {
+      publishPullRequest: async () => {
+        throw new Error('must use the existing merged PR')
+      },
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      github: { identity: 'app' },
+      babysitter: { enabled: false },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: number,
+        state: 'MERGED',
+      }),
+      probeCloser: async (input) => ({
+        repo: input.repo,
+        prNumber: input.prNumber,
+        state: 'CLOSED',
+      }),
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      expect(reviewRequests).toEqual([])
     } finally {
       await factory.stop()
     }

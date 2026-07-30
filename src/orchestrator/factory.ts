@@ -1564,10 +1564,12 @@ export class FactoryLoop implements Factory {
               this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
               return undefined
             }
-            this.#requestAutomatedPullRequestReview({
-              repo: pr.repo,
-              number: pr.prNumber,
-            })
+            if (normalizePrState(pr.state) === 'OPEN') {
+              this.#requestAutomatedPullRequestReview({
+                repo: pr.repo,
+                number: pr.prNumber,
+              })
+            }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
               this.#increment('completionSweepMissingPr')
               return undefined
@@ -6888,10 +6890,12 @@ export class FactoryLoop implements Factory {
         ? await this.#openPrForIssue(issue)
         : await this.#completionPrForIssue(issue)
       if (!pr || pr.draft) return false
-      this.#requestAutomatedPullRequestReview({
-        repo: pr.repo,
-        number: pr.prNumber,
-      })
+      if (normalizePrState(pr.state) === 'OPEN') {
+        this.#requestAutomatedPullRequestReview({
+          repo: pr.repo,
+          number: pr.prNumber,
+        })
+      }
       return true
     } catch (error) {
       this.#logger.warn?.('[factory] PR probe failed after implementer exit; preserving restart behavior', {
@@ -15173,7 +15177,7 @@ const installFactoryDraftPredicate = (mount: MountClient, config: FactoryConfig)
   mount.setDefaultAllowedDraftPredicate?.((path, content, opts) =>
     isAllowedFactoryDraft(path, content, opts, mount, config))
   mount.setDefaultAllowedDeletePredicate?.((path, content) =>
-    isAllowedFactoryGithubWritebackDraft(path, content))
+    isAllowedFactoryDraft(path, content, { guarded: true }, mount, config))
 }
 
 const isAllowedFactoryDraft = async (

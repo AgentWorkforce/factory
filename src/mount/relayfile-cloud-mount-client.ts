@@ -788,10 +788,10 @@ export class RelayfileCloudMountClient implements MountClient {
     path: string,
     opts: { timeoutMs?: number; returnFailed?: boolean } = {},
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
-    const opId = this.#lastOpByPath.get(path) ?? await this.#recoverLatestWriteOperation(path)
+    const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
+    const opId = this.#lastOpByPath.get(path) ?? await this.#recoverLatestWriteOperation(path, deadline)
     if (!opId || !this.#client.getOp) return 'timeout'
 
-    const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
     for (;;) {
       const operation = await this.#client.getOp(this.workspaceId, opId)
       let status: 'acked' | 'pending' | 'failed'
@@ -823,17 +823,18 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
-  async #recoverLatestWriteOperation(path: string): Promise<string | undefined> {
+  async #recoverLatestWriteOperation(path: string, deadline: number): Promise<string | undefined> {
     if (!this.#client.listOps) return undefined
     let cursor: string | undefined
     const matching: OperationStatusResponse[] = []
     do {
-      const page = await this.#client.listOps(this.workspaceId, {
-        action: 'file_upsert',
-        provider: providerForPath(path),
-        cursor,
-        limit: 100,
-      })
+      const page = await settleBeforeDeadline(this.#client.listOps(this.workspaceId, {
+          action: 'file_upsert',
+          provider: providerForPath(path),
+          cursor,
+          limit: 100,
+        }), deadline)
+      if (!page) return undefined
       for (const operation of page.items) {
         if (operation.path === path) matching.push(operation)
       }
@@ -960,6 +961,25 @@ const serializeContent = (content: unknown): { content: string; contentType: str
 const isHttpStatus = (error: unknown, status: number): boolean => {
   const record = error !== null && typeof error === 'object' ? error as Record<string, unknown> : undefined
   return record?.status === status || record?.statusCode === status
+}
+
+const settleBeforeDeadline = async <T>(operation: Promise<T>, deadline: number): Promise<T | undefined> => {
+  const remainingMs = deadline - Date.now()
+  if (remainingMs <= 0) return undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), remainingMs)
+        timer.unref?.()
+      }),
+    ])
+  } catch {
+    return undefined
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 const mapOperationStatus = (
