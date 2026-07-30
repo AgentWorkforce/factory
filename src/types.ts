@@ -59,6 +59,8 @@ export interface FactoryPorts {
   reviewRequestRetryMs?: number
   /** Maximum time run-once drains automated PR review retries before returning. Test-only override. */
   reviewRequestRunOnceDrainMs?: number
+  /** Maximum time stop waits before abandoning durable automated PR review work. Test-only override. */
+  reviewRequestStopDrainMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager

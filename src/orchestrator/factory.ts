@@ -398,6 +398,7 @@ export class FactoryLoop implements Factory {
   readonly #startupAgentExitDrainTimeoutMs: number
   readonly #reviewRequestRetryMs: number
   readonly #reviewRequestRunOnceDrainMs: number
+  readonly #reviewRequestStopDrainMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -612,6 +613,7 @@ export class FactoryLoop implements Factory {
     this.#reviewRequestRetryMs = ports.reviewRequestRetryMs ?? AUTOMATED_REVIEW_REQUEST_RETRY_MS
     this.#reviewRequestRunOnceDrainMs =
       ports.reviewRequestRunOnceDrainMs ?? AUTOMATED_REVIEW_REQUEST_RUN_ONCE_DRAIN_MS
+    this.#reviewRequestStopDrainMs = ports.reviewRequestStopDrainMs ?? STOP_TEARDOWN_TIMEOUT_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -6323,8 +6325,32 @@ export class FactoryLoop implements Factory {
   async #drainAutomatedPullRequestReviewWorkForStop(): Promise<void> {
     // A verification can enqueue the request itself as it settles, so drain
     // until no tracked generation remains. `#stopping` fences new entry points.
-    while (this.#reviewRequestWork.size > 0) {
-      await Promise.allSettled([...this.#reviewRequestWork])
+    // The deadline abandons only execution, not the obligation: publication
+    // receipts and provider PRs are durable, and restart reconciliation checks
+    // whether the fixed request landed before issuing another at-least-once try.
+    const deadline = Date.now() + this.#reviewRequestStopDrainMs
+    while (this.#reviewRequestWork.size > 0 && Date.now() < deadline) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          Promise.allSettled([...this.#reviewRequestWork]),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, Math.max(0, deadline - Date.now()))
+            timer.unref?.()
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+    if (this.#reviewRequestWork.size > 0) {
+      this.#logger.warn?.(
+        `[factory] automated PR review request drain timed out after ${this.#reviewRequestStopDrainMs}ms; abandoning execution for restart reconciliation`,
+        {
+          timeoutMs: this.#reviewRequestStopDrainMs,
+          pendingWork: this.#reviewRequestWork.size,
+        },
+      )
     }
   }
 

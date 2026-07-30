@@ -10080,6 +10080,50 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('bounds stop when a custom automated review requester cannot settle', async () => {
+    const number = 531
+    const warnings: unknown[][] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async () => {
+        await new Promise<never>(() => undefined)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      reviewRequestStopDrainMs: 10,
+      logger: {
+        info: () => undefined,
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    await expect(factory.stop()).resolves.toBeUndefined()
+    expect(warnings).toContainEqual([
+      '[factory] automated PR review request drain timed out after 10ms; abandoning execution for restart reconciliation',
+      { timeoutMs: 10, pendingWork: 1 },
+    ])
+  })
+
   it('backs off rejected automated review requests after issue completion', async () => {
     const number = 527
     const reviewRequests: Array<{ repo: string; number: number }> = []
