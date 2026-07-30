@@ -238,6 +238,7 @@ class ClarificationQuestionDeliveryLeaseLostError extends Error {}
 class GithubEscalationReconciliationUnavailableError extends Error {}
 class GithubEscalationPostAmbiguousError extends Error {}
 class AutomatedReviewRequestDrainError extends Error {}
+class AutomatedReviewPublisherIdentityRequiredError extends Error {}
 
 type GithubEscalationReconciliation = 'found' | 'absent' | 'unavailable'
 class ClarificationWakeStoppedError extends Error {}
@@ -6272,6 +6273,19 @@ export class FactoryLoop implements Factory {
           this.#scheduleAutomatedPullRequestReviewRetry(published)
         }))
     } catch (error) {
+      if (error instanceof AutomatedReviewPublisherIdentityRequiredError) {
+        this.#reviewRequestAttempts.delete(key)
+        this.#increment('githubPullRequestReviewRequestIdentityRequired')
+        this.#logger.error?.(
+          '[factory] automated PR review request reached terminal publisher-identity refusal; verify the PR original publisher, set github.identity explicitly to "app" or "user", and restart',
+          {
+            repo: published.repo,
+            prNumber: published.number,
+            error: describeError(error).errorMessage,
+          },
+        )
+        return
+      }
       this.#increment('githubPullRequestReviewRequestFailures')
       this.#logger.warn?.('[factory] automated PR review request failed; lifecycle completion remains independent', {
         repo: published.repo,
@@ -6472,7 +6486,7 @@ export class FactoryLoop implements Factory {
     const configured = this.#config.github.identity
     const identity = published.publisherIdentity ?? (configured === 'auto' ? undefined : configured)
     if (!identity) {
-      throw new Error(
+      throw new AutomatedReviewPublisherIdentityRequiredError(
         'Automated PR review request requires the persisted publisher identity when github.identity is "auto"; refusing to select an identity from current availability',
       )
     }

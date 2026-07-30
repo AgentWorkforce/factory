@@ -10383,6 +10383,120 @@ describe('FactoryLoop', () => {
     },
   )
 
+  it('makes a legacy auto receipt terminal until the original publisher is configured explicitly', async () => {
+    const number = 537
+    const path = issuePath(number)
+    const issue = issueFile(number)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const seedFactory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+    const receipt = {
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+    }
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      issueKey(decision.issue),
+      {
+        runId: 'terminal-review-legacy-auto',
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        pullRequests: [receipt],
+        pullRequest: receipt,
+        updatedAtMs: 0,
+      },
+      'stopped-owner',
+      0,
+      1,
+    )
+
+    const appReviewRequests: Array<{ repo: string; number: number }> = []
+    const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+    const appWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('restart recovery must reuse the durable receipt')
+      },
+      requestPullRequestReview: async (input) => {
+        appReviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const errors: unknown[][] = []
+    const auto = createFactory(config({ github: { identity: 'auto' } }), {
+      mount: new FakeMountClient({ [path]: issue }, appWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: userWriteback,
+      reviewRequestRetryMs: 5,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      logger: {
+        info: () => undefined,
+        warn: () => undefined,
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    try {
+      await auto.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() =>
+        expect(auto.status().counters.githubPullRequestReviewRequestIdentityRequired).toBe(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(auto.status().counters.githubPullRequestReviewRequestIdentityRequired).toBe(1)
+      expect(appReviewRequests).toEqual([])
+      expect(userWriteback.reviewRequests).toEqual([])
+      expect(errors).toContainEqual([
+        '[factory] automated PR review request reached terminal publisher-identity refusal; verify the PR original publisher, set github.identity explicitly to "app" or "user", and restart',
+        expect.objectContaining({ repo: receipt.repo, prNumber: number }),
+      ])
+    } finally {
+      await auto.stop()
+    }
+
+    const explicitUser = createFactory(config({ github: { identity: 'user' } }), {
+      mount: new FakeMountClient({ [path]: issue }, appWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: userWriteback,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+    })
+    try {
+      await explicitUser.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() =>
+        expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+      expect(appReviewRequests).toEqual([])
+    } finally {
+      await explicitUser.stop()
+      await seedFactory.stop()
+    }
+  })
+
   it('contains a failed startup review reconciliation without failing the lifecycle owner', async () => {
     class ReconciliationFailingStateStore extends InMemoryStateStore {
       listCalls = 0
