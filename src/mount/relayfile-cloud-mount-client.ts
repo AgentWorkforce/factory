@@ -291,7 +291,10 @@ export class RelayfileCloudMountClient implements MountClient {
   #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
-  readonly #lastOpByPath = new Map<string, string>()
+  readonly #lastOpByPath = new Map<string, {
+    opId: string
+    correlationId?: string
+  }>()
   readonly #confirmedExternalIdByPath = new Map<string, string>()
   readonly #confirmedFailureReasonByPath = new Map<string, string>()
 
@@ -538,10 +541,10 @@ export class RelayfileCloudMountClient implements MountClient {
     }
 
     try {
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      this.#lastOpByPath.set(path, { opId: (await writeAtCurrentRevision()).opId })
     } catch (error) {
       if (!isHttpStatus(error, 409)) throw error
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      this.#lastOpByPath.set(path, { opId: (await writeAtCurrentRevision()).opId })
     }
   }
 
@@ -570,7 +573,10 @@ export class RelayfileCloudMountClient implements MountClient {
         contentType: serialized.contentType,
         ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
       })
-      this.#lastOpByPath.set(path, queued.opId)
+      this.#lastOpByPath.set(path, {
+        opId: queued.opId,
+        ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
+      })
       return 'created'
     } catch (error) {
       if (!isCreateRevisionConflict(error)) throw error
@@ -587,11 +593,13 @@ export class RelayfileCloudMountClient implements MountClient {
       await this.#assertProviderDeleteAllowed(path, currentContent)
     }
 
-    this.#lastOpByPath.set(path, (await this.#client.deleteFile({
-      workspaceId: this.workspaceId,
-      path,
-      baseRevision: current.revision,
-    })).opId)
+    this.#lastOpByPath.set(path, {
+      opId: (await this.#client.deleteFile({
+        workspaceId: this.workspaceId,
+        path,
+        baseRevision: current.revision,
+      })).opId,
+    })
   }
 
   async #assertProviderDeleteAllowed(path: string, currentContent: unknown): Promise<void> {
@@ -599,14 +607,14 @@ export class RelayfileCloudMountClient implements MountClient {
       throw new Error(`Refusing provider delete for ${path}: current record is reconciled or linked`)
     }
 
-    const opId = this.#lastOpByPath.get(path)
-    if (!opId || !this.#client.getOp) {
+    const cachedOperation = this.#lastOpByPath.get(path)
+    if (!cachedOperation || !this.#client.getOp) {
       throw new Error(`Refusing provider delete for ${path}: create operation is unknown`)
     }
 
     let op: OperationStatusResponse
     try {
-      op = await this.#client.getOp(this.workspaceId, opId)
+      op = await this.#client.getOp(this.workspaceId, cachedOperation.opId)
     } catch (error) {
       throw new Error(`Refusing provider delete for ${path}: unable to verify create operation: ${errorMessage(error)}`)
     }
@@ -833,8 +841,11 @@ export class RelayfileCloudMountClient implements MountClient {
     opts: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string } = {},
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
-    const opId = this.#lastOpByPath.get(path) ??
-      await this.#recoverLatestWriteOperation(path, deadline, opts.correlationId)
+    const cachedOperation = this.#lastOpByPath.get(path)
+    const opId = cachedOperation &&
+      (!opts.correlationId || cachedOperation.correlationId === opts.correlationId)
+      ? cachedOperation.opId
+      : await this.#recoverLatestWriteOperation(path, deadline, opts.correlationId)
     if (!opId || !this.#client.getOp) return 'timeout'
 
     for (;;) {
@@ -899,7 +910,12 @@ export class RelayfileCloudMountClient implements MountClient {
       cursor = page.nextCursor ?? undefined
     } while (cursor)
     const latest = uniquelyLatestOperation(matching)
-    if (latest) this.#lastOpByPath.set(path, latest.opId)
+    if (latest) {
+      this.#lastOpByPath.set(path, {
+        opId: latest.opId,
+        ...(latest.correlationId ? { correlationId: latest.correlationId } : {}),
+      })
+    }
     return latest?.opId
   }
 

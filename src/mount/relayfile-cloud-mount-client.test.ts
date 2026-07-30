@@ -1540,6 +1540,56 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.deleteFileCalls).toHaveLength(1)
   })
 
+  it('does not let a cached delete acknowledge a correlated write after stale draft reappearance', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const content = { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' }
+    const fake = new FakeRelayFileClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    mount.setDefaultAllowedDeletePredicate((candidatePath, candidateContent) =>
+      candidatePath === path && JSON.stringify(candidateContent) === JSON.stringify(content))
+
+    await expect(mount.createFile(path, content, {
+      guarded: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('created')
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'failed',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('failed')
+    await expect(mount.deleteFile(path)).resolves.toBeUndefined()
+
+    // Provider reconciliation may briefly make the failed local draft visible
+    // again. The cached deletion op must not satisfy the correlated publish.
+    fake.files.set(path, {
+      revision: '2',
+      content: JSON.stringify(content),
+      contentType: 'application/json',
+    })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('failed')
+
+    expect(fake.listOpsCalls.at(-1)?.options?.correlationId).toBe(reviewCorrelationId)
+    expect(fake.getOpCalls.at(-1)).toEqual({ workspaceId: 'rw_test', opId: 'op-1' })
+  })
+
   it('bounds restarted operation recovery by the confirmation timeout', async () => {
     class HangingListOpsClient extends FakeRelayFileClient {
       override async listOps(): Promise<OperationFeedResponse> {
