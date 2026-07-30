@@ -131,7 +131,7 @@ export interface MountClient {
    * `exists` means the store observed a revision conflict; callers must still
    * verify that the winner wrote the record they intended.
    */
-  createFile(
+  createFile?(
     path: string,
     content: unknown,
     opts?: { guarded?: boolean },

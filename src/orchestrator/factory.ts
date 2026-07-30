@@ -6256,12 +6256,16 @@ export class FactoryLoop implements Factory {
       this.#reviewRequestRetryTimers.has(key)
     ) return
     this.#reviewRequestVerifications.add(key)
-    const openLookup = published.headRef
-      ? this.#openPullRequestByHead(published.repo, published.headRef)
-      : this.#openPullRequestByNumber(published.repo, published.number)
+    // Retry authorization must come from an authoritative point lookup. The
+    // head-based discovery helper may fall back to webhook-fed mount metadata,
+    // which is useful for reconciliation but cannot prove a PR remains open.
+    const openLookup = this.#openPullRequestByNumber(published.repo, published.number)
     void openLookup
       .then((open) => {
-        if (open?.number === published.number) {
+        if (
+          open?.number === published.number &&
+          (!published.headRef || open.headRef === published.headRef)
+        ) {
           this.#requestAutomatedPullRequestReview(open)
         }
       })

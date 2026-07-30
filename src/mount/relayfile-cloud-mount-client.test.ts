@@ -1570,7 +1570,7 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.listOpsCalls).toHaveLength(1)
   })
 
-  it('treats restarted operation lookup failures as unavailable recovery data', async () => {
+  it('propagates restarted operation feed failures instead of reporting a timeout', async () => {
     class FailingListOpsClient extends FakeRelayFileClient {
       override async listOps(): Promise<OperationFeedResponse> {
         throw new Error('relayfile unavailable')
@@ -1585,8 +1585,28 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
       timeoutMs: 5,
-    })).resolves.toBe('timeout')
+    })).rejects.toThrow('relayfile unavailable')
     expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('propagates operation lookup failures instead of reporting a timeout', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json'
+    class FailingGetOpClient extends FakeRelayFileClient {
+      override async getOp(): Promise<OperationStatusResponse> {
+        throw new Error('operation lookup unavailable')
+      }
+    }
+    const fake = new FailingGetOpClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile(path, { body: '@coderabbitai review' }, { guarded: true })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+    })).rejects.toThrow('operation lookup unavailable')
   })
 
   it('fails closed when restarted write operations have the same latest timestamp', async () => {

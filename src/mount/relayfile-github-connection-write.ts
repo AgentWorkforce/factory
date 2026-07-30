@@ -24,7 +24,8 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'createFile' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
+  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
+    createFile: NonNullable<MountClient['createFile']>
     queryFiles(opts: {
       path: string
       provider?: string

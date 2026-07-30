@@ -1023,8 +1023,6 @@ const settleBeforeDeadline = async <T>(operation: Promise<T>, deadline: number):
         timer.unref?.()
       }),
     ])
-  } catch {
-    return undefined
   } finally {
     if (timer) clearTimeout(timer)
   }

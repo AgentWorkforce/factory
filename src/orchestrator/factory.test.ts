@@ -10122,6 +10122,58 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('does not let stale mounted metadata authorize a review retry when GitHub lookup fails', async () => {
+    const number = 529
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let openLookups = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('transient provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      [`/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`]: {
+        number,
+        state: 'open',
+        head_ref: `factory/ar-${number}-pear`,
+        isDraft: false,
+      },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => {
+        openLookups += 1
+        throw new Error('authoritative GitHub lookup unavailable')
+      },
+      reviewRequestRetryMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() => expect(openLookups).toBeGreaterThan(1))
+      expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('does not retry an automated review request after the pull request closes', async () => {
     const number = 528
     const reviewRequests: Array<{ repo: string; number: number }> = []
