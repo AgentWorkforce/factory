@@ -1109,7 +1109,7 @@ export class FactoryLoop implements Factory {
         highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
       })
       try {
-        await this.runOnce()
+        await this.#runOnce({ drainAutomatedReviewRequests: false })
       } catch (error) {
         // A startup backfill failure must not abort the daemon: log it and fall
         // back to the live event stream (plus any buffered events) instead of
@@ -1692,6 +1692,15 @@ export class FactoryLoop implements Factory {
   }
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
+    return this.#runOnce({
+      ...opts,
+      drainAutomatedReviewRequests: true,
+    })
+  }
+
+  async #runOnce(
+    opts: { dryRun?: boolean; drainAutomatedReviewRequests: boolean },
+  ): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const startedAtMs = this.#clock.now()
     const relayfileWaitWarningsAtStart = this.#counters.relayfileOperationWaitWarnings ?? 0
@@ -1865,7 +1874,9 @@ export class FactoryLoop implements Factory {
       // A daemon leaves delay-capped retries on their backoff timers. A true
       // one-shot invocation has no later loop iteration, so drain them before
       // its caller is allowed to dispose the mount and exit.
-      if (report && !this.#started) await this.#drainAutomatedPullRequestReviewRetriesForRunOnce()
+      if (report && opts.drainAutomatedReviewRequests) {
+        await this.#drainAutomatedPullRequestReviewRetriesForRunOnce()
+      }
       if (report) {
         this.#logger.info?.('[factory] run-once completed', {
           dryRun,
@@ -2361,7 +2372,10 @@ export class FactoryLoop implements Factory {
           await this.#sweepWaitingClarifications()
           await this.#drainReadyClarificationWake()
           await this.#sweepPrStateCompletions('run-loop')
-          reports.push(await this.runOnce({ dryRun: opts.dryRun }))
+          reports.push(await this.#runOnce({
+            dryRun: opts.dryRun,
+            drainAutomatedReviewRequests: false,
+          }))
           consecutiveFailures = 0
         } catch (error) {
           consecutiveFailures += 1

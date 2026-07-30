@@ -10190,6 +10190,56 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('does not exhaust automated review retries during normal run-loop iterations', async () => {
+    const number = 532
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('persistent provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      reviewRequestRetryMs: 60_000,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+    await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+
+    const reports = await factory.runLoop({ dryRun: true, maxIterations: 2 })
+
+    expect(reports).toHaveLength(2)
+    expect(reports.every((report) => report.error === undefined)).toBe(true)
+    expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
+    expect(factory.status().counters.loopIterationFailures).toBeUndefined()
+    expect(factory.status().counters.loopCircuitBreaks).toBeUndefined()
+  })
+
   it('makes an unmet bounded run-once review drain a named terminal failure', async () => {
     const number = 530
     const reviewRequests: Array<{ repo: string; number: number }> = []
