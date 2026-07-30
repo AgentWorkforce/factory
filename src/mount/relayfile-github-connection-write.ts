@@ -14,6 +14,7 @@ import {
 } from '../github/review-request'
 
 const REVIEW_REQUEST_CONFIRM_TIMEOUT_MS = 10_000
+const REVIEW_REQUEST_RECENT_EVENT_LIMIT = 200
 
 const execFileAsync = promisify(execFile)
 const WRITE_CONFIRM_TIMEOUT_MS = 90_000
@@ -23,7 +24,7 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'>
+  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'getEvents' | 'listTree' | 'readFile' | 'writeFile'>
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
@@ -157,7 +158,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       'u',
     )
     const commentRoots = new Set([`${pullsRoot}/${number}/comments`])
-    for (const path of await this.#listTreeOrEmpty(pullsRoot)) {
+    for (const path of await this.#listTreeOrEmpty(`${pullsRoot}/${number}`)) {
       const pullDirectory = pullDirectoryPattern.exec(path)?.[1]
       if (pullDirectory) commentRoots.add(`${pullsRoot}/${pullDirectory}/comments`)
     }
@@ -215,19 +216,15 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       `^${escapeRegExp(canonicalCommentsRoot)}/[^/]+/(?:meta|metadata)\\.json$`,
       'u',
     )
-    const canonicalDirectoryPattern = new RegExp(
-      `^${escapeRegExp(canonicalCommentsRoot)}/[^/.]+$`,
-      'u',
-    )
     const canonicalPaths = new Set<string>()
-    for (const path of await this.#listTreeOrEmpty(canonicalCommentsRoot)) {
+    const recentEvents = await this.#mount.getEvents({
+      provider: 'github',
+      last: REVIEW_REQUEST_RECENT_EVENT_LIMIT,
+    })
+    for (const event of recentEvents.events) {
+      const path = event.resource.path
       if (canonicalDirectPattern.test(path) || canonicalNestedPattern.test(path)) {
         canonicalPaths.add(path)
-        continue
-      }
-      if (!canonicalDirectoryPattern.test(path)) continue
-      for (const nestedPath of await this.#listTreeOrEmpty(path)) {
-        if (canonicalNestedPattern.test(nestedPath)) canonicalPaths.add(nestedPath)
       }
     }
     for (const path of canonicalPaths) {

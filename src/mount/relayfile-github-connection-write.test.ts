@@ -15,6 +15,12 @@ const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (ar
   throw new Error(`unexpected git args: ${args.join(' ')}`)
 })
 
+const githubEvent = (id: string, path: string): Parameters<FakeMountClient['emit']>[0] => ({
+  id,
+  type: 'relayfile.changed',
+  resource: { provider: 'github', path },
+} as Parameters<FakeMountClient['emit']>[0])
+
 describe('RelayfileGithubConnectionWrite', () => {
   it('requests CodeRabbit review once through the connected app write path', async () => {
     const mount = new FakeMountClient()
@@ -185,7 +191,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
       override async listTree(prefix: string): Promise<string[]> {
         this.listPrefixes.push(prefix)
-        if (prefix.endsWith('/pulls')) {
+        if (prefix.endsWith('/pulls/87')) {
           return ['/github/repos/AgentWorkforce/factory/pulls/87__renamed']
         }
         if (prefix.endsWith('/pulls/87__renamed/comments')) return [stalePath]
@@ -216,10 +222,10 @@ describe('RelayfileGithubConnectionWrite', () => {
     await expect(write.requestPullRequestReview(input)).resolves.toBeUndefined()
     expect(mount.writes).toEqual([])
     expect(mount.listPrefixes).toEqual([
-      '/github/repos/AgentWorkforce/factory/pulls',
+      '/github/repos/AgentWorkforce/factory/pulls/87',
       '/github/repos/AgentWorkforce/factory/pulls/87/comments',
       '/github/repos/AgentWorkforce/factory/pulls/87__renamed/comments',
-      '/github/repos/AgentWorkforce/factory/pulls',
+      '/github/repos/AgentWorkforce/factory/pulls/87',
       '/github/repos/AgentWorkforce/factory/pulls/87/comments',
       '/github/repos/AgentWorkforce/factory/pulls/87__renamed/comments',
     ])
@@ -313,6 +319,8 @@ describe('RelayfileGithubConnectionWrite', () => {
         },
       },
     })
+    mount.emit(githubEvent('canonical-unrelated', unrelatedPath))
+    mount.emit(githubEvent('canonical-request', canonicalPath))
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
     await expect(write.requestPullRequestReview({
@@ -336,6 +344,7 @@ describe('RelayfileGithubConnectionWrite', () => {
         },
       },
     })
+    mount.emit(githubEvent('canonical-other-pr', canonicalPath))
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
     await expect(write.requestPullRequestReview({
