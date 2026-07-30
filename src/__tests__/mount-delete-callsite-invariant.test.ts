@@ -8,6 +8,8 @@ const SDK_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const ALLOWED_DELETE_CALLSITES = new Set([
   'writeback/linear.ts',
   'writeback/slack.ts',
+  // Deletes only the exact review draft after its publish operation reaches a terminal state.
+  'mount/relayfile-github-connection-write.ts',
 ])
 
 describe('mount.deleteFile callsite invariant', () => {
