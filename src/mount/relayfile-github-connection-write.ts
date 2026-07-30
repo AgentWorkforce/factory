@@ -422,7 +422,9 @@ const canonicalGithubCommentMatches = (
   if (directNumber) numbers.add(directNumber)
   for (const value of [
     content.pull_request_url,
+    content.html_url,
     payload.pull_request_url,
+    payload.html_url,
     comment.pull_request_url,
     comment.html_url,
   ]) {

@@ -425,6 +425,26 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.reads).toEqual([canonicalPath])
   })
 
+  it('finds a root-level GitHub issue comment by its pull request URL after restart', async () => {
+    const canonicalPath =
+      '/github/repos/AgentWorkforce/factory/comments/9011.json'
+    const mount = new FakeMountClient({
+      [canonicalPath]: {
+        html_url: 'https://github.com/AgentWorkforce/factory/pull/95#issuecomment-9011',
+        body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 95,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.reads).toEqual([canonicalPath])
+  })
+
   it('fails closed when canonical identity fields conflict with the pull request URL', async () => {
     const canonicalPath =
       '/github/repos/AgentWorkforce/factory/comments/9010.json'
