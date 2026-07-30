@@ -6600,19 +6600,23 @@ export class FactoryLoop implements Factory {
   async #openPullRequestByNumber(
     repo: string,
     number: number,
+    signal?: AbortSignal,
   ): Promise<AutomatedReviewRequestTarget | undefined> {
     if (!this.#hasProbePrGhRunner) {
       throw new Error('Authoritative GitHub pull request lookup is unavailable')
     }
-    const result = await this.#probePrGhRunner([
-      'pr',
-      'view',
-      String(number),
-      '--repo',
-      repo,
-      '--json',
-      'number,headRefName,isDraft,state',
-    ])
+    const result = await this.#probePrGhRunner(
+      [
+        'pr',
+        'view',
+        String(number),
+        '--repo',
+        repo,
+        '--json',
+        'number,headRefName,isDraft,state',
+      ],
+      { signal },
+    )
     const candidate = asRecord(parseJsonContent(result.stdout))
     const candidateNumber = numberValue(candidate?.number)
     if (
@@ -6632,19 +6636,27 @@ export class FactoryLoop implements Factory {
     repo: string,
     number: number,
   ): Promise<AutomatedReviewRequestTarget | undefined> {
+    const controller = new AbortController()
+    let timedOut = false
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      return await Promise.race([
-        this.#openPullRequestByNumber(repo, number),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error(
-              `Authoritative GitHub pull request lookup timed out after ${this.#reviewRequestVerificationTimeoutMs}ms`,
-            ))
-          }, this.#reviewRequestVerificationTimeoutMs)
-          timer.unref?.()
-        }),
-      ])
+      // A logical Promise.race would release the verification key while the
+      // physical `gh` process kept running. Abort the runner and await that
+      // operation's rejection so retries cannot accumulate subprocesses.
+      timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, this.#reviewRequestVerificationTimeoutMs)
+      timer.unref?.()
+      return await this.#openPullRequestByNumber(repo, number, controller.signal)
+    } catch (error) {
+      if (timedOut) {
+        throw new Error(
+          `Authoritative GitHub pull request lookup timed out after ${this.#reviewRequestVerificationTimeoutMs}ms`,
+          { cause: error },
+        )
+      }
+      throw error
     } finally {
       if (timer) clearTimeout(timer)
     }

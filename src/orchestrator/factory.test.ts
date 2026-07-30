@@ -10394,11 +10394,14 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('times out a hung review verification, releases its key, and retries the durable obligation', async () => {
+  it('cancels repeated hung review verifications before retrying the durable obligation', async () => {
     const number = 536
     const reviewRequests: Array<{ repo: string; number: number }> = []
     let reviewAttempts = 0
     let lookupAttempts = 0
+    let activeLookups = 0
+    let maximumActiveLookups = 0
+    let abortedLookups = 0
     const fleet = new FakeFleetClient()
     const factory = createFactory(config(), {
       mount: new FakeMountClient({
@@ -10421,9 +10424,32 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       probePrResolver: async () => undefined,
-      probePrGhRunner: async () => {
+      probePrGhRunner: async (_args, options) => {
         lookupAttempts += 1
-        if (lookupAttempts === 1) await new Promise<never>(() => undefined)
+        if (lookupAttempts <= 3) {
+          activeLookups += 1
+          maximumActiveLookups = Math.max(maximumActiveLookups, activeLookups)
+          await new Promise<never>((_, reject) => {
+            const signal = options?.signal
+            if (!signal) {
+              activeLookups -= 1
+              reject(new Error('verification lookup did not receive a cancellation signal'))
+              return
+            }
+            const abort = () => {
+              activeLookups -= 1
+              abortedLookups += 1
+              const error = new Error('synthetic gh lookup aborted')
+              error.name = 'AbortError'
+              reject(error)
+            }
+            if (signal.aborted) {
+              abort()
+            } else {
+              signal.addEventListener('abort', abort, { once: true })
+            }
+          })
+        }
         return {
           stdout: JSON.stringify({
             number,
@@ -10433,8 +10459,8 @@ describe('FactoryLoop', () => {
           }),
         }
       },
-      reviewRequestRetryMs: 5,
-      reviewRequestVerificationTimeoutMs: 10,
+      reviewRequestRetryMs: 1,
+      reviewRequestVerificationTimeoutMs: 5,
     })
 
     try {
@@ -10443,11 +10469,14 @@ describe('FactoryLoop', () => {
       ))
       fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
 
-      await vi.waitFor(() => expect(lookupAttempts).toBe(2))
+      await vi.waitFor(() => expect(lookupAttempts).toBe(4))
       await vi.waitFor(() => expect(reviewRequests).toEqual([
         { repo: 'AgentWorkforce/pear', number },
         { repo: 'AgentWorkforce/pear', number },
       ]))
+      expect(abortedLookups).toBe(3)
+      expect(maximumActiveLookups).toBe(1)
+      expect(activeLookups).toBe(0)
     } finally {
       await factory.stop()
     }

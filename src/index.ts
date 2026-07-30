@@ -114,6 +114,7 @@ export {
 export type {
   CloseProbePrInput,
   CloseProbePrResult,
+  GhRunOptions,
   GhRunner,
   GhRunResult,
   GithubMergeInput,
