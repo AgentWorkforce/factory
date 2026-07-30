@@ -10067,6 +10067,7 @@ describe('FactoryLoop', () => {
     const number = 527
     const reviewRequests: Array<{ repo: string; number: number }> = []
     let attempts = 0
+    let openLookups = 0
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => ({
         repo: input.repo,
@@ -10091,6 +10092,18 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       probePrResolver: async () => undefined,
+      probePrGhRunner: async () => {
+        openLookups += 1
+        if (openLookups === 1) throw new Error('transient open-state lookup failure')
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
       reviewRequestRetryMs: 5,
     })
 
@@ -10103,6 +10116,57 @@ describe('FactoryLoop', () => {
         { repo: 'AgentWorkforce/pear', number },
         { repo: 'AgentWorkforce/pear', number },
       ]))
+      expect(openLookups).toBe(2)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not retry an automated review request after the pull request closes', async () => {
+    const number = 528
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('provider failed before the pull request closed')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'CLOSED',
+        }),
+      }),
+      reviewRequestRetryMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
     } finally {
       await factory.stop()
     }

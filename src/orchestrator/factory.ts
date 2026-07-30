@@ -135,6 +135,7 @@ type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: bool
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullRequest'>
 type GithubPullRequestIdentity = 'app' | 'user'
+type AutomatedReviewRequestTarget = GithubPullRequestRef & { headRef?: string }
 type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
@@ -1575,6 +1576,7 @@ export class FactoryLoop implements Factory {
               this.#requestAutomatedPullRequestReview({
                 repo: pr.repo,
                 number: pr.prNumber,
+                headRef: pr.headRef,
               })
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -6199,7 +6201,7 @@ export class FactoryLoop implements Factory {
   }
 
   #requestAutomatedPullRequestReview(
-    published: GithubPullRequestRef,
+    published: AutomatedReviewRequestTarget,
   ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (this.#reviewRequestedPullRequests.has(key) || this.#reviewRequestRetryTimers.has(key)) return
@@ -6229,7 +6231,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  #scheduleAutomatedPullRequestReviewRetry(published: GithubPullRequestRef): void {
+  #scheduleAutomatedPullRequestReviewRetry(published: AutomatedReviewRequestTarget): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (
       this.#stopping ||
@@ -6238,19 +6240,26 @@ export class FactoryLoop implements Factory {
     ) return
     const timer = setTimeout(() => {
       this.#reviewRequestRetryTimers.delete(key)
-      if (!this.#stopping) this.#requestAutomatedPullRequestReview(published)
+      if (!this.#stopping) this.#requestAutomatedPullRequestReviewForOpenReceipt(published)
     }, this.#reviewRequestRetryMs)
     timer.unref?.()
     this.#reviewRequestRetryTimers.set(key, timer)
   }
 
   #requestAutomatedPullRequestReviewForOpenReceipt(
-    published: GithubPublishPullRequestResult,
+    published: AutomatedReviewRequestTarget,
   ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
-    if (this.#reviewRequestedPullRequests.has(key) || this.#reviewRequestVerifications.has(key)) return
+    if (
+      this.#reviewRequestedPullRequests.has(key) ||
+      this.#reviewRequestVerifications.has(key) ||
+      this.#reviewRequestRetryTimers.has(key)
+    ) return
     this.#reviewRequestVerifications.add(key)
-    void this.#openPullRequestByHead(published.repo, published.headRef)
+    const openLookup = published.headRef
+      ? this.#openPullRequestByHead(published.repo, published.headRef)
+      : this.#openPullRequestByNumber(published.repo, published.number)
+    void openLookup
       .then((open) => {
         if (open?.number === published.number) {
           this.#requestAutomatedPullRequestReview(open)
@@ -6263,6 +6272,7 @@ export class FactoryLoop implements Factory {
           prNumber: published.number,
           error: describeError(error).errorMessage,
         })
+        this.#scheduleAutomatedPullRequestReviewRetry(published)
       })
       .finally(() => this.#reviewRequestVerifications.delete(key))
   }
@@ -6404,6 +6414,43 @@ export class FactoryLoop implements Factory {
       }
     }
     return candidates.sort((a, b) => b.number - a.number)[0]
+  }
+
+  async #openPullRequestByNumber(
+    repo: string,
+    number: number,
+  ): Promise<AutomatedReviewRequestTarget | undefined> {
+    if (this.#hasProbePrGhRunner) {
+      const result = await this.#probePrGhRunner([
+        'pr',
+        'view',
+        String(number),
+        '--repo',
+        repo,
+        '--json',
+        'number,headRefName,isDraft,state',
+      ])
+      const candidate = asRecord(parseJsonContent(result.stdout))
+      const candidateNumber = numberValue(candidate?.number)
+      if (
+        candidateNumber !== number ||
+        Boolean(candidate?.isDraft) ||
+        normalizePrState(stringValue(candidate?.state)) !== 'OPEN'
+      ) return undefined
+      const headRef = stringValue(candidate?.headRefName)
+      return {
+        repo,
+        number,
+        ...(headRef ? { headRef } : {}),
+      }
+    }
+    const snapshot = await this.#github.getPr(repo, number)
+    if (snapshot.number !== number || normalizePrState(snapshot.state) !== 'OPEN') return undefined
+    return {
+      repo,
+      number,
+      ...(snapshot.headRef ? { headRef: snapshot.headRef } : {}),
+    }
   }
 
   async #prepareAgentWorktree(record: InFlightIssue, spec: AgentSpec): Promise<void> {
@@ -6940,6 +6987,7 @@ export class FactoryLoop implements Factory {
         this.#requestAutomatedPullRequestReview({
           repo: pr.repo,
           number: pr.prNumber,
+          headRef: pr.headRef,
         })
       }
       return true
