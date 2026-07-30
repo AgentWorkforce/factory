@@ -14,6 +14,7 @@ export {
   standaloneBabysitterAgentName,
 } from './standalone-babysitter'
 export type {
+  GhRunOptions,
   GhRunner,
   GhRunResult,
   GithubMergeInput,

@@ -191,6 +191,26 @@ export class FileStateStore extends InMemoryStateStore {
     }))
   }
 
+  override async recordDispatchLifecyclePullRequestPublisherIdentity(
+    workspaceId: string,
+    key: string,
+    repo: string,
+    number: number,
+    identity: 'app' | 'user',
+    nowMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
+      if (!lifecycle) return false
+      const updated = recordPullRequestPublisherIdentity(lifecycle, repo, number, identity)
+      if (!updated) return false
+      lifecycle.updatedAtMs = nowMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
   override async getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined> {
     return await this.#exclusive(async () => {
       const lifecycle = (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchLifecycles[key]
@@ -870,6 +890,26 @@ export class FileStateStore extends InMemoryStateStore {
     this.#operation = result.then(() => undefined, () => undefined)
     return await result
   }
+}
+
+const recordPullRequestPublisherIdentity = (
+  lifecycle: DispatchLifecycle,
+  repo: string,
+  number: number,
+  identity: 'app' | 'user',
+): boolean => {
+  const receipts = [
+    ...(lifecycle.pullRequest ? [lifecycle.pullRequest] : []),
+    ...(lifecycle.pullRequests ?? []),
+  ].filter((receipt) =>
+    githubRepositoriesMatch(receipt.repo, repo) && receipt.number === number)
+  if (
+    receipts.length === 0 ||
+    receipts.some((receipt) =>
+      receipt.publisherIdentity !== undefined && receipt.publisherIdentity !== identity)
+  ) return false
+  for (const receipt of receipts) receipt.publisherIdentity = identity
+  return true
 }
 
 const parseDocument = (value: unknown): WatchStateDocument => {

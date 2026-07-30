@@ -114,6 +114,7 @@ export {
 export type {
   CloseProbePrInput,
   CloseProbePrResult,
+  GhRunOptions,
   GhRunner,
   GhRunResult,
   GithubMergeInput,
@@ -301,6 +302,7 @@ export type {
   FactoryIntegrationProvider,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  GithubPullRequestRef,
   LocalMountOptions,
   MountClient,
   ProviderSyncStatus,

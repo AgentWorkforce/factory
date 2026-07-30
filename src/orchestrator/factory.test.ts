@@ -291,12 +291,14 @@ class RecordingGithubWriteback implements GithubWriteback {
 
 class PublishingGithubWriteback extends RecordingGithubWriteback {
   readonly publishInputs: GithubPublishPullRequestInput[] = []
+  readonly reviewRequests: Array<{ repo: string; number: number }> = []
 
   constructor(
     private readonly receipt: {
       number: number
       author: string
     },
+    private readonly failReviewRequest = false,
   ) {
     super()
   }
@@ -310,6 +312,11 @@ class PublishingGithubWriteback extends RecordingGithubWriteback {
       headRef: input.headRef ?? `factory/${this.receipt.number}-user`,
       author: this.receipt.author,
     }
+  }
+
+  async requestPullRequestReview(input: { repo: string; number: number }) {
+    this.reviewRequests.push(input)
+    if (this.failReviewRequest) throw new Error('transient review request failure')
   }
 }
 
@@ -3698,14 +3705,17 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.statuses).toEqual([])
   })
 
-  it('does not treat an accepted merge command as proof that a GitHub-native PR merged', async () => {
+  it('does not let an accepted merge command or review-request failure falsely complete a GitHub-native issue', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 50)
     const mount = new FakeMountClient({
       [path]: githubIssueFile(50, { labels: ['factory'] }),
     })
     mount.setSubRoot('/linear/issues', 'absent')
     const fleet = new FakeFleetClient()
-    const githubWriteback = new RecordingGithubWriteback()
+    const githubWriteback = new PublishingGithubWriteback(
+      { number: 50, author: 'operator-user' },
+      true,
+    )
     const mergeGate = new ScriptedGithubMergeGate([readyMergeVerdict('github-head')])
     const factory = createFactory(config({
       issueSource: 'github',
@@ -3717,7 +3727,21 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       githubWriteback,
       mergeGate,
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50 }),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: 50,
+        author: 'operator-user',
+        state: 'OPEN',
+      }),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number: 50,
+          headRefName: 'github-head',
+          isDraft: false,
+          state: 'OPEN',
+          author: { login: 'operator-user' },
+        }),
+      }),
     })
 
     await factory.runOnce()
@@ -3727,6 +3751,7 @@ describe('FactoryLoop', () => {
 
     expect(mergeGate.checks).toEqual([{ repo: 'AgentWorkforce/pear', number: 50 }])
     expect(mergeGate.merges).toEqual([{ repo: 'AgentWorkforce/pear', number: 50, expectedHeadSha: 'github-head' }])
+    expect(githubWriteback.reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 50 }])
     expect(githubWriteback.closes).toEqual([])
     expect(githubWriteback.statuses).toEqual([
       { key: '50', status: 'in-progress' },
@@ -6135,6 +6160,7 @@ describe('FactoryLoop', () => {
       probePrResolver: async () => ({
         repo: 'AgentWorkforce/pear',
         prNumber: 1591,
+        author: 'operator-user',
         headRef: branch,
         state: 'OPEN',
         url: 'https://github.com/AgentWorkforce/pear/pull/1591',
@@ -6145,6 +6171,7 @@ describe('FactoryLoop', () => {
           url: 'https://github.com/AgentWorkforce/pear/pull/1591',
           headRefName: branch,
           isDraft: false,
+          author: { login: 'operator-user' },
         }]),
       }),
     })
@@ -6162,6 +6189,7 @@ describe('FactoryLoop', () => {
           repo: 'AgentWorkforce/pear',
           number: 1591,
           headRef: branch,
+          publisherIdentity: 'user',
         },
       })
     })
@@ -6179,12 +6207,17 @@ describe('FactoryLoop', () => {
     const publishPullRequest = vi.fn(async () => {
       throw new Error('must reconcile the exact existing branch')
     })
+    const reviewRequests: Array<{ repo: string; number: number }> = []
     const mount = new FakeMountClient({ [issuePath(597)]: issue }, {
       publishPullRequest,
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
       closePullRequest: async () => undefined,
     })
     const fleet = new DurableRemoteLifecycleFleetClient()
     const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const userWriteback = new PublishingGithubWriteback({ number: 1597, author: 'operator-user' })
     const ghCalls: string[][] = []
     let branch = ''
     const factory = createFactory(config({ babysitter: { enabled: true } }), {
@@ -6201,10 +6234,18 @@ describe('FactoryLoop', () => {
                 url: 'https://github.com/AgentWorkforce/pear/pull/1597',
                 headRefName: branch,
                 isDraft: false,
+                author: { login: 'operator-user' },
               }])
-            : '[]',
+            : JSON.stringify({
+                number: 1597,
+                headRefName: branch,
+                isDraft: false,
+                state: 'OPEN',
+                author: { login: 'operator-user' },
+              }),
         }
       },
+      githubWriteback: userWriteback,
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
 
@@ -6222,8 +6263,79 @@ describe('FactoryLoop', () => {
         },
       })
     })
-    expect(ghCalls.length).toBeGreaterThan(0)
-    expect(ghCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    const lookupCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'list')
+    expect(lookupCalls.length).toBeGreaterThan(0)
+    expect(lookupCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    expect(reviewRequests).toEqual([])
+    expect(userWriteback.reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 1597 }])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      .resolves.toMatchObject({
+        pullRequest: { publisherIdentity: 'user' },
+      })
+    expect(publishPullRequest).not.toHaveBeenCalled()
+    await factory.stop()
+  })
+
+  it('reverifies a reconciled PR before requesting review when it closes after head lookup', async () => {
+    const issue = issueFile(598)
+    const publishPullRequest = vi.fn(async () => {
+      throw new Error('must reconcile the existing PR instead of publishing another')
+    })
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const mount = new FakeMountClient({ [issuePath(598)]: issue }, {
+      publishPullRequest,
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new DurableRemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const ghCalls: string[][] = []
+    let branch = ''
+    const factory = createFactory(config({ babysitter: { enabled: true } }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: args[1] === 'view'
+            ? JSON.stringify({
+                number: 1598,
+                headRefName: branch,
+                isDraft: false,
+                state: 'CLOSED',
+              })
+            : JSON.stringify([{
+                number: 1598,
+                url: 'https://github.com/AgentWorkforce/pear/pull/1598',
+                headRefName: branch,
+                isDraft: false,
+              }]),
+        }
+      },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(598), issue))
+
+    await factory.dispatch(decision)
+    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      .decision.implementers[0]!.branch!
+    fleet.emitAgentExit('ar-598-impl-pear', 'reconciled-missing')
+
+    await vi.waitFor(async () => {
+      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+        pullRequest: {
+          repo: 'AgentWorkforce/pear',
+          number: 1598,
+          headRef: branch,
+        },
+      })
+    })
+    await vi.waitFor(() =>
+      expect(ghCalls.some((args) => args[0] === 'pr' && args[1] === 'view')).toBe(true))
+    expect(reviewRequests).toEqual([])
     expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
@@ -6622,6 +6734,7 @@ describe('FactoryLoop', () => {
         }
       },
       closePullRequest: async () => undefined,
+      requestPullRequestReview: async () => undefined,
     }
     const mount = new ConfirmingMount({
       [issuePath(885)]: issueFile(885),
@@ -9943,6 +10056,7 @@ describe('FactoryLoop', () => {
     async ({ identity, appAvailable, expectedIdentity }) => {
       const number = identity === 'app' ? 520 : identity === 'user' ? 521 : appAvailable ? 522 : 523
       const appInputs: GithubPublishPullRequestInput[] = []
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
       const appWrite: GithubConnectionWrite = {
         publishPullRequest: async (input) => {
           appInputs.push(input)
@@ -9953,6 +10067,9 @@ describe('FactoryLoop', () => {
             headRef: `factory/${number}-app`,
             author: 'relayfile[bot]',
           }
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
         },
         closePullRequest: async () => undefined,
       }
@@ -9982,6 +10099,12 @@ describe('FactoryLoop', () => {
 
       expect(appInputs).toHaveLength(expectedIdentity === 'app' ? 1 : 0)
       expect(userWriteback.publishInputs).toHaveLength(expectedIdentity === 'user' ? 1 : 0)
+      expect(appReviewRequests).toEqual(
+        expectedIdentity === 'app' ? [{ repo: 'AgentWorkforce/pear', number }] : [],
+      )
+      expect(userWriteback.reviewRequests).toEqual(
+        expectedIdentity === 'user' ? [{ repo: 'AgentWorkforce/pear', number }] : [],
+      )
       expect(infoLogs).toContainEqual([
         '[factory] published PR',
         expect.objectContaining({
@@ -9992,6 +10115,1075 @@ describe('FactoryLoop', () => {
       ])
     },
   )
+
+  it('does not let a pending automated review request stall lifecycle completion and drains it on stop', async () => {
+    const number = 524
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let releaseReviewRequest!: () => void
+    const reviewRequestSettled = new Promise<void>((resolve) => {
+      releaseReviewRequest = resolve
+    })
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        await reviewRequestSettled
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    let stopping: Promise<void> | undefined
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(reviewRequests).toEqual([{
+        repo: 'AgentWorkforce/pear',
+        number,
+      }]))
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+      let stopped = false
+      stopping = factory.stop().then(() => {
+        stopped = true
+      })
+      await flush()
+      expect(stopped).toBe(false)
+
+      releaseReviewRequest()
+      await stopping
+      expect(stopped).toBe(true)
+    } finally {
+      releaseReviewRequest()
+      await (stopping ?? factory.stop())
+    }
+  })
+
+  it('bounds stop when a custom automated review requester cannot settle', async () => {
+    const number = 531
+    const warnings: unknown[][] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async () => {
+        await new Promise<never>(() => undefined)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      reviewRequestStopDrainMs: 10,
+      logger: {
+        info: () => undefined,
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    await expect(factory.stop()).resolves.toBeUndefined()
+    expect(warnings).toContainEqual([
+      '[factory] automated PR review request drain timed out after 10ms; abandoning execution for restart reconciliation',
+      { timeoutMs: 10, pendingWork: 1 },
+    ])
+  })
+
+  it('reconciles a terminal lifecycle review obligation after process restart', async () => {
+    const number = 533
+    const path = issuePath(number)
+    const issue = issueFile(number)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const seedFactory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+    const receipt = {
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+      publisherIdentity: 'app' as const,
+    }
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      issueKey(decision.issue),
+      {
+        runId: 'terminal-review-restart',
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        pullRequests: [receipt],
+        pullRequest: receipt,
+        updatedAtMs: 0,
+      },
+      'stopped-owner',
+      0,
+      1,
+    )
+
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('restart recovery must reuse the durable receipt')
+      },
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const restarted = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }, githubWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+    })
+
+    try {
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(reviewRequests).toEqual([{
+        repo: receipt.repo,
+        number,
+      }]))
+    } finally {
+      await restarted.stop()
+      await seedFactory.stop()
+    }
+  })
+
+  it.each([
+    {
+      publisherIdentity: 'user' as const,
+      appAvailable: true,
+      expectedRequester: 'user' as const,
+    },
+    {
+      publisherIdentity: 'app' as const,
+      appAvailable: true,
+      expectedRequester: 'app' as const,
+    },
+    {
+      publisherIdentity: 'app' as const,
+      appAvailable: false,
+      expectedRequester: undefined,
+    },
+  ])(
+    'preserves $publisherIdentity publisher identity during auto recovery when appAvailable=$appAvailable',
+    async ({ publisherIdentity, appAvailable, expectedRequester }) => {
+      const number = publisherIdentity === 'user' ? 534 : appAvailable ? 535 : 536
+      const path = issuePath(number)
+      const issue = issueFile(number)
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const seedFactory = createFactory(config(), {
+        mount: new FakeMountClient({ [path]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+      })
+      const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+      const receipt = {
+        repo: 'AgentWorkforce/pear',
+        number,
+        url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+        headRef: `factory/ar-${number}-pear`,
+        publisherIdentity,
+      }
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-${publisherIdentity}-${appAvailable}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
+      const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+      const appWrite: GithubConnectionWrite = {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse the durable receipt')
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
+        },
+        closePullRequest: async () => undefined,
+      }
+      const restarted = createFactory(config({ github: { identity: 'auto' } }), {
+        mount: new FakeMountClient({ [path]: issue }, appAvailable ? appWrite : undefined),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: userWriteback,
+        reviewRequestRetryMs: 60_000,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify({
+            number,
+            headRefName: receipt.headRef,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }),
+      })
+
+      try {
+        await restarted.start({ mode: 'dispatch-owner' })
+        if (expectedRequester === 'app') {
+          await vi.waitFor(() => expect(appReviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(userWriteback.reviewRequests).toEqual([])
+        } else if (expectedRequester === 'user') {
+          await vi.waitFor(() =>
+            expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(appReviewRequests).toEqual([])
+        } else {
+          await vi.waitFor(() =>
+            expect(restarted.status().counters.githubPullRequestReviewRequestFailures).toBe(1))
+          expect(appReviewRequests).toEqual([])
+          expect(userWriteback.reviewRequests).toEqual([])
+        }
+      } finally {
+        await restarted.stop()
+        await seedFactory.stop()
+      }
+    },
+  )
+
+  it.each([
+    {
+      number: 538,
+      author: 'relayfile[bot]',
+      expectedIdentity: 'app' as const,
+    },
+    {
+      number: 539,
+      author: 'operator-user',
+      expectedIdentity: 'user' as const,
+    },
+  ])(
+    'recovers and persists $expectedIdentity identity for a legacy receipt from authoritative author $author',
+    async ({ number, author, expectedIdentity }) => {
+      const path = issuePath(number)
+      const issue = issueFile(number)
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const seedFactory = createFactory(config(), {
+        mount: new FakeMountClient({ [path]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+      })
+      const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+      const receipt = {
+        repo: 'AgentWorkforce/pear',
+        number,
+        url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+        headRef: `factory/ar-${number}-pear`,
+      }
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-legacy-${expectedIdentity}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
+      const appWrite: GithubConnectionWrite = {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse the durable receipt')
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
+        },
+        closePullRequest: async () => undefined,
+      }
+      const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+      const restarted = createFactory(config({ github: { identity: 'auto' } }), {
+        mount: new FakeMountClient({ [path]: issue }, appWrite),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: userWriteback,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify({
+            number,
+            headRefName: receipt.headRef,
+            isDraft: false,
+            state: 'OPEN',
+            author: { login: author },
+          }),
+        }),
+      })
+
+      try {
+        await restarted.start({ mode: 'dispatch-owner' })
+        if (expectedIdentity === 'app') {
+          await vi.waitFor(() => expect(appReviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(userWriteback.reviewRequests).toEqual([])
+        } else {
+          await vi.waitFor(() =>
+            expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(appReviewRequests).toEqual([])
+        }
+        await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .resolves.toMatchObject({
+            pullRequest: { publisherIdentity: expectedIdentity },
+            pullRequests: [expect.objectContaining({ publisherIdentity: expectedIdentity })],
+          })
+      } finally {
+        await restarted.stop()
+        await seedFactory.stop()
+      }
+    },
+  )
+
+  it('makes a legacy auto receipt terminal until the original publisher is configured explicitly', async () => {
+    const number = 537
+    const path = issuePath(number)
+    const issue = issueFile(number)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const seedFactory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+    const receipt = {
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+    }
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      issueKey(decision.issue),
+      {
+        runId: 'terminal-review-legacy-auto',
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        pullRequests: [receipt],
+        pullRequest: receipt,
+        updatedAtMs: 0,
+      },
+      'stopped-owner',
+      0,
+      1,
+    )
+
+    const appReviewRequests: Array<{ repo: string; number: number }> = []
+    const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+    const appWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('restart recovery must reuse the durable receipt')
+      },
+      requestPullRequestReview: async (input) => {
+        appReviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const errors: unknown[][] = []
+    const auto = createFactory(config({ github: { identity: 'auto' } }), {
+      mount: new FakeMountClient({ [path]: issue }, appWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: userWriteback,
+      reviewRequestRetryMs: 5,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      logger: {
+        info: () => undefined,
+        warn: () => undefined,
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    try {
+      await auto.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() =>
+        expect(auto.status().counters.githubPullRequestReviewRequestIdentityRequired).toBe(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(auto.status().counters.githubPullRequestReviewRequestIdentityRequired).toBe(1)
+      expect(appReviewRequests).toEqual([])
+      expect(userWriteback.reviewRequests).toEqual([])
+      expect(errors).toContainEqual([
+        '[factory] automated PR review request reached terminal publisher-identity refusal; verify the PR original publisher, set github.identity explicitly to "app" or "user", and restart',
+        expect.objectContaining({ repo: receipt.repo, prNumber: number }),
+      ])
+    } finally {
+      await auto.stop()
+    }
+
+    const explicitUser = createFactory(config({ github: { identity: 'user' } }), {
+      mount: new FakeMountClient({ [path]: issue }, appWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: userWriteback,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+    })
+    try {
+      await explicitUser.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() =>
+        expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+      expect(appReviewRequests).toEqual([])
+    } finally {
+      await explicitUser.stop()
+      await seedFactory.stop()
+    }
+  })
+
+  it('contains a failed startup review reconciliation without failing the lifecycle owner', async () => {
+    class ReconciliationFailingStateStore extends InMemoryStateStore {
+      listCalls = 0
+
+      override async listDispatchLifecycles(
+        workspaceId: string,
+      ): Promise<Awaited<ReturnType<InMemoryStateStore['listDispatchLifecycles']>>> {
+        this.listCalls += 1
+        if (this.listCalls === 2) throw new Error('relayfile lifecycle listing unavailable')
+        return super.listDispatchLifecycles(workspaceId)
+      }
+    }
+
+    const warnings: unknown[][] = []
+    const stateStore = new ReconciliationFailingStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {
+        info: () => undefined,
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    try {
+      await expect(factory.start({ mode: 'dispatch-owner' })).resolves.toBeUndefined()
+      expect(warnings).toContainEqual([
+        '[factory] automated PR review startup reconciliation deferred; lifecycle completion remains independent',
+        { error: 'relayfile lifecycle listing unavailable' },
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('serializes startup review reconciliation without blocking lifecycle-owner startup', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const receipts = [534, 535].map((number) => ({
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+      publisherIdentity: 'app' as const,
+    }))
+    for (const receipt of receipts) {
+      const issue = parseLinearIssue(issuePath(receipt.number), issueFile(receipt.number))
+      const decision = await new StaticTriage().triage(issue)
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-restart-${receipt.number}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+    }
+
+    let releaseFirstLookup!: () => void
+    const firstLookup = new Promise<void>((resolve) => {
+      releaseFirstLookup = resolve
+    })
+    const lookupNumbers: number[] = []
+    const reviewRequests: number[] = []
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({}, {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse durable receipts')
+        },
+        requestPullRequestReview: async ({ number }) => {
+          reviewRequests.push(number)
+        },
+        closePullRequest: async () => undefined,
+      }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        const number = Number(args[2])
+        lookupNumbers.push(number)
+        if (lookupNumbers.length === 1) await firstLookup
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
+    })
+
+    try {
+      await expect(factory.start({ mode: 'dispatch-owner' })).resolves.toBeUndefined()
+      expect(lookupNumbers).toHaveLength(1)
+      expect(reviewRequests).toEqual([])
+
+      releaseFirstLookup()
+      await vi.waitFor(() => expect(lookupNumbers).toEqual([534, 535]))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([534, 535]))
+    } finally {
+      releaseFirstLookup()
+      await factory.stop()
+    }
+  })
+
+  it('cancels repeated hung review verifications before retrying the durable obligation', async () => {
+    const number = 536
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let reviewAttempts = 0
+    let lookupAttempts = 0
+    let activeLookups = 0
+    let maximumActiveLookups = 0
+    let abortedLookups = 0
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({
+        [issuePath(number)]: issueFile(number),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number,
+          url: `https://github.com/${input.repo}/pull/${number}`,
+          headRef: input.headRef!,
+        }),
+        requestPullRequestReview: async (input) => {
+          reviewRequests.push(input)
+          reviewAttempts += 1
+          if (reviewAttempts === 1) throw new Error('initial provider failure')
+        },
+        closePullRequest: async () => undefined,
+      }),
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async (_args, options) => {
+        lookupAttempts += 1
+        if (lookupAttempts <= 3) {
+          activeLookups += 1
+          maximumActiveLookups = Math.max(maximumActiveLookups, activeLookups)
+          await new Promise<never>((_, reject) => {
+            const signal = options?.signal
+            if (!signal) {
+              activeLookups -= 1
+              reject(new Error('verification lookup did not receive a cancellation signal'))
+              return
+            }
+            const abort = () => {
+              activeLookups -= 1
+              abortedLookups += 1
+              const error = new Error('synthetic gh lookup aborted')
+              error.name = 'AbortError'
+              reject(error)
+            }
+            if (signal.aborted) {
+              abort()
+            } else {
+              signal.addEventListener('abort', abort, { once: true })
+            }
+          })
+        }
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
+      reviewRequestRetryMs: 1,
+      reviewRequestVerificationTimeoutMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(
+        parseLinearIssue(issuePath(number), issueFile(number)),
+      ))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(lookupAttempts).toBe(4))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+      expect(abortedLookups).toBe(3)
+      expect(maximumActiveLookups).toBe(1)
+      expect(activeLookups).toBe(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('backs off rejected automated review requests after issue completion', async () => {
+    const number = 527
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let attempts = 0
+    let openLookups = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        attempts += 1
+        if (attempts <= 2) throw new Error('transient provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => {
+        openLookups += 1
+        if (openLookups === 1) throw new Error('transient open-state lookup failure')
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
+      reviewRequestRetryMs: 10,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(reviewRequests).toHaveLength(2)
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+      expect(openLookups).toBe(3)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not exhaust automated review retries during normal run-loop iterations', async () => {
+    const number = 532
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('persistent provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      reviewRequestRetryMs: 60_000,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+    await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+
+    const reports = await factory.runLoop({ dryRun: true, maxIterations: 2 })
+
+    expect(reports).toHaveLength(2)
+    expect(reports.every((report) => report.error === undefined)).toBe(true)
+    expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
+    expect(factory.status().counters.loopIterationFailures).toBeUndefined()
+    expect(factory.status().counters.loopCircuitBreaks).toBeUndefined()
+  })
+
+  it('makes an unmet bounded run-once review drain a named terminal failure', async () => {
+    const number = 530
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('persistent provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+      // A normal timer cannot fire during this test; runOnce must explicitly
+      // drain the pending obligation.
+      reviewRequestRetryMs: 60_000,
+      reviewRequestRunOnceDrainMs: 1_000,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+
+      await expect(factory.runOnce({ dryRun: true }))
+        .rejects.toThrow('Run-once automated PR review request drain failed')
+
+      expect(reviewRequests).toHaveLength(5)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(reviewRequests).toHaveLength(5)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each([
+    ['is unavailable', undefined],
+    ['fails', async () => { throw new Error('authoritative GitHub lookup unavailable') }],
+  ] as const)('does not let stale mounted metadata authorize a review retry when GitHub lookup %s', async (
+    _condition,
+    probePrGhRunner,
+  ) => {
+    const number = 529
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('transient provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      [`/github/repos/AgentWorkforce/pear/pulls/${number}/metadata.json`]: {
+        number,
+        state: 'open',
+        head_ref: `factory/ar-${number}-pear`,
+        isDraft: false,
+      },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner,
+      reviewRequestRetryMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() =>
+        expect(factory.status().counters.githubPullRequestReviewRequestFailures).toBeGreaterThan(1))
+      expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not retry an automated review request after the pull request closes', async () => {
+    const number = 528
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        throw new Error('provider failed before the pull request closed')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: `factory/ar-${number}-pear`,
+          isDraft: false,
+          state: 'CLOSED',
+        }),
+      }),
+      reviewRequestRetryMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() => expect(reviewRequests).toHaveLength(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number }])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('keeps provider delete authorization aligned with guarded draft authorization', async () => {
+    class DeletePredicateMount extends FakeMountClient {
+      deletePredicate?: (path: string, content: unknown) => boolean | Promise<boolean>
+
+      setDefaultAllowedDeletePredicate(
+        predicate: (path: string, content: unknown) => boolean | Promise<boolean>,
+      ): void {
+        this.deletePredicate ??= predicate
+      }
+    }
+    const number = 525
+    const mount = new DeletePredicateMount({
+      [issuePath(number)]: issueFile(number),
+    })
+    const factory = createFactory(config(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+
+    try {
+      expect(await mount.deletePredicate?.(
+        `/linear/issues/AR-${number}__uuid-${number}/comments/factory-draft.json`,
+        { body: 'status update' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.(
+        '/slack/channels/C123/messages/factory-draft.json',
+        { text: 'status update' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.(
+        '/github/repos/AgentWorkforce/factory/pulls/525/comments/factory-coderabbit-review.json',
+        { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+      )).toBe(true)
+      expect(await mount.deletePredicate?.('/github/repos/AgentWorkforce/factory/arbitrary.json', {}))
+        .toBe(false)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not request automated review for an already-closed completion PR', async () => {
+    const number = 526
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+    }, {
+      publishPullRequest: async () => {
+        throw new Error('must use the existing merged PR')
+      },
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      github: { identity: 'app' },
+      babysitter: { enabled: false },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: number,
+        state: 'MERGED',
+      }),
+      probeCloser: async (input) => ({
+        repo: input.repo,
+        prNumber: input.prNumber,
+        state: 'CLOSED',
+      }),
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      expect(reviewRequests).toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
     class OrderedPreviewFleetClient extends FakeFleetClient {
@@ -10059,7 +11251,7 @@ describe('FactoryLoop', () => {
         },
       },
       probePrResolver: async () => undefined,
-      probePrGhRunner: async () => { throw new Error('gh must not be invoked for PR publication') },
+      probePrGhRunner: async () => { throw new Error('gh must not be invoked for app publication') },
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(52), issueFile(52))))
@@ -11926,6 +13118,17 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       probePrGhRunner: async (args) => {
         ghCalls.push(args)
+        if (args[0] === 'pr' && args[1] === 'view') {
+          const number = Number(args[2])
+          return {
+            stdout: JSON.stringify({
+              number,
+              headRefName: number === 856 ? 'ar-355-is-odd-v2' : 'ar-356-square',
+              isDraft: false,
+              state: 'OPEN',
+            }),
+          }
+        }
         return {
           stdout: JSON.stringify([
             ghPr(880, {
@@ -11964,7 +13167,10 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(ghCalls).toHaveLength(2)
+    const listCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'list')
+    const viewCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'view')
+    expect(listCalls).toHaveLength(2)
+    expect(viewCalls.map((args) => Number(args[2])).sort((a, b) => a - b)).toEqual([856, 857])
     expect(ghCalls.every((args) => args.includes('--repo') && args.includes('AgentWorkforce/pear'))).toBe(true)
     expect(closeInputs).toEqual([
       { repo: 'AgentWorkforce/pear', prNumber: 856, expectedIssueKey: 'AR-355', requireTitleMarker: false },

@@ -63,6 +63,13 @@ export interface GithubPublishPullRequestResult {
   headSha?: string
   /** Provider-confirmed login or identity label used to author the PR. */
   author?: string
+  /** Durable write path that authored the PR; review requests must preserve it. */
+  publisherIdentity?: 'app' | 'user'
+}
+
+export interface GithubPullRequestRef {
+  repo: string
+  number: number
 }
 
 export type FactoryIntegrationProvider = 'github' | 'linear'
@@ -93,6 +100,7 @@ export interface FactoryIntegrationConnections {
  */
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
+  requestPullRequestReview?(input: GithubPullRequestRef): Promise<void>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
 }
 
@@ -120,16 +128,32 @@ export interface MountClient {
   dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
+  /**
+   * Atomically create a path without replacing an existing record.
+   * `exists` means the store observed a revision conflict; callers must still
+   * verify that the winner wrote the record they intended.
+   */
+  createFile?(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean; correlationId?: string },
+  ): Promise<'created' | 'exists'>
   deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
+  ): void
+  setDefaultAllowedDeletePredicate?(
+    predicate: (path: string, content: unknown) => boolean | Promise<boolean>,
   ): void
   listTree(prefix: string): Promise<string[]>
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription
   getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage>
   getEventHighWatermark?(opts?: { provider?: string }): Promise<string | undefined>
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
-  confirmWrite(path: string, opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
+  confirmWrite(
+    path: string,
+    opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
+  ): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
   /** Provider failure detail retained for a completed failed write, when available. */
   getConfirmedWriteFailureReason?(path: string): Promise<string | undefined>
   /** Provider object id returned by the acknowledged write operation, when available. */

@@ -5,6 +5,7 @@ import type {
   ChangeEvent,
   ClaimDurableSubscriptionDeliveriesInput,
   CreateOrRenewDurableResourceSubscriptionInput,
+  OperationFeedResponse,
   OperationStatusResponse,
 } from '@relayfile/sdk'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -22,6 +23,8 @@ import {
 } from './relayfile-cloud-mount-client'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 import { MountAuthScopeError } from './mount-auth-error'
+
+const reviewCorrelationId = 'factory:coderabbit-review:agentworkforce/factory#85'
 
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
@@ -53,6 +56,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
     content: string
     contentType?: string
+    correlationId?: string
   }> = []
   readonly deleteFileCalls: Array<{
     workspaceId: string
@@ -60,9 +64,17 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
   }> = []
   readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
+  readonly queryFilesCalls: Array<{
+    workspaceId: string
+    options?: { path?: string; provider?: string; comment?: string; cursor?: string; limit?: number }
+  }> = []
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
+  readonly listOpsCalls: Array<{
+    workspaceId: string
+    options?: { action?: string; provider?: string; correlationId?: string; cursor?: string; limit?: number }
+  }> = []
   readonly createSubscriptionCalls: CreateOrRenewDurableResourceSubscriptionInput[] = []
   readonly claimDeliveryCalls: ClaimDurableSubscriptionDeliveriesInput[] = []
   readonly acceptDeliveryCalls: AcceptDurableSubscriptionDeliveryInput[] = []
@@ -110,6 +122,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
     content: string
     contentType?: string
+    correlationId?: string
   }) {
     this.writeFileCalls.push(input)
     this.files.set(input.path, {
@@ -154,6 +167,31 @@ class FakeRelayFileClient implements RelayFileClientLike {
     }
   }
 
+  async queryFiles(
+    workspaceId: string,
+    options?: { path?: string; provider?: string; comment?: string; cursor?: string; limit?: number },
+  ) {
+    this.queryFilesCalls.push({ workspaceId, options })
+    const paths = [...this.files.keys()]
+      .filter((path) => path.startsWith(options?.path ?? '/'))
+      .sort()
+    const start = options?.cursor
+      ? Math.max(0, paths.findIndex((path) => path === options.cursor) + 1)
+      : 0
+    const limit = options?.limit ?? paths.length
+    const page = paths.slice(start, start + limit)
+    return {
+      items: page.map((path) => ({
+        path,
+        revision: this.files.get(path)?.revision ?? '1',
+        contentType: this.files.get(path)?.contentType ?? 'application/json',
+        provider: options?.provider,
+        size: this.files.get(path)?.content.length ?? 0,
+      })),
+      nextCursor: page.length >= limit ? page.at(-1) ?? null : null,
+    }
+  }
+
   async getEvents(workspaceId: string, opts?: { cursor?: string; limit?: number; provider?: string; last?: number }) {
     this.getEventsCalls.push({ workspaceId, opts })
     return { events: this.events, nextCursor: null }
@@ -193,6 +231,25 @@ class FakeRelayFileClient implements RelayFileClientLike {
         status: 200,
         externalId: 'linear-id',
       },
+    }
+  }
+
+  async listOps(
+    workspaceId: string,
+    options?: { action?: string; provider?: string; correlationId?: string; cursor?: string; limit?: number },
+  ) {
+    this.listOpsCalls.push({ workspaceId, options })
+    const matching = [...this.ops.values()].filter((operation) =>
+      (!options?.action || operation.action === options.action) &&
+      (!options?.provider || operation.provider === options.provider) &&
+      (!options?.correlationId || operation.correlationId === options.correlationId))
+    const start = Number(options?.cursor ?? 0)
+    const limit = options?.limit ?? matching.length
+    const items = matching.slice(start, start + limit)
+    const next = start + items.length
+    return {
+      items,
+      nextCursor: next < matching.length ? String(next) : null,
     }
   }
 
@@ -955,7 +1012,7 @@ describe('RelayfileCloudMountClient', () => {
       .rejects.toThrow('Relayfile cloud session required; run `agent-relay login`')
   })
 
-  it('delegates readFile/listTree/getEvents with the configured workspace id', async () => {
+  it('delegates readFile/listTree/queryFiles/getEvents with the configured workspace id', async () => {
     const fake = new FakeRelayFileClient()
     fake.files.set('/linear/issues/AR-1.json', {
       revision: '7',
@@ -969,6 +1026,14 @@ describe('RelayfileCloudMountClient', () => {
       revision: '7',
     })
     await expect(mount.listTree('/linear/issues')).resolves.toEqual(['/linear/issues/AR-1.json'])
+    await expect(mount.queryFiles({
+      path: '/linear/issues',
+      provider: 'linear',
+      limit: 100,
+    })).resolves.toEqual({
+      paths: ['/linear/issues/AR-1.json'],
+      nextCursor: null,
+    })
     await expect(mount.getEvents({ cursor: 'evt-0', limit: 10 })).resolves.toMatchObject({
       events: fake.events,
       nextCursor: null,
@@ -978,6 +1043,10 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.listTreeCalls[0]).toEqual({
       workspaceId: 'rw_test',
       options: { path: '/linear/issues', cursor: undefined },
+    })
+    expect(fake.queryFilesCalls[0]).toEqual({
+      workspaceId: 'rw_test',
+      options: { path: '/linear/issues', provider: 'linear', limit: 100 },
     })
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
   })
@@ -1212,6 +1281,186 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
   })
 
+  it('observes an already-acked operation during a zero-timeout status probe', async () => {
+    const fake = new FakeRelayFileClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', { timeoutMs: 0 })).resolves.toBe('acked')
+    expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
+  })
+
+  it('observes an already-failed operation during a zero-timeout status probe', async () => {
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+      lastError: 'provider rejected the request',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile('/linear/issues/new.json', { title: 'new' })
+
+    await expect(mount.confirmWrite('/linear/issues/new.json', {
+      timeoutMs: 0,
+      returnFailed: true,
+    })).resolves.toBe('failed')
+    expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
+  })
+
+  it('preserves create-only revision conflicts instead of updating the winner', async () => {
+    class RevisionCheckingClient extends FakeRelayFileClient {
+      override async writeFile(input: Parameters<FakeRelayFileClient['writeFile']>[0]) {
+        this.writeFileCalls.push(input)
+        const current = this.files.get(input.path)
+        if (current && input.baseRevision === '0') {
+          throw Object.assign(new Error('revision conflict'), {
+            status: 409,
+            expectedRevision: '0',
+            currentRevision: current.revision,
+          })
+        }
+        this.files.set(input.path, {
+          revision: String(Number(input.baseRevision) + 1),
+          content: input.content,
+          contentType: input.contentType ?? 'application/json',
+        })
+        return {
+          opId: `op-${this.writeFileCalls.length}`,
+          status: 'queued' as const,
+          targetRevision: 'next',
+        }
+      }
+    }
+    const fake = new RevisionCheckingClient()
+    fake.files.set('/github/review-request.json', {
+      revision: '7',
+      content: '{"body":"winner"}',
+      contentType: 'application/json',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.createFile(
+      '/github/review-request.json',
+      { body: 'loser' },
+      { guarded: true },
+    )).resolves.toBe('exists')
+
+    expect(fake.writeFileCalls).toEqual([expect.objectContaining({
+      path: '/github/review-request.json',
+      baseRevision: '0',
+      content: '{"body":"loser"}',
+    })])
+    expect(fake.files.get('/github/review-request.json')?.content).toBe('{"body":"winner"}')
+  })
+
+  it('recovers the concurrent winner instead of confirming a cached prior attempt', async () => {
+    class RevisionCheckingClient extends FakeRelayFileClient {
+      override async writeFile(input: Parameters<FakeRelayFileClient['writeFile']>[0]) {
+        const current = this.files.get(input.path)
+        if (current && input.baseRevision === '0') {
+          this.writeFileCalls.push(input)
+          throw Object.assign(new Error('revision conflict'), {
+            status: 409,
+            expectedRevision: '0',
+            currentRevision: current.revision,
+          })
+        }
+        return await super.writeFile(input)
+      }
+    }
+    const path = '/github/review-request.json'
+    const fake = new RevisionCheckingClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile(path, { body: 'prior attempt' })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      status: 'succeeded',
+      attemptCount: 1,
+      createdAt: '2026-07-30T00:00:00.000Z',
+      providerResult: { status: 201, externalId: 'prior' },
+    })
+    fake.files.set(path, {
+      revision: '2',
+      content: '{"body":"concurrent winner"}',
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-2', {
+      opId: 'op-2',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'succeeded',
+      attemptCount: 1,
+      createdAt: '2026-07-30T00:00:01.000Z',
+      providerResult: { status: 201, externalId: 'winner' },
+    })
+
+    await expect(mount.createFile(
+      path,
+      { body: 'losing attempt' },
+      { guarded: true, correlationId: reviewCorrelationId },
+    )).resolves.toBe('exists')
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 50,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('acked')
+
+    expect(fake.writeFileCalls.at(-1)).toEqual(expect.objectContaining({
+      path,
+      baseRevision: '0',
+      correlationId: reviewCorrelationId,
+    }))
+    expect(fake.listOpsCalls).toHaveLength(1)
+    expect(fake.getOpCalls.at(-1)).toEqual({ workspaceId: 'rw_test', opId: 'op-2' })
+    await expect(mount.getConfirmedWriteExternalId(path)).resolves.toBe('winner')
+  })
+
+  it('does not collapse an unrelated 409 into create-only success', async () => {
+    class InvalidStateClient extends FakeRelayFileClient {
+      override async writeFile(_input: Parameters<FakeRelayFileClient['writeFile']>[0]): Promise<never> {
+        throw Object.assign(new Error('provider state conflict'), {
+          status: 409,
+          code: 'invalid_state',
+        })
+      }
+    }
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: new InvalidStateClient(),
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.createFile(
+      '/github/review-request.json',
+      { body: 'request' },
+      { guarded: true },
+    )).rejects.toThrow('provider state conflict')
+  })
+
   it('confirms a succeeded draft op with providerResult 201 and externalId', async () => {
     const fake = new FakeRelayFileClient()
     fake.ops.set('op-1', {
@@ -1262,7 +1511,281 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(legacyMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
     await expect(restartedMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
+    expect(fake.listOpsCalls).toEqual([])
     expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('recovers the latest write operation by path after a mount restart', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const content = { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' }
+    const fake = new FakeRelayFileClient()
+    fake.files.set(path, {
+      revision: '2',
+      content: JSON.stringify(content),
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-old', {
+      opId: 'op-old',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'succeeded',
+      attemptCount: 1,
+      createdAt: '2026-07-30T00:00:00.000Z',
+      providerResult: { status: 201, externalId: '84' },
+    })
+    fake.ops.set('op-latest', {
+      opId: 'op-latest',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'failed',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    restartedMount.setDefaultAllowedDeletePredicate((candidatePath, candidateContent) =>
+      candidatePath === path && JSON.stringify(candidateContent) === JSON.stringify(content))
+
+    await expect(restartedMount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('failed')
+    await expect(restartedMount.deleteFile(path)).resolves.toBeUndefined()
+
+    expect(fake.listOpsCalls).toEqual([{
+      workspaceId: 'rw_test',
+      options: {
+        action: 'file_upsert',
+        provider: 'github',
+        correlationId: reviewCorrelationId,
+        cursor: undefined,
+        limit: 100,
+      },
+    }])
+    expect(fake.getOpCalls).toEqual([
+      { workspaceId: 'rw_test', opId: 'op-latest' },
+      { workspaceId: 'rw_test', opId: 'op-latest' },
+    ])
+    expect(fake.deleteFileCalls).toHaveLength(1)
+  })
+
+  it('does not let a cached delete acknowledge a correlated write after stale draft reappearance', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const content = { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' }
+    const fake = new FakeRelayFileClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+    mount.setDefaultAllowedDeletePredicate((candidatePath, candidateContent) =>
+      candidatePath === path && JSON.stringify(candidateContent) === JSON.stringify(content))
+
+    await expect(mount.createFile(path, content, {
+      guarded: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('created')
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'failed',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('failed')
+    await expect(mount.deleteFile(path)).resolves.toBeUndefined()
+
+    // Provider reconciliation may briefly make the failed local draft visible
+    // again. The cached deletion op must not satisfy the correlated publish.
+    fake.files.set(path, {
+      revision: '2',
+      content: JSON.stringify(content),
+      contentType: 'application/json',
+    })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('failed')
+
+    expect(fake.listOpsCalls.at(-1)?.options?.correlationId).toBe(reviewCorrelationId)
+    expect(fake.getOpCalls.at(-1)).toEqual({ workspaceId: 'rw_test', opId: 'op-1' })
+  })
+
+  it('bounds restarted operation recovery by the confirmation timeout', async () => {
+    class HangingListOpsClient extends FakeRelayFileClient {
+      override async listOps(): Promise<OperationFeedResponse> {
+        await new Promise<never>(() => undefined)
+      }
+    }
+    const fake = new HangingListOpsClient()
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
+      timeoutMs: 5,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('timeout')
+    expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('bounds recovered operation polling by the confirmation timeout', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    class HangingRecoveredOperationClient extends FakeRelayFileClient {
+      override async getOp(): Promise<OperationStatusResponse> {
+        await new Promise<never>(() => undefined)
+      }
+    }
+    const fake = new HangingRecoveredOperationClient()
+    fake.ops.set('op-recovered', {
+      opId: 'op-recovered',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'pending',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('timeout')
+    expect(fake.listOpsCalls).toHaveLength(1)
+  })
+
+  it('propagates restarted operation feed failures instead of reporting a timeout', async () => {
+    class FailingListOpsClient extends FakeRelayFileClient {
+      override async listOps(): Promise<OperationFeedResponse> {
+        throw new Error('relayfile unavailable')
+      }
+    }
+    const fake = new FailingListOpsClient()
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
+      timeoutMs: 5,
+      correlationId: reviewCorrelationId,
+    })).rejects.toThrow('relayfile unavailable')
+    expect(fake.getOpCalls).toEqual([])
+  })
+
+  it('propagates operation lookup failures instead of reporting a timeout', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json'
+    class FailingGetOpClient extends FakeRelayFileClient {
+      override async getOp(): Promise<OperationStatusResponse> {
+        throw new Error('operation lookup unavailable')
+      }
+    }
+    const fake = new FailingGetOpClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile(path, { body: '@coderabbitai review' }, { guarded: true })
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 5,
+    })).rejects.toThrow('operation lookup unavailable')
+  })
+
+  it('fails closed when restarted write operations have the same latest timestamp', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const fake = new FakeRelayFileClient()
+    for (const opId of ['op-first', 'op-second']) {
+      fake.ops.set(opId, {
+        opId,
+        path,
+        action: 'file_upsert',
+        provider: 'github',
+        correlationId: reviewCorrelationId,
+        status: opId === 'op-first' ? 'succeeded' : 'failed',
+        attemptCount: 1,
+        createdAt: '2026-07-30T01:00:00.000Z',
+      })
+    }
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('timeout')
+
+    expect(fake.getOpCalls).toEqual([])
+    expect(fake.deleteFileCalls).toEqual([])
+  })
+
+  it('fails closed when one of multiple restarted write operations is undated', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const fake = new FakeRelayFileClient()
+    fake.ops.set('op-dated', {
+      opId: 'op-dated',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'failed',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    fake.ops.set('op-undated', {
+      opId: 'op-undated',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      correlationId: reviewCorrelationId,
+      status: 'succeeded',
+      attemptCount: 1,
+    })
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('timeout')
+
+    expect(fake.getOpCalls).toEqual([])
+    expect(fake.deleteFileCalls).toEqual([])
   })
 
   it('refuses provider writeback paths when the draft predicate is unset or rejects', async () => {
@@ -1521,6 +2044,46 @@ describe('RelayfileCloudMountClient', () => {
       path: '/linear/issues/AR-E2ECANARY.json',
       baseRevision: '3',
     }])
+  })
+
+  it('installs a default provider-delete predicate without replacing an injected policy', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    const content = { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' }
+    const createMount = (
+      fake: FakeRelayFileClient,
+      isAllowedDelete?: () => boolean,
+    ): RelayfileCloudMountClient => new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+      isAllowedDelete,
+    })
+
+    const defaultFake = new FakeRelayFileClient()
+    defaultFake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+    })
+    const defaultMount = createMount(defaultFake)
+    defaultMount.setDefaultAllowedDeletePredicate((candidatePath, candidateContent) =>
+      candidatePath === path && JSON.stringify(candidateContent) === JSON.stringify(content))
+    await defaultMount.writeFile(path, content)
+    await expect(defaultMount.deleteFile(path)).resolves.toBeUndefined()
+    expect(defaultFake.deleteFileCalls).toHaveLength(1)
+
+    const injectedFake = new FakeRelayFileClient()
+    injectedFake.ops.set('op-1', {
+      opId: 'op-1',
+      status: 'failed',
+      attemptCount: 1,
+    })
+    const injectedMount = createMount(injectedFake, () => false)
+    injectedMount.setDefaultAllowedDeletePredicate(() => true)
+    await injectedMount.writeFile(path, content)
+    await expect(injectedMount.deleteFile(path))
+      .rejects.toThrow(/delete predicate rejected or is unset/)
+    expect(injectedFake.deleteFileCalls).toEqual([])
   })
 
   it('refuses failed unlinked orphan deletes when the injected delete predicate is unset', async () => {

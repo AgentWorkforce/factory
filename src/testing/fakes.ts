@@ -71,6 +71,17 @@ export class FakeMountClient implements MountClient {
     this.writes.push({ path, content })
   }
 
+  async createFile(
+    path: string,
+    content: unknown,
+    _opts?: { guarded?: boolean; correlationId?: string },
+  ): Promise<'created' | 'exists'> {
+    if (this.files.has(path)) return 'exists'
+    this.files.set(path, { content, revision: '1' })
+    this.writes.push({ path, content })
+    return 'created'
+  }
+
   async deleteFile(path: string): Promise<void> {
     if (!this.files.has(path)) {
       throw new Error(`File not found: ${path}`)
@@ -81,6 +92,25 @@ export class FakeMountClient implements MountClient {
 
   async listTree(prefix: string): Promise<string[]> {
     return [...this.files.keys()].filter((path) => path.startsWith(prefix)).sort()
+  }
+
+  async queryFiles(opts: {
+    path: string
+    provider?: string
+    comment?: string
+    cursor?: string
+    limit?: number
+  }): Promise<{ paths: string[]; nextCursor: string | null }> {
+    const paths = [...this.files.keys()].filter((path) => path.startsWith(opts.path)).sort()
+    const start = opts.cursor
+      ? Math.max(0, paths.findIndex((path) => path === opts.cursor) + 1)
+      : 0
+    const limit = opts.limit ?? paths.length
+    const page = paths.slice(start, start + limit)
+    return {
+      paths: page,
+      nextCursor: page.length >= limit ? page.at(-1) ?? null : null,
+    }
   }
 
   isLocalMountAuthDegraded(): boolean {
@@ -123,7 +153,10 @@ export class FakeMountClient implements MountClient {
     return events.at(-1)?.id
   }
 
-  async confirmWrite(path: string, _opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+  async confirmWrite(
+    path: string,
+    _opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
+  ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     return this.#confirmations.get(path) ?? 'acked'
   }
 

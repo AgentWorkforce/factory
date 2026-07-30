@@ -70,6 +70,7 @@ import {
 import type { FactoryIntegrationProvider } from '../ports'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
+import { isAllowedFactoryGithubWritebackDraft } from '../github/review-request'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -178,7 +179,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
         mount = deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
           workspaceId,
-          isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
+          isAllowedDraft: (path, content, opts) => isAllowedFactoryGithubDraft(path, content, opts),
         })
         await prepareFactoryIntegrations(command, mount, undefined, globals, deps, workspaceId, err)
         githubWrite = mount.githubWrite
@@ -1489,20 +1490,18 @@ async function isAllowedFactoryDraft(
     return true
   }
 
-  if (isAllowedFactoryGithubDraft(path, opts)) {
+  if (isAllowedFactoryGithubDraft(path, content, opts)) {
     return true
   }
 
   return false
 }
 
-const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
-
 const isAllowedFactoryGithubDraft = (
   path: string,
+  content: unknown,
   opts: { guarded?: boolean } | undefined,
-): boolean => opts?.guarded === true && isFactoryGithubWritebackPath(path)
+): boolean => opts?.guarded === true && isAllowedFactoryGithubWritebackDraft(path, content)
 
 const scopeIssueFromDraftContent = (content: unknown) => ({
   title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',

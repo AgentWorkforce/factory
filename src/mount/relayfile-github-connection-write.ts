@@ -7,6 +7,16 @@ import type {
   GithubPublishPullRequestResult,
   MountClient,
 } from '../ports'
+import {
+  FACTORY_CODERABBIT_REVIEW_BODY,
+  FACTORY_CODERABBIT_REVIEW_MARKER,
+  containsCoderabbitReviewRequest,
+  factoryCoderabbitReviewCorrelationId,
+  isAllowedFactoryGithubWritebackDraft,
+} from '../github/review-request'
+
+const REVIEW_REQUEST_CONFIRM_TIMEOUT_MS = 10_000
+const REVIEW_REQUEST_QUERY_PAGE_LIMIT = 100
 
 const execFileAsync = promisify(execFile)
 const WRITE_CONFIRM_TIMEOUT_MS = 90_000
@@ -16,7 +26,16 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'readFile' | 'writeFile'>
+  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
+    createFile: NonNullable<MountClient['createFile']>
+    queryFiles(opts: {
+      path: string
+      provider?: string
+      comment?: string
+      cursor?: string
+      limit?: number
+    }): Promise<{ paths: string[]; nextCursor: string | null }>
+  }
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
@@ -33,6 +52,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #receiptReadAttempts: number
   readonly #receiptReadDelayMs: number
   readonly #writesByPath = new Map<string, Promise<string | undefined>>()
+  readonly #reviewRequests = new Map<string, Promise<void>>()
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
     this.#mount = config.mount
@@ -108,6 +128,171 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       // The concrete bot login is installation-specific and is not included in
       // every acknowledgement receipt, so retain the stable identity label.
       author: 'app',
+    }
+  }
+
+  async requestPullRequestReview(input: { repo: string; number: number }): Promise<void> {
+    const { owner, repo } = githubRepoParts(input.repo)
+    if (!Number.isInteger(input.number) || input.number <= 0) {
+      throw new Error(`GitHub pull request number must be a positive integer: ${input.number}`)
+    }
+    const repoRoots = [
+      `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(repo)}`,
+    ]
+    // The process-local promise handles re-entry here; the Relayfile
+    // create-if-absent below arbitrates independent Factory processes. Direct
+    // GitHub comments remain outside that store boundary and can still race.
+    const requestKey = `${input.repo.toLowerCase()}#${input.number}`
+    const existing = this.#reviewRequests.get(requestKey)
+    if (existing) return existing
+    const request = this.#requestPullRequestReview(input.repo, input.number, repoRoots)
+      .catch((error: unknown) => {
+        this.#reviewRequests.delete(requestKey)
+        throw error
+      })
+    this.#reviewRequests.set(requestKey, request)
+    return request
+  }
+
+  async #requestPullRequestReview(expectedRepo: string, number: number, repoRoots: string[]): Promise<void> {
+    for (const repoRoot of repoRoots) {
+      if (await this.#hasPullRequestReviewRequest(expectedRepo, number, repoRoot)) return
+    }
+    const commentsRoot = `${repoRoots[0]}/pulls/${number}/comments`
+    const path = `${commentsRoot}/factory-coderabbit-review.json`
+    const content = { body: FACTORY_CODERABBIT_REVIEW_BODY }
+    const correlationId = factoryCoderabbitReviewCorrelationId(expectedRepo, number)
+    const result = await this.#mount.createFile(path, content, {
+      guarded: true,
+      correlationId,
+    })
+    if (result === 'exists') {
+      const existing = (await this.#mount.readFile(path)).content
+      if (!isAllowedFactoryGithubWritebackDraft(path, existing)) {
+        throw new Error(`GitHub review request create conflicted with unexpected content at ${path}`)
+      }
+    }
+    const status = await this.#mount.confirmWrite(path, {
+      timeoutMs: WRITE_CONFIRM_TIMEOUT_MS,
+      returnFailed: true,
+      correlationId,
+    })
+    if (status !== 'acked') {
+      const failureReason = status === 'failed'
+        ? await this.#mount.getConfirmedWriteFailureReason?.(path)
+        : undefined
+      throw new Error(`GitHub writeback did not complete for ${path}: ${failureReason ?? status}`)
+    }
+  }
+
+  async #hasPullRequestReviewRequest(expectedRepo: string, number: number, repoRoot: string): Promise<boolean> {
+    const pullsRoot = `${repoRoot}/pulls`
+    const pullDirectoryPattern = new RegExp(
+      `^${escapeRegExp(pullsRoot)}/(${number}(?:__[^/]+)?)(?:/|$)`,
+      'u',
+    )
+    const commentRoots = new Set([`${pullsRoot}/${number}/comments`])
+    for (const path of await this.#listTreeOrEmpty(`${pullsRoot}/${number}`)) {
+      const pullDirectory = pullDirectoryPattern.exec(path)?.[1]
+      if (pullDirectory) commentRoots.add(`${pullsRoot}/${pullDirectory}/comments`)
+    }
+    for (const commentsRoot of commentRoots) {
+      const directCommentPattern = new RegExp(`^${escapeRegExp(commentsRoot)}/[^/]+\\.json$`, 'u')
+      const nestedCommentPattern = new RegExp(
+        `^${escapeRegExp(commentsRoot)}/[^/]+/(?:meta|metadata)\\.json$`,
+        'u',
+      )
+      const directCommentDirectoryPattern = new RegExp(`^${escapeRegExp(commentsRoot)}/[^/.]+$`, 'u')
+      const commentPaths = new Set<string>()
+      for (const path of await this.#listTreeOrEmpty(commentsRoot)) {
+        if (directCommentPattern.test(path) || nestedCommentPattern.test(path)) {
+          commentPaths.add(path)
+          continue
+        }
+        if (!directCommentDirectoryPattern.test(path)) continue
+        for (const nestedPath of await this.#listTreeOrEmpty(path)) {
+          if (nestedCommentPattern.test(nestedPath)) commentPaths.add(nestedPath)
+        }
+      }
+      for (const path of commentPaths) {
+        // A listed comment becoming unreadable is indeterminate, not evidence
+        // that the request is absent. Propagate so the caller retries the scan.
+        const content = record((await this.#mount.readFile(path)).content)
+        // A failed provider operation can leave our bare local draft in the
+        // tree. Resolve its provider status rather than treating the draft
+        // itself as evidence that GitHub received the request.
+        if (isAllowedFactoryGithubWritebackDraft(path, content)) {
+          const status = await this.#mount.confirmWrite(path, {
+            timeoutMs: REVIEW_REQUEST_CONFIRM_TIMEOUT_MS,
+            returnFailed: true,
+            correlationId: factoryCoderabbitReviewCorrelationId(expectedRepo, number),
+          })
+          if (status === 'acked') return true
+          if (status === 'failed') {
+            await this.#mount.deleteFile(path)
+            continue
+          }
+          throw new Error(`GitHub review request draft has indeterminate provider status for ${path}: ${status}`)
+        }
+        const payload = record(content.payload)
+        const comment = record(payload.comment)
+        const rootComment = record(content.comment)
+        const body = stringValue(content.body) ?? stringValue(payload.body) ?? stringValue(comment.body)
+          ?? stringValue(rootComment.body)
+        if (body && containsCoderabbitReviewRequest(body)) return true
+      }
+    }
+    const canonicalCommentsRoot = `${repoRoot}/comments`
+    const canonicalDirectPattern = new RegExp(
+      `^${escapeRegExp(canonicalCommentsRoot)}/[^/]+\\.json$`,
+      'u',
+    )
+    const canonicalNestedPattern = new RegExp(
+      `^${escapeRegExp(canonicalCommentsRoot)}/[^/]+/(?:meta|metadata)\\.json$`,
+      'u',
+    )
+    let cursor: string | undefined
+    const visitedCursors = new Set<string>()
+    do {
+      const page = await this.#mount.queryFiles({
+        path: canonicalCommentsRoot,
+        provider: 'github',
+        comment: FACTORY_CODERABBIT_REVIEW_MARKER,
+        cursor,
+        limit: REVIEW_REQUEST_QUERY_PAGE_LIMIT,
+      })
+      for (const path of page.paths) {
+        if (!canonicalDirectPattern.test(path) && !canonicalNestedPattern.test(path)) continue
+        let content: Record<string, unknown>
+        try {
+          content = record((await this.#mount.readFile(path)).content)
+        } catch (error) {
+          // A current-tree query can race provider reconciliation. A path that
+          // was deleted after the query is stale evidence, so continue; other
+          // read failures remain indeterminate and must be retried by the caller.
+          if (isMountPathNotFound(error)) continue
+          throw error
+        }
+        if (!canonicalGithubCommentMatches(content, expectedRepo, number)) continue
+        const body = githubCommentBody(content)
+        if (body && containsCoderabbitReviewRequest(body)) return true
+      }
+      cursor = page.nextCursor ?? undefined
+      if (cursor && visitedCursors.has(cursor)) {
+        throw new Error(`Relayfile file query repeated cursor while scanning ${canonicalCommentsRoot}: ${cursor}`)
+      }
+      if (cursor) visitedCursors.add(cursor)
+    } while (cursor)
+    return false
+  }
+
+  async #listTreeOrEmpty(prefix: string): Promise<string[]> {
+    try {
+      return await this.#mount.listTree(prefix)
+    } catch (error) {
+      if (isMountPathNotFound(error)) return []
+      throw error
     }
   }
 
@@ -214,8 +399,86 @@ const record = (value: unknown): Record<string, unknown> =>
     ? value as Record<string, unknown>
     : {}
 
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+
+const isMountPathNotFound = (error: unknown): boolean => {
+  const details = record(error)
+  const response = record(details.response)
+  const status = details.status ?? details.statusCode ?? response.status ?? response.statusCode
+  const code = stringValue(details.code)?.toLowerCase()
+  return status === 404 || status === '404' || code === 'not_found' || code === 'file_not_found'
+}
+
 const stringValue = (value: unknown): string | undefined =>
   typeof value === 'string' && value.length > 0 ? value : undefined
+
+const githubCommentBody = (content: Record<string, unknown>): string | undefined => {
+  const payload = record(content.payload)
+  const comment = record(payload.comment)
+  const rootComment = record(content.comment)
+  return stringValue(content.body) ?? stringValue(payload.body) ?? stringValue(comment.body)
+    ?? stringValue(rootComment.body)
+}
+
+const canonicalGithubCommentMatches = (
+  content: Record<string, unknown>,
+  expectedRepo: string,
+  expectedNumber: number,
+): boolean => {
+  const payload = record(content.payload)
+  const comment = record(payload.comment)
+  const repository = record(
+    Object.keys(record(payload.repository)).length > 0
+      ? payload.repository
+      : content.repository,
+  )
+  const pullRequest = record(
+    Object.keys(record(payload.pull_request)).length > 0
+      ? payload.pull_request
+      : content.pull_request,
+  )
+  const identities = new Set<string>()
+  const numbers = new Set<number>()
+  const fullName = stringValue(repository.full_name)
+  if (fullName) identities.add(fullName.toLowerCase())
+  const owner = stringValue(payload.owner) ?? stringValue(content.owner)
+  const repo = stringValue(payload.repo) ?? stringValue(content.repo)
+  if (owner || repo) {
+    if (!owner || !repo) return false
+    identities.add(`${owner}/${repo}`.toLowerCase())
+  }
+  const directNumber = positiveInteger(pullRequest.number)
+  if (directNumber) numbers.add(directNumber)
+  for (const value of [
+    content.pull_request_url,
+    content.html_url,
+    payload.pull_request_url,
+    payload.html_url,
+    comment.pull_request_url,
+    comment.html_url,
+  ]) {
+    const parsed = githubPullRequestFromUrl(stringValue(value))
+    if (!parsed) continue
+    identities.add(parsed.repo.toLowerCase())
+    numbers.add(parsed.number)
+  }
+  return identities.size === 1 &&
+    identities.has(expectedRepo.toLowerCase()) &&
+    numbers.size === 1 &&
+    numbers.has(expectedNumber)
+}
+
+const githubPullRequestFromUrl = (value: string | undefined): { repo: string; number: number } | undefined => {
+  if (!value) return undefined
+  const match = value.match(
+    /^https:\/\/(?:api\.)?github\.com\/(?:repos\/)?([^/]+)\/([^/]+)\/pulls?\/(\d+)(?:[#/?].*)?$/iu,
+  )
+  const number = positiveInteger(match?.[3])
+  return match?.[1] && match[2] && number
+    ? { repo: `${match[1]}/${match[2]}`, number }
+    : undefined
+}
 
 const positiveInteger = (value: unknown): number | undefined => {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN

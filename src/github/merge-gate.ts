@@ -8,7 +8,12 @@ export interface GhRunResult {
   stderr?: string
 }
 
-export type GhRunner = (args: string[]) => Promise<GhRunResult>
+export interface GhRunOptions {
+  /** Cancels the underlying `gh` subprocess; callers must await its settlement before retrying. */
+  signal?: AbortSignal
+}
+
+export type GhRunner = (args: string[], options?: GhRunOptions) => Promise<GhRunResult>
 
 export interface GithubMergeGateInput {
   repo: string
@@ -172,10 +177,13 @@ export function evaluateGithubMergeGate(
   }
 }
 
-export const defaultGhRunner: GhRunner = async (args) => {
+export const defaultGhRunner: GhRunner = async (args, options) => {
   // TODO(issue-52): retire this compatibility runner when merge-gate reads and
   // guarded merges are fully represented by the mounted GitHub connection.
-  const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
+  const { stdout, stderr } = await execFileAsync('gh', args, {
+    maxBuffer: 1024 * 1024,
+    signal: options?.signal,
+  })
   return { stdout, stderr }
 }
 

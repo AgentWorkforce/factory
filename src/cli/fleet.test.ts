@@ -2050,6 +2050,21 @@ describe('fleet CLI runtime', () => {
             { ref: 'refs/heads/factory/77', sha: 'abc123' },
             { guarded: true },
           )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/pulls/42/comments/factory-coderabbit-review.json`,
+            { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/pulls/42/comments/factory-coderabbit-review.json`,
+            { body: 'arbitrary public comment' },
+            { guarded: true },
+          )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/pulls/42/comments/arbitrary.json`,
+            { body: '@coderabbitai review' },
+            { guarded: true },
+          )).toBe(false)
           closes.push(input)
         },
       }
