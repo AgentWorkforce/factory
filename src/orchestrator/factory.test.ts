@@ -3728,6 +3728,14 @@ describe('FactoryLoop', () => {
       githubWriteback,
       mergeGate,
       probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50, state: 'OPEN' }),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number: 50,
+          headRefName: 'github-head',
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
     })
 
     await factory.runOnce()
@@ -12488,6 +12496,17 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       probePrGhRunner: async (args) => {
         ghCalls.push(args)
+        if (args[0] === 'pr' && args[1] === 'view') {
+          const number = Number(args[2])
+          return {
+            stdout: JSON.stringify({
+              number,
+              headRefName: number === 856 ? 'ar-355-is-odd-v2' : 'ar-356-square',
+              isDraft: false,
+              state: 'OPEN',
+            }),
+          }
+        }
         return {
           stdout: JSON.stringify([
             ghPr(880, {
@@ -12526,7 +12545,10 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(ghCalls).toHaveLength(2)
+    const listCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'list')
+    const viewCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'view')
+    expect(listCalls).toHaveLength(2)
+    expect(viewCalls.map((args) => Number(args[2])).sort((a, b) => a - b)).toEqual([856, 857])
     expect(ghCalls.every((args) => args.includes('--repo') && args.includes('AgentWorkforce/pear'))).toBe(true)
     expect(closeInputs).toEqual([
       { repo: 'AgentWorkforce/pear', prNumber: 856, expectedIssueKey: 'AR-355', requireTitleMarker: false },
