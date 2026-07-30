@@ -170,6 +170,22 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async recordDispatchLifecyclePullRequestPublisherIdentity(
+    workspaceId: string,
+    key: string,
+    repo: string,
+    number: number,
+    identity: 'app' | 'user',
+    nowMs: number,
+  ): Promise<boolean> {
+    const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
+    if (!lifecycle) return false
+    const updated = recordPullRequestPublisherIdentity(lifecycle, repo, number, identity)
+    if (!updated) return false
+    lifecycle.updatedAtMs = nowMs
+    return true
+  }
+
   async getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined> {
     const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
     return lifecycle ? cloneDispatchLifecycle(lifecycle) : undefined
@@ -664,6 +680,26 @@ export class InMemoryStateStore implements StateStore {
     }
     return state
   }
+}
+
+const recordPullRequestPublisherIdentity = (
+  lifecycle: DispatchLifecycle,
+  repo: string,
+  number: number,
+  identity: 'app' | 'user',
+): boolean => {
+  const receipts = [
+    ...(lifecycle.pullRequest ? [lifecycle.pullRequest] : []),
+    ...(lifecycle.pullRequests ?? []),
+  ].filter((receipt) =>
+    githubRepositoriesMatch(receipt.repo, repo) && receipt.number === number)
+  if (
+    receipts.length === 0 ||
+    receipts.some((receipt) =>
+      receipt.publisherIdentity !== undefined && receipt.publisherIdentity !== identity)
+  ) return false
+  for (const receipt of receipts) receipt.publisherIdentity = identity
+  return true
 }
 
 const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)

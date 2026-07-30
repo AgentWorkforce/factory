@@ -308,6 +308,14 @@ export interface StateStore {
     nowMs: number,
     lifecycle: DispatchLifecycle,
   ): Promise<boolean>
+  recordDispatchLifecyclePullRequestPublisherIdentity(
+    workspaceId: string,
+    key: string,
+    repo: string,
+    number: number,
+    identity: 'app' | 'user',
+    nowMs: number,
+  ): Promise<boolean>
   getDispatchLifecycle(workspaceId: string, key: string): Promise<DispatchLifecycle | undefined>
   listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>>
   clearQueuedDispatchLifecycle(

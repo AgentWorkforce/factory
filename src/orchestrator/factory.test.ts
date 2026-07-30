@@ -3727,13 +3727,19 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
       githubWriteback,
       mergeGate,
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 50, state: 'OPEN' }),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: 50,
+        author: 'operator-user',
+        state: 'OPEN',
+      }),
       probePrGhRunner: async () => ({
         stdout: JSON.stringify({
           number: 50,
           headRefName: 'github-head',
           isDraft: false,
           state: 'OPEN',
+          author: { login: 'operator-user' },
         }),
       }),
     })
@@ -6154,6 +6160,7 @@ describe('FactoryLoop', () => {
       probePrResolver: async () => ({
         repo: 'AgentWorkforce/pear',
         prNumber: 1591,
+        author: 'operator-user',
         headRef: branch,
         state: 'OPEN',
         url: 'https://github.com/AgentWorkforce/pear/pull/1591',
@@ -6164,6 +6171,7 @@ describe('FactoryLoop', () => {
           url: 'https://github.com/AgentWorkforce/pear/pull/1591',
           headRefName: branch,
           isDraft: false,
+          author: { login: 'operator-user' },
         }]),
       }),
     })
@@ -6181,6 +6189,7 @@ describe('FactoryLoop', () => {
           repo: 'AgentWorkforce/pear',
           number: 1591,
           headRef: branch,
+          publisherIdentity: 'user',
         },
       })
     })
@@ -6208,6 +6217,7 @@ describe('FactoryLoop', () => {
     })
     const fleet = new DurableRemoteLifecycleFleetClient()
     const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const userWriteback = new PublishingGithubWriteback({ number: 1597, author: 'operator-user' })
     const ghCalls: string[][] = []
     let branch = ''
     const factory = createFactory(config({ babysitter: { enabled: true } }), {
@@ -6224,15 +6234,18 @@ describe('FactoryLoop', () => {
                 url: 'https://github.com/AgentWorkforce/pear/pull/1597',
                 headRefName: branch,
                 isDraft: false,
+                author: { login: 'operator-user' },
               }])
             : JSON.stringify({
                 number: 1597,
                 headRefName: branch,
                 isDraft: false,
                 state: 'OPEN',
+                author: { login: 'operator-user' },
               }),
         }
       },
+      githubWriteback: userWriteback,
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
 
@@ -6253,7 +6266,12 @@ describe('FactoryLoop', () => {
     const lookupCalls = ghCalls.filter((args) => args[0] === 'pr' && args[1] === 'list')
     expect(lookupCalls.length).toBeGreaterThan(0)
     expect(lookupCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
-    expect(reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 1597 }])
+    expect(reviewRequests).toEqual([])
+    expect(userWriteback.reviewRequests).toEqual([{ repo: 'AgentWorkforce/pear', number: 1597 }])
+    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      .resolves.toMatchObject({
+        pullRequest: { publisherIdentity: 'user' },
+      })
     expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
@@ -10377,6 +10395,106 @@ describe('FactoryLoop', () => {
           expect(appReviewRequests).toEqual([])
           expect(userWriteback.reviewRequests).toEqual([])
         }
+      } finally {
+        await restarted.stop()
+        await seedFactory.stop()
+      }
+    },
+  )
+
+  it.each([
+    {
+      number: 538,
+      author: 'relayfile[bot]',
+      expectedIdentity: 'app' as const,
+    },
+    {
+      number: 539,
+      author: 'operator-user',
+      expectedIdentity: 'user' as const,
+    },
+  ])(
+    'recovers and persists $expectedIdentity identity for a legacy receipt from authoritative author $author',
+    async ({ number, author, expectedIdentity }) => {
+      const path = issuePath(number)
+      const issue = issueFile(number)
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const seedFactory = createFactory(config(), {
+        mount: new FakeMountClient({ [path]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+      })
+      const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+      const receipt = {
+        repo: 'AgentWorkforce/pear',
+        number,
+        url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+        headRef: `factory/ar-${number}-pear`,
+      }
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-legacy-${expectedIdentity}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
+      const appWrite: GithubConnectionWrite = {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse the durable receipt')
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
+        },
+        closePullRequest: async () => undefined,
+      }
+      const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+      const restarted = createFactory(config({ github: { identity: 'auto' } }), {
+        mount: new FakeMountClient({ [path]: issue }, appWrite),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: userWriteback,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify({
+            number,
+            headRefName: receipt.headRef,
+            isDraft: false,
+            state: 'OPEN',
+            author: { login: author },
+          }),
+        }),
+      })
+
+      try {
+        await restarted.start({ mode: 'dispatch-owner' })
+        if (expectedIdentity === 'app') {
+          await vi.waitFor(() => expect(appReviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(userWriteback.reviewRequests).toEqual([])
+        } else {
+          await vi.waitFor(() =>
+            expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(appReviewRequests).toEqual([])
+        }
+        await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+          .resolves.toMatchObject({
+            pullRequest: { publisherIdentity: expectedIdentity },
+            pullRequests: [expect.objectContaining({ publisherIdentity: expectedIdentity })],
+          })
       } finally {
         await restarted.stop()
         await seedFactory.stop()

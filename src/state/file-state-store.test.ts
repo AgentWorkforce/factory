@@ -54,6 +54,59 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('atomically records a recovered publisher identity on a terminal pull-request receipt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-publisher-identity-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      const key = 'AR-86:uuid-86:/linear/issues/AR-86.json'
+      const seed = dispatchLifecycle(86)
+      const claim = await store.claimDispatchLifecycle(
+        'workspace-1', key, seed, 'owner-a', 1_000, 5_000,
+      )
+      expect(claim.lease).toBeDefined()
+      expect(await store.saveDispatchLifecycle(
+        'workspace-1',
+        key,
+        'owner-a',
+        claim.lease!.epoch,
+        1_001,
+        {
+          ...claim.lifecycle,
+          phase: 'complete',
+          pullRequest: {
+            repo: 'AgentWorkforce/factory',
+            number: 86,
+            url: 'https://github.com/AgentWorkforce/factory/pull/86',
+            headRef: 'factory/ar-86-agentworkforce-factory',
+          },
+          pullRequests: [{
+            repo: 'AgentWorkforce/factory',
+            number: 86,
+            url: 'https://github.com/AgentWorkforce/factory/pull/86',
+            headRef: 'factory/ar-86-agentworkforce-factory',
+          }],
+        },
+      )).toBe(true)
+
+      expect(await store.recordDispatchLifecyclePullRequestPublisherIdentity(
+        'workspace-1', key, 'agentworkforce/FACTORY', 86, 'app', 1_002,
+      )).toBe(true)
+      expect(await store.recordDispatchLifecyclePullRequestPublisherIdentity(
+        'workspace-1', key, 'AgentWorkforce/factory', 86, 'user', 1_003,
+      )).toBe(false)
+
+      await expect(new FileStateStore({ batchSize: 2, watchStatePath })
+        .getDispatchLifecycle('workspace-1', key)).resolves.toMatchObject({
+        phase: 'complete',
+        pullRequest: { publisherIdentity: 'app' },
+        pullRequests: [expect.objectContaining({ publisherIdentity: 'app' })],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('atomically adopts an existing GitHub lifecycle across Relayfile issue aliases', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-github-alias-'))
     try {

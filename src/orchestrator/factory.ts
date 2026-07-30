@@ -123,6 +123,7 @@ type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
 type ResolvedIssuePr = {
   repo: string
   prNumber: number
+  author?: string
   draft?: boolean
   headRef?: string
   headRepo?: string
@@ -137,6 +138,7 @@ type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullReques
 type GithubPullRequestIdentity = 'app' | 'user'
 type AutomatedReviewRequestTarget = GithubPullRequestRef & {
   headRef?: string
+  author?: string
   publisherIdentity?: GithubPullRequestIdentity
 }
 type GithubOrphanRecoveryContext = {
@@ -1601,7 +1603,7 @@ export class FactoryLoop implements Factory {
                 repo: pr.repo,
                 number: pr.prNumber,
                 headRef: pr.headRef,
-                publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
+                publisherIdentity: this.#publisherIdentityForExistingPullRequest(pr.author),
               })
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -6194,7 +6196,10 @@ export class FactoryLoop implements Factory {
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
-        const adopted = { ...existing, publisherIdentity: identity }
+        const adopted = {
+          ...existing,
+          publisherIdentity: this.#publisherIdentityForExistingPullRequest(existing.author),
+        }
         this.#publishedPullRequests.set(key, adopted)
         this.#requestAutomatedPullRequestReviewForOpenReceipt(adopted)
         this.#increment('githubPullRequestsReconciled')
@@ -6321,6 +6326,7 @@ export class FactoryLoop implements Factory {
 
   #requestAutomatedPullRequestReviewForOpenReceipt(
     published: AutomatedReviewRequestTarget,
+    recoveryLifecycleKeys: string[] = [],
   ): Promise<void> | undefined {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (
@@ -6338,14 +6344,33 @@ export class FactoryLoop implements Factory {
       published.number,
     )
     const work = openLookup
-      .then((open) => {
+      .then(async (open) => {
         if (
           open?.number === published.number &&
           (!published.headRef || open.headRef === published.headRef)
         ) {
+          const recoveredIdentity = published.publisherIdentity ??
+            this.#publisherIdentityForExistingPullRequest(open.author)
+          if (recoveredIdentity && recoveryLifecycleKeys.length > 0) {
+            for (const lifecycleKey of recoveryLifecycleKeys) {
+              const persisted = await this.#state.recordDispatchLifecyclePullRequestPublisherIdentity(
+                this.#workspaceId,
+                lifecycleKey,
+                published.repo,
+                published.number,
+                recoveredIdentity,
+                this.#clock.now(),
+              )
+              if (!persisted) {
+                throw new Error(
+                  `Unable to persist recovered publisher identity for ${published.repo}#${published.number}`,
+                )
+              }
+            }
+          }
           this.#requestAutomatedPullRequestReview({
             ...open,
-            publisherIdentity: published.publisherIdentity,
+            publisherIdentity: recoveredIdentity,
           })
         } else {
           this.#reviewRequestAttempts.delete(key)
@@ -6376,11 +6401,20 @@ export class FactoryLoop implements Factory {
       })
       return
     }
-    const receipts = new Map<string, GithubPublishPullRequestResult>()
-    for (const [, lifecycle] of lifecycles) {
+    const receipts = new Map<string, {
+      receipt: GithubPublishPullRequestResult
+      lifecycleKeys: string[]
+    }>()
+    for (const [lifecycleKey, lifecycle] of lifecycles) {
       if (!isTerminalDispatchLifecycle(lifecycle)) continue
       for (const receipt of publishedPullRequests(lifecycle)) {
-        receipts.set(`${receipt.repo.toLowerCase()}#${receipt.number}`, receipt)
+        const key = `${receipt.repo.toLowerCase()}#${receipt.number}`
+        const existing = receipts.get(key)
+        if (existing) {
+          if (!existing.lifecycleKeys.includes(lifecycleKey)) existing.lifecycleKeys.push(lifecycleKey)
+        } else {
+          receipts.set(key, { receipt, lifecycleKeys: [lifecycleKey] })
+        }
       }
     }
     // Reconciliation is intentionally detached from startup and serialized.
@@ -6388,9 +6422,9 @@ export class FactoryLoop implements Factory {
     // view` subprocesses, and a review-request outage must not prevent the
     // lifecycle owner from starting. Receipts stay durable for the next pass.
     const reconciliation = (async () => {
-      for (const receipt of receipts.values()) {
+      for (const { receipt, lifecycleKeys } of receipts.values()) {
         if (this.#stopping) return
-        await this.#requestAutomatedPullRequestReviewForOpenReceipt(receipt)
+        await this.#requestAutomatedPullRequestReviewForOpenReceipt(receipt, lifecycleKeys)
       }
     })()
     this.#trackAutomatedPullRequestReviewWork(reconciliation)
@@ -6532,10 +6566,12 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  #publisherIdentityForNewReviewObligation(): GithubPullRequestIdentity {
+  #publisherIdentityForExistingPullRequest(
+    author: string | undefined,
+  ): GithubPullRequestIdentity | undefined {
     const configured = this.#config.github.identity
     if (configured !== 'auto') return configured
-    return this.#mount.githubWrite ? 'app' : 'user'
+    return githubPublisherIdentityFromAuthor(author)
   }
 
   #shouldAttemptPullRequestPublication(): boolean {
@@ -6566,7 +6602,7 @@ export class FactoryLoop implements Factory {
           '--state',
           'open',
           '--json',
-          'number,url,headRefName,isDraft',
+          'number,url,headRefName,isDraft,author',
           '--limit',
           '10',
         ])
@@ -6578,7 +6614,13 @@ export class FactoryLoop implements Factory {
             const url = stringValue(candidate?.url)
             const headRef = stringValue(candidate?.headRefName)
             if (!number || !url || headRef !== expectedHeadRef || candidate?.isDraft !== false) return []
-            return [{ repo, number, url, headRef }]
+            return [{
+              repo,
+              number,
+              url,
+              headRef,
+              author: githubAuthorLogin(candidate!),
+            }]
           })
           return candidates.sort((a, b) => b.number - a.number)[0]
         }
@@ -6626,6 +6668,7 @@ export class FactoryLoop implements Factory {
             number: snapshot.number,
             url: snapshot.url ?? `https://github.com/${repo}/pull/${snapshot.number}`,
             headRef: expectedHeadRef,
+            author: snapshot.author,
           })
         } catch {
           // A partially materialized PR record cannot prove exact ownership.
@@ -6651,7 +6694,7 @@ export class FactoryLoop implements Factory {
         '--repo',
         repo,
         '--json',
-        'number,headRefName,isDraft,state',
+        'number,headRefName,isDraft,state,author',
       ],
       { signal },
     )
@@ -6667,6 +6710,7 @@ export class FactoryLoop implements Factory {
       repo,
       number,
       ...(headRef ? { headRef } : {}),
+      author: githubAuthorLogin(candidate!),
     }
   }
 
@@ -7219,7 +7263,7 @@ export class FactoryLoop implements Factory {
         if (existing) {
           this.#requestAutomatedPullRequestReviewForOpenReceipt({
             ...existing,
-            publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
+            publisherIdentity: this.#publisherIdentityForExistingPullRequest(existing.author),
           })
           return true
         }
@@ -7238,7 +7282,7 @@ export class FactoryLoop implements Factory {
           repo: pr.repo,
           number: pr.prNumber,
           headRef: pr.headRef,
-          publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
+          publisherIdentity: this.#publisherIdentityForExistingPullRequest(pr.author),
         })
       }
       return true
@@ -14716,6 +14760,7 @@ const resolveIssuePrFromMount = async (
       candidates.push({
         repo,
         prNumber: pr.number,
+        author: pr.author,
         draft: pr.draft,
         headRef: pr.headRef,
         headRepo: pr.headRepo,
@@ -14763,7 +14808,7 @@ const resolveIssuePrFromGh = async (
         '--state',
         'all',
         '--json',
-        'number,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,isDraft,state,url',
+        'number,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,isDraft,state,url,author',
         '--limit',
         String(PROBE_PR_GH_CANDIDATE_LIMIT),
       ])
@@ -14802,6 +14847,7 @@ const resolveIssuePrFromGh = async (
       candidates.push({
         repo,
         prNumber: pr.number,
+        author: pr.author,
         draft: pr.draft,
         headRef: pr.headRef,
         headRepo: pr.headRepo,
@@ -14927,6 +14973,7 @@ const readProbePrCandidate = async (
   path: string,
 ): Promise<{
   number: number
+  author?: string
   title: string
   body: string
   headRef: string
@@ -14948,6 +14995,7 @@ const readProbePrCandidate = async (
     if (!Number.isInteger(number) || number <= 0) return undefined
     return {
       number,
+      author: githubAuthorLogin(payload),
       title: stringValue(payload.title) ?? '',
       body: stringValue(payload.body) ?? '',
       headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? '',
@@ -14968,6 +15016,7 @@ const ghProbePrCandidate = (
   value: unknown,
 ): {
   number: number
+  author?: string
   title: string
   body: string
   headRef: string
@@ -14990,6 +15039,7 @@ const ghProbePrCandidate = (
   })()
   return {
     number,
+    author: githubAuthorLogin(payload),
     title: stringValue(payload.title) ?? '',
     body: stringValue(payload.body) ?? '',
     headRef: stringValue(payload.headRefName) ?? '',
@@ -15093,6 +15143,7 @@ const isGithubPullFilePath = (path: string): boolean =>
 
 type PullSnapshot = {
   number: number
+  author?: string
   state?: string
   headRef?: string
   draft?: boolean
@@ -15114,6 +15165,7 @@ const parsePullSnapshot = (content: unknown, fallbackNumber: number): PullSnapsh
   const number = fallbackNumber
   return {
     number,
+    author: githubAuthorLogin(payload),
     state: stringValue(payload.state),
     headRef: refName(payload.headRef) ?? refName(payload.head) ?? stringValue(payload.head_ref) ?? stringValue(payload.headRefName),
     draft: booleanValue(payload.isDraft) ?? booleanValue(payload.draft),
@@ -15512,6 +15564,14 @@ const githubAuthorLogin = (payload: Record<string, unknown>): string | undefined
     if (login) return login
   }
   return undefined
+}
+
+const githubPublisherIdentityFromAuthor = (
+  author: string | undefined,
+): GithubPullRequestIdentity | undefined => {
+  const normalized = author?.trim().toLowerCase()
+  if (!normalized) return undefined
+  return normalized.endsWith('[bot]') ? 'app' : 'user'
 }
 
 
