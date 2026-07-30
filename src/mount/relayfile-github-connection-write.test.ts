@@ -125,6 +125,37 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.deletes).toEqual([])
   })
 
+  it('gives restarted cloud operation recovery a realistic bounded confirmation window', async () => {
+    const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
+    class ConfirmationOptionsMount extends FakeMountClient {
+      readonly options: Array<{ timeoutMs?: number; returnFailed?: boolean } | undefined> = []
+
+      override async confirmWrite(
+        _path: string,
+        opts?: { timeoutMs?: number; returnFailed?: boolean },
+      ): Promise<'acked'> {
+        this.options.push(opts)
+        return 'acked'
+      }
+    }
+    const mount = new ConfirmationOptionsMount({
+      [draftPath]: {
+        body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 86,
+    })).resolves.toBeUndefined()
+
+    expect(mount.options).toEqual([{
+      timeoutMs: 10_000,
+      returnFailed: true,
+    }])
+  })
+
   it('fails closed on an indeterminate review draft instead of posting a duplicate', async () => {
     const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
     const mount = new FakeMountClient({

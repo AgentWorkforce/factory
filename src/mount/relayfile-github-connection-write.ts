@@ -13,6 +13,8 @@ import {
   isAllowedFactoryGithubWritebackDraft,
 } from '../github/review-request'
 
+const REVIEW_REQUEST_CONFIRM_TIMEOUT_MS = 10_000
+
 const execFileAsync = promisify(execFile)
 const WRITE_CONFIRM_TIMEOUT_MS = 90_000
 const RECEIPT_READ_ATTEMPTS = 5
@@ -186,7 +188,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
         // itself as evidence that GitHub received the request.
         if (isAllowedFactoryGithubWritebackDraft(path, content)) {
           const status = await this.#mount.confirmWrite(path, {
-            timeoutMs: 1,
+            timeoutMs: REVIEW_REQUEST_CONFIRM_TIMEOUT_MS,
             returnFailed: true,
           })
           if (status === 'acked') return true

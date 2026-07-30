@@ -521,6 +521,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterCriticalAgents = new Set<string>()
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
   readonly #reviewRequestedPullRequests = new Set<string>()
+  readonly #reviewRequestVerifications = new Set<string>()
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
@@ -6106,7 +6107,7 @@ export class FactoryLoop implements Factory {
     const { identity, publisher } = this.#githubPullRequestPublisher()
     const cached = this.#publishedPullRequests.get(key)
     if (cached) {
-      this.#requestAutomatedPullRequestReview(cached)
+      this.#requestAutomatedPullRequestReviewForOpenReceipt(cached)
       return cached
     }
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
@@ -6136,7 +6137,7 @@ export class FactoryLoop implements Factory {
       (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
     ) {
       this.#publishedPullRequests.set(key, durableReceipt)
-      this.#requestAutomatedPullRequestReview(durableReceipt)
+      this.#requestAutomatedPullRequestReviewForOpenReceipt(durableReceipt)
       return durableReceipt
     }
     if (opts.reconcileExisting && expectedHeadRef) {
@@ -6219,6 +6220,29 @@ export class FactoryLoop implements Factory {
         error: describeError(error).errorMessage,
       })
     }
+  }
+
+  #requestAutomatedPullRequestReviewForOpenReceipt(
+    published: GithubPublishPullRequestResult,
+  ): void {
+    const key = `${published.repo.toLowerCase()}#${published.number}`
+    if (this.#reviewRequestedPullRequests.has(key) || this.#reviewRequestVerifications.has(key)) return
+    this.#reviewRequestVerifications.add(key)
+    void this.#openPullRequestByHead(published.repo, published.headRef)
+      .then((open) => {
+        if (open?.number === published.number) {
+          this.#requestAutomatedPullRequestReview(open)
+        }
+      })
+      .catch((error: unknown) => {
+        this.#increment('githubPullRequestReviewRequestFailures')
+        this.#logger.warn?.('[factory] automated PR review request skipped; unable to verify receipt is still open', {
+          repo: published.repo,
+          prNumber: published.number,
+          error: describeError(error).errorMessage,
+        })
+      })
+      .finally(() => this.#reviewRequestVerifications.delete(key))
   }
 
   #githubPullRequestReviewRequester(): ((input: GithubPullRequestRef) => Promise<void>) | undefined {
@@ -6872,7 +6896,7 @@ export class FactoryLoop implements Factory {
           receipt.repo.toLowerCase() === repo.toLowerCase()
         )
         if (durableReceipt) {
-          this.#requestAutomatedPullRequestReview(durableReceipt)
+          this.#requestAutomatedPullRequestReviewForOpenReceipt(durableReceipt)
           return true
         }
         const existing = await this.#openPullRequestByHead(repo, implementer.spec.branch)

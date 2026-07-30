@@ -829,11 +829,11 @@ export class RelayfileCloudMountClient implements MountClient {
     const matching: OperationStatusResponse[] = []
     do {
       const page = await settleBeforeDeadline(this.#client.listOps(this.workspaceId, {
-          action: 'file_upsert',
-          provider: providerForPath(path),
-          cursor,
-          limit: 100,
-        }), deadline)
+        action: 'file_upsert',
+        provider: providerForPath(path),
+        cursor,
+        limit: 100,
+      }), deadline)
       if (!page) return undefined
       for (const operation of page.items) {
         if (operation.path === path) matching.push(operation)
