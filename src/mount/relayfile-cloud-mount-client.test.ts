@@ -61,6 +61,10 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
   }> = []
   readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
+  readonly queryFilesCalls: Array<{
+    workspaceId: string
+    options?: { path?: string; provider?: string; cursor?: string; limit?: number }
+  }> = []
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
@@ -156,6 +160,31 @@ class FakeRelayFileClient implements RelayFileClientLike {
       path: options?.path ?? '/',
       entries: page.map((path) => ({ path, type: 'file' as const, revision: '1' })),
       nextCursor: next < paths.length ? String(next) : null,
+    }
+  }
+
+  async queryFiles(
+    workspaceId: string,
+    options?: { path?: string; provider?: string; cursor?: string; limit?: number },
+  ) {
+    this.queryFilesCalls.push({ workspaceId, options })
+    const paths = [...this.files.keys()]
+      .filter((path) => path.startsWith(options?.path ?? '/'))
+      .sort()
+    const start = options?.cursor
+      ? Math.max(0, paths.findIndex((path) => path === options.cursor) + 1)
+      : 0
+    const limit = options?.limit ?? paths.length
+    const page = paths.slice(start, start + limit)
+    return {
+      items: page.map((path) => ({
+        path,
+        revision: this.files.get(path)?.revision ?? '1',
+        contentType: this.files.get(path)?.contentType ?? 'application/json',
+        provider: options?.provider,
+        size: this.files.get(path)?.content.length ?? 0,
+      })),
+      nextCursor: page.length >= limit ? page.at(-1) ?? null : null,
     }
   }
 
@@ -978,7 +1007,7 @@ describe('RelayfileCloudMountClient', () => {
       .rejects.toThrow('Relayfile cloud session required; run `agent-relay login`')
   })
 
-  it('delegates readFile/listTree/getEvents with the configured workspace id', async () => {
+  it('delegates readFile/listTree/queryFiles/getEvents with the configured workspace id', async () => {
     const fake = new FakeRelayFileClient()
     fake.files.set('/linear/issues/AR-1.json', {
       revision: '7',
@@ -992,6 +1021,14 @@ describe('RelayfileCloudMountClient', () => {
       revision: '7',
     })
     await expect(mount.listTree('/linear/issues')).resolves.toEqual(['/linear/issues/AR-1.json'])
+    await expect(mount.queryFiles({
+      path: '/linear/issues',
+      provider: 'linear',
+      limit: 100,
+    })).resolves.toEqual({
+      paths: ['/linear/issues/AR-1.json'],
+      nextCursor: null,
+    })
     await expect(mount.getEvents({ cursor: 'evt-0', limit: 10 })).resolves.toMatchObject({
       events: fake.events,
       nextCursor: null,
@@ -1001,6 +1038,10 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.listTreeCalls[0]).toEqual({
       workspaceId: 'rw_test',
       options: { path: '/linear/issues', cursor: undefined },
+    })
+    expect(fake.queryFilesCalls[0]).toEqual({
+      workspaceId: 'rw_test',
+      options: { path: '/linear/issues', provider: 'linear', limit: 100 },
     })
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
   })

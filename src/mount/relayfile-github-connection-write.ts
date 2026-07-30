@@ -14,7 +14,7 @@ import {
 } from '../github/review-request'
 
 const REVIEW_REQUEST_CONFIRM_TIMEOUT_MS = 10_000
-const REVIEW_REQUEST_RECENT_EVENT_LIMIT = 200
+const REVIEW_REQUEST_QUERY_PAGE_LIMIT = 100
 
 const execFileAsync = promisify(execFile)
 const WRITE_CONFIRM_TIMEOUT_MS = 90_000
@@ -24,7 +24,14 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'getEvents' | 'listTree' | 'readFile' | 'writeFile'>
+  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
+    queryFiles(opts: {
+      path: string
+      provider?: string
+      cursor?: string
+      limit?: number
+    }): Promise<{ paths: string[]; nextCursor: string | null }>
+  }
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
@@ -216,23 +223,37 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       `^${escapeRegExp(canonicalCommentsRoot)}/[^/]+/(?:meta|metadata)\\.json$`,
       'u',
     )
-    const canonicalPaths = new Set<string>()
-    const recentEvents = await this.#mount.getEvents({
-      provider: 'github',
-      last: REVIEW_REQUEST_RECENT_EVENT_LIMIT,
-    })
-    for (const event of recentEvents.events) {
-      const path = event.resource.path
-      if (canonicalDirectPattern.test(path) || canonicalNestedPattern.test(path)) {
-        canonicalPaths.add(path)
+    let cursor: string | undefined
+    const visitedCursors = new Set<string>()
+    do {
+      const page = await this.#mount.queryFiles({
+        path: canonicalCommentsRoot,
+        provider: 'github',
+        cursor,
+        limit: REVIEW_REQUEST_QUERY_PAGE_LIMIT,
+      })
+      for (const path of page.paths) {
+        if (!canonicalDirectPattern.test(path) && !canonicalNestedPattern.test(path)) continue
+        let content: Record<string, unknown>
+        try {
+          content = record((await this.#mount.readFile(path)).content)
+        } catch (error) {
+          // A current-tree query can race provider reconciliation. A path that
+          // was deleted after the query is stale evidence, so continue; other
+          // read failures remain indeterminate and must be retried by the caller.
+          if (isMountPathNotFound(error)) continue
+          throw error
+        }
+        if (!canonicalGithubCommentMatches(content, expectedRepo, number)) continue
+        const body = githubCommentBody(content)
+        if (body && containsCoderabbitReviewRequest(body)) return true
       }
-    }
-    for (const path of canonicalPaths) {
-      const content = record((await this.#mount.readFile(path)).content)
-      if (!canonicalGithubCommentMatches(content, expectedRepo, number)) continue
-      const body = githubCommentBody(content)
-      if (body && containsCoderabbitReviewRequest(body)) return true
-    }
+      cursor = page.nextCursor ?? undefined
+      if (cursor && visitedCursors.has(cursor)) {
+        throw new Error(`Relayfile file query repeated cursor while scanning ${canonicalCommentsRoot}: ${cursor}`)
+      }
+      if (cursor) visitedCursors.add(cursor)
+    } while (cursor)
     return false
   }
 

@@ -319,8 +319,6 @@ describe('RelayfileGithubConnectionWrite', () => {
         },
       },
     })
-    mount.emit(githubEvent('canonical-unrelated', unrelatedPath))
-    mount.emit(githubEvent('canonical-request', canonicalPath))
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
     await expect(write.requestPullRequestReview({
@@ -330,6 +328,56 @@ describe('RelayfileGithubConnectionWrite', () => {
 
     expect(mount.writes).toEqual([])
     expect(mount.reads).toEqual([unrelatedPath, canonicalPath])
+  })
+
+  it('paginates the current canonical comment tree and skips a concurrently deleted result', async () => {
+    const canonicalRoot = '/github/repos/AgentWorkforce/factory/comments'
+    const stalePath = `${canonicalRoot}/9007.json`
+    const canonicalPath = `${canonicalRoot}/9008.json`
+    class PaginatedCanonicalCommentsMount extends FakeMountClient {
+      readonly queryCalls: Array<{ path: string; provider?: string; cursor?: string; limit?: number }> = []
+
+      override async queryFiles(opts: {
+        path: string
+        provider?: string
+        cursor?: string
+        limit?: number
+      }): Promise<{ paths: string[]; nextCursor: string | null }> {
+        this.queryCalls.push(opts)
+        return opts.cursor
+          ? { paths: [canonicalPath], nextCursor: null }
+          : { paths: [stalePath], nextCursor: 'canonical-page-2' }
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === stalePath) {
+          throw Object.assign(new Error(`File not found: ${path}`), { code: 'file_not_found' })
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new PaginatedCanonicalCommentsMount({
+      [canonicalPath]: {
+        repository: { full_name: 'AgentWorkforce/factory' },
+        pull_request: { number: 90 },
+        comment: {
+          body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->',
+        },
+      },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 90,
+    })).resolves.toBeUndefined()
+
+    expect(mount.writes).toEqual([])
+    expect(mount.queryCalls).toEqual([
+      { path: canonicalRoot, provider: 'github', cursor: undefined, limit: 100 },
+      { path: canonicalRoot, provider: 'github', cursor: 'canonical-page-2', limit: 100 },
+    ])
+    expect(mount.reads).toEqual([canonicalPath])
   })
 
   it('does not let another pull request canonical comment suppress a request', async () => {
@@ -344,7 +392,6 @@ describe('RelayfileGithubConnectionWrite', () => {
         },
       },
     })
-    mount.emit(githubEvent('canonical-other-pr', canonicalPath))
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
 
     await expect(write.requestPullRequestReview({

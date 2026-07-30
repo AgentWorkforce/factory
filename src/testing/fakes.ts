@@ -83,6 +83,24 @@ export class FakeMountClient implements MountClient {
     return [...this.files.keys()].filter((path) => path.startsWith(prefix)).sort()
   }
 
+  async queryFiles(opts: {
+    path: string
+    provider?: string
+    cursor?: string
+    limit?: number
+  }): Promise<{ paths: string[]; nextCursor: string | null }> {
+    const paths = [...this.files.keys()].filter((path) => path.startsWith(opts.path)).sort()
+    const start = opts.cursor
+      ? Math.max(0, paths.findIndex((path) => path === opts.cursor) + 1)
+      : 0
+    const limit = opts.limit ?? paths.length
+    const page = paths.slice(start, start + limit)
+    return {
+      paths: page,
+      nextCursor: page.length >= limit ? page.at(-1) ?? null : null,
+    }
+  }
+
   isLocalMountAuthDegraded(): boolean {
     return this.authDegraded
   }

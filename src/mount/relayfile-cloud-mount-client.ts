@@ -10,6 +10,7 @@ import {
   type ChangeEvent,
   type DeleteFileInput,
   type EventFeedResponse,
+  type FileQueryResponse,
   type FileReadResponse,
   type GetEventsOptions,
   type GetOperationsOptions,
@@ -17,6 +18,7 @@ import {
   type OperationFeedResponse,
   type ResourceAtEventResult,
   type OperationStatusResponse,
+  type QueryFilesOptions,
   type Subscription,
   type TreeResponse,
   type WriteFileInput,
@@ -221,6 +223,7 @@ export type RelayFileClientLike = {
     writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
     deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
     listTree(workspaceId: string, options?: ListTreeOptions): Promise<TreeResponse>
+    queryFiles(workspaceId: string, options?: QueryFilesOptions): Promise<FileQueryResponse>
     getEvents(workspaceId: string, options?: GetEventsOptions): Promise<EventFeedResponse>
     listLastNChanges?(limit: number, context?: { workspaceId: string; token?: string }): Promise<{ events: ChangeEvent[] }>
     getResourceAtEvent(eventId: string, context?: { workspaceId: string; token?: string }): Promise<ResourceAtEventResult>
@@ -766,6 +769,14 @@ export class RelayfileCloudMountClient implements MountClient {
     const response = await this.#client.getEvents(this.workspaceId, opts)
     return {
       events: response.events as unknown as EventPage['events'],
+      nextCursor: response.nextCursor,
+    }
+  }
+
+  async queryFiles(opts: QueryFilesOptions): Promise<{ paths: string[]; nextCursor: string | null }> {
+    const response = await this.#client.queryFiles(this.workspaceId, opts)
+    return {
+      paths: response.items.map((item) => item.path),
       nextCursor: response.nextCursor,
     }
   }
