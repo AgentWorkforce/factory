@@ -1601,6 +1601,7 @@ export class FactoryLoop implements Factory {
                 repo: pr.repo,
                 number: pr.prNumber,
                 headRef: pr.headRef,
+                publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
               })
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -6193,16 +6194,17 @@ export class FactoryLoop implements Factory {
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
-        this.#publishedPullRequests.set(key, existing)
-        this.#requestAutomatedPullRequestReviewForOpenReceipt(existing)
+        const adopted = { ...existing, publisherIdentity: identity }
+        this.#publishedPullRequests.set(key, adopted)
+        this.#requestAutomatedPullRequestReviewForOpenReceipt(adopted)
         this.#increment('githubPullRequestsReconciled')
         this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
           issue: issue.key,
-          repo: existing.repo,
-          prNumber: existing.number,
-          url: existing.url,
+          repo: adopted.repo,
+          prNumber: adopted.number,
+          url: adopted.url,
         })
-        return existing
+        return adopted
       }
     }
     const baseRef = await this.#githubDefaultBranch(repo)
@@ -6528,6 +6530,12 @@ export class FactoryLoop implements Factory {
       identity: 'user',
       publisher: { publishPullRequest: publishPullRequest.bind(this.#githubWriteback) },
     }
+  }
+
+  #publisherIdentityForNewReviewObligation(): GithubPullRequestIdentity {
+    const configured = this.#config.github.identity
+    if (configured !== 'auto') return configured
+    return this.#mount.githubWrite ? 'app' : 'user'
   }
 
   #shouldAttemptPullRequestPublication(): boolean {
@@ -7209,7 +7217,10 @@ export class FactoryLoop implements Factory {
         }
         const existing = await this.#openPullRequestByHead(repo, implementer.spec.branch)
         if (existing) {
-          this.#requestAutomatedPullRequestReviewForOpenReceipt(existing)
+          this.#requestAutomatedPullRequestReviewForOpenReceipt({
+            ...existing,
+            publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
+          })
           return true
         }
         return false
@@ -7227,6 +7238,7 @@ export class FactoryLoop implements Factory {
           repo: pr.repo,
           number: pr.prNumber,
           headRef: pr.headRef,
+          publisherIdentity: this.#publisherIdentityForNewReviewObligation(),
         })
       }
       return true

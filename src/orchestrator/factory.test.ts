@@ -10218,6 +10218,7 @@ describe('FactoryLoop', () => {
       number,
       url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
       headRef: `factory/ar-${number}-pear`,
+      publisherIdentity: 'app' as const,
     }
     await stateStore.claimDispatchLifecycle(
       'factory-test',
@@ -10542,6 +10543,7 @@ describe('FactoryLoop', () => {
       number,
       url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
       headRef: `factory/ar-${number}-pear`,
+      publisherIdentity: 'app' as const,
     }))
     for (const receipt of receipts) {
       const issue = parseLinearIssue(issuePath(receipt.number), issueFile(receipt.number))
