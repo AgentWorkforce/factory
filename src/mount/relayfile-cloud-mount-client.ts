@@ -804,7 +804,12 @@ export class RelayfileCloudMountClient implements MountClient {
     if (!opId || !this.#client.getOp) return 'timeout'
 
     for (;;) {
-      const operation = await this.#client.getOp(this.workspaceId, opId)
+      if (Date.now() >= deadline) return 'timeout'
+      const operation = await settleBeforeDeadline(
+        this.#client.getOp(this.workspaceId, opId),
+        deadline,
+      )
+      if (!operation) return 'timeout'
       let status: 'acked' | 'pending' | 'failed'
       try {
         status = mapOperationStatus(operation)

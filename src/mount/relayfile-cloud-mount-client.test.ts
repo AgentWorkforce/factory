@@ -1406,6 +1406,36 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([])
   })
 
+  it('bounds recovered operation polling by the confirmation timeout', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    class HangingRecoveredOperationClient extends FakeRelayFileClient {
+      override async getOp(): Promise<OperationStatusResponse> {
+        await new Promise<never>(() => undefined)
+      }
+    }
+    const fake = new HangingRecoveredOperationClient()
+    fake.ops.set('op-recovered', {
+      opId: 'op-recovered',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      status: 'pending',
+      attemptCount: 1,
+      createdAt: '2026-07-30T01:00:00.000Z',
+    })
+    const restartedMount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(restartedMount.confirmWrite(path, {
+      timeoutMs: 5,
+      returnFailed: true,
+    })).resolves.toBe('timeout')
+    expect(fake.listOpsCalls).toHaveLength(1)
+  })
+
   it('treats restarted operation lookup failures as unavailable recovery data', async () => {
     class FailingListOpsClient extends FakeRelayFileClient {
       override async listOps(): Promise<OperationFeedResponse> {
