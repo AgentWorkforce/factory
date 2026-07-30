@@ -10063,6 +10063,51 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('retries a rejected automated review request after issue completion', async () => {
+    const number = 527
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        attempts += 1
+        if (attempts === 1) throw new Error('transient provider failure')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      reviewRequestRetryMs: 5,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('keeps provider delete authorization aligned with guarded draft authorization', async () => {
     class DeletePredicateMount extends FakeMountClient {
       deletePredicate?: (path: string, content: unknown) => boolean | Promise<boolean>

@@ -266,6 +266,7 @@ const PROBE_PR_GH_BACKOFF_MS = 60_000
 const PROBE_PR_GH_CANDIDATE_LIMIT = 200
 const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
+const AUTOMATED_REVIEW_REQUEST_RETRY_MS = 5_000
 const SLACK_REPLY_EVENTS_LIMIT = 100
 const SLACK_REPLY_POLL_INTERVAL_MS = 5_000
 const SLACK_IDENTITY_MESSAGE_SCAN_LIMIT = 250
@@ -390,6 +391,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterWakeUnreachableEscalateMs: number
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
+  readonly #reviewRequestRetryMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -522,6 +524,7 @@ export class FactoryLoop implements Factory {
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
   readonly #reviewRequestedPullRequests = new Set<string>()
   readonly #reviewRequestVerifications = new Set<string>()
+  readonly #reviewRequestRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
   readonly #probePrGhBackoffUntilMs = new Map<string, number>()
@@ -595,6 +598,7 @@ export class FactoryLoop implements Factory {
     this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
+    this.#reviewRequestRetryMs = ports.reviewRequestRetryMs ?? AUTOMATED_REVIEW_REQUEST_RETRY_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -891,6 +895,8 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer = undefined
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
+    for (const timer of this.#reviewRequestRetryTimers.values()) clearTimeout(timer)
+    this.#reviewRequestRetryTimers.clear()
     this.#abandonedDispatchReasons.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
@@ -6196,7 +6202,7 @@ export class FactoryLoop implements Factory {
     published: GithubPullRequestRef,
   ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
-    if (this.#reviewRequestedPullRequests.has(key)) return
+    if (this.#reviewRequestedPullRequests.has(key) || this.#reviewRequestRetryTimers.has(key)) return
     try {
       const requestReview = this.#githubPullRequestReviewRequester()
       if (!requestReview) return
@@ -6211,6 +6217,7 @@ export class FactoryLoop implements Factory {
             prNumber: published.number,
             error: describeError(error).errorMessage,
           })
+          this.#scheduleAutomatedPullRequestReviewRetry(published)
         })
     } catch (error) {
       this.#increment('githubPullRequestReviewRequestFailures')
@@ -6220,6 +6227,21 @@ export class FactoryLoop implements Factory {
         error: describeError(error).errorMessage,
       })
     }
+  }
+
+  #scheduleAutomatedPullRequestReviewRetry(published: GithubPullRequestRef): void {
+    const key = `${published.repo.toLowerCase()}#${published.number}`
+    if (
+      this.#stopping ||
+      this.#reviewRequestedPullRequests.has(key) ||
+      this.#reviewRequestRetryTimers.has(key)
+    ) return
+    const timer = setTimeout(() => {
+      this.#reviewRequestRetryTimers.delete(key)
+      if (!this.#stopping) this.#requestAutomatedPullRequestReview(published)
+    }, this.#reviewRequestRetryMs)
+    timer.unref?.()
+    this.#reviewRequestRetryTimers.set(key, timer)
   }
 
   #requestAutomatedPullRequestReviewForOpenReceipt(

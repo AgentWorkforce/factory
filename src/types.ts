@@ -55,6 +55,8 @@ export interface FactoryPorts {
    * active in the background. Test-only override of the built-in default.
    */
   startupAgentExitDrainTimeoutMs?: number
+  /** Retry cadence for failed automated PR review requests. Test-only override. */
+  reviewRequestRetryMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
