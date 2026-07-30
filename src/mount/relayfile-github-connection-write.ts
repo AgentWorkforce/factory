@@ -24,7 +24,7 @@ const RECEIPT_READ_DELAY_MS = 100
 export type GitCommandRunner = (args: string[]) => Promise<{ stdout: string; stderr?: string }>
 
 export interface RelayfileGithubConnectionWriteConfig {
-  mount: Pick<MountClient, 'confirmWrite' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
+  mount: Pick<MountClient, 'confirmWrite' | 'createFile' | 'deleteFile' | 'getConfirmedWriteExternalId' | 'getConfirmedWriteFailureReason' | 'listTree' | 'readFile' | 'writeFile'> & {
     queryFiles(opts: {
       path: string
       provider?: string
@@ -136,6 +136,9 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
       `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(repo)}`,
     ]
+    // The process-local promise handles re-entry here; the Relayfile
+    // create-if-absent below arbitrates independent Factory processes. Direct
+    // GitHub comments remain outside that store boundary and can still race.
     const requestKey = `${input.repo.toLowerCase()}#${input.number}`
     const existing = this.#reviewRequests.get(requestKey)
     if (existing) return existing
@@ -153,9 +156,25 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       if (await this.#hasPullRequestReviewRequest(expectedRepo, number, repoRoot)) return
     }
     const commentsRoot = `${repoRoots[0]}/pulls/${number}/comments`
-    await this.#writeAndConfirm(`${commentsRoot}/factory-coderabbit-review.json`, {
-      body: FACTORY_CODERABBIT_REVIEW_BODY,
+    const path = `${commentsRoot}/factory-coderabbit-review.json`
+    const content = { body: FACTORY_CODERABBIT_REVIEW_BODY }
+    const result = await this.#mount.createFile(path, content, { guarded: true })
+    if (result === 'exists') {
+      const existing = (await this.#mount.readFile(path)).content
+      if (!isAllowedFactoryGithubWritebackDraft(path, existing)) {
+        throw new Error(`GitHub review request create conflicted with unexpected content at ${path}`)
+      }
+    }
+    const status = await this.#mount.confirmWrite(path, {
+      timeoutMs: WRITE_CONFIRM_TIMEOUT_MS,
+      returnFailed: true,
     })
+    if (status !== 'acked') {
+      const failureReason = status === 'failed'
+        ? await this.#mount.getConfirmedWriteFailureReason?.(path)
+        : undefined
+      throw new Error(`GitHub writeback did not complete for ${path}: ${failureReason ?? status}`)
+    }
   }
 
   async #hasPullRequestReviewRequest(expectedRepo: string, number: number, repoRoot: string): Promise<boolean> {

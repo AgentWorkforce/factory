@@ -71,6 +71,17 @@ export class FakeMountClient implements MountClient {
     this.writes.push({ path, content })
   }
 
+  async createFile(
+    path: string,
+    content: unknown,
+    _opts?: { guarded?: boolean },
+  ): Promise<'created' | 'exists'> {
+    if (this.files.has(path)) return 'exists'
+    this.files.set(path, { content, revision: '1' })
+    this.writes.push({ path, content })
+    return 'created'
+  }
+
   async deleteFile(path: string): Promise<void> {
     if (!this.files.has(path)) {
       throw new Error(`File not found: ${path}`)

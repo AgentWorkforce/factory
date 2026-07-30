@@ -545,6 +545,38 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
+  async createFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean },
+  ): Promise<'created' | 'exists'> {
+    if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
+      throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
+    }
+
+    const serialized = serializeContent(content)
+    // A conflict means another writer owns the current operation. Do not let a
+    // prior attempt cached by this mount stand in for that winner during
+    // confirmation; the caller must recover the current op from Relayfile.
+    this.#lastOpByPath.delete(path)
+    this.#confirmedExternalIdByPath.delete(path)
+    this.#confirmedFailureReasonByPath.delete(path)
+    try {
+      const queued = await this.#client.writeFile({
+        workspaceId: this.workspaceId,
+        path,
+        baseRevision: '0',
+        content: serialized.content,
+        contentType: serialized.contentType,
+      })
+      this.#lastOpByPath.set(path, queued.opId)
+      return 'created'
+    } catch (error) {
+      if (!isCreateRevisionConflict(error)) throw error
+      return 'exists'
+    }
+  }
+
   async deleteFile(path: string): Promise<void> {
     this.#confirmedExternalIdByPath.delete(path)
     this.#confirmedFailureReasonByPath.delete(path)
@@ -1124,6 +1156,14 @@ const isProviderWritebackPath = (path: string): boolean =>
 
 const isProviderPath = (path: string): boolean =>
   path.startsWith('/linear/') || path.startsWith('/github/') || path.startsWith('/slack/')
+
+const isCreateRevisionConflict = (error: unknown): boolean => {
+  if (!isHttpStatus(error, 409) || error === null || typeof error !== 'object') return false
+  const conflict = error as { expectedRevision?: unknown; currentRevision?: unknown }
+  return conflict.expectedRevision === '0' &&
+    typeof conflict.currentRevision === 'string' &&
+    conflict.currentRevision !== '0'
+}
 
 const providerForPath = (path: string): string | undefined =>
   /^\/([^/]+)\//u.exec(path)?.[1]

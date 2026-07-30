@@ -158,6 +158,9 @@ export class GhCliGithubWriteback implements GithubWriteback {
   }
 
   async requestPullRequestReview(input: { repo: string; number: number }): Promise<void> {
+    // This map only coalesces callers in this process. A human can post the
+    // same command between the public scan and `gh pr comment`, so this path is
+    // intentionally at-least-once rather than an unqualified dedupe guarantee.
     const requestKey = `${input.repo.toLowerCase()}#${input.number}`
     const existing = this.#reviewRequests.get(requestKey)
     if (existing) return existing

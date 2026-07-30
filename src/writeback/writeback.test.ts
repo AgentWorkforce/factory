@@ -887,7 +887,7 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
-  it('requests CodeRabbit review once through the authenticated gh user', async () => {
+  it('coalesces CodeRabbit review requests within one authenticated gh process', async () => {
     const calls: string[][] = []
     let comments = '[[]]'
     const github = new GhCliGithubWriteback({

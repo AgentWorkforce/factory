@@ -47,6 +47,81 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toHaveLength(1)
   })
 
+  it('uses atomic create to dedupe two independent connected-app writers', async () => {
+    class RacingCreateMount extends FakeMountClient {
+      createArrivals = 0
+      confirmations = 0
+      readonly #bothArrived: Promise<void>
+      #releaseBoth!: () => void
+
+      constructor() {
+        super()
+        this.#bothArrived = new Promise((resolve) => {
+          this.#releaseBoth = resolve
+        })
+      }
+
+      override async createFile(
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean },
+      ): Promise<'created' | 'exists'> {
+        this.createArrivals += 1
+        if (this.createArrivals === 2) this.#releaseBoth()
+        await this.#bothArrived
+        return await super.createFile(path, content, opts)
+      }
+
+      override async confirmWrite(
+        path: string,
+        opts?: { timeoutMs?: number; returnFailed?: boolean },
+      ): Promise<'acked'> {
+        this.confirmations += 1
+        return await super.confirmWrite(path, opts) as 'acked'
+      }
+    }
+    const mount = new RacingCreateMount()
+    const input = { repo: 'AgentWorkforce/factory', number: 85 }
+    const first = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+    const second = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await Promise.all([
+      first.requestPullRequestReview(input),
+      second.requestPullRequestReview(input),
+    ])
+
+    expect(mount.createArrivals).toBe(2)
+    expect(mount.writes).toEqual([{
+      path: '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json',
+      content: { body: '@coderabbitai review\n<!-- factory-coderabbit-review-request -->' },
+    }])
+    // The loser only accepts the conflict after reading the exact winning
+    // draft and observing the same provider operation reach acknowledgement.
+    expect(mount.confirmations).toBe(2)
+  })
+
+  it('fails a create conflict when the winning draft is not the exact request', async () => {
+    const path = '/github/repos/AgentWorkforce/factory/pulls/85/comments/factory-coderabbit-review.json'
+    class AppearingConflictMount extends FakeMountClient {
+      override async createFile(): Promise<'exists'> {
+        this.files.set(path, {
+          content: { body: '@coderabbitai review' },
+          revision: '1',
+        })
+        return 'exists'
+      }
+    }
+    const mount = new AppearingConflictMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    await expect(write.requestPullRequestReview({
+      repo: 'AgentWorkforce/factory',
+      number: 85,
+    })).rejects.toThrow(`GitHub review request create conflicted with unexpected content at ${path}`)
+
+    expect(mount.writes).toEqual([])
+  })
+
   it('treats missing fresh-PR comment trees as empty and posts the first request', async () => {
     class MissingCommentTreesMount extends FakeMountClient {
       override async listTree(): Promise<string[]> {

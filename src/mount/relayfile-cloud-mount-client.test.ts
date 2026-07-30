@@ -1276,6 +1276,140 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([{ workspaceId: 'rw_test', opId: 'op-1' }])
   })
 
+  it('preserves create-only revision conflicts instead of updating the winner', async () => {
+    class RevisionCheckingClient extends FakeRelayFileClient {
+      override async writeFile(input: Parameters<FakeRelayFileClient['writeFile']>[0]) {
+        this.writeFileCalls.push(input)
+        const current = this.files.get(input.path)
+        if (current && input.baseRevision === '0') {
+          throw Object.assign(new Error('revision conflict'), {
+            status: 409,
+            expectedRevision: '0',
+            currentRevision: current.revision,
+          })
+        }
+        this.files.set(input.path, {
+          revision: String(Number(input.baseRevision) + 1),
+          content: input.content,
+          contentType: input.contentType ?? 'application/json',
+        })
+        return {
+          opId: `op-${this.writeFileCalls.length}`,
+          status: 'queued' as const,
+          targetRevision: 'next',
+        }
+      }
+    }
+    const fake = new RevisionCheckingClient()
+    fake.files.set('/github/review-request.json', {
+      revision: '7',
+      content: '{"body":"winner"}',
+      contentType: 'application/json',
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.createFile(
+      '/github/review-request.json',
+      { body: 'loser' },
+      { guarded: true },
+    )).resolves.toBe('exists')
+
+    expect(fake.writeFileCalls).toEqual([expect.objectContaining({
+      path: '/github/review-request.json',
+      baseRevision: '0',
+      content: '{"body":"loser"}',
+    })])
+    expect(fake.files.get('/github/review-request.json')?.content).toBe('{"body":"winner"}')
+  })
+
+  it('recovers the concurrent winner instead of confirming a cached prior attempt', async () => {
+    class RevisionCheckingClient extends FakeRelayFileClient {
+      override async writeFile(input: Parameters<FakeRelayFileClient['writeFile']>[0]) {
+        const current = this.files.get(input.path)
+        if (current && input.baseRevision === '0') {
+          this.writeFileCalls.push(input)
+          throw Object.assign(new Error('revision conflict'), {
+            status: 409,
+            expectedRevision: '0',
+            currentRevision: current.revision,
+          })
+        }
+        return await super.writeFile(input)
+      }
+    }
+    const path = '/github/review-request.json'
+    const fake = new RevisionCheckingClient()
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await mount.writeFile(path, { body: 'prior attempt' })
+    fake.ops.set('op-1', {
+      opId: 'op-1',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      status: 'succeeded',
+      attemptCount: 1,
+      createdAt: '2026-07-30T00:00:00.000Z',
+      providerResult: { status: 201, externalId: 'prior' },
+    })
+    fake.files.set(path, {
+      revision: '2',
+      content: '{"body":"concurrent winner"}',
+      contentType: 'application/json',
+    })
+    fake.ops.set('op-2', {
+      opId: 'op-2',
+      path,
+      action: 'file_upsert',
+      provider: 'github',
+      status: 'succeeded',
+      attemptCount: 1,
+      createdAt: '2026-07-30T00:00:01.000Z',
+      providerResult: { status: 201, externalId: 'winner' },
+    })
+
+    await expect(mount.createFile(
+      path,
+      { body: 'losing attempt' },
+      { guarded: true },
+    )).resolves.toBe('exists')
+    await expect(mount.confirmWrite(path, { timeoutMs: 50 })).resolves.toBe('acked')
+
+    expect(fake.listOpsCalls).toHaveLength(1)
+    expect(fake.getOpCalls.at(-1)).toEqual({ workspaceId: 'rw_test', opId: 'op-2' })
+    await expect(mount.getConfirmedWriteExternalId(path)).resolves.toBe('winner')
+  })
+
+  it('does not collapse an unrelated 409 into create-only success', async () => {
+    class InvalidStateClient extends FakeRelayFileClient {
+      override async writeFile(_input: Parameters<FakeRelayFileClient['writeFile']>[0]): Promise<never> {
+        throw Object.assign(new Error('provider state conflict'), {
+          status: 409,
+          code: 'invalid_state',
+        })
+      }
+    }
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: new InvalidStateClient(),
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.createFile(
+      '/github/review-request.json',
+      { body: 'request' },
+      { guarded: true },
+    )).rejects.toThrow('provider state conflict')
+  })
+
   it('confirms a succeeded draft op with providerResult 201 and externalId', async () => {
     const fake = new FakeRelayFileClient()
     fake.ops.set('op-1', {

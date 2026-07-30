@@ -126,6 +126,16 @@ export interface MountClient {
   dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
   writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
+  /**
+   * Atomically create a path without replacing an existing record.
+   * `exists` means the store observed a revision conflict; callers must still
+   * verify that the winner wrote the record they intended.
+   */
+  createFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean },
+  ): Promise<'created' | 'exists'>
   deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
