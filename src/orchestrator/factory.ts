@@ -823,6 +823,7 @@ export class FactoryLoop implements Factory {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
       this.#startupAgentAdoptionActive = false
+      await this.#reconcileTerminalAutomatedReviewRequests()
       if (opts.mode !== 'dispatch-owner') await this.#reapOrphanedWorktreesOnStartup(legacyRegistry)
       if (this.#config.babysitter.enabled) {
         // Re-run the idempotent receipt fold after adoption returns. This
@@ -6331,6 +6332,20 @@ export class FactoryLoop implements Factory {
       .finally(() => this.#reviewRequestVerifications.delete(key)))
   }
 
+  async #reconcileTerminalAutomatedReviewRequests(): Promise<void> {
+    const lifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+    const receipts = new Map<string, GithubPublishPullRequestResult>()
+    for (const [, lifecycle] of lifecycles) {
+      if (!isTerminalDispatchLifecycle(lifecycle)) continue
+      for (const receipt of publishedPullRequests(lifecycle)) {
+        receipts.set(`${receipt.repo.toLowerCase()}#${receipt.number}`, receipt)
+      }
+    }
+    for (const receipt of receipts.values()) {
+      this.#requestAutomatedPullRequestReviewForOpenReceipt(receipt)
+    }
+  }
+
   #trackAutomatedPullRequestReviewWork(work: Promise<void>): void {
     this.#reviewRequestWork.add(work)
     void work.finally(() => this.#reviewRequestWork.delete(work))
@@ -6339,9 +6354,9 @@ export class FactoryLoop implements Factory {
   async #drainAutomatedPullRequestReviewWorkForStop(): Promise<void> {
     // A verification can enqueue the request itself as it settles, so drain
     // until no tracked generation remains. `#stopping` fences new entry points.
-    // The deadline abandons only execution, not the obligation: publication
-    // receipts and provider PRs are durable, and restart reconciliation checks
-    // whether the fixed request landed before issuing another at-least-once try.
+    // The deadline abandons only execution, not the obligation: terminal
+    // lifecycle receipts are durable, and startup reconciliation verifies
+    // every open PR before issuing another at-least-once try.
     const deadline = Date.now() + this.#reviewRequestStopDrainMs
     while (this.#reviewRequestWork.size > 0 && Date.now() < deadline) {
       let timer: ReturnType<typeof setTimeout> | undefined

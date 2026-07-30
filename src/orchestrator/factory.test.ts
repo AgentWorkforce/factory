@@ -10201,6 +10201,81 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('reconciles a terminal lifecycle review obligation after process restart', async () => {
+    const number = 533
+    const path = issuePath(number)
+    const issue = issueFile(number)
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const seedFactory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+    const receipt = {
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+    }
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      issueKey(decision.issue),
+      {
+        runId: 'terminal-review-restart',
+        issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+        decision,
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        pullRequests: [receipt],
+        pullRequest: receipt,
+        updatedAtMs: 0,
+      },
+      'stopped-owner',
+      0,
+      1,
+    )
+
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('restart recovery must reuse the durable receipt')
+      },
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const restarted = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }, githubWrite),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async () => ({
+        stdout: JSON.stringify({
+          number,
+          headRefName: receipt.headRef,
+          isDraft: false,
+          state: 'OPEN',
+        }),
+      }),
+    })
+
+    try {
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(reviewRequests).toEqual([{
+        repo: receipt.repo,
+        number,
+      }]))
+    } finally {
+      await restarted.stop()
+      await seedFactory.stop()
+    }
+  })
+
   it('backs off rejected automated review requests after issue completion', async () => {
     const number = 527
     const reviewRequests: Array<{ repo: string; number: number }> = []
