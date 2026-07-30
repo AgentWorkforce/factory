@@ -910,6 +910,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRetryTimers.clear()
     for (const retry of this.#reviewRequestRetryTimers.values()) clearTimeout(retry.timer)
     this.#reviewRequestRetryTimers.clear()
+    await this.#drainAutomatedPullRequestReviewWorkForStop()
     this.#abandonedDispatchReasons.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
@@ -6220,7 +6221,11 @@ export class FactoryLoop implements Factory {
     published: AutomatedReviewRequestTarget,
   ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
-    if (this.#reviewRequestedPullRequests.has(key) || this.#reviewRequestRetryTimers.has(key)) return
+    if (
+      this.#stopping ||
+      this.#reviewRequestedPullRequests.has(key) ||
+      this.#reviewRequestRetryTimers.has(key)
+    ) return
     try {
       const requestReview = this.#githubPullRequestReviewRequester()
       if (!requestReview) return
@@ -6277,6 +6282,7 @@ export class FactoryLoop implements Factory {
   ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (
+      this.#stopping ||
       this.#reviewRequestedPullRequests.has(key) ||
       this.#reviewRequestVerifications.has(key) ||
       this.#reviewRequestRetryTimers.has(key)
@@ -6312,6 +6318,14 @@ export class FactoryLoop implements Factory {
   #trackAutomatedPullRequestReviewWork(work: Promise<void>): void {
     this.#reviewRequestWork.add(work)
     void work.finally(() => this.#reviewRequestWork.delete(work))
+  }
+
+  async #drainAutomatedPullRequestReviewWorkForStop(): Promise<void> {
+    // A verification can enqueue the request itself as it settles, so drain
+    // until no tracked generation remains. `#stopping` fences new entry points.
+    while (this.#reviewRequestWork.size > 0) {
+      await Promise.allSettled([...this.#reviewRequestWork])
+    }
   }
 
   async #drainAutomatedPullRequestReviewRetriesForRunOnce(): Promise<void> {

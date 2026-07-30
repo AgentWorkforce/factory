@@ -10021,9 +10021,13 @@ describe('FactoryLoop', () => {
     },
   )
 
-  it('does not let a pending automated review request stall lifecycle completion', async () => {
+  it('does not let a pending automated review request stall lifecycle completion and drains it on stop', async () => {
     const number = 524
     const reviewRequests: Array<{ repo: string; number: number }> = []
+    let releaseReviewRequest!: () => void
+    const reviewRequestSettled = new Promise<void>((resolve) => {
+      releaseReviewRequest = resolve
+    })
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => ({
         repo: input.repo,
@@ -10033,7 +10037,7 @@ describe('FactoryLoop', () => {
       }),
       requestPullRequestReview: async (input) => {
         reviewRequests.push(input)
-        await new Promise<never>(() => undefined)
+        await reviewRequestSettled
       },
       closePullRequest: async () => undefined,
     }
@@ -10049,6 +10053,7 @@ describe('FactoryLoop', () => {
       probePrResolver: async () => undefined,
     })
 
+    let stopping: Promise<void> | undefined
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
       fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
@@ -10058,8 +10063,20 @@ describe('FactoryLoop', () => {
         number,
       }]))
       await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+      let stopped = false
+      stopping = factory.stop().then(() => {
+        stopped = true
+      })
+      await flush()
+      expect(stopped).toBe(false)
+
+      releaseReviewRequest()
+      await stopping
+      expect(stopped).toBe(true)
     } finally {
-      await factory.stop()
+      releaseReviewRequest()
+      await (stopping ?? factory.stop())
     }
   })
 
