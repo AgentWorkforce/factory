@@ -24,6 +24,8 @@ import {
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
 import { MountAuthScopeError } from './mount-auth-error'
 
+const reviewCorrelationId = 'factory:coderabbit-review:agentworkforce/factory#85'
+
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
   apiUrl: 'https://cloud.example',
   accessToken: 'cld_at_aaa',
@@ -54,6 +56,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
     content: string
     contentType?: string
+    correlationId?: string
   }> = []
   readonly deleteFileCalls: Array<{
     workspaceId: string
@@ -63,14 +66,14 @@ class FakeRelayFileClient implements RelayFileClientLike {
   readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
   readonly queryFilesCalls: Array<{
     workspaceId: string
-    options?: { path?: string; provider?: string; cursor?: string; limit?: number }
+    options?: { path?: string; provider?: string; comment?: string; cursor?: string; limit?: number }
   }> = []
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
   readonly listOpsCalls: Array<{
     workspaceId: string
-    options?: { action?: string; provider?: string; cursor?: string; limit?: number }
+    options?: { action?: string; provider?: string; correlationId?: string; cursor?: string; limit?: number }
   }> = []
   readonly createSubscriptionCalls: CreateOrRenewDurableResourceSubscriptionInput[] = []
   readonly claimDeliveryCalls: ClaimDurableSubscriptionDeliveriesInput[] = []
@@ -119,6 +122,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
     baseRevision: string
     content: string
     contentType?: string
+    correlationId?: string
   }) {
     this.writeFileCalls.push(input)
     this.files.set(input.path, {
@@ -165,7 +169,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
 
   async queryFiles(
     workspaceId: string,
-    options?: { path?: string; provider?: string; cursor?: string; limit?: number },
+    options?: { path?: string; provider?: string; comment?: string; cursor?: string; limit?: number },
   ) {
     this.queryFilesCalls.push({ workspaceId, options })
     const paths = [...this.files.keys()]
@@ -232,12 +236,13 @@ class FakeRelayFileClient implements RelayFileClientLike {
 
   async listOps(
     workspaceId: string,
-    options?: { action?: string; provider?: string; cursor?: string; limit?: number },
+    options?: { action?: string; provider?: string; correlationId?: string; cursor?: string; limit?: number },
   ) {
     this.listOpsCalls.push({ workspaceId, options })
     const matching = [...this.ops.values()].filter((operation) =>
       (!options?.action || operation.action === options.action) &&
-      (!options?.provider || operation.provider === options.provider))
+      (!options?.provider || operation.provider === options.provider) &&
+      (!options?.correlationId || operation.correlationId === options.correlationId))
     const start = Number(options?.cursor ?? 0)
     const limit = options?.limit ?? matching.length
     const items = matching.slice(start, start + limit)
@@ -1370,6 +1375,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'succeeded',
       attemptCount: 1,
       createdAt: '2026-07-30T00:00:01.000Z',
@@ -1379,10 +1385,18 @@ describe('RelayfileCloudMountClient', () => {
     await expect(mount.createFile(
       path,
       { body: 'losing attempt' },
-      { guarded: true },
+      { guarded: true, correlationId: reviewCorrelationId },
     )).resolves.toBe('exists')
-    await expect(mount.confirmWrite(path, { timeoutMs: 50 })).resolves.toBe('acked')
+    await expect(mount.confirmWrite(path, {
+      timeoutMs: 50,
+      correlationId: reviewCorrelationId,
+    })).resolves.toBe('acked')
 
+    expect(fake.writeFileCalls.at(-1)).toEqual(expect.objectContaining({
+      path,
+      baseRevision: '0',
+      correlationId: reviewCorrelationId,
+    }))
     expect(fake.listOpsCalls).toHaveLength(1)
     expect(fake.getOpCalls.at(-1)).toEqual({ workspaceId: 'rw_test', opId: 'op-2' })
     await expect(mount.getConfirmedWriteExternalId(path)).resolves.toBe('winner')
@@ -1460,6 +1474,7 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(legacyMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
     await expect(restartedMount.confirmWrite('/linear/issues/new.json', { timeoutMs: 5 })).resolves.toBe('timeout')
+    expect(fake.listOpsCalls).toEqual([])
     expect(fake.getOpCalls).toEqual([])
   })
 
@@ -1477,6 +1492,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'succeeded',
       attemptCount: 1,
       createdAt: '2026-07-30T00:00:00.000Z',
@@ -1487,6 +1503,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'failed',
       attemptCount: 1,
       createdAt: '2026-07-30T01:00:00.000Z',
@@ -1502,6 +1519,7 @@ describe('RelayfileCloudMountClient', () => {
     await expect(restartedMount.confirmWrite(path, {
       timeoutMs: 5,
       returnFailed: true,
+      correlationId: reviewCorrelationId,
     })).resolves.toBe('failed')
     await expect(restartedMount.deleteFile(path)).resolves.toBeUndefined()
 
@@ -1510,6 +1528,7 @@ describe('RelayfileCloudMountClient', () => {
       options: {
         action: 'file_upsert',
         provider: 'github',
+        correlationId: reviewCorrelationId,
         cursor: undefined,
         limit: 100,
       },
@@ -1536,6 +1555,7 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
       timeoutMs: 5,
+      correlationId: reviewCorrelationId,
     })).resolves.toBe('timeout')
     expect(fake.getOpCalls).toEqual([])
   })
@@ -1553,6 +1573,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'pending',
       attemptCount: 1,
       createdAt: '2026-07-30T01:00:00.000Z',
@@ -1566,6 +1587,7 @@ describe('RelayfileCloudMountClient', () => {
     await expect(restartedMount.confirmWrite(path, {
       timeoutMs: 5,
       returnFailed: true,
+      correlationId: reviewCorrelationId,
     })).resolves.toBe('timeout')
     expect(fake.listOpsCalls).toHaveLength(1)
   })
@@ -1585,6 +1607,7 @@ describe('RelayfileCloudMountClient', () => {
 
     await expect(restartedMount.confirmWrite('/github/repos/AgentWorkforce/factory/pulls/85/comments/review.json', {
       timeoutMs: 5,
+      correlationId: reviewCorrelationId,
     })).rejects.toThrow('relayfile unavailable')
     expect(fake.getOpCalls).toEqual([])
   })
@@ -1618,6 +1641,7 @@ describe('RelayfileCloudMountClient', () => {
         path,
         action: 'file_upsert',
         provider: 'github',
+        correlationId: reviewCorrelationId,
         status: opId === 'op-first' ? 'succeeded' : 'failed',
         attemptCount: 1,
         createdAt: '2026-07-30T01:00:00.000Z',
@@ -1632,6 +1656,7 @@ describe('RelayfileCloudMountClient', () => {
     await expect(restartedMount.confirmWrite(path, {
       timeoutMs: 5,
       returnFailed: true,
+      correlationId: reviewCorrelationId,
     })).resolves.toBe('timeout')
 
     expect(fake.getOpCalls).toEqual([])
@@ -1646,6 +1671,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'failed',
       attemptCount: 1,
       createdAt: '2026-07-30T01:00:00.000Z',
@@ -1655,6 +1681,7 @@ describe('RelayfileCloudMountClient', () => {
       path,
       action: 'file_upsert',
       provider: 'github',
+      correlationId: reviewCorrelationId,
       status: 'succeeded',
       attemptCount: 1,
     })
@@ -1667,6 +1694,7 @@ describe('RelayfileCloudMountClient', () => {
     await expect(restartedMount.confirmWrite(path, {
       timeoutMs: 5,
       returnFailed: true,
+      correlationId: reviewCorrelationId,
     })).resolves.toBe('timeout')
 
     expect(fake.getOpCalls).toEqual([])

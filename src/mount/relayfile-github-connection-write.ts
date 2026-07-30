@@ -9,7 +9,9 @@ import type {
 } from '../ports'
 import {
   FACTORY_CODERABBIT_REVIEW_BODY,
+  FACTORY_CODERABBIT_REVIEW_MARKER,
   containsCoderabbitReviewRequest,
+  factoryCoderabbitReviewCorrelationId,
   isAllowedFactoryGithubWritebackDraft,
 } from '../github/review-request'
 
@@ -29,6 +31,7 @@ export interface RelayfileGithubConnectionWriteConfig {
     queryFiles(opts: {
       path: string
       provider?: string
+      comment?: string
       cursor?: string
       limit?: number
     }): Promise<{ paths: string[]; nextCursor: string | null }>
@@ -159,7 +162,11 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const commentsRoot = `${repoRoots[0]}/pulls/${number}/comments`
     const path = `${commentsRoot}/factory-coderabbit-review.json`
     const content = { body: FACTORY_CODERABBIT_REVIEW_BODY }
-    const result = await this.#mount.createFile(path, content, { guarded: true })
+    const correlationId = factoryCoderabbitReviewCorrelationId(expectedRepo, number)
+    const result = await this.#mount.createFile(path, content, {
+      guarded: true,
+      correlationId,
+    })
     if (result === 'exists') {
       const existing = (await this.#mount.readFile(path)).content
       if (!isAllowedFactoryGithubWritebackDraft(path, existing)) {
@@ -169,6 +176,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const status = await this.#mount.confirmWrite(path, {
       timeoutMs: WRITE_CONFIRM_TIMEOUT_MS,
       returnFailed: true,
+      correlationId,
     })
     if (status !== 'acked') {
       const failureReason = status === 'failed'
@@ -218,6 +226,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
           const status = await this.#mount.confirmWrite(path, {
             timeoutMs: REVIEW_REQUEST_CONFIRM_TIMEOUT_MS,
             returnFailed: true,
+            correlationId: factoryCoderabbitReviewCorrelationId(expectedRepo, number),
           })
           if (status === 'acked') return true
           if (status === 'failed') {
@@ -249,6 +258,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       const page = await this.#mount.queryFiles({
         path: canonicalCommentsRoot,
         provider: 'github',
+        comment: FACTORY_CODERABBIT_REVIEW_MARKER,
         cursor,
         limit: REVIEW_REQUEST_QUERY_PAGE_LIMIT,
       })

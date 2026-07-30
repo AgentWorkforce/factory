@@ -548,7 +548,7 @@ export class RelayfileCloudMountClient implements MountClient {
   async createFile(
     path: string,
     content: unknown,
-    opts?: { guarded?: boolean },
+    opts?: { guarded?: boolean; correlationId?: string },
   ): Promise<'created' | 'exists'> {
     if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
       throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
@@ -568,6 +568,7 @@ export class RelayfileCloudMountClient implements MountClient {
         baseRevision: '0',
         content: serialized.content,
         contentType: serialized.contentType,
+        ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
       })
       this.#lastOpByPath.set(path, queued.opId)
       return 'created'
@@ -829,10 +830,11 @@ export class RelayfileCloudMountClient implements MountClient {
 
   async confirmWrite(
     path: string,
-    opts: { timeoutMs?: number; returnFailed?: boolean } = {},
+    opts: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string } = {},
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     const deadline = Date.now() + (opts.timeoutMs ?? 90_000)
-    const opId = this.#lastOpByPath.get(path) ?? await this.#recoverLatestWriteOperation(path, deadline)
+    const opId = this.#lastOpByPath.get(path) ??
+      await this.#recoverLatestWriteOperation(path, deadline, opts.correlationId)
     if (!opId || !this.#client.getOp) return 'timeout'
 
     for (;;) {
@@ -871,14 +873,22 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
-  async #recoverLatestWriteOperation(path: string, deadline: number): Promise<string | undefined> {
-    if (!this.#client.listOps) return undefined
+  async #recoverLatestWriteOperation(
+    path: string,
+    deadline: number,
+    correlationId?: string,
+  ): Promise<string | undefined> {
+    // Restart recovery must use the durable discriminator written with this
+    // request. Scanning the workspace-wide operation feed is unbounded and can
+    // make an unrelated write look like the operation being confirmed.
+    if (!this.#client.listOps || !correlationId) return undefined
     let cursor: string | undefined
     const matching: OperationStatusResponse[] = []
     do {
       const page = await settleBeforeDeadline(this.#client.listOps(this.workspaceId, {
         action: 'file_upsert',
         provider: providerForPath(path),
+        correlationId,
         cursor,
         limit: 100,
       }), deadline)

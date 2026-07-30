@@ -3,6 +3,9 @@ export const FACTORY_CODERABBIT_REVIEW_MARKER = '<!-- factory-coderabbit-review-
 export const FACTORY_CODERABBIT_REVIEW_BODY =
   `${CODERABBIT_REVIEW_REQUEST}\n${FACTORY_CODERABBIT_REVIEW_MARKER}`
 
+export const factoryCoderabbitReviewCorrelationId = (repo: string, number: number): string =>
+  `factory:coderabbit-review:${repo.toLowerCase()}#${number}`
+
 export const containsCoderabbitReviewRequest = (value: string): boolean =>
   value.includes(CODERABBIT_REVIEW_REQUEST) && value.includes(FACTORY_CODERABBIT_REVIEW_MARKER)
 

@@ -134,7 +134,7 @@ export interface MountClient {
   createFile?(
     path: string,
     content: unknown,
-    opts?: { guarded?: boolean },
+    opts?: { guarded?: boolean; correlationId?: string },
   ): Promise<'created' | 'exists'>
   deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
@@ -150,7 +150,7 @@ export interface MountClient {
   getSyncStatus?(provider: string): Promise<ProviderSyncStatus | undefined>
   confirmWrite(
     path: string,
-    opts?: { timeoutMs?: number; returnFailed?: boolean },
+    opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
   ): Promise<'acked' | 'pending' | 'failed' | 'timeout'>
   /** Provider failure detail retained for a completed failed write, when available. */
   getConfirmedWriteFailureReason?(path: string): Promise<string | undefined>

@@ -74,7 +74,7 @@ export class FakeMountClient implements MountClient {
   async createFile(
     path: string,
     content: unknown,
-    _opts?: { guarded?: boolean },
+    _opts?: { guarded?: boolean; correlationId?: string },
   ): Promise<'created' | 'exists'> {
     if (this.files.has(path)) return 'exists'
     this.files.set(path, { content, revision: '1' })
@@ -97,6 +97,7 @@ export class FakeMountClient implements MountClient {
   async queryFiles(opts: {
     path: string
     provider?: string
+    comment?: string
     cursor?: string
     limit?: number
   }): Promise<{ paths: string[]; nextCursor: string | null }> {
@@ -152,7 +153,10 @@ export class FakeMountClient implements MountClient {
     return events.at(-1)?.id
   }
 
-  async confirmWrite(path: string, _opts?: { timeoutMs?: number }): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+  async confirmWrite(
+    path: string,
+    _opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
+  ): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
     return this.#confirmations.get(path) ?? 'acked'
   }
 

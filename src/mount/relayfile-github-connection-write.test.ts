@@ -51,6 +51,12 @@ describe('RelayfileGithubConnectionWrite', () => {
     class RacingCreateMount extends FakeMountClient {
       createArrivals = 0
       confirmations = 0
+      readonly createOptions: Array<{ guarded?: boolean; correlationId?: string } | undefined> = []
+      readonly confirmationOptions: Array<{
+        timeoutMs?: number
+        returnFailed?: boolean
+        correlationId?: string
+      } | undefined> = []
       readonly #bothArrived: Promise<void>
       #releaseBoth!: () => void
 
@@ -64,9 +70,10 @@ describe('RelayfileGithubConnectionWrite', () => {
       override async createFile(
         path: string,
         content: unknown,
-        opts?: { guarded?: boolean },
+        opts?: { guarded?: boolean; correlationId?: string },
       ): Promise<'created' | 'exists'> {
         this.createArrivals += 1
+        this.createOptions.push(opts)
         if (this.createArrivals === 2) this.#releaseBoth()
         await this.#bothArrived
         return await super.createFile(path, content, opts)
@@ -74,9 +81,10 @@ describe('RelayfileGithubConnectionWrite', () => {
 
       override async confirmWrite(
         path: string,
-        opts?: { timeoutMs?: number; returnFailed?: boolean },
+        opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
       ): Promise<'acked'> {
         this.confirmations += 1
+        this.confirmationOptions.push(opts)
         return await super.confirmWrite(path, opts) as 'acked'
       }
     }
@@ -98,6 +106,28 @@ describe('RelayfileGithubConnectionWrite', () => {
     // The loser only accepts the conflict after reading the exact winning
     // draft and observing the same provider operation reach acknowledgement.
     expect(mount.confirmations).toBe(2)
+    expect(mount.createOptions).toEqual([
+      {
+        guarded: true,
+        correlationId: 'factory:coderabbit-review:agentworkforce/factory#85',
+      },
+      {
+        guarded: true,
+        correlationId: 'factory:coderabbit-review:agentworkforce/factory#85',
+      },
+    ])
+    expect(mount.confirmationOptions).toEqual([
+      {
+        timeoutMs: 90_000,
+        returnFailed: true,
+        correlationId: 'factory:coderabbit-review:agentworkforce/factory#85',
+      },
+      {
+        timeoutMs: 90_000,
+        returnFailed: true,
+        correlationId: 'factory:coderabbit-review:agentworkforce/factory#85',
+      },
+    ])
   })
 
   it('fails a create conflict when the winning draft is not the exact request', async () => {
@@ -203,11 +233,15 @@ describe('RelayfileGithubConnectionWrite', () => {
   it('gives restarted cloud operation recovery a realistic bounded confirmation window', async () => {
     const draftPath = '/github/repos/AgentWorkforce/factory/pulls/86/comments/factory-coderabbit-review.json'
     class ConfirmationOptionsMount extends FakeMountClient {
-      readonly options: Array<{ timeoutMs?: number; returnFailed?: boolean } | undefined> = []
+      readonly options: Array<{
+        timeoutMs?: number
+        returnFailed?: boolean
+        correlationId?: string
+      } | undefined> = []
 
       override async confirmWrite(
         _path: string,
-        opts?: { timeoutMs?: number; returnFailed?: boolean },
+        opts?: { timeoutMs?: number; returnFailed?: boolean; correlationId?: string },
       ): Promise<'acked'> {
         this.options.push(opts)
         return 'acked'
@@ -228,6 +262,7 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.options).toEqual([{
       timeoutMs: 10_000,
       returnFailed: true,
+      correlationId: 'factory:coderabbit-review:agentworkforce/factory#86',
     }])
   })
 
@@ -409,6 +444,7 @@ describe('RelayfileGithubConnectionWrite', () => {
       override async queryFiles(opts: {
         path: string
         provider?: string
+        comment?: string
         cursor?: string
         limit?: number
       }): Promise<{ paths: string[]; nextCursor: string | null }> {
@@ -443,8 +479,20 @@ describe('RelayfileGithubConnectionWrite', () => {
 
     expect(mount.writes).toEqual([])
     expect(mount.queryCalls).toEqual([
-      { path: canonicalRoot, provider: 'github', cursor: undefined, limit: 100 },
-      { path: canonicalRoot, provider: 'github', cursor: 'canonical-page-2', limit: 100 },
+      {
+        path: canonicalRoot,
+        provider: 'github',
+        comment: '<!-- factory-coderabbit-review-request -->',
+        cursor: undefined,
+        limit: 100,
+      },
+      {
+        path: canonicalRoot,
+        provider: 'github',
+        comment: '<!-- factory-coderabbit-review-request -->',
+        cursor: 'canonical-page-2',
+        limit: 100,
+      },
     ])
     expect(mount.reads).toEqual([canonicalPath])
   })
