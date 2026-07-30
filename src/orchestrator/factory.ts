@@ -1564,7 +1564,7 @@ export class FactoryLoop implements Factory {
               this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
               return undefined
             }
-            await this.#requestAutomatedPullRequestReview({
+            this.#requestAutomatedPullRequestReview({
               repo: pr.repo,
               number: pr.prNumber,
             })
@@ -6104,7 +6104,7 @@ export class FactoryLoop implements Factory {
     const { identity, publisher } = this.#githubPullRequestPublisher()
     const cached = this.#publishedPullRequests.get(key)
     if (cached) {
-      await this.#requestAutomatedPullRequestReview(cached)
+      this.#requestAutomatedPullRequestReview(cached)
       return cached
     }
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
@@ -6134,14 +6134,14 @@ export class FactoryLoop implements Factory {
       (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
     ) {
       this.#publishedPullRequests.set(key, durableReceipt)
-      await this.#requestAutomatedPullRequestReview(durableReceipt)
+      this.#requestAutomatedPullRequestReview(durableReceipt)
       return durableReceipt
     }
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
         this.#publishedPullRequests.set(key, existing)
-        await this.#requestAutomatedPullRequestReview(existing)
+        this.#requestAutomatedPullRequestReview(existing)
         this.#increment('githubPullRequestsReconciled')
         this.#logger.info?.('[factory] reconciled existing PR from implementer branch', {
           issue: issue.key,
@@ -6185,20 +6185,30 @@ export class FactoryLoop implements Factory {
       identity,
       author: published.author,
     })
-    await this.#requestAutomatedPullRequestReview(published)
+    this.#requestAutomatedPullRequestReview(published)
     return published
   }
 
-  async #requestAutomatedPullRequestReview(
+  #requestAutomatedPullRequestReview(
     published: GithubPullRequestRef,
-  ): Promise<void> {
+  ): void {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (this.#reviewRequestedPullRequests.has(key)) return
     try {
       const requestReview = this.#githubPullRequestReviewRequester()
       if (!requestReview) return
-      await requestReview({ repo: published.repo, number: published.number })
       this.#reviewRequestedPullRequests.add(key)
+      void Promise.resolve()
+        .then(() => requestReview({ repo: published.repo, number: published.number }))
+        .catch((error: unknown) => {
+          this.#reviewRequestedPullRequests.delete(key)
+          this.#increment('githubPullRequestReviewRequestFailures')
+          this.#logger.warn?.('[factory] automated PR review request failed; lifecycle completion remains independent', {
+            repo: published.repo,
+            prNumber: published.number,
+            error: describeError(error).errorMessage,
+          })
+        })
     } catch (error) {
       this.#increment('githubPullRequestReviewRequestFailures')
       this.#logger.warn?.('[factory] automated PR review request failed; lifecycle completion remains independent', {
@@ -6860,12 +6870,12 @@ export class FactoryLoop implements Factory {
           receipt.repo.toLowerCase() === repo.toLowerCase()
         )
         if (durableReceipt) {
-          await this.#requestAutomatedPullRequestReview(durableReceipt)
+          this.#requestAutomatedPullRequestReview(durableReceipt)
           return true
         }
         const existing = await this.#openPullRequestByHead(repo, implementer.spec.branch)
         if (existing) {
-          await this.#requestAutomatedPullRequestReview(existing)
+          this.#requestAutomatedPullRequestReview(existing)
           return true
         }
         return false
@@ -6878,7 +6888,7 @@ export class FactoryLoop implements Factory {
         ? await this.#openPrForIssue(issue)
         : await this.#completionPrForIssue(issue)
       if (!pr || pr.draft) return false
-      await this.#requestAutomatedPullRequestReview({
+      this.#requestAutomatedPullRequestReview({
         repo: pr.repo,
         number: pr.prNumber,
       })

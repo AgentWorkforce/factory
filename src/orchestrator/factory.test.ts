@@ -10021,6 +10021,48 @@ describe('FactoryLoop', () => {
     },
   )
 
+  it('does not let a pending automated review request stall lifecycle completion', async () => {
+    const number = 524
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number,
+        url: `https://github.com/${input.repo}/pull/${number}`,
+        headRef: input.headRef!,
+      }),
+      requestPullRequestReview: async (input) => {
+        reviewRequests.push(input)
+        await new Promise<never>(() => undefined)
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(reviewRequests).toEqual([{
+        repo: 'AgentWorkforce/pear',
+        number,
+      }]))
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
     class OrderedPreviewFleetClient extends FakeFleetClient {
       readonly terminalEvents: string[] = []
