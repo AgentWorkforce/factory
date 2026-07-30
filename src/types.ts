@@ -57,6 +57,8 @@ export interface FactoryPorts {
   startupAgentExitDrainTimeoutMs?: number
   /** Retry cadence for failed automated PR review requests. Test-only override. */
   reviewRequestRetryMs?: number
+  /** Maximum time an authoritative PR-state lookup may hold a review retry lock. Test-only override. */
+  reviewRequestVerificationTimeoutMs?: number
   /** Maximum time run-once drains automated PR review retries before returning. Test-only override. */
   reviewRequestRunOnceDrainMs?: number
   /** Maximum time stop waits before abandoning durable automated PR review work. Test-only override. */

@@ -270,6 +270,7 @@ const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const AUTOMATED_REVIEW_REQUEST_RETRY_MS = 5_000
 const AUTOMATED_REVIEW_REQUEST_MAX_DELAY_MS = 60_000
+const AUTOMATED_REVIEW_REQUEST_VERIFICATION_TIMEOUT_MS = 30_000
 const AUTOMATED_REVIEW_REQUEST_RUN_ONCE_ATTEMPTS = 5
 const AUTOMATED_REVIEW_REQUEST_RUN_ONCE_DRAIN_MS = 10_000
 const SLACK_REPLY_EVENTS_LIMIT = 100
@@ -397,6 +398,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
   readonly #reviewRequestRetryMs: number
+  readonly #reviewRequestVerificationTimeoutMs: number
   readonly #reviewRequestRunOnceDrainMs: number
   readonly #reviewRequestStopDrainMs: number
   readonly #state: StateStore
@@ -611,6 +613,8 @@ export class FactoryLoop implements Factory {
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
     this.#reviewRequestRetryMs = ports.reviewRequestRetryMs ?? AUTOMATED_REVIEW_REQUEST_RETRY_MS
+    this.#reviewRequestVerificationTimeoutMs =
+      ports.reviewRequestVerificationTimeoutMs ?? AUTOMATED_REVIEW_REQUEST_VERIFICATION_TIMEOUT_MS
     this.#reviewRequestRunOnceDrainMs =
       ports.reviewRequestRunOnceDrainMs ?? AUTOMATED_REVIEW_REQUEST_RUN_ONCE_DRAIN_MS
     this.#reviewRequestStopDrainMs = ports.reviewRequestStopDrainMs ?? STOP_TEARDOWN_TIMEOUT_MS
@@ -6296,7 +6300,7 @@ export class FactoryLoop implements Factory {
 
   #requestAutomatedPullRequestReviewForOpenReceipt(
     published: AutomatedReviewRequestTarget,
-  ): void {
+  ): Promise<void> | undefined {
     const key = `${published.repo.toLowerCase()}#${published.number}`
     if (
       this.#stopping ||
@@ -6308,8 +6312,11 @@ export class FactoryLoop implements Factory {
     // Retry authorization must come from an authoritative point lookup. The
     // head-based discovery helper may fall back to webhook-fed mount metadata,
     // which is useful for reconciliation but cannot prove a PR remains open.
-    const openLookup = this.#openPullRequestByNumber(published.repo, published.number)
-    this.#trackAutomatedPullRequestReviewWork(openLookup
+    const openLookup = this.#openPullRequestByNumberWithinVerificationDeadline(
+      published.repo,
+      published.number,
+    )
+    const work = openLookup
       .then((open) => {
         if (
           open?.number === published.number &&
@@ -6329,11 +6336,22 @@ export class FactoryLoop implements Factory {
         })
         this.#scheduleAutomatedPullRequestReviewRetry(published)
       })
-      .finally(() => this.#reviewRequestVerifications.delete(key)))
+      .finally(() => this.#reviewRequestVerifications.delete(key))
+    this.#trackAutomatedPullRequestReviewWork(work)
+    return work
   }
 
   async #reconcileTerminalAutomatedReviewRequests(): Promise<void> {
-    const lifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+    let lifecycles: Array<[string, DispatchLifecycle]>
+    try {
+      lifecycles = await this.#state.listDispatchLifecycles(this.#workspaceId)
+    } catch (error) {
+      this.#increment('githubPullRequestReviewRequestFailures')
+      this.#logger.warn?.('[factory] automated PR review startup reconciliation deferred; lifecycle completion remains independent', {
+        error: describeError(error).errorMessage,
+      })
+      return
+    }
     const receipts = new Map<string, GithubPublishPullRequestResult>()
     for (const [, lifecycle] of lifecycles) {
       if (!isTerminalDispatchLifecycle(lifecycle)) continue
@@ -6341,9 +6359,17 @@ export class FactoryLoop implements Factory {
         receipts.set(`${receipt.repo.toLowerCase()}#${receipt.number}`, receipt)
       }
     }
-    for (const receipt of receipts.values()) {
-      this.#requestAutomatedPullRequestReviewForOpenReceipt(receipt)
-    }
+    // Reconciliation is intentionally detached from startup and serialized.
+    // A large durable history must not become an unbounded burst of `gh pr
+    // view` subprocesses, and a review-request outage must not prevent the
+    // lifecycle owner from starting. Receipts stay durable for the next pass.
+    const reconciliation = (async () => {
+      for (const receipt of receipts.values()) {
+        if (this.#stopping) return
+        await this.#requestAutomatedPullRequestReviewForOpenReceipt(receipt)
+      }
+    })()
+    this.#trackAutomatedPullRequestReviewWork(reconciliation)
   }
 
   #trackAutomatedPullRequestReviewWork(work: Promise<void>): void {
@@ -6599,6 +6625,28 @@ export class FactoryLoop implements Factory {
       repo,
       number,
       ...(headRef ? { headRef } : {}),
+    }
+  }
+
+  async #openPullRequestByNumberWithinVerificationDeadline(
+    repo: string,
+    number: number,
+  ): Promise<AutomatedReviewRequestTarget | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        this.#openPullRequestByNumber(repo, number),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(
+              `Authoritative GitHub pull request lookup timed out after ${this.#reviewRequestVerificationTimeoutMs}ms`,
+            ))
+          }, this.#reviewRequestVerificationTimeoutMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 

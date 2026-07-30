@@ -10276,6 +10276,183 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('contains a failed startup review reconciliation without failing the lifecycle owner', async () => {
+    class ReconciliationFailingStateStore extends InMemoryStateStore {
+      listCalls = 0
+
+      override async listDispatchLifecycles(
+        workspaceId: string,
+      ): Promise<Awaited<ReturnType<InMemoryStateStore['listDispatchLifecycles']>>> {
+        this.listCalls += 1
+        if (this.listCalls === 2) throw new Error('relayfile lifecycle listing unavailable')
+        return super.listDispatchLifecycles(workspaceId)
+      }
+    }
+
+    const warnings: unknown[][] = []
+    const stateStore = new ReconciliationFailingStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {
+        info: () => undefined,
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    try {
+      await expect(factory.start({ mode: 'dispatch-owner' })).resolves.toBeUndefined()
+      expect(warnings).toContainEqual([
+        '[factory] automated PR review startup reconciliation deferred; lifecycle completion remains independent',
+        { error: 'relayfile lifecycle listing unavailable' },
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('serializes startup review reconciliation without blocking lifecycle-owner startup', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const receipts = [534, 535].map((number) => ({
+      repo: 'AgentWorkforce/pear',
+      number,
+      url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+      headRef: `factory/ar-${number}-pear`,
+    }))
+    for (const receipt of receipts) {
+      const issue = parseLinearIssue(issuePath(receipt.number), issueFile(receipt.number))
+      const decision = await new StaticTriage().triage(issue)
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-restart-${receipt.number}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+    }
+
+    let releaseFirstLookup!: () => void
+    const firstLookup = new Promise<void>((resolve) => {
+      releaseFirstLookup = resolve
+    })
+    const lookupNumbers: number[] = []
+    const reviewRequests: number[] = []
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({}, {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse durable receipts')
+        },
+        requestPullRequestReview: async ({ number }) => {
+          reviewRequests.push(number)
+        },
+        closePullRequest: async () => undefined,
+      }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      probePrGhRunner: async (args) => {
+        const number = Number(args[2])
+        lookupNumbers.push(number)
+        if (lookupNumbers.length === 1) await firstLookup
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
+    })
+
+    try {
+      await expect(factory.start({ mode: 'dispatch-owner' })).resolves.toBeUndefined()
+      expect(lookupNumbers).toHaveLength(1)
+      expect(reviewRequests).toEqual([])
+
+      releaseFirstLookup()
+      await vi.waitFor(() => expect(lookupNumbers).toEqual([534, 535]))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([534, 535]))
+    } finally {
+      releaseFirstLookup()
+      await factory.stop()
+    }
+  })
+
+  it('times out a hung review verification, releases its key, and retries the durable obligation', async () => {
+    const number = 536
+    const reviewRequests: Array<{ repo: string; number: number }> = []
+    let reviewAttempts = 0
+    let lookupAttempts = 0
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({
+        [issuePath(number)]: issueFile(number),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number,
+          url: `https://github.com/${input.repo}/pull/${number}`,
+          headRef: input.headRef!,
+        }),
+        requestPullRequestReview: async (input) => {
+          reviewRequests.push(input)
+          reviewAttempts += 1
+          if (reviewAttempts === 1) throw new Error('initial provider failure')
+        },
+        closePullRequest: async () => undefined,
+      }),
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+      probePrGhRunner: async () => {
+        lookupAttempts += 1
+        if (lookupAttempts === 1) await new Promise<never>(() => undefined)
+        return {
+          stdout: JSON.stringify({
+            number,
+            headRefName: `factory/ar-${number}-pear`,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }
+      },
+      reviewRequestRetryMs: 5,
+      reviewRequestVerificationTimeoutMs: 10,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(
+        parseLinearIssue(issuePath(number), issueFile(number)),
+      ))
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(lookupAttempts).toBe(2))
+      await vi.waitFor(() => expect(reviewRequests).toEqual([
+        { repo: 'AgentWorkforce/pear', number },
+        { repo: 'AgentWorkforce/pear', number },
+      ]))
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('backs off rejected automated review requests after issue completion', async () => {
     const number = 527
     const reviewRequests: Array<{ repo: string; number: number }> = []
