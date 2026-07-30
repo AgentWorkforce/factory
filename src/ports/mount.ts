@@ -63,6 +63,8 @@ export interface GithubPublishPullRequestResult {
   headSha?: string
   /** Provider-confirmed login or identity label used to author the PR. */
   author?: string
+  /** Durable write path that authored the PR; review requests must preserve it. */
+  publisherIdentity?: 'app' | 'user'
 }
 
 export interface GithubPullRequestRef {

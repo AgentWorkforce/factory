@@ -39,6 +39,7 @@ describe('FileStateStore', () => {
           number: 85,
           url: 'https://github.com/AgentWorkforce/factory/pull/85',
           headRef: 'factory/ar-85-agentworkforce-factory',
+          publisherIdentity: 'app',
         },
       })).toBe(true)
 
@@ -46,7 +47,7 @@ describe('FileStateStore', () => {
       expect(await restarted.getDispatchLifecycle('workspace-1', key)).toMatchObject({
         phase: 'published',
         lease: { owner: 'owner-b', epoch: 2 },
-        pullRequest: { number: 85 },
+        pullRequest: { number: 85, publisherIdentity: 'app' },
       })
     } finally {
       await rm(root, { recursive: true, force: true })

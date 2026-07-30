@@ -10276,6 +10276,113 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it.each([
+    {
+      publisherIdentity: 'user' as const,
+      appAvailable: true,
+      expectedRequester: 'user' as const,
+    },
+    {
+      publisherIdentity: 'app' as const,
+      appAvailable: true,
+      expectedRequester: 'app' as const,
+    },
+    {
+      publisherIdentity: 'app' as const,
+      appAvailable: false,
+      expectedRequester: undefined,
+    },
+  ])(
+    'preserves $publisherIdentity publisher identity during auto recovery when appAvailable=$appAvailable',
+    async ({ publisherIdentity, appAvailable, expectedRequester }) => {
+      const number = publisherIdentity === 'user' ? 534 : appAvailable ? 535 : 536
+      const path = issuePath(number)
+      const issue = issueFile(number)
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const seedFactory = createFactory(config(), {
+        mount: new FakeMountClient({ [path]: issue }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+      })
+      const decision = await seedFactory.triageIssue(parseLinearIssue(path, issue))
+      const receipt = {
+        repo: 'AgentWorkforce/pear',
+        number,
+        url: `https://github.com/AgentWorkforce/pear/pull/${number}`,
+        headRef: `factory/ar-${number}-pear`,
+        publisherIdentity,
+      }
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: `terminal-review-${publisherIdentity}-${appAvailable}`,
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'complete',
+          agents: [],
+          invocationIds: [],
+          pullRequests: [receipt],
+          pullRequest: receipt,
+          updatedAtMs: 0,
+        },
+        'stopped-owner',
+        0,
+        1,
+      )
+
+      const appReviewRequests: Array<{ repo: string; number: number }> = []
+      const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+      const appWrite: GithubConnectionWrite = {
+        publishPullRequest: async () => {
+          throw new Error('restart recovery must reuse the durable receipt')
+        },
+        requestPullRequestReview: async (input) => {
+          appReviewRequests.push(input)
+        },
+        closePullRequest: async () => undefined,
+      }
+      const restarted = createFactory(config({ github: { identity: 'auto' } }), {
+        mount: new FakeMountClient({ [path]: issue }, appAvailable ? appWrite : undefined),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: userWriteback,
+        reviewRequestRetryMs: 60_000,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify({
+            number,
+            headRefName: receipt.headRef,
+            isDraft: false,
+            state: 'OPEN',
+          }),
+        }),
+      })
+
+      try {
+        await restarted.start({ mode: 'dispatch-owner' })
+        if (expectedRequester === 'app') {
+          await vi.waitFor(() => expect(appReviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(userWriteback.reviewRequests).toEqual([])
+        } else if (expectedRequester === 'user') {
+          await vi.waitFor(() =>
+            expect(userWriteback.reviewRequests).toEqual([{ repo: receipt.repo, number }]))
+          expect(appReviewRequests).toEqual([])
+        } else {
+          await vi.waitFor(() =>
+            expect(restarted.status().counters.githubPullRequestReviewRequestFailures).toBe(1))
+          expect(appReviewRequests).toEqual([])
+          expect(userWriteback.reviewRequests).toEqual([])
+        }
+      } finally {
+        await restarted.stop()
+        await seedFactory.stop()
+      }
+    },
+  )
+
   it('contains a failed startup review reconciliation without failing the lifecycle owner', async () => {
     class ReconciliationFailingStateStore extends InMemoryStateStore {
       listCalls = 0

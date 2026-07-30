@@ -135,7 +135,10 @@ type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: bool
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullRequest'>
 type GithubPullRequestIdentity = 'app' | 'user'
-type AutomatedReviewRequestTarget = GithubPullRequestRef & { headRef?: string }
+type AutomatedReviewRequestTarget = GithubPullRequestRef & {
+  headRef?: string
+  publisherIdentity?: GithubPullRequestIdentity
+}
 type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
@@ -6209,9 +6212,11 @@ export class FactoryLoop implements Factory {
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue, implementer.spec.preview),
     })
-    const published = result.author
-      ? result
-      : { ...result, author: identity }
+    const published = {
+      ...result,
+      ...(result.author ? {} : { author: identity }),
+      publisherIdentity: identity,
+    }
     if (
       published.repo.toLowerCase() !== repo.toLowerCase() ||
       published.headRef !== (remoteBranch ?? published.headRef) ||
@@ -6248,7 +6253,7 @@ export class FactoryLoop implements Factory {
       this.#reviewRequestRetryTimers.has(key)
     ) return
     try {
-      const requestReview = this.#githubPullRequestReviewRequester()
+      const requestReview = this.#githubPullRequestReviewRequester(published)
       if (!requestReview) return
       this.#reviewRequestedPullRequests.add(key)
       this.#trackAutomatedPullRequestReviewWork(Promise.resolve()
@@ -6322,7 +6327,10 @@ export class FactoryLoop implements Factory {
           open?.number === published.number &&
           (!published.headRef || open.headRef === published.headRef)
         ) {
-          this.#requestAutomatedPullRequestReview(open)
+          this.#requestAutomatedPullRequestReview({
+            ...open,
+            publisherIdentity: published.publisherIdentity,
+          })
         } else {
           this.#reviewRequestAttempts.delete(key)
         }
@@ -6458,14 +6466,22 @@ export class FactoryLoop implements Factory {
     )
   }
 
-  #githubPullRequestReviewRequester(): ((input: GithubPullRequestRef) => Promise<void>) | undefined {
+  #githubPullRequestReviewRequester(
+    published: AutomatedReviewRequestTarget,
+  ): ((input: GithubPullRequestRef) => Promise<void>) | undefined {
     const configured = this.#config.github.identity
-    if (configured !== 'user' && this.#mount.githubWrite) {
+    const identity = published.publisherIdentity ?? (configured === 'auto' ? undefined : configured)
+    if (!identity) {
+      throw new Error(
+        'Automated PR review request requires the persisted publisher identity when github.identity is "auto"; refusing to select an identity from current availability',
+      )
+    }
+    if (identity === 'app' && this.#mount.githubWrite) {
       return this.#mount.githubWrite.requestPullRequestReview?.bind(this.#mount.githubWrite)
     }
-    if (configured === 'app') {
+    if (identity === 'app') {
       throw new Error(
-        'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+        'The PR was published with GitHub App identity, but no connected workspace GitHub App write path is available; refusing to fall back to the local gh user',
       )
     }
     if (this.#mount.writebackTransport === 'test' && !this.#githubWritebackProvided) return undefined
