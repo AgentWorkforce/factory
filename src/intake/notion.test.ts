@@ -137,6 +137,7 @@ describe('Notion spec intake', () => {
       'agent:team',
       'relay',
     ])
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
     const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     expect(stored.receipts[`notion:${pageId}:repo:agentworkforce/relay`]).toMatchObject({
       kind: 'github',
@@ -147,6 +148,21 @@ describe('Notion spec intake', () => {
     const second = await runNotionIntake({ manifest, dispatch: true, github })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves an explicit Factory title prefix without duplicating it', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: {
+        ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+        title: '[factory] Resume the checkpoint',
+      },
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+
+    await runNotionIntake({ manifest, dispatch: true, github })
+
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
   })
 
   it('blocks a source marker that has no authoritative intake receipt', async () => {
