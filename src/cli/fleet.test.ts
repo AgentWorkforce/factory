@@ -566,6 +566,48 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('returns after exact-path intake while preserving the spawned worker infrastructure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-dispatch-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      const projectPath = join(root, 'project')
+      await mkdir(mountedPage, { recursive: true })
+      await mkdir(projectPath, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify exact-path dispatch',
+        'Summary: Prove intake returns while its worker continues.',
+        'Recipe: single',
+        `Project-Paths: ${projectPath}`,
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        statePath: './state.json',
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const output = buffer()
+      const fleet = new FakeFleetClient()
+
+      const code = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(fleet.preservedInfrastructure).toBe(1)
+      expect(JSON.parse(output.text())).toMatchObject({
+        ok: true,
+        results: [{ status: 'dispatched', target: { projectPath } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('prompts and connects a missing GitHub integration before an interactive triage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-connect-'))
     try {

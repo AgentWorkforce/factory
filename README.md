@@ -197,6 +197,7 @@ hatch is deliberately page-specific; there is no title or content heuristic.
 {
   "version": 1,
   "mountRoot": ".integrations/notion",
+  "workerMountRoot": ".integrations/notion",
   "statePath": ".factory/notion-intake-state.json",
   "tasks": [
     { "page": "https://app.notion.com/p/Reconcile-3b36800c1c90801db1cfc8f2e1cff7cf" }
@@ -204,8 +205,9 @@ hatch is deliberately page-specific; there is no title or content heuristic.
 }
 ```
 
-`mountRoot` and `statePath` resolve relative to the manifest file and default to
-the values shown above. `page` accepts a Notion URL or a bare page ID.
+`mountRoot` and `statePath` resolve relative to the manifest file. `workerMountRoot`
+is the repo-relative read-only mount workers receive; all three default to the
+values shown above. `page` accepts a Notion URL or a bare page ID.
 
 Plan without writes, then dispatch:
 

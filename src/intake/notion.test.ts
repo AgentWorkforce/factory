@@ -91,6 +91,11 @@ describe('Notion spec intake', () => {
       target: { repo: 'AgentWorkforce/cloud' },
     })
 
+    const originalDigest = tasks[0]!.digest
+    manifest.tasks[0]!.bootstrap!.summary = 'Operator corrected the authorized summary.'
+    const corrected = await normalizeNotionManifest(manifest)
+    expect(corrected[0]!.digest).not.toBe(originalDigest)
+
     manifest.tasks[0]!.bootstrap!.authorizedPageId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
     await expect(normalizeNotionManifest(manifest)).rejects.toThrow('does not match mounted page')
   })
@@ -117,24 +122,97 @@ describe('Notion spec intake', () => {
     })
     const { root, manifest } = await fixtureManifest('private mounted implementation detail', { bootstrap: mapping })
     roots.push(root)
+    manifest.workerMountRoot = 'specs/notion'
     const github = fakeGithub({ visibility: 'public' })
 
     const first = await runNotionIntake({ manifest, dispatch: true, github })
     const body = vi.mocked(github.createIssue).mock.calls[0]![0].body
     expect(first.results[0]).toMatchObject({ status: 'dispatched', issue: { number: 42 } })
     expect(body).toContain('Resolve the already-scoped fleet reliability follow-ups.')
-    expect(body).toContain(`.integrations/notion/pages/${pageId}/content.md`)
+    expect(body).toContain(`specs/notion/pages/${pageId}/content.md`)
+    expect(body).toContain("SHA-256 hash the mounted file's UTF-8 bytes")
     expect(body).not.toContain('private mounted implementation detail')
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].labels).toEqual([
       'factory-ready',
       'agent:team',
       'relay',
     ])
+    const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(stored.receipts[`notion:${pageId}:repo:agentworkforce/relay`]).toMatchObject({
+      kind: 'github',
+      issue: { number: 42, url: 'https://github.test/issues/42' },
+    })
 
     vi.mocked(github.findBySource).mockResolvedValue({ number: 42, url: 'https://github.test/issues/42', body })
     const second = await runNotionIntake({ manifest, dispatch: true, github })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks a source marker that has no authoritative intake receipt', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 99,
+      url: 'https://github.test/issues/99',
+      body: `Source digest: \`${'a'.repeat(64)}\`\n<!-- factory-source:notion:${pageId}:repo:agentworkforce/cloud -->`,
+    })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: 'lifecycle issue marker has no authoritative local receipt',
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('serializes overlapping runs and creates one lifecycle issue', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    let createdBody: string | undefined
+    vi.mocked(github.findBySource).mockImplementation(async () => createdBody
+      ? { number: 42, url: 'https://github.test/issues/42', body: createdBody }
+      : undefined)
+    vi.mocked(github.createIssue).mockImplementation(async (input) => {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+      createdBody = input.body
+      return { number: 42, url: 'https://github.test/issues/42' }
+    })
+
+    const reports = await Promise.all([
+      runNotionIntake({ manifest, dispatch: true, github }),
+      runNotionIntake({ manifest, dispatch: true, github }),
+    ])
+
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+    expect(reports.flatMap((report) => report.results).map((result) => result.status).sort()).toEqual([
+      'already-dispatched',
+      'dispatched',
+    ])
+  })
+
+  it('blocks lifecycle publication when required labels are missing', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: ['reviewed'] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    vi.mocked(github.missingLabels).mockResolvedValue(['reviewed'])
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: 'missing required GitHub labels: reviewed',
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
   })
 
   it('dispatches exact-path work once and persists a digest-bound receipt', async () => {
@@ -161,6 +239,7 @@ describe('Notion spec intake', () => {
     }))
     const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     expect(stored.receipts[`notion:${pageId}:workspace:/work/benchmark`]).toMatchObject({
+      kind: 'workspace',
       agent: 'benchmark-agent',
       dispatchedAt: '2026-08-05T22:00:00.000Z',
     })
@@ -221,6 +300,7 @@ async function fixtureManifest(
     manifest: {
       version: 1,
       mountRoot,
+      workerMountRoot: '.integrations/notion',
       statePath: join(root, 'state.json'),
       tasks: [{ page: pageId, ...task }],
     },

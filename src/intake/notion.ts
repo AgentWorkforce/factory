@@ -3,7 +3,10 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
+import lockfile from 'proper-lockfile'
 import { z } from 'zod'
+
+const INTAKE_LOCK_STALE_MS = 60_000
 
 const recipeSchema = z.enum(['single', 'workflow', 'team'])
 
@@ -33,6 +36,7 @@ const bootstrapSchema = z.object({
 const manifestSchema = z.object({
   version: z.literal(1),
   mountRoot: z.string().trim().min(1).default('.integrations/notion'),
+  workerMountRoot: z.string().trim().min(1).default('.integrations/notion'),
   statePath: z.string().trim().min(1).default('.factory/notion-intake-state.json'),
   tasks: z.array(z.object({
     page: z.string().trim().min(1),
@@ -49,6 +53,8 @@ export interface NormalizedNotionTask {
   sourceKey: string
   sourcePath: string
   workerSourcePath: string
+  authorizationDigestInput?: string
+  contentDigest: string
   digest: string
   title: string
   summary: string
@@ -104,9 +110,22 @@ export interface NotionIntakeReport {
   results: NotionIntakeResult[]
 }
 
+type IntakeReceipt = {
+  kind: 'github'
+  digest: string
+  issue: { number: number; url: string }
+  dispatchedAt: string
+} | {
+  kind: 'workspace'
+  digest: string
+  agent: string
+  node?: string
+  dispatchedAt: string
+}
+
 type IntakeState = {
   version: 1
-  receipts: Record<string, { digest: string; agent: string; node?: string; dispatchedAt: string }>
+  receipts: Record<string, IntakeReceipt>
 }
 
 /** Load and validate an operator-reviewed intake manifest with paths resolved from the manifest directory. */
@@ -129,18 +148,40 @@ export async function runNotionIntake(input: {
   workspace?: WorkspaceTaskDispatcher
   now?: () => Date
 }): Promise<NotionIntakeReport> {
+  if (!input.dispatch) return await runNotionIntakeUnlocked(input)
+
+  await mkdir(dirname(input.manifest.statePath), { recursive: true, mode: 0o700 })
+  const release = await lockfile.lock(input.manifest.statePath, {
+    realpath: false,
+    stale: INTAKE_LOCK_STALE_MS,
+    update: INTAKE_LOCK_STALE_MS / 2,
+    retries: { retries: 50, factor: 1.2, minTimeout: 10, maxTimeout: 100, randomize: true },
+  })
+  try {
+    return await runNotionIntakeUnlocked(input)
+  } finally {
+    await release()
+  }
+}
+
+async function runNotionIntakeUnlocked(
+  input: Parameters<typeof runNotionIntake>[0],
+): Promise<NotionIntakeReport> {
   const tasks = await normalizeNotionManifest(input.manifest)
   const state = await readIntakeState(input.manifest.statePath)
   const results: NotionIntakeResult[] = []
 
   for (const task of tasks) {
     try {
+      await assertMountedTaskUnchanged(task)
+      const hadReceipt = Boolean(state.receipts[task.sourceKey])
+      let result: NotionIntakeResult
       if ('repo' in task.target) {
-        results.push(await publishRepoTask(task, input))
-        continue
+        result = await publishRepoTask(task, input, state)
+      } else {
+        result = await dispatchWorkspaceTask(task, input, state)
       }
-      const result = await dispatchWorkspaceTask(task, input, state)
-      if (input.dispatch && result.status === 'dispatched') {
+      if (input.dispatch && !hadReceipt && state.receipts[task.sourceKey]) {
         await writeIntakeState(input.manifest.statePath, state)
       }
       results.push(result)
@@ -156,9 +197,6 @@ export async function runNotionIntake(input: {
     }
   }
 
-  if (input.dispatch) {
-    await writeIntakeState(input.manifest.statePath, state)
-  }
   return {
     ok: results.every((result) => result.status !== 'blocked'),
     dispatch: input.dispatch,
@@ -178,7 +216,9 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
     const spec = task.bootstrap
       ? normalizedBootstrapSpec(task.bootstrap, pageId)
       : parseChiefSpecHeader(content)
-    const digest = createHash('sha256').update(content).digest('hex')
+    const authorizationDigestInput = task.bootstrap ? canonicalJson(spec) : undefined
+    const contentDigest = createHash('sha256').update(content).digest('hex')
+    const digest = contractDigest(content, authorizationDigestInput)
 
     for (const target of spec.targets) {
       const targetKey = 'repo' in target ? `repo:${target.repo.toLowerCase()}` : `workspace:${resolve(target.projectPath)}`
@@ -190,8 +230,10 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
         sourceKey,
         sourcePath,
         workerSourcePath: 'repo' in target
-          ? `.integrations/notion/pages/${pageId}/content.md`
+          ? join(manifest.workerMountRoot, 'pages', pageId, 'content.md')
           : sourcePath,
+        ...(authorizationDigestInput ? { authorizationDigestInput } : {}),
+        contentDigest,
         digest,
         title: spec.title,
         summary: spec.summary,
@@ -297,6 +339,7 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
 async function publishRepoTask(
   task: NormalizedNotionTask,
   input: Parameters<typeof runNotionIntake>[0],
+  state: IntakeState,
 ): Promise<NotionIntakeResult> {
   const target = repoTargetSchema.parse(task.target)
   const base: NotionIntakeResult = {
@@ -309,8 +352,22 @@ async function publishRepoTask(
   if (!input.dispatch) return base
   if (!input.github) return { ...base, status: 'blocked', reason: 'GitHub issue publisher is not configured' }
 
+  const receipt = state.receipts[task.sourceKey]
+  if (receipt && receipt.kind !== 'github') {
+    return { ...base, status: 'blocked', reason: 'intake receipt kind does not match repository destination' }
+  }
+  if (receipt?.digest !== undefined && receipt.digest !== task.digest) {
+    return { ...base, status: 'blocked', issue: receipt.issue, reason: 'mounted spec changed after the lifecycle issue was created' }
+  }
+
   const existing = await input.github.findBySource(target.repo, task.sourceKey)
   if (existing) {
+    if (!receipt) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue marker has no authoritative local receipt' }
+    }
+    if (existing.number !== receipt.issue.number || existing.url !== receipt.issue.url) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue does not match the authoritative local receipt' }
+    }
     const currentDigest = digestFromBody(existing.body)
     if (!currentDigest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'existing lifecycle issue is missing its source digest' }
@@ -319,6 +376,9 @@ async function publishRepoTask(
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
     return { ...base, status: 'already-dispatched', issue: existing }
+  }
+  if (receipt) {
+    return { ...base, status: 'blocked', issue: receipt.issue, reason: 'authoritative lifecycle receipt exists but its issue marker was not found' }
   }
 
   const visibility = await input.github.repositoryVisibility(target.repo)
@@ -336,6 +396,12 @@ async function publishRepoTask(
     labels,
     body: renderIssueBody(task, visibility === 'public' ? target.publicSummary! : task.summary),
   })
+  state.receipts[task.sourceKey] = {
+    kind: 'github',
+    digest: task.digest,
+    issue,
+    dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
+  }
   return { ...base, status: 'dispatched', issue }
 }
 
@@ -355,6 +421,9 @@ async function dispatchWorkspaceTask(
   if (!input.dispatch) return base
   const receipt = state.receipts[task.sourceKey]
   if (receipt) {
+    if (receipt.kind !== 'workspace') {
+      return { ...base, status: 'blocked', reason: 'intake receipt kind does not match workspace destination' }
+    }
     if (receipt.digest !== task.digest) {
       return { ...base, status: 'blocked', agent: receipt.agent, node: receipt.node, reason: 'mounted spec changed after workspace dispatch' }
     }
@@ -373,12 +442,18 @@ async function dispatchWorkspaceTask(
     task: renderWorkspaceTask(task),
   })
   state.receipts[task.sourceKey] = {
+    kind: 'workspace',
     digest: task.digest,
     agent: result.agent,
     ...(result.node ? { node: result.node } : {}),
     dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
   }
-  return { ...base, status: 'dispatched', agent: result.agent, node: result.node }
+  return {
+    ...base,
+    status: result.status === 'already-running' ? 'already-dispatched' : 'dispatched',
+    agent: result.agent,
+    node: result.node,
+  }
 }
 
 function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pageId: string) {
@@ -386,7 +461,7 @@ function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pag
   if (authorizedPageId !== pageId) {
     throw new Error(`bootstrap authorization ${authorizedPageId} does not match mounted page ${pageId}`)
   }
-  return bootstrap
+  return { ...bootstrap, authorizedPageId }
 }
 
 function renderIssueBody(task: NormalizedNotionTask, summary: string): string {
@@ -399,6 +474,7 @@ function renderIssueBody(task: NormalizedNotionTask, summary: string): string {
     `\`${task.workerSourcePath}\``,
     '',
     'Treat the mounted page as the execution contract. Preserve every safety gate in it. Do not write back to Notion.',
+    `Before executing, SHA-256 hash the mounted file's UTF-8 bytes and refuse the task unless it matches \`${task.contentDigest}\`.`,
     '',
     `Source identity: \`notion:${task.pageId}\``,
     `Source digest: \`${task.digest}\``,
@@ -413,6 +489,7 @@ function renderWorkspaceTask(task: NormalizedNotionTask): string {
     task.summary,
     '',
     `Read the full execution contract from the authorized read-only Notion mount at ${task.workerSourcePath}.`,
+    `Before executing, SHA-256 hash that file's UTF-8 bytes and refuse the task unless it matches ${task.contentDigest}.`,
     'Preserve every safety gate in that page. Do not write back to Notion.',
     `Factory source: ${task.sourceKey}`,
     `Source digest: ${task.digest}`,
@@ -439,20 +516,55 @@ function splitField(value: string | undefined): string[] {
 
 async function readIntakeState(path: string): Promise<IntakeState> {
   try {
+    const common = {
+      digest: z.string().regex(/^[0-9a-f]{64}$/u),
+      dispatchedAt: z.string().datetime(),
+    }
     return z.object({
       version: z.literal(1),
-      receipts: z.record(z.string(), z.object({
-        digest: z.string().regex(/^[0-9a-f]{64}$/u),
-        agent: z.string().min(1),
-        node: z.string().min(1).optional(),
-        dispatchedAt: z.string().datetime(),
-      })),
+      receipts: z.record(z.string(), z.discriminatedUnion('kind', [
+        z.object({
+          kind: z.literal('github'),
+          ...common,
+          issue: z.object({ number: z.number().int().positive(), url: z.string().url() }),
+        }).strict(),
+        z.object({
+          kind: z.literal('workspace'),
+          ...common,
+          agent: z.string().min(1),
+          node: z.string().min(1).optional(),
+        }).strict(),
+      ])),
     }).parse(JSON.parse(await readFile(path, 'utf8')))
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT') return { version: 1, receipts: {} }
     throw error
   }
+}
+
+async function assertMountedTaskUnchanged(task: NormalizedNotionTask): Promise<void> {
+  const content = await readFile(task.sourcePath, 'utf8')
+  if (contractDigest(content, task.authorizationDigestInput) !== task.digest) {
+    throw new Error('mounted spec changed while intake was planning dispatch')
+  }
+}
+
+function contractDigest(content: string, authorizationDigestInput?: string): string {
+  const digest = createHash('sha256').update(content)
+  if (authorizationDigestInput) digest.update('\0').update(authorizationDigestInput)
+  return digest.digest('hex')
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 
 async function writeIntakeState(path: string, state: IntakeState): Promise<void> {

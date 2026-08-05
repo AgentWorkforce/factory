@@ -193,6 +193,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
             cwd: task.projectPath,
             invocationId: task.invocationId,
           })
+          fleet.preserveInfrastructureOnDispose?.()
           return { agent: spawned.name, node: spawned.node, status: 'spawned' }
         },
       }
