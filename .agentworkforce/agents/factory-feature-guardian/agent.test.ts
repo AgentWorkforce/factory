@@ -683,7 +683,7 @@ describe('factory-feature-guardian runtime paths', () => {
 
     const catalog = await loadFactoryGuardianCatalog(production.ctx);
 
-    expect(catalog.features).toHaveLength(308);
+    expect(catalog.features).toHaveLength(310);
     expect(catalog.features.flatMap((feature) => feature.locations)).toEqual(
       expect.arrayContaining(['src/environments/', 'src/triage/', 'src/fleet/', 'src/writeback/'])
     );

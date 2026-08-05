@@ -70,6 +70,12 @@ import {
 import type { FactoryIntegrationProvider } from '../ports'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
+import {
+  GhCliIssuePublisher,
+  loadNotionIntakeManifest,
+  runNotionIntake,
+  type WorkspaceTaskDispatcher,
+} from '../intake'
 
 interface FleetCliDeps {
   fleet?: FleetClient
@@ -137,6 +143,7 @@ type ParsedCommand =
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
   | { kind: 'factory-init'; repo?: string; workspaceId?: string }
+  | { kind: 'notion-intake'; manifestPath: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -169,6 +176,34 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     if (command.kind === 'factory-init') {
       await initializeFactory({ repo: command.repo, workspaceId: command.workspaceId, stdout: out, stderr: err })
       return 0
+    }
+
+    if (command.kind === 'notion-intake') {
+      const manifest = await loadNotionIntakeManifest(command.manifestPath)
+      const workspace: WorkspaceTaskDispatcher = {
+        dispatch: async (task) => {
+          fleet ??= await buildFleet(globals, undefined, deps)
+          const running = (await fleet.roster()).agents.find((agent) => agent.name === task.name)
+          if (running) return { agent: running.name, node: running.node, status: 'already-running' }
+          const spawned = await fleet.spawn({
+            name: task.name,
+            capability: 'spawn:codex',
+            node: task.node ?? 'self',
+            task: task.task,
+            cwd: task.projectPath,
+            invocationId: task.invocationId,
+          })
+          fleet.preserveInfrastructureOnDispose?.()
+          return { agent: spawned.name, node: spawned.node, status: 'spawned' }
+        },
+      }
+      const report = await runNotionIntake({
+        manifest,
+        dispatch: !globals.dryRun,
+        ...(!globals.dryRun ? { github: new GhCliIssuePublisher(), workspace } : {}),
+      })
+      writeJson(out, report)
+      return report.ok ? 0 : 1
     }
 
     if (command.kind === 'factory-close-probe') {
@@ -414,7 +449,19 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     return parseFeatureMapCommand(rest)
   }
 
+  if (verb === 'intake') {
+    return parseIntakeCommand(rest)
+  }
+
   throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseIntakeCommand(args: string[]): ParsedCommand {
+  const [source, manifestPath, ...rest] = args
+  if (source !== 'notion') throw new Error('factory intake currently requires the notion source')
+  if (!manifestPath) throw new Error('factory intake notion requires a manifest path')
+  if (rest.length > 0) throw new Error(`Unexpected factory intake argument: ${rest[0]}`)
+  return { kind: 'notion-intake', manifestPath }
 }
 
 function parseFeatureMapCommand(args: string[]): ParsedCommand {
@@ -1840,6 +1887,7 @@ Commands:
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
   featuremap check      Validate .agentworkforce/features/manifest.yaml
+  intake notion <file>  Normalize mounted Notion specs into Factory work
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:

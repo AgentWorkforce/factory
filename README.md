@@ -141,6 +141,7 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
+| `factory intake notion <manifest>` | Normalize ready specs from a read-only Notion mount into GitHub lifecycle issues or exact-path fleet work. Honors `--dry-run`. |
 
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
@@ -159,6 +160,67 @@ instruction to rerun the Factory command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
+
+### Mounted Notion specs
+
+Notion is an intake source, not a lifecycle writeback surface. Factory reads a
+Relayfile-mounted page, binds it to a stable `notion:<page-id>` identity and
+digest, then either creates a labeled GitHub issue for a repository target or
+dispatches an exact-path workspace task through the fleet. Existing GitHub and
+Linear discovery continue unchanged.
+
+New pages fail closed unless the first block is an explicit ready spec:
+
+```markdown
+# Chief Spec
+Status: ready
+Title: Reconcile the mail integration
+Summary: Resume the reviewed recovery procedure and preserve every gate.
+Recipe: team
+Repos: AgentWorkforce/cloud
+
+The full private execution contract starts here.
+```
+
+Supported destinations are `Repos: owner/name, ...` and
+`Project-Paths: /absolute/path, ...`; `Node:` can pin exact-path work to a fleet
+node. `Recipe:` is `single`, `workflow`, or `team`. For a public repository the
+header must also contain a reviewed `Public-Summary:`. Factory never copies the
+mounted body into a public issue.
+
+The intake manifest identifies pages and the local mount root. Headerless legacy
+pages can be admitted only with a bootstrap entry containing the exact
+`authorizedPageId`, destination, safe summary, and operator reason. That escape
+hatch is deliberately page-specific; there is no title or content heuristic.
+
+```json
+{
+  "version": 1,
+  "mountRoot": ".integrations/notion",
+  "workerMountRoot": ".integrations/notion",
+  "statePath": ".factory/notion-intake-state.json",
+  "tasks": [
+    { "page": "https://app.notion.com/p/Reconcile-3b36800c1c90801db1cfc8f2e1cff7cf" }
+  ]
+}
+```
+
+`mountRoot` and `statePath` resolve relative to the manifest file. `workerMountRoot`
+is the repo-relative read-only mount workers receive; all three default to the
+values shown above. `page` accepts a Notion URL or a bare page ID.
+
+Plan without writes, then dispatch:
+
+```bash
+factory intake notion ./ops/notion-intake.json --dry-run
+factory intake notion ./ops/notion-intake.json --backend relay
+```
+
+Repository targets require the `factory-ready` and matching
+`agent:<recipe>` labels to already exist. Re-running is idempotent: GitHub work
+is claimed by a hidden source marker, while exact-path dispatches use a local
+digest-bound receipt. A changed mounted spec blocks instead of silently mutating
+already-dispatched work.
 
 ### Feature-map validation
 
