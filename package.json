@@ -58,6 +58,10 @@
       "types": "./dist/featuremap/index.d.ts",
       "import": "./dist/featuremap/index.js"
     },
+    "./intake": {
+      "types": "./dist/intake/index.d.ts",
+      "import": "./dist/intake/index.js"
+    },
     "./feature-guardian": {
       "types": "./dist/feature-guardian/index.d.ts",
       "import": "./dist/feature-guardian/index.js"

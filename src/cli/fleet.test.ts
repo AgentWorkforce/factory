@@ -264,6 +264,19 @@ describe('fleet CLI parsing', () => {
     )
   })
 
+  it('parses mounted Notion intake as a first-class source command', () => {
+    expect(parseFleetCommand(['intake', 'notion', 'ops/notion.json'])).toEqual({
+      kind: 'notion-intake',
+      manifestPath: 'ops/notion.json',
+    })
+    expect(() => parseFleetCommand(['intake', 'linear', 'ops/linear.json'])).toThrow(
+      'currently requires the notion source',
+    )
+    expect(() => parseFleetCommand(['intake', 'notion'])).toThrow(
+      'requires a manifest path',
+    )
+  })
+
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
     expect(parseGlobalOptions([
       'run-once',
@@ -506,6 +519,49 @@ describe('fleet CLI runtime', () => {
     expect(code).toBe(0)
     expect(featureMapCheck).toHaveBeenCalledWith({ baseRef: 'origin/main' })
     expect(JSON.parse(output.text())).toMatchObject({ ok: true, featureCount: 8 })
+  })
+
+  it('plans mounted Notion intake without loading config, publishing, or constructing a fleet', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-intake-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      await mkdir(mountedPage, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify intake',
+        'Summary: Prove the mounted spec normalizes without writes.',
+        'Recipe: team',
+        'Repos: AgentWorkforce/cloud',
+        '',
+        'Implementation details.',
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        statePath: './state.json',
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const output = buffer()
+
+      const code = await runFleetCli(['intake', 'notion', manifestPath, '--dry-run'], {
+        createFleet: () => {
+          throw new Error('dry-run Notion intake should not construct a fleet')
+        },
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        ok: true,
+        dispatch: false,
+        results: [{ status: 'ready', target: { repo: 'AgentWorkforce/cloud' } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('prompts and connects a missing GitHub integration before an interactive triage', async () => {

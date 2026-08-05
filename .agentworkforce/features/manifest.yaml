@@ -1,13 +1,13 @@
 version: '1.1'
-updated: '2026-07-23'
+updated: '2026-08-05'
 catalog:
   category_count: 25
-  feature_count: 308
+  feature_count: 310
   tier_counts:
-    1: 47
+    1: 48
     2: 124
     3: 11
-    4: 51
+    4: 52
     5: 60
     6: 15
 
@@ -86,6 +86,21 @@ categories:
         description: Fail CI on malformed feature manifests, duplicate ids, invalid tiers, catalog drift, or missing locations and advise reviewers when referenced code changes beside unchanged metadata
         location: src/featuremap/validate.ts, src/featuremap/check.ts, src/cli/fleet.ts
         verify_tier: 1
+
+      - id: cli-notion-intake-plan
+        name: Mounted Notion Spec Intake Plan
+        cli: factory intake notion <manifest> --dry-run
+        api: '@agent-relay/factory/intake runNotionIntake()'
+        description: Fail closed on malformed or unapproved mounted Notion specs, normalize exact page identities and destinations, and report the dispatch plan without writes
+        location: src/intake/notion.ts, src/cli/fleet.ts
+        verify_tier: 1
+
+      - id: cli-notion-intake-dispatch
+        name: Mounted Notion Spec Dispatch
+        cli: factory intake notion <manifest>
+        description: Idempotently publish privacy-safe repository work into the GitHub lifecycle or dispatch an exact-path task through the fleet
+        location: src/intake/notion.ts, src/cli/fleet.ts
+        verify_tier: 4
 
       - id: cli-run-once
         name: Single Factory Cycle
