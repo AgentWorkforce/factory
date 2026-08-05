@@ -193,6 +193,20 @@ pages can be admitted only with a bootstrap entry containing the exact
 `authorizedPageId`, destination, safe summary, and operator reason. That escape
 hatch is deliberately page-specific; there is no title or content heuristic.
 
+```json
+{
+  "version": 1,
+  "mountRoot": ".integrations/notion",
+  "statePath": ".factory/notion-intake-state.json",
+  "tasks": [
+    { "page": "https://app.notion.com/p/Reconcile-3b36800c1c90801db1cfc8f2e1cff7cf" }
+  ]
+}
+```
+
+`mountRoot` and `statePath` resolve relative to the manifest file and default to
+the values shown above. `page` accepts a Notion URL or a bare page ID.
+
 Plan without writes, then dispatch:
 
 ```bash

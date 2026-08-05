@@ -11,6 +11,7 @@ import {
   runNotionIntake,
   type GithubIssuePublisher,
   type NotionIntakeManifest,
+  type NotionIntakeTarget,
   type WorkspaceTaskDispatcher,
 } from './notion'
 
@@ -27,6 +28,9 @@ describe('Notion spec intake', () => {
       'https://app.notion.com/p/Gmail-3b36800c1c90801db1cfc8f2e1cff7cf?source=copy_link',
     )).toBe(pageId)
     expect(normalizeNotionPageId(pageId)).toBe(pageId)
+    expect(() => normalizeNotionPageId(`f${pageId.replaceAll('-', '')}`)).toThrow(
+      'does not contain a 32-character page id',
+    )
   })
 
   it('requires an explicit, ready Chief Spec header and parses both destination kinds', () => {
@@ -119,6 +123,7 @@ describe('Notion spec intake', () => {
     const body = vi.mocked(github.createIssue).mock.calls[0]![0].body
     expect(first.results[0]).toMatchObject({ status: 'dispatched', issue: { number: 42 } })
     expect(body).toContain('Resolve the already-scoped fleet reliability follow-ups.')
+    expect(body).toContain(`.integrations/notion/pages/${pageId}/content.md`)
     expect(body).not.toContain('private mounted implementation detail')
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].labels).toEqual([
       'factory-ready',
@@ -152,6 +157,7 @@ describe('Notion spec intake', () => {
       projectPath: '/work/benchmark',
       node: 'kjg-laptop',
       invocationId: expect.stringContaining(`factory:notion:${pageId}:workspace:/work/benchmark`),
+      task: expect.stringContaining(join(root, 'notion', 'pages', pageId, 'content.md')),
     }))
     const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     expect(stored.receipts[`notion:${pageId}:workspace:/work/benchmark`]).toMatchObject({
@@ -161,6 +167,18 @@ describe('Notion spec intake', () => {
 
     const second = await runNotionIntake({ manifest, dispatch: true, workspace })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', agent: 'benchmark-agent' })
+    expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+
+    await writeFile(
+      join(manifest.mountRoot, 'pages', pageId, 'content.md'),
+      'workspace body changed after dispatch',
+    )
+    const changed = await runNotionIntake({ manifest, dispatch: true, workspace })
+    expect(changed.results[0]).toMatchObject({
+      status: 'blocked',
+      agent: 'benchmark-agent',
+      reason: 'mounted spec changed after workspace dispatch',
+    })
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
   })
 
@@ -209,9 +227,8 @@ async function fixtureManifest(
   }
 }
 
-function bootstrap(target: NotionIntakeManifest['tasks'][number]['bootstrap'] extends infer T
-  ? T extends { targets: infer Targets } ? Targets extends unknown[] ? Targets[number] : never : never
-  : never,
+function bootstrap(
+  target: NotionIntakeTarget,
 ): NonNullable<NotionIntakeManifest['tasks'][number]['bootstrap']> {
   return {
     authorizedPageId: pageId,

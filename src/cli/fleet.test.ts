@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -554,6 +555,7 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
+      expect(existsSync(join(root, 'state.json'))).toBe(false)
       expect(JSON.parse(output.text())).toMatchObject({
         ok: true,
         dispatch: false,

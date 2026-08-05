@@ -48,6 +48,7 @@ export interface NormalizedNotionTask {
   pageId: string
   sourceKey: string
   sourcePath: string
+  workerSourcePath: string
   digest: string
   title: string
   summary: string
@@ -108,6 +109,7 @@ type IntakeState = {
   receipts: Record<string, { digest: string; agent: string; node?: string; dispatchedAt: string }>
 }
 
+/** Load and validate an operator-reviewed intake manifest with paths resolved from the manifest directory. */
 export async function loadNotionIntakeManifest(path: string): Promise<NotionIntakeManifest> {
   const manifestPath = resolve(path)
   const parsed = manifestSchema.parse(JSON.parse(await readFile(manifestPath, 'utf8')))
@@ -119,6 +121,7 @@ export async function loadNotionIntakeManifest(path: string): Promise<NotionInta
   }
 }
 
+/** Plan or execute every mounted Notion destination and return one durable result per source key. */
 export async function runNotionIntake(input: {
   manifest: NotionIntakeManifest
   dispatch: boolean
@@ -137,10 +140,10 @@ export async function runNotionIntake(input: {
         continue
       }
       const result = await dispatchWorkspaceTask(task, input, state)
-      results.push(result)
       if (input.dispatch && result.status === 'dispatched') {
         await writeIntakeState(input.manifest.statePath, state)
       }
+      results.push(result)
     } catch (error) {
       results.push({
         sourceKey: task.sourceKey,
@@ -163,6 +166,7 @@ export async function runNotionIntake(input: {
   }
 }
 
+/** Read mounted page bodies and normalize strict headers or exact bootstrap mappings into Factory tasks. */
 export async function normalizeNotionManifest(manifest: NotionIntakeManifest): Promise<NormalizedNotionTask[]> {
   const normalized: NormalizedNotionTask[] = []
   const seen = new Set<string>()
@@ -185,6 +189,9 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
         pageId,
         sourceKey,
         sourcePath,
+        workerSourcePath: 'repo' in target
+          ? `.integrations/notion/pages/${pageId}/content.md`
+          : sourcePath,
         digest,
         title: spec.title,
         summary: spec.summary,
@@ -199,14 +206,16 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
   return normalized
 }
 
+/** Extract one boundary-delimited Notion UUID from a bare identifier or application URL. */
 export function normalizeNotionPageId(value: string): string {
   const lowered = value.toLowerCase()
-  const hyphenated = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})(?![0-9a-f])/u.exec(lowered)
-  const compact = hyphenated?.slice(1).join('') ?? lowered.match(/[0-9a-f]{32}(?![0-9a-f])/u)?.[0]
+  const hyphenated = /(?<![0-9a-f])([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})(?![0-9a-f])/u.exec(lowered)
+  const compact = hyphenated?.slice(1).join('') ?? lowered.match(/(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/u)?.[0]
   if (!compact) throw new Error(`Notion page reference does not contain a 32-character page id: ${value}`)
   return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`
 }
 
+/** Parse the fail-closed Chief Spec header at the start of a mounted Notion page. */
 export function parseChiefSpecHeader(content: string): {
   title: string
   summary: string
@@ -248,6 +257,7 @@ export function parseChiefSpecHeader(content: string): {
   return { title, summary, recipe, targets }
 }
 
+/** GitHub CLI publisher with shell-free arguments, bounded output, and source-marker reconciliation. */
 export class GhCliIssuePublisher implements GithubIssuePublisher {
   async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
     const output = (await runGh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
@@ -258,14 +268,15 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async missingLabels(repo: string, labels: readonly string[]): Promise<string[]> {
-    const output = await runGh(['label', 'list', '--repo', repo, '--limit', '1000', '--json', 'name', '--jq', '.[].name'])
+    const output = await runGh(['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'])
     const available = new Set(output.split('\n').map((label) => label.trim()).filter(Boolean))
     return labels.filter((label) => !available.has(label))
   }
 
   async findBySource(repo: string, sourceKey: string): Promise<ExistingGithubIssue | undefined> {
     const output = await runGh([
-      'issue', 'list', '--repo', repo, '--state', 'all', '--limit', '1000',
+      'issue', 'list', '--repo', repo, '--state', 'all', '--limit', '100',
+      '--search', `"factory-source:${sourceKey}" in:body`,
       '--json', 'number,url,body',
     ])
     const issues = z.array(z.object({ number: z.number().int().positive(), url: z.string().url(), body: z.string() })).parse(JSON.parse(output))
@@ -379,14 +390,13 @@ function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pag
 }
 
 function renderIssueBody(task: NormalizedNotionTask, summary: string): string {
-  const mountedPath = `.integrations/notion/pages/${task.pageId}/content.md`
   return [
     '## Factory intake',
     '',
     summary,
     '',
     'The complete authorized spec is available to workers through the read-only Relayfile mount:',
-    `\`${mountedPath}\``,
+    `\`${task.workerSourcePath}\``,
     '',
     'Treat the mounted page as the execution contract. Preserve every safety gate in it. Do not write back to Notion.',
     '',
@@ -402,7 +412,7 @@ function renderWorkspaceTask(task: NormalizedNotionTask): string {
     '',
     task.summary,
     '',
-    `Read the full execution contract from the authorized read-only Notion mount at .integrations/notion/pages/${task.pageId}/content.md.`,
+    `Read the full execution contract from the authorized read-only Notion mount at ${task.workerSourcePath}.`,
     'Preserve every safety gate in that page. Do not write back to Notion.',
     `Factory source: ${task.sourceKey}`,
     `Source digest: ${task.digest}`,
@@ -454,10 +464,15 @@ async function writeIntakeState(path: string, state: IntakeState): Promise<void>
 
 async function runGh(args: string[], input?: string): Promise<string> {
   return await new Promise((resolvePromise, reject) => {
-    const child = spawn('gh', args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn('gh', args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 30_000,
+      killSignal: 'SIGKILL',
+    })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
-    let size = 0
+    let stdoutSize = 0
+    let stderrSize = 0
     let settled = false
     const fail = (error: Error) => {
       if (settled) return
@@ -465,12 +480,12 @@ async function runGh(args: string[], input?: string): Promise<string> {
       reject(error)
     }
     child.stdout.on('data', (chunk: Buffer) => {
-      size += chunk.length
-      if (size <= 1024 * 1024) stdout.push(chunk)
+      stdoutSize += chunk.length
+      if (stdoutSize <= 1024 * 1024) stdout.push(chunk)
     })
     child.stderr.on('data', (chunk: Buffer) => {
-      size += chunk.length
-      if (size <= 1024 * 1024) stderr.push(chunk)
+      stderrSize += chunk.length
+      if (stderrSize <= 1024 * 1024) stderr.push(chunk)
     })
     child.once('error', fail)
     child.stdin.once('error', (error: NodeJS.ErrnoException) => {
@@ -482,8 +497,8 @@ async function runGh(args: string[], input?: string): Promise<string> {
         fail(new Error(`gh ${args.slice(0, 2).join(' ')} failed (${code ?? 'signal'}): ${Buffer.concat(stderr).toString('utf8').trim()}`))
         return
       }
-      if (size > 1024 * 1024) {
-        fail(new Error('gh output exceeded 1 MiB'))
+      if (stdoutSize > 1024 * 1024 || stderrSize > 1024 * 1024) {
+        fail(new Error(`gh ${stdoutSize > 1024 * 1024 ? 'stdout' : 'stderr'} exceeded 1 MiB`))
         return
       }
       settled = true
