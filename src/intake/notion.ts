@@ -392,7 +392,7 @@ async function publishRepoTask(
   }
   const issue = await input.github.createIssue({
     repo: target.repo,
-    title: task.title,
+    title: factoryIssueTitle(task.title),
     labels,
     body: renderIssueBody(task, visibility === 'public' ? target.publicSummary! : task.summary),
   })
@@ -403,6 +403,10 @@ async function publishRepoTask(
     dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
   }
   return { ...base, status: 'dispatched', issue }
+}
+
+function factoryIssueTitle(title: string): string {
+  return title.toLowerCase().startsWith('[factory]') ? title : `[factory] ${title}`
 }
 
 async function dispatchWorkspaceTask(

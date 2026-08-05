@@ -217,7 +217,9 @@ factory intake notion ./ops/notion-intake.json --backend relay
 ```
 
 Repository targets require the `factory-ready` and matching
-`agent:<recipe>` labels to already exist. Re-running is idempotent: GitHub work
+`agent:<recipe>` labels to already exist. Factory automatically prefixes their
+issue titles with `[factory]` so the hosted brain's independent safety gate can
+accept them. Re-running is idempotent: GitHub work
 is claimed by a hidden source marker, while exact-path dispatches use a local
 digest-bound receipt. A changed mounted spec blocks instead of silently mutating
 already-dispatched work.
