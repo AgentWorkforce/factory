@@ -582,12 +582,13 @@ describe('fleet CLI runtime', () => {
         `Project-Paths: ${projectPath}`,
       ].join('\n'))
       const manifestPath = join(root, 'notion.json')
-      await writeFile(manifestPath, JSON.stringify({
+      const manifest = {
         version: 1,
         mountRoot: './notion',
         statePath: './state.json',
         tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
-      }))
+      }
+      await writeFile(manifestPath, JSON.stringify(manifest))
       const output = buffer()
       const fleet = new FakeFleetClient()
 
@@ -603,6 +604,79 @@ describe('fleet CLI runtime', () => {
         ok: true,
         results: [{ status: 'dispatched', target: { projectPath } }],
       })
+
+      await writeFile(manifestPath, JSON.stringify({
+        ...manifest,
+        workerMountTransport: { kind: 'relay-channel' },
+      }))
+      const contracts = {
+        publish: vi.fn(async () => ({
+          kind: 'relay-channel' as const,
+          channel: 'factory-notion-e1cff7cf-aabbccddee',
+          messageIds: ['message-1'],
+          encoding: 'base64-chunks-v1' as const,
+        })),
+        dispose: vi.fn(async () => { throw new Error('cleanup failed') }),
+      }
+      const migratedOutput = buffer()
+      const migratedErrors = buffer()
+      const migratedCode = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet,
+        notionContracts: contracts,
+        env: {},
+        stdout: migratedOutput,
+        stderr: migratedErrors,
+      })
+
+      expect(migratedCode).toBe(0)
+      expect(fleet.spawns).toHaveLength(1)
+      expect(fleet.messages).toEqual([expect.objectContaining({
+        to: expect.stringContaining('notion-e1cff7cf'),
+        text: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
+        mode: 'steer',
+      })])
+      expect(contracts.dispose).toHaveBeenCalledOnce()
+      expect(migratedErrors.text()).toContain('Notion contract publisher failed during shutdown')
+      expect(JSON.parse(migratedOutput.text())).toMatchObject({
+        ok: true,
+        results: [{ status: 'already-dispatched', target: { projectPath } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not borrow an ambient workspace when an explicit intake environment has no key', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-no-key-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      await mkdir(mountedPage, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify isolated credentials',
+        'Summary: Refuse ambient workspace credentials.',
+        'Recipe: single',
+        'Repos: AgentWorkforce/cloud',
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        workerMountTransport: { kind: 'relay-channel' },
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const errors = buffer()
+
+      const code = await runFleetCli(['intake', 'notion', manifestPath], {
+        env: {},
+        createFleet: () => { throw new Error('missing key must fail before fleet construction') },
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('requires an active Agent Relay workspace')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

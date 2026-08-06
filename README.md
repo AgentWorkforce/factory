@@ -198,6 +198,7 @@ hatch is deliberately page-specific; there is no title or content heuristic.
   "version": 1,
   "mountRoot": ".integrations/notion",
   "workerMountRoot": ".integrations/notion",
+  "workerMountTransport": { "kind": "relay-channel" },
   "statePath": ".factory/notion-intake-state.json",
   "tasks": [
     { "page": "https://app.notion.com/p/Reconcile-3b36800c1c90801db1cfc8f2e1cff7cf" }
@@ -206,8 +207,15 @@ hatch is deliberately page-specific; there is no title or content heuristic.
 ```
 
 `mountRoot` and `statePath` resolve relative to the manifest file. `workerMountRoot`
-is the repo-relative read-only mount workers receive; all three default to the
-values shown above. `page` accepts a Notion URL or a bare page ID.
+is the repo-relative read-only mount workers receive. With the recommended
+`relay-channel` transport, Factory base64-chunks the digest-bound mounted bytes
+into a workspace-private Agent Relay channel. A worker on any fleet machine can
+reconstruct the exact file at `workerMountRoot`, set it to mode `0444`, and
+apply the source SHA-256 gate without exposing the page in a public issue.
+The field defaults to `{ "kind": "local" }` whenever it is omitted, including
+in new manifests. Portable delivery must be selected explicitly and requires a
+resolvable active Agent Relay workspace key; otherwise dispatch fails closed.
+`page` accepts a Notion URL or a bare page ID.
 
 Plan without writes, then dispatch:
 

@@ -23,6 +23,23 @@ const workspaceTargetSchema = z.object({
 
 const targetSchema = z.union([repoTargetSchema, workspaceTargetSchema])
 
+const workerMountTransportSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('local') }).strict(),
+  z.object({ kind: z.literal('relay-channel') }).strict(),
+]).default({ kind: 'local' })
+
+const contractMarkerTokenSchema = z.string().trim().min(1).regex(
+  /^[A-Za-z0-9._-]+$/u,
+  'portable delivery identifiers must use the marker-safe ASCII alphabet',
+)
+
+const contractDeliverySchema = z.object({
+  kind: z.literal('relay-channel'),
+  channel: contractMarkerTokenSchema,
+  messageIds: z.array(contractMarkerTokenSchema).min(1, 'portable delivery must include at least one message id'),
+  encoding: z.literal('base64-chunks-v1'),
+}).strict()
+
 const bootstrapSchema = z.object({
   authorizedPageId: z.string().trim().min(1),
   reason: z.string().trim().min(1),
@@ -37,6 +54,7 @@ const manifestSchema = z.object({
   version: z.literal(1),
   mountRoot: z.string().trim().min(1).default('.integrations/notion'),
   workerMountRoot: z.string().trim().min(1).default('.integrations/notion'),
+  workerMountTransport: workerMountTransportSchema,
   statePath: z.string().trim().min(1).default('.factory/notion-intake-state.json'),
   tasks: z.array(z.object({
     page: z.string().trim().min(1),
@@ -53,6 +71,7 @@ export interface NormalizedNotionTask {
   sourceKey: string
   sourcePath: string
   workerSourcePath: string
+  content: string
   authorizationDigestInput?: string
   contentDigest: string
   digest: string
@@ -79,10 +98,35 @@ export interface GithubIssuePublisher {
     body: string
     labels: readonly string[]
   }): Promise<{ number: number; url: string }>
+  updateIssue(input: {
+    repo: string
+    number: number
+    body: string
+  }): Promise<void>
+}
+
+export type NotionContractDelivery = z.infer<typeof contractDeliverySchema>
+
+export interface NotionContractPublisher {
+  publish(input: {
+    pageId: string
+    sourceKey: string
+    content: string
+    contentDigest: string
+  }): Promise<NotionContractDelivery>
+  dispose?(): Promise<void>
 }
 
 export interface WorkspaceTaskDispatcher {
   dispatch(input: {
+    name: string
+    invocationId: string
+    node?: string
+    projectPath: string
+    title: string
+    task: string
+  }): Promise<{ agent: string; node?: string; status?: string }>
+  redispatch?(input: {
     name: string
     invocationId: string
     node?: string
@@ -114,12 +158,14 @@ type IntakeReceipt = {
   kind: 'github'
   digest: string
   issue: { number: number; url: string }
+  delivery?: NotionContractDelivery
   dispatchedAt: string
 } | {
   kind: 'workspace'
   digest: string
   agent: string
   node?: string
+  delivery?: NotionContractDelivery
   dispatchedAt: string
 }
 
@@ -146,6 +192,7 @@ export async function runNotionIntake(input: {
   dispatch: boolean
   github?: GithubIssuePublisher
   workspace?: WorkspaceTaskDispatcher
+  contracts?: NotionContractPublisher
   now?: () => Date
 }): Promise<NotionIntakeReport> {
   if (!input.dispatch) return await runNotionIntakeUnlocked(input)
@@ -174,14 +221,19 @@ async function runNotionIntakeUnlocked(
   for (const task of tasks) {
     try {
       await assertMountedTaskUnchanged(task)
-      const hadReceipt = Boolean(state.receipts[task.sourceKey])
+      const receiptBefore = state.receipts[task.sourceKey]
+        ? JSON.stringify(state.receipts[task.sourceKey])
+        : undefined
       let result: NotionIntakeResult
       if ('repo' in task.target) {
         result = await publishRepoTask(task, input, state)
       } else {
         result = await dispatchWorkspaceTask(task, input, state)
       }
-      if (input.dispatch && !hadReceipt && state.receipts[task.sourceKey]) {
+      const receiptAfter = state.receipts[task.sourceKey]
+        ? JSON.stringify(state.receipts[task.sourceKey])
+        : undefined
+      if (input.dispatch && receiptAfter && receiptAfter !== receiptBefore) {
         await writeIntakeState(input.manifest.statePath, state)
       }
       results.push(result)
@@ -229,9 +281,10 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
         pageId,
         sourceKey,
         sourcePath,
-        workerSourcePath: 'repo' in target
+        workerSourcePath: 'repo' in target || manifest.workerMountTransport.kind === 'relay-channel'
           ? join(manifest.workerMountRoot, 'pages', pageId, 'content.md')
           : sourcePath,
+        content,
         ...(authorizationDigestInput ? { authorizationDigestInput } : {}),
         contentDigest,
         digest,
@@ -334,6 +387,10 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
     if (!Number.isInteger(number) || number <= 0) throw new Error(`GitHub issue create returned an unexpected URL: ${url}`)
     return { number, url }
   }
+
+  async updateIssue(input: { repo: string; number: number; body: string }): Promise<void> {
+    await runGh(['issue', 'edit', String(input.number), '--repo', input.repo, '--body-file', '-'], input.body)
+  }
 }
 
 async function publishRepoTask(
@@ -375,6 +432,41 @@ async function publishRepoTask(
     if (currentDigest !== task.digest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
+    const bodyDelivery = contractDeliveryFromBody(existing.body)
+    if (input.manifest.workerMountTransport.kind === 'local') {
+      if (receipt.delivery || bodyDelivery) {
+        return { ...base, status: 'blocked', issue: existing, reason: 'portable Notion delivery cannot be downgraded to a local worker mount' }
+      }
+      return { ...base, status: 'already-dispatched', issue: existing }
+    }
+    const visibility = await input.github.repositoryVisibility(target.repo)
+    if (visibility === 'public' && !target.publicSummary) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'public repository requires an explicit publicSummary; mounted content was not copied' }
+    }
+    const summary = visibility === 'public' ? target.publicSummary! : task.summary
+    const bodyWasEdited = existing.body !== renderIssueBody(task, summary, bodyDelivery)
+    if (bodyWasEdited) {
+      return {
+        ...base,
+        status: 'blocked',
+        issue: existing,
+        reason: 'existing lifecycle issue body was edited; refusing to overwrite it during portable mount migration',
+      }
+    }
+    if (receipt.delivery && bodyDelivery && !sameContractDelivery(receipt.delivery, bodyDelivery)) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue portable delivery does not match its authoritative receipt' }
+    }
+    const delivery = await prepareContractDelivery(task, input, receipt.delivery ?? bodyDelivery)
+    if (delivery && !bodyDelivery) {
+      await input.github.updateIssue({
+        repo: target.repo,
+        number: existing.number,
+        body: renderIssueBody(task, summary, delivery),
+      })
+    }
+    if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
+      state.receipts[task.sourceKey] = { ...receipt, delivery }
+    }
     return { ...base, status: 'already-dispatched', issue: existing }
   }
   if (receipt) {
@@ -390,16 +482,18 @@ async function publishRepoTask(
   if (missing.length > 0) {
     return { ...base, status: 'blocked', reason: `missing required GitHub labels: ${missing.join(', ')}` }
   }
+  const delivery = await prepareContractDelivery(task, input)
   const issue = await input.github.createIssue({
     repo: target.repo,
     title: factoryIssueTitle(task.title),
     labels,
-    body: renderIssueBody(task, visibility === 'public' ? target.publicSummary! : task.summary),
+    body: renderIssueBody(task, visibility === 'public' ? target.publicSummary! : task.summary, delivery),
   })
   state.receipts[task.sourceKey] = {
     kind: 'github',
     digest: task.digest,
     issue,
+    ...(delivery ? { delivery } : {}),
     dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
   }
   return { ...base, status: 'dispatched', issue }
@@ -431,9 +525,39 @@ async function dispatchWorkspaceTask(
     if (receipt.digest !== task.digest) {
       return { ...base, status: 'blocked', agent: receipt.agent, node: receipt.node, reason: 'mounted spec changed after workspace dispatch' }
     }
-    return { ...base, status: 'already-dispatched', agent: receipt.agent, node: receipt.node }
+    const delivery = await prepareContractDelivery(task, input, receipt.delivery)
+    if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
+      if (!input.workspace?.redispatch) {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'portable workspace mount migration requires a workspace redispatcher',
+        }
+      }
+      const refreshed = await input.workspace.redispatch({
+        name: receipt.agent,
+        invocationId: `factory:${task.sourceKey}:${task.digest}:portable-mount`,
+        node: receipt.node ?? target.node,
+        projectPath: target.projectPath,
+        title: task.title,
+        task: renderWorkspaceTask(task, delivery),
+      })
+      state.receipts[task.sourceKey] = {
+        ...receipt,
+        agent: refreshed.agent,
+        ...(refreshed.node ? { node: refreshed.node } : {}),
+        delivery,
+        dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
+      }
+    }
+    const currentReceipt = state.receipts[task.sourceKey] as Extract<IntakeReceipt, { kind: 'workspace' }>
+    return { ...base, status: 'already-dispatched', agent: currentReceipt.agent, node: currentReceipt.node }
   }
   if (!input.workspace) return { ...base, status: 'blocked', reason: 'workspace task dispatcher is not configured' }
+
+  const delivery = await prepareContractDelivery(task, input)
 
   const suffix = createHash('sha256').update(task.sourceKey).digest('hex').slice(0, 8)
   const name = `notion-${task.pageId.slice(-8)}-${suffix}`
@@ -443,13 +567,14 @@ async function dispatchWorkspaceTask(
     node: target.node,
     projectPath: target.projectPath,
     title: task.title,
-    task: renderWorkspaceTask(task),
+    task: renderWorkspaceTask(task, delivery),
   })
   state.receipts[task.sourceKey] = {
     kind: 'workspace',
     digest: task.digest,
     agent: result.agent,
     ...(result.node ? { node: result.node } : {}),
+    ...(delivery ? { delivery } : {}),
     dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
   }
   return {
@@ -468,14 +593,17 @@ function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pag
   return { ...bootstrap, authorizedPageId }
 }
 
-function renderIssueBody(task: NormalizedNotionTask, summary: string): string {
+function renderIssueBody(
+  task: NormalizedNotionTask,
+  summary: string,
+  delivery?: NotionContractDelivery,
+): string {
   return [
     '## Factory intake',
     '',
     summary,
     '',
-    'The complete authorized spec is available to workers through the read-only Relayfile mount:',
-    `\`${task.workerSourcePath}\``,
+    ...renderWorkerMountInstructions(task, delivery),
     '',
     'Treat the mounted page as the execution contract. Preserve every safety gate in it. Do not write back to Notion.',
     `Before executing, SHA-256 hash the mounted file's UTF-8 bytes and refuse the task unless it matches \`${task.contentDigest}\`.`,
@@ -483,21 +611,93 @@ function renderIssueBody(task: NormalizedNotionTask, summary: string): string {
     `Source identity: \`notion:${task.pageId}\``,
     `Source digest: \`${task.digest}\``,
     sourceMarker(task.sourceKey),
+    ...(delivery ? [contractDeliveryMarker(delivery)] : []),
   ].join('\n')
 }
 
-function renderWorkspaceTask(task: NormalizedNotionTask): string {
+function renderWorkspaceTask(task: NormalizedNotionTask, delivery?: NotionContractDelivery): string {
   return [
     task.title,
     '',
     task.summary,
     '',
-    `Read the full execution contract from the authorized read-only Notion mount at ${task.workerSourcePath}.`,
+    ...renderWorkerMountInstructions(task, delivery),
     `Before executing, SHA-256 hash that file's UTF-8 bytes and refuse the task unless it matches ${task.contentDigest}.`,
     'Preserve every safety gate in that page. Do not write back to Notion.',
     `Factory source: ${task.sourceKey}`,
     `Source digest: ${task.digest}`,
   ].join('\n')
+}
+
+async function prepareContractDelivery(
+  task: NormalizedNotionTask,
+  input: Parameters<typeof runNotionIntake>[0],
+  existing?: NotionContractDelivery,
+): Promise<NotionContractDelivery | undefined> {
+  if (input.manifest.workerMountTransport.kind === 'local') return undefined
+  if (!input.contracts) {
+    throw new Error('relay-channel worker mount transport requires an Agent Relay contract publisher')
+  }
+  const published = await input.contracts.publish({
+    pageId: task.pageId,
+    sourceKey: task.sourceKey,
+    content: task.content,
+    contentDigest: task.contentDigest,
+  })
+  const parsed = contractDeliverySchema.safeParse(published)
+  if (!parsed.success) {
+    const details = [...new Set(parsed.error.issues.map((issue) => issue.message))].join('; ')
+    throw new Error(`portable Notion contract publisher returned invalid delivery: ${details}`)
+  }
+  const delivery = parsed.data
+  if (existing && !sameContractDelivery(existing, delivery)) {
+    throw new Error('portable Notion contract delivery changed after dispatch')
+  }
+  return delivery
+}
+
+function renderWorkerMountInstructions(
+  task: NormalizedNotionTask,
+  delivery?: NotionContractDelivery,
+): string[] {
+  if (!delivery) {
+    return [
+      'The complete authorized spec is available to workers through the read-only Relayfile mount:',
+      `\`${task.workerSourcePath}\``,
+    ]
+  }
+  return [
+    'The complete authorized spec was snapshotted from the read-only Notion mount into a workspace-private Agent Relay channel:',
+    `- channel: \`${delivery.channel}\``,
+    `- ordered message ids: \`${delivery.messageIds.join(',')}\``,
+    `- encoding: \`${delivery.encoding}\``,
+    '',
+    `Join that channel, concatenate the base64 payload from those exact messages in order, decode it to \`${task.workerSourcePath}\`, chmod the file 0444, and then apply the SHA-256 gate below. Never copy the contract to GitHub or another public surface.`,
+  ]
+}
+
+function sameContractDelivery(
+  left: NotionContractDelivery | undefined,
+  right: NotionContractDelivery,
+): boolean {
+  return Boolean(left && left.kind === right.kind && left.channel === right.channel &&
+    left.encoding === right.encoding && left.messageIds.join('\0') === right.messageIds.join('\0'))
+}
+
+function contractDeliveryMarker(delivery: NotionContractDelivery): string {
+  return `<!-- factory-notion-contract:${delivery.kind}:${delivery.channel}:${delivery.messageIds.join(',')} -->`
+}
+
+function contractDeliveryFromBody(body: string): NotionContractDelivery | undefined {
+  const match = /<!-- factory-notion-contract:relay-channel:([A-Za-z0-9._-]+):([A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*) -->/u.exec(body)
+  if (!match) return undefined
+  const parsed = contractDeliverySchema.safeParse({
+    kind: 'relay-channel',
+    channel: match[1],
+    messageIds: match[2]?.split(','),
+    encoding: 'base64-chunks-v1',
+  })
+  return parsed.success ? parsed.data : undefined
 }
 
 function sourceMarker(sourceKey: string): string {
@@ -523,6 +723,7 @@ async function readIntakeState(path: string): Promise<IntakeState> {
     const common = {
       digest: z.string().regex(/^[0-9a-f]{64}$/u),
       dispatchedAt: z.string().datetime(),
+      delivery: contractDeliverySchema.optional(),
     }
     return z.object({
       version: z.literal(1),
