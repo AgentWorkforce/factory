@@ -70,10 +70,13 @@ import {
 import type { FactoryIntegrationProvider } from '../ports'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
+import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import {
   GhCliIssuePublisher,
+  RelayChannelNotionContractPublisher,
   loadNotionIntakeManifest,
   runNotionIntake,
+  type NotionContractPublisher,
   type WorkspaceTaskDispatcher,
 } from '../intake'
 
@@ -111,6 +114,8 @@ interface FleetCliDeps {
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
   featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
+  /** Hermetic portable Notion contract publisher for intake tests and alternate runtimes. */
+  notionContracts?: NotionContractPublisher
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
   reapEnvironments?: typeof reapFactoryEnvironmentsOnce
 }
@@ -151,6 +156,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   let fleet: FleetClient | undefined
   let mount: MountClient | undefined
   let reporter: FactoryEventReporter | undefined
+  let notionContracts: NotionContractPublisher | undefined
 
   try {
     if (argv.some(isHelpFlag)) {
@@ -180,6 +186,13 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'notion-intake') {
       const manifest = await loadNotionIntakeManifest(command.manifestPath)
+      if (!globals.dryRun && manifest.workerMountTransport.kind === 'relay-channel') {
+        const workspaceKey = resolveRelayWorkspaceKey({ env: deps.env ?? process.env })
+        if (!workspaceKey) {
+          throw new Error('relay-channel worker mount transport requires an active Agent Relay workspace')
+        }
+        notionContracts = deps.notionContracts ?? new RelayChannelNotionContractPublisher({ workspaceKey })
+      }
       const workspace: WorkspaceTaskDispatcher = {
         dispatch: async (task) => {
           fleet ??= await buildFleet(globals, undefined, deps)
@@ -200,7 +213,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       const report = await runNotionIntake({
         manifest,
         dispatch: !globals.dryRun,
-        ...(!globals.dryRun ? { github: new GhCliIssuePublisher(), workspace } : {}),
+        ...(!globals.dryRun ? {
+          github: new GhCliIssuePublisher(),
+          workspace,
+          ...(notionContracts ? { contracts: notionContracts } : {}),
+        } : {}),
       })
       writeJson(out, report)
       return report.ok ? 0 : 1
@@ -406,24 +423,28 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     return 1
   } finally {
     try {
-      await mount?.dispose?.()
+      await notionContracts?.dispose?.()
     } finally {
       try {
-        await fleet?.dispose()
+        await mount?.dispose?.()
       } finally {
-        if (reporter) {
-          try {
-            await reporter.report(createFactoryCloudEventV1({
-              type: 'instance.stopping',
-              attributes: { component: 'cli', operation: 'stop' },
-            }))
-            await reporter.report(createFactoryCloudEventV1({
-              type: 'instance.stopped',
-              attributes: { component: 'cli', operation: 'stop' },
-            }))
-            await reporter.close?.({ deadlineMs: 2_000 })
-          } catch {
-            err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+        try {
+          await fleet?.dispose()
+        } finally {
+          if (reporter) {
+            try {
+              await reporter.report(createFactoryCloudEventV1({
+                type: 'instance.stopping',
+                attributes: { component: 'cli', operation: 'stop' },
+              }))
+              await reporter.report(createFactoryCloudEventV1({
+                type: 'instance.stopped',
+                attributes: { component: 'cli', operation: 'stop' },
+              }))
+              await reporter.close?.({ deadlineMs: 2_000 })
+            } catch {
+              err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+            }
           }
         }
       }

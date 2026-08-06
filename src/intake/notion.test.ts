@@ -12,6 +12,7 @@ import {
   type GithubIssuePublisher,
   type NotionIntakeManifest,
   type NotionIntakeTarget,
+  type NotionContractPublisher,
   type WorkspaceTaskDispatcher,
 } from './notion'
 
@@ -163,6 +164,128 @@ describe('Notion spec intake', () => {
     await runNotionIntake({ manifest, dispatch: true, github })
 
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
+  })
+
+  it('delivers private mounted bytes through a portable Relay channel without copying them to GitHub', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const github = fakeGithub({ visibility: 'private' })
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1', 'message-2'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({ status: 'dispatched' })
+    expect(contracts.publish).toHaveBeenCalledWith(expect.objectContaining({
+      pageId,
+      content: 'private mounted implementation detail',
+    }))
+    const body = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    expect(body).toContain('workspace-private Agent Relay channel')
+    expect(body).toContain('factory-notion-e1cff7cf-aabbccddee')
+    expect(body).toContain('message-1,message-2')
+    expect(body).toContain('chmod the file 0444')
+    expect(body).not.toContain('private mounted implementation detail')
+    const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(stored.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery).toEqual({
+      kind: 'relay-channel',
+      channel: 'factory-notion-e1cff7cf-aabbccddee',
+      messageIds: ['message-1', 'message-2'],
+      encoding: 'base64-chunks-v1',
+    })
+  })
+
+  it('migrates an untouched lifecycle issue to a portable mount without dispatching it again', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    await runNotionIntake({ manifest, dispatch: true, github })
+    const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: originalBody,
+    })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+    expect(github.updateIssue).toHaveBeenCalledWith(expect.objectContaining({
+      repo: 'AgentWorkforce/cloud',
+      number: 42,
+      body: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
+    }))
+  })
+
+  it('refuses to overwrite a manually edited lifecycle issue during portable mount migration', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    await runNotionIntake({ manifest, dispatch: true, github })
+    const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: `${originalBody}\noperator note`,
+    })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('refusing to overwrite'),
+    })
+    expect(contracts.publish).not.toHaveBeenCalled()
+    expect(github.updateIssue).not.toHaveBeenCalled()
+  })
+
+  it('blocks portable dispatch when no Relay contract publisher is configured', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const github = fakeGithub({ visibility: 'private' })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('requires an Agent Relay contract publisher'),
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
   })
 
   it('blocks a source marker that has no authoritative intake receipt', async () => {
@@ -317,6 +440,7 @@ async function fixtureManifest(
       version: 1,
       mountRoot,
       workerMountRoot: '.integrations/notion',
+      workerMountTransport: { kind: 'local' },
       statePath: join(root, 'state.json'),
       tasks: [{ page: pageId, ...task }],
     },
@@ -343,5 +467,6 @@ function fakeGithub(input: { visibility: 'public' | 'private' | 'internal' }): G
     missingLabels: vi.fn(async () => []),
     findBySource: vi.fn(async () => undefined),
     createIssue: vi.fn(async () => ({ number: 42, url: 'https://github.test/issues/42' })),
+    updateIssue: vi.fn(async () => undefined),
   }
 }

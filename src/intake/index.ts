@@ -11,7 +11,15 @@ export {
   type NotionIntakeReport,
   type NotionIntakeResult,
   type NotionIntakeTarget,
+  type NotionContractDelivery,
+  type NotionContractPublisher,
   type NotionRecipe,
   type NormalizedNotionTask,
   type WorkspaceTaskDispatcher,
 } from './notion'
+
+export {
+  RelayChannelNotionContractPublisher,
+  contractChannelName,
+  contractMarkerPrefix,
+} from './notion-relay-contract'
