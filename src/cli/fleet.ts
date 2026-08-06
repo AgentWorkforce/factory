@@ -187,11 +187,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     if (command.kind === 'notion-intake') {
       const manifest = await loadNotionIntakeManifest(command.manifestPath)
       if (!globals.dryRun && manifest.workerMountTransport.kind === 'relay-channel') {
-        const workspaceKey = resolveRelayWorkspaceKey({ env: deps.env ?? process.env })
-        if (!workspaceKey) {
-          throw new Error('relay-channel worker mount transport requires an active Agent Relay workspace')
+        notionContracts = deps.notionContracts
+        if (!notionContracts) {
+          const workspaceKey = resolveRelayWorkspaceKey({ env: deps.env ?? process.env })
+          if (!workspaceKey) {
+            throw new Error('relay-channel worker mount transport requires an active Agent Relay workspace')
+          }
+          notionContracts = new RelayChannelNotionContractPublisher({ workspaceKey })
         }
-        notionContracts = deps.notionContracts ?? new RelayChannelNotionContractPublisher({ workspaceKey })
       }
       const workspace: WorkspaceTaskDispatcher = {
         dispatch: async (task) => {

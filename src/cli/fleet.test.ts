@@ -622,6 +622,7 @@ describe('fleet CLI runtime', () => {
       const migratedCode = await runFleetCli(['intake', 'notion', manifestPath], {
         fleet,
         notionContracts: contracts,
+        env: {},
         stdout: migratedOutput,
         stderr: buffer(),
       })
