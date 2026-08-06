@@ -376,6 +376,31 @@ describe('Notion spec intake', () => {
     expect(github.createIssue).not.toHaveBeenCalled()
   })
 
+  it('blocks portable delivery identifiers that cannot round-trip through an issue marker', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const github = fakeGithub({ visibility: 'private' })
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion:unsafe',
+        messageIds: ['message-1,forged'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('marker-safe ASCII alphabet'),
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
   it('blocks a source marker that has no authoritative intake receipt', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),

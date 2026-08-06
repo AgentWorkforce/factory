@@ -28,10 +28,15 @@ const workerMountTransportSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('relay-channel') }).strict(),
 ]).default({ kind: 'local' })
 
+const contractMarkerTokenSchema = z.string().trim().min(1).regex(
+  /^[A-Za-z0-9._-]+$/u,
+  'portable delivery identifiers must use the marker-safe ASCII alphabet',
+)
+
 const contractDeliverySchema = z.object({
   kind: z.literal('relay-channel'),
-  channel: z.string().trim().min(1),
-  messageIds: z.array(z.string().trim().min(1)).min(1),
+  channel: contractMarkerTokenSchema,
+  messageIds: z.array(contractMarkerTokenSchema).min(1, 'portable delivery must include at least one message id'),
   encoding: z.literal('base64-chunks-v1'),
 }).strict()
 
@@ -641,7 +646,8 @@ async function prepareContractDelivery(
   })
   const parsed = contractDeliverySchema.safeParse(published)
   if (!parsed.success) {
-    throw new Error('portable Notion contract publisher must return a channel and at least one message id')
+    const details = [...new Set(parsed.error.issues.map((issue) => issue.message))].join('; ')
+    throw new Error(`portable Notion contract publisher returned invalid delivery: ${details}`)
   }
   const delivery = parsed.data
   if (existing && !sameContractDelivery(existing, delivery)) {
@@ -683,7 +689,7 @@ function contractDeliveryMarker(delivery: NotionContractDelivery): string {
 }
 
 function contractDeliveryFromBody(body: string): NotionContractDelivery | undefined {
-  const match = /<!-- factory-notion-contract:relay-channel:([^:\s>]+):([^\s>]+) -->/u.exec(body)
+  const match = /<!-- factory-notion-contract:relay-channel:([A-Za-z0-9._-]+):([A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*) -->/u.exec(body)
   if (!match) return undefined
   const parsed = contractDeliverySchema.safeParse({
     kind: 'relay-channel',

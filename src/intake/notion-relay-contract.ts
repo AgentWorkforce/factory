@@ -32,6 +32,7 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
   #workspaceRelay?: ContractRelay
   #agentRelay?: ContractRelay
   #relayReady?: Promise<ContractRelay>
+  #disposed = false
 
   constructor(options: RelayChannelContractPublisherOptions) {
     this.#workspaceKey = options.workspaceKey
@@ -47,6 +48,7 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
     content: string
     contentDigest: string
   }): Promise<NotionContractDelivery> {
+    if (this.#disposed) throw new Error('Notion contract publisher has been disposed')
     const observedDigest = createHash('sha256').update(input.content).digest('hex')
     if (observedDigest !== input.contentDigest) {
       throw new Error('Notion contract changed before portable mount publication')
@@ -111,6 +113,8 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
   }
 
   async dispose(): Promise<void> {
+    this.#disposed = true
+    await this.#relayReady?.catch(() => undefined)
     await this.#agentRelay?.messaging.events.disconnect().catch(() => undefined)
     await this.#workspaceRelay?.agents.delete(this.#publisherName).catch(() => undefined)
     this.#agentRelay = undefined
@@ -139,6 +143,10 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
       name: this.#publisherName,
       type: 'system',
     })
+    if (this.#disposed) {
+      await workspaceRelay.agents.delete(this.#publisherName).catch(() => undefined)
+      throw new Error('Notion contract publisher was disposed during initialization')
+    }
     this.#workspaceRelay = workspaceRelay
     this.#agentRelay = this.#createRelay({ ...options, agentToken: registration.token })
     return this.#agentRelay

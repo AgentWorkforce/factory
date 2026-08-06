@@ -6,6 +6,12 @@ import { RelayChannelNotionContractPublisher, contractChannelName, contractMarke
 
 type StoredMessage = { id: string; text: string }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 function fakeRelaySurface() {
   const channels = new Map<string, StoredMessage[]>()
   let registrations = 0
@@ -141,5 +147,34 @@ describe('RelayChannelNotionContractPublisher', () => {
     ])
 
     expect(fake.registrationCount()).toBe(1)
+  })
+
+  it('cleans up an agent registration that completes during disposal', async () => {
+    const registration = deferred<{ token: string }>()
+    const deleteAgent = vi.fn(async () => undefined)
+    const createRelay = vi.fn((options: { agentToken?: string }) => ({
+      agents: {
+        register: vi.fn(async () => registration.promise),
+        delete: deleteAgent,
+      },
+      channels: { join: vi.fn(), create: vi.fn() },
+      messages: { list: vi.fn(), send: vi.fn() },
+      messaging: { events: { disconnect: vi.fn() } },
+      options,
+    }) as never)
+    const publisher = new RelayChannelNotionContractPublisher({
+      workspaceKey: 'workspace-key',
+      publisherName: 'disposing-publisher',
+      createRelay,
+    })
+
+    const publication = publisher.publish(contractInput('private body'))
+    const rejectedPublication = expect(publication).rejects.toThrow('disposed during initialization')
+    const disposal = publisher.dispose()
+    registration.resolve({ token: 'agent-token' })
+
+    await Promise.all([rejectedPublication, disposal])
+    expect(createRelay).toHaveBeenCalledOnce()
+    expect(deleteAgent).toHaveBeenCalledWith('disposing-publisher')
   })
 })
