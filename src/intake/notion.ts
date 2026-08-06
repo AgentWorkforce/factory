@@ -544,6 +544,7 @@ async function dispatchWorkspaceTask(
         agent: refreshed.agent,
         ...(refreshed.node ? { node: refreshed.node } : {}),
         delivery,
+        dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
       }
     }
     const currentReceipt = state.receipts[task.sourceKey] as Extract<IntakeReceipt, { kind: 'workspace' }>

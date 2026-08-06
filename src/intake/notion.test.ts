@@ -485,7 +485,13 @@ describe('Notion spec intake', () => {
         encoding: 'base64-chunks-v1',
       })),
     }
-    const migrated = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
+    const migrated = await runNotionIntake({
+      manifest,
+      dispatch: true,
+      workspace,
+      contracts,
+      now: () => new Date('2026-08-05T23:00:00.000Z'),
+    })
     expect(migrated.results[0]).toMatchObject({
       status: 'already-dispatched',
       agent: 'benchmark-agent',
@@ -497,6 +503,19 @@ describe('Notion spec intake', () => {
       task: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
     }))
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+    expect(contracts.publish).toHaveBeenCalledOnce()
+    const migratedState = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(migratedState.receipts[`notion:${pageId}:workspace:/work/benchmark`]).toMatchObject({
+      kind: 'workspace',
+      agent: 'benchmark-agent',
+      dispatchedAt: '2026-08-05T23:00:00.000Z',
+      delivery: {
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      },
+    })
 
     await writeFile(
       join(manifest.mountRoot, 'pages', pageId, 'content.md'),
