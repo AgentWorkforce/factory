@@ -361,6 +361,7 @@ describe('Notion spec intake', () => {
     roots.push(root)
     const workspace: WorkspaceTaskDispatcher = {
       dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
+      redispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'respawned' })),
     }
 
     const first = await runNotionIntake({
@@ -387,17 +388,69 @@ describe('Notion spec intake', () => {
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', agent: 'benchmark-agent' })
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
 
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+    const migrated = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
+    expect(migrated.results[0]).toMatchObject({
+      status: 'already-dispatched',
+      agent: 'benchmark-agent',
+      node: 'kjg-laptop',
+    })
+    expect(workspace.redispatch).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'benchmark-agent',
+      node: 'kjg-laptop',
+      task: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
+    }))
+    expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+
     await writeFile(
       join(manifest.mountRoot, 'pages', pageId, 'content.md'),
       'workspace body changed after dispatch',
     )
-    const changed = await runNotionIntake({ manifest, dispatch: true, workspace })
+    const changed = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
     expect(changed.results[0]).toMatchObject({
       status: 'blocked',
       agent: 'benchmark-agent',
       reason: 'mounted spec changed after workspace dispatch',
     })
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+    expect(workspace.redispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks an exact-path portable migration when the existing worker cannot be refreshed', async () => {
+    const { root, manifest } = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(root)
+    const workspace: WorkspaceTaskDispatcher = {
+      dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
+    }
+    await runNotionIntake({ manifest, dispatch: true, workspace })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: 'portable workspace mount migration requires a workspace redispatcher',
+    })
+    const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(stored.receipts[`notion:${pageId}:workspace:/work/benchmark`].delivery).toBeUndefined()
   })
 
   it('retains per-destination results when a later publisher fails', async () => {

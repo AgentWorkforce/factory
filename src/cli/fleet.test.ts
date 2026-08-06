@@ -582,12 +582,13 @@ describe('fleet CLI runtime', () => {
         `Project-Paths: ${projectPath}`,
       ].join('\n'))
       const manifestPath = join(root, 'notion.json')
-      await writeFile(manifestPath, JSON.stringify({
+      const manifest = {
         version: 1,
         mountRoot: './notion',
         statePath: './state.json',
         tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
-      }))
+      }
+      await writeFile(manifestPath, JSON.stringify(manifest))
       const output = buffer()
       const fleet = new FakeFleetClient()
 
@@ -602,6 +603,40 @@ describe('fleet CLI runtime', () => {
       expect(JSON.parse(output.text())).toMatchObject({
         ok: true,
         results: [{ status: 'dispatched', target: { projectPath } }],
+      })
+
+      await writeFile(manifestPath, JSON.stringify({
+        ...manifest,
+        workerMountTransport: { kind: 'relay-channel' },
+      }))
+      const contracts = {
+        publish: vi.fn(async () => ({
+          kind: 'relay-channel' as const,
+          channel: 'factory-notion-e1cff7cf-aabbccddee',
+          messageIds: ['message-1'],
+          encoding: 'base64-chunks-v1' as const,
+        })),
+        dispose: vi.fn(async () => undefined),
+      }
+      const migratedOutput = buffer()
+      const migratedCode = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet,
+        notionContracts: contracts,
+        stdout: migratedOutput,
+        stderr: buffer(),
+      })
+
+      expect(migratedCode).toBe(0)
+      expect(fleet.spawns).toHaveLength(1)
+      expect(fleet.messages).toEqual([expect.objectContaining({
+        to: expect.stringContaining('notion-e1cff7cf'),
+        text: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
+        mode: 'steer',
+      })])
+      expect(contracts.dispose).toHaveBeenCalledOnce()
+      expect(JSON.parse(migratedOutput.text())).toMatchObject({
+        ok: true,
+        results: [{ status: 'already-dispatched', target: { projectPath } }],
       })
     } finally {
       await rm(root, { recursive: true, force: true })

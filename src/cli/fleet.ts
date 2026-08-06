@@ -209,6 +209,24 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           fleet.preserveInfrastructureOnDispose?.()
           return { agent: spawned.name, node: spawned.node, status: 'spawned' }
         },
+        redispatch: async (task) => {
+          fleet ??= await buildFleet(globals, undefined, deps)
+          const running = (await fleet.roster()).agents.find((agent) => agent.name === task.name)
+          if (running) {
+            await fleet.sendMessage({ to: `@${running.name}`, text: task.task, mode: 'steer' })
+            return { agent: running.name, node: running.node, status: 'updated-running' }
+          }
+          const spawned = await fleet.spawn({
+            name: task.name,
+            capability: 'spawn:codex',
+            node: task.node ?? 'self',
+            task: task.task,
+            cwd: task.projectPath,
+            invocationId: task.invocationId,
+          })
+          fleet.preserveInfrastructureOnDispose?.()
+          return { agent: spawned.name, node: spawned.node, status: 'respawned' }
+        },
       }
       const report = await runNotionIntake({
         manifest,

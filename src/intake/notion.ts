@@ -119,6 +119,14 @@ export interface WorkspaceTaskDispatcher {
     title: string
     task: string
   }): Promise<{ agent: string; node?: string; status?: string }>
+  redispatch?(input: {
+    name: string
+    invocationId: string
+    node?: string
+    projectPath: string
+    title: string
+    task: string
+  }): Promise<{ agent: string; node?: string; status?: string }>
 }
 
 export type NotionIntakeResult = {
@@ -507,9 +515,32 @@ async function dispatchWorkspaceTask(
     }
     const delivery = await prepareContractDelivery(task, input, receipt.delivery)
     if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
-      state.receipts[task.sourceKey] = { ...receipt, delivery }
+      if (!input.workspace?.redispatch) {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'portable workspace mount migration requires a workspace redispatcher',
+        }
+      }
+      const refreshed = await input.workspace.redispatch({
+        name: receipt.agent,
+        invocationId: `factory:${task.sourceKey}:${task.digest}:portable-mount`,
+        node: receipt.node ?? target.node,
+        projectPath: target.projectPath,
+        title: task.title,
+        task: renderWorkspaceTask(task, delivery),
+      })
+      state.receipts[task.sourceKey] = {
+        ...receipt,
+        agent: refreshed.agent,
+        ...(refreshed.node ? { node: refreshed.node } : {}),
+        delivery,
+      }
     }
-    return { ...base, status: 'already-dispatched', agent: receipt.agent, node: receipt.node }
+    const currentReceipt = state.receipts[task.sourceKey] as Extract<IntakeReceipt, { kind: 'workspace' }>
+    return { ...base, status: 'already-dispatched', agent: currentReceipt.agent, node: currentReceipt.node }
   }
   if (!input.workspace) return { ...base, status: 'blocked', reason: 'workspace task dispatcher is not configured' }
 
