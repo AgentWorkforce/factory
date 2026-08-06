@@ -11,6 +11,7 @@ import {
   parseChiefSpecHeader,
   runNotionIntake,
   type GithubIssuePublisher,
+  type NotionIntakeClaimStore,
   type NotionIntakeManifest,
   type NotionIntakeTarget,
   type NotionContractPublisher,
@@ -19,8 +20,21 @@ import {
 
 const pageId = '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf'
 const roots: string[] = []
+const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
+const claims: NotionIntakeClaimStore = {
+  get: vi.fn(async (sourceKey) => durableClaims.get(sourceKey)),
+  claim: vi.fn(async (claim) => {
+    const existing = durableClaims.get(claim.sourceKey)
+    if (existing) return { status: 'existing' as const, claim: existing }
+    durableClaims.set(claim.sourceKey, claim)
+    return { status: 'claimed' as const, claim }
+  }),
+}
 
 afterEach(async () => {
+  durableClaims.clear()
+  vi.mocked(claims.get).mockClear()
+  vi.mocked(claims.claim).mockClear()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
@@ -123,7 +137,7 @@ describe('Notion spec intake', () => {
     roots.push(root)
     const github = fakeGithub({ visibility: 'public' })
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(report.ok).toBe(false)
     expect(report.results[0]).toMatchObject({ status: 'blocked', reason: expect.stringContaining('publicSummary') })
@@ -141,7 +155,7 @@ describe('Notion spec intake', () => {
     manifest.workerMountRoot = 'specs/notion'
     const github = fakeGithub({ visibility: 'public' })
 
-    const first = await runNotionIntake({ manifest, dispatch: true, github })
+    const first = await runNotionIntake({ manifest, dispatch: true, claims, github })
     const body = vi.mocked(github.createIssue).mock.calls[0]![0].body
     expect(first.results[0]).toMatchObject({ status: 'dispatched', issue: { number: 42 } })
     expect(body).toContain('Resolve the already-scoped fleet reliability follow-ups.')
@@ -161,7 +175,7 @@ describe('Notion spec intake', () => {
     })
 
     vi.mocked(github.findBySource).mockResolvedValue({ number: 42, url: 'https://github.test/issues/42', body })
-    const second = await runNotionIntake({ manifest, dispatch: true, github })
+    const second = await runNotionIntake({ manifest, dispatch: true, claims, github })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.createIssue).toHaveBeenCalledTimes(1)
   })
@@ -176,7 +190,7 @@ describe('Notion spec intake', () => {
     roots.push(root)
     const github = fakeGithub({ visibility: 'private' })
 
-    await runNotionIntake({ manifest, dispatch: true, github })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
   })
@@ -197,7 +211,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({ status: 'dispatched' })
     expect(contracts.publish).toHaveBeenCalledWith(expect.objectContaining({
@@ -225,7 +239,7 @@ describe('Notion spec intake', () => {
     })
     roots.push(root)
     const github = fakeGithub({ visibility: 'private' })
-    await runNotionIntake({ manifest, dispatch: true, github })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
     const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
     vi.mocked(github.findBySource).mockResolvedValue({
       number: 42,
@@ -242,7 +256,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.createIssue).toHaveBeenCalledTimes(1)
@@ -266,7 +280,7 @@ describe('Notion spec intake', () => {
     })
     roots.push(root)
     const github = fakeGithub({ visibility: 'private' })
-    await runNotionIntake({ manifest, dispatch: true, github })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
     const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
     vi.mocked(github.findBySource).mockResolvedValue({
       number: 42,
@@ -282,7 +296,7 @@ describe('Notion spec intake', () => {
         encoding: 'base64-chunks-v1',
       })),
     }
-    await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
     const migratedBody = vi.mocked(github.updateIssue).mock.calls[0]![0].body
     const interruptedState = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     delete interruptedState.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery
@@ -293,7 +307,7 @@ describe('Notion spec intake', () => {
       body: migratedBody,
     })
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.updateIssue).toHaveBeenCalledTimes(1)
@@ -307,7 +321,7 @@ describe('Notion spec intake', () => {
     })
     roots.push(root)
     const github = fakeGithub({ visibility: 'private' })
-    await runNotionIntake({ manifest, dispatch: true, github })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
     const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
     vi.mocked(github.findBySource).mockResolvedValue({
       number: 42,
@@ -324,7 +338,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -342,7 +356,7 @@ describe('Notion spec intake', () => {
     manifest.workerMountTransport = { kind: 'relay-channel' }
     const github = fakeGithub({ visibility: 'private' })
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -367,7 +381,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -392,7 +406,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -401,25 +415,77 @@ describe('Notion spec intake', () => {
     expect(github.createIssue).not.toHaveBeenCalled()
   })
 
-  it('blocks a source marker that has no authoritative intake receipt', async () => {
+  it('blocks a source marker that has neither a durable claim nor a local migration receipt', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
     })
     roots.push(root)
     const github = fakeGithub({ visibility: 'private' })
+    const [task] = await normalizeNotionManifest(manifest)
     vi.mocked(github.findBySource).mockResolvedValue({
       number: 99,
       url: 'https://github.test/issues/99',
-      body: `Source digest: \`${'a'.repeat(64)}\`\n<!-- factory-source:notion:${pageId}:repo:agentworkforce/cloud -->`,
+      body: `Source digest: \`${task!.digest}\`\n<!-- factory-source:notion:${pageId}:repo:agentworkforce/cloud -->`,
     })
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
-      reason: 'lifecycle issue marker has no authoritative local receipt',
+      reason: 'lifecycle issue marker has neither a durable shared claim nor a local migration receipt',
     })
     expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('requires a durable claim acknowledgement before creating a lifecycle issue', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    const unavailableClaims: NotionIntakeClaimStore = {
+      get: vi.fn(async () => undefined),
+      claim: vi.fn(async () => { throw new Error('shared claim write failed') }),
+    }
+
+    const report = await runNotionIntake({
+      manifest,
+      dispatch: true,
+      claims: unavailableClaims,
+      github,
+    })
+
+    expect(report.results[0]).toMatchObject({ status: 'blocked', reason: 'shared claim write failed' })
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('prevents two machines with independent local state from publishing the same page twice', async () => {
+    const firstFixture = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(firstFixture.root)
+    const secondStatePath = join(firstFixture.root, 'second-machine', 'state.json')
+    const secondManifest = { ...firstFixture.manifest, statePath: secondStatePath }
+    const github = fakeGithub({ visibility: 'private' })
+    vi.mocked(github.createIssue).mockImplementation(async () => {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+      return { number: 42, url: 'https://github.test/issues/42' }
+    })
+
+    const reports = await Promise.all([
+      runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, github }),
+      runNotionIntake({ manifest: secondManifest, dispatch: true, claims, github }),
+    ])
+
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+    expect(reports.flatMap((report) => report.results).map((result) => result.status).sort()).toEqual([
+      'blocked',
+      'dispatched',
+    ])
+    expect(reports.flatMap((report) => report.results)).toContainEqual(expect.objectContaining({
+      status: 'blocked',
+      reason: expect.stringContaining('durable Notion claim already exists'),
+    }))
   })
 
   it('serializes overlapping runs and creates one lifecycle issue', async () => {
@@ -439,8 +505,8 @@ describe('Notion spec intake', () => {
     })
 
     const reports = await Promise.all([
-      runNotionIntake({ manifest, dispatch: true, github }),
-      runNotionIntake({ manifest, dispatch: true, github }),
+      runNotionIntake({ manifest, dispatch: true, claims, github }),
+      runNotionIntake({ manifest, dispatch: true, claims, github }),
     ])
 
     expect(github.createIssue).toHaveBeenCalledTimes(1)
@@ -458,7 +524,7 @@ describe('Notion spec intake', () => {
     const github = fakeGithub({ visibility: 'private' })
     vi.mocked(github.missingLabels).mockResolvedValue(['reviewed'])
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -479,7 +545,7 @@ describe('Notion spec intake', () => {
 
     const first = await runNotionIntake({
       manifest,
-      dispatch: true,
+      dispatch: true, claims,
       workspace,
       now: () => new Date('2026-08-05T22:00:00.000Z'),
     })
@@ -497,7 +563,7 @@ describe('Notion spec intake', () => {
       dispatchedAt: '2026-08-05T22:00:00.000Z',
     })
 
-    const second = await runNotionIntake({ manifest, dispatch: true, workspace })
+    const second = await runNotionIntake({ manifest, dispatch: true, claims, workspace })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', agent: 'benchmark-agent' })
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
 
@@ -512,7 +578,7 @@ describe('Notion spec intake', () => {
     }
     const migrated = await runNotionIntake({
       manifest,
-      dispatch: true,
+      dispatch: true, claims,
       workspace,
       contracts,
       now: () => new Date('2026-08-05T23:00:00.000Z'),
@@ -546,7 +612,7 @@ describe('Notion spec intake', () => {
       join(manifest.mountRoot, 'pages', pageId, 'content.md'),
       'workspace body changed after dispatch',
     )
-    const changed = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
+    const changed = await runNotionIntake({ manifest, dispatch: true, claims, workspace, contracts })
     expect(changed.results[0]).toMatchObject({
       status: 'blocked',
       agent: 'benchmark-agent',
@@ -554,6 +620,71 @@ describe('Notion spec intake', () => {
     })
     expect(workspace.dispatch).toHaveBeenCalledTimes(1)
     expect(workspace.redispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('writes the shared claim before spawning exact-path work and aborts when that write fails', async () => {
+    const { root, manifest } = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(root)
+    const events: string[] = []
+    const unavailableClaims: NotionIntakeClaimStore = {
+      get: vi.fn(async () => undefined),
+      claim: vi.fn(async () => {
+        events.push('claim')
+        throw new Error('durable claim unavailable')
+      }),
+    }
+    const workspace: WorkspaceTaskDispatcher = {
+      dispatch: vi.fn(async () => {
+        events.push('spawn')
+        return { agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' }
+      }),
+    }
+
+    const report = await runNotionIntake({
+      manifest,
+      dispatch: true,
+      claims: unavailableClaims,
+      workspace,
+    })
+
+    expect(report.results[0]).toMatchObject({ status: 'blocked', reason: 'durable claim unavailable' })
+    expect(events).toEqual(['claim'])
+    expect(workspace.dispatch).not.toHaveBeenCalled()
+  })
+
+  it('prevents independent machines from spawning the same exact-path task twice', async () => {
+    const firstFixture = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(firstFixture.root)
+    const secondManifest = {
+      ...firstFixture.manifest,
+      statePath: join(firstFixture.root, 'second-machine', 'state.json'),
+    }
+    const workspace: WorkspaceTaskDispatcher = {
+      find: vi.fn(async () => undefined),
+      dispatch: vi.fn(async () => {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+        return { agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' }
+      }),
+    }
+
+    const reports = await Promise.all([
+      runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, workspace }),
+      runNotionIntake({ manifest: secondManifest, dispatch: true, claims, workspace }),
+    ])
+
+    expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+    expect(reports.flatMap((report) => report.results).map((result) => result.status).sort()).toEqual([
+      'blocked',
+      'dispatched',
+    ])
+    expect(reports.flatMap((report) => report.results)).toContainEqual(expect.objectContaining({
+      status: 'blocked',
+      reason: expect.stringContaining('refusing a second spawn'),
+    }))
   })
 
   it('blocks an exact-path portable migration when the existing worker cannot be refreshed', async () => {
@@ -564,7 +695,7 @@ describe('Notion spec intake', () => {
     const workspace: WorkspaceTaskDispatcher = {
       dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
     }
-    await runNotionIntake({ manifest, dispatch: true, workspace })
+    await runNotionIntake({ manifest, dispatch: true, claims, workspace })
     manifest.workerMountTransport = { kind: 'relay-channel' }
     const contracts: NotionContractPublisher = {
       publish: vi.fn(async () => ({
@@ -575,7 +706,7 @@ describe('Notion spec intake', () => {
       })),
     }
 
-    const report = await runNotionIntake({ manifest, dispatch: true, workspace, contracts })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, workspace, contracts })
 
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
@@ -601,7 +732,7 @@ describe('Notion spec intake', () => {
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('GitHub unavailable'))
 
-    const report = await runNotionIntake({ manifest, dispatch: true, github })
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(report.ok).toBe(false)
     expect(report.results).toEqual([

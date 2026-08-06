@@ -75,9 +75,11 @@ import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import {
   GhCliIssuePublisher,
+  RelayChannelNotionClaimStore,
   RelayChannelNotionContractPublisher,
   loadNotionIntakeManifest,
   runNotionIntake,
+  type NotionIntakeClaimStore,
   type NotionContractPublisher,
   type WorkspaceTaskDispatcher,
 } from '../intake'
@@ -118,6 +120,8 @@ interface FleetCliDeps {
   featureMapCheck?: (options?: CheckFeatureMapOptions) => Promise<FeatureMapCheckReport>
   /** Hermetic portable Notion contract publisher for intake tests and alternate runtimes. */
   notionContracts?: NotionContractPublisher
+  /** Hermetic workspace-global Notion claim store for tests and alternate runtimes. */
+  notionClaims?: NotionIntakeClaimStore
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
   reapEnvironments?: typeof reapFactoryEnvironmentsOnce
 }
@@ -157,6 +161,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   let mount: MountClient | undefined
   let reporter: FactoryEventReporter | undefined
   let notionContracts: NotionContractPublisher | undefined
+  let notionClaims: NotionIntakeClaimStore | undefined
 
   try {
     if (argv.some(isHelpFlag)) {
@@ -186,20 +191,31 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'notion-intake') {
       const manifest = await loadNotionIntakeManifest(command.manifestPath)
-      if (!globals.dryRun && manifest.workerMountTransport.kind === 'relay-channel') {
+      if (!globals.dryRun) {
+        notionClaims = deps.notionClaims
         notionContracts = deps.notionContracts
-        if (!notionContracts) {
-          const workspaceKey = resolveRelayWorkspaceKey({
+        const needsWorkspaceKey = !notionClaims ||
+          (manifest.workerMountTransport.kind === 'relay-channel' && !notionContracts)
+        const workspaceKey = needsWorkspaceKey
+          ? resolveRelayWorkspaceKey({
             env: deps.env ?? process.env,
             ...(deps.env ? { activeWorkspaceKey: () => undefined } : {}),
           })
-          if (!workspaceKey) {
-            throw new Error('relay-channel worker mount transport requires an active Agent Relay workspace')
-          }
-          notionContracts = new RelayChannelNotionContractPublisher({ workspaceKey })
+          : undefined
+        if (needsWorkspaceKey && !workspaceKey) {
+          throw new Error('Notion dispatch requires an active Agent Relay workspace for its durable shared claim')
+        }
+        notionClaims ??= new RelayChannelNotionClaimStore({ workspaceKey: workspaceKey! })
+        if (manifest.workerMountTransport.kind === 'relay-channel') {
+          notionContracts ??= new RelayChannelNotionContractPublisher({ workspaceKey: workspaceKey! })
         }
       }
       const workspace: WorkspaceTaskDispatcher = {
+        find: async (name) => {
+          fleet ??= await buildFleet(globals, undefined, deps)
+          const running = (await fleet.roster()).agents.find((agent) => agent.name === name)
+          return running ? { agent: running.name, node: running.node } : undefined
+        },
         dispatch: async (task) => {
           fleet ??= await buildFleet(globals, undefined, deps)
           const running = (await fleet.roster()).agents.find((agent) => agent.name === task.name)
@@ -240,6 +256,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         ...(!globals.dryRun ? {
           github: new GhCliIssuePublisher(),
           workspace,
+          ...(notionClaims ? { claims: notionClaims } : {}),
           ...(notionContracts ? { contracts: notionContracts } : {}),
         } : {}),
       })
@@ -448,30 +465,38 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   } finally {
     try {
       try {
-        await notionContracts?.dispose?.()
+        await notionClaims?.dispose?.()
       } catch {
-        err.write('[factory] warning: Notion contract publisher failed during shutdown\n')
+        err.write('[factory] warning: Notion claim store failed during shutdown\n')
       }
     } finally {
       try {
-        await mount?.dispose?.()
+        try {
+          await notionContracts?.dispose?.()
+        } catch {
+          err.write('[factory] warning: Notion contract publisher failed during shutdown\n')
+        }
       } finally {
         try {
-          await fleet?.dispose()
+          await mount?.dispose?.()
         } finally {
-          if (reporter) {
-            try {
-              await reporter.report(createFactoryCloudEventV1({
-                type: 'instance.stopping',
-                attributes: { component: 'cli', operation: 'stop' },
-              }))
-              await reporter.report(createFactoryCloudEventV1({
-                type: 'instance.stopped',
-                attributes: { component: 'cli', operation: 'stop' },
-              }))
-              await reporter.close?.({ deadlineMs: 2_000 })
-            } catch {
-              err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+          try {
+            await fleet?.dispose()
+          } finally {
+            if (reporter) {
+              try {
+                await reporter.report(createFactoryCloudEventV1({
+                  type: 'instance.stopping',
+                  attributes: { component: 'cli', operation: 'stop' },
+                }))
+                await reporter.report(createFactoryCloudEventV1({
+                  type: 'instance.stopped',
+                  attributes: { component: 'cli', operation: 'stop' },
+                }))
+                await reporter.close?.({ deadlineMs: 2_000 })
+              } catch {
+                err.write('[factory] warning: Cloud progress reporter failed during shutdown\n')
+              }
             }
           }
         }

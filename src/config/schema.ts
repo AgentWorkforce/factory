@@ -264,9 +264,12 @@ const WorkspaceConfigObjectSchema = z.object({
   models: modelsSchema,
   agentCapabilities: agentCapabilitiesSchema,
   slack: slackSchema,
-  // Linear remains the default whenever its issue sub-root is connected. When
-  // omitted, the orchestrator probes that sub-root once and falls back to
-  // GitHub-native issue lifecycle handling only when Linear is absent.
+  // This selects the discovery + lifecycle-writeback adapter, not every intake
+  // surface. Notion deliberately remains a separate intake command that
+  // normalizes repository work into GitHub lifecycle issues. Linear remains
+  // the default whenever its issue sub-root is connected. When omitted, the
+  // orchestrator probes that sub-root once and falls back to GitHub-native
+  // issue lifecycle handling only when Linear is absent.
   issueSource: z.enum(['linear', 'github']).optional(),
   mergePolicy: z.enum(['never', 'on-green-with-review']).default('never'),
   // Opt-in PR babysitter. When enabled, a sonnet agent is spawned once the
