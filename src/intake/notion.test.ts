@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  loadNotionIntakeManifest,
   normalizeNotionManifest,
   normalizeNotionPageId,
   parseChiefSpecHeader,
@@ -32,6 +33,20 @@ describe('Notion spec intake', () => {
     expect(() => normalizeNotionPageId(`f${pageId.replaceAll('-', '')}`)).toThrow(
       'does not contain a 32-character page id',
     )
+  })
+
+  it('defaults an omitted worker mount transport to local when loading existing manifests', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-notion-manifest-'))
+    roots.push(root)
+    const manifestPath = join(root, 'notion.json')
+    await writeFile(manifestPath, JSON.stringify({
+      version: 1,
+      tasks: [{ page: pageId }],
+    }))
+
+    const manifest = await loadNotionIntakeManifest(manifestPath)
+
+    expect(manifest.workerMountTransport).toEqual({ kind: 'local' })
   })
 
   it('requires an explicit, ready Chief Spec header and parses both destination kinds', () => {
@@ -236,6 +251,54 @@ describe('Notion spec intake', () => {
       number: 42,
       body: expect.stringContaining('factory-notion-e1cff7cf-aabbccddee'),
     }))
+    const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(stored.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery).toEqual({
+      kind: 'relay-channel',
+      channel: 'factory-notion-e1cff7cf-aabbccddee',
+      messageIds: ['message-1'],
+      encoding: 'base64-chunks-v1',
+    })
+  })
+
+  it('reconciles a portable issue marker when the receipt write was interrupted', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    await runNotionIntake({ manifest, dispatch: true, github })
+    const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: originalBody,
+    })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+    await runNotionIntake({ manifest, dispatch: true, github, contracts })
+    const migratedBody = vi.mocked(github.updateIssue).mock.calls[0]![0].body
+    const interruptedState = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    delete interruptedState.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery
+    await writeFile(manifest.statePath, JSON.stringify(interruptedState))
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: migratedBody,
+    })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
+    expect(github.updateIssue).toHaveBeenCalledTimes(1)
+    const reconciled = JSON.parse(await readFile(manifest.statePath, 'utf8'))
+    expect(reconciled.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery.messageIds).toEqual(['message-1'])
   })
 
   it('refuses to overwrite a manually edited lifecycle issue during portable mount migration', async () => {
@@ -284,6 +347,31 @@ describe('Notion spec intake', () => {
     expect(report.results[0]).toMatchObject({
       status: 'blocked',
       reason: expect.stringContaining('requires an Agent Relay contract publisher'),
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('blocks a portable publisher response with no contract messages', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const github = fakeGithub({ visibility: 'private' })
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: [],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({ manifest, dispatch: true, github, contracts })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('at least one message id'),
     })
     expect(github.createIssue).not.toHaveBeenCalled()
   })

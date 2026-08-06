@@ -13,7 +13,10 @@ type RelayChannelContractPublisherOptions = {
   workspaceKey: string
   baseUrl?: string
   publisherName?: string
+  createRelay?: (options: { workspaceKey: string; baseUrl?: string; agentToken?: string }) => ContractRelay
 }
+
+type ContractRelay = Pick<AgentRelay, 'agents' | 'channels' | 'messages' | 'messaging'>
 
 /**
  * Publishes digest-bound Notion bytes to a workspace-private Relay channel.
@@ -24,15 +27,18 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
   readonly #workspaceKey: string
   readonly #baseUrl?: string
   readonly #publisherName: string
+  readonly #createRelay: NonNullable<RelayChannelContractPublisherOptions['createRelay']>
   readonly #cache = new Map<string, NotionContractDelivery>()
-  #workspaceRelay?: AgentRelay
-  #agentRelay?: AgentRelay
+  #workspaceRelay?: ContractRelay
+  #agentRelay?: ContractRelay
+  #relayReady?: Promise<ContractRelay>
 
   constructor(options: RelayChannelContractPublisherOptions) {
     this.#workspaceKey = options.workspaceKey
     this.#baseUrl = options.baseUrl
     this.#publisherName = options.publisherName ??
       `factory-notion-intake-${process.pid}-${Date.now().toString(36)}`
+    this.#createRelay = options.createRelay ?? ((relayOptions) => new AgentRelay(relayOptions))
   }
 
   async publish(input: {
@@ -45,21 +51,28 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
     if (observedDigest !== input.contentDigest) {
       throw new Error('Notion contract changed before portable mount publication')
     }
-    const cached = this.#cache.get(input.sourceKey)
+    const cacheKey = `${input.sourceKey}\0${input.contentDigest}`
+    const cached = this.#cache.get(cacheKey)
     if (cached) return cached
 
     const relay = await this.#relay()
-    const channel = contractChannelName(input.pageId, input.sourceKey)
+    const channel = contractChannelName(input.pageId, input.sourceKey, input.contentDigest)
     try {
       await relay.channels.join(channel)
-    } catch {
+    } catch (joinError) {
       try {
         await relay.channels.create({
           name: channel,
           topic: `Read-only Notion contract ${input.pageId}`,
         })
-      } catch {
-        await relay.channels.join(channel)
+      } catch (createError) {
+        try {
+          await relay.channels.join(channel)
+        } catch (finalJoinError) {
+          throw new Error(`unable to join or create Notion contract channel ${channel}`, {
+            cause: new AggregateError([joinError, createError, finalJoinError]),
+          })
+        }
       }
     }
 
@@ -77,10 +90,10 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
         .digest('hex')
       const prior = existing.find((message) => message.text.startsWith(`${marker}\n`))
       const message = prior ?? await relay.messages.send({
-          channel,
-          text: expectedText,
-          idempotencyKey: `factory-notion-contract-v1:${idempotencyKey}`,
-        })
+        channel,
+        text: expectedText,
+        idempotencyKey: `factory-notion-contract-v1:${idempotencyKey}`,
+      })
       if (message.text !== expectedText) {
         throw new Error(`portable Notion contract chunk ${index + 1} does not match its digest-bound marker`)
       }
@@ -93,7 +106,7 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
       messageIds,
       encoding: 'base64-chunks-v1',
     }
-    this.#cache.set(input.sourceKey, delivery)
+    this.#cache.set(cacheKey, delivery)
     return delivery
   }
 
@@ -102,28 +115,39 @@ export class RelayChannelNotionContractPublisher implements NotionContractPublis
     await this.#workspaceRelay?.agents.delete(this.#publisherName).catch(() => undefined)
     this.#agentRelay = undefined
     this.#workspaceRelay = undefined
+    this.#relayReady = undefined
   }
 
-  async #relay(): Promise<AgentRelay> {
+  async #relay(): Promise<ContractRelay> {
     if (this.#agentRelay) return this.#agentRelay
+    this.#relayReady ??= this.#initializeRelay()
+    try {
+      return await this.#relayReady
+    } catch (error) {
+      this.#relayReady = undefined
+      throw error
+    }
+  }
+
+  async #initializeRelay(): Promise<ContractRelay> {
     const options = {
       workspaceKey: this.#workspaceKey,
       ...(this.#baseUrl ? { baseUrl: this.#baseUrl } : {}),
     }
-    const workspaceRelay = new AgentRelay(options)
+    const workspaceRelay = this.#createRelay(options)
     const registration = await workspaceRelay.agents.register({
       name: this.#publisherName,
       type: 'system',
     })
     this.#workspaceRelay = workspaceRelay
-    this.#agentRelay = new AgentRelay({ ...options, agentToken: registration.token })
+    this.#agentRelay = this.#createRelay({ ...options, agentToken: registration.token })
     return this.#agentRelay
   }
 }
 
-export function contractChannelName(pageId: string, sourceKey: string): string {
-  const suffix = createHash('sha256').update(sourceKey).digest('hex').slice(0, 10)
-  return `factory-notion-${pageId.slice(-8)}-${suffix}`
+export function contractChannelName(pageId: string, sourceKey: string, contentDigest: string): string {
+  const sourceSuffix = createHash('sha256').update(sourceKey).digest('hex').slice(0, 8)
+  return `factory-notion-${pageId.slice(-8)}-${sourceSuffix}-${contentDigest.slice(0, 10)}`
 }
 
 export function contractMarkerPrefix(pageId: string, contentDigest: string): string {
@@ -138,7 +162,7 @@ function splitContract(encoded: string): string[] {
   return chunks.length > 0 ? chunks : ['']
 }
 
-async function listAllMessages(relay: AgentRelay, channel: string): Promise<RelayMessage[]> {
+async function listAllMessages(relay: ContractRelay, channel: string): Promise<RelayMessage[]> {
   const messages: RelayMessage[] = []
   let before: string | undefined
   for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
@@ -151,5 +175,5 @@ async function listAllMessages(relay: AgentRelay, channel: string): Promise<Rela
     }
     before = nextBefore
   }
-  throw new Error('portable Notion contract channel exceeds the 10,000-message safety limit')
+  throw new Error('portable Notion contract digest channel exceeds the 10,000-message safety limit')
 }

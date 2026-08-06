@@ -212,9 +212,10 @@ is the repo-relative read-only mount workers receive. With the recommended
 into a workspace-private Agent Relay channel. A worker on any fleet machine can
 reconstruct the exact file at `workerMountRoot`, set it to mode `0444`, and
 apply the source SHA-256 gate without exposing the page in a public issue.
-`{ "kind": "local" }` retains the older shared-filesystem contract and remains
-the default for existing manifests. `page` accepts a Notion URL or a bare page
-ID.
+The field defaults to `{ "kind": "local" }` whenever it is omitted, including
+in new manifests. Portable delivery must be selected explicitly and requires a
+resolvable active Agent Relay workspace key; otherwise dispatch fails closed.
+`page` accepts a Notion URL or a bare page ID.
 
 Plan without writes, then dispatch:
 

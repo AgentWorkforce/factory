@@ -189,7 +189,10 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       if (!globals.dryRun && manifest.workerMountTransport.kind === 'relay-channel') {
         notionContracts = deps.notionContracts
         if (!notionContracts) {
-          const workspaceKey = resolveRelayWorkspaceKey({ env: deps.env ?? process.env })
+          const workspaceKey = resolveRelayWorkspaceKey({
+            env: deps.env ?? process.env,
+            ...(deps.env ? { activeWorkspaceKey: () => undefined } : {}),
+          })
           if (!workspaceKey) {
             throw new Error('relay-channel worker mount transport requires an active Agent Relay workspace')
           }
@@ -444,7 +447,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
     return 1
   } finally {
     try {
-      await notionContracts?.dispose?.()
+      try {
+        await notionContracts?.dispose?.()
+      } catch {
+        err.write('[factory] warning: Notion contract publisher failed during shutdown\n')
+      }
     } finally {
       try {
         await mount?.dispose?.()

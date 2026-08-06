@@ -28,6 +28,13 @@ const workerMountTransportSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('relay-channel') }).strict(),
 ]).default({ kind: 'local' })
 
+const contractDeliverySchema = z.object({
+  kind: z.literal('relay-channel'),
+  channel: z.string().trim().min(1),
+  messageIds: z.array(z.string().trim().min(1)).min(1),
+  encoding: z.literal('base64-chunks-v1'),
+}).strict()
+
 const bootstrapSchema = z.object({
   authorizedPageId: z.string().trim().min(1),
   reason: z.string().trim().min(1),
@@ -93,12 +100,7 @@ export interface GithubIssuePublisher {
   }): Promise<void>
 }
 
-export interface NotionContractDelivery {
-  kind: 'relay-channel'
-  channel: string
-  messageIds: string[]
-  encoding: 'base64-chunks-v1'
-}
+export type NotionContractDelivery = z.infer<typeof contractDeliverySchema>
 
 export interface NotionContractPublisher {
   publish(input: {
@@ -425,10 +427,20 @@ async function publishRepoTask(
     if (currentDigest !== task.digest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
+    const bodyDelivery = contractDeliveryFromBody(existing.body)
+    if (input.manifest.workerMountTransport.kind === 'local') {
+      if (receipt.delivery || bodyDelivery) {
+        return { ...base, status: 'blocked', issue: existing, reason: 'portable Notion delivery cannot be downgraded to a local worker mount' }
+      }
+      return { ...base, status: 'already-dispatched', issue: existing }
+    }
     const visibility = await input.github.repositoryVisibility(target.repo)
+    if (visibility === 'public' && !target.publicSummary) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'public repository requires an explicit publicSummary; mounted content was not copied' }
+    }
     const summary = visibility === 'public' ? target.publicSummary! : task.summary
-    if (input.manifest.workerMountTransport.kind === 'relay-channel' &&
-      !receipt.delivery && existing.body !== renderIssueBody(task, summary)) {
+    const bodyWasEdited = existing.body !== renderIssueBody(task, summary, bodyDelivery)
+    if (bodyWasEdited) {
       return {
         ...base,
         status: 'blocked',
@@ -436,16 +448,11 @@ async function publishRepoTask(
         reason: 'existing lifecycle issue body was edited; refusing to overwrite it during portable mount migration',
       }
     }
-    const delivery = await prepareContractDelivery(task, input, receipt.delivery)
-    if (delivery && !issueHasContractDelivery(existing.body, delivery)) {
-      if (existing.body !== renderIssueBody(task, summary)) {
-        return {
-          ...base,
-          status: 'blocked',
-          issue: existing,
-          reason: 'existing lifecycle issue body was edited; refusing to overwrite it during portable mount migration',
-        }
-      }
+    if (receipt.delivery && bodyDelivery && !sameContractDelivery(receipt.delivery, bodyDelivery)) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue portable delivery does not match its authoritative receipt' }
+    }
+    const delivery = await prepareContractDelivery(task, input, receipt.delivery ?? bodyDelivery)
+    if (delivery && !bodyDelivery) {
       await input.github.updateIssue({
         repo: target.repo,
         number: existing.number,
@@ -625,12 +632,17 @@ async function prepareContractDelivery(
   if (!input.contracts) {
     throw new Error('relay-channel worker mount transport requires an Agent Relay contract publisher')
   }
-  const delivery = await input.contracts.publish({
+  const published = await input.contracts.publish({
     pageId: task.pageId,
     sourceKey: task.sourceKey,
     content: task.content,
     contentDigest: task.contentDigest,
   })
+  const parsed = contractDeliverySchema.safeParse(published)
+  if (!parsed.success) {
+    throw new Error('portable Notion contract publisher must return a channel and at least one message id')
+  }
+  const delivery = parsed.data
   if (existing && !sameContractDelivery(existing, delivery)) {
     throw new Error('portable Notion contract delivery changed after dispatch')
   }
@@ -665,12 +677,20 @@ function sameContractDelivery(
     left.encoding === right.encoding && left.messageIds.join('\0') === right.messageIds.join('\0'))
 }
 
-function issueHasContractDelivery(body: string, delivery: NotionContractDelivery): boolean {
-  return body.includes(contractDeliveryMarker(delivery))
-}
-
 function contractDeliveryMarker(delivery: NotionContractDelivery): string {
   return `<!-- factory-notion-contract:${delivery.kind}:${delivery.channel}:${delivery.messageIds.join(',')} -->`
+}
+
+function contractDeliveryFromBody(body: string): NotionContractDelivery | undefined {
+  const match = /<!-- factory-notion-contract:relay-channel:([^:\s>]+):([^\s>]+) -->/u.exec(body)
+  if (!match) return undefined
+  const parsed = contractDeliverySchema.safeParse({
+    kind: 'relay-channel',
+    channel: match[1],
+    messageIds: match[2]?.split(','),
+    encoding: 'base64-chunks-v1',
+  })
+  return parsed.success ? parsed.data : undefined
 }
 
 function sourceMarker(sourceKey: string): string {
@@ -693,16 +713,10 @@ function splitField(value: string | undefined): string[] {
 
 async function readIntakeState(path: string): Promise<IntakeState> {
   try {
-    const delivery = z.object({
-      kind: z.literal('relay-channel'),
-      channel: z.string().min(1),
-      messageIds: z.array(z.string().min(1)).min(1),
-      encoding: z.literal('base64-chunks-v1'),
-    }).strict()
     const common = {
       digest: z.string().regex(/^[0-9a-f]{64}$/u),
       dispatchedAt: z.string().datetime(),
-      delivery: delivery.optional(),
+      delivery: contractDeliverySchema.optional(),
     }
     return z.object({
       version: z.literal(1),
