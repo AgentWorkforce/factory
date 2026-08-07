@@ -7,9 +7,23 @@ export const RELAYFILE_SYNC_INTERVAL_MS = 30 * 1000
 export const STALE_RECONCILE_INTERVALS = 3
 export const STALE_RECONCILE_MS = RELAYFILE_SYNC_INTERVAL_MS * STALE_RECONCILE_INTERVALS
 
+/** Use the registered mirror cadence when available; fall back to Relayfile's default. */
+export function staleReconcileMs(intervalMs: unknown): number {
+  const registeredIntervalMs = typeof intervalMs === 'number' &&
+    Number.isFinite(intervalMs) &&
+    intervalMs >= 1_000
+    ? Math.floor(intervalMs)
+    : RELAYFILE_SYNC_INTERVAL_MS
+  return registeredIntervalMs * STALE_RECONCILE_INTERVALS
+}
+
 type MountState = {
   workspaceId?: unknown
   lastReconcileAt?: unknown
+  // Relayfile writes the active poll cadence in state.json. It is part of the
+  // mount's liveness contract, so the stale threshold must follow it rather
+  // than assuming the default cadence for every registered mirror.
+  intervalMs?: unknown
   // The mount process pid. Older mounts wrote a top-level `pid`; SDK-launched
   // mounts record it under `daemon.pid` instead. Either may be absent.
   pid?: unknown
@@ -63,7 +77,7 @@ export function checkMountStaleness(
   }
 
   const ageMs = Date.now() - lastReconcileAt
-  if (ageMs > STALE_RECONCILE_MS) {
+  if (ageMs > staleReconcileMs(parsed.intervalMs)) {
     return {
       stale: true,
       reason: `last reconcile ${Math.floor(ageMs / 60000)}m ago`,
