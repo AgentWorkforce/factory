@@ -2821,6 +2821,73 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('handles SIGTERM gracefully while an unknown workspace mirror is still resolving', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-resolve-mirror-sigterm-'))
+    try {
+      const configPath = await writeConfig(root)
+      const listeners = new Map<string, () => void>()
+      const processLike = {
+        once(signal: string, listener: () => void) {
+          listeners.set(signal, listener)
+          return processLike
+        },
+        off(signal: string, listener: () => void) {
+          if (listeners.get(signal) === listener) listeners.delete(signal)
+          return processLike
+        },
+      }
+      const calls: string[] = []
+      let registeredRoot: string | undefined
+      let releaseMount!: () => void
+      const mountReleased = new Promise<void>((resolve) => { releaseMount = resolve })
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountRoot: () => registeredRoot,
+      })
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => { calls.push('stop') }),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const ensureLocalMount = vi.fn(async () => {
+        await mountReleased
+        registeredRoot = join(root, 'chief', '.integrations')
+      })
+
+      const run = runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+        flushDaemonOutput: async () => { calls.push('flush') },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      await vi.waitFor(() => {
+        expect(ensureLocalMount).toHaveBeenCalledTimes(1)
+        expect(listeners.has('SIGTERM')).toBe(true)
+      })
+      listeners.get('SIGTERM')?.()
+      await vi.waitFor(() => expect(calls).toEqual(['stop', 'flush']))
+      releaseMount()
+
+      await expect(run).resolves.toBe(0)
+      expect(factory.start).not.toHaveBeenCalled()
+      expect(factory.stop).toHaveBeenCalledTimes(1)
+      expect(listeners.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not start a live factory when an unknown workspace mirror cannot be resolved', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-unresolved-mirror-'))
     try {

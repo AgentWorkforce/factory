@@ -656,20 +656,6 @@ async function runFactoryCommand(
         const message = error instanceof Error ? error.message : String(error)
         mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
       }
-      if (mount.getLocalMountRoot?.() === undefined) {
-        try {
-          const result = await warmMount()
-          if (!result.mounted) {
-            mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
-            return 1
-          }
-        } catch (error) {
-          handleWarmMountError(error)
-          return 1
-        }
-      } else {
-        void warmMount().catch(handleWarmMountError)
-      }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
@@ -681,6 +667,23 @@ async function runFactoryCommand(
         processLike: deps.stopSignalProcessLike,
       })
       try {
+        if (mount.getLocalMountRoot?.() === undefined) {
+          try {
+            const result = await warmMount()
+            if (!result.mounted) {
+              mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
+              if (stoppedBySignal) return await waiter.promise
+              return 1
+            }
+          } catch (error) {
+            handleWarmMountError(error)
+            if (stoppedBySignal) return await waiter.promise
+            return 1
+          }
+        } else {
+          void warmMount().catch(handleWarmMountError)
+        }
+        if (stoppedBySignal) return await waiter.promise
         await factory.start({ mode: command.mode })
         const code = await (deps.waitForStopSignal?.() ?? waiter.promise)
         return typeof code === 'number' ? code : 0
