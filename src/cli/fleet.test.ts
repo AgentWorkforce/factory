@@ -1354,7 +1354,13 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+      expect(JSON.parse(output.text())).toEqual({
+        ...factoryStatus,
+        eventListener: {
+          state: 'not-listening',
+          reason: 'heartbeat missing',
+        },
+      })
       expect(git).not.toHaveBeenCalled()
       expect(integrations.getStatus).not.toHaveBeenCalled()
     } finally {
@@ -1865,7 +1871,8 @@ describe('fleet CLI runtime', () => {
   it('surfaces a stale registered workspace mirror in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-status-'))
     try {
-      const configPath = await writeConfig(root)
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
       const output = buffer()
       const mirror = join(root, 'chief', '.integrations')
       const factory = {
@@ -1886,6 +1893,16 @@ describe('fleet CLI runtime', () => {
           localDir: mirror,
         }),
       })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
 
       const code = await runFleetCli(['status', '--config', configPath], {
         fleet: new FakeFleetClient(),
@@ -1897,9 +1914,72 @@ describe('fleet CLI runtime', () => {
 
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toMatchObject({
+        eventListener: {
+          state: 'subscribed',
+        },
         localMountDegraded: true,
         localMountDegradedReason: 'last reconcile 5m ago',
         localMountRoot: mirror,
+        localMountEventFeed: {
+          state: 'degraded',
+          livenessSignal: '.integrations/.relay/state.json',
+          reason: 'last reconcile 5m ago',
+          root: mirror,
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('distinguishes a healthy quiet mount event feed from a daemon that is not listening', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-event-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const output = buffer()
+      const mirror = join(root, 'chief', '.integrations')
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountHealth: () => ({ degraded: false, localDir: mirror }),
+      })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        eventListener: { state: 'subscribed' },
+        localMountEventFeed: {
+          state: 'healthy',
+          livenessSignal: '.integrations/.relay/state.json',
+          root: mirror,
+        },
       })
     } finally {
       await rm(root, { recursive: true, force: true })

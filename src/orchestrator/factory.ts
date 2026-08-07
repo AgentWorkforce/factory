@@ -67,6 +67,7 @@ import { isResourceSubscriptionsUnavailable, type ResourceSubscription } from '.
 import type {
   DispatchResult,
   Factory,
+  FactoryEventListenerStatus,
   FactoryEventPayload,
   FactoryPorts,
   FactoryStatus,
@@ -832,6 +833,11 @@ export class FactoryLoop implements Factory {
       this.#schedulePreviewSweep()
       try {
         await this.#startLiveSubscription(issueSource, opts.liveSubscription)
+        // The initial live heartbeat is intentionally written before startup
+        // so crash reapers can see a daemon while it bootstraps. Write again
+        // once the listener is actually registered so external `factory
+        // status` can distinguish a quiet feed from no listener.
+        await this.#writeLiveHeartbeat('running')
         await this.#rearmSlackReplyWatchers()
         await this.#drainReadyClarificationWake()
         await this.#rearmGithubIssueCommentWatchers()
@@ -2782,7 +2788,27 @@ export class FactoryLoop implements Factory {
       counters: { ...this.#counters },
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
+      eventListener: this.#eventListenerStatus(),
     }
+  }
+
+  #eventListenerStatus(): FactoryEventListenerStatus {
+    if (this.#startMode !== 'live') {
+      return {
+        state: 'not-listening',
+        reason: this.#startMode ? `factory mode is ${this.#startMode}` : 'factory has not started',
+      }
+    }
+    if (!this.#liveHeartbeatActive) {
+      return { state: 'not-listening', reason: 'live daemon heartbeat is inactive' }
+    }
+    if (this.#subscription) {
+      return { state: 'subscribed' }
+    }
+    if (this.#liveOptions({}).transport === 'poll' && this.#liveEventCursor !== undefined) {
+      return { state: 'polling' }
+    }
+    return { state: 'starting' }
   }
 
   on(event: FactoryEvent, listener: Listener): () => void {
@@ -5072,6 +5098,7 @@ export class FactoryLoop implements Factory {
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
       registryPath,
+      eventListener: this.#eventListenerStatus(),
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')

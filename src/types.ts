@@ -93,6 +93,16 @@ export interface FactoryLiveSubscriptionOptions {
   replaySkewMarginMs: number
 }
 
+/**
+ * The daemon's own view of its primary Relayfile event listener.  This is
+ * intentionally separate from the local mirror's reconcile health: a quiet
+ * event stream can be healthy, while a stopped daemon is not listening at all.
+ */
+export interface FactoryEventListenerStatus {
+  state: 'starting' | 'subscribed' | 'polling' | 'not-listening' | 'unknown'
+  reason?: string
+}
+
 export interface FactoryLoopRunOptions {
   dryRun?: boolean
   maxIterations?: number
@@ -111,6 +121,7 @@ export interface FactoryLoopHeartbeat {
   updatedAt: string
   updatedAtMs: number
   registryPath?: string
+  eventListener?: FactoryEventListenerStatus
 }
 
 export interface FactoryInFlightRegistryAgent {
@@ -205,6 +216,8 @@ export interface FactoryStatus {
   counters: Record<string, number>
   slackDegraded?: boolean
   slackDegradedReason?: string
+  /** Primary Relayfile subscription/poll registration, not event activity. */
+  eventListener?: FactoryEventListenerStatus
 }
 
 export type FactoryEventPayload =

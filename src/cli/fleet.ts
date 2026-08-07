@@ -688,7 +688,7 @@ async function runFactoryCommand(
       return 0
     }
     if (command.action === 'status') {
-      writeJson(out, factoryStatusWithMountHealth(factory, mount))
+      writeJson(out, await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs))
       return 0
     }
     if (command.action === 'loop-status') {
@@ -717,7 +717,10 @@ async function runFactoryCommand(
     })
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
-      writeJson(out, { reports, status: factoryStatusWithMountHealth(factory, mount) })
+      writeJson(out, {
+        reports,
+        status: await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs),
+      })
     } finally {
       removeSignalHandlers()
       await factory.stop()
@@ -993,18 +996,49 @@ function resolveIntegrationsMountRoot(mount: MountClient): string {
   return mount.getLocalMountRoot?.() ?? resolve(process.cwd(), '.integrations')
 }
 
-function factoryStatusWithMountHealth(factory: Factory, mount: MountClient): ReturnType<Factory['status']> & {
+async function factoryStatusWithMountHealth(
+  factory: Factory,
+  mount: MountClient,
+  heartbeatPath: string,
+  heartbeatStaleMs: number,
+): Promise<ReturnType<Factory['status']> & {
   localMountDegraded?: boolean
   localMountDegradedReason?: string
   localMountRoot?: string
-} {
+  /** Local mirror liveness, independently of whether the daemon is listening. */
+  localMountEventFeed?: {
+    state: 'healthy' | 'degraded'
+    livenessSignal: '.integrations/.relay/state.json'
+    reason?: string
+    root?: string
+  }
+}> {
+  const status = factory.status()
+  const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+  const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
+  const eventListener = liveness.ok
+    ? heartbeat?.eventListener ?? {
+      state: 'unknown' as const,
+      reason: 'running daemon heartbeat does not report event listener state',
+    }
+    : {
+      state: 'not-listening' as const,
+      reason: liveness.reason,
+    }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return factory.status()
+  if (!health) return { ...status, eventListener }
   return {
-    ...factory.status(),
+    ...status,
+    eventListener,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),
+    localMountEventFeed: {
+      state: health.degraded ? 'degraded' : 'healthy',
+      livenessSignal: '.integrations/.relay/state.json',
+      ...(health.reason ? { reason: health.reason } : {}),
+      ...(health.localDir ? { root: health.localDir } : {}),
+    },
   }
 }
 
