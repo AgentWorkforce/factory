@@ -12825,12 +12825,11 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  // Absolute path to the local .integrations mount the daemon manages. The mount
-  // is created at the daemon's cwd (see ensureLocalMount), and spawned agents run
-  // in their repo clonePath, so writeback paths handed to agents must be absolute
-  // against this root rather than a bare relative `.integrations/...`.
+  // Absolute path to the one registered workspace mirror. Spawned agents run in
+  // repo clone paths, so writeback instructions must name the shared mirror,
+  // not a relative `.integrations` path or a per-repository re-home attempt.
   #integrationsMountRoot(): string {
-    return resolve(process.cwd(), '.integrations')
+    return this.#mount.getLocalMountRoot?.() ?? resolve(process.cwd(), '.integrations')
   }
 
   async #slackChannelDir(): Promise<string | undefined> {

@@ -234,6 +234,10 @@ const WorkspaceConfigObjectSchema = z.object({
   // falling back to the SDK's built-in default. Set it only to pin a non-active
   // workspace. See resolveFactoryWorkspace() in relayfile-cloud-mount-client.ts.
   workspaceId: z.string().optional(),
+  // Optional exact root of this workspace's single Relayfile mirror. When
+  // omitted Factory reads Relayfile's existing registration. This is a
+  // workspace-scoped escape hatch, never a request to re-home per checkout.
+  localMountRoot: z.string().min(1).optional(),
   subscription: subscriptionSchema,
   liveSubscription: liveSubscriptionSchema,
   dispatch: dispatchSchema,

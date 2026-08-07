@@ -30,6 +30,7 @@ import type {
   FactoryIntegrationProvider,
   GithubConnectionWrite,
   LocalMountOptions,
+  LocalMountHealth,
   Logger,
   MountClient,
   ProviderSyncStatus,
@@ -51,6 +52,7 @@ import {
 } from './local-mount-preflight'
 import { checkMountStaleness } from './relayfile-binary'
 import { MountAuthScopeError } from './mount-auth-error'
+import { resolveRegisteredWorkspaceMirror } from './workspace-mirror'
 
 const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
@@ -210,6 +212,10 @@ export interface RelayfileCloudMountClientConfig {
   localMountHealthIntervalMs?: number
   /** Internal mount-work concurrency override for tests. */
   localMountMaxConcurrency?: number
+  /** Explicit registered mirror root; never inferred from a routed checkout. */
+  localMountRoot?: string
+  /** Read-only registration lookup override for tests and alternate runtimes. */
+  workspaceMirrorResolver?: (workspaceIds: readonly string[]) => string | undefined
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
@@ -266,6 +272,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #localMountPreflight: LocalMountPreflight
   readonly #localMountAgentName: string
   readonly #localMountScopes: string[]
+  #localMountRoot?: string
   readonly #localMounts = new Map<string, MountedWorkspaceHandleLike>()
   readonly #localMountSupervisions = new Map<string, {
     startDir: string
@@ -321,6 +328,9 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountPreflight = config.localMountPreflight ?? runLocalMountPreflight
     this.#localMountAgentName = config.agentName ?? DEFAULT_AGENT_NAME
     this.#localMountScopes = config.scopes ?? [...FACTORY_RELAYFILE_SCOPES]
+    this.#localMountRoot = config.localMountRoot ??
+      config.workspaceMirrorResolver?.([this.workspaceId]) ??
+      resolveRegisteredWorkspaceMirror([this.workspaceId])?.localDir
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
@@ -355,9 +365,13 @@ export class RelayfileCloudMountClient implements MountClient {
     })
     const client = handle.client()
 
+    const registeredMountRoot = config.localMountRoot ??
+      config.workspaceMirrorResolver?.([workspaceId, handle.workspaceId ?? '']) ??
+      resolveRegisteredWorkspaceMirror([workspaceId, handle.workspaceId ?? ''])?.localDir
     return new RelayfileCloudMountClient({
       ...config,
       workspaceId,
+      ...(registeredMountRoot ? { localMountRoot: registeredMountRoot } : {}),
       client,
       // WorkspaceHandle.getToken() returns the token originally minted by
       // joinWorkspace. RelayFileClient.getToken() resolves the SDK's rotating
@@ -370,11 +384,55 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async ensureLocalMount(startDir: string, options: LocalMountOptions = {}): Promise<void> {
-    const localDir = join(resolve(startDir), '.integrations')
-    return this.#runLocalMountOperation(localDir, () => this.#ensureLocalMount(startDir, localDir, options))
+    // A Relayfile workspace has one registered local mirror.  Do not derive a
+    // new one from every routed checkout: that asks Relayfile to re-home the
+    // workspace and makes all but the first route fail.  The fallback is only
+    // invoked once per Factory command rather than once per repository.
+    const hasResolvedMirror = this.#localMountRoot !== undefined
+    const localDir = this.#localMountRoot ?? join(resolve(startDir), '.integrations')
+    this.#localMountRoot = localDir
+    try {
+      await this.#runLocalMountOperation(localDir, () => this.#ensureLocalMount(localDir, options))
+      return
+    } catch (error) {
+      // Older Relayfile installations do not persist the registration in a
+      // local file we can read. The mount admission response is nevertheless
+      // authoritative about the already-registered root. Retry exactly that
+      // root once; never ask Relayfile to re-home it and never override an
+      // explicit/configured mirror root.
+      const registeredRoot = hasResolvedMirror ? undefined : registeredMirrorFromMountError(error)
+      if (!registeredRoot || registeredRoot === localDir) throw error
+      this.#clearLocalMountHealthCheck(localDir)
+      this.#localMountSupervisions.delete(localDir)
+      this.#degradedLocalMounts.delete(localDir)
+      this.#authDegradedLocalMounts.delete(localDir)
+      this.#localMountRoot = registeredRoot
+      await this.#runLocalMountOperation(registeredRoot, () => this.#ensureLocalMount(registeredRoot, options))
+    }
   }
 
-  async #ensureLocalMount(startDir: string, localDir: string, options: LocalMountOptions): Promise<void> {
+  getLocalMountRoot(): string | undefined {
+    return this.#localMountRoot
+  }
+
+  getLocalMountHealth(): LocalMountHealth {
+    const localDir = this.#localMountRoot
+    if (!localDir) {
+      return { degraded: true, reason: 'Relayfile workspace mirror is not registered' }
+    }
+    const statePath = join(localDir, '.relay', 'state.json')
+    if (!existsSync(statePath)) {
+      return { degraded: true, reason: `mount state is missing at ${statePath}`, localDir }
+    }
+    const staleness = checkMountStaleness(statePath, this.workspaceId, this.#acceptableWorkspaceIds())
+    return {
+      degraded: staleness.stale,
+      ...(staleness.reason ? { reason: staleness.reason } : {}),
+      localDir,
+    }
+  }
+
+  async #ensureLocalMount(localDir: string, options: LocalMountOptions): Promise<void> {
     const setup = this.#relayfileSetup
     const workspace = this.#relayfileWorkspace
     if (!setup?.ensureMountedWorkspace || !workspace) {
@@ -382,10 +440,7 @@ export class RelayfileCloudMountClient implements MountClient {
     }
     const ensureMountedWorkspace = setup.ensureMountedWorkspace.bind(setup)
 
-    const acceptableWorkspaceIds = new Set(options.acceptableWorkspaceIds ?? [])
-    if (workspace.workspaceId && workspace.workspaceId !== this.workspaceId) {
-      acceptableWorkspaceIds.add(workspace.workspaceId)
-    }
+    const acceptableWorkspaceIds = new Set(this.#acceptableWorkspaceIds(options.acceptableWorkspaceIds))
     const launch = (): Promise<MountedWorkspaceHandleLike> => ensureMountedWorkspace({
       workspace,
       localDir,
@@ -404,7 +459,7 @@ export class RelayfileCloudMountClient implements MountClient {
       ...(options.stateWaitTimeoutMs === undefined ? {} : { readyTimeoutMs: options.stateWaitTimeoutMs }),
     })
     this.#localMountSupervisions.set(localDir, {
-      startDir,
+      startDir: join(localDir, '..'),
       options: { ...options, acceptableWorkspaceIds: [...acceptableWorkspaceIds] },
       launch,
       suggestedRefreshAtMs: this.#localMountSupervisions.get(localDir)?.suggestedRefreshAtMs,
@@ -417,7 +472,7 @@ export class RelayfileCloudMountClient implements MountClient {
     if (staleBefore?.stale) this.#markLocalMountDegraded(localDir, 'mount_stale')
 
     try {
-      await this.#localMountPreflight(this.workspaceId, startDir, {
+      await this.#localMountPreflight(this.workspaceId, join(localDir, '..'), {
         ...options,
         acceptableWorkspaceIds: [...acceptableWorkspaceIds],
         startMount: async () => {
@@ -443,6 +498,17 @@ export class RelayfileCloudMountClient implements MountClient {
     if (staleAfter.stale) this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
     else this.#markLocalMountRecovered(localDir)
     this.#scheduleLocalMountHealthCheck(localDir)
+  }
+
+  #acceptableWorkspaceIds(extra: readonly string[] = []): string[] {
+    const workspace = this.#relayfileWorkspace?.workspaceId
+    return [...new Set([...extra, ...(workspace && workspace !== this.workspaceId ? [workspace] : [])])]
+  }
+
+  #clearLocalMountHealthCheck(localDir: string): void {
+    const timer = this.#localMountHealthTimers.get(localDir)
+    if (timer) clearTimeout(timer)
+    this.#localMountHealthTimers.delete(localDir)
   }
 
   #runLocalMountOperation(localDir: string, operation: () => Promise<void>): Promise<void> {
@@ -919,6 +985,19 @@ const serializeContent = (content: unknown): { content: string; contentType: str
     content: JSON.stringify(content),
     contentType: 'application/json',
   }
+}
+
+/**
+ * Relayfile's single-mirror admission check names the registered directory in
+ * its refusal. Treat that directory as a read-only registration lookup: the
+ * retry asks for the already registered root and never supplies `--rehome`.
+ */
+function registeredMirrorFromMountError(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error)
+  const match = /\balready mirrored at\s+(.+?)(?:;|\n|$)/iu.exec(message)
+  if (!match?.[1]) return undefined
+  const localDir = match[1].trim().replace(/^["']|["']$/gu, '')
+  return localDir.startsWith('/') ? resolve(localDir) : undefined
 }
 
 const isHttpStatus = (error: unknown, status: number): boolean => {

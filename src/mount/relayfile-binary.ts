@@ -1,6 +1,11 @@
 import { readFileSync } from 'node:fs'
 
-const STALE_RECONCILE_MS = 15 * 60 * 1000
+// Relayfile's poll mirror reconciles every 30 seconds by default.  Three
+// intervals allow one missed poll and ordinary filesystem jitter, while still
+// making a stalled projection visible within 90 seconds rather than hours.
+export const RELAYFILE_SYNC_INTERVAL_MS = 30 * 1000
+export const STALE_RECONCILE_INTERVALS = 3
+export const STALE_RECONCILE_MS = RELAYFILE_SYNC_INTERVAL_MS * STALE_RECONCILE_INTERVALS
 
 type MountState = {
   workspaceId?: unknown

@@ -3,7 +3,11 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { checkMountStaleness } from './relayfile-binary'
+import {
+  checkMountStaleness,
+  RELAYFILE_SYNC_INTERVAL_MS,
+  STALE_RECONCILE_INTERVALS,
+} from './relayfile-binary'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -90,6 +94,23 @@ describe('checkMountStaleness', () => {
       expect(result.stale).toBe(true)
       expect(result.reason).toMatch(/^last reconcile 16m ago$/u)
       expect(result.pid).toBe(process.pid)
+    })
+  })
+
+  it('uses a multiple of the Relayfile poll interval as its stale threshold', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(
+          Date.now() - (RELAYFILE_SYNC_INTERVAL_MS * STALE_RECONCILE_INTERVALS) - 1,
+        ).toISOString(),
+        pid: process.pid,
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toMatchObject({
+        stale: true,
+        reason: expect.stringMatching(/^last reconcile \d+m ago$/u),
+      })
     })
   })
 

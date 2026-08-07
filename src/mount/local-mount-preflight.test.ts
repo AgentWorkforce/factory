@@ -99,6 +99,7 @@ describe('ensureLocalMount', () => {
           pid: process.pid,
         })
       })
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
       await expect(ensureLocalMount('rw_test', dir, {
         startMount,
@@ -106,6 +107,9 @@ describe('ensureLocalMount', () => {
         stateWaitPollMs: 1,
       })).resolves.toBeUndefined()
       expect(startMount).toHaveBeenCalledTimes(1)
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(
+        `local mount at ${join(dir, '.integrations')} is stale`,
+      ))
     })
   })
 

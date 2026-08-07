@@ -82,6 +82,10 @@ export async function ensureLocalMount(
 
   const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
   const manualHint = 'Restart Factory after restoring the Agent Relay Cloud session'
+  // Include the registered target in an operator-facing refresh log. This is
+  // intentionally the state path's parent, not the current Factory checkout:
+  // a stale mirror must heal where Relayfile registered it.
+  const mountTarget = join(startDir, '.integrations')
 
   // Stale AND under-scoped: refreshing cannot help. Fail fast and terminal so
   // the supervisor stops retrying and startup surfaces one actionable error.
@@ -90,14 +94,14 @@ export async function ensureLocalMount(
   }
 
   if (options.refreshStaleMount === false) {
-    process.stderr.write(`[factory] local mount is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
     return
   }
 
   // Self-heal through the same SDK-authenticated launch path used for first
   // start, rather than silently shipping writebacks into a stale mirror.
   if (!options.suppressStaleRefreshLogs) {
-    process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix}; refreshing\n`)
   }
   try {
     await options.startMount()
@@ -109,7 +113,7 @@ export async function ensureLocalMount(
       options.acceptableWorkspaceIds,
     )
     if (!options.suppressStaleRefreshLogs) {
-      process.stderr.write('[factory] local mount refreshed\n')
+      process.stderr.write(`[factory] local mount at ${mountTarget} refreshed\n`)
     }
   } catch (error) {
     if (error instanceof MountAuthScopeError) throw error
@@ -124,7 +128,7 @@ export async function ensureLocalMount(
         cause: error,
       })
     }
-    process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
   }
 }
 

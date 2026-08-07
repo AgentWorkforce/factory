@@ -8,6 +8,7 @@ export type {
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  LocalMountHealth,
   LocalMountOptions,
   MountClient,
   ProviderSyncStatus,

@@ -43,6 +43,12 @@ export interface LocalMountOptions {
   stateWaitPollMs?: number
 }
 
+export interface LocalMountHealth {
+  degraded: boolean
+  reason?: string
+  localDir?: string
+}
+
 export interface GithubPublishPullRequestInput {
   repo: string
   /** Local checkout fallback for internal/local dispatches. */
@@ -106,8 +112,12 @@ export interface MountClient {
    */
   readonly resourceSubscriptions?: ResourceSubscriptionsClient
   readonly integrationConnections?: FactoryIntegrationConnections
-  /** Ensure the SDK-authenticated Relayfile mirror exists below a checkout. */
+  /** Ensure the SDK-authenticated Relayfile workspace mirror is available. */
   ensureLocalMount?(startDir: string, options?: LocalMountOptions): Promise<void>
+  /** The registered workspace mirror root, when the mount can resolve one. */
+  getLocalMountRoot?(): string | undefined
+  /** Read-only local mirror freshness for `factory status`. */
+  getLocalMountHealth?(): LocalMountHealth
   /**
    * Whether a local mount is terminally degraded because the cloud session
    * lacks the filesystem scope the mount needs. When true, the mirror is
