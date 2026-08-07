@@ -16241,6 +16241,87 @@ describe('FactoryLoop PR babysitter', () => {
   const humanReviewStateId = 'state-human-review'
   const inPlanning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
 
+  it('discovers one opted-in routed PR without issue dispatch and keeps notifications off', async () => {
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/701.json': {
+        number: 701,
+        title: 'Repair a human-authored PR',
+        body: 'Use this PR body as the definition of done.',
+        state: 'OPEN',
+        isDraft: false,
+        merged: false,
+        url: 'https://github.com/AgentWorkforce/pear/pull/701',
+        headRefName: 'human/repair-pr',
+        headRefOid: 'head-701',
+        baseRefName: 'main',
+        headRepository: { nameWithOwner: 'AgentWorkforce/pear' },
+        isCrossRepository: false,
+        labels: [],
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['pear'],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+      babysitter: {
+        enabled: true,
+        mode: 'routed-open-prs',
+        excludeLabels: ['factory:skip-babysitter'],
+        excludePullRequests: [],
+        notifyHumans: false,
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.runOnce()
+
+    expect(fleet.spawns).toHaveLength(1)
+    expect(fleet.spawns[0]?.invocationId).toBe('factory-babysit:agentworkforce/pear#701')
+    expect(fleet.spawns[0]?.task).toContain('PR title JSON (definition of done): "Repair a human-authored PR"')
+    expect(fleet.spawns[0]?.task).toContain('Before your first provider write')
+    expect(fleet.spawns[0]?.task).toContain('Do not post status comments, mention humans, send notifications, or escalate')
+    expect(fleet.spawns[0]?.task).not.toContain('proactively offer to discuss')
+  })
+
+  it('checks routed PR opt-out before spawning', async () => {
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/702.json': {
+        number: 702,
+        title: 'Leave this PR alone',
+        body: '',
+        state: 'OPEN',
+        isDraft: false,
+        merged: false,
+        headRefName: 'human/no-babysitter',
+        headRefOid: 'head-702',
+        baseRefName: 'main',
+        headRepository: { nameWithOwner: 'AgentWorkforce/pear' },
+        isCrossRepository: false,
+        labels: [{ name: 'factory:skip-babysitter' }],
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: { org: 'AgentWorkforce', names: ['pear'], clonePaths: { 'AgentWorkforce/pear': '/work/pear' } },
+      babysitter: {
+        enabled: true,
+        mode: 'routed-open-prs',
+        excludeLabels: ['factory:skip-babysitter'],
+        excludePullRequests: [],
+        notifyHumans: false,
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.runOnce()
+
+    expect(fleet.spawns).toEqual([])
+  })
+
   const babysitterConfig = (overrides: FactoryConfigOverrides = {}): FactoryConfig => config({
     babysitter: { enabled: true },
     terminalState: 'human-review',

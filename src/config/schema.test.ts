@@ -36,7 +36,13 @@ describe('FactoryConfigSchema', () => {
       reviewer: 'spawn:claude',
       babysitter: 'spawn:claude',
     })
-    expect(parsed.babysitter).toEqual({ enabled: false })
+    expect(parsed.babysitter).toEqual({
+      enabled: false,
+      mode: 'factory-created',
+      excludeLabels: ['factory:skip-babysitter'],
+      excludePullRequests: [],
+      notifyHumans: false,
+    })
     expect(parsed.terminalState).toBe('human-review')
     expect(parsed.stateIds.humanReview).toBeUndefined()
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')

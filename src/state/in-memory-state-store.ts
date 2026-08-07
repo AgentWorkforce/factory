@@ -9,6 +9,8 @@ import type {
   DispatchAttemptState,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
+  RoutedPrBabysitterClaim,
+  RoutedPrBabysitterClaimResult,
   ConversationMessage,
   ConversationSessionState,
   StateStore,
@@ -31,6 +33,7 @@ type WorkspaceState = {
   canonicalIssueStates: Map<string, string>
   dispatchFailureReaperHandoffs: Map<string, RegistryHandoffAgent>
   babysitterSessions: Map<string, BabysitterSessionState>
+  routedPrBabysitterClaims: Map<string, RoutedPrBabysitterClaim>
   dispatchLifecycles: Map<string, DispatchLifecycle>
 }
 
@@ -633,6 +636,85 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).babysitterSessions.delete(issueKey)
   }
 
+  async claimRoutedPrBabysitter(
+    workspaceId: string,
+    identity: string,
+    seed: Omit<RoutedPrBabysitterClaim, 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+    maxActive: number,
+  ): Promise<RoutedPrBabysitterClaimResult> {
+    const claims = this.#workspace(workspaceId).routedPrBabysitterClaims
+    const existing = claims.get(identity)
+    if (existing?.status !== 'complete' && existing?.owner === owner) {
+      existing.leaseUntilMs = nowMs + leaseMs
+      existing.updatedAtMs = nowMs
+      return { outcome: 'owned', claim: structuredClone(existing) }
+    }
+    if (existing?.status !== 'complete' && existing && existing.leaseUntilMs > nowMs) {
+      return { outcome: 'already-running', claim: structuredClone(existing) }
+    }
+    if (existing?.status === 'complete' && (existing.source === 'issue-created' || existing.revision === seed.revision)) {
+      return { outcome: 'unchanged', claim: structuredClone(existing) }
+    }
+    const active = [...claims.entries()].filter(([key, claim]) =>
+      key !== identity && claim.status !== 'complete' && claim.leaseUntilMs > nowMs
+    ).length
+    if (active >= Math.max(1, Math.trunc(maxActive))) return { outcome: 'capacity' }
+    const claim: RoutedPrBabysitterClaim = {
+      ...seed,
+      status: 'claimed',
+      owner,
+      leaseUntilMs: nowMs + leaseMs,
+      claimedAtMs: nowMs,
+      updatedAtMs: nowMs,
+    }
+    claims.set(identity, claim)
+    return { outcome: 'claimed', claim: structuredClone(claim) }
+  }
+
+  async markRoutedPrBabysitterRunning(
+    workspaceId: string,
+    identity: string,
+    owner: string,
+    agentName: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const claim = this.#workspace(workspaceId).routedPrBabysitterClaims.get(identity)
+    if (!claim || claim.owner !== owner || claim.status === 'complete') return false
+    claim.status = 'running'
+    claim.agentName = agentName
+    claim.updatedAtMs = nowMs
+    return true
+  }
+
+  async completeRoutedPrBabysitter(
+    workspaceId: string,
+    identity: string,
+    agentName: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const claim = this.#workspace(workspaceId).routedPrBabysitterClaims.get(identity)
+    if (!claim || claim.agentName !== agentName || claim.status === 'complete') return false
+    claim.status = 'complete'
+    claim.leaseUntilMs = nowMs
+    claim.updatedAtMs = nowMs
+    return true
+  }
+
+  async releaseRoutedPrBabysitterClaim(workspaceId: string, identity: string, owner: string): Promise<boolean> {
+    const claims = this.#workspace(workspaceId).routedPrBabysitterClaims
+    const claim = claims.get(identity)
+    if (!claim || claim.owner !== owner || claim.status === 'running') return false
+    return claims.delete(identity)
+  }
+
+  async listRoutedPrBabysitterClaims(workspaceId: string): Promise<Array<[string, RoutedPrBabysitterClaim]>> {
+    return [...this.#workspace(workspaceId).routedPrBabysitterClaims]
+      .map(([identity, claim]) => [identity, structuredClone(claim)])
+  }
+
   async recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void> {
     this.#workspace(workspaceId).canonicalIssueStates.set(key, stateId)
   }
@@ -658,6 +740,7 @@ export class InMemoryStateStore implements StateStore {
         canonicalIssueStates: new Map(),
         dispatchFailureReaperHandoffs: new Map(),
         babysitterSessions: new Map(),
+        routedPrBabysitterClaims: new Map(),
         dispatchLifecycles: new Map(),
       }
       this.#workspaces.set(workspaceId, state)

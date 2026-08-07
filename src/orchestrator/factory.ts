@@ -5,7 +5,16 @@ import { dirname, isAbsolute, resolve } from 'node:path'
 import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
-import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import {
+  GithubMergeGate,
+  closeProbePr,
+  discoverRoutedPullRequests,
+  routedPrIdentity,
+  standaloneBabysitterAgentName,
+  type GhRunner,
+  type GithubMergeGate as GithubMergeGatePort,
+  type RoutedPrCandidate,
+} from '../github'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
@@ -282,6 +291,7 @@ const INJECTION_RETRY_DELAY_MS = 1_000
 const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const BABYSITTER_EVENT_COALESCE_MS = 750
+const ROUTED_PR_BABYSITTER_CLAIM_LEASE_MS = 15 * 60_000
 const BABYSITTER_EVENT_RETRY_MS = 1_000
 const BABYSITTER_SUBSCRIPTION_TTL_SECONDS = 60 * 60
 // Relayfile receives provider-native GitHub events, not the materialized file
@@ -441,6 +451,9 @@ export class FactoryLoop implements Factory {
   readonly #clarificationWakeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #clarificationWakeOwner = `${process.pid}:${randomUUID()}`
   readonly #dispatchLifecycleOwner = `${process.pid}:${randomUUID()}`
+  readonly #routedPrBabysitterOwner = `${process.pid}:${randomUUID()}`
+  readonly #routedPrBabysitterAgents = new Map<string, string>()
+  #routedPrBabysitterSweep?: Promise<void>
   readonly #dispatchLifecycleEpochs = new Map<string, number>()
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -804,6 +817,7 @@ export class FactoryLoop implements Factory {
     try {
       this.#wireFleetEvents()
       await this.#adoptInFlightAgents(legacyRegistry)
+      await this.#restoreRoutedPrBabysitterClaims()
       this.#startupAgentAdoptionActive = false
       if (opts.mode !== 'dispatch-owner') await this.#reapOrphanedWorktreesOnStartup(legacyRegistry)
       if (this.#config.babysitter.enabled) {
@@ -927,6 +941,7 @@ export class FactoryLoop implements Factory {
       this.#clarificationIntents.clear()
 
       await this.#drainBabysitterWakesForStop()
+      await this.#routedPrBabysitterSweep
       await this.#drainAgentExitsInFlight()
 
       // Durable relay placements must survive an owner restart so a successor
@@ -946,6 +961,7 @@ export class FactoryLoop implements Factory {
       this.#babysitterSubscriptionOwners.clear()
       this.#babysitterReady.clear()
       this.#babysitterCriticalAgents.clear()
+      this.#routedPrBabysitterAgents.clear()
       const subscription = this.#subscription
       this.#subscription = undefined
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
@@ -1246,6 +1262,7 @@ export class FactoryLoop implements Factory {
         if (!page.nextCursor || page.nextCursor === cursor) break
         cursor = page.nextCursor
       }
+      await this.#sweepRoutedPrBabysitters()
     } catch (error) {
       this.#logger.warn?.('[factory] live subscription poll failed', error)
     } finally {
@@ -1535,6 +1552,7 @@ export class FactoryLoop implements Factory {
     // while the event loop was busy (for example during a large startup pull).
     // Keep reconciliation active even when babysitters own PR completion.
     await this.#fleet.reconcileTrackedAgents?.()
+    await this.#sweepRoutedPrBabysitters()
     // When the babysitter owns PR-open, completion is driven by PR webhooks +
     // the babysitter's readiness signal (see #handlePrChange / #handleAgentExit),
     // not this polling sweep. Disabling it here is what makes the babysitter path
@@ -1669,6 +1687,199 @@ export class FactoryLoop implements Factory {
     return undefined
   }
 
+  async #restoreRoutedPrBabysitterClaims(): Promise<void> {
+    if (this.#config.babysitter.mode !== 'routed-open-prs') return
+    const roster = await this.#fleet.roster()
+    const online = new Set(roster.agents.map((agent) => agent.name))
+    for (const [identity, claim] of await this.#state.listRoutedPrBabysitterClaims(this.#workspaceId)) {
+      if (claim.status === 'running' && claim.agentName && online.has(claim.agentName)) {
+        this.#routedPrBabysitterAgents.set(claim.agentName, identity)
+        this.#increment('routedPrBabysitterClaimsRestored')
+      } else if (claim.status !== 'complete' && claim.leaseUntilMs > this.#clock.now()) {
+        this.#logger.warn?.('[factory] routed PR babysitter claim awaits lease expiry after missing agent', {
+          repo: claim.repo,
+          prNumber: claim.prNumber,
+          leaseUntilMs: claim.leaseUntilMs,
+        })
+      }
+    }
+  }
+
+  async #sweepRoutedPrBabysitters(dryRun = this.#config.dryRun): Promise<void> {
+    if (!this.#config.babysitter.enabled || this.#config.babysitter.mode !== 'routed-open-prs' || this.#stopping) return
+    if (this.#routedPrBabysitterSweep) return this.#routedPrBabysitterSweep
+    const sweep = this.#runRoutedPrBabysitterSweep(dryRun).finally(() => {
+      if (this.#routedPrBabysitterSweep === sweep) this.#routedPrBabysitterSweep = undefined
+    })
+    this.#routedPrBabysitterSweep = sweep
+    return sweep
+  }
+
+  async #runRoutedPrBabysitterSweep(dryRun: boolean): Promise<void> {
+    const discovery = await discoverRoutedPullRequests(this.#mount, this.#config)
+    const priorClaims = await this.#state.listRoutedPrBabysitterClaims(this.#workspaceId)
+    for (const [identity, claim] of priorClaims) {
+      if (
+        claim.owner === this.#routedPrBabysitterOwner &&
+        claim.status === 'running' &&
+        claim.agentName &&
+        this.#routedPrBabysitterAgents.get(claim.agentName) === identity
+      ) {
+        await this.#state.claimRoutedPrBabysitter(
+          this.#workspaceId,
+          identity,
+          {
+            repo: claim.repo,
+            prNumber: claim.prNumber,
+            revision: claim.revision,
+            source: claim.source,
+          },
+          this.#routedPrBabysitterOwner,
+          this.#clock.now(),
+          ROUTED_PR_BABYSITTER_CLAIM_LEASE_MS,
+          this.#config.batchSize,
+        )
+      }
+    }
+    const stats = {
+      scanned: discovery.scanned,
+      eligible: discovery.eligible,
+      excluded: discovery.excluded,
+      incomplete: discovery.incomplete,
+      terminal: discovery.terminal,
+      crossRepository: discovery.crossRepository,
+      duplicates: discovery.duplicates,
+      failures: discovery.failures.length,
+      alreadyOwned: 0,
+      admitted: 0,
+      capacityDeferred: 0,
+      unchanged: 0,
+    }
+    for (const failure of discovery.failures) {
+      this.#logger.warn?.('[factory] routed PR babysitter discovery dropped candidate', failure)
+    }
+    const issueSessions = await this.#state.listBabysitterSessions(this.#workspaceId)
+    const issueOwned = new Set(issueSessions.map(([, session]) => routedPrIdentity(session.repo, session.prNumber)))
+    for (const candidate of discovery.candidates) {
+      const identity = routedPrIdentity(candidate.repo, candidate.number)
+      if (issueOwned.has(identity)) {
+        stats.alreadyOwned += 1
+        continue
+      }
+      if (dryRun) continue
+      const claim = await this.#state.claimRoutedPrBabysitter(
+        this.#workspaceId,
+        identity,
+        {
+          repo: candidate.repo,
+          prNumber: candidate.number,
+          revision: candidate.revision,
+          source: 'routed-open-prs',
+        },
+        this.#routedPrBabysitterOwner,
+        this.#clock.now(),
+        ROUTED_PR_BABYSITTER_CLAIM_LEASE_MS,
+        this.#config.batchSize,
+      )
+      if (claim.outcome === 'capacity') {
+        stats.capacityDeferred += 1
+        continue
+      }
+      if (claim.outcome === 'already-running' || claim.outcome === 'owned') {
+        stats.alreadyOwned += 1
+        continue
+      }
+      if (claim.outcome === 'unchanged') {
+        stats.unchanged += 1
+        continue
+      }
+      try {
+        await this.#spawnRoutedPrBabysitter(candidate, identity)
+        stats.admitted += 1
+      } catch (error) {
+        await this.#state.releaseRoutedPrBabysitterClaim(
+          this.#workspaceId,
+          identity,
+          this.#routedPrBabysitterOwner,
+        )
+        this.#increment('routedPrBabysitterSpawnFailures')
+        this.#logger.warn?.('[factory] routed PR babysitter spawn failed', {
+          repo: candidate.repo,
+          prNumber: candidate.number,
+          error: describeError(error).errorMessage,
+        })
+      }
+      // Pacing is intentionally one new admission per sweep. Every remaining
+      // eligible candidate is explicitly accounted as deferred, never dropped.
+      stats.capacityDeferred += discovery.candidates.length -
+        stats.alreadyOwned - stats.unchanged - stats.admitted - stats.capacityDeferred
+      break
+    }
+    this.#logger.info?.('[factory] routed PR babysitter sweep completed', stats)
+  }
+
+  async #spawnRoutedPrBabysitter(candidate: RoutedPrCandidate, identity: string): Promise<void> {
+    const clonePath = this.#config.repos.clonePaths[candidate.repo]
+    const issue = {
+      key: `${candidate.repo}#${candidate.number}`,
+      title: candidate.title,
+      description: candidate.body || '(No PR description was provided.)',
+    }
+    const testGuidance = await resolveTestGuidance({
+      repoPath: clonePath,
+      issue,
+      changedFiles: candidate.filesChanged,
+    })
+    const name = standaloneBabysitterAgentName(candidate.repo, candidate.number)
+    const task = renderAgentTask({
+      issue,
+      route: { repo: candidate.repo, clonePath },
+      role: 'babysitter',
+      config: { mergePolicy: 'never', terminalState: 'human-review' },
+      reviewerName: '',
+      pr: {
+        number: candidate.number,
+        url: candidate.url,
+        headRef: candidate.headRef,
+        headSha: candidate.headSha,
+        baseRef: candidate.baseRef,
+        headRepo: candidate.headRepo,
+        crossRepository: candidate.crossRepository,
+        maintainerCanModify: candidate.maintainerCanModify,
+      },
+      standaloneBabysitter: {
+        specSource: 'pull-request',
+        excludeLabels: this.#config.babysitter.excludeLabels,
+        notifyHumans: this.#config.babysitter.notifyHumans,
+      },
+      integrationsMountRoot: this.#integrationsMountRoot(),
+      testGuidance,
+    })
+    const result = await this.#fleet.spawn({
+      name,
+      capability: this.#config.agentCapabilities.babysitter,
+      node: 'self',
+      repo: candidate.repo,
+      clonePath,
+      task,
+      model: this.#config.models.babysitter,
+      cwd: clonePath,
+      invocationId: `factory-babysit:${identity}`,
+    })
+    if (!await this.#state.markRoutedPrBabysitterRunning(
+      this.#workspaceId,
+      identity,
+      this.#routedPrBabysitterOwner,
+      result.name,
+      this.#clock.now(),
+    )) {
+      await this.#fleet.release(result.name, 'routed-pr-claim-lost')
+      throw new Error(`Routed PR babysitter claim lost after spawning ${identity}`)
+    }
+    this.#routedPrBabysitterAgents.set(result.name, identity)
+    this.#increment('routedPrBabysittersSpawned')
+  }
+
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const startedAtMs = this.#clock.now()
@@ -1678,6 +1889,7 @@ export class FactoryLoop implements Factory {
     this.#logger.info?.('[factory] run-once started', { dryRun })
     let report: IterationReport | undefined
     try {
+      await this.#sweepRoutedPrBabysitters(dryRun)
       this.#dependencyIssues.clear()
       // Terminal observations are only a live-cycle cache. Rebuild them from
       // current provider snapshots (or merged PR metadata) so a reopened issue
@@ -5693,6 +5905,20 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    const routedIdentity = this.#routedPrBabysitterAgents.get(name)
+    if (routedIdentity) {
+      this.#routedPrBabysitterAgents.delete(name)
+      await this.#state.completeRoutedPrBabysitter(
+        this.#workspaceId,
+        routedIdentity,
+        name,
+        this.#clock.now(),
+      )
+      this.#increment('routedPrBabysittersCompleted')
+      await this.#sweepRoutedPrBabysitters()
+      return
+    }
+
     // Agent messages and exits are separate fleet callbacks. A needs-input DM
     // can therefore be followed by the instructed session exit before the
     // first durable state await completes. The message handler installs this
@@ -5748,6 +5974,14 @@ export class FactoryLoop implements Factory {
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit question replay completed', { issue: record.issue.key, name })
 
     const exiting = record.agents.get(name)
+    if (isCompletionReason(reason) && exiting?.spec.role === 'babysitter' && exiting.spec.ownedPullRequest) {
+      await this.#state.completeRoutedPrBabysitter(
+        this.#workspaceId,
+        routedPrIdentity(exiting.spec.ownedPullRequest.repo, exiting.spec.ownedPullRequest.number),
+        name,
+        this.#clock.now(),
+      )
+    }
     if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
@@ -10041,6 +10275,11 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // The routed sweep performs its own authoritative metadata and opt-out
+    // checks. Trigger it from PR activity, but keep the issue-created router
+    // below unchanged.
+    void this.#sweepRoutedPrBabysitters()
+
     const repo = `${parts.owner}/${parts.repo}`
     // Once ownership exists, it is authoritative even if the PR title or head
     // branch is renamed. Branch/title/body matching is spawn-time discovery
@@ -10311,6 +10550,30 @@ export class FactoryLoop implements Factory {
       this.#increment('babysitterLifecycleOwnershipRejected')
       return
     }
+    const prWorkIdentity = routedPrIdentity(prRef.repo, prRef.prNumber)
+    const prWorkClaim = await this.#state.claimRoutedPrBabysitter(
+      this.#workspaceId,
+      prWorkIdentity,
+      {
+        repo: prRef.repo,
+        prNumber: prRef.prNumber,
+        revision: `issue:${issueKey(record.issue)}`,
+        source: 'issue-created',
+      },
+      this.#dispatchLifecycleOwner,
+      this.#clock.now(),
+      ROUTED_PR_BABYSITTER_CLAIM_LEASE_MS,
+      Number.MAX_SAFE_INTEGER,
+    )
+    if (prWorkClaim.outcome === 'already-running' && prWorkClaim.claim?.source === 'routed-open-prs') {
+      this.#increment('babysitterOwnershipConflictsSuppressed')
+      this.#logger.warn?.('[factory] issue-created babysitter suppressed by existing PR work-unit claim', {
+        issue: record.issue.key,
+        repo: prRef.repo,
+        prNumber: prRef.prNumber,
+      })
+      return
+    }
     const replacedSuperseded = prRef.authoritative
       ? await this.#retireSupersededBabysitters(record, prRef)
       : false
@@ -10363,6 +10626,13 @@ export class FactoryLoop implements Factory {
       this.#babysitterSpawned.add(babysitterKey)
       const ref = this.#babysitterPr.get(babysitterKey)!
       await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#state.markRoutedPrBabysitterRunning(
+        this.#workspaceId,
+        prWorkIdentity,
+        this.#dispatchLifecycleOwner,
+        tracked.result?.name ?? trackedName,
+        this.#clock.now(),
+      )
       await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#retargetSlackConversationToBabysitter(record)
       return
@@ -10466,6 +10736,13 @@ export class FactoryLoop implements Factory {
       })
       const ref = this.#babysitterPr.get(babysitterKey)!
       await this.#persistBabysitterSession(record.issue, ref, tracked)
+      await this.#state.markRoutedPrBabysitterRunning(
+        this.#workspaceId,
+        prWorkIdentity,
+        this.#dispatchLifecycleOwner,
+        tracked?.result?.name ?? spawned.name,
+        this.#clock.now(),
+      )
       await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#retargetSlackConversationToBabysitter(record)
       await this.#writeInFlightRegistry()

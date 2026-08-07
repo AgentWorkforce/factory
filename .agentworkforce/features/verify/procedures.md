@@ -351,6 +351,19 @@ Verify the PR contains the issue key, commits, tests, and review activity; no dr
 
 Enable `babysitter.enabled`, open a non-draft PR through the issue-driven path, and confirm only one babysitter starts. Make CI fail or add a review request, confirm only the exact repo/PR owner wakes, then enter the documented destructive critical section and prove Factory ACKs only after the no-submit fence persists. Confirm coalesced activity is delivered once after exit, the babysitter fixes the current PR branch, then send/observe its readiness signal. A mismatched signal or draft/closed PR must not advance the issue.
 
+For widened intake, additionally set `babysitter.mode` to
+`routed-open-prs` in a disposable workspace. Provide one eligible PR, one PR
+with `factory:skip-babysitter`, one configured `excludePullRequests` identity,
+one draft, and one same-number PR in a repository absent from `repos.names`.
+Run a dry/read-only sweep and verify the exact discovery counters account for
+every candidate without spawning or writing. Then use a fake fleet/state test
+to prove the eligible PR is atomically claimed before spawn, two owners cannot
+claim it, the opt-outs spawn nothing, only one new routed PR is admitted per
+sweep, capacity deferrals are logged, restart restores the exact repo/PR owner,
+and the automatic prompt disables notifications and checks labels before its
+first provider write. Do not run a provider-writing widened sweep until the
+GitHub App identity path is independently validated.
+
 Do not attempt a cross-host active/active control-plane test: the supported ownership topology is multiple Factory processes sharing one same-host `FileStateStore`. Remote relay execution nodes are supported and do not need that directory.
 
 ### Standalone babysitter
