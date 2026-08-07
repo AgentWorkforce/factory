@@ -1329,8 +1329,10 @@ describe('fleet CLI runtime', () => {
   it('does not infer or preflight clone paths for a maintenance command', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-maintenance-clone-'))
     try {
+      const heartbeatPath = join(root, 'heartbeat.json')
       const configPath = await writeConfig(root, {
         repos: { org: 'AgentWorkforce', names: ['pear'] },
+        loop: { heartbeatPath, heartbeatStaleMs: 10_000 },
       })
       const git = vi.fn(async () => {
         throw new Error('status must not inspect local git state')
@@ -1834,7 +1836,8 @@ describe('fleet CLI runtime', () => {
   it('prints factory status from the top-level status command', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-status-'))
     try {
-      const configPath = await writeConfig(root)
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
       const output = buffer()
       const factoryStatus = { inFlight: [], queued: [], counters: { pulled: 0 } }
       const factory = {
@@ -1862,7 +1865,13 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+      expect(JSON.parse(output.text())).toEqual({
+        ...factoryStatus,
+        eventListener: {
+          state: 'not-listening',
+          reason: 'heartbeat missing',
+        },
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
