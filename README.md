@@ -228,10 +228,22 @@ therefore requires a resolvable active Agent Relay workspace key.
 into a workspace-private Agent Relay channel. A worker on any fleet machine can
 reconstruct the exact file at `workerMountRoot`, set it to mode `0444`, and
 apply the source SHA-256 gate without exposing the page in a public issue.
-The field defaults to `{ "kind": "local" }` whenever it is omitted, including
-in new manifests. Portable delivery must be selected explicitly; otherwise the
-worker uses the local mount path. Missing portable delivery or claim capability
-fails closed.
+`workerMountTransport` defaults to `{ "kind": "local" }` whenever it is
+omitted, including in new manifests. Portable delivery must be selected
+explicitly; otherwise the worker uses the local mount path. Missing portable
+delivery or claim capability fails closed.
+
+If dispatch stops after creating the durable claim but before recording its
+receipt, re-running stays blocked rather than guessing whether the downstream
+side effect happened. The blocked result includes the source key. A workspace
+administrator can derive the claim channel as
+`factory-notion-claim-<sha256(sourceKey)>`. After verifying that no matching
+lifecycle issue or workspace agent exists, the administrator may delete that
+channel in Agent Relay and re-run intake. Never clear a claim merely because
+its local receipt is missing: the shared claim, issue marker, and running agent
+must be reconciled first. A blocked portable-mount migration uses the same
+channel formula with `<sourceKey>:portable-mount` as the hashed value; verify
+the worker was not redispatched before clearing it.
 `page` accepts a Notion URL or a bare page ID.
 
 Plan without writes, then dispatch:

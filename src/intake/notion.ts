@@ -572,6 +572,28 @@ async function dispatchWorkspaceTask(
       return { ...base, status: 'blocked', agent: receipt.agent, node: receipt.node, reason: 'mounted spec changed after workspace dispatch' }
     }
     await claimNotionTask(task, input)
+    const needsPortableMigration = input.manifest.workerMountTransport.kind !== 'local' && !receipt.delivery
+    if (needsPortableMigration) {
+      if (!input.workspace?.redispatch) {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'portable workspace mount migration requires a workspace redispatcher',
+        }
+      }
+      const migrationClaim = await claimNotionTask(task, input, `${task.sourceKey}:portable-mount`)
+      if (migrationClaim.status === 'existing') {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'durable portable-mount migration claim already exists; refusing a second workspace redispatch',
+        }
+      }
+    }
     const delivery = await prepareContractDelivery(task, input, receipt.delivery)
     if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
       if (!input.workspace?.redispatch) {
@@ -610,7 +632,14 @@ async function dispatchWorkspaceTask(
   const name = `notion-${task.pageId.slice(-8)}-${suffix}`
   const claim = await claimNotionTask(task, input)
   if (claim.status === 'existing') {
-    const running = await input.workspace.find?.(name)
+    if (!input.workspace.find) {
+      return {
+        ...base,
+        status: 'blocked',
+        reason: 'durable Notion claim already exists but this workspace dispatcher cannot look up running agents; refusing a second spawn',
+      }
+    }
+    const running = await input.workspace.find(name)
     if (!running) {
       return {
         ...base,
@@ -670,16 +699,17 @@ async function observeNotionClaim(
 async function claimNotionTask(
   task: NormalizedNotionTask,
   input: Parameters<typeof runNotionIntake>[0],
+  sourceKey = task.sourceKey,
 ): Promise<{ status: 'claimed' | 'existing'; claim: NotionIntakeClaim }> {
   if (!input.claims) {
     throw new Error('dispatch requires a durable Agent Relay Notion claim store')
   }
   const result = await input.claims.claim({
-    sourceKey: task.sourceKey,
+    sourceKey,
     digest: task.digest,
     claimedAt: (input.now?.() ?? new Date()).toISOString(),
   })
-  if (result.claim.sourceKey !== task.sourceKey) {
+  if (result.claim.sourceKey !== sourceKey) {
     throw new Error('durable Notion claim does not match the requested source key')
   }
   if (result.claim.digest !== task.digest) {

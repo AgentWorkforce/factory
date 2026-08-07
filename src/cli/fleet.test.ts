@@ -767,6 +767,36 @@ describe('fleet CLI runtime', () => {
         ok: true,
         results: [{ status: 'already-dispatched', target: { projectPath } }],
       })
+
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Changed exact-path dispatch',
+        'Summary: This digest must not reuse the durable claim.',
+        'Recipe: single',
+        `Project-Paths: ${projectPath}`,
+      ].join('\n'))
+      await writeFile(manifestPath, JSON.stringify({
+        ...manifest,
+        statePath: './changed-state.json',
+      }))
+      const changedOutput = buffer()
+      const changedCode = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet,
+        notionClaims,
+        stdout: changedOutput,
+        stderr: buffer(),
+      })
+
+      expect(changedCode).toBe(1)
+      expect(fleet.spawns).toHaveLength(1)
+      expect(JSON.parse(changedOutput.text())).toMatchObject({
+        ok: false,
+        results: [{
+          status: 'blocked',
+          reason: 'durable Notion claim digest does not match the mounted spec',
+        }],
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

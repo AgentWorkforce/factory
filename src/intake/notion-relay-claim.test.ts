@@ -50,7 +50,7 @@ const claim = {
 }
 
 describe('RelayChannelNotionClaimStore', () => {
-  it('uses workspace-global channel uniqueness so different dispatchers observe one claim', async () => {
+  it('enforces the workspace-uniqueness contract across dispatcher instances', async () => {
     const fake = fakeRelaySurface()
     const first = new RelayChannelNotionClaimStore({
       workspaceKey: 'workspace-key',

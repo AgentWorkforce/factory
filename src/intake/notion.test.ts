@@ -683,7 +683,74 @@ describe('Notion spec intake', () => {
     ])
     expect(reports.flatMap((report) => report.results)).toContainEqual(expect.objectContaining({
       status: 'blocked',
-      reason: expect.stringContaining('refusing a second spawn'),
+      reason: 'durable Notion claim already exists but no running workspace agent was found; refusing a second spawn',
+    }))
+  })
+
+  it('reports a missing workspace lookup capability separately from a missing agent', async () => {
+    const firstFixture = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(firstFixture.root)
+    const workspace: WorkspaceTaskDispatcher = {
+      dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
+    }
+    await runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, workspace })
+
+    const secondManifest = {
+      ...firstFixture.manifest,
+      statePath: join(firstFixture.root, 'second-machine', 'state.json'),
+    }
+    const report = await runNotionIntake({ manifest: secondManifest, dispatch: true, claims, workspace })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: 'durable Notion claim already exists but this workspace dispatcher cannot look up running agents; refusing a second spawn',
+    })
+    expect(workspace.dispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses a durable migration claim to prevent two old receipts from redispatching one worker', async () => {
+    const firstFixture = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(firstFixture.root)
+    const workspace: WorkspaceTaskDispatcher = {
+      dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
+      redispatch: vi.fn(async () => {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+        return { agent: 'benchmark-agent', node: 'kjg-laptop', status: 'respawned' }
+      }),
+    }
+    await runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, workspace })
+    const secondStatePath = join(firstFixture.root, 'second-machine', 'state.json')
+    await mkdir(join(firstFixture.root, 'second-machine'), { recursive: true })
+    await writeFile(secondStatePath, await readFile(firstFixture.manifest.statePath, 'utf8'))
+    firstFixture.manifest.workerMountTransport = { kind: 'relay-channel' }
+    const secondManifest = { ...firstFixture.manifest, statePath: secondStatePath }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const reports = await Promise.all([
+      runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, workspace, contracts }),
+      runNotionIntake({ manifest: secondManifest, dispatch: true, claims, workspace, contracts }),
+    ])
+
+    expect(workspace.redispatch).toHaveBeenCalledTimes(1)
+    expect(contracts.publish).toHaveBeenCalledTimes(1)
+    expect(reports.flatMap((report) => report.results).map((result) => result.status).sort()).toEqual([
+      'already-dispatched',
+      'blocked',
+    ])
+    expect(reports.flatMap((report) => report.results)).toContainEqual(expect.objectContaining({
+      status: 'blocked',
+      reason: 'durable portable-mount migration claim already exists; refusing a second workspace redispatch',
     }))
   })
 
