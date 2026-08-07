@@ -121,6 +121,22 @@ const slackSchema = z.object({
 
 const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
+  // Preserve the historical issue-created intake unless an operator
+  // deliberately opts into the wider routed-repository sweep. Keeping the
+  // rollout switch separate from `enabled` lets the identity fix in #221 land
+  // before automated writes are attributed across existing human PRs.
+  mode: z.enum(['factory-created', 'routed-open-prs']).default('factory-created'),
+  // This label is an author-controlled hard stop. Discovery reads it before
+  // spawning an agent, and routed babysitters are instructed to re-check it
+  // before their first provider write.
+  excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
+  excludePullRequests: z.array(z.string().regex(
+    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9_.-]{1,100}#[1-9]\d*$/u,
+    'expected owner/repo#number',
+  )).default([]),
+  // Routed intake stays quiet until an operator explicitly approves the
+  // notification shape observed in a read-only sweep.
+  notifyHumans: z.boolean().default(false),
 }).default({})
 
 const reportingSchema = z.object({
