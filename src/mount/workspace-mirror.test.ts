@@ -30,6 +30,20 @@ describe('resolveRegisteredWorkspaceMirror', () => {
     })
   })
 
+  it('anchors a legacy relative workspace registry root to the Relayfile home', async () => {
+    await withTempHome(async (home) => {
+      await mkdir(join(home, '.relayfile'), { recursive: true })
+      await writeFile(join(home, '.relayfile', 'workspaces.json'), JSON.stringify({
+        workspaces: [{ id: 'rw_shared', localDir: '.integrations' }],
+      }))
+
+      expect(resolveRegisteredWorkspaceMirror(['rw_shared'], home)).toEqual({
+        localDir: join(home, '.integrations'),
+        source: 'workspace-registry',
+      })
+    })
+  })
+
   it('falls back to the Relayfile private mount registration', async () => {
     await withTempHome(async (home) => {
       const mirror = join(home, 'registered', '.integrations')
@@ -42,6 +56,22 @@ describe('resolveRegisteredWorkspaceMirror', () => {
 
       expect(resolveRegisteredWorkspaceMirror(['rw_handle', 'cloud-workspace-id'], home)).toEqual({
         localDir: mirror,
+        source: 'mount-state',
+      })
+    })
+  })
+
+  it('anchors a legacy relative mount-state root to the Relayfile home', async () => {
+    await withTempHome(async (home) => {
+      const stateDir = join(home, '.relayfile-mount-state', 'mount-1')
+      await mkdir(stateDir, { recursive: true })
+      await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+        workspaceId: 'rw_shared',
+        localRoot: 'registered/.integrations',
+      }))
+
+      expect(resolveRegisteredWorkspaceMirror(['rw_shared'], home)).toEqual({
+        localDir: join(home, 'registered', '.integrations'),
         source: 'mount-state',
       })
     })

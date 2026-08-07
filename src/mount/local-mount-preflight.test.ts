@@ -48,6 +48,29 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  it('uses the exact registered root when the mirror is not named .integrations', async () => {
+    await withTempDir(async (dir) => {
+      const localDir = join(dir, 'relayfile-mirror')
+      const startMount = vi.fn(async () => {
+        const stateDir = join(localDir, '.relay')
+        await mkdir(stateDir, { recursive: true })
+        await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+          workspaceId: 'rw_test',
+          lastReconcileAt: new Date().toISOString(),
+          pid: process.pid,
+        }))
+      })
+
+      await expect(ensureLocalMount('rw_test', dir, {
+        localDir,
+        startMount,
+        stateWaitTimeoutMs: 100,
+        stateWaitPollMs: 1,
+      })).resolves.toBeUndefined()
+      expect(startMount).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('accepts a fresh SDK mount state that intentionally omits a daemon pid', async () => {
     await withTempDir(async (dir) => {
       const startMount = vi.fn(async () => {

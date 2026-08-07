@@ -627,16 +627,17 @@ async function runFactoryCommand(
           waiter.resolve(code)
         }
       }
-      // Local mirrors are a writeback aid, not the source of truth for remote
-      // issue discovery. Start their SDK-backed supervisors immediately, but
-      // do not serialize durable recovery behind a stale checkout's readiness
-      // timeout. The mount client reports degradation and keeps retrying.
+      // Once a workspace mirror is known, retain background stale-mount
+      // supervision so durable recovery is not serialized behind a refresh.
+      // If there is no registered root yet, however, wait for the single
+      // mount/admission fallback before Factory can dispatch: agents must not
+      // receive a provisional checkout-local `.integrations` path.
       //
       // A MountAuthScopeError is the exception: it is terminal (the cloud
       // session lacks the filesystem scope the mount needs), so limping on
       // would only spawn agents against a read-denied mirror. Fail fast with the
       // remediation and resolve the command with a non-zero code.
-      void warmStartPathMounts(
+      const warmMount = () => warmStartPathMounts(
         mount,
         mountFn,
         workspaceId,
@@ -645,16 +646,30 @@ async function runFactoryCommand(
         mountStderr,
         debugMountRefreshes,
       )
-        .catch((error: unknown) => {
-          if (error instanceof MountAuthScopeError) {
-            mountStderr.write(`${error.message}\n`)
-            mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-            void flushAndResolve(1)
-            return
+      const handleWarmMountError = (error: unknown): void => {
+        if (error instanceof MountAuthScopeError) {
+          mountStderr.write(`${error.message}\n`)
+          mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
+          void flushAndResolve(1)
+          return
+        }
+        const message = error instanceof Error ? error.message : String(error)
+        mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+      }
+      if (mount.getLocalMountRoot?.() === undefined) {
+        try {
+          const result = await warmMount()
+          if (!result.mounted) {
+            mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
+            return 1
           }
-          const message = error instanceof Error ? error.message : String(error)
-          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
-        })
+        } catch (error) {
+          handleWarmMountError(error)
+          return 1
+        }
+      } else {
+        void warmMount().catch(handleWarmMountError)
+      }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
@@ -769,7 +784,7 @@ async function warmStartPathMounts(
   acceptableMountIds?: readonly string[],
   stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
   debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
-): Promise<void> {
+): Promise<WorkspaceMountPreflight> {
   const result = await ensureWorkspaceMount(
     mount,
     mountFn,
@@ -782,6 +797,7 @@ async function warmStartPathMounts(
     `[factory] Relayfile workspace mirror preflight: mounted=${result.mounted ? 1 : 0} ` +
     `failed=${result.mounted ? 0 : 1} routedRepos=${new Set(Object.values(config.repos.byLabel)).size}\n`,
   )
+  return result
 }
 
 async function runStandaloneBabysitCommand(

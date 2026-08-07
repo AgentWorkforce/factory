@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 
 type RecordValue = Record<string, unknown>
 
@@ -23,13 +23,13 @@ export function resolveRegisteredWorkspaceMirror(
   const accepted = new Set(workspaceIds.filter((id) => id.trim().length > 0))
   if (accepted.size === 0) return undefined
 
-  const registryMirror = readWorkspaceRegistry(join(homeDir, '.relayfile', 'workspaces.json'), accepted)
+  const registryMirror = readWorkspaceRegistry(join(homeDir, '.relayfile', 'workspaces.json'), accepted, homeDir)
   if (registryMirror) return { localDir: registryMirror, source: 'workspace-registry' }
 
-  return readMountStateDirectory(join(homeDir, '.relayfile-mount-state'), accepted)
+  return readMountStateDirectory(join(homeDir, '.relayfile-mount-state'), accepted, homeDir)
 }
 
-function readWorkspaceRegistry(path: string, accepted: ReadonlySet<string>): string | undefined {
+function readWorkspaceRegistry(path: string, accepted: ReadonlySet<string>, homeDir: string): string | undefined {
   let payload: unknown
   try {
     payload = JSON.parse(readFileSync(path, 'utf8')) as unknown
@@ -42,7 +42,7 @@ function readWorkspaceRegistry(path: string, accepted: ReadonlySet<string>): str
     const workspaceId = stringField(record, 'id') ?? stringField(record, 'workspaceId') ?? stringField(record, 'workspace')
     if (!workspaceId || !accepted.has(workspaceId)) continue
     const localDir = stringField(record, 'localDir') ?? stringField(record, 'localRoot') ?? stringField(record, 'mirrorDir')
-    if (localDir) mirrors.add(resolve(localDir))
+    if (localDir) mirrors.add(resolveRegisteredLocalDir(homeDir, localDir))
   }
   // Workspace aliases can appear as separate records. Like mount state, do
   // not choose one by JSON ordering if they disagree about the mirror root.
@@ -63,6 +63,7 @@ function workspaceRecords(payload: unknown): RecordValue[] {
 function readMountStateDirectory(
   stateRoot: string,
   accepted: ReadonlySet<string>,
+  homeDir: string,
 ): RegisteredWorkspaceMirror | undefined {
   let entries: string[]
   try {
@@ -77,7 +78,7 @@ function readMountStateDirectory(
       const state = JSON.parse(readFileSync(join(stateRoot, entry, 'state.json'), 'utf8')) as unknown
       if (!isRecord(state) || !accepted.has(stringField(state, 'workspaceId') ?? '')) continue
       const localDir = stringField(state, 'localDir') ?? stringField(state, 'localRoot')
-      if (localDir) mirrors.add(resolve(localDir))
+      if (localDir) mirrors.add(resolveRegisteredLocalDir(homeDir, localDir))
     } catch {
       // A partially-written or retired mount state is not a registration.
     }
@@ -87,6 +88,11 @@ function readMountStateDirectory(
   // as unavailable instead of guessing which directory to refresh.
   if (mirrors.size !== 1) return undefined
   return { localDir: [...mirrors][0]!, source: 'mount-state' }
+}
+
+/** Registry values are stored under this user's Relayfile home; preserve that base for relative legacy entries. */
+function resolveRegisteredLocalDir(homeDir: string, localDir: string): string {
+  return isAbsolute(localDir) ? resolve(localDir) : resolve(homeDir, localDir)
 }
 
 function stringField(record: RecordValue, key: string): string | undefined {

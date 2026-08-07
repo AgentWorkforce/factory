@@ -2778,6 +2778,84 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('resolves an unknown workspace mirror before enabling a live factory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-resolve-mirror-before-start-'))
+    try {
+      const configPath = await writeConfig(root)
+      const events: string[] = []
+      let registeredRoot: string | undefined
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountRoot: () => registeredRoot,
+      })
+      const factory = {
+        start: vi.fn(async () => { events.push('factory-start') }),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const ensureLocalMount = vi.fn(async () => {
+        events.push('mount-resolved')
+        registeredRoot = join(root, 'chief', '.integrations')
+      })
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(events).toEqual(['mount-resolved', 'factory-start'])
+      expect(ensureLocalMount).toHaveBeenCalledTimes(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not start a live factory when an unknown workspace mirror cannot be resolved', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-unresolved-mirror-'))
+    try {
+      const configPath = await writeConfig(root)
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const errors = buffer()
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), { getLocalMountRoot: () => undefined }),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount: vi.fn(async () => { throw new Error('admission refused') }),
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(factory.start).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('aborting startup: Relayfile workspace mirror could not be resolved')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('uses ./factory.config.json by default for factory commands', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-default-config-'))
     const previousCwd = process.cwd()

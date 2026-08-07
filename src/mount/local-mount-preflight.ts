@@ -10,8 +10,6 @@ import {
   readMountAuthErrorFromState,
 } from './mount-auth-error'
 
-const STATE_FILE = '.integrations/.relay/state.json'
-
 // How long to wait for a freshly-spawned mount to write a valid state.json
 // (workspace match + a fresh reconcile timestamp). A CLI mount over a large `.integrations` tree
 // can take well over 10s to complete its FIRST reconcile (early cycles hit
@@ -22,6 +20,8 @@ const STATE_FILE = '.integrations/.relay/state.json'
 const DEFAULT_STATE_READY_TIMEOUT_MS = 60_000
 
 export interface EnsureLocalMountOptions extends LocalMountOptions {
+  /** Exact registered mirror root, for mirrors not conventionally named `.integrations`. */
+  localDir?: string
   /**
    * Starts an authenticated mount through the Relayfile SDK. Credential minting,
    * binary resolution, and launch details deliberately stay outside this
@@ -35,7 +35,8 @@ export async function ensureLocalMount(
   startDir: string,
   options: EnsureLocalMountOptions,
 ): Promise<void> {
-  const stateFilePath = join(startDir, STATE_FILE)
+  const localDir = options.localDir ?? join(startDir, '.integrations')
+  const stateFilePath = join(localDir, '.relay', 'state.json')
 
   if (!(await isMountStatePresent(stateFilePath))) {
     try {
@@ -85,7 +86,7 @@ export async function ensureLocalMount(
   // Include the registered target in an operator-facing refresh log. This is
   // intentionally the state path's parent, not the current Factory checkout:
   // a stale mirror must heal where Relayfile registered it.
-  const mountTarget = join(startDir, '.integrations')
+  const mountTarget = localDir
 
   // Stale AND under-scoped: refreshing cannot help. Fail fast and terminal so
   // the supervisor stops retrying and startup surfaces one actionable error.

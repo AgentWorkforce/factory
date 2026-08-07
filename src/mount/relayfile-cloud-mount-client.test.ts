@@ -389,6 +389,7 @@ describe('RelayfileCloudMountClient', () => {
     })).resolves.toBeUndefined()
 
     expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/repo', expect.objectContaining({
+      localDir: join('/work/repo', '.integrations'),
       acceptableWorkspaceIds: ['cloud-workspace-uuid'],
       stateWaitTimeoutMs: 3210,
       startMount: expect.any(Function),
@@ -408,6 +409,59 @@ describe('RelayfileCloudMountClient', () => {
 
     await mount.dispose()
     expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes an exact nonstandard registered mirror root to local preflight', async () => {
+    const localDir = '/work/chief/relayfile-mirror'
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })) },
+      relayfileWorkspace: handle,
+      localMountRoot: localDir,
+      localMountPreflight,
+    })
+
+    try {
+      await mount.ensureLocalMount('/work/unrelated-repository')
+      expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/chief', expect.objectContaining({ localDir }))
+    } finally {
+      await mount.dispose()
+    }
+  })
+
+  it('looks up a configured workspace mirror only once during fromConfig', async () => {
+    const fake = new FakeRelayFileClient()
+    const resolver = vi.fn(() => undefined)
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => ({
+          workspaceId: 'cloud-workspace-uuid',
+          client: () => fake,
+          getToken: async () => 'delegated-relayfile-token',
+          info: { relayfileUrl: 'https://relayfile.example' },
+        })),
+      })),
+      workspaceMirrorResolver: resolver,
+    })
+
+    expect(resolver).toHaveBeenCalledTimes(1)
+    expect(resolver).toHaveBeenCalledWith(['rw_test', 'cloud-workspace-uuid'])
+    await mount.dispose()
   })
 
   it('uses one registered workspace mirror even when callers name different repository checkouts', async () => {

@@ -22,7 +22,7 @@ import {
 } from '@relayfile/sdk'
 import { RelayfileSetup } from '@relayfile/sdk/cli'
 import { existsSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 
 import type {
   EventPage,
@@ -216,6 +216,8 @@ export interface RelayfileCloudMountClientConfig {
   localMountRoot?: string
   /** Read-only registration lookup override for tests and alternate runtimes. */
   workspaceMirrorResolver?: (workspaceIds: readonly string[]) => string | undefined
+  /** Internal: fromConfig already attempted the registration lookup, including no-match. */
+  skipRegisteredMirrorLookup?: boolean
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
 }
@@ -329,9 +331,10 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountAgentName = config.agentName ?? DEFAULT_AGENT_NAME
     this.#localMountScopes = config.scopes ?? [...FACTORY_RELAYFILE_SCOPES]
     const workspaceIds = this.#acceptableWorkspaceIds([this.workspaceId])
-    this.#localMountRoot = config.localMountRoot ??
-      config.workspaceMirrorResolver?.(workspaceIds) ??
-      resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir
+    this.#localMountRoot = config.localMountRoot ?? (config.skipRegisteredMirrorLookup
+      ? undefined
+      : config.workspaceMirrorResolver?.(workspaceIds) ??
+        resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
@@ -373,6 +376,7 @@ export class RelayfileCloudMountClient implements MountClient {
       ...config,
       workspaceId,
       ...(registeredMountRoot ? { localMountRoot: registeredMountRoot } : {}),
+      skipRegisteredMirrorLookup: true,
       client,
       // WorkspaceHandle.getToken() returns the token originally minted by
       // joinWorkspace. RelayFileClient.getToken() resolves the SDK's rotating
@@ -461,6 +465,7 @@ export class RelayfileCloudMountClient implements MountClient {
     try {
       await this.#localMountPreflight(this.workspaceId, join(localDir, '..'), {
         ...options,
+        localDir,
         acceptableWorkspaceIds: [...acceptableWorkspaceIds],
         startMount: async () => {
           await this.#replaceLocalMount(localDir, launch)
@@ -1009,7 +1014,7 @@ function registeredMirrorFromMountError(error: unknown): string | undefined {
   const match = /\balready mirrored at\s+(.+?)(?:;|\n|$)/iu.exec(message)
   if (!match?.[1]) return undefined
   const localDir = match[1].trim().replace(/^["']|["']$/gu, '')
-  return localDir.startsWith('/') ? resolve(localDir) : undefined
+  return isAbsolute(localDir) ? resolve(localDir) : undefined
 }
 
 const isHttpStatus = (error: unknown, status: number): boolean => {
