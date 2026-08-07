@@ -626,8 +626,6 @@ async function dispatchWorkspaceTask(
   }
   if (!input.workspace) return { ...base, status: 'blocked', reason: 'workspace task dispatcher is not configured' }
 
-  const delivery = await prepareContractDelivery(task, input)
-
   const suffix = createHash('sha256').update(task.sourceKey).digest('hex').slice(0, 8)
   const name = `notion-${task.pageId.slice(-8)}-${suffix}`
   const claim = await claimNotionTask(task, input)
@@ -647,6 +645,18 @@ async function dispatchWorkspaceTask(
         reason: 'durable Notion claim already exists but no running workspace agent was found; refusing a second spawn',
       }
     }
+    const migrationSourceKey = `${task.sourceKey}:portable-mount`
+    if (input.manifest.workerMountTransport.kind !== 'local' &&
+      await observeNotionClaim(task, input, migrationSourceKey)) {
+      return {
+        ...base,
+        status: 'blocked',
+        agent: running.agent,
+        node: running.node,
+        reason: 'durable portable-mount migration claim exists without a local completion receipt; refusing to assume the running worker was refreshed',
+      }
+    }
+    const delivery = await prepareContractDelivery(task, input)
     state.receipts[task.sourceKey] = {
       kind: 'workspace',
       digest: task.digest,
@@ -657,6 +667,7 @@ async function dispatchWorkspaceTask(
     }
     return { ...base, status: 'already-dispatched', agent: running.agent, node: running.node }
   }
+  const delivery = await prepareContractDelivery(task, input)
   await assertMountedTaskUnchanged(task)
   const result = await input.workspace.dispatch({
     name,
@@ -685,11 +696,15 @@ async function dispatchWorkspaceTask(
 async function observeNotionClaim(
   task: NormalizedNotionTask,
   input: Parameters<typeof runNotionIntake>[0],
+  sourceKey = task.sourceKey,
 ): Promise<NotionIntakeClaim | undefined> {
   if (!input.claims) {
     throw new Error('dispatch requires a durable Agent Relay Notion claim store')
   }
-  const claim = await input.claims.get(task.sourceKey)
+  const claim = await input.claims.get(sourceKey)
+  if (claim?.sourceKey !== undefined && claim.sourceKey !== sourceKey) {
+    throw new Error('durable Notion claim does not match the requested source key')
+  }
   if (claim?.digest !== undefined && claim.digest !== task.digest) {
     throw new Error('durable Notion claim digest does not match the mounted spec')
   }

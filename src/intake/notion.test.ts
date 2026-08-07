@@ -752,6 +752,68 @@ describe('Notion spec intake', () => {
       status: 'blocked',
       reason: 'durable portable-mount migration claim already exists; refusing a second workspace redispatch',
     }))
+    const storedStates = await Promise.all([
+      firstFixture.manifest.statePath,
+      secondStatePath,
+    ].map(async (statePath) => JSON.parse(await readFile(statePath, 'utf8'))))
+    expect(storedStates
+      .map((stored) => stored.receipts[`notion:${pageId}:workspace:/work/benchmark`]?.delivery)
+      .filter(Boolean)).toEqual([{
+      kind: 'relay-channel',
+      channel: 'factory-notion-e1cff7cf-aabbccddee',
+      messageIds: ['message-1'],
+      encoding: 'base64-chunks-v1',
+    }])
+  })
+
+  it('does not treat an unresolved portable migration claim as a completed receipt on another machine', async () => {
+    const firstFixture = await fixtureManifest('workspace body', {
+      bootstrap: bootstrap({ projectPath: '/work/benchmark', node: 'kjg-laptop' }),
+    })
+    roots.push(firstFixture.root)
+    const workspace: WorkspaceTaskDispatcher = {
+      find: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop' })),
+      dispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'spawned' })),
+      redispatch: vi.fn(async () => ({ agent: 'benchmark-agent', node: 'kjg-laptop', status: 'respawned' })),
+    }
+    await runNotionIntake({ manifest: firstFixture.manifest, dispatch: true, claims, workspace })
+    const firstState = JSON.parse(await readFile(firstFixture.manifest.statePath, 'utf8'))
+    const sourceKey = `notion:${pageId}:workspace:/work/benchmark`
+    const primaryClaim = durableClaims.get(sourceKey)
+    expect(primaryClaim).toBeDefined()
+    durableClaims.set(`${sourceKey}:portable-mount`, {
+      ...primaryClaim!,
+      sourceKey: `${sourceKey}:portable-mount`,
+    })
+
+    const secondStatePath = join(firstFixture.root, 'second-machine', 'state.json')
+    firstFixture.manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const report = await runNotionIntake({
+      manifest: { ...firstFixture.manifest, statePath: secondStatePath },
+      dispatch: true,
+      claims,
+      workspace,
+      contracts,
+    })
+
+    expect(firstState.receipts[sourceKey].delivery).toBeUndefined()
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      agent: 'benchmark-agent',
+      reason: 'durable portable-mount migration claim exists without a local completion receipt; refusing to assume the running worker was refreshed',
+    })
+    expect(contracts.publish).not.toHaveBeenCalled()
+    expect(workspace.redispatch).not.toHaveBeenCalled()
+    await expect(readFile(secondStatePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('blocks an exact-path portable migration when the existing worker cannot be refreshed', async () => {
