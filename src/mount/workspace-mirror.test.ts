@@ -47,6 +47,20 @@ describe('resolveRegisteredWorkspaceMirror', () => {
     })
   })
 
+  it('refuses ambiguous workspace-registry roots across accepted aliases', async () => {
+    await withTempHome(async (home) => {
+      await mkdir(join(home, '.relayfile'), { recursive: true })
+      await writeFile(join(home, '.relayfile', 'workspaces.json'), JSON.stringify({
+        workspaces: [
+          { id: 'rw_handle', localDir: join(home, 'first', '.integrations') },
+          { id: 'cloud-workspace-id', localDir: join(home, 'second', '.integrations') },
+        ],
+      }))
+
+      expect(resolveRegisteredWorkspaceMirror(['rw_handle', 'cloud-workspace-id'], home)).toBeUndefined()
+    })
+  })
+
   it('refuses to guess when stale local state names more than one mirror', async () => {
     await withTempHome(async (home) => {
       const stateRoot = join(home, '.relayfile-mount-state')

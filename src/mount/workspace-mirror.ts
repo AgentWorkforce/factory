@@ -37,13 +37,16 @@ function readWorkspaceRegistry(path: string, accepted: ReadonlySet<string>): str
     return undefined
   }
 
+  const mirrors = new Set<string>()
   for (const record of workspaceRecords(payload)) {
     const workspaceId = stringField(record, 'id') ?? stringField(record, 'workspaceId') ?? stringField(record, 'workspace')
     if (!workspaceId || !accepted.has(workspaceId)) continue
     const localDir = stringField(record, 'localDir') ?? stringField(record, 'localRoot') ?? stringField(record, 'mirrorDir')
-    if (localDir) return resolve(localDir)
+    if (localDir) mirrors.add(resolve(localDir))
   }
-  return undefined
+  // Workspace aliases can appear as separate records. Like mount state, do
+  // not choose one by JSON ordering if they disagree about the mirror root.
+  return mirrors.size === 1 ? [...mirrors][0] : undefined
 }
 
 function workspaceRecords(payload: unknown): RecordValue[] {

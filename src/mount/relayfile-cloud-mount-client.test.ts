@@ -452,6 +452,28 @@ describe('RelayfileCloudMountClient', () => {
     }
   })
 
+  it('resolves a direct client mirror through the cloud workspace identifier alias', async () => {
+    const fake = new FakeRelayFileClient()
+    const resolver = vi.fn((workspaceIds: readonly string[]) =>
+      workspaceIds.includes('cloud-workspace-uuid') ? '/work/chief/.integrations' : undefined)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace: vi.fn() },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      workspaceMirrorResolver: resolver,
+    })
+
+    expect(resolver).toHaveBeenCalledWith(['rw_shared', 'cloud-workspace-uuid'])
+    expect(mount.getLocalMountRoot()).toBe('/work/chief/.integrations')
+    await mount.dispose()
+  })
+
   it('uses the registered root reported by Relayfile instead of re-homing an unresolved fallback', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-admission-registered-mirror-'))
     const fallbackDir = join(root, 'first-checkout', '.integrations')
@@ -485,10 +507,14 @@ describe('RelayfileCloudMountClient', () => {
     })
 
     try {
-      await mount.ensureLocalMount(join(root, 'first-checkout'))
+      await Promise.all([
+        mount.ensureLocalMount(join(root, 'first-checkout')),
+        mount.ensureLocalMount(join(root, 'second-checkout')),
+      ])
 
       expect(ensureMountedWorkspace).toHaveBeenNthCalledWith(1, expect.objectContaining({ localDir: fallbackDir }))
       expect(ensureMountedWorkspace).toHaveBeenNthCalledWith(2, expect.objectContaining({ localDir: registeredDir }))
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(2)
       expect(mount.getLocalMountRoot()).toBe(registeredDir)
     } finally {
       await mount.dispose()

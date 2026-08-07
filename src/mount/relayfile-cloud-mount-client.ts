@@ -328,9 +328,10 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountPreflight = config.localMountPreflight ?? runLocalMountPreflight
     this.#localMountAgentName = config.agentName ?? DEFAULT_AGENT_NAME
     this.#localMountScopes = config.scopes ?? [...FACTORY_RELAYFILE_SCOPES]
+    const workspaceIds = this.#acceptableWorkspaceIds([this.workspaceId])
     this.#localMountRoot = config.localMountRoot ??
-      config.workspaceMirrorResolver?.([this.workspaceId]) ??
-      resolveRegisteredWorkspaceMirror([this.workspaceId])?.localDir
+      config.workspaceMirrorResolver?.(workspaceIds) ??
+      resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
@@ -388,27 +389,13 @@ export class RelayfileCloudMountClient implements MountClient {
     // new one from every routed checkout: that asks Relayfile to re-home the
     // workspace and makes all but the first route fail.  The fallback is only
     // invoked once per Factory command rather than once per repository.
-    const hasResolvedMirror = this.#localMountRoot !== undefined
+    const canDiscoverRegisteredMirror = this.#localMountRoot === undefined
     const localDir = this.#localMountRoot ?? join(resolve(startDir), '.integrations')
     this.#localMountRoot = localDir
-    try {
-      await this.#runLocalMountOperation(localDir, () => this.#ensureLocalMount(localDir, options))
-      return
-    } catch (error) {
-      // Older Relayfile installations do not persist the registration in a
-      // local file we can read. The mount admission response is nevertheless
-      // authoritative about the already-registered root. Retry exactly that
-      // root once; never ask Relayfile to re-home it and never override an
-      // explicit/configured mirror root.
-      const registeredRoot = hasResolvedMirror ? undefined : registeredMirrorFromMountError(error)
-      if (!registeredRoot || registeredRoot === localDir) throw error
-      this.#clearLocalMountHealthCheck(localDir)
-      this.#localMountSupervisions.delete(localDir)
-      this.#degradedLocalMounts.delete(localDir)
-      this.#authDegradedLocalMounts.delete(localDir)
-      this.#localMountRoot = registeredRoot
-      await this.#runLocalMountOperation(registeredRoot, () => this.#ensureLocalMount(registeredRoot, options))
-    }
+    return this.#runLocalMountOperation(
+      localDir,
+      () => this.#ensureLocalMountWithRegisteredFallback(localDir, options, canDiscoverRegisteredMirror),
+    )
   }
 
   getLocalMountRoot(): string | undefined {
@@ -498,6 +485,31 @@ export class RelayfileCloudMountClient implements MountClient {
     if (staleAfter.stale) this.#markLocalMountDegraded(localDir, 'mount_refresh_failed')
     else this.#markLocalMountRecovered(localDir)
     this.#scheduleLocalMountHealthCheck(localDir)
+  }
+
+  async #ensureLocalMountWithRegisteredFallback(
+    localDir: string,
+    options: LocalMountOptions,
+    canDiscoverRegisteredMirror: boolean,
+  ): Promise<void> {
+    try {
+      await this.#ensureLocalMount(localDir, options)
+      return
+    } catch (error) {
+      // Older Relayfile installations do not persist the registration in a
+      // local file we can read. The mount admission response is nevertheless
+      // authoritative about the already-registered root. This retry remains
+      // inside the shared operation, so concurrent callers all await the same
+      // recovery rather than racing to re-home a checkout.
+      const registeredRoot = canDiscoverRegisteredMirror ? registeredMirrorFromMountError(error) : undefined
+      if (!registeredRoot || registeredRoot === localDir) throw error
+      this.#clearLocalMountHealthCheck(localDir)
+      this.#localMountSupervisions.delete(localDir)
+      this.#degradedLocalMounts.delete(localDir)
+      this.#authDegradedLocalMounts.delete(localDir)
+      await this.#ensureLocalMount(registeredRoot, options)
+      this.#localMountRoot = registeredRoot
+    }
   }
 
   #acceptableWorkspaceIds(extra: readonly string[] = []): string[] {
