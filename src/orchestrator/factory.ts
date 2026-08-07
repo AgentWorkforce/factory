@@ -464,6 +464,10 @@ export class FactoryLoop implements Factory {
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
+  // The effective transport includes per-start overrides, which can differ
+  // from config.liveSubscription. Persist it so status/heartbeat describes
+  // the listener that was actually registered.
+  #liveTransport?: FactoryLiveSubscriptionOptions['transport']
   #liveEventCursor?: string
   #liveEventHighWatermark?: string
   #liveConnectStartedAtMs = 0
@@ -1051,6 +1055,7 @@ export class FactoryLoop implements Factory {
     overrides: Partial<FactoryLiveSubscriptionOptions> = {},
   ): Promise<void> {
     const options = this.#liveOptions(overrides)
+    this.#liveTransport = options.transport
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -2805,7 +2810,7 @@ export class FactoryLoop implements Factory {
     if (this.#subscription) {
       return { state: 'subscribed' }
     }
-    if (this.#liveOptions({}).transport === 'poll' && this.#liveEventCursor !== undefined) {
+    if (this.#liveTransport === 'poll') {
       return { state: 'polling' }
     }
     return { state: 'starting' }
