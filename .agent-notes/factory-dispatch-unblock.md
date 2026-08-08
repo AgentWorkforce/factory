@@ -33,3 +33,11 @@
 - Fallback eligibility now uses PR #220's health facts: a degraded local mount or listener state other than `subscribed`/`polling` means the projection cannot answer. A healthy projection miss fails without calling GitHub.
 - Added configured `repo#number` and `owner/repo#number` selectors so a targeted fallback performs one authoritative lookup and avoids ambiguous org-wide probes.
 - Live `factory triage factory#222` reached the empty projection, reported the listener `unknown`, resolved via `github-api-fallback`, and routed to `AgentWorkforce/factory`. It emitted its successful decision; the existing one-shot shutdown path remained open until SIGINT, then returned 0. The shutdown hang is separate from issue resolution.
+
+## 2026-08-08 verification
+
+- Live CLI through `runFleetCli` with a no-op reporter: `factory#222` exit 0, source `github-api-fallback`, projection `no-match`, routed only to `AgentWorkforce/factory`; `factory#999999` exit 1, no decision emitted.
+- Focused build and three-suite check: exit 0; 157 tests passed.
+- Projection-preference mutation check: forced projection hits past the preferred branch; targeted test exited 1. Restored source; same check exited 0.
+- Safety mutation check: made the intentionally unsafe fallback fixture satisfy the existing GitHub label/title markers; targeted rejection test exited 1. Restored unsafe fixture; same check exited 0.
+- Default-timeout full suite: exit 1; 1,461 passed and six timing-sensitive tests failed. Rerun of the three affected non-orchestrator files with a 20-second ceiling exited 0 (65 tests). One pre-existing heartbeat timing assertion still exits 1 even in isolation (`600 < 500`); the other affected orchestrator test passed in isolation.
