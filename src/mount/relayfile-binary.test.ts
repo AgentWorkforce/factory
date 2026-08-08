@@ -3,7 +3,13 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { checkMountStaleness } from './relayfile-binary'
+import {
+  checkMountStaleness,
+  RELAYFILE_SYNC_INTERVAL_MS,
+  STALE_RECONCILE_MS,
+  STALE_RECONCILE_INTERVALS,
+  staleReconcileMs,
+} from './relayfile-binary'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -20,7 +26,13 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 
 async function writeState(
   dir: string,
-  state: { workspaceId?: string; lastReconcileAt?: string; pid?: number; daemon?: { pid?: number } },
+  state: {
+    workspaceId?: string
+    lastReconcileAt?: string
+    intervalMs?: number
+    pid?: number
+    daemon?: { pid?: number }
+  },
 ): Promise<string> {
   const statePath = join(dir, 'state.json')
   await writeFile(statePath, JSON.stringify(state), 'utf8')
@@ -90,6 +102,53 @@ describe('checkMountStaleness', () => {
       expect(result.stale).toBe(true)
       expect(result.reason).toMatch(/^last reconcile 16m ago$/u)
       expect(result.pid).toBe(process.pid)
+    })
+  })
+
+  it('uses a multiple of the Relayfile poll interval as its stale threshold', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(
+          Date.now() - (RELAYFILE_SYNC_INTERVAL_MS * STALE_RECONCILE_INTERVALS) - 1,
+        ).toISOString(),
+        pid: process.pid,
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toMatchObject({
+        stale: true,
+        reason: expect.stringMatching(/^last reconcile \d+m ago$/u),
+      })
+    })
+  })
+
+  it('uses the registered non-default poll interval rather than falsely staling a healthy slow mirror', async () => {
+    await withTempDir(async (dir) => {
+      const intervalMs = 2 * 60 * 1000
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        intervalMs,
+        // Past the 90s default but still within three registered 2m intervals.
+        lastReconcileAt: new Date(Date.now() - STALE_RECONCILE_MS - 1).toISOString(),
+        pid: process.pid,
+      })
+
+      expect(staleReconcileMs(intervalMs)).toBe(intervalMs * STALE_RECONCILE_INTERVALS)
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false, pid: process.pid })
+    })
+  })
+
+  it('falls back to the default interval when state.json has an invalid cadence', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        intervalMs: 0,
+        lastReconcileAt: new Date(Date.now() - STALE_RECONCILE_MS - 1).toISOString(),
+        pid: process.pid,
+      })
+
+      expect(staleReconcileMs(0)).toBe(STALE_RECONCILE_MS)
+      expect(checkMountStaleness(statePath, 'rw_test')).toMatchObject({ stale: true })
     })
   })
 

@@ -10,8 +10,6 @@ import {
   readMountAuthErrorFromState,
 } from './mount-auth-error'
 
-const STATE_FILE = '.integrations/.relay/state.json'
-
 // How long to wait for a freshly-spawned mount to write a valid state.json
 // (workspace match + a fresh reconcile timestamp). A CLI mount over a large `.integrations` tree
 // can take well over 10s to complete its FIRST reconcile (early cycles hit
@@ -22,6 +20,8 @@ const STATE_FILE = '.integrations/.relay/state.json'
 const DEFAULT_STATE_READY_TIMEOUT_MS = 60_000
 
 export interface EnsureLocalMountOptions extends LocalMountOptions {
+  /** Exact registered mirror root, for mirrors not conventionally named `.integrations`. */
+  localDir?: string
   /**
    * Starts an authenticated mount through the Relayfile SDK. Credential minting,
    * binary resolution, and launch details deliberately stay outside this
@@ -35,7 +35,8 @@ export async function ensureLocalMount(
   startDir: string,
   options: EnsureLocalMountOptions,
 ): Promise<void> {
-  const stateFilePath = join(startDir, STATE_FILE)
+  const localDir = options.localDir ?? join(startDir, '.integrations')
+  const stateFilePath = join(localDir, '.relay', 'state.json')
 
   if (!(await isMountStatePresent(stateFilePath))) {
     try {
@@ -82,6 +83,10 @@ export async function ensureLocalMount(
 
   const suffix = staleness.reason !== undefined ? ` (${staleness.reason})` : ''
   const manualHint = 'Restart Factory after restoring the Agent Relay Cloud session'
+  // Include the registered target in an operator-facing refresh log. This is
+  // intentionally the state path's parent, not the current Factory checkout:
+  // a stale mirror must heal where Relayfile registered it.
+  const mountTarget = localDir
 
   // Stale AND under-scoped: refreshing cannot help. Fail fast and terminal so
   // the supervisor stops retrying and startup surfaces one actionable error.
@@ -90,14 +95,14 @@ export async function ensureLocalMount(
   }
 
   if (options.refreshStaleMount === false) {
-    process.stderr.write(`[factory] local mount is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix}; writeback may not propagate. ${manualHint}\n`)
     return
   }
 
   // Self-heal through the same SDK-authenticated launch path used for first
   // start, rather than silently shipping writebacks into a stale mirror.
   if (!options.suppressStaleRefreshLogs) {
-    process.stderr.write(`[factory] local mount is stale${suffix}; refreshing\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix}; refreshing\n`)
   }
   try {
     await options.startMount()
@@ -109,7 +114,7 @@ export async function ensureLocalMount(
       options.acceptableWorkspaceIds,
     )
     if (!options.suppressStaleRefreshLogs) {
-      process.stderr.write('[factory] local mount refreshed\n')
+      process.stderr.write(`[factory] local mount at ${mountTarget} refreshed\n`)
     }
   } catch (error) {
     if (error instanceof MountAuthScopeError) throw error
@@ -124,7 +129,7 @@ export async function ensureLocalMount(
         cause: error,
       })
     }
-    process.stderr.write(`[factory] local mount is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
+    process.stderr.write(`[factory] local mount at ${mountTarget} is stale${suffix} and auto-refresh failed (${reason}); writeback may not propagate. ${manualHint}\n`)
   }
 }
 

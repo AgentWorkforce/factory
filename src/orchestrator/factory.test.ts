@@ -8609,6 +8609,7 @@ describe('FactoryLoop', () => {
     const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    expect(factory.status().eventListener).toEqual({ state: 'subscribed' })
     mount.files.set(path, { content: realIssueFile(25) })
     mount.emit(changeEvent(path, 'event-live-25'))
     await vi.waitFor(() => {
@@ -9058,6 +9059,8 @@ describe('FactoryLoop', () => {
 
       await factory.start({ mode: 'live', liveSubscription: { transport: 'poll', pollIntervalMs: 10 } })
       await vi.advanceTimersByTimeAsync(0)
+
+      expect(factory.status().eventListener).toEqual({ state: 'polling' })
 
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-30-impl-pear', 'ar-30-review'])
 

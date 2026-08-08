@@ -389,6 +389,7 @@ describe('RelayfileCloudMountClient', () => {
     })).resolves.toBeUndefined()
 
     expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/repo', expect.objectContaining({
+      localDir: join('/work/repo', '.integrations'),
       acceptableWorkspaceIds: ['cloud-workspace-uuid'],
       stateWaitTimeoutMs: 3210,
       startMount: expect.any(Function),
@@ -408,6 +409,225 @@ describe('RelayfileCloudMountClient', () => {
 
     await mount.dispose()
     expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes an exact nonstandard registered mirror root to local preflight', async () => {
+    const localDir = '/work/chief/relayfile-mirror'
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace: vi.fn(async () => ({ stop: async () => {} })) },
+      relayfileWorkspace: handle,
+      localMountRoot: localDir,
+      localMountPreflight,
+    })
+
+    try {
+      await mount.ensureLocalMount('/work/unrelated-repository')
+      expect(localMountPreflight).toHaveBeenCalledWith('rw_test', '/work/chief', expect.objectContaining({ localDir }))
+    } finally {
+      await mount.dispose()
+    }
+  })
+
+  it('looks up a configured workspace mirror only once during fromConfig', async () => {
+    const fake = new FakeRelayFileClient()
+    const resolver = vi.fn(() => undefined)
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider: vi.fn(async () => cloudSession(storedAuth())),
+      relayfileSetupFactory: vi.fn(() => ({
+        joinWorkspace: vi.fn(async () => ({
+          workspaceId: 'cloud-workspace-uuid',
+          client: () => fake,
+          getToken: async () => 'delegated-relayfile-token',
+          info: { relayfileUrl: 'https://relayfile.example' },
+        })),
+      })),
+      workspaceMirrorResolver: resolver,
+    })
+
+    expect(resolver).toHaveBeenCalledTimes(1)
+    expect(resolver).toHaveBeenCalledWith(['rw_test', 'cloud-workspace-uuid'])
+    await mount.dispose()
+  })
+
+  it('uses one registered workspace mirror even when callers name different repository checkouts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-shared-workspace-mirror-'))
+    const localDir = join(root, 'chief', '.integrations')
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      workspaceId: 'cloud-workspace-uuid',
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop }))
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace },
+      relayfileWorkspace: handle,
+      localMountRoot: localDir,
+      localMountPreflight,
+    })
+
+    try {
+      await Promise.all([
+        mount.ensureLocalMount(join(root, 'repo-a')),
+        mount.ensureLocalMount(join(root, 'repo-b')),
+      ])
+
+      expect(mount.getLocalMountRoot()).toBe(localDir)
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(1)
+      expect(ensureMountedWorkspace).toHaveBeenCalledWith(expect.objectContaining({ localDir }))
+      expect(localMountPreflight).toHaveBeenCalledWith('rw_shared', join(root, 'chief'), expect.any(Object))
+    } finally {
+      await mount.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves a direct client mirror through the cloud workspace identifier alias', async () => {
+    const fake = new FakeRelayFileClient()
+    const resolver = vi.fn((workspaceIds: readonly string[]) =>
+      workspaceIds.includes('cloud-workspace-uuid') ? '/work/chief/.integrations' : undefined)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace: vi.fn() },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      workspaceMirrorResolver: resolver,
+    })
+
+    expect(resolver).toHaveBeenCalledWith(['rw_shared', 'cloud-workspace-uuid'])
+    expect(mount.getLocalMountRoot()).toBe('/work/chief/.integrations')
+    await mount.dispose()
+  })
+
+  it('uses the registered root reported by Relayfile instead of re-homing an unresolved fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-admission-registered-mirror-'))
+    const fallbackDir = join(root, 'first-checkout', '.integrations')
+    const registeredDir = join(root, 'chief', '.integrations')
+    const fake = new FakeRelayFileClient()
+    const stop = vi.fn(async () => {})
+    const ensureMountedWorkspace = vi.fn(async ({ localDir }: { localDir: string }) => {
+      if (localDir === fallbackDir) {
+        throw new Error(
+          `workspace rw_shared is already mirrored at ${registeredDir}; refusing to silently re-home it to ${fallbackDir}`,
+        )
+      }
+      return { stop }
+    })
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => options.startMount())
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountPreflight,
+    })
+
+    try {
+      await Promise.all([
+        mount.ensureLocalMount(join(root, 'first-checkout')),
+        mount.ensureLocalMount(join(root, 'second-checkout')),
+      ])
+
+      expect(ensureMountedWorkspace).toHaveBeenNthCalledWith(1, expect.objectContaining({ localDir: fallbackDir }))
+      expect(ensureMountedWorkspace).toHaveBeenNthCalledWith(2, expect.objectContaining({ localDir: registeredDir }))
+      expect(ensureMountedWorkspace).toHaveBeenCalledTimes(2)
+      expect(mount.getLocalMountRoot()).toBe(registeredDir)
+    } finally {
+      await mount.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports a stale registered mirror and refreshes that same directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-stale-registered-mirror-'))
+    const localDir = join(root, 'registered', '.integrations')
+    await mkdir(join(localDir, '.relay'), { recursive: true })
+    await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+      workspaceId: 'cloud-workspace-uuid',
+      lastReconcileAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      pid: process.pid,
+    }))
+    const fake = new FakeRelayFileClient()
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop: async () => {} }))
+    const localMountPreflight = vi.fn(async (
+      _workspaceId: string,
+      _startDir: string,
+      options: { startMount: () => Promise<void> },
+    ) => {
+      await options.startMount()
+      await writeFile(join(localDir, '.relay', 'state.json'), JSON.stringify({
+        workspaceId: 'cloud-workspace-uuid',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
+      }))
+    })
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountRoot: localDir,
+      localMountPreflight,
+    })
+
+    try {
+      expect(mount.getLocalMountHealth()).toMatchObject({
+        degraded: true,
+        reason: expect.stringMatching(/^last reconcile \d+m ago$/u),
+        localDir,
+      })
+
+      await mount.ensureLocalMount(join(root, 'unrelated-repository'))
+
+      expect(ensureMountedWorkspace).toHaveBeenCalledWith(expect.objectContaining({ localDir }))
+      expect(mount.getLocalMountHealth()).toEqual({ degraded: false, localDir })
+    } finally {
+      await mount.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('reports and supervises an initial SDK mount failure with no prior state file', async () => {
@@ -537,7 +757,7 @@ describe('RelayfileCloudMountClient', () => {
     await mount.dispose()
   })
 
-  it('bounds mount work across checkouts to prevent refresh storms', async () => {
+  it('coalesces routed checkouts onto one workspace-mirror mount operation', async () => {
     const fake = new FakeRelayFileClient()
     let active = 0
     let maximumActive = 0
@@ -563,17 +783,16 @@ describe('RelayfileCloudMountClient', () => {
         info: { relayfileUrl: 'https://relayfile.example' },
       },
       localMountPreflight,
-      localMountMaxConcurrency: 2,
     })
 
     const checks = Array.from({ length: 6 }, (_, index) => mount.ensureLocalMount(`/work/repo-${index}`))
-    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(2))
-    expect(maximumActive).toBe(2)
+    await vi.waitFor(() => expect(localMountPreflight).toHaveBeenCalledTimes(1))
+    expect(maximumActive).toBe(1)
     releasePreflights()
     await Promise.all(checks)
 
-    expect(localMountPreflight).toHaveBeenCalledTimes(6)
-    expect(maximumActive).toBe(2)
+    expect(localMountPreflight).toHaveBeenCalledTimes(1)
+    expect(maximumActive).toBe(1)
     await mount.dispose()
   })
 

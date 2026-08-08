@@ -1329,8 +1329,10 @@ describe('fleet CLI runtime', () => {
   it('does not infer or preflight clone paths for a maintenance command', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-maintenance-clone-'))
     try {
+      const heartbeatPath = join(root, 'heartbeat.json')
       const configPath = await writeConfig(root, {
         repos: { org: 'AgentWorkforce', names: ['pear'] },
+        loop: { heartbeatPath, heartbeatStaleMs: 10_000 },
       })
       const git = vi.fn(async () => {
         throw new Error('status must not inspect local git state')
@@ -1354,7 +1356,13 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+      expect(JSON.parse(output.text())).toEqual({
+        ...factoryStatus,
+        eventListener: {
+          state: 'not-listening',
+          reason: 'heartbeat missing',
+        },
+      })
       expect(git).not.toHaveBeenCalled()
       expect(integrations.getStatus).not.toHaveBeenCalled()
     } finally {
@@ -1828,7 +1836,8 @@ describe('fleet CLI runtime', () => {
   it('prints factory status from the top-level status command', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-status-'))
     try {
-      const configPath = await writeConfig(root)
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
       const output = buffer()
       const factoryStatus = { inFlight: [], queued: [], counters: { pulled: 0 } }
       const factory = {
@@ -1856,7 +1865,131 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).toEqual(factoryStatus)
+      expect(JSON.parse(output.text())).toEqual({
+        ...factoryStatus,
+        eventListener: {
+          state: 'not-listening',
+          reason: 'heartbeat missing',
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('surfaces a stale registered workspace mirror in factory status', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const output = buffer()
+      const mirror = join(root, 'chief', '.integrations')
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountHealth: () => ({
+          degraded: true,
+          reason: 'last reconcile 5m ago',
+          localDir: mirror,
+        }),
+      })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        eventListener: {
+          state: 'subscribed',
+        },
+        localMountDegraded: true,
+        localMountDegradedReason: 'last reconcile 5m ago',
+        localMountRoot: mirror,
+        localMountEventFeed: {
+          state: 'degraded',
+          livenessSignal: '.integrations/.relay/state.json',
+          reason: 'last reconcile 5m ago',
+          root: mirror,
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('distinguishes a healthy quiet mount event feed from a daemon that is not listening', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-event-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const output = buffer()
+      const mirror = join(root, 'chief', '.integrations')
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountHealth: () => ({ degraded: false, localDir: mirror }),
+      })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        eventListener: { state: 'subscribed' },
+        localMountEventFeed: {
+          state: 'healthy',
+          livenessSignal: '.integrations/.relay/state.json',
+          root: mirror,
+        },
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2008,8 +2141,8 @@ describe('fleet CLI runtime', () => {
 
       expect(code).toBe(0)
       expect(integrations.getStatus).toHaveBeenCalledWith('github')
-      expect(mountCalls).toEqual([process.cwd(), clonePath])
-      expect(errors.text()).toContain(`warning: could not start relayfile mount for standalone babysitter at ${clonePath}`)
+      expect(mountCalls).toEqual([process.cwd()])
+      expect(errors.text()).toBe('')
       expect(fleet.spawns).toHaveLength(1)
       expect(fleet.preservedInfrastructure).toBe(1)
       expect(fleet.spawns[0]).toMatchObject({
@@ -2309,11 +2442,12 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('summarizes stale clone-path mount refreshes once and keeps path details at debug verbosity', async () => {
+  it('refreshes one stale registered workspace mirror once, regardless of routed clone count', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-mounts-'))
     const previousCwd = process.cwd()
     try {
       const clonePaths = [join(root, 'pear'), join(root, 'relay')]
+      const mirrorDir = join(root, 'chief', '.integrations')
       await Promise.all(clonePaths.map((clonePath) => mkdir(clonePath)))
       const configPath = await writeConfig(root, {
         repos: {
@@ -2358,14 +2492,17 @@ describe('fleet CLI runtime', () => {
           dispose: vi.fn(),
         } as unknown as Factory
         const errors = buffer()
+        const mount = Object.assign(new FakeMountClient(), {
+          getLocalMountRoot: () => mirrorDir,
+        })
         const code = await runFleetCli(['start', '--config', configPath], {
           fleet: new FakeFleetClient(),
-          mount: new FakeMountClient(),
+          mount,
           createFactory: vi.fn(() => factory),
           ensureLocalMount,
           waitForStopSignal: vi.fn(async () => {
             await vi.waitFor(() => {
-              expect(errors.text()).toContain('[factory] refreshed 2 stale local mount(s)')
+              expect(errors.text()).toContain('[factory] refreshed 1 stale local mount(s)')
             })
           }),
           env: debug ? { FACTORY_LOG_LEVEL: 'debug' } : {},
@@ -2377,20 +2514,17 @@ describe('fleet CLI runtime', () => {
       }
 
       const staleAt = Date.now()
-      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
-      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      await writeMountState(dirname(mirrorDir), new Date(staleAt - 31 * 60 * 1000).toISOString())
       const normalOutput = await runStart(false)
-      expect(normalOutput).toContain('[factory] refreshed 2 stale local mount(s) (last reconcile ~31m ago)')
+      expect(normalOutput).toContain('[factory] refreshed 1 stale local mount(s) (last reconcile ~31m ago)')
       expect(normalOutput).not.toContain('local mount is stale')
       expect(normalOutput).not.toContain('[factory] debug:')
       expect(normalOutput.match(/stale local mount/gu)).toHaveLength(1)
 
-      await writeMountState(clonePaths[0]!, new Date(staleAt - 30 * 60 * 1000).toISOString())
-      await writeMountState(clonePaths[1]!, new Date(staleAt - 31 * 60 * 1000).toISOString())
+      await writeMountState(dirname(mirrorDir), new Date(staleAt - 31 * 60 * 1000).toISOString())
       const debugOutput = await runStart(true)
-      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[0]}`)
-      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${clonePaths[1]}`)
-      expect(debugOutput).toContain('[factory] refreshed 2 stale local mount(s)')
+      expect(debugOutput).toContain(`[factory] debug: refreshed stale local mount at ${mirrorDir}`)
+      expect(debugOutput).toContain('[factory] refreshed 1 stale local mount(s)')
     } finally {
       process.chdir(previousCwd)
       await rm(root, { recursive: true, force: true })
@@ -2443,9 +2577,7 @@ describe('fleet CLI runtime', () => {
       expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', process.cwd(), {
         acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
       })
-      expect(ensureLocalMount).toHaveBeenCalledWith('rw_7ccfea89', '/work/pear', {
-        acceptableWorkspaceIds: ['50587328-441d-4acb-b8f3-dbe1b3c5de99'],
-      })
+      expect(ensureLocalMount).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2488,9 +2620,7 @@ describe('fleet CLI runtime', () => {
       expect(ensureSdkMount).toHaveBeenCalledWith(process.cwd(), {
         acceptableWorkspaceIds: undefined,
       })
-      expect(ensureSdkMount).toHaveBeenCalledWith('/work/pear', {
-        acceptableWorkspaceIds: undefined,
-      })
+      expect(ensureSdkMount).toHaveBeenCalledTimes(1)
       expect(disposeMount).toHaveBeenCalledTimes(1)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -2577,9 +2707,7 @@ describe('fleet CLI runtime', () => {
       expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', process.cwd(), {
         acceptableWorkspaceIds: undefined,
       })
-      expect(ensureLocalMount).toHaveBeenCalledWith('factory-cli-test', '/work/pear', {
-        acceptableWorkspaceIds: undefined,
-      })
+      expect(ensureLocalMount).toHaveBeenCalledTimes(1)
       expect(createFactory).toHaveBeenCalledTimes(1)
       expect(createFactory.mock.calls[0]?.[1].stateStore).toBeInstanceOf(FileStateStore)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
@@ -2591,11 +2719,11 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('warms configured clone mounts with bounded concurrency without blocking live start', async () => {
+  it('warms one registered workspace mirror without blocking live start for sixteen routes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-start-mount-concurrency-'))
     try {
       const clonePaths = Object.fromEntries(
-        Array.from({ length: 9 }, (_, index) => [`AgentWorkforce/repo-${index}`, join(root, `repo-${index}`)]),
+        Array.from({ length: 16 }, (_, index) => [`AgentWorkforce/repo-${index}`, join(root, `repo-${index}`)]),
       )
       const configPath = await writeConfig(root, {
         repos: {
@@ -2605,6 +2733,9 @@ describe('fleet CLI runtime', () => {
         },
       })
       const mounted: string[] = []
+      const mirrorDir = join(root, 'chief', '.integrations')
+      let releaseMount!: () => void
+      const mountReleased = new Promise<void>((resolve) => { releaseMount = resolve })
       let mountedWhenFactoryStarted = -1
       const factory = {
         start: vi.fn(async () => { mountedWhenFactoryStarted = mounted.length }),
@@ -2617,33 +2748,176 @@ describe('fleet CLI runtime', () => {
         on: vi.fn(),
         dispose: vi.fn(),
       } as unknown as Factory
-      let active = 0
-      let maxActive = 0
       const ensureLocalMount = vi.fn(async (_workspaceId: string, startDir: string) => {
-        if (startDir === process.cwd()) return
+        await mountReleased
         mounted.push(startDir)
-        active += 1
-        maxActive = Math.max(maxActive, active)
-        await new Promise((resolve) => setTimeout(resolve, 10))
-        active -= 1
+      })
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountRoot: () => mirrorDir,
       })
 
       await runFleetCli(['start', '--config', configPath], {
         fleet: new FakeFleetClient(),
-        mount: new FakeMountClient(),
+        mount,
         createFactory: vi.fn(() => factory),
         ensureLocalMount,
         waitForStopSignal: vi.fn(async () => {
-          await vi.waitFor(() => expect(mounted).toHaveLength(9))
+          releaseMount()
+          await vi.waitFor(() => expect(mounted).toHaveLength(1))
         }),
         stdout: buffer(),
         stderr: buffer(),
       })
 
-      expect(maxActive).toBe(4)
-      expect(mounted.sort()).toEqual(Object.values(clonePaths).sort())
-      expect(mountedWhenFactoryStarted).toBeLessThan(Object.keys(clonePaths).length)
+      expect(mounted).toEqual([dirname(mirrorDir)])
+      expect(ensureLocalMount).toHaveBeenCalledTimes(1)
+      expect(mountedWhenFactoryStarted).toBeLessThan(1)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves an unknown workspace mirror before enabling a live factory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-resolve-mirror-before-start-'))
+    try {
+      const configPath = await writeConfig(root)
+      const events: string[] = []
+      let registeredRoot: string | undefined
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountRoot: () => registeredRoot,
+      })
+      const factory = {
+        start: vi.fn(async () => { events.push('factory-start') }),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const ensureLocalMount = vi.fn(async () => {
+        events.push('mount-resolved')
+        registeredRoot = join(root, 'chief', '.integrations')
+      })
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(events).toEqual(['mount-resolved', 'factory-start'])
+      expect(ensureLocalMount).toHaveBeenCalledTimes(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('handles SIGTERM gracefully while an unknown workspace mirror is still resolving', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-resolve-mirror-sigterm-'))
+    try {
+      const configPath = await writeConfig(root)
+      const listeners = new Map<string, () => void>()
+      const processLike = {
+        once(signal: string, listener: () => void) {
+          listeners.set(signal, listener)
+          return processLike
+        },
+        off(signal: string, listener: () => void) {
+          if (listeners.get(signal) === listener) listeners.delete(signal)
+          return processLike
+        },
+      }
+      const calls: string[] = []
+      let registeredRoot: string | undefined
+      let releaseMount!: () => void
+      const mountReleased = new Promise<void>((resolve) => { releaseMount = resolve })
+      const mount = Object.assign(new FakeMountClient(), {
+        getLocalMountRoot: () => registeredRoot,
+      })
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => { calls.push('stop') }),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const ensureLocalMount = vi.fn(async () => {
+        await mountReleased
+        registeredRoot = join(root, 'chief', '.integrations')
+      })
+
+      const run = runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount,
+        waitForStopSignal: vi.fn(async () => undefined),
+        stopSignalProcessLike: processLike as unknown as Pick<NodeJS.Process, 'once' | 'off'>,
+        flushDaemonOutput: async () => { calls.push('flush') },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      await vi.waitFor(() => {
+        expect(ensureLocalMount).toHaveBeenCalledTimes(1)
+        expect(listeners.has('SIGTERM')).toBe(true)
+      })
+      listeners.get('SIGTERM')?.()
+      await vi.waitFor(() => expect(calls).toEqual(['stop', 'flush']))
+      releaseMount()
+
+      await expect(run).resolves.toBe(0)
+      expect(factory.start).not.toHaveBeenCalled()
+      expect(factory.stop).toHaveBeenCalledTimes(1)
+      expect(listeners.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not start a live factory when an unknown workspace mirror cannot be resolved', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-unresolved-mirror-'))
+    try {
+      const configPath = await writeConfig(root)
+      const factory = {
+        start: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+      const errors = buffer()
+
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), { getLocalMountRoot: () => undefined }),
+        createFactory: vi.fn(() => factory),
+        ensureLocalMount: vi.fn(async () => { throw new Error('admission refused') }),
+        waitForStopSignal: vi.fn(async () => undefined),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(factory.start).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('aborting startup: Relayfile workspace mirror could not be resolved')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

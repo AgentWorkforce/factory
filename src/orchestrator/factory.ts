@@ -67,6 +67,7 @@ import { isResourceSubscriptionsUnavailable, type ResourceSubscription } from '.
 import type {
   DispatchResult,
   Factory,
+  FactoryEventListenerStatus,
   FactoryEventPayload,
   FactoryPorts,
   FactoryStatus,
@@ -463,6 +464,10 @@ export class FactoryLoop implements Factory {
   #subscription?: Subscription
   #livePollTimer?: ReturnType<typeof setTimeout>
   #livePollInFlight = false
+  // The effective transport includes per-start overrides, which can differ
+  // from config.liveSubscription. Persist it so status/heartbeat describes
+  // the listener that was actually registered.
+  #liveTransport?: FactoryLiveSubscriptionOptions['transport']
   #liveEventCursor?: string
   #liveEventHighWatermark?: string
   #liveConnectStartedAtMs = 0
@@ -832,6 +837,11 @@ export class FactoryLoop implements Factory {
       this.#schedulePreviewSweep()
       try {
         await this.#startLiveSubscription(issueSource, opts.liveSubscription)
+        // The initial live heartbeat is intentionally written before startup
+        // so crash reapers can see a daemon while it bootstraps. Write again
+        // once the listener is actually registered so external `factory
+        // status` can distinguish a quiet feed from no listener.
+        await this.#writeLiveHeartbeat('running')
         await this.#rearmSlackReplyWatchers()
         await this.#drainReadyClarificationWake()
         await this.#rearmGithubIssueCommentWatchers()
@@ -1045,6 +1055,7 @@ export class FactoryLoop implements Factory {
     overrides: Partial<FactoryLiveSubscriptionOptions> = {},
   ): Promise<void> {
     const options = this.#liveOptions(overrides)
+    this.#liveTransport = options.transport
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -2782,7 +2793,27 @@ export class FactoryLoop implements Factory {
       counters: { ...this.#counters },
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
+      eventListener: this.#eventListenerStatus(),
     }
+  }
+
+  #eventListenerStatus(): FactoryEventListenerStatus {
+    if (this.#startMode !== 'live') {
+      return {
+        state: 'not-listening',
+        reason: this.#startMode ? `factory mode is ${this.#startMode}` : 'factory has not started',
+      }
+    }
+    if (!this.#liveHeartbeatActive) {
+      return { state: 'not-listening', reason: 'live daemon heartbeat is inactive' }
+    }
+    if (this.#subscription) {
+      return { state: 'subscribed' }
+    }
+    if (this.#liveTransport === 'poll') {
+      return { state: 'polling' }
+    }
+    return { state: 'starting' }
   }
 
   on(event: FactoryEvent, listener: Listener): () => void {
@@ -5072,6 +5103,7 @@ export class FactoryLoop implements Factory {
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
       registryPath,
+      eventListener: this.#eventListenerStatus(),
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
@@ -12825,12 +12857,11 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  // Absolute path to the local .integrations mount the daemon manages. The mount
-  // is created at the daemon's cwd (see ensureLocalMount), and spawned agents run
-  // in their repo clonePath, so writeback paths handed to agents must be absolute
-  // against this root rather than a bare relative `.integrations/...`.
+  // Absolute path to the one registered workspace mirror. Spawned agents run in
+  // repo clone paths, so writeback instructions must name the shared mirror,
+  // not a relative `.integrations` path or a per-repository re-home attempt.
   #integrationsMountRoot(): string {
-    return resolve(process.cwd(), '.integrations')
+    return this.#mount.getLocalMountRoot?.() ?? resolve(process.cwd(), '.integrations')
   }
 
   async #slackChannelDir(): Promise<string | undefined> {

@@ -133,8 +133,6 @@ interface LoadedConfig {
 }
 
 const autoDetectedIssueSources = new WeakSet<FactoryConfig>()
-const CLONE_MOUNT_PREFLIGHT_CONCURRENCY = 4
-
 type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; workflow?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
@@ -629,16 +627,18 @@ async function runFactoryCommand(
           waiter.resolve(code)
         }
       }
-      // Local mirrors are a writeback aid, not the source of truth for remote
-      // issue discovery. Start their SDK-backed supervisors immediately, but
-      // do not serialize durable recovery behind a stale checkout's readiness
-      // timeout. The mount client reports degradation and keeps retrying.
+      // Once a workspace mirror is known, retain background stale-mount
+      // supervision so durable recovery is not serialized behind a refresh.
+      // If there is no registered root yet, however, wait for the single
+      // mount/admission fallback before Factory can dispatch: agents must not
+      // receive a provisional checkout-local `.integrations` path.
       //
       // A MountAuthScopeError is the exception: it is terminal (the cloud
       // session lacks the filesystem scope the mount needs), so limping on
       // would only spawn agents against a read-denied mirror. Fail fast with the
       // remediation and resolve the command with a non-zero code.
-      void warmStartPathMounts(
+      const warmMount = () => warmStartPathMounts(
+        mount,
         mountFn,
         workspaceId,
         config,
@@ -646,16 +646,16 @@ async function runFactoryCommand(
         mountStderr,
         debugMountRefreshes,
       )
-        .catch((error: unknown) => {
-          if (error instanceof MountAuthScopeError) {
-            mountStderr.write(`${error.message}\n`)
-            mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-            void flushAndResolve(1)
-            return
-          }
-          const message = error instanceof Error ? error.message : String(error)
-          mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
-        })
+      const handleWarmMountError = (error: unknown): void => {
+        if (error instanceof MountAuthScopeError) {
+          mountStderr.write(`${error.message}\n`)
+          mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
+          void flushAndResolve(1)
+          return
+        }
+        const message = error instanceof Error ? error.message : String(error)
+        mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+      }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
           stoppedBySignal = true
@@ -667,6 +667,23 @@ async function runFactoryCommand(
         processLike: deps.stopSignalProcessLike,
       })
       try {
+        if (mount.getLocalMountRoot?.() === undefined) {
+          try {
+            const result = await warmMount()
+            if (!result.mounted) {
+              mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
+              if (stoppedBySignal) return await waiter.promise
+              return 1
+            }
+          } catch (error) {
+            handleWarmMountError(error)
+            if (stoppedBySignal) return await waiter.promise
+            return 1
+          }
+        } else {
+          void warmMount().catch(handleWarmMountError)
+        }
+        if (stoppedBySignal) return await waiter.promise
         await factory.start({ mode: command.mode })
         const code = await (deps.waitForStopSignal?.() ?? waiter.promise)
         return typeof code === 'number' ? code : 0
@@ -678,19 +695,18 @@ async function runFactoryCommand(
       }
     }
     if (command.action === 'run-once') {
-      await ensureClonePathMounts(
+      await ensureWorkspaceMount(
+        mount,
         mountFn,
         workspaceId,
-        config,
         acceptableMountIds,
         mountStderr,
-        debugMountRefreshes,
       )
       writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
       return 0
     }
     if (command.action === 'status') {
-      writeJson(out, factory.status())
+      writeJson(out, await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs))
       return 0
     }
     if (command.action === 'loop-status') {
@@ -707,20 +723,22 @@ async function runFactoryCommand(
       writeJson(out, { killed: heartbeat.pid, signal: 'SIGTERM' })
       return 0
     }
-    await ensureClonePathMounts(
+    await ensureWorkspaceMount(
+      mount,
       mountFn,
       workspaceId,
-      config,
       acceptableMountIds,
       mountStderr,
-      debugMountRefreshes,
     )
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
-      writeJson(out, { reports, status: factory.status() })
+      writeJson(out, {
+        reports,
+        status: await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs),
+      })
     } finally {
       removeSignalHandlers()
       await factory.stop()
@@ -762,31 +780,27 @@ async function runFactoryCommand(
 }
 
 async function warmStartPathMounts(
+  mount: MountClient,
   mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
   workspaceId: string,
   config: FactoryConfig,
   acceptableMountIds?: readonly string[],
   stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
   debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
-): Promise<void> {
-  const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
-  const [daemonRefresh, cloneRefreshes] = await Promise.all([
-    ensureMountPath(mountFn, workspaceId, process.cwd(), mountOpts, stderr),
-    ensureClonePathMounts(
-      mountFn,
-      workspaceId,
-      config,
-      acceptableMountIds,
-      stderr,
-      debug,
-      false,
-    ),
-  ])
-  writeMountRefreshSummary(
-    [...(daemonRefresh ? [daemonRefresh] : []), ...cloneRefreshes],
+): Promise<WorkspaceMountPreflight> {
+  const result = await ensureWorkspaceMount(
+    mount,
+    mountFn,
+    workspaceId,
+    acceptableMountIds,
     stderr,
-    debug,
   )
+  writeMountRefreshSummary(result.refreshed ? [result.refreshed] : [], stderr, debug)
+  stderr.write(
+    `[factory] Relayfile workspace mirror preflight: mounted=${result.mounted ? 1 : 0} ` +
+    `failed=${result.mounted ? 0 : 1} routedRepos=${new Set(Object.values(config.repos.byLabel)).size}\n`,
+  )
+  return result
 }
 
 async function runStandaloneBabysitCommand(
@@ -803,11 +817,7 @@ async function runStandaloneBabysitCommand(
   const repo = resolveStandaloneBabysitRepo(command.repo, config)
   const clonePath = standaloneBabysitClonePath(repo, config)
   const mountFn = resolveLocalMountFn(deps, mount)
-  const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
-  await ensureStandaloneBabysitMount(mountFn, workspaceId, process.cwd(), mountOpts, deps.stderr)
-  if (clonePath && resolve(clonePath) !== resolve(process.cwd())) {
-    await ensureStandaloneBabysitMount(mountFn, workspaceId, clonePath, mountOpts, deps.stderr)
-  }
+  await ensureWorkspaceMount(mount, mountFn, workspaceId, acceptableMountIds, deps.stderr)
 
   const pr = await readStandalonePullRequest(
     mount,
@@ -875,7 +885,7 @@ async function runStandaloneBabysitCommand(
       maintainerCanModify: pr.maintainerCanModify,
     },
     standaloneBabysitter: { specSource },
-    integrationsMountRoot: resolve(process.cwd(), '.integrations'),
+    integrationsMountRoot: resolveIntegrationsMountRoot(mount),
     testGuidance,
   })
   const receiptBase = {
@@ -915,27 +925,6 @@ async function runStandaloneBabysitCommand(
   return 0
 }
 
-async function ensureStandaloneBabysitMount(
-  mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
-  workspaceId: string,
-  startDir: string,
-  options: { acceptableWorkspaceIds?: readonly string[] },
-  stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
-): Promise<void> {
-  try {
-    await mountFn(workspaceId, startDir, options)
-  } catch (error) {
-    // Terminal scope shortfall: propagate so the command aborts with the
-    // remediation rather than silently falling back to a read-denied mirror.
-    if (error instanceof MountAuthScopeError) throw error
-    const message = error instanceof Error ? error.message : String(error)
-    stderr.write(
-      `[factory] warning: could not start relayfile mount for standalone babysitter at ${resolve(startDir)}; ` +
-      `the agent will use the GitHub CLI fallback: ${message}\n`,
-    )
-  }
-}
-
 function resolveStandaloneBabysitRepo(repo: string | undefined, config: FactoryConfig): string {
   const configured = repo ?? config.repos.default
   if (!configured) {
@@ -966,43 +955,31 @@ function standaloneBabysitClonePath(repo: string, config: FactoryConfig): string
 }
 
 /**
- * Ensures the relayfile mount is running at each configured clone path so
- * spawned agents can resolve `.integrations` relative to their working
- * directory (the checkout path). The mount daemon started at the daemon CWD
- * is not automatically accessible from a different directory, and agents need
- * these paths for integration writebacks (Slack, GitHub, etc.).
+ * Ensures exactly one Relayfile mirror for the workspace.  Agents receive this
+ * absolute path in their tasks, so routing more repositories never asks
+ * Relayfile to re-home the mirror into each checkout.
  */
-async function ensureClonePathMounts(
+async function ensureWorkspaceMount(
+  mount: MountClient,
   mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
   workspaceId: string,
-  config: FactoryConfig,
   acceptableMountIds?: readonly string[],
   stderr: Pick<NodeJS.WriteStream, 'write'> = process.stderr,
-  debug = process.env.FACTORY_LOG_LEVEL?.toLowerCase() === 'debug',
-  reportSummary = true,
-): Promise<RefreshedStaleMount[]> {
+): Promise<WorkspaceMountPreflight> {
   const mountOpts = { acceptableWorkspaceIds: acceptableMountIds }
-  const daemonCwd = resolve(process.cwd())
-  const clonePaths = [...new Set(Object.values(config.clonePaths ?? {}).map((clonePath) => resolve(clonePath)))]
-    .filter((clonePath) => clonePath !== daemonCwd)
-  const refreshedStaleMounts: RefreshedStaleMount[] = []
-  let nextIndex = 0
-  const mountNext = async (): Promise<void> => {
-    while (nextIndex < clonePaths.length) {
-      const resolved = clonePaths[nextIndex++]!
-      const refreshed = await ensureMountPath(mountFn, workspaceId, resolved, mountOpts, stderr)
-      if (refreshed) refreshedStaleMounts.push(refreshed)
-    }
-  }
-  await Promise.all(Array.from(
-    { length: Math.min(CLONE_MOUNT_PREFLIGHT_CONCURRENCY, clonePaths.length) },
-    mountNext,
-  ))
-  if (reportSummary) writeMountRefreshSummary(refreshedStaleMounts, stderr, debug)
-  return refreshedStaleMounts
+  const localDir = mount.getLocalMountRoot?.()
+  return ensureMountPath(
+    mountFn,
+    workspaceId,
+    localDir ? dirname(localDir) : process.cwd(),
+    mountOpts,
+    stderr,
+    localDir,
+  )
 }
 
 type RefreshedStaleMount = { path: string; reason?: string }
+type WorkspaceMountPreflight = { mounted: boolean; refreshed?: RefreshedStaleMount }
 
 async function ensureMountPath(
   mountFn: NonNullable<FleetCliDeps['ensureLocalMount']>,
@@ -1010,27 +987,78 @@ async function ensureMountPath(
   path: string,
   mountOpts: { acceptableWorkspaceIds?: readonly string[] },
   stderr: Pick<NodeJS.WriteStream, 'write'>,
-): Promise<RefreshedStaleMount | undefined> {
-  const resolved = resolve(path)
-  const statePath = join(resolved, '.integrations', '.relay', 'state.json')
+  localDir = join(resolve(path), '.integrations'),
+): Promise<WorkspaceMountPreflight> {
+  const statePath = join(localDir, '.relay', 'state.json')
   const staleBefore = checkMountStaleness(statePath, workspaceId, mountOpts.acceptableWorkspaceIds)
   try {
-    await mountFn(workspaceId, resolved, {
+    await mountFn(workspaceId, resolve(path), {
       ...mountOpts,
       ...(staleBefore.stale ? { suppressStaleRefreshLogs: true } : {}),
     })
     if (staleBefore.stale && !checkMountStaleness(statePath, workspaceId, mountOpts.acceptableWorkspaceIds).stale) {
-      return { path: resolved, reason: staleBefore.reason }
+      return { mounted: true, refreshed: { path: localDir, reason: staleBefore.reason } }
     }
+    return { mounted: true }
   } catch (error) {
     // A scope shortfall is terminal and identical across every clone path;
     // propagate it so startup fails fast with one remediation instead of
     // logging the same unfixable warning per path.
     if (error instanceof MountAuthScopeError) throw error
     const message = error instanceof Error ? error.message : String(error)
-    stderr.write(`[factory] warning: could not start relayfile mount at ${resolved}: ${message}\n`)
+    stderr.write(`[factory] warning: could not start Relayfile workspace mirror at ${localDir}: ${message}\n`)
   }
-  return undefined
+  return { mounted: false }
+}
+
+function resolveIntegrationsMountRoot(mount: MountClient): string {
+  return mount.getLocalMountRoot?.() ?? resolve(process.cwd(), '.integrations')
+}
+
+async function factoryStatusWithMountHealth(
+  factory: Factory,
+  mount: MountClient,
+  heartbeatPath: string,
+  heartbeatStaleMs: number,
+): Promise<ReturnType<Factory['status']> & {
+  localMountDegraded?: boolean
+  localMountDegradedReason?: string
+  localMountRoot?: string
+  /** Local mirror liveness, independently of whether the daemon is listening. */
+  localMountEventFeed?: {
+    state: 'healthy' | 'degraded'
+    livenessSignal: '.integrations/.relay/state.json'
+    reason?: string
+    root?: string
+  }
+}> {
+  const status = factory.status()
+  const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+  const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
+  const eventListener = liveness.ok
+    ? heartbeat?.eventListener ?? {
+      state: 'unknown' as const,
+      reason: 'running daemon heartbeat does not report event listener state',
+    }
+    : {
+      state: 'not-listening' as const,
+      reason: liveness.reason,
+    }
+  const health = mount.getLocalMountHealth?.()
+  if (!health) return { ...status, eventListener }
+  return {
+    ...status,
+    eventListener,
+    localMountDegraded: health.degraded,
+    ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
+    ...(health.localDir ? { localMountRoot: health.localDir } : {}),
+    localMountEventFeed: {
+      state: health.degraded ? 'degraded' : 'healthy',
+      livenessSignal: '.integrations/.relay/state.json',
+      ...(health.reason ? { reason: health.reason } : {}),
+      ...(health.localDir ? { root: health.localDir } : {}),
+    },
+  }
 }
 
 function writeMountRefreshSummary(
@@ -1539,6 +1567,7 @@ async function buildMount(
   let mount: MountClient
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
+    localMountRoot: loaded.config.localMountRoot,
     logger: observability.logger,
     onLocalMountHealth: observability.onLocalMountHealth,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),

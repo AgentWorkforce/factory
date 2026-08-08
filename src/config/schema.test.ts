@@ -237,6 +237,21 @@ describe('FactoryConfigSchema', () => {
     expect(github.issueSource).toBe('github')
   })
 
+  it('normalizes an explicit workspace mirror root and rejects unsafe values', () => {
+    const parsed = FactoryConfigSchema.parse({
+      localMountRoot: '  /work/chief/.integrations  ',
+      repos: { default: 'AgentWorkforce/factory' },
+    })
+
+    expect(parsed.localMountRoot).toBe('/work/chief/.integrations')
+    for (const localMountRoot of ['', '   ', './.integrations', 'relative/mirror']) {
+      expect(() => FactoryConfigSchema.parse({
+        localMountRoot,
+        repos: { default: 'AgentWorkforce/factory' },
+      })).toThrow()
+    }
+  })
+
   it.each(['app', 'user', 'auto'] as const)('accepts github.identity %s', (identity) => {
     const parsed = FactoryConfigSchema.parse({
       repos: { default: 'AgentWorkforce/factory' },
