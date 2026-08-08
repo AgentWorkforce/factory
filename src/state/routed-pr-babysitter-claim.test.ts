@@ -117,7 +117,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
     )).outcome).toBe('already-running')
   })
 
-  it(`${label} atomically adopts a restored running claim`, async () => {
+  it(`${label} atomically adopts an expired restored running claim`, async () => {
     const store = await create()
     await store.claimRoutedPrBabysitter(
       'workspace',
@@ -140,12 +140,12 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'agentworkforce/pear#7',
       'agent-a',
       'new-owner',
-      2_000,
+      61_001,
       60_000,
     )).toBe(true)
     expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
       owner: 'new-owner',
-      leaseUntilMs: 62_000,
+      leaseUntilMs: 121_001,
       agentName: 'agent-a',
       status: 'running',
     })
@@ -154,6 +154,72 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'agentworkforce/pear#7',
       'old-owner',
     )).toBe(false)
+  })
+
+  it(`${label} refuses to adopt another owner's live running lease`, async () => {
+    const store = await create()
+    await store.claimRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      seed,
+      'old-owner',
+      1_000,
+      60_000,
+      5,
+    )
+    await store.markRoutedPrBabysitterRunning(
+      'workspace',
+      'agentworkforce/pear#7',
+      'old-owner',
+      'agent-a',
+      1_001,
+    )
+
+    expect(await store.adoptRoutedPrBabysitterClaim(
+      'workspace',
+      'agentworkforce/pear#7',
+      'agent-a',
+      'new-owner',
+      2_000,
+      60_000,
+    )).toBe(false)
+    expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
+      owner: 'old-owner',
+      leaseUntilMs: 61_000,
+    })
+  })
+
+  it(`${label} lets the current owner renew a live running lease`, async () => {
+    const store = await create()
+    await store.claimRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      seed,
+      'owner-a',
+      1_000,
+      60_000,
+      5,
+    )
+    await store.markRoutedPrBabysitterRunning(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      'agent-a',
+      1_001,
+    )
+
+    expect(await store.adoptRoutedPrBabysitterClaim(
+      'workspace',
+      'agentworkforce/pear#7',
+      'agent-a',
+      'owner-a',
+      2_000,
+      60_000,
+    )).toBe(true)
+    expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
+      owner: 'owner-a',
+      leaseUntilMs: 62_000,
+    })
   })
 
   it(`${label} prunes completed claims after bounded retention`, async () => {

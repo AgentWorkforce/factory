@@ -737,7 +737,12 @@ export class FileStateStore extends InMemoryStateStore {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (!claim || claim.status !== 'running' || claim.agentName !== agentName) return false
+      if (
+        !claim ||
+        claim.status !== 'running' ||
+        claim.agentName !== agentName ||
+        (claim.owner !== owner && claim.leaseUntilMs > nowMs)
+      ) return false
       claim.owner = owner
       claim.leaseUntilMs = nowMs + leaseMs
       claim.updatedAtMs = nowMs

@@ -711,7 +711,12 @@ export class InMemoryStateStore implements StateStore {
     leaseMs: number,
   ): Promise<boolean> {
     const claim = this.#workspace(workspaceId).routedPrBabysitterClaims.get(identity)
-    if (!claim || claim.status !== 'running' || claim.agentName !== agentName) return false
+    if (
+      !claim ||
+      claim.status !== 'running' ||
+      claim.agentName !== agentName ||
+      (claim.owner !== owner && claim.leaseUntilMs > nowMs)
+    ) return false
     claim.owner = owner
     claim.leaseUntilMs = nowMs + leaseMs
     claim.updatedAtMs = nowMs
