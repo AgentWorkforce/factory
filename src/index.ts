@@ -80,7 +80,7 @@ export {
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
-export { RelayfileGithubConnectionRead } from './mount/relayfile-github-connection-read'
+export { GithubApiIssueRead } from './mount/github-api-issue-read'
 export {
   ensureFactoryIntegrations,
   inspectFactoryIntegration,

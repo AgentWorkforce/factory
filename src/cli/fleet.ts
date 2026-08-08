@@ -1694,11 +1694,18 @@ async function resolveIssueArg(
     }
   }
 
-  const number = Number(issueArg.replace(/^#/, ''))
+  const selector = parseGithubIssueSelector(issueArg, config)
   const projection = projectionStatus
     ? await projectionStatus()
     : projectionStatusFromMount(mount)
-  const fallback = await findGithubIssueThroughConnection(mount, number, config)
+  const unavailableReason = githubProjectionUnavailableReason(projection)
+  if (!unavailableReason) {
+    throw new Error(
+      `${githubIssueResolutionError(config, issueArg)}: found 0 matches in the healthy Relayfile projection; ` +
+      'the GitHub API fallback was not used',
+    )
+  }
+  const fallback = await findGithubIssueThroughConnection(mount, selector, config, issueArg)
   if (!fallback) {
     throw new Error(`${githubIssueResolutionError(config, issueArg)}: found 0 matches in the projection and GitHub API`)
   }
@@ -1707,7 +1714,7 @@ async function resolveIssueArg(
     resolution: {
       source: 'github-api-fallback',
       repo: fallback.repo,
-      detail: 'Relayfile projection returned no match; resolved authoritatively through the workspace GitHub API connection.',
+      detail: `Relayfile projection could not answer (${unavailableReason}); resolved authoritatively through the GitHub API fallback.`,
       projection,
     },
   }
@@ -1715,11 +1722,9 @@ async function resolveIssueArg(
 
 async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string | undefined> {
   if (config.issueSource === 'github') {
-    const number = Number(key.replace(/^#/, ''))
-    if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`${githubIssueResolutionError(config, key)}: expected a positive issue number`)
-    }
-    const configuredRepos = configuredGithubIssueRepos(config)
+    const selector = parseGithubIssueSelector(key, config)
+    const number = selector.number
+    const configuredRepos = selector.repo ? [selector.repo] : configuredGithubIssueRepos(config)
     if (configuredRepos.length === 0 && hasConfiguredGithubIssueRoutes(config)) {
       throw new Error(
         `${githubIssueResolutionError(config, key)}: configured repository routes do not resolve to owner/repo; ` +
@@ -1779,28 +1784,29 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
 
 async function findGithubIssueThroughConnection(
   mount: MountClient,
-  number: number,
+  selector: GithubIssueSelector,
   config: FactoryConfig,
+  issueArg: string,
 ) {
   const github = mount.githubRead
   if (!github) {
     throw new Error(
-      `${githubIssueResolutionError(config, String(number))}: projection returned no match and the GitHub API fallback is unavailable`,
+      `${githubIssueResolutionError(config, issueArg)}: projection cannot answer and the GitHub API fallback is unavailable`,
     )
   }
-  const repos = configuredGithubIssueRepos(config)
+  const repos = selector.repo ? [selector.repo] : configuredGithubIssueRepos(config)
   if (repos.length === 0) {
     throw new Error(
-      `${githubIssueResolutionError(config, String(number))}: projection returned no match and no configured owner/repo is available for the GitHub API fallback`,
+      `${githubIssueResolutionError(config, issueArg)}: projection cannot answer and no configured owner/repo is available for the GitHub API fallback`,
     )
   }
-  const matches = (await Promise.all(repos.map((repo) => github.getIssue(repo, number))))
+  const matches = (await Promise.all(repos.map((repo) => github.getIssue(repo, selector.number))))
     .filter((issue): issue is NonNullable<typeof issue> => Boolean(issue))
   if (matches.length === 0) return undefined
-  if (!config.repos.default && matches.length > 1) {
+  if (!selector.repo && !config.repos.default && matches.length > 1) {
     const matchedRepos = matches.map((match) => match.repo).sort((left, right) => left.localeCompare(right))
     throw new Error(
-      `${githubIssueResolutionError(config, String(number))}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
+      `${githubIssueResolutionError(config, issueArg)}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
       'set repos.default or pass a repo-qualified argument',
     )
   }
@@ -1833,6 +1839,47 @@ function projectionStatusFromMount(mount: MountClient): IssueResolution['project
     ...(health ? { localMountDegraded: health.degraded } : {}),
     ...(health?.reason ? { localMountDegradedReason: health.reason } : {}),
   }
+}
+
+function githubProjectionUnavailableReason(projection: IssueResolution['projection']): string | undefined {
+  if (projection.localMountDegraded) {
+    return projection.localMountDegradedReason ?? 'local mount is degraded'
+  }
+  if (projection.eventListener && !['subscribed', 'polling'].includes(projection.eventListener.state)) {
+    return projection.eventListener.reason ?? `event listener is ${projection.eventListener.state}`
+  }
+  return undefined
+}
+
+type GithubIssueSelector = { number: number; repo?: string }
+
+function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIssueSelector {
+  const qualified = key.match(/^([^#]+)#([1-9]\d*)$/u)
+  const bare = key.match(/^#?([1-9]\d*)$/u)
+  const number = Number(qualified?.[2] ?? bare?.[1])
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new Error(
+      `${githubIssueResolutionError(config, key)}: expected a positive issue number or repo-qualified reference (repo#number)`,
+    )
+  }
+  if (!qualified) return { number }
+
+  const requested = qualified[1]!
+  const configured = configuredGithubIssueRepos(config)
+  const expanded = requested.includes('/')
+    ? requested
+    : config.repos.org
+      ? `${config.repos.org}/${requested}`
+      : Object.entries(config.repos.byLabel).find(([label]) => label.toLowerCase() === requested.toLowerCase())?.[1]
+  const repo = expanded
+    ? configured.find((candidate) => candidate.toLowerCase() === expanded.toLowerCase())
+    : undefined
+  if (!repo) {
+    throw new Error(
+      `${githubIssueResolutionError(config, key)}: repository ${requested} is not one of the configured Factory routes`,
+    )
+  }
+  return { number, repo }
 }
 
 function configuredGithubIssueRepos(config: FactoryConfig): string[] {

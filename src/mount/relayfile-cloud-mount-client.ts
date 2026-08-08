@@ -47,7 +47,7 @@ import {
 } from '../subscriptions'
 import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
-import { RelayfileGithubConnectionRead } from './relayfile-github-connection-read'
+import { GithubApiIssueRead } from './github-api-issue-read'
 import {
   ensureLocalMount as runLocalMountPreflight,
   type EnsureLocalMountOptions,
@@ -73,7 +73,6 @@ export const FACTORY_RELAYFILE_SCOPES = [
   // cleanly. Do NOT narrow this back to `/github/repos/**`.
   'relayfile:fs:read:/github/**',
   'relayfile:fs:write:/github/**',
-  'integration:github:read',
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
@@ -348,10 +347,7 @@ export class RelayfileCloudMountClient implements MountClient {
         resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
-    const githubConnectionRequest = config.relayfileWorkspace?.requestJson?.bind(config.relayfileWorkspace)
-    this.githubRead = githubConnectionRequest
-      ? new RelayfileGithubConnectionRead({ workspace: { requestJson: githubConnectionRequest } })
-      : undefined
+    this.githubRead = new GithubApiIssueRead()
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
     this.integrationConnections = relayfileIntegrationConnections(
       config.relayfileWorkspace,

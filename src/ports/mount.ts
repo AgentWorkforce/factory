@@ -72,10 +72,10 @@ export interface GithubPublishPullRequestResult {
 }
 
 /**
- * Provider-authoritative GitHub issue returned through the workspace's
- * connected GitHub integration. `content` intentionally uses the same
- * provider record shape as the Relayfile projection so the existing parser
- * and safety gates stay authoritative.
+ * Provider-authoritative GitHub issue returned by the direct API fallback.
+ * `content` intentionally uses the same provider record shape as the
+ * Relayfile projection so the existing parser and safety gates stay
+ * authoritative.
  */
 export interface GithubConnectionIssue {
   repo: string

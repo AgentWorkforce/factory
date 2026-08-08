@@ -26,3 +26,10 @@
 - Focused build/tests: exit 0; 153 tests passed across the new connection reader, mount client, and CLI suites.
 - Live preflight exposed a necessary unblock: the connected GitHub projection currently reports `degraded, complete`, and the old preflight rejected the command before resolution. Targeted triage/dispatch now proceeds only when the SDK GitHub read seam exists; missing connections and run-loop/canary flows retain the existing preflight. The command prints a warning and still checks the projection first.
 - Updated focused build/tests: exit 0; 154 tests passed.
+
+## 2026-08-08 live correction
+
+- The connection-backed GraphQL attempt reached Cloud but exited 1 `Forbidden`: that route additionally requires a deployed sponsor persona, which the local Factory workspace join is not. Replaced it with a read-only direct GitHub REST client; GitHub writes remain on Relayfile app-authored writeback.
+- Fallback eligibility now uses PR #220's health facts: a degraded local mount or listener state other than `subscribed`/`polling` means the projection cannot answer. A healthy projection miss fails without calling GitHub.
+- Added configured `repo#number` and `owner/repo#number` selectors so a targeted fallback performs one authoritative lookup and avoids ambiguous org-wide probes.
+- Live `factory triage factory#222` reached the empty projection, reported the listener `unknown`, resolved via `github-api-fallback`, and routed to `AgentWorkforce/factory`. It emitted its successful decision; the existing one-shot shutdown path remained open until SIGINT, then returned 0. The shutdown hang is separate from issue resolution.
