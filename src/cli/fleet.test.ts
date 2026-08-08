@@ -758,6 +758,44 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('allows targeted GitHub resolution through the API seam when the connected projection is not ready', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-github-fallback-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'degraded',
+        initialSyncState: 'complete',
+      }))
+      const githubRead = fakeGithubConnectionRead(async () => {
+        throw new Error('populated projection must remain preferred')
+      })
+      const mount = Object.assign(
+        mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations),
+        { githubRead },
+      )
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(errors.text()).toContain('GitHub projection is not ready (degraded, complete)')
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'relayfile-projection' },
+      })
+      expect(githubRead.getIssue).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not prompt or connect when a missing integration is checked without a TTY', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-headless-'))
     try {

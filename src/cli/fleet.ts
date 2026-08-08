@@ -1446,9 +1446,31 @@ async function prepareFactoryIntegrations(
   const providers = requiredIntegrationsForCommand(command, config)
   if (providers.length === 0) return
   const dryRun = globals.dryRun || command.kind === 'factory-canary'
+  const providersToEnsure: FactoryIntegrationProvider[] = []
+  for (const provider of providers) {
+    const observation = observed.get(provider) ?? await inspectFactoryIntegration(connections, provider)
+    observed.set(provider, observation)
+    if (
+      provider === 'github' &&
+      observation.kind === 'connected-not-ready' &&
+      mount.githubRead &&
+      (command.kind === 'factory-triage' || command.kind === 'factory-dispatch')
+    ) {
+      const details = [observation.state, observation.initialSyncState]
+        .filter((value): value is string => Boolean(value))
+        .join(', ')
+      err.write(
+        `[factory] warning: GitHub projection is not ready${details ? ` (${details})` : ''}; ` +
+        'targeted resolution remains projection-first and will use the GitHub API fallback only for a miss.\n',
+      )
+      continue
+    }
+    providersToEnsure.push(provider)
+  }
+  if (providersToEnsure.length === 0) return
   await ensureFactoryIntegrations({
     connections,
-    providers,
+    providers: providersToEnsure,
     workspaceId,
     interactive: !dryRun && (deps.isInteractive?.() ?? Boolean(process.stdin.isTTY && process.stderr.isTTY)),
     dryRun,

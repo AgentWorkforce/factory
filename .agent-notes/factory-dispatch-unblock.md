@@ -24,3 +24,5 @@
 - Triage and dispatch results carry `issueResolution`; fallback records also include PR #220's `localMountDegraded`, `localMountDegradedReason`, and `eventListener` state.
 - Dispatch re-reads a fallback issue through the provider before applying the existing scope/readiness/dispatchability/repo-label gates.
 - Focused build/tests: exit 0; 153 tests passed across the new connection reader, mount client, and CLI suites.
+- Live preflight exposed a necessary unblock: the connected GitHub projection currently reports `degraded, complete`, and the old preflight rejected the command before resolution. Targeted triage/dispatch now proceeds only when the SDK GitHub read seam exists; missing connections and run-loop/canary flows retain the existing preflight. The command prints a warning and still checks the projection first.
+- Updated focused build/tests: exit 0; 154 tests passed.
