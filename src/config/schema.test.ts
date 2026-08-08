@@ -330,6 +330,23 @@ describe('FactoryConfigSchema', () => {
       babysitter: { enabled: true, mode: 'factory-created' },
       repos: {},
     }).babysitter.mode).toBe('factory-created')
+
+    expect(() => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+      repos: { names: ['pear'] },
+    })).toThrow(/must resolve at least one owner\/repository route/u)
+  })
+
+  it('accepts one-character repository opt-out identities', () => {
+    const parsed = FactoryConfigSchema.parse({
+      babysitter: {
+        enabled: true,
+        excludePullRequests: ['owner/r#1'],
+      },
+      repos: {},
+    })
+
+    expect(parsed.babysitter.excludePullRequests).toEqual(['owner/r#1'])
   })
 
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {

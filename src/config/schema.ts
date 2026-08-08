@@ -131,7 +131,7 @@ const babysitterSchema = z.object({
   // before their first provider write.
   excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
   excludePullRequests: z.array(z.string().regex(
-    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9_.-]{1,100}#[1-9]\d*$/u,
+    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9_.-]{0,99}#[1-9]\d*$/u,
     'expected owner/repo#number',
   )).default([]),
   // Routed intake stays quiet until an operator explicitly approves the
@@ -333,6 +333,20 @@ const requireRoutedBabysitterRepos = (
       path: ['repos', 'names'],
       message: 'repos.names must contain at least one repository when babysitter.mode is routed-open-prs',
     })
+    return
+  }
+  if (cfg.babysitter.mode === 'routed-open-prs') {
+    const routedRepos = (cfg.repos.names ?? []).map((name) =>
+      cfg.repos.byLabel[name] ?? cfg.repos.overrides[name] ??
+      (cfg.repos.org ? `${cfg.repos.org}/${name}` : name)
+    )
+    if (!routedRepos.some((repo) => /^[^/]+\/[^/]+$/u.test(repo))) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['repos', 'names'],
+        message: 'repos.names must resolve at least one owner/repository route when babysitter.mode is routed-open-prs',
+      })
+    }
   }
 }
 

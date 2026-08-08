@@ -16281,10 +16281,58 @@ describe('FactoryLoop PR babysitter', () => {
 
     expect(fleet.spawns).toHaveLength(1)
     expect(fleet.spawns[0]?.invocationId).toBe('factory-babysit:agentworkforce/pear#701')
+    expect(fleet.spawns[0]?.restartPolicy).toEqual({ max_restarts: 0 })
     expect(fleet.spawns[0]?.task).toContain('PR title JSON (definition of done): "Repair a human-authored PR"')
     expect(fleet.spawns[0]?.task).toContain('Before your first provider write')
     expect(fleet.spawns[0]?.task).toContain('Do not post status comments, mention humans, send notifications, or escalate')
     expect(fleet.spawns[0]?.task).not.toContain('proactively offer to discuss')
+  })
+
+  it('does not renew durable routed claims during a dry-run sweep', async () => {
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/704.json': {
+        number: 704,
+        title: 'Keep dry-run read-only',
+        body: 'Do not mutate the existing lease.',
+        state: 'OPEN',
+        isDraft: false,
+        merged: false,
+        headRefName: 'human/dry-run',
+        headRefOid: 'head-704',
+        baseRefName: 'main',
+        headRepository: { nameWithOwner: 'AgentWorkforce/pear' },
+        isCrossRepository: false,
+        labels: [],
+      },
+    })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['pear'],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+      },
+      babysitter: {
+        enabled: true,
+        mode: 'routed-open-prs',
+        excludeLabels: [],
+        excludePullRequests: [],
+        notifyHumans: false,
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    await factory.runOnce()
+    const before = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))[0]?.[1]
+    await factory.runOnce({ dryRun: true })
+    const after = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))[0]?.[1]
+
+    expect(after).toEqual(before)
   })
 
   it('checks routed PR opt-out before spawning', async () => {

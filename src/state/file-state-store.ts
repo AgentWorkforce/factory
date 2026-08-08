@@ -31,7 +31,7 @@ type PersistedWorkspaceState = {
 }
 
 type WatchStateDocument = {
-  version: 3
+  version: 4
   workspaces: Record<string, PersistedWorkspaceState>
 }
 
@@ -655,7 +655,7 @@ export class FileStateStore extends InMemoryStateStore {
   override async claimRoutedPrBabysitter(
     workspaceId: string,
     identity: string,
-    seed: Omit<RoutedPrBabysitterClaim, 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
+    seed: Omit<RoutedPrBabysitterClaim, 'claimId' | 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
     owner: string,
     nowMs: number,
     leaseMs: number,
@@ -666,8 +666,9 @@ export class FileStateStore extends InMemoryStateStore {
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
       for (const [key, claim] of Object.entries(workspace.routedPrBabysitterClaims)) {
         if (
-          claim.status === 'complete' &&
-          claim.updatedAtMs <= nowMs - ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS
+          (claim.status === 'complete' &&
+            claim.updatedAtMs <= nowMs - ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS) ||
+          (claim.status !== 'complete' && claim.leaseUntilMs <= nowMs)
         ) delete workspace.routedPrBabysitterClaims[key]
       }
       const existing = workspace.routedPrBabysitterClaims[identity]
@@ -695,6 +696,7 @@ export class FileStateStore extends InMemoryStateStore {
       if (active >= Math.max(1, Math.trunc(maxActive))) return { outcome: 'capacity' }
       const claim: RoutedPrBabysitterClaim = {
         ...seed,
+        claimId: randomUUID(),
         status: 'claimed',
         owner,
         leaseUntilMs: nowMs + leaseMs,
@@ -711,13 +713,20 @@ export class FileStateStore extends InMemoryStateStore {
     workspaceId: string,
     identity: string,
     owner: string,
+    claimId: string,
     agentName: string,
     nowMs: number,
   ): Promise<boolean> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (!claim || claim.owner !== owner || claim.status === 'complete') return false
+      if (
+        !claim ||
+        claim.owner !== owner ||
+        claim.claimId !== claimId ||
+        claim.status === 'complete' ||
+        claim.leaseUntilMs <= nowMs
+      ) return false
       claim.status = 'running'
       claim.agentName = agentName
       claim.updatedAtMs = nowMs
@@ -733,34 +742,47 @@ export class FileStateStore extends InMemoryStateStore {
     owner: string,
     nowMs: number,
     leaseMs: number,
-  ): Promise<boolean> {
+    allowLiveLeaseTransfer = false,
+  ): Promise<RoutedPrBabysitterClaim | undefined> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
       if (
         !claim ||
-        claim.status !== 'running' ||
-        claim.agentName !== agentName ||
-        (claim.owner !== owner && claim.leaseUntilMs > nowMs)
-      ) return false
+        claim.status === 'complete' ||
+        (claim.status === 'running' && claim.agentName !== agentName) ||
+        (claim.status === 'claimed' && !allowLiveLeaseTransfer) ||
+        (claim.owner !== owner && claim.leaseUntilMs > nowMs && !allowLiveLeaseTransfer)
+      ) return undefined
+      if (claim.owner !== owner) claim.claimId = randomUUID()
       claim.owner = owner
+      claim.status = 'running'
+      claim.agentName = agentName
       claim.leaseUntilMs = nowMs + leaseMs
       claim.updatedAtMs = nowMs
       await this.#persist(document)
-      return true
+      return structuredClone(claim)
     }))
   }
 
   override async completeRoutedPrBabysitter(
     workspaceId: string,
     identity: string,
+    owner: string,
+    claimId: string,
     agentName: string,
     nowMs: number,
   ): Promise<boolean> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (!claim || claim.agentName !== agentName || claim.status === 'complete') return false
+      if (
+        !claim ||
+        claim.owner !== owner ||
+        claim.claimId !== claimId ||
+        claim.agentName !== agentName ||
+        claim.status === 'complete'
+      ) return false
       claim.status = 'complete'
       claim.leaseUntilMs = nowMs
       claim.updatedAtMs = nowMs
@@ -769,12 +791,17 @@ export class FileStateStore extends InMemoryStateStore {
     }))
   }
 
-  override async releaseRoutedPrBabysitterClaim(workspaceId: string, identity: string, owner: string): Promise<boolean> {
+  override async releaseRoutedPrBabysitterClaim(
+    workspaceId: string,
+    identity: string,
+    owner: string,
+    claimId: string,
+  ): Promise<boolean> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
       const claim = workspace?.routedPrBabysitterClaims[identity]
-      if (!workspace || !claim || claim.owner !== owner) return false
+      if (!workspace || !claim || claim.owner !== owner || claim.claimId !== claimId) return false
       delete workspace.routedPrBabysitterClaims[identity]
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)
@@ -964,7 +991,7 @@ export class FileStateStore extends InMemoryStateStore {
       return parseDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
-      return { version: 3, workspaces: {} }
+      return { version: 4, workspaces: {} }
     }
   }
 
@@ -1018,7 +1045,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
   if (!isRecord(value) || !isRecord(value.workspaces)) {
     throw new Error('Factory GitHub watch state file is invalid')
   }
-  if (value.version === 3) {
+  if (value.version === 4 || value.version === 3) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
     for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
       if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
@@ -1042,12 +1069,12 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
-        routedPrBabysitterClaims: parseRoutedPrBabysitterClaims(routedClaims ?? {}),
+        routedPrBabysitterClaims: parseRoutedPrBabysitterClaims(routedClaims ?? {}, value.version === 3),
         conversationSessions: parseConversationSessions(conversations ?? {}),
         dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
       }
     }
-    return { version: 3, workspaces }
+    return { version: 4, workspaces }
   }
   if (value.version === 2) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -1068,7 +1095,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         dispatchLifecycles: {},
       }
     }
-    return { version: 3, workspaces }
+    return { version: 4, workspaces }
   }
   if (value.version === 1) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -1085,7 +1112,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         dispatchLifecycles: {},
       }
     }
-    return { version: 3, workspaces }
+    return { version: 4, workspaces }
   }
   throw new Error('Factory GitHub watch state file is invalid')
 }
@@ -1099,11 +1126,15 @@ const cloneClarification = (record: WaitingClarification): WaitingClarification 
 const cloneBabysitterSession = (session: BabysitterSessionState): BabysitterSessionState =>
   structuredClone(session)
 
-const parseRoutedPrBabysitterClaims = (value: Record<string, unknown>): Record<string, RoutedPrBabysitterClaim> => {
+const parseRoutedPrBabysitterClaims = (
+  value: Record<string, unknown>,
+  legacyV3 = false,
+): Record<string, RoutedPrBabysitterClaim> => {
   const claims: Record<string, RoutedPrBabysitterClaim> = {}
   for (const [identity, candidate] of Object.entries(value)) {
     if (
       !isRecord(candidate) ||
+      (!legacyV3 && typeof candidate.claimId !== 'string') ||
       typeof candidate.repo !== 'string' ||
       !Number.isSafeInteger(candidate.prNumber) ||
       (candidate.prNumber as number) < 1 ||
@@ -1118,7 +1149,12 @@ const parseRoutedPrBabysitterClaims = (value: Record<string, unknown>): Record<s
     ) {
       throw new Error('Factory GitHub watch state file is invalid')
     }
-    claims[identity] = structuredClone(candidate) as RoutedPrBabysitterClaim
+    claims[identity] = {
+      ...(structuredClone(candidate) as Omit<RoutedPrBabysitterClaim, 'claimId'>),
+      claimId: typeof candidate.claimId === 'string'
+        ? candidate.claimId
+        : `${candidate.owner}:${candidate.claimedAtMs}:${identity}`,
+    }
   }
   return claims
 }

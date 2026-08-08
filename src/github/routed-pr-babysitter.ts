@@ -138,7 +138,7 @@ export async function discoverRoutedPullRequests(
 
 const pullNumberFromPath = (path: string, owner: string, repo: string): number | undefined => {
   const match = path.match(
-    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([^/]+)__([^/]+))\/pulls\/(?:by-id\/)?(\d+)(?:__[^/]*)?(?:\/(?:meta|metadata)\.json|\.json)$/u,
+    /^\/github\/repos\/(?:([^/]+)\/([^/]+)|([A-Za-z0-9-]+)__([^/]+))\/pulls\/(?:by-id\/)?(\d+)(?:__[^/]*)?(?:\/(?:meta|metadata)\.json|\.json)$/u,
   )
   const actualOwner = match?.[1] ?? match?.[3]
   const actualRepo = match?.[2] ?? match?.[4]

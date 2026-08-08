@@ -54,6 +54,25 @@ describe('routed PR babysitter discovery', () => {
     ])
   })
 
+  it('parses compact aliases for repository names containing double underscores', async () => {
+    const cfg = FactoryConfigSchema.parse({
+      repos: {
+        names: ['pear__ui'],
+        byLabel: { pear__ui: 'AgentWorkforce/pear__ui' },
+      },
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+    })
+    const report = await discoverRoutedPullRequests(mount({
+      '/github/repos/AgentWorkforce__pear__ui/pulls/by-id/7.json': pull({
+        headRepository: { nameWithOwner: 'AgentWorkforce/pear__ui' },
+      }),
+    }), cfg)
+
+    expect(report.candidates.map(({ repo, number }) => `${repo}#${number}`)).toEqual([
+      'AgentWorkforce/pear__ui#7',
+    ])
+  })
+
   it('continues through an unreadable alias root and an unreadable first PR alias', async () => {
     const nested = '/github/repos/AgentWorkforce/pear/pulls/7/meta.json'
     const byID = '/github/repos/AgentWorkforce__pear/pulls/by-id/7.json'

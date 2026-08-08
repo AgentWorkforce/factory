@@ -32,7 +32,14 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
     const store = await create()
     const first = await store.claimRoutedPrBabysitter('workspace', 'agentworkforce/pear#7', seed, 'owner-a', 1_000, 60_000, 1)
     expect(first.outcome).toBe('claimed')
-    expect(await store.markRoutedPrBabysitterRunning('workspace', 'agentworkforce/pear#7', 'owner-a', 'agent-a', 1_001)).toBe(true)
+    expect(await store.markRoutedPrBabysitterRunning(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      first.claim!.claimId,
+      'agent-a',
+      1_001,
+    )).toBe(true)
     expect((await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#8',
@@ -42,7 +49,14 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       60_000,
       1,
     )).outcome).toBe('capacity')
-    expect(await store.completeRoutedPrBabysitter('workspace', 'agentworkforce/pear#7', 'agent-a', 1_003)).toBe(true)
+    expect(await store.completeRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      first.claim!.claimId,
+      'agent-a',
+      1_003,
+    )).toBe(true)
     expect((await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
@@ -83,6 +97,8 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       60_000,
       1,
     )
+    expect((await store.listRoutedPrBabysitterClaims('workspace'))
+      .map(([identity]) => identity)).toEqual(['agentworkforce/pear#8'])
     expect((await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
@@ -117,9 +133,56 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
     )).outcome).toBe('already-running')
   })
 
+  it(`${label} fences delayed transitions from an expired claim generation`, async () => {
+    const store = await create()
+    const expired = await store.claimRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      seed,
+      'owner-a',
+      1_000,
+      1_000,
+      5,
+    )
+    const current = await store.claimRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      { ...seed, revision: 'rev-2' },
+      'owner-a',
+      2_001,
+      60_000,
+      5,
+    )
+    expect(current.outcome).toBe('claimed')
+    expect(await store.markRoutedPrBabysitterRunning(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      expired.claim!.claimId,
+      'stale-agent',
+      2_002,
+    )).toBe(false)
+    expect(await store.markRoutedPrBabysitterRunning(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      current.claim!.claimId,
+      'current-agent',
+      2_002,
+    )).toBe(true)
+    expect(await store.completeRoutedPrBabysitter(
+      'workspace',
+      'agentworkforce/pear#7',
+      'owner-a',
+      expired.claim!.claimId,
+      'current-agent',
+      2_003,
+    )).toBe(false)
+  })
+
   it(`${label} atomically adopts an expired restored running claim`, async () => {
     const store = await create()
-    await store.claimRoutedPrBabysitter(
+    const original = await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
       seed,
@@ -132,17 +195,19 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'workspace',
       'agentworkforce/pear#7',
       'old-owner',
+      original.claim!.claimId,
       'agent-a',
       1_001,
     )
-    expect(await store.adoptRoutedPrBabysitterClaim(
+    const adopted = await store.adoptRoutedPrBabysitterClaim(
       'workspace',
       'agentworkforce/pear#7',
       'agent-a',
       'new-owner',
       61_001,
       60_000,
-    )).toBe(true)
+    )
+    expect(adopted).toMatchObject({ owner: 'new-owner' })
     expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
       owner: 'new-owner',
       leaseUntilMs: 121_001,
@@ -153,12 +218,13 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'workspace',
       'agentworkforce/pear#7',
       'old-owner',
+      original.claim!.claimId,
     )).toBe(false)
   })
 
   it(`${label} refuses to adopt another owner's live running lease`, async () => {
     const store = await create()
-    await store.claimRoutedPrBabysitter(
+    const original = await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
       seed,
@@ -171,6 +237,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'workspace',
       'agentworkforce/pear#7',
       'old-owner',
+      original.claim!.claimId,
       'agent-a',
       1_001,
     )
@@ -182,7 +249,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'new-owner',
       2_000,
       60_000,
-    )).toBe(false)
+    )).toBeUndefined()
     expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
       owner: 'old-owner',
       leaseUntilMs: 61_000,
@@ -191,7 +258,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
 
   it(`${label} lets the current owner renew a live running lease`, async () => {
     const store = await create()
-    await store.claimRoutedPrBabysitter(
+    const original = await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
       seed,
@@ -204,6 +271,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'workspace',
       'agentworkforce/pear#7',
       'owner-a',
+      original.claim!.claimId,
       'agent-a',
       1_001,
     )
@@ -215,7 +283,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'owner-a',
       2_000,
       60_000,
-    )).toBe(true)
+    )).toMatchObject({ owner: 'owner-a', claimId: original.claim!.claimId })
     expect((await store.listRoutedPrBabysitterClaims('workspace'))[0]?.[1]).toMatchObject({
       owner: 'owner-a',
       leaseUntilMs: 62_000,
@@ -224,7 +292,7 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
 
   it(`${label} prunes completed claims after bounded retention`, async () => {
     const store = await create()
-    await store.claimRoutedPrBabysitter(
+    const original = await store.claimRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
       seed,
@@ -237,12 +305,15 @@ const verifyClaims = (label: string, create: () => Promise<StateStore> | StateSt
       'workspace',
       'agentworkforce/pear#7',
       'owner-a',
+      original.claim!.claimId,
       'agent-a',
       1_001,
     )
     await store.completeRoutedPrBabysitter(
       'workspace',
       'agentworkforce/pear#7',
+      'owner-a',
+      original.claim!.claimId,
       'agent-a',
       1_002,
     )

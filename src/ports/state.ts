@@ -92,6 +92,8 @@ export type BabysitterSessionState = {
 }
 
 export type RoutedPrBabysitterClaim = {
+  /** Opaque fencing token for one admission generation. */
+  claimId: string
   repo: string
   prNumber: number
   /** Stable hash of the mounted PR snapshot which admitted this run. */
@@ -403,13 +405,20 @@ export interface StateStore {
   claimRoutedPrBabysitter(
     workspaceId: string,
     identity: string,
-    seed: Omit<RoutedPrBabysitterClaim, 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
+    seed: Omit<RoutedPrBabysitterClaim, 'claimId' | 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
     owner: string,
     nowMs: number,
     leaseMs: number,
     maxActive: number,
   ): Promise<RoutedPrBabysitterClaimResult>
-  markRoutedPrBabysitterRunning(workspaceId: string, identity: string, owner: string, agentName: string, nowMs: number): Promise<boolean>
+  markRoutedPrBabysitterRunning(
+    workspaceId: string,
+    identity: string,
+    owner: string,
+    claimId: string,
+    agentName: string,
+    nowMs: number,
+  ): Promise<boolean>
   adoptRoutedPrBabysitterClaim(
     workspaceId: string,
     identity: string,
@@ -417,9 +426,22 @@ export interface StateStore {
     owner: string,
     nowMs: number,
     leaseMs: number,
+    allowLiveLeaseTransfer?: boolean,
+  ): Promise<RoutedPrBabysitterClaim | undefined>
+  completeRoutedPrBabysitter(
+    workspaceId: string,
+    identity: string,
+    owner: string,
+    claimId: string,
+    agentName: string,
+    nowMs: number,
   ): Promise<boolean>
-  completeRoutedPrBabysitter(workspaceId: string, identity: string, agentName: string, nowMs: number): Promise<boolean>
-  releaseRoutedPrBabysitterClaim(workspaceId: string, identity: string, owner: string): Promise<boolean>
+  releaseRoutedPrBabysitterClaim(
+    workspaceId: string,
+    identity: string,
+    owner: string,
+    claimId: string,
+  ): Promise<boolean>
   listRoutedPrBabysitterClaims(workspaceId: string): Promise<Array<[string, RoutedPrBabysitterClaim]>>
 
   recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
