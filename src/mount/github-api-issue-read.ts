@@ -50,10 +50,14 @@ export class GithubApiIssueRead implements GithubConnectionRead {
     if (!issue) {
       throw new Error(`GitHub API issue lookup returned an incomplete issue record for ${repo}#${number}`)
     }
+    // GitHub's REST "issues" endpoint also returns pull requests. For Factory
+    // issue dispatch a PR occupying the same repository number is an
+    // authoritative non-match, not a malformed issue.
+    if (issue.pull_request !== undefined) return undefined
     const resolvedNumber = positiveInteger(issue.number)
     const title = stringValue(issue.title)
     const url = stringValue(issue.html_url)
-    if (resolvedNumber !== number || !title || !url || issue.pull_request !== undefined) {
+    if (resolvedNumber !== number || !title || !url) {
       throw new Error(`GitHub API issue lookup returned an incomplete issue record for ${repo}#${number}`)
     }
 

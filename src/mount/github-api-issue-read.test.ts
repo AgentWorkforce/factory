@@ -59,7 +59,7 @@ describe('GithubApiIssueRead', () => {
     )
   })
 
-  it('does not treat a pull request returned by the issues endpoint as an issue', async () => {
+  it('treats a pull request returned by the issues endpoint as an authoritative issue miss', async () => {
     const reader = new GithubApiIssueRead({
       fetch: vi.fn(async () => new Response(JSON.stringify({
         id: 222,
@@ -70,8 +70,6 @@ describe('GithubApiIssueRead', () => {
       }), { status: 200 })),
     })
 
-    await expect(reader.getIssue('AgentWorkforce/factory', 222)).rejects.toThrow(
-      'returned an incomplete issue record',
-    )
+    await expect(reader.getIssue('AgentWorkforce/factory', 222)).resolves.toBeUndefined()
   })
 })
