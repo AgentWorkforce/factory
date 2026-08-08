@@ -265,6 +265,11 @@ export interface IssueResolution {
     localMountDegraded?: boolean
     localMountDegradedReason?: string
     eventListener?: FactoryEventListenerStatus
+    githubConnection?: {
+      ready: boolean
+      state?: string
+      initialSyncState?: string
+    }
   }
 }
 

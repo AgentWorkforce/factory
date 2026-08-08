@@ -127,13 +127,6 @@ export interface RelayfileWorkspaceHandleLike {
   info: { relayfileUrl: string }
   client(): RelayFileClientLike
   getToken(): Promise<string> | string
-  requestJson?(options: {
-    operation: string
-    method: string
-    path: string
-    body?: unknown
-    timeoutMs?: number
-  }): Promise<unknown>
   getConnectionStatus?(provider: FactoryIntegrationProvider, connectionId: string): Promise<{
     ready: boolean
     state?: string

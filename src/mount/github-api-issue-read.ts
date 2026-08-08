@@ -34,6 +34,7 @@ export class GithubApiIssueRead implements GithubConnectionRead {
       `${GITHUB_API_BASE_URL}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/${number}`,
       {
         method: 'GET',
+        signal: AbortSignal.timeout(30_000),
         headers: {
           accept: 'application/vnd.github+json',
           'user-agent': '@agent-relay/factory',

@@ -412,6 +412,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
+  readonly #githubApiFallbackIssues = new Set<string>()
   #githubIssuePathIndexReady = false
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
@@ -2426,6 +2427,10 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
+    if (decision.issueResolution?.source === 'github-api-fallback') {
+      const parts = githubIssuePathParts(decision.issue.path) ?? githubIssueDirectoryPathParts(decision.issue.path)
+      if (parts) this.#githubApiFallbackIssues.add(githubIssueIdentity(parts.owner, parts.repo, parts.number))
+    }
     const liveIssue = await this.#readIssue(decision.issue.path)
     if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
@@ -4672,7 +4677,8 @@ export class FactoryLoop implements Factory {
     } catch (error) {
       if (isMissingIssueFileError(error)) {
         const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
-        if (parts && this.#mount.githubRead) {
+        const identity = parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
+        if (parts && identity && this.#githubApiFallbackIssues.has(identity) && this.#mount.githubRead) {
           const fallback = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
           if (fallback) {
             const githubIssue = parseGithubIssue(fallback.path, fallback.content)

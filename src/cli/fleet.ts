@@ -1824,11 +1824,15 @@ async function issueProjectionStatus(
     config.loop.heartbeatPath,
     config.loop.heartbeatStaleMs,
   )
+  const githubConnection = mount.integrationConnections
+    ? await mount.integrationConnections.getStatus('github')
+    : undefined
   return {
     outcome: 'no-match',
     ...(status.localMountDegraded !== undefined ? { localMountDegraded: status.localMountDegraded } : {}),
     ...(status.localMountDegradedReason ? { localMountDegradedReason: status.localMountDegradedReason } : {}),
     ...(status.eventListener ? { eventListener: status.eventListener } : {}),
+    ...(githubConnection ? { githubConnection } : {}),
   }
 }
 
@@ -1842,6 +1846,12 @@ function projectionStatusFromMount(mount: MountClient): IssueResolution['project
 }
 
 function githubProjectionUnavailableReason(projection: IssueResolution['projection']): string | undefined {
+  if (projection.githubConnection && !projection.githubConnection.ready) {
+    const detail = [projection.githubConnection.state, projection.githubConnection.initialSyncState]
+      .filter((value): value is string => Boolean(value))
+      .join(', ')
+    return `GitHub projection connection is not ready${detail ? ` (${detail})` : ''}`
+  }
   if (projection.localMountDegraded) {
     return projection.localMountDegradedReason ?? 'local mount is degraded'
   }

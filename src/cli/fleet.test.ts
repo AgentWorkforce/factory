@@ -796,6 +796,55 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('uses connected-not-ready status as the reported reason an empty projection cannot answer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-github-empty-fallback-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'degraded',
+        initialSyncState: 'complete',
+      }))
+      const githubRead = fakeGithubConnectionRead(async (_repo, number) => githubConnectionIssue('pear', number))
+      const mount = Object.assign(
+        mountWithIntegrationConnections({}, integrations),
+        {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: false }),
+        },
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: {
+          source: 'github-api-fallback',
+          detail: expect.stringContaining('GitHub projection connection is not ready (degraded, complete)'),
+          projection: {
+            githubConnection: { ready: false, state: 'degraded', initialSyncState: 'complete' },
+          },
+        },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', 222)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not prompt or connect when a missing integration is checked without a TTY', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-headless-'))
     try {

@@ -35,6 +35,11 @@ export const TriageDecisionSchema = z.object({
         state: z.enum(['starting', 'subscribed', 'polling', 'not-listening', 'unknown']),
         reason: z.string().optional(),
       }).optional(),
+      githubConnection: z.object({
+        ready: z.boolean(),
+        state: z.string().optional(),
+        initialSyncState: z.string().optional(),
+      }).optional(),
     }),
   }).optional(),
   routes: z.array(z.object({
