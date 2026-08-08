@@ -2388,7 +2388,9 @@ export class FactoryLoop implements Factory {
     const dispatched = this.#dispatchUnlocked(decision, opts)
     this.#dispatchInFlight.set(key, dispatched)
     try {
-      return await dispatched
+      const result = await dispatched
+      if (decision.issueResolution) result.issueResolution = structuredClone(decision.issueResolution)
+      return result
     } finally {
       if (this.#dispatchInFlight.get(key) === dispatched) {
         this.#dispatchInFlight.delete(key)
@@ -4669,8 +4671,22 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       if (isMissingIssueFileError(error)) {
+        const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+        if (parts && this.#mount.githubRead) {
+          const fallback = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
+          if (fallback) {
+            const githubIssue = parseGithubIssue(fallback.path, fallback.content)
+            this.#indexDependencyIssue(githubIssueAsFactoryIssue(githubIssue))
+            this.#logger.warn?.('[factory] Relayfile projection missed GitHub issue; using GitHub API fallback', {
+              repo: fallback.repo,
+              number: fallback.number,
+              source: 'github-api-fallback',
+            })
+            return githubIssue
+          }
+        }
         this.#increment('githubIssuePhantomSkipped')
-        this.#logger.debug?.('[factory] skipped missing GitHub issue file discovered from issue tree', { path })
+        this.#logger.debug?.('[factory] skipped missing GitHub issue after projection and provider lookup', { path })
         return undefined
       }
       throw error
@@ -13433,6 +13449,9 @@ const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefin
 
 const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
+  decision.issueResolution
+    ? `Issue resolution: ${decision.issueResolution.source} — ${decision.issueResolution.detail}`
+    : undefined,
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
   decision.scope === 'workflow' ? `Workflow: ${agents.find((agent) => agent.role === 'workflow')?.name ?? 'none'}` : undefined,
   `Reviewer: ${agents.find((agent) => agent.role === 'reviewer')?.name ?? 'none'}`,

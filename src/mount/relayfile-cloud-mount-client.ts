@@ -28,6 +28,7 @@ import type {
   EventPage,
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
+  GithubConnectionRead,
   GithubConnectionWrite,
   LocalMountOptions,
   LocalMountHealth,
@@ -46,6 +47,7 @@ import {
 } from '../subscriptions'
 import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import { RelayfileGithubConnectionRead } from './relayfile-github-connection-read'
 import {
   ensureLocalMount as runLocalMountPreflight,
   type EnsureLocalMountOptions,
@@ -71,6 +73,7 @@ export const FACTORY_RELAYFILE_SCOPES = [
   // cleanly. Do NOT narrow this back to `/github/repos/**`.
   'relayfile:fs:read:/github/**',
   'relayfile:fs:write:/github/**',
+  'integration:github:read',
   'relayfile:fs:read:/slack/channels/**',
   'relayfile:fs:write:/slack/channels/**',
   'relayfile:fs:read:/slack/users/**',
@@ -125,6 +128,13 @@ export interface RelayfileWorkspaceHandleLike {
   info: { relayfileUrl: string }
   client(): RelayFileClientLike
   getToken(): Promise<string> | string
+  requestJson?(options: {
+    operation: string
+    method: string
+    path: string
+    body?: unknown
+    timeoutMs?: number
+  }): Promise<unknown>
   getConnectionStatus?(provider: FactoryIntegrationProvider, connectionId: string): Promise<{
     ready: boolean
     state?: string
@@ -257,6 +267,7 @@ export function relayfileWorkspaceTokenProvider(
 export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
+  readonly githubRead?: GithubConnectionRead
   readonly githubWrite: GithubConnectionWrite
   readonly resourceSubscriptions?: ResourceSubscriptionsClient
   readonly integrationConnections?: FactoryIntegrationConnections
@@ -337,6 +348,10 @@ export class RelayfileCloudMountClient implements MountClient {
         resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
+    const githubConnectionRequest = config.relayfileWorkspace?.requestJson?.bind(config.relayfileWorkspace)
+    this.githubRead = githubConnectionRequest
+      ? new RelayfileGithubConnectionRead({ workspace: { requestJson: githubConnectionRequest } })
+      : undefined
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
     this.integrationConnections = relayfileIntegrationConnections(
       config.relayfileWorkspace,

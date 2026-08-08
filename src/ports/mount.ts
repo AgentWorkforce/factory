@@ -71,6 +71,24 @@ export interface GithubPublishPullRequestResult {
   author?: string
 }
 
+/**
+ * Provider-authoritative GitHub issue returned through the workspace's
+ * connected GitHub integration. `content` intentionally uses the same
+ * provider record shape as the Relayfile projection so the existing parser
+ * and safety gates stay authoritative.
+ */
+export interface GithubConnectionIssue {
+  repo: string
+  number: number
+  path: string
+  content: unknown
+}
+
+export interface GithubConnectionRead {
+  /** Returns undefined only when GitHub authoritatively reports no issue. */
+  getIssue(repo: string, number: number): Promise<GithubConnectionIssue | undefined>
+}
+
 export type FactoryIntegrationProvider = 'github' | 'linear'
 
 export interface FactoryIntegrationConnectionStatus {
@@ -104,6 +122,7 @@ export interface GithubConnectionWrite {
 
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
+  readonly githubRead?: GithubConnectionRead
   readonly githubWrite?: GithubConnectionWrite
   /**
    * Optional durable Relayfile resource-subscription API. Its absence means

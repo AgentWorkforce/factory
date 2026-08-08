@@ -52,6 +52,8 @@ import {
   type LocalMountHealthEvent,
   type LocalMountOptions,
   type MountClient,
+  type IssueResolution,
+  type LinearIssue,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
@@ -753,8 +755,13 @@ async function runFactoryCommand(
     return result.ok ? 0 : 1
   }
 
-  const issue = await readIssueArg(mount, command.issue, config)
-  const decision = await factory.triageIssue(issue)
+  const resolved = await resolveIssueArg(mount, command.issue, config, async () =>
+    issueProjectionStatus(factory, mount, config),
+  )
+  const decision = {
+    ...await factory.triageIssue(resolved.issue),
+    issueResolution: resolved.resolution,
+  }
   if (command.kind === 'factory-triage') {
     writeJson(out, decision)
     return 0
@@ -1637,15 +1644,54 @@ const scopeIssueFromDraftContent = (content: unknown) => ({
   raw: asRecord(content),
 })
 
-async function readIssueArg(mount: MountClient, issueArg: string, config: FactoryConfig) {
-  const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg, config)
-  if (githubIssuePathParts(path)) {
-    return parseGithubFactoryIssue(path, (await mount.readFile(path)).content)
-  }
-  return readLinearIssueWithCanonicalFallback(mount, path)
+async function readIssueArg(mount: MountClient, issueArg: string, config: FactoryConfig): Promise<LinearIssue> {
+  return (await resolveIssueArg(mount, issueArg, config)).issue
 }
 
-async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string> {
+type ResolvedIssueArg = { issue: LinearIssue; resolution: IssueResolution }
+
+async function resolveIssueArg(
+  mount: MountClient,
+  issueArg: string,
+  config: FactoryConfig,
+  projectionStatus?: () => Promise<IssueResolution['projection']>,
+): Promise<ResolvedIssueArg> {
+  const explicitPath = issueArg.startsWith('/')
+  const path = explicitPath ? issueArg : await findIssuePath(mount, issueArg, config)
+  if (path) {
+    const issue = githubIssuePathParts(path)
+      ? parseGithubFactoryIssue(path, (await mount.readFile(path)).content)
+      : await readLinearIssueWithCanonicalFallback(mount, path)
+    return {
+      issue,
+      resolution: {
+        source: 'relayfile-projection',
+        detail: 'Resolved from the preferred Relayfile projection.',
+        projection: { outcome: 'matched' },
+      },
+    }
+  }
+
+  const number = Number(issueArg.replace(/^#/, ''))
+  const projection = projectionStatus
+    ? await projectionStatus()
+    : projectionStatusFromMount(mount)
+  const fallback = await findGithubIssueThroughConnection(mount, number, config)
+  if (!fallback) {
+    throw new Error(`${githubIssueResolutionError(config, issueArg)}: found 0 matches in the projection and GitHub API`)
+  }
+  return {
+    issue: parseGithubFactoryIssue(fallback.path, fallback.content),
+    resolution: {
+      source: 'github-api-fallback',
+      repo: fallback.repo,
+      detail: 'Relayfile projection returned no match; resolved authoritatively through the workspace GitHub API connection.',
+      projection,
+    },
+  }
+}
+
+async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string | undefined> {
   if (config.issueSource === 'github') {
     const number = Number(key.replace(/^#/, ''))
     if (!Number.isInteger(number) || number <= 0) {
@@ -1678,7 +1724,7 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
       })
       .sort((left, right) => githubIssuePathPreference(left) - githubIssuePathPreference(right) || left.localeCompare(right))
     if (matches.length === 0) {
-      throw new Error(`${githubIssueResolutionError(config, key)}: found 0 matches`)
+      return undefined
     }
     const matchesByRepo = new Map<string, { repo: string; path: string }>()
     for (const path of matches) {
@@ -1707,6 +1753,64 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
     )
   }
   return matches[0]
+}
+
+async function findGithubIssueThroughConnection(
+  mount: MountClient,
+  number: number,
+  config: FactoryConfig,
+) {
+  const github = mount.githubRead
+  if (!github) {
+    throw new Error(
+      `${githubIssueResolutionError(config, String(number))}: projection returned no match and the GitHub API fallback is unavailable`,
+    )
+  }
+  const repos = configuredGithubIssueRepos(config)
+  if (repos.length === 0) {
+    throw new Error(
+      `${githubIssueResolutionError(config, String(number))}: projection returned no match and no configured owner/repo is available for the GitHub API fallback`,
+    )
+  }
+  const matches = (await Promise.all(repos.map((repo) => github.getIssue(repo, number))))
+    .filter((issue): issue is NonNullable<typeof issue> => Boolean(issue))
+  if (matches.length === 0) return undefined
+  if (!config.repos.default && matches.length > 1) {
+    const matchedRepos = matches.map((match) => match.repo).sort((left, right) => left.localeCompare(right))
+    throw new Error(
+      `${githubIssueResolutionError(config, String(number))}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
+      'set repos.default or pass a repo-qualified argument',
+    )
+  }
+  return matches[0]
+}
+
+async function issueProjectionStatus(
+  factory: Factory,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<IssueResolution['projection']> {
+  const status = await factoryStatusWithMountHealth(
+    factory,
+    mount,
+    config.loop.heartbeatPath,
+    config.loop.heartbeatStaleMs,
+  )
+  return {
+    outcome: 'no-match',
+    ...(status.localMountDegraded !== undefined ? { localMountDegraded: status.localMountDegraded } : {}),
+    ...(status.localMountDegradedReason ? { localMountDegradedReason: status.localMountDegradedReason } : {}),
+    ...(status.eventListener ? { eventListener: status.eventListener } : {}),
+  }
+}
+
+function projectionStatusFromMount(mount: MountClient): IssueResolution['projection'] {
+  const health = mount.getLocalMountHealth?.()
+  return {
+    outcome: 'no-match',
+    ...(health ? { localMountDegraded: health.degraded } : {}),
+    ...(health?.reason ? { localMountDegradedReason: health.reason } : {}),
+  }
 }
 
 function configuredGithubIssueRepos(config: FactoryConfig): string[] {

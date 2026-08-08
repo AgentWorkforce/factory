@@ -80,6 +80,7 @@ export {
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
 export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
+export { RelayfileGithubConnectionRead } from './mount/relayfile-github-connection-read'
 export {
   ensureFactoryIntegrations,
   inspectFactoryIntegration,
@@ -295,6 +296,8 @@ export type {
   Clock,
   EventPage,
   GithubConnectionWrite,
+  GithubConnectionIssue,
+  GithubConnectionRead,
   FactoryIntegrationConnectionStatus,
   FactoryIntegrationConnections,
   FactoryIntegrationConnectResult,
@@ -438,6 +441,7 @@ export type {
   FactoryStartOptions,
   FactoryStatus,
   IssueRef,
+  IssueResolution,
   IterationReport,
   LinearIssue,
   ProbeCloser,

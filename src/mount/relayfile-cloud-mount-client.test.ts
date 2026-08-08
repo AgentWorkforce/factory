@@ -994,6 +994,7 @@ describe('RelayfileCloudMountClient', () => {
     // github uses the provider root `/github/**`; `/github/repos/**` is rejected
     // by RelayAuth's path-token validator and would fail the whole batch mint.
     expect(joinOptions.scopes).toContain('relayfile:fs:write:/github/**')
+    expect(joinOptions.scopes).toContain('integration:github:read')
     expect(joinOptions.scopes).not.toContain('relayfile:fs:write:/github/repos/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:write:/factory/observability/**')
     expect(joinOptions.scopes).toContain('relayfile:fs:read:/slack/users/**')

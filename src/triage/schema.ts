@@ -23,6 +23,20 @@ export const TriageDecisionSchema = z.object({
     key: z.string(),
     path: z.string(),
   }),
+  issueResolution: z.object({
+    source: z.enum(['relayfile-projection', 'github-api-fallback']),
+    repo: z.string().optional(),
+    detail: z.string(),
+    projection: z.object({
+      outcome: z.enum(['matched', 'no-match']),
+      localMountDegraded: z.boolean().optional(),
+      localMountDegradedReason: z.string().optional(),
+      eventListener: z.object({
+        state: z.enum(['starting', 'subscribed', 'polling', 'not-listening', 'unknown']),
+        reason: z.string().optional(),
+      }).optional(),
+    }),
+  }).optional(),
   routes: z.array(z.object({
     repo: z.string(),
     clonePath: z.string().optional(),

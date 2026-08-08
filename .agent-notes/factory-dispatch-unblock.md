@@ -15,3 +15,12 @@
 - No queue, Cloudflare, mount, daemon, or launchd mutations.
 - No `gh` process for the fallback.
 - No merge and no default-branch push.
+
+## 2026-08-08 implementation checkpoint
+
+- Added `RelayfileGithubConnectionRead`, which calls the Cloud GitHub GraphQL read route through `WorkspaceHandle.requestJson`; the SDK supplies the Relayfile workspace token and Factory never handles a GitHub token.
+- Added `integration:github:read` to Factory's requested Relayfile workspace scopes.
+- Targeted GitHub resolution now checks the Relayfile projection first, calls the API only after zero matches, and treats an authoritative empty API result as not found.
+- Triage and dispatch results carry `issueResolution`; fallback records also include PR #220's `localMountDegraded`, `localMountDegradedReason`, and `eventListener` state.
+- Dispatch re-reads a fallback issue through the provider before applying the existing scope/readiness/dispatchability/repo-label gates.
+- Focused build/tests: exit 0; 153 tests passed across the new connection reader, mount client, and CLI suites.

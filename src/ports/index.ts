@@ -5,6 +5,8 @@ export type {
   FactoryIntegrationConnections,
   FactoryIntegrationConnectResult,
   FactoryIntegrationProvider,
+  GithubConnectionIssue,
+  GithubConnectionRead,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
