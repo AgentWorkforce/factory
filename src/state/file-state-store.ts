@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
 
 import { githubRepositoriesMatch } from '../github/repo-identity'
+import { ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS } from '../ports/state'
 import type {
   BabysitterSessionState,
   ClarificationReply,
@@ -663,8 +664,20 @@ export class FileStateStore extends InMemoryStateStore {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      for (const [key, claim] of Object.entries(workspace.routedPrBabysitterClaims)) {
+        if (
+          claim.status === 'complete' &&
+          claim.updatedAtMs <= nowMs - ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS
+        ) delete workspace.routedPrBabysitterClaims[key]
+      }
       const existing = workspace.routedPrBabysitterClaims[identity]
-      if (existing?.status !== 'complete' && existing?.owner === owner) {
+      if (
+        existing?.status !== 'complete' &&
+        existing?.owner === owner &&
+        existing.leaseUntilMs > nowMs &&
+        (existing.source === 'routed-open-prs' ||
+          (existing.source === seed.source && existing.revision === seed.revision))
+      ) {
         existing.leaseUntilMs = nowMs + leaseMs
         existing.updatedAtMs = nowMs
         await this.#persist(document)
@@ -713,6 +726,26 @@ export class FileStateStore extends InMemoryStateStore {
     }))
   }
 
+  override async adoptRoutedPrBabysitterClaim(
+    workspaceId: string,
+    identity: string,
+    agentName: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
+      if (!claim || claim.status !== 'running' || claim.agentName !== agentName) return false
+      claim.owner = owner
+      claim.leaseUntilMs = nowMs + leaseMs
+      claim.updatedAtMs = nowMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
   override async completeRoutedPrBabysitter(
     workspaceId: string,
     identity: string,
@@ -736,7 +769,7 @@ export class FileStateStore extends InMemoryStateStore {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
       const claim = workspace?.routedPrBabysitterClaims[identity]
-      if (!workspace || !claim || claim.owner !== owner || claim.status === 'running') return false
+      if (!workspace || !claim || claim.owner !== owner) return false
       delete workspace.routedPrBabysitterClaims[identity]
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)

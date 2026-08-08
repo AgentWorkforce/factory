@@ -323,9 +323,26 @@ const NodeConfigObjectSchema = z.object({
 
 const FactoryConfigObjectSchema = WorkspaceConfigObjectSchema.merge(NodeConfigObjectSchema)
 
-export const WorkspaceConfigSchema = WorkspaceConfigObjectSchema.transform((cfg) => normalizeWorkspaceConfig(cfg))
+const requireRoutedBabysitterRepos = (
+  cfg: z.infer<typeof WorkspaceConfigObjectSchema>,
+  ctx: z.RefinementCtx,
+): void => {
+  if (cfg.babysitter.mode === 'routed-open-prs' && (cfg.repos.names?.length ?? 0) === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['repos', 'names'],
+      message: 'repos.names must contain at least one repository when babysitter.mode is routed-open-prs',
+    })
+  }
+}
+
+export const WorkspaceConfigSchema = WorkspaceConfigObjectSchema
+  .superRefine(requireRoutedBabysitterRepos)
+  .transform((cfg) => normalizeWorkspaceConfig(cfg))
 export const NodeConfigSchema = NodeConfigObjectSchema.transform((cfg) => normalizeNodeConfig(cfg))
-export const FactoryConfigSchema = FactoryConfigObjectSchema.transform((cfg) => normalizeFactoryConfig(cfg))
+export const FactoryConfigSchema = FactoryConfigObjectSchema
+  .superRefine(requireRoutedBabysitterRepos)
+  .transform((cfg) => normalizeFactoryConfig(cfg))
 
 function normalizeWorkspaceConfig(cfg: z.infer<typeof WorkspaceConfigObjectSchema>) {
   const resolved = resolveRepos(cfg.repos, cfg.repos.cloneRoot)

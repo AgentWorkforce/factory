@@ -105,6 +105,8 @@ export type RoutedPrBabysitterClaim = {
   agentName?: string
 }
 
+export const ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60_000
+
 export type RoutedPrBabysitterClaimResult =
   | { outcome: 'claimed'; claim: RoutedPrBabysitterClaim }
   | { outcome: 'owned' | 'already-running' | 'unchanged' | 'capacity'; claim?: RoutedPrBabysitterClaim }
@@ -408,6 +410,14 @@ export interface StateStore {
     maxActive: number,
   ): Promise<RoutedPrBabysitterClaimResult>
   markRoutedPrBabysitterRunning(workspaceId: string, identity: string, owner: string, agentName: string, nowMs: number): Promise<boolean>
+  adoptRoutedPrBabysitterClaim(
+    workspaceId: string,
+    identity: string,
+    agentName: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean>
   completeRoutedPrBabysitter(workspaceId: string, identity: string, agentName: string, nowMs: number): Promise<boolean>
   releaseRoutedPrBabysitterClaim(workspaceId: string, identity: string, owner: string): Promise<boolean>
   listRoutedPrBabysitterClaims(workspaceId: string): Promise<Array<[string, RoutedPrBabysitterClaim]>>

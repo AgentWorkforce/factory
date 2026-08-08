@@ -1,5 +1,6 @@
 import { BatchTracker } from '../orchestrator/batch-tracker'
 import { githubRepositoriesMatch } from '../github/repo-identity'
+import { ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS } from '../ports/state'
 import type {
   BatchSnapshot,
   BabysitterSessionState,
@@ -646,8 +647,20 @@ export class InMemoryStateStore implements StateStore {
     maxActive: number,
   ): Promise<RoutedPrBabysitterClaimResult> {
     const claims = this.#workspace(workspaceId).routedPrBabysitterClaims
+    for (const [key, claim] of claims) {
+      if (
+        claim.status === 'complete' &&
+        claim.updatedAtMs <= nowMs - ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS
+      ) claims.delete(key)
+    }
     const existing = claims.get(identity)
-    if (existing?.status !== 'complete' && existing?.owner === owner) {
+    if (
+      existing?.status !== 'complete' &&
+      existing?.owner === owner &&
+      existing.leaseUntilMs > nowMs &&
+      (existing.source === 'routed-open-prs' ||
+        (existing.source === seed.source && existing.revision === seed.revision))
+    ) {
       existing.leaseUntilMs = nowMs + leaseMs
       existing.updatedAtMs = nowMs
       return { outcome: 'owned', claim: structuredClone(existing) }
@@ -689,6 +702,22 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async adoptRoutedPrBabysitterClaim(
+    workspaceId: string,
+    identity: string,
+    agentName: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const claim = this.#workspace(workspaceId).routedPrBabysitterClaims.get(identity)
+    if (!claim || claim.status !== 'running' || claim.agentName !== agentName) return false
+    claim.owner = owner
+    claim.leaseUntilMs = nowMs + leaseMs
+    claim.updatedAtMs = nowMs
+    return true
+  }
+
   async completeRoutedPrBabysitter(
     workspaceId: string,
     identity: string,
@@ -706,7 +735,7 @@ export class InMemoryStateStore implements StateStore {
   async releaseRoutedPrBabysitterClaim(workspaceId: string, identity: string, owner: string): Promise<boolean> {
     const claims = this.#workspace(workspaceId).routedPrBabysitterClaims
     const claim = claims.get(identity)
-    if (!claim || claim.owner !== owner || claim.status === 'running') return false
+    if (!claim || claim.owner !== owner) return false
     return claims.delete(identity)
   }
 

@@ -16322,6 +16322,86 @@ describe('FactoryLoop PR babysitter', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('retries abnormal routed exits and completes only successful exits', async () => {
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/703.json': {
+        number: 703,
+        title: 'Retry an interrupted routed babysitter',
+        body: 'Keep the work unit retryable after a crash.',
+        state: 'OPEN',
+        isDraft: false,
+        merged: false,
+        headRefName: 'human/retry-babysitter',
+        headRefOid: 'head-703',
+        baseRefName: 'main',
+        headRepository: { nameWithOwner: 'AgentWorkforce/pear' },
+        isCrossRepository: false,
+        labels: [],
+      },
+    })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['pear'],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+      },
+      babysitter: {
+        enabled: true,
+        mode: 'routed-open-prs',
+        excludeLabels: ['factory:skip-babysitter'],
+        excludePullRequests: [],
+        notifyHumans: false,
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    const agentName = fleet.spawns[0]!.name
+    fleet.emitAgentExit(agentName, 'crash')
+    await vi.waitFor(() => expect(fleet.spawns).toHaveLength(2))
+
+    fleet.emitAgentExit(agentName, 'completed')
+    await vi.waitFor(async () => {
+      expect((await stateStore.listRoutedPrBabysitterClaims('factory-test'))[0]?.[1].status)
+        .toBe('complete')
+    })
+    await factory.runOnce()
+    expect(fleet.spawns).toHaveLength(2)
+  })
+
+  it('contains routed sweep state failures at the optional feature boundary', async () => {
+    class FailingRoutedClaimsStore extends InMemoryStateStore {
+      override async listRoutedPrBabysitterClaims(): Promise<never> {
+        throw new Error('routed claim store unavailable')
+      }
+    }
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: {
+        org: 'AgentWorkforce',
+        names: ['pear'],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+      },
+      babysitter: {
+        enabled: true,
+        mode: 'routed-open-prs',
+        excludeLabels: [],
+        excludePullRequests: [],
+        notifyHumans: false,
+      },
+    }), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      stateStore: new FailingRoutedClaimsStore({ batchSize: 2 }),
+      triage: new StaticTriage(),
+    })
+
+    await expect(factory.runOnce()).resolves.toBeDefined()
+    expect(factory.status().counters.routedPrBabysitterSweepErrors).toBe(1)
+  })
+
   const babysitterConfig = (overrides: FactoryConfigOverrides = {}): FactoryConfig => config({
     babysitter: { enabled: true },
     terminalState: 'human-review',

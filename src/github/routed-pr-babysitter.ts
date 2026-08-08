@@ -79,14 +79,19 @@ export async function discoverRoutedPullRequests(
       `/github/repos/${owner}__${name}/pulls/by-id/`,
     ]
     const paths = new Set<string>()
-    try {
-      for (const root of roots) {
+    let readableRoot = false
+    for (const root of roots) {
+      try {
         for (const path of await mount.listTree(root)) paths.add(path)
+        readableRoot = true
+      } catch (error) {
+        report.failures.push({
+          repo,
+          reason: `${root}: ${error instanceof Error ? error.message : String(error)}`,
+        })
       }
-    } catch (error) {
-      report.failures.push({ repo, reason: error instanceof Error ? error.message : String(error) })
-      continue
     }
+    if (!readableRoot) continue
     for (const path of [...paths].sort()) {
       const pathNumber = pullNumberFromPath(path, owner!, name!)
       if (!pathNumber) continue
@@ -96,7 +101,6 @@ export async function discoverRoutedPullRequests(
         report.duplicates += 1
         continue
       }
-      seen.add(identity)
       let candidate: RoutedPrCandidate | undefined
       try {
         candidate = parseRoutedPrCandidate((await mount.readFile(path)).content, repo, pathNumber, path)
@@ -109,6 +113,7 @@ export async function discoverRoutedPullRequests(
         report.failures.push({ repo, prNumber: pathNumber, reason: 'incomplete authoritative PR metadata' })
         continue
       }
+      seen.add(identity)
       if (candidate.merged || candidate.state !== 'OPEN' || candidate.draft) {
         report.terminal += 1
         continue
@@ -196,7 +201,7 @@ const parseRoutedPrCandidate = (
     crossRepository,
     maintainerCanModify: booleanValue(payload.maintainerCanModify) ?? booleanValue(payload.maintainer_can_modify),
     labels,
-    filesChanged: changedFiles(payload.filesChanged ?? payload.files),
+    filesChanged: changedFiles(payload.filesChanged ?? payload.files_changed ?? payload.files),
     path,
   }
   return {
@@ -222,7 +227,11 @@ const labelNames = (value: unknown): string[] => Array.isArray(value)
 
 const changedFiles = (value: unknown): string[] | undefined => {
   if (!Array.isArray(value)) return undefined
-  const paths = value.map((entry) => typeof entry === 'string' ? entry : stringValue(asRecord(entry)?.path))
+  const paths = value.map((entry) => {
+    if (typeof entry === 'string') return entry
+    const record = asRecord(entry)
+    return stringValue(record?.path) ?? stringValue(record?.filename)
+  })
     .filter((entry): entry is string => Boolean(entry))
   return paths.length > 0 ? paths : undefined
 }

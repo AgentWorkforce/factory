@@ -1689,28 +1689,51 @@ export class FactoryLoop implements Factory {
 
   async #restoreRoutedPrBabysitterClaims(): Promise<void> {
     if (this.#config.babysitter.mode !== 'routed-open-prs') return
-    const roster = await this.#fleet.roster()
-    const online = new Set(roster.agents.map((agent) => agent.name))
-    for (const [identity, claim] of await this.#state.listRoutedPrBabysitterClaims(this.#workspaceId)) {
-      if (claim.status === 'running' && claim.agentName && online.has(claim.agentName)) {
-        this.#routedPrBabysitterAgents.set(claim.agentName, identity)
-        this.#increment('routedPrBabysitterClaimsRestored')
-      } else if (claim.status !== 'complete' && claim.leaseUntilMs > this.#clock.now()) {
-        this.#logger.warn?.('[factory] routed PR babysitter claim awaits lease expiry after missing agent', {
-          repo: claim.repo,
-          prNumber: claim.prNumber,
-          leaseUntilMs: claim.leaseUntilMs,
-        })
+    try {
+      const roster = await this.#fleet.roster()
+      const online = new Set(roster.agents.map((agent) => agent.name))
+      for (const [identity, claim] of await this.#state.listRoutedPrBabysitterClaims(this.#workspaceId)) {
+        if (claim.status === 'running' && claim.agentName && online.has(claim.agentName)) {
+          const adopted = await this.#state.adoptRoutedPrBabysitterClaim(
+            this.#workspaceId,
+            identity,
+            claim.agentName,
+            this.#routedPrBabysitterOwner,
+            this.#clock.now(),
+            ROUTED_PR_BABYSITTER_CLAIM_LEASE_MS,
+          )
+          if (adopted) {
+            this.#routedPrBabysitterAgents.set(claim.agentName, identity)
+            this.#increment('routedPrBabysitterClaimsRestored')
+          }
+        } else if (claim.status !== 'complete' && claim.leaseUntilMs > this.#clock.now()) {
+          this.#logger.warn?.('[factory] routed PR babysitter claim awaits lease expiry after missing agent', {
+            repo: claim.repo,
+            prNumber: claim.prNumber,
+            leaseUntilMs: claim.leaseUntilMs,
+          })
+        }
       }
+    } catch (error) {
+      this.#logger.warn?.('[factory] failed to restore routed PR babysitter claims', {
+        error: describeError(error).errorMessage,
+      })
     }
   }
 
   async #sweepRoutedPrBabysitters(dryRun = this.#config.dryRun): Promise<void> {
     if (!this.#config.babysitter.enabled || this.#config.babysitter.mode !== 'routed-open-prs' || this.#stopping) return
     if (this.#routedPrBabysitterSweep) return this.#routedPrBabysitterSweep
-    const sweep = this.#runRoutedPrBabysitterSweep(dryRun).finally(() => {
-      if (this.#routedPrBabysitterSweep === sweep) this.#routedPrBabysitterSweep = undefined
-    })
+    const sweep = this.#runRoutedPrBabysitterSweep(dryRun)
+      .catch((error) => {
+        this.#increment('routedPrBabysitterSweepErrors')
+        this.#logger.warn?.('[factory] routed PR babysitter sweep failed', {
+          error: describeError(error).errorMessage,
+        })
+      })
+      .finally(() => {
+        if (this.#routedPrBabysitterSweep === sweep) this.#routedPrBabysitterSweep = undefined
+      })
     this.#routedPrBabysitterSweep = sweep
     return sweep
   }
@@ -1754,6 +1777,7 @@ export class FactoryLoop implements Factory {
       admitted: 0,
       capacityDeferred: 0,
       unchanged: 0,
+      spawnFailures: 0,
     }
     for (const failure of discovery.failures) {
       this.#logger.warn?.('[factory] routed PR babysitter discovery dropped candidate', failure)
@@ -1803,6 +1827,7 @@ export class FactoryLoop implements Factory {
           this.#routedPrBabysitterOwner,
         )
         this.#increment('routedPrBabysitterSpawnFailures')
+        stats.spawnFailures += 1
         this.#logger.warn?.('[factory] routed PR babysitter spawn failed', {
           repo: candidate.repo,
           prNumber: candidate.number,
@@ -1812,7 +1837,7 @@ export class FactoryLoop implements Factory {
       // Pacing is intentionally one new admission per sweep. Every remaining
       // eligible candidate is explicitly accounted as deferred, never dropped.
       stats.capacityDeferred += discovery.candidates.length -
-        stats.alreadyOwned - stats.unchanged - stats.admitted - stats.capacityDeferred
+        stats.alreadyOwned - stats.unchanged - stats.admitted - stats.capacityDeferred - stats.spawnFailures
       break
     }
     this.#logger.info?.('[factory] routed PR babysitter sweep completed', stats)
@@ -5908,13 +5933,22 @@ export class FactoryLoop implements Factory {
     const routedIdentity = this.#routedPrBabysitterAgents.get(name)
     if (routedIdentity) {
       this.#routedPrBabysitterAgents.delete(name)
-      await this.#state.completeRoutedPrBabysitter(
-        this.#workspaceId,
-        routedIdentity,
-        name,
-        this.#clock.now(),
-      )
-      this.#increment('routedPrBabysittersCompleted')
+      if (isCompletionReason(reason)) {
+        await this.#state.completeRoutedPrBabysitter(
+          this.#workspaceId,
+          routedIdentity,
+          name,
+          this.#clock.now(),
+        )
+        this.#increment('routedPrBabysittersCompleted')
+      } else {
+        await this.#state.releaseRoutedPrBabysitterClaim(
+          this.#workspaceId,
+          routedIdentity,
+          this.#routedPrBabysitterOwner,
+        )
+        this.#increment('routedPrBabysitterAbnormalExits')
+      }
       await this.#sweepRoutedPrBabysitters()
       return
     }

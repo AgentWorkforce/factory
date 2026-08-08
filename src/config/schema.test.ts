@@ -320,6 +320,18 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.names).toEqual(['pear', 'cloud', 'agentswarm'])
   })
 
+  it('requires explicit routed repositories for routed PR babysitting', () => {
+    expect(() => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+      repos: {},
+    })).toThrow(/repos\.names must contain at least one repository/u)
+
+    expect(FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'factory-created' },
+      repos: {},
+    }).babysitter.mode).toBe('factory-created')
+  })
+
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {
     const parsed = FactoryConfigSchema.parse({
       subscription: { labels: ['pear'] },

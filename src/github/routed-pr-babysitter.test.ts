@@ -54,6 +54,45 @@ describe('routed PR babysitter discovery', () => {
     ])
   })
 
+  it('continues through an unreadable alias root and an unreadable first PR alias', async () => {
+    const nested = '/github/repos/AgentWorkforce/pear/pulls/7/meta.json'
+    const byID = '/github/repos/AgentWorkforce__pear/pulls/by-id/7.json'
+    const client = {
+      listTree: async (prefix: string) => {
+        if (prefix.includes('/AgentWorkforce/pear/')) throw new Error('nested alias unavailable')
+        return [nested, byID]
+      },
+      readFile: async (path: string) => {
+        if (path === nested) throw new Error('stale alias unreadable')
+        return { content: pull() }
+      },
+    } as unknown as MountClient
+
+    const report = await discoverRoutedPullRequests(client, config())
+
+    expect(report.candidates.map(({ number }) => number)).toEqual([7])
+    expect(report.failures.map(({ reason }) => reason)).toEqual([
+      expect.stringContaining('nested alias unavailable'),
+      'stale alias unreadable',
+    ])
+  })
+
+  it('reads REST and established changed-file aliases', async () => {
+    const rest = await discoverRoutedPullRequests(mount({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/7.json': pull({
+        files: [{ filename: 'src/rest.ts' }],
+      }),
+    }), config())
+    expect(rest.candidates[0]?.filesChanged).toEqual(['src/rest.ts'])
+
+    const established = await discoverRoutedPullRequests(mount({
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/7.json': pull({
+        files_changed: [{ path: 'src/established.ts' }],
+      }),
+    }), config())
+    expect(established.candidates[0]?.filesChanged).toEqual(['src/established.ts'])
+  })
+
   it('honours label and config opt-outs before admission', async () => {
     const files = {
       '/github/repos/AgentWorkforce__pear/pulls/by-id/7.json': pull({
