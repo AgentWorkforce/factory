@@ -45,3 +45,10 @@
 - Final focused build/check after that correction: exit 0; 158 tests passed. Live `factory#222` remained exit 0 through the fallback and routed only to Factory.
 - A bare-number live check exposed GitHub's REST issues endpoint returning PRs. Those are now authoritative issue misses instead of malformed records. After the correction, live `factory triage 222` exited 0 and selected/routed `AgentWorkforce/factory` through the fallback.
 - Live safety and dispatch checks: dry-run dispatch of an existing issue missing both Factory markers exited 1 with no dispatch; dry-run dispatch of `factory#222` exited 0 and carried `github-api-fallback` in both the result and its dispatch comment.
+
+## 2026-08-08 PR publication blocker
+
+- The implementation branch is pushed to `origin/agent/factory-dispatch-api-fallback`; no default branch was pushed or merged.
+- PR publication was attempted only through `RelayfileGithubConnectionWrite`, whose draft explicitly requests `author: 'app'`. No `gh` command or alternate GitHub identity was used.
+- The guarded Relayfile draft writes were accepted, but all three durable operations failed before a provider attempt (`attemptCount: 0`) with GitHub HTTP 403 resource-access semantics. A direct readback of the minted Relayfile token confirmed that its normalized grants include scoped write access to `/github/**`, so the remaining denial is at the GitHub App repository/permission boundary.
+- A read-only GitHub API check confirmed that zero open pull requests exist for the pushed head branch. Repeating the same write cannot satisfy the gate until the app permission/install state changes.
