@@ -298,6 +298,7 @@ export type {
   GithubConnectionWrite,
   GithubConnectionIssue,
   GithubConnectionRead,
+  GithubIssueLookup,
   FactoryIntegrationConnectionStatus,
   FactoryIntegrationConnections,
   FactoryIntegrationConnectResult,

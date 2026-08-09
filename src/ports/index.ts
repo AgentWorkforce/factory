@@ -8,6 +8,7 @@ export type {
   GithubConnectionIssue,
   GithubConnectionRead,
   GithubConnectionWrite,
+  GithubIssueLookup,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
   LocalMountHealth,

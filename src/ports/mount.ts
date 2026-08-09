@@ -84,9 +84,22 @@ export interface GithubConnectionIssue {
   content: unknown
 }
 
+/**
+ * Outcome of a GitHub issue lookup. A reader that cannot authenticate can
+ * only prove absence within what it can see: `not-found` means the reader
+ * confirmed the repository is visible and the issue is not in it;
+ * `indeterminate` means the reader could not establish that (for example an
+ * unauthenticated 404 against a repository it also cannot confirm is
+ * public — GitHub returns the same 404 for "does not exist" and "private,
+ * hidden from you"). Callers must not treat `indeterminate` as absence.
+ */
+export type GithubIssueLookup =
+  | { outcome: 'found'; issue: GithubConnectionIssue }
+  | { outcome: 'not-found' }
+  | { outcome: 'indeterminate'; reason: string }
+
 export interface GithubConnectionRead {
-  /** Returns undefined only when GitHub authoritatively reports no issue. */
-  getIssue(repo: string, number: number): Promise<GithubConnectionIssue | undefined>
+  getIssue(repo: string, number: number): Promise<GithubIssueLookup>
 }
 
 export type FactoryIntegrationProvider = 'github' | 'linear'

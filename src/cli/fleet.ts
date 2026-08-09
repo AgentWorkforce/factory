@@ -1800,17 +1800,42 @@ async function findGithubIssueThroughConnection(
       `${githubIssueResolutionError(config, issueArg)}: projection cannot answer and no configured owner/repo is available for the GitHub API fallback`,
     )
   }
-  const matches = (await Promise.all(repos.map((repo) => github.getIssue(repo, selector.number))))
-    .filter((issue): issue is NonNullable<typeof issue> => Boolean(issue))
-  if (matches.length === 0) return undefined
-  if (!selector.repo && !config.repos.default && matches.length > 1) {
-    const matchedRepos = matches.map((match) => match.repo).sort((left, right) => left.localeCompare(right))
-    throw new Error(
-      `${githubIssueResolutionError(config, issueArg)}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
-      'set repos.default or pass a repo-qualified argument',
-    )
+  const lookups = await Promise.all(repos.map((repo) => github.getIssue(repo, selector.number)))
+  const found = lookups.filter((lookup): lookup is Extract<typeof lookup, { outcome: 'found' }> =>
+    lookup.outcome === 'found',
+  )
+  const indeterminate = lookups.some((lookup) => lookup.outcome === 'indeterminate')
+
+  if (found.length === 0) {
+    if (indeterminate) {
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: the projection could not answer and the GitHub API fallback ` +
+        'could not determine whether the issue exists (one or more configured repositories are not visible without authentication)',
+      )
+    }
+    return undefined
   }
-  return matches[0]
+  if (!selector.repo && !config.repos.default) {
+    if (found.length > 1) {
+      const matchedRepos = found.map((match) => match.issue.repo).sort((left, right) => left.localeCompare(right))
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
+        'set repos.default or pass a repo-qualified argument',
+      )
+    }
+    if (indeterminate) {
+      // A single confirmed match is not the same as a unique one: at least
+      // one other configured repository could not be checked, so a same-
+      // numbered issue could exist there too. Refuse rather than silently
+      // dispatch to whichever repo happened to answer.
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: GitHub API found a match in ${found[0]!.issue.repo} but could not ` +
+        'confirm it is unique because one or more other configured repositories could not be checked without authentication; ' +
+        'set repos.default or pass a repo-qualified argument',
+      )
+    }
+  }
+  return found[0]!.issue
 }
 
 async function issueProjectionStatus(

@@ -17,7 +17,7 @@ import type {
 import { stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { GithubConnectionRead, GithubConnectionWrite, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
@@ -127,6 +127,15 @@ const githubConnectionIssue = (
   path: `/github/repos/AgentWorkforce__${repo}/issues/by-id/${number}.json`,
   content,
 })
+
+const githubIssueFound = (repo: string, number: number, content?: unknown): GithubIssueLookup =>
+  ({ outcome: 'found', issue: githubConnectionIssue(repo, number, content) })
+
+const githubIssueNotFound = (): GithubIssueLookup => ({ outcome: 'not-found' })
+
+const githubIssueIndeterminate = (
+  reason = 'repository not visible without authentication',
+): GithubIssueLookup => ({ outcome: 'indeterminate', reason })
 
 const fakeGithubConnectionRead = (
   resolveIssue: (repo: string, number: number) => ReturnType<GithubConnectionRead['getIssue']>,
@@ -812,7 +821,7 @@ describe('fleet CLI runtime', () => {
         state: 'degraded',
         initialSyncState: 'complete',
       }))
-      const githubRead = fakeGithubConnectionRead(async (_repo, number) => githubConnectionIssue('pear', number))
+      const githubRead = fakeGithubConnectionRead(async (_repo, number) => githubIssueFound('pear', number))
       const mount = Object.assign(
         mountWithIntegrationConnections({}, integrations),
         {
@@ -1676,8 +1685,8 @@ describe('fleet CLI runtime', () => {
       })
       const githubRead = fakeGithubConnectionRead(async (repo, number) =>
         repo === 'AgentWorkforce/pear' && number === 222
-          ? githubConnectionIssue('pear', number)
-          : undefined,
+          ? githubIssueFound('pear', number)
+          : githubIssueNotFound(),
       )
       const mount = Object.assign(new FakeMountClient(), {
         githubRead,
@@ -1769,7 +1778,7 @@ describe('fleet CLI runtime', () => {
           default: 'AgentWorkforce/pear',
         },
       })
-      const githubRead = fakeGithubConnectionRead(async () => undefined)
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueNotFound())
       const errors = buffer()
 
       const code = await runFleetCli(['triage', '999999', '--config', configPath], {
@@ -1785,6 +1794,80 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(1)
       expect(errors.text()).toContain('found 0 matches in the projection and GitHub API')
       expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', 999999)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports that GitHub could not determine existence instead of a confident 0 matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-indeterminate-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueIndeterminate())
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('could not determine whether the issue exists')
+      expect(errors.text()).not.toContain('found 0 matches')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to dispatch to a found match when another configured repo could not be checked (no silent misroute)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-unconfirmed-unique-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: {
+            factory: 'AgentWorkforce/factory',
+            cloud: 'AgentWorkforce/cloud',
+          },
+          clonePaths: {
+            'AgentWorkforce/factory': '/work/factory',
+            'AgentWorkforce/cloud': '/work/cloud',
+          },
+        },
+      })
+      // A public repo (factory) answers with a match; a repo it cannot see
+      // (cloud) is indeterminate. A same-numbered issue could exist there
+      // too — dispatching to the found match alone would be a silent misroute.
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'AgentWorkforce/factory' ? githubIssueFound('factory', number) : githubIssueIndeterminate(),
+      )
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('could not confirm it is unique')
+      expect(errors.text()).toContain('AgentWorkforce/factory')
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1811,7 +1894,7 @@ describe('fleet CLI runtime', () => {
         '- Run the focused CLI regression checks.',
       ].join('\n')
       const githubRead = fakeGithubConnectionRead(async (_repo, number) =>
-        githubConnectionIssue('pear', number, content),
+        githubIssueFound('pear', number, content),
       )
       const output = buffer()
 
@@ -1853,7 +1936,7 @@ describe('fleet CLI runtime', () => {
       unsafe.payload.labels = [{ name: 'pear' }]
       unsafe.payload.title = 'Missing both configured safety markers'
       const githubRead = fakeGithubConnectionRead(async (_repo, number) =>
-        githubConnectionIssue('pear', number, unsafe),
+        githubIssueFound('pear', number, unsafe),
       )
       const errors = buffer()
       const fleet = new FakeFleetClient()
@@ -1889,7 +1972,7 @@ describe('fleet CLI runtime', () => {
           default: 'AgentWorkforce/pear',
         },
       })
-      const githubRead = fakeGithubConnectionRead(async () => githubConnectionIssue('pear', 222))
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueFound('pear', 222))
       const errors = buffer()
       const now = Date.now()
       await writeFile(heartbeatPath, JSON.stringify({
@@ -1939,7 +2022,7 @@ describe('fleet CLI runtime', () => {
         },
       })
       const githubRead = fakeGithubConnectionRead(async (repo, number) =>
-        repo === 'AgentWorkforce/factory' ? githubConnectionIssue('factory', number) : undefined,
+        repo === 'AgentWorkforce/factory' ? githubIssueFound('factory', number) : githubIssueNotFound(),
       )
       const output = buffer()
 
@@ -1982,7 +2065,7 @@ describe('fleet CLI runtime', () => {
         },
       })
       const githubRead = fakeGithubConnectionRead(async (repo, number) =>
-        repo === 'AgentWorkforce/cloud' ? githubConnectionIssue('cloud', number) : undefined,
+        repo === 'AgentWorkforce/cloud' ? githubIssueFound('cloud', number) : githubIssueNotFound(),
       )
       const output = buffer()
 

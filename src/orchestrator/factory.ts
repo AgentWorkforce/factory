@@ -4679,16 +4679,31 @@ export class FactoryLoop implements Factory {
         const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
         const identity = parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
         if (parts && identity && this.#githubApiFallbackIssues.has(identity) && this.#mount.githubRead) {
-          const fallback = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
-          if (fallback) {
-            const githubIssue = parseGithubIssue(fallback.path, fallback.content)
+          const lookup = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
+          if (lookup.outcome === 'found') {
+            const githubIssue = parseGithubIssue(lookup.issue.path, lookup.issue.content)
             this.#indexDependencyIssue(githubIssueAsFactoryIssue(githubIssue))
             this.#logger.warn?.('[factory] Relayfile projection missed GitHub issue; using GitHub API fallback', {
-              repo: fallback.repo,
-              number: fallback.number,
+              repo: lookup.issue.repo,
+              number: lookup.issue.number,
               source: 'github-api-fallback',
             })
             return githubIssue
+          }
+          if (lookup.outcome === 'indeterminate') {
+            // The provider lookup could not confirm absence (e.g. an
+            // unauthenticated 404 against a repo it cannot prove is public).
+            // That is not the same claim as "confirmed gone" — count and log
+            // it separately so it stays visible instead of being folded into
+            // the phantom-skip metric.
+            this.#increment('githubIssueUnverifiable')
+            this.#logger.warn?.('[factory] GitHub API fallback could not determine issue existence', {
+              path,
+              repo: `${parts.owner}/${parts.repo}`,
+              number: parts.number,
+              reason: lookup.reason,
+            })
+            return undefined
           }
         }
         this.#increment('githubIssuePhantomSkipped')
