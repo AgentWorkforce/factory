@@ -8,19 +8,20 @@ import type {
   CloseProbePrInput,
   Factory,
   FactoryCloudEventInputV1,
+  FactoryConfig,
   FactoryEventReporter,
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
   FactoryPorts,
   createFactory,
 } from '../index'
-import { stateResolutionFromIds } from '../index'
+import { FactoryConfigSchema, stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
-import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -102,7 +103,7 @@ class CompletingRemoteFleetClient extends FakeFleetClient {
   }
 }
 
-const githubIssueFile = (repo: string, number = 48) => ({
+const githubIssueFile = (repo: string, number = 48, owner = 'AgentWorkforce') => ({
   provider: 'github',
   objectType: 'issue',
   objectId: `${repo}-${number}`,
@@ -112,8 +113,8 @@ const githubIssueFile = (repo: string, number = 48) => ({
     body: 'Dispatch the repository-qualified GitHub issue.',
     state: 'open',
     labels: [{ name: 'factory' }, { name: repo }],
-    url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
-    repository: { name: repo, owner: { login: 'AgentWorkforce' } },
+    url: `https://github.com/${owner}/${repo}/issues/${number}`,
+    repository: { name: repo, owner: { login: owner } },
   },
 })
 
@@ -474,6 +475,93 @@ describe('fleet CLI parsing', () => {
         .toBe(join(stateDir, 'connection.json'))
     } finally {
       await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('parseGithubIssueSelector normalization matrix', () => {
+  // Three review rounds each found a different normalization gap in this
+  // resolution (default-only collapse, org-only expansion, bare-label vs
+  // normalized comparison). Every candidate and every configured entry must
+  // pass through the same canonicalization before any comparison — this
+  // table exercises the combinations that produced each of those bugs,
+  // not just the one case each round happened to name.
+  const buildConfig = (overrides: {
+    org?: string
+    byLabel?: Record<string, string>
+    default?: string
+  }): FactoryConfig => FactoryConfigSchema.parse({
+    workspaceId: 'factory-cli-test',
+    repos: {
+      byLabel: overrides.byLabel ?? {},
+      clonePaths: {},
+      ...(overrides.org !== undefined ? { org: overrides.org } : {}),
+      ...(overrides.default !== undefined ? { default: overrides.default } : {}),
+    },
+    stateIds: TEST_STATE_IDS,
+  })
+
+  it.each([
+    [
+      'qualified selector, bare label route, org set: resolves via org-prefixing',
+      'work#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, bare label route, org unset: cannot resolve without an owner',
+      'work#5',
+      { byLabel: { work: 'factory' } },
+      undefined,
+    ],
+    [
+      'qualified selector, cross-owner qualified label route, org set to a different owner: label route wins over org',
+      'work#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'OtherOrg/partner-repo' } },
+      { number: 5, repo: 'OtherOrg/partner-repo' },
+    ],
+    [
+      'qualified selector, cross-owner qualified label route, org unset: resolves without needing org',
+      'work#5',
+      { byLabel: { work: 'OtherOrg/partner-repo' } },
+      { number: 5, repo: 'OtherOrg/partner-repo' },
+    ],
+    [
+      'qualified selector, already fully owner/repo-qualified: resolves directly regardless of byLabel',
+      'AgentWorkforce/factory#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, label match is case-insensitive',
+      'WORK#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, unconfigured label: rejected regardless of org',
+      'unknown#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      undefined,
+    ],
+    [
+      'bare selector: never carries a repo, independent of org/byLabel shape',
+      '5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' }, default: 'AgentWorkforce/factory' },
+      { number: 5 },
+    ],
+    [
+      'bare selector with no default and no org: still just the number',
+      '5',
+      { byLabel: { work: 'factory' } },
+      { number: 5 },
+    ],
+  ] as const)('%s', (_name, key, overrides, expected) => {
+    const config = buildConfig(overrides)
+    if (expected === undefined) {
+      expect(() => parseGithubIssueSelector(key, config)).toThrow(/is not one of the configured Factory routes/)
+    } else {
+      expect(parseGithubIssueSelector(key, config)).toEqual(expected)
     }
   })
 })
@@ -2114,7 +2202,7 @@ describe('fleet CLI runtime', () => {
                 repo: 'OtherOrg/partner-repo',
                 number,
                 path: `/github/repos/OtherOrg__partner-repo/issues/by-id/${number}.json`,
-                content: githubIssueFile('partner-repo', number),
+                content: githubIssueFile('partner-repo', number, 'OtherOrg'),
               },
             }
           : githubIssueNotFound(),

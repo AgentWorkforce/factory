@@ -1886,9 +1886,9 @@ function githubProjectionUnavailableReason(projection: IssueResolution['projecti
   return undefined
 }
 
-type GithubIssueSelector = { number: number; repo?: string }
+export type GithubIssueSelector = { number: number; repo?: string }
 
-function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIssueSelector {
+export function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIssueSelector {
   const qualified = key.match(/^([^#]+)#([1-9]\d*)$/u)
   const bare = key.match(/^#?([1-9]\d*)$/u)
   const number = Number(qualified?.[2] ?? bare?.[1])
@@ -1901,21 +1901,16 @@ function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIss
 
   const requested = qualified[1]!
   const configured = allConfiguredGithubIssueRepos(config)
-  const labelRoute = Object.entries(config.repos.byLabel)
-    .find(([label]) => label.toLowerCase() === requested.toLowerCase())?.[1]
-  // A label can route to a repo outside repos.org. Try the org expansion
-  // first (the common case), but fall back to the label's own route rather
-  // than only ever trying one — otherwise a cross-owner label is rejected as
-  // unconfigured even though allConfiguredGithubIssueRepos does include it.
-  const candidates = requested.includes('/')
-    ? [requested]
-    : [
-        ...(config.repos.org ? [`${config.repos.org}/${requested}`] : []),
-        ...(labelRoute ? [labelRoute] : []),
-      ]
-  const repo = candidates
-    .map((expanded) => configured.find((candidate) => candidate.toLowerCase() === expanded.toLowerCase()))
-    .find((match): match is string => Boolean(match))
+  // Resolve what the caller typed through the exact same canonicalization
+  // every configured route already goes through (label mapping, org
+  // prefixing, canonical-route lookup) instead of a second, ad-hoc
+  // expansion — three review rounds each found a different normalization
+  // gap (default-only, org-only, bare-label-vs-normalized) in a hand-rolled
+  // comparison here. Comparison is only ever normalized against normalized.
+  const [resolved] = resolveGithubIssueRepoCandidates(config, [requested])
+  const repo = resolved
+    ? configured.find((candidate) => candidate.toLowerCase() === resolved.toLowerCase())
+    : undefined
   if (!repo) {
     throw new Error(
       `${githubIssueResolutionError(config, key)}: repository ${requested} is not one of the configured Factory routes`,
