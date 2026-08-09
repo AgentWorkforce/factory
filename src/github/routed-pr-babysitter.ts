@@ -1,4 +1,5 @@
 import type { FactoryConfig } from '../config/schema'
+import { resolveRoutedRepo } from '../config/schema'
 import type { MountClient } from '../ports'
 import { asRecord, stableHash, wrappedPayload } from '../writeback/shared'
 
@@ -41,13 +42,8 @@ export const routedPrIdentity = (repo: string, prNumber: number): string =>
 export const routedPrRepos = (config: FactoryConfig): string[] => {
   const repos = new Map<string, string>()
   for (const name of config.repos.names ?? []) {
-    const configured = config.repos.byLabel[name] ?? name
-    const repo = configured.includes('/')
-      ? configured
-      : config.repos.org
-        ? `${config.repos.org}/${configured}`
-        : undefined
-    if (!repo || !/^[^/]+\/[^/]+$/u.test(repo)) continue
+    const repo = resolveRoutedRepo(config.repos.byLabel[name] ?? name, config.repos.org)
+    if (!repo) continue
     repos.set(repo.toLowerCase(), repo)
   }
   return [...repos.values()].sort((left, right) => left.localeCompare(right))

@@ -323,6 +323,19 @@ const NodeConfigObjectSchema = z.object({
 
 const FactoryConfigObjectSchema = WorkspaceConfigObjectSchema.merge(NodeConfigObjectSchema)
 
+// Shared with routedPrRepos (src/github/routed-pr-babysitter.ts): the last
+// step in resolving a repos.names entry to a routable owner/repo slug. A
+// resolved value that already has a slash is used as-is; one that doesn't
+// gets `org` prefixed as a rescue, regardless of whether it came from an
+// explicit byLabel entry, overrides, or the bare name itself -- that rescue
+// used to live only in routedPrRepos, so a validator that ran before
+// normalizeFactoryConfig's transform (and so never saw org get applied)
+// could reject a config routedPrRepos would resolve fine at runtime.
+export const resolveRoutedRepo = (configured: string, org: string | undefined): string | undefined => {
+  const repo = configured.includes('/') ? configured : (org ? `${org}/${configured}` : undefined)
+  return repo && /^[^/]+\/[^/]+$/u.test(repo) ? repo : undefined
+}
+
 const requireRoutedBabysitterRepos = (
   cfg: z.infer<typeof WorkspaceConfigObjectSchema>,
   ctx: z.RefinementCtx,
@@ -336,11 +349,13 @@ const requireRoutedBabysitterRepos = (
     return
   }
   if (cfg.babysitter.mode === 'routed-open-prs') {
-    const routedRepos = (cfg.repos.names ?? []).map((name) =>
-      cfg.repos.byLabel[name] ?? cfg.repos.overrides[name] ??
-      (cfg.repos.org ? `${cfg.repos.org}/${name}` : name)
-    )
-    if (!routedRepos.some((repo) => /^[^/]+\/[^/]+$/u.test(repo))) {
+    // Mirror resolveRepos' own derivation (overrides win over a bare
+    // org/name, explicit byLabel wins over that) instead of a second,
+    // hand-rolled copy of that fallback chain that can drift from it.
+    const { byLabel } = resolveRepos(cfg.repos, cfg.repos.cloneRoot)
+    const routedRepos = (cfg.repos.names ?? [])
+      .map((name) => resolveRoutedRepo(byLabel[name] ?? name, cfg.repos.org))
+    if (!routedRepos.some(Boolean)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['repos', 'names'],
