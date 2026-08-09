@@ -27,13 +27,13 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { dispatchComment, githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
+import { dispatchComment, githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import {
   ResourceSubscriptionsUnavailableError,
@@ -1836,6 +1836,69 @@ describe('dispatchComment', () => {
     const comment = dispatchComment(decision, [{ name: 'ar-222-review', role: 'reviewer' }])
 
     expect(comment).toContain('Issue resolution: relayfile-projection')
+  })
+})
+
+describe('rememberBoundedFallbackEligibility', () => {
+  it('bounds the eligible set, evicting the least-recently-registered identity', () => {
+    const eligible = new Set<string>()
+    const evicted = new Set<string>()
+
+    rememberBoundedFallbackEligibility(eligible, evicted, 'a', 2, 2)
+    rememberBoundedFallbackEligibility(eligible, evicted, 'b', 2, 2)
+    expect(eligible).toEqual(new Set(['a', 'b']))
+
+    // Over capacity: 'a' is the least-recently-registered and is evicted.
+    rememberBoundedFallbackEligibility(eligible, evicted, 'c', 2, 2)
+    expect(eligible).toEqual(new Set(['b', 'c']))
+    expect(eligible.has('a')).toBe(false)
+    expect(evicted.has('a')).toBe(true)
+  })
+
+  it('re-registering an identity refreshes its recency instead of leaving it due for eviction', () => {
+    const eligible = new Set<string>()
+    const evicted = new Set<string>()
+
+    rememberBoundedFallbackEligibility(eligible, evicted, 'a', 2, 2)
+    rememberBoundedFallbackEligibility(eligible, evicted, 'b', 2, 2)
+    // Without the delete+add refresh, 'a' would still be positioned first
+    // (oldest) and would be evicted next, even though it was just reused.
+    rememberBoundedFallbackEligibility(eligible, evicted, 'a', 2, 2)
+    rememberBoundedFallbackEligibility(eligible, evicted, 'c', 2, 2)
+
+    expect(eligible).toEqual(new Set(['a', 'c']))
+    expect(eligible.has('b')).toBe(false)
+  })
+
+  it('re-registering a previously evicted identity restores it and clears the eviction record', () => {
+    const eligible = new Set<string>()
+    const evicted = new Set<string>()
+
+    rememberBoundedFallbackEligibility(eligible, evicted, 'a', 2, 2)
+    rememberBoundedFallbackEligibility(eligible, evicted, 'b', 2, 2)
+    rememberBoundedFallbackEligibility(eligible, evicted, 'c', 2, 2)
+    expect(evicted.has('a')).toBe(true)
+
+    rememberBoundedFallbackEligibility(eligible, evicted, 'a', 2, 2)
+
+    expect(eligible.has('a')).toBe(true)
+    expect(evicted.has('a')).toBe(false)
+  })
+
+  it('bounds the evicted record itself, so it cannot grow without bound either', () => {
+    const eligible = new Set<string>()
+    const evicted = new Set<string>()
+
+    // maxEligible=1 forces an eviction on every insert after the first.
+    for (const identity of ['a', 'b', 'c', 'd', 'e']) {
+      rememberBoundedFallbackEligibility(eligible, evicted, identity, 1, 2)
+    }
+
+    expect(eligible).toEqual(new Set(['e']))
+    expect(evicted.size).toBeLessThanOrEqual(2)
+    // The most recently evicted identities survive; the earliest do not.
+    expect(evicted.has('d')).toBe(true)
+    expect(evicted.has('a')).toBe(false)
   })
 })
 
@@ -6451,6 +6514,93 @@ describe('FactoryLoop', () => {
         })
       }
       expect(restarted.status().inFlight).toEqual([])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a durable GitHub dispatch through the API fallback after a restart loses process-local eligibility', async () => {
+    class AckGapFleet extends RemoteLifecycleFleetClient {
+      failed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (!this.failed) {
+          this.failed = true
+          throw new Error('owner crashed after remote spawn ack')
+        }
+        return result
+      }
+    }
+
+    const number = 700
+    const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+    const openIssue = githubIssueFile(number, { state: 'open', labels: ['factory'] })
+    // The Relayfile projection never has this issue at all — only the direct
+    // GitHub API fallback can serve it, exactly like a CLI-resolved
+    // repo#number target the projection could never answer.
+    const githubRead: GithubConnectionRead = {
+      getIssue: vi.fn(async (repo: string, num: number) =>
+        repo === 'AgentWorkforce/pear' && num === number
+          ? { outcome: 'found' as const, issue: { repo, number: num, path, content: openIssue } }
+          : { outcome: 'not-found' as const }),
+    }
+    const mount = Object.assign(new FakeMountClient({}), { githubRead })
+    const fleet = new AckGapFleet()
+    const root = await mkdtemp(join(tmpdir(), `factory-github-api-fallback-restart-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const triaged = await first.triageIssue(parseGithubFactoryIssue(path, openIssue))
+      const decision: TriageDecision = {
+        ...triaged,
+        issueResolution: {
+          source: 'github-api-fallback',
+          repo: 'AgentWorkforce/pear',
+          detail: 'Relayfile projection could not answer; resolved authoritatively through the GitHub API fallback.',
+          projection: { outcome: 'no-match' },
+        },
+      }
+
+      await expect(first.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', number)
+      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'retryable' })
+      await first.stop()
+
+      // A restarted process's #githubApiFallbackIssues is empty — it is
+      // process-local. Only decision.issueResolution, persisted in the
+      // durable lifecycle record, can restore fallback eligibility here.
+      // Without that restoration this resume throws "issue is not currently
+      // readable" on every retry and the lifecycle never leaves 'retryable'.
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+      )).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        `ar-${number}-impl-pear`,
+        `ar-${number}-review-pear`,
+      ])
     } finally {
       await restarted?.stop()
       await first.stop()

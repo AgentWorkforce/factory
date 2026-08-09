@@ -345,6 +345,47 @@ const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
 const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
+// #githubApiFallbackIssues is append-only in memory for the life of the
+// process; bound it so a long-running `factory start --mode live` daemon
+// doesn't accumulate one entry per fallback dispatch forever.
+const GITHUB_API_FALLBACK_ISSUES_MAX = 2_000
+// A small, separately-bounded record of recently evicted identities, so a
+// later miss can be reported as "eligibility was evicted" rather than
+// silently folded into the same signal as "never was eligible" — an
+// operator investigating a false phantom-skip needs to tell those apart.
+const GITHUB_API_FALLBACK_ISSUES_EVICTED_MAX = 200
+
+/**
+ * Adds `identity` to `eligible`, evicting the least-recently-registered
+ * entry once at capacity (Sets preserve insertion order; delete+add
+ * refreshes an existing identity's recency instead of leaving it at its
+ * original position). An evicted identity moves into `evicted` — itself
+ * bounded — so a later caller can tell "eligibility was evicted" apart from
+ * "never was eligible" instead of collapsing both into the same signal.
+ * Exported standalone (pure, no class state) so the bounding and eviction
+ * behavior is directly testable without driving thousands of dispatches
+ * through a full FactoryLoop to fill the production-sized set.
+ */
+export function rememberBoundedFallbackEligibility(
+  eligible: Set<string>,
+  evicted: Set<string>,
+  identity: string,
+  maxEligible: number,
+  maxEvicted: number,
+): void {
+  evicted.delete(identity)
+  eligible.delete(identity)
+  eligible.add(identity)
+  if (eligible.size <= maxEligible) return
+  const oldest = eligible.values().next().value
+  if (oldest === undefined) return
+  eligible.delete(oldest)
+  evicted.delete(oldest)
+  evicted.add(oldest)
+  if (evicted.size <= maxEvicted) return
+  const oldestEvicted = evicted.values().next().value
+  if (oldestEvicted !== undefined) evicted.delete(oldestEvicted)
+}
 
 class DispatchLifecycleCapacityError extends Error {}
 class DispatchLifecycleOwnedElsewhereError extends Error {
@@ -413,6 +454,7 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
   readonly #githubApiFallbackIssues = new Set<string>()
+  readonly #githubApiFallbackIssuesEvicted = new Set<string>()
   #githubIssuePathIndexReady = false
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
@@ -2427,10 +2469,7 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    if (decision.issueResolution?.source === 'github-api-fallback') {
-      const parts = githubIssuePathParts(decision.issue.path) ?? githubIssueDirectoryPathParts(decision.issue.path)
-      if (parts) this.#githubApiFallbackIssues.add(githubIssueIdentity(parts.owner, parts.repo, parts.number))
-    }
+    this.#registerGithubApiFallbackEligibility(decision)
     const liveIssue = await this.#readIssue(decision.issue.path)
     if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
@@ -3994,6 +4033,7 @@ export class FactoryLoop implements Factory {
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
     let liveIssue: LinearIssue | undefined
     if (!record.dryRun) {
+      this.#registerGithubApiFallbackEligibility(record.decision)
       liveIssue = await this.#readIssue(record.issue.path)
       if (!liveIssue) {
         throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
@@ -4654,6 +4694,30 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * `#githubApiFallbackIssues` is process-local, so a restart loses it while
+   * a durably-persisted decision still records `issueResolution.source ===
+   * 'github-api-fallback'`. Call this before any `#readIssue`/
+   * `#readGithubIssue` that must be able to recover such an issue (initial
+   * dispatch and durable-dispatch resume alike) so eligibility is restored
+   * from the decision itself rather than assumed lost.
+   */
+  #registerGithubApiFallbackEligibility(decision: TriageDecision): void {
+    if (decision.issueResolution?.source !== 'github-api-fallback') return
+    const parts = githubIssuePathParts(decision.issue.path) ?? githubIssueDirectoryPathParts(decision.issue.path)
+    if (parts) this.#rememberGithubApiFallbackEligible(githubIssueIdentity(parts.owner, parts.repo, parts.number))
+  }
+
+  #rememberGithubApiFallbackEligible(identity: string): void {
+    rememberBoundedFallbackEligibility(
+      this.#githubApiFallbackIssues,
+      this.#githubApiFallbackIssuesEvicted,
+      identity,
+      GITHUB_API_FALLBACK_ISSUES_MAX,
+      GITHUB_API_FALLBACK_ISSUES_EVICTED_MAX,
+    )
+  }
+
   async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
     const preferredPath = await this.#preferredGithubIssuePath(path)
     const candidatePaths = [...new Set([
@@ -4705,6 +4769,17 @@ export class FactoryLoop implements Factory {
             })
             return undefined
           }
+        }
+        if (identity && this.#githubApiFallbackIssuesEvicted.has(identity)) {
+          // identity was eligible for the API fallback but aged out of the
+          // bounded set — a different claim from "never was eligible", and
+          // one this signal must not silently collapse into a confirmed miss.
+          this.#increment('githubIssueApiFallbackEligibilityEvicted')
+          this.#logger.warn?.('[factory] GitHub API fallback eligibility was evicted from the bounded cache before this read', {
+            path,
+            identity,
+          })
+          return undefined
         }
         this.#increment('githubIssuePhantomSkipped')
         this.#logger.debug?.('[factory] skipped missing GitHub issue after projection and provider lookup', { path })
