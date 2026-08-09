@@ -17262,6 +17262,14 @@ describe('FactoryLoop PR babysitter', () => {
     expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
   })
 
+  // This asserts what the fix actually guarantees: the claim gets
+  // renegotiated (markRoutedPrBabysitterRunning is called again) instead of
+  // latching forever on stale local bookkeeping. It does NOT assert a real
+  // second OS-level process spawns — that is separately gated by
+  // #spawnAgent's own crash-recovery idempotency layer (batch.shouldSpawn on
+  // a deterministic invocationId), which has no way to learn that a later
+  // release invalidated an earlier "already dispatched" record. Tracked as
+  // AgentWorkforce/factory#229; not fixed here (different subsystem).
   it('retries ensureBabysitter after a lost PR work claim instead of latching the spawn flag forever', async () => {
     class LoseNextClaimStore extends InMemoryStateStore {
       failNext = false
@@ -17316,6 +17324,71 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(prPath, 'pr-505-retry'))
 
       await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(2))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('suppresses the retry instead of re-marking running when a lost claim was genuinely taken by another owner', async () => {
+    // Unlike the artificial-failure test above (which forces
+    // markRoutedPrBabysitterRunning to fail without changing any underlying
+    // state, to isolate the local-bookkeeping fix), this simulates the one
+    // realistic way that call actually fails: another owner adopts the claim
+    // via a live-lease transfer between our claim and our markRunning call —
+    // the same mechanism #restoreRoutedPrBabysitterClaims uses on restart.
+    class StolenByAnotherOwnerStore extends InMemoryStateStore {
+      stealNext = false
+      markRunningCalls = 0
+
+      override async markRoutedPrBabysitterRunning(
+        workspaceId: string,
+        identity: string,
+        owner: string,
+        claimId: string,
+        agentName: string,
+        nowMs: number,
+      ): Promise<boolean> {
+        this.markRunningCalls += 1
+        if (this.stealNext) {
+          this.stealNext = false
+          await this.adoptRoutedPrBabysitterClaim(workspaceId, identity, 'other-owner-agent', 'other-owner', nowMs, 15 * 60_000, true)
+        }
+        return super.markRoutedPrBabysitterRunning(workspaceId, identity, owner, claimId, agentName, nowMs)
+      }
+    }
+
+    const issue = realIssueFile(506, ready, { title: 'Real babysitter claim genuinely stolen' })
+    const mount = new FakeMountClient({ [issuePath(506)]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new StolenByAnotherOwnerStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 506 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(506), issue)))
+
+      stateStore.stealNext = true
+      fleet.emitAgentExit('ar-506-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toContain('ar-506-babysit'))
+      expect(stateStore.markRunningCalls).toBe(1)
+
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/506/metadata.json'
+      mount.files.set(prPath, { content: { number: 506, state: 'open', head_ref: 'ar-506-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-506-retry'))
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterOwnershipConflictsSuppressed).toBeGreaterThan(0))
+      // The retry's own claimRoutedPrBabysitter call must see the other
+      // owner's live claim and suppress before ever reaching
+      // markRoutedPrBabysitterRunning again — proving the local-bookkeeping
+      // fix does not let a genuinely-taken claim be re-marked running out
+      // from under its real owner (no phantom-running claim).
+      expect(stateStore.markRunningCalls).toBe(1)
     } finally {
       await factory.stop()
     }
