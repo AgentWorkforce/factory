@@ -33,7 +33,7 @@ import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, Gi
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
+import { dispatchComment, githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import {
   ResourceSubscriptionsUnavailableError,
@@ -1775,6 +1775,69 @@ class RecoveringSlackRootMountClient extends CloudWritebackFakeMountClient {
     return super.confirmWrite(path, opts)
   }
 }
+
+describe('dispatchComment', () => {
+  const baseDecision: TriageDecision = {
+    issue: { uuid: 'uuid-222', key: 'factory#222', path: '/github/repos/AgentWorkforce__factory/issues/by-id/222.json' },
+    routes: [{ repo: 'AgentWorkforce/factory', clonePath: '/work/factory', rationale: 'test route' }],
+    scope: 'single',
+    implementers: [],
+    reviewer: {
+      name: 'ar-222-review',
+      role: 'reviewer',
+      capability: 'spawn:claude',
+      model: 'claude',
+      task: 'Review factory#222',
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      node: 'self',
+    },
+    thin: false,
+    confidence: 'high',
+    rationale: 'test decision',
+  }
+
+  it('never posts a local filesystem path from a degraded-mount fallback resolution', () => {
+    // This is the actual shape a degraded local mount produces: the Relayfile
+    // health check embeds its own state file path in the reason string, and
+    // that reason flows into issueResolution.detail unmodified.
+    const decision: TriageDecision = {
+      ...baseDecision,
+      issueResolution: {
+        source: 'github-api-fallback',
+        repo: 'AgentWorkforce/factory',
+        detail: 'Relayfile projection could not answer (mount state is missing at /Users/khaliqgant/.relayfile/rw_7ccfea89/.relay/state.json); resolved authoritatively through the GitHub API fallback.',
+        projection: {
+          outcome: 'no-match',
+          localMountDegraded: true,
+          localMountDegradedReason: 'mount state is missing at /Users/khaliqgant/.relayfile/rw_7ccfea89/.relay/state.json',
+        },
+      },
+    }
+
+    const comment = dispatchComment(decision, [{ name: 'ar-222-review', role: 'reviewer' }])
+
+    expect(comment).toContain('Issue resolution: github-api-fallback')
+    expect(comment).not.toMatch(/\/Users\//)
+    expect(comment).not.toContain('/.relay/state.json')
+    expect(comment).not.toContain(decision.issueResolution!.detail)
+  })
+
+  it('still names the resolution source for a healthy projection match', () => {
+    const decision: TriageDecision = {
+      ...baseDecision,
+      issueResolution: {
+        source: 'relayfile-projection',
+        detail: 'Resolved from the preferred Relayfile projection.',
+        projection: { outcome: 'matched' },
+      },
+    }
+
+    const comment = dispatchComment(decision, [{ name: 'ar-222-review', role: 'reviewer' }])
+
+    expect(comment).toContain('Issue resolution: relayfile-projection')
+  })
+})
 
 describe('FactoryLoop', () => {
   it('sweeps preview orphans on daemon startup using durable active issue owners', async () => {

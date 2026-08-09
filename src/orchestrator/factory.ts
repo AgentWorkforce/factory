@@ -13468,10 +13468,16 @@ const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefin
   return [...pids].sort((a, b) => a - b)
 }
 
-const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
+// `issueResolution.detail` and `projection.localMountDegradedReason` are
+// free text that can carry an absolute local filesystem path (e.g. "mount
+// state is missing at /Users/<name>/...") — safe in the JSON result and in
+// logs, but this comment is posted to a public GitHub issue. Emit only
+// `source`, a closed enum, rather than trying to scrub paths out of free
+// text; free text is not a safe thing to scrub, only a safe thing to omit.
+export const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
   decision.issueResolution
-    ? `Issue resolution: ${decision.issueResolution.source} — ${decision.issueResolution.detail}`
+    ? `Issue resolution: ${decision.issueResolution.source}`
     : undefined,
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
   decision.scope === 'workflow' ? `Workflow: ${agents.find((agent) => agent.role === 'workflow')?.name ?? 'none'}` : undefined,
