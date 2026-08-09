@@ -767,7 +767,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('allows targeted GitHub resolution through the API seam when the connected projection is not ready', async () => {
+  it('keeps a populated projection preferred over the API fallback when the connection is not ready', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-github-fallback-'))
     try {
       const configPath = await writeConfig(root, { issueSource: 'github' })
