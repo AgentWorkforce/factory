@@ -131,7 +131,7 @@ const babysitterSchema = z.object({
   // before their first provider write.
   excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
   excludePullRequests: z.array(z.string().regex(
-    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9_.-]{0,99}#[1-9]\d*$/u,
+    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})#[1-9]\d*$/u,
     'expected owner/repo#number',
   )).default([]),
   // Routed intake stays quiet until an operator explicitly approves the

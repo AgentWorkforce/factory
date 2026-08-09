@@ -349,6 +349,18 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.babysitter.excludePullRequests).toEqual(['owner/r#1'])
   })
 
+  it('mirrors the owner-segment length rule onto the repo segment', () => {
+    const withRepo = (repo: string) => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, excludePullRequests: [`owner/${repo}#1`] },
+      repos: {},
+    })
+
+    expect(() => withRepo('')).toThrow(/expected owner\/repo#number/u)
+    expect(withRepo('r').babysitter.excludePullRequests).toEqual(['owner/r#1'])
+    expect(withRepo('r'.repeat(100)).babysitter.excludePullRequests).toEqual([`owner/${'r'.repeat(100)}#1`])
+    expect(() => withRepo('r'.repeat(101))).toThrow(/expected owner\/repo#number/u)
+  })
+
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {
     const parsed = FactoryConfigSchema.parse({
       subscription: { labels: ['pear'] },
