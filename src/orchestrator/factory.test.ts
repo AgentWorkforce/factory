@@ -17394,6 +17394,83 @@ describe('FactoryLoop PR babysitter', () => {
     })
   })
 
+  it('retries after a late failure in ensureBabysitter\'s fresh-spawn attempt, not just after a lost claim', async () => {
+    // Uncited by any reviewer -- found while fixing 3741674681 (the two
+    // markedRunning-failure branches) by noticing this pre-existing catch
+    // block hand-rolled the same three-key cleanup, missing #babysitterReady,
+    // and (like the markedRunning branches before their fix) never dropped
+    // the just-spawned agent from record.agents. Same class, a third
+    // pre-existing instance, found by reading code we were already touching
+    // rather than by a new review pass.
+    class FailNextPersistStore extends InMemoryStateStore {
+      failNext = false
+      markRunningCalls = 0
+
+      override async setBabysitterSession(
+        workspaceId: string,
+        key: string,
+        session: Parameters<InMemoryStateStore['setBabysitterSession']>[2],
+      ): Promise<void> {
+        if (this.failNext) {
+          this.failNext = false
+          throw new Error('durable session write unavailable')
+        }
+        await super.setBabysitterSession(workspaceId, key, session)
+      }
+
+      override async markRoutedPrBabysitterRunning(
+        ...args: Parameters<InMemoryStateStore['markRoutedPrBabysitterRunning']>
+      ): ReturnType<InMemoryStateStore['markRoutedPrBabysitterRunning']> {
+        this.markRunningCalls += 1
+        return super.markRoutedPrBabysitterRunning(...args)
+      }
+    }
+
+    const issue = realIssueFile(508, ready, { title: 'Real babysitter late spawn failure retry' })
+    const mount = new FakeMountClient({ [issuePath(508)]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new FailNextPersistStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 508 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(508), issue)))
+
+      stateStore.failNext = true
+      fleet.emitAgentExit('ar-508-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(factory.status().counters.babysitterSpawnFailures).toBe(1))
+      // The failure happened before markRoutedPrBabysitterRunning was ever
+      // reached (setBabysitterSession is called first in the try block).
+      expect(stateStore.markRunningCalls).toBe(0)
+
+      // markRunningCalls alone can't tell fresh-spawn apart from adopt (see
+      // the sibling test above) -- the adopt branch, reusing the phantom
+      // agent this catch block left behind pre-fix, also calls
+      // markRoutedPrBabysitterRunning. #readIssue is fresh-spawn-only, so a
+      // second read of the issue file is the real discriminator.
+      const readsBeforeRetry = mount.reads.filter((path) => path === issuePath(508)).length
+
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/508/metadata.json'
+      mount.files.set(prPath, { content: { number: 508, state: 'open', head_ref: 'ar-508-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-508-retry'))
+
+      // Before this fix, the catch block left #babysitterSpawned set and the
+      // spawned agent in record.agents, so this retry would have
+      // short-circuited on the stale flag (adopting the phantom record) and
+      // never reached markRoutedPrBabysitterRunning at all.
+      await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(1))
+      expect(mount.reads.filter((path) => path === issuePath(508)).length).toBeGreaterThan(readsBeforeRetry)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('suppresses the retry instead of re-marking running when a lost claim was genuinely taken by another owner', async () => {
     // Unlike the artificial-failure test above (which forces
     // markRoutedPrBabysitterRunning to fail without changing any underlying

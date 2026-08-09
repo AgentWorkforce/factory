@@ -10762,6 +10762,10 @@ export class FactoryLoop implements Factory {
     let finishSpawn!: () => void
     const spawnFinished = new Promise<void>((resolve) => { finishSpawn = resolve })
     this.#babysitterSpawnInFlight.set(babysitterKey, spawnFinished)
+    // Hoisted above the try so the catch block can drop the phantom
+    // record.agents entry if a later step in this attempt fails after the
+    // spawn itself succeeded (see the cancelBabysitterWake call in catch).
+    let spawnedAgentName: string | undefined
 
     try {
       const issue = await this.#readIssue(record.issue.path)
@@ -10847,6 +10851,7 @@ export class FactoryLoop implements Factory {
         task,
         ownedPullRequest: { repo: prRef.repo, number: prRef.prNumber, path: prRef.path },
       }, false)
+      spawnedAgentName = spawned.name
       const tracked = record.agents.get(spawned.name)
       this.#babysitterPr.set(babysitterKey, {
         repo: prRef.repo,
@@ -10907,13 +10912,18 @@ export class FactoryLoop implements Factory {
         await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
       }
     } catch (error) {
-      // Allow a later event to retry the spawn.
-      this.#babysitterSpawned.delete(babysitterKey)
-      this.#babysitterPr.delete(babysitterKey)
-      this.#babysitterIssueRefs.delete(babysitterKey)
-      if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
-        await this.#state.clearBabysitterSession(this.#workspaceId, babysitterKey)
-      }
+      // Allow a later event to retry the spawn. Same teardown as the
+      // markedRunning-failure branch above: #cancelBabysitterWake clears all
+      // four tracking keys (this hand-rolled version was missing
+      // #babysitterReady) and the durable session under the same
+      // "is this still ours to clear" guard this block already applied by
+      // hand. If the spawn itself succeeded before a later step in this try
+      // threw, drop the now-orphaned record.agents entry too -- otherwise a
+      // retry's trackedBabysitter search finds a released process and
+      // silently "adopts" it instead of spawning fresh (the same failure
+      // mode fixed for the markedRunning case above).
+      if (spawnedAgentName) record.agents.delete(spawnedAgentName)
+      await this.#cancelBabysitterWake(babysitterKey)
       this.#increment('babysitterSpawnFailures')
       this.#error(error, record.issue)
     } finally {
