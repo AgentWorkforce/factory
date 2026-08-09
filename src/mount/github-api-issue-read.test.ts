@@ -73,16 +73,20 @@ describe('GithubApiIssueRead', () => {
     // unauthenticated caller". Before this reader probed repo visibility, a
     // 404 here collapsed straight to `undefined`, indistinguishable from a
     // confirmed miss on a public repo — RED without the repo-visibility check.
-    const reader = new GithubApiIssueRead({
-      fetch: fetchByPath({
-        '/repos/AgentWorkforce/cloud': () => new Response('{}', { status: 404 }),
-        '/repos/AgentWorkforce/cloud/issues/222': () => new Response('{}', { status: 404 }),
-      }),
+    const request = vi.fn(async (input: string | URL | Request) => {
+      expect(String(input)).toBe('https://api.github.com/repos/AgentWorkforce/cloud')
+      return new Response('{}', { status: 404 })
     })
+    const reader = new GithubApiIssueRead({ fetch: request })
 
     const result = await reader.getIssue('AgentWorkforce/cloud', 222)
     expect(result.outcome).toBe('indeterminate')
     expect(result).not.toEqual({ outcome: 'not-found' })
+
+    // A confirmed-invisible repo can't inform the issue lookup either way —
+    // the issue-level GET would only spend a second request (of 60/hr,
+    // unauthenticated) on the same unresolvable 404. Assert it is never made.
+    expect(request).toHaveBeenCalledTimes(1)
   })
 
   it('caches a confirmed repo-visibility verdict across repeated lookups', async () => {

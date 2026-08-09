@@ -45,6 +45,15 @@ export class GithubApiIssueRead implements GithubConnectionRead {
         reason: `could not confirm ${owner}/${name} is publicly visible without authentication`,
       }
     }
+    if (!isPublic) {
+      // If the repo itself isn't visible unauthenticated, its issues can't
+      // be either — the issue-level GET would only return the same 404 for
+      // a different reason we still can't tell apart. Skip it: on this
+      // reader's rate limit (60 req/hr, unauthenticated), a private repo is
+      // the common case in this org, not the edge, so this second call is
+      // never wasted by accident.
+      return { outcome: 'indeterminate', reason: `${owner}/${name} is not visible without authentication` }
+    }
 
     const response = await this.#fetch(
       `${GITHUB_API_BASE_URL}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/${number}`,
@@ -58,12 +67,9 @@ export class GithubApiIssueRead implements GithubConnectionRead {
       },
     )
     if (response.status === 404) {
-      // A confirmed-public repo's 404 is a trustworthy miss. Otherwise this
-      // 404 is the same one GitHub returns to hide a private repo's
-      // existence, and cannot be told apart from a real absence.
-      return isPublic
-        ? { outcome: 'not-found' }
-        : { outcome: 'indeterminate', reason: `${owner}/${name} is not visible without authentication` }
+      // Reached only when isPublic === true: a confirmed-public repo's 404
+      // is a trustworthy miss.
+      return { outcome: 'not-found' }
     }
     if (isRateLimitOrAuthStatus(response.status)) {
       return { outcome: 'indeterminate', reason: `GitHub API issue lookup returned HTTP ${response.status}` }
