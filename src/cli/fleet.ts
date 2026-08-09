@@ -1875,7 +1875,7 @@ function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIss
   if (!qualified) return { number }
 
   const requested = qualified[1]!
-  const configured = configuredGithubIssueRepos(config)
+  const configured = allConfiguredGithubIssueRepos(config)
   const expanded = requested.includes('/')
     ? requested
     : config.repos.org
@@ -1892,14 +1892,7 @@ function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIss
   return { number, repo }
 }
 
-function configuredGithubIssueRepos(config: FactoryConfig): string[] {
-  const candidates = config.repos.default
-    ? [config.repos.default]
-    : [
-        ...Object.values(config.repos.byLabel),
-        ...Object.values(config.repos.byProject),
-        ...config.repos.keywordRules.map((rule) => rule.repo),
-      ]
+function resolveGithubIssueRepoCandidates(config: FactoryConfig, candidates: string[]): string[] {
   const repos = new Map<string, string>()
   const routedRepos = [
     ...Object.values(config.repos.byLabel),
@@ -1922,6 +1915,32 @@ function configuredGithubIssueRepos(config: FactoryConfig): string[] {
     repos.set(repo.toLowerCase(), repo)
   }
   return [...repos.values()]
+}
+
+/** Bare-number resolution stays default-only: when repos.default is set, a
+ *  bare issue number resolves against that single repo, not every route. */
+function configuredGithubIssueRepos(config: FactoryConfig): string[] {
+  const candidates = config.repos.default
+    ? [config.repos.default]
+    : [
+        ...Object.values(config.repos.byLabel),
+        ...Object.values(config.repos.byProject),
+        ...config.repos.keywordRules.map((rule) => rule.repo),
+      ]
+  return resolveGithubIssueRepoCandidates(config, candidates)
+}
+
+/** Qualified `repo#number` selectors must validate against every configured
+ *  route, not just repos.default — a route reachable only through byLabel,
+ *  byProject, or keywordRules is still a valid dispatch target. */
+function allConfiguredGithubIssueRepos(config: FactoryConfig): string[] {
+  const candidates = [
+    ...(config.repos.default ? [config.repos.default] : []),
+    ...Object.values(config.repos.byLabel),
+    ...Object.values(config.repos.byProject),
+    ...config.repos.keywordRules.map((rule) => rule.repo),
+  ]
+  return resolveGithubIssueRepoCandidates(config, candidates)
 }
 
 function hasConfiguredGithubIssueRoutes(config: FactoryConfig): boolean {
