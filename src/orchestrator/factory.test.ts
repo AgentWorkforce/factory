@@ -17330,11 +17330,24 @@ describe('FactoryLoop PR babysitter', () => {
       // flag and never renegotiated the claim at all — markRunningCalls would
       // stay latched at 1 forever, even though the babysitter that owned
       // that claim no longer exists.
+      // markRunningCalls alone is not sufficient to prove the retry took the
+      // fresh-spawn branch specifically: ensureBabysitter's adopt branch
+      // (reusing a *stale, released* tracked agent still sitting in
+      // record.agents) calls markRoutedPrBabysitterRunning too, so it would
+      // pass this same assertion by silently re-confirming a phantom agent
+      // as "the" babysitter instead of retrying for real. #readIssue is
+      // called only inside the fresh-spawn branch's try block -- the adopt
+      // branch never calls it -- so a second read of the issue file is a
+      // real discriminator between the two, unlike anything both branches
+      // call.
+      const readsBeforeRetry = mount.reads.filter((path) => path === issuePath(505)).length
+
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/505/metadata.json'
       mount.files.set(prPath, { content: { number: 505, state: 'open', head_ref: 'ar-505-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-505-retry'))
 
       await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(2))
+      expect(mount.reads.filter((path) => path === issuePath(505)).length).toBeGreaterThan(readsBeforeRetry)
     } finally {
       await factory.stop()
     }
