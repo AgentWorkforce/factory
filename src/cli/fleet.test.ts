@@ -2089,6 +2089,58 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('validates a qualified label selector routed outside repos.org', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-qualified-cross-owner-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          org: 'AgentWorkforce',
+          byLabel: {
+            // Routed to a different owner than repos.org — the org expansion
+            // alone (`${org}/${requested}`) cannot resolve this label.
+            partner: 'OtherOrg/partner-repo',
+          },
+          clonePaths: {
+            'OtherOrg/partner-repo': '/work/partner-repo',
+          },
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'OtherOrg/partner-repo'
+          ? {
+              outcome: 'found',
+              issue: {
+                repo: 'OtherOrg/partner-repo',
+                number,
+                path: `/github/repos/OtherOrg__partner-repo/issues/by-id/${number}.json`,
+                content: githubIssueFile('partner-repo', number),
+              },
+            }
+          : githubIssueNotFound(),
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', 'partner#5', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'github-api-fallback', repo: 'OtherOrg/partner-repo' },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('OtherOrg/partner-repo', 5)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('rejects non-positive GitHub issue numbers with source context', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-invalid-number-'))
     try {

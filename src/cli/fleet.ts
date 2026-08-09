@@ -1901,14 +1901,21 @@ function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIss
 
   const requested = qualified[1]!
   const configured = allConfiguredGithubIssueRepos(config)
-  const expanded = requested.includes('/')
-    ? requested
-    : config.repos.org
-      ? `${config.repos.org}/${requested}`
-      : Object.entries(config.repos.byLabel).find(([label]) => label.toLowerCase() === requested.toLowerCase())?.[1]
-  const repo = expanded
-    ? configured.find((candidate) => candidate.toLowerCase() === expanded.toLowerCase())
-    : undefined
+  const labelRoute = Object.entries(config.repos.byLabel)
+    .find(([label]) => label.toLowerCase() === requested.toLowerCase())?.[1]
+  // A label can route to a repo outside repos.org. Try the org expansion
+  // first (the common case), but fall back to the label's own route rather
+  // than only ever trying one — otherwise a cross-owner label is rejected as
+  // unconfigured even though allConfiguredGithubIssueRepos does include it.
+  const candidates = requested.includes('/')
+    ? [requested]
+    : [
+        ...(config.repos.org ? [`${config.repos.org}/${requested}`] : []),
+        ...(labelRoute ? [labelRoute] : []),
+      ]
+  const repo = candidates
+    .map((expanded) => configured.find((candidate) => candidate.toLowerCase() === expanded.toLowerCase()))
+    .find((match): match is string => Boolean(match))
   if (!repo) {
     throw new Error(
       `${githubIssueResolutionError(config, key)}: repository ${requested} is not one of the configured Factory routes`,
