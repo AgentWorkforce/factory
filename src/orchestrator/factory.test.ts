@@ -33,7 +33,7 @@ import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, Gi
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { dispatchComment, githubIssuePathParts, githubRepoSubscriptionGlobs, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
+import { dispatchComment, githubIssueIdentity, githubIssuePathParts, githubRepoSubscriptionGlobs, isGithubApiFallbackEligible, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
 import { globMatchesPath } from '../subscriptions/globs'
 import {
   ResourceSubscriptionsUnavailableError,
@@ -1899,6 +1899,69 @@ describe('rememberBoundedFallbackEligibility', () => {
     // The most recently evicted identities survive; the earliest do not.
     expect(evicted.has('d')).toBe(true)
     expect(evicted.has('a')).toBe(false)
+  })
+})
+
+describe('isGithubApiFallbackEligible', () => {
+  // Registering eligibility at exactly two sites (dispatch, resume) against
+  // ~21 read call sites is the shape that produced the 'publishing'-phase
+  // bug (round 4): the next entry path added without also registering
+  // silently reintroduces it. This is the guard against that: a record
+  // present in `inFlight` with a fallback-sourced issueResolution must be
+  // found eligible by identity alone, with no hint and nothing having
+  // "registered" it — proving no caller has to remember anything for a
+  // currently-tracked issue.
+  const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 700)
+  const identity = githubIssueIdentity('AgentWorkforce', 'pear', 700)
+  const issue = { uuid: 'u-700', key: '700', path }
+  const fallbackDecision: TriageDecision = {
+    issue,
+    routes: [],
+    scope: 'single',
+    implementers: [],
+    reviewer: { name: 'r', role: 'reviewer', capability: 'spawn:claude', model: 'claude', task: 't', repo: 'AgentWorkforce/pear', clonePath: '/work/pear', node: 'self' },
+    thin: false,
+    confidence: 'high',
+    rationale: 'test',
+    issueResolution: {
+      source: 'github-api-fallback',
+      repo: 'AgentWorkforce/pear',
+      detail: 'test',
+      projection: { outcome: 'no-match' },
+    },
+  }
+
+  it('is eligible from a tracked in-flight record alone — no hint, nothing registered', () => {
+    expect(isGithubApiFallbackEligible([{ issue, decision: fallbackDecision }], identity)).toBe(true)
+  })
+
+  it('is not eligible when no tracked record and no hint matches the identity', () => {
+    expect(isGithubApiFallbackEligible([], identity)).toBe(false)
+  })
+
+  it('is not eligible for a tracked record resolved through the projection, not the fallback', () => {
+    const projectionDecision: TriageDecision = {
+      ...fallbackDecision,
+      issueResolution: { source: 'relayfile-projection', detail: 'test', projection: { outcome: 'matched' } },
+    }
+    expect(isGithubApiFallbackEligible([{ issue, decision: projectionDecision }], identity)).toBe(false)
+  })
+
+  it('is not eligible for a tracked record with a different identity', () => {
+    const otherIssue = { uuid: 'u-701', key: '701', path: githubIssueNestedMetaPath('AgentWorkforce', 'pear', 701) }
+    expect(isGithubApiFallbackEligible(
+      [{ issue: otherIssue, decision: { ...fallbackDecision, issue: otherIssue } }],
+      identity,
+    )).toBe(false)
+  })
+
+  it('is eligible from decisionHint alone, before any record is tracked', () => {
+    expect(isGithubApiFallbackEligible([], identity, fallbackDecision)).toBe(true)
+  })
+
+  it('does not use decisionHint for a different identity', () => {
+    const otherIdentity = githubIssueIdentity('AgentWorkforce', 'pear', 701)
+    expect(isGithubApiFallbackEligible([], otherIdentity, fallbackDecision)).toBe(false)
   })
 })
 
@@ -6607,6 +6670,104 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('recovers a fallback-backed issue during PR publication after a restart, not just during dispatch resume', async () => {
+    // Registering eligibility only at #dispatchUnlocked/#resumeDurableDispatch
+    // covers the 'dispatching'/'retryable' phases but not 'publishing' (or
+    // any other phase/call site that reads the issue) — this drives a
+    // fallback-backed record through a restart while parked at 'publishing'
+    // specifically, where nothing ever registered anything for it.
+    const number = 701
+    const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+    const openIssue = githubIssueFile(number, { state: 'open', labels: ['factory'] })
+    const githubRead: GithubConnectionRead = {
+      getIssue: vi.fn(async (repo: string, num: number) =>
+        repo === 'AgentWorkforce/pear' && num === number
+          ? { outcome: 'found' as const, issue: { repo, number: num, path, content: openIssue } }
+          : { outcome: 'not-found' as const }),
+    }
+    let providerReady = false
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (!providerReady) throw new Error('publisher unavailable')
+        return {
+          repo: input.repo,
+          number: 900,
+          url: 'https://github.com/AgentWorkforce/pear/pull/900',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = Object.assign(new FakeMountClient({
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite), { githubRead })
+    const firstFleet = new RemoteLifecycleFleetClient()
+    const root = await mkdtemp(join(tmpdir(), `factory-github-api-fallback-publishing-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: firstFleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async () => undefined,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const triaged = await first.triageIssue(parseGithubFactoryIssue(path, openIssue))
+      const decision: TriageDecision = {
+        ...triaged,
+        issueResolution: {
+          source: 'github-api-fallback',
+          repo: 'AgentWorkforce/pear',
+          detail: 'Relayfile projection could not answer; resolved authoritatively through the GitHub API fallback.',
+          projection: { outcome: 'no-match' },
+        },
+      }
+
+      await first.dispatch(decision)
+      firstFleet.emitAgentExit(`ar-${number}-impl-pear`, 'exited')
+      // The read inside #publishImplementerPullRequest succeeds here too —
+      // still the same process, the cache warmed during dispatch covers it.
+      await vi.waitFor(() => expect(attempts).toBe(1))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .toMatchObject({ phase: 'publishing' }))
+      await first.stop()
+
+      providerReady = true
+      const restartedFleet = new RemoteLifecycleFleetClient()
+      restarted = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: restartedFleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrResolver: async () => undefined,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      // Before the fix: the restarted process's eligibility set is empty and
+      // nothing registers it for the 'publishing' phase, so the read inside
+      // #publishImplementerPullRequest throws "issue is no longer readable"
+      // before ever calling the publisher — attempts never reaches 2, and
+      // this waitFor times out.
+      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 4_000 })
+      // The lifecycle can race straight past 'published' to 'complete' by
+      // the time this polls — either proves the read (and publish) succeeded.
+      await vi.waitFor(async () => {
+        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        expect(['published', 'complete']).toContain(lifecycle?.phase)
+      }, { timeout: 4_000 })
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
 
   it('autonomously retries a transient remote PR publication without another exit event', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-publish-retry-'))

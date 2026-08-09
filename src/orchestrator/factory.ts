@@ -2469,8 +2469,11 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    this.#registerGithubApiFallbackEligibility(decision)
-    const liveIssue = await this.#readIssue(decision.issue.path)
+    // This read runs before `decision` has any tracked record for
+    // #deriveGithubApiFallbackEligibility to find (batch insertion happens
+    // later, once scope/readiness are validated), so pass it directly
+    // rather than registering it into the cache first.
+    const liveIssue = await this.#readIssue(decision.issue.path, decision)
     if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
       this.#error(error, decision.issue)
@@ -4033,8 +4036,11 @@ export class FactoryLoop implements Factory {
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
     let liveIssue: LinearIssue | undefined
     if (!record.dryRun) {
-      this.#registerGithubApiFallbackEligibility(record.decision)
-      liveIssue = await this.#readIssue(record.issue.path)
+      // record is already inserted into the batch by the time any phase
+      // handler runs (BatchTracker.restore, called before this), so
+      // #deriveGithubApiFallbackEligibility would find it there too — the
+      // explicit hint is defense in depth, not a requirement.
+      liveIssue = await this.#readIssue(record.issue.path, record.decision)
       if (!liveIssue) {
         throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
       }
@@ -4694,20 +4700,6 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  /**
-   * `#githubApiFallbackIssues` is process-local, so a restart loses it while
-   * a durably-persisted decision still records `issueResolution.source ===
-   * 'github-api-fallback'`. Call this before any `#readIssue`/
-   * `#readGithubIssue` that must be able to recover such an issue (initial
-   * dispatch and durable-dispatch resume alike) so eligibility is restored
-   * from the decision itself rather than assumed lost.
-   */
-  #registerGithubApiFallbackEligibility(decision: TriageDecision): void {
-    if (decision.issueResolution?.source !== 'github-api-fallback') return
-    const parts = githubIssuePathParts(decision.issue.path) ?? githubIssueDirectoryPathParts(decision.issue.path)
-    if (parts) this.#rememberGithubApiFallbackEligible(githubIssueIdentity(parts.owner, parts.repo, parts.number))
-  }
-
   #rememberGithubApiFallbackEligible(identity: string): void {
     rememberBoundedFallbackEligibility(
       this.#githubApiFallbackIssues,
@@ -4718,7 +4710,30 @@ export class FactoryLoop implements Factory {
     )
   }
 
-  async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
+  /**
+   * `#githubApiFallbackIssues` is a cache, not a source of truth: eligibility
+   * is derived here, not remembered by every caller. A restart (or any read
+   * path added later that never registered anything) still resolves
+   * correctly because this checks the actual current state instead of
+   * requiring every entry point to have called a registration method first.
+   *
+   * `decisionHint` covers the one read that happens before its own record
+   * exists in the batch (the initial live dispatch, which reads the issue
+   * to validate scope before it is tracked at all) — everywhere else, the
+   * durably-restored or live-dispatched record is already in
+   * `batch.inFlight` (`BatchTracker.restore`/`start` insert it before any
+   * phase handler runs), so scanning it finds the same `issueResolution`
+   * a durable-state lookup would, without needing to reconstruct the
+   * `IssueRef` composite key (uuid/key/path) that a direct durable-store
+   * lookup would require and that this path alone cannot reliably rebuild
+   * (the real uuid is built from GitHub's node_id/id when content is
+   * available; from just a path, only the issue number is derivable).
+   */
+  async #deriveGithubApiFallbackEligibility(identity: string, decisionHint?: TriageDecision): Promise<boolean> {
+    return isGithubApiFallbackEligible((await this.#batch()).inFlight, identity, decisionHint)
+  }
+
+  async #readGithubIssue(path: string, decisionHint?: TriageDecision): Promise<GithubIssueSource | undefined> {
     const preferredPath = await this.#preferredGithubIssuePath(path)
     const candidatePaths = [...new Set([
       ...githubIssueReadCandidatePaths(preferredPath),
@@ -4742,7 +4757,12 @@ export class FactoryLoop implements Factory {
       if (isMissingIssueFileError(error)) {
         const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
         const identity = parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
-        if (parts && identity && this.#githubApiFallbackIssues.has(identity) && this.#mount.githubRead) {
+        const eligible = identity
+          ? this.#githubApiFallbackIssues.has(identity) ||
+            await this.#deriveGithubApiFallbackEligibility(identity, decisionHint)
+          : false
+        if (eligible && identity) this.#rememberGithubApiFallbackEligible(identity)
+        if (parts && identity && eligible && this.#mount.githubRead) {
           const lookup = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
           if (lookup.outcome === 'found') {
             const githubIssue = parseGithubIssue(lookup.issue.path, lookup.issue.content)
@@ -5384,10 +5404,10 @@ export class FactoryLoop implements Factory {
     return [...pathsByKey.values()].sort()
   }
 
-  async #readIssue(path: string): Promise<LinearIssue | undefined> {
+  async #readIssue(path: string, decisionHint?: TriageDecision): Promise<LinearIssue | undefined> {
     try {
       if (isGithubIssueFilePath(path)) {
-        const githubIssue = await this.#readGithubIssue(path)
+        const githubIssue = await this.#readGithubIssue(path, decisionHint)
         return githubIssue ? githubIssueAsFactoryIssue(githubIssue) : undefined
       }
       // Newly-synced issues land as a change-event STUB at the primary
@@ -14177,12 +14197,39 @@ export const githubIssuePathParts = (path: string): { owner: string; repo: strin
   }
 }
 
-const githubIssueIdentity = (owner: string, repo: string, number: number): string =>
+export const githubIssueIdentity = (owner: string, repo: string, number: number): string =>
   `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`
 
 const githubIssueRefIdentity = (issue: IssueRef): string | undefined => {
   const parts = githubIssuePathParts(issue.path)
   return parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
+}
+
+/**
+ * Whether a GitHub API fallback read is eligible for `identity`, derived
+ * from currently-tracked state rather than a separately-remembered flag:
+ * `decisionHint` (the one read that happens before its own record is
+ * tracked) or a currently in-flight record whose decision was resolved
+ * through the fallback. Exported standalone so this is directly testable —
+ * no caller has to have registered anything for this to return true, which
+ * is the property that keeps a future read call site from silently
+ * reintroducing the restart-eligibility bug by omission.
+ */
+export function isGithubApiFallbackEligible(
+  inFlight: readonly { issue: IssueRef; decision: TriageDecision }[],
+  identity: string,
+  decisionHint?: TriageDecision,
+): boolean {
+  if (
+    decisionHint?.issueResolution?.source === 'github-api-fallback' &&
+    githubIssueRefIdentity(decisionHint.issue) === identity
+  ) {
+    return true
+  }
+  return inFlight.some((record) =>
+    record.decision.issueResolution?.source === 'github-api-fallback' &&
+    githubIssueRefIdentity(record.issue) === identity,
+  )
 }
 
 const githubIssuePathPreference = (path: string): number => {
