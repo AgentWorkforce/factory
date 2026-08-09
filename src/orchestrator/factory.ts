@@ -6033,15 +6033,24 @@ export class FactoryLoop implements Factory {
 
     const exiting = record.agents.get(name)
     const issueClaim = this.#issueBabysitterClaims.get(name)
-    if (isCompletionReason(reason) && exiting?.spec.role === 'babysitter' && issueClaim) {
-      await this.#state.completeRoutedPrBabysitter(
-        this.#workspaceId,
-        issueClaim.identity,
-        this.#dispatchLifecycleOwner,
-        issueClaim.claimId,
-        name,
-        this.#clock.now(),
-      )
+    if (exiting?.spec.role === 'babysitter' && issueClaim) {
+      if (isCompletionReason(reason)) {
+        await this.#state.completeRoutedPrBabysitter(
+          this.#workspaceId,
+          issueClaim.identity,
+          this.#dispatchLifecycleOwner,
+          issueClaim.claimId,
+          name,
+          this.#clock.now(),
+        )
+      } else {
+        await this.#state.releaseRoutedPrBabysitterClaim(
+          this.#workspaceId,
+          issueClaim.identity,
+          this.#dispatchLifecycleOwner,
+          issueClaim.claimId,
+        )
+      }
     }
     this.#issueBabysitterClaims.delete(name)
     if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })

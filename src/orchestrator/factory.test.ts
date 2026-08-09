@@ -17270,6 +17270,17 @@ describe('FactoryLoop PR babysitter', () => {
   // a deterministic invocationId), which has no way to learn that a later
   // release invalidated an earlier "already dispatched" record. Tracked as
   // AgentWorkforce/factory#229; not fixed here (different subsystem).
+  //
+  // The store override below forces markRoutedPrBabysitterRunning to fail
+  // WITHOUT any underlying claim-state change, which isolates the local
+  // bookkeeping fix under test but does not correspond to any reachable
+  // production path — see the "suppresses the retry..." test directly below
+  // for what a *real* markedRunning failure (another owner adopted the
+  // claim, or the lease genuinely expired) actually does on retry, which is
+  // materially different (the retry's own claim call detects the state
+  // change and either suppresses or mints a fresh claim, so it can never
+  // reach markRoutedPrBabysitterRunning on stale claim data). Do not read
+  // this test as evidence about what happens when a real claim is lost.
   it('retries ensureBabysitter after a lost PR work claim instead of latching the spawn flag forever', async () => {
     class LoseNextClaimStore extends InMemoryStateStore {
       failNext = false
@@ -17327,6 +17338,47 @@ describe('FactoryLoop PR babysitter', () => {
     } finally {
       await factory.stop()
     }
+  })
+
+  it('releases the PR work-unit claim when an issue-created babysitter exits abnormally', async () => {
+    const issue = realIssueFile(507, ready, { title: 'Real babysitter abnormal exit releases claim' })
+    const mount = new FakeMountClient({ [issuePath(507)]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 507 }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(507), issue)))
+    fleet.emitAgentExit('ar-507-impl-pear', 'worker_exited')
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-507-babysit'))
+
+    const identity = 'agentworkforce/pear#507'
+    await vi.waitFor(async () => {
+      const claim = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))
+        .find(([key]) => key === identity)?.[1]
+      expect(claim?.status).toBe('running')
+    })
+
+    // A crash/non-completion exit, unlike a normal 'issue-done' completion.
+    fleet.emitAgentExit('ar-507-babysit', 'worker_exited')
+
+    // Before the fix, only the routed-PR exit path released the claim on a
+    // non-completion reason (mirroring isCompletionReason(reason) ? complete
+    // : release); the issue-created path here only ever called
+    // completeRoutedPrBabysitter, gated behind isCompletionReason, and did
+    // nothing at all on a non-completion exit — leaving the claim marked
+    // 'running' for a process that no longer exists until its lease expires
+    // naturally, blocking retry for that whole window.
+    await vi.waitFor(async () => {
+      const claim = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))
+        .find(([key]) => key === identity)?.[1]
+      expect(claim).toBeUndefined()
+    })
   })
 
   it('suppresses the retry instead of re-marking running when a lost claim was genuinely taken by another owner', async () => {
