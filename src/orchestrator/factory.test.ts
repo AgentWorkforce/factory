@@ -17262,6 +17262,65 @@ describe('FactoryLoop PR babysitter', () => {
     expect(fleet.spawns.filter((s) => s.name === 'ar-403-babysit')).toHaveLength(1)
   })
 
+  it('retries ensureBabysitter after a lost PR work claim instead of latching the spawn flag forever', async () => {
+    class LoseNextClaimStore extends InMemoryStateStore {
+      failNext = false
+      markRunningCalls = 0
+
+      override async markRoutedPrBabysitterRunning(
+        workspaceId: string,
+        identity: string,
+        owner: string,
+        claimId: string,
+        agentName: string,
+        nowMs: number,
+      ): Promise<boolean> {
+        this.markRunningCalls += 1
+        if (this.failNext) {
+          this.failNext = false
+          return false
+        }
+        return super.markRoutedPrBabysitterRunning(workspaceId, identity, owner, claimId, agentName, nowMs)
+      }
+    }
+
+    const issue = realIssueFile(505, ready, { title: 'Real babysitter claim-lost retry' })
+    const mount = new FakeMountClient({ [issuePath(505)]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new LoseNextClaimStore({ batchSize: 2 })
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 505 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(505), issue)))
+
+      stateStore.failNext = true
+      fleet.emitAgentExit('ar-505-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toContain('ar-505-babysit'))
+      expect(stateStore.markRunningCalls).toBe(1)
+
+      // Before the fix, #babysitterSpawned/#babysitterPr/#babysitterIssueRefs
+      // stayed set after the claim-lost release, so a later PR event's
+      // ensureBabysitter call short-circuited on the stale "already spawned"
+      // flag and never renegotiated the claim at all — markRunningCalls would
+      // stay latched at 1 forever, even though the babysitter that owned
+      // that claim no longer exists.
+      const prPath = '/github/repos/AgentWorkforce/pear/pulls/505/metadata.json'
+      mount.files.set(prPath, { content: { number: 505, state: 'open', head_ref: 'ar-505-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-505-retry'))
+
+      await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(2))
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('uses Relayfile by-id delivery claims for renamed PR activity, renews idempotently, and retires terminal claims after the local queue is durable', async () => {
     const number = 604
     const issue = realIssueFile(number, ready, { title: 'Real durable resource babysitter' })

@@ -10737,6 +10737,7 @@ export class FactoryLoop implements Factory {
       )
       if (!markedRunning) {
         await this.#fleet.release(tracked.result?.name ?? trackedName, 'pr-work-claim-lost')
+        await this.#cancelBabysitterWake(babysitterKey)
         return
       }
       this.#issueBabysitterClaims.set(tracked.result?.name ?? trackedName, {
@@ -10856,6 +10857,13 @@ export class FactoryLoop implements Factory {
       )
       if (!markedRunning) {
         await this.#fleet.release(tracked?.result?.name ?? spawned.name, 'pr-work-claim-lost')
+        // This agent was spawned solely for this claim attempt (unlike the
+        // adopt-branch case above, which reuses an agent that already owned
+        // this PR before the claim check ran) — drop it so a retry's
+        // trackedBabysitter search doesn't find a released process and skip
+        // straight to (incorrectly) re-adopting it instead of spawning fresh.
+        record.agents.delete(spawned.name)
+        await this.#cancelBabysitterWake(babysitterKey)
         return
       }
       this.#issueBabysitterClaims.set(tracked?.result?.name ?? spawned.name, {
