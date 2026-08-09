@@ -33,7 +33,8 @@ import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, Gi
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { dispatchComment, githubIssueIdentity, githubIssuePathParts, githubRepoSubscriptionGlobs, isGithubApiFallbackEligible, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
+import { dispatchComment, githubApiFallbackCandidatesFromDispatchLifecycles, githubApiFallbackCandidatesFromWaitingClarifications, githubIssueIdentity, githubIssuePathParts, githubRepoSubscriptionGlobs, isGithubApiFallbackEligible, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
+import type { WaitingClarification } from '../ports/state'
 import { globMatchesPath } from '../subscriptions/globs'
 import {
   ResourceSubscriptionsUnavailableError,
@@ -1962,6 +1963,95 @@ describe('isGithubApiFallbackEligible', () => {
   it('does not use decisionHint for a different identity', () => {
     const otherIdentity = githubIssueIdentity('AgentWorkforce', 'pear', 701)
     expect(isGithubApiFallbackEligible([], otherIdentity, fallbackDecision)).toBe(false)
+  })
+})
+
+describe('github API fallback eligibility candidate gathering', () => {
+  // Round 6: a fallback-backed decision parked as a waiting clarification is
+  // reachable from #state.listWaitingClarifications but never inserted into
+  // the batch, so isGithubApiFallbackEligible alone (scanning only
+  // batch.inFlight) missed it — #clarificationIssueStillActive treated a
+  // still-valid issue as gone and cancelled a human's reply instead of
+  // resuming. The guard: a fallback-backed decision reachable from EACH of
+  // the three durable sources #deriveGithubApiFallbackEligibility gathers
+  // resolves eligible once mapped into candidates, so a future path relying
+  // on any of them is covered by construction, not by having been found.
+  const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', 704)
+  const identity = githubIssueIdentity('AgentWorkforce', 'pear', 704)
+  const issue = { uuid: 'u-704', key: '704', path }
+  const fallbackDecision: TriageDecision = {
+    issue,
+    routes: [],
+    scope: 'single',
+    implementers: [],
+    reviewer: { name: 'r', role: 'reviewer', capability: 'spawn:claude', model: 'claude', task: 't', repo: 'AgentWorkforce/pear', clonePath: '/work/pear', node: 'self' },
+    thin: false,
+    confidence: 'high',
+    rationale: 'test',
+    issueResolution: {
+      source: 'github-api-fallback',
+      repo: 'AgentWorkforce/pear',
+      detail: 'test',
+      projection: { outcome: 'no-match' },
+    },
+  }
+
+  it('a fallback-backed decision reachable only as a waiting clarification resolves eligible', () => {
+    const waiting: WaitingClarification = {
+      issue,
+      decision: fallbackDecision,
+      dryRun: false,
+      askerName: 'ar-704-impl-pear',
+      question: 'test question',
+      askedAtMs: 0,
+      agents: [],
+    }
+    const candidates = githubApiFallbackCandidatesFromWaitingClarifications([['704', waiting]])
+    expect(isGithubApiFallbackEligible(candidates, identity)).toBe(true)
+  })
+
+  it('a fallback-backed decision reachable only as a non-terminal dispatch lifecycle resolves eligible', () => {
+    const lifecycle: DispatchLifecycle = {
+      runId: 'run-704',
+      issue,
+      decision: fallbackDecision,
+      dryRun: false,
+      phase: 'running',
+      agents: [],
+      invocationIds: [],
+      updatedAtMs: 0,
+    }
+    const candidates = githubApiFallbackCandidatesFromDispatchLifecycles([['704', lifecycle]])
+    expect(isGithubApiFallbackEligible(candidates, identity)).toBe(true)
+  })
+
+  it.each(['complete', 'abandoned'] as const)(
+    'excludes a %s dispatch lifecycle — a finished dispatch is not a reason to trust a live read',
+    (phase) => {
+      const lifecycle: DispatchLifecycle = {
+        runId: 'run-704',
+        issue,
+        decision: fallbackDecision,
+        dryRun: false,
+        phase,
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      }
+      const candidates = githubApiFallbackCandidatesFromDispatchLifecycles([['704', lifecycle]])
+      expect(candidates).toEqual([])
+      expect(isGithubApiFallbackEligible(candidates, identity)).toBe(false)
+    },
+  )
+
+  it('keeps a non-terminal dispatch lifecycle alongside an excluded terminal one', () => {
+    const other = { uuid: 'u-705', key: '705', path: githubIssueNestedMetaPath('AgentWorkforce', 'pear', 705) }
+    const lifecycles: Array<[string, DispatchLifecycle]> = [
+      ['704', { runId: 'run-704', issue, decision: fallbackDecision, dryRun: false, phase: 'complete', agents: [], invocationIds: [], updatedAtMs: 0 }],
+      ['705', { runId: 'run-705', issue: other, decision: { ...fallbackDecision, issue: other }, dryRun: false, phase: 'running', agents: [], invocationIds: [], updatedAtMs: 0 }],
+    ]
+    const candidates = githubApiFallbackCandidatesFromDispatchLifecycles(lifecycles)
+    expect(candidates).toEqual([{ issue: other, decision: { ...fallbackDecision, issue: other } }])
   })
 })
 
@@ -15632,6 +15722,118 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('resumes a fallback-backed clarification after a restart instead of cancelling the wake', async () => {
+    // A parked clarification is rebuilt as a local InFlightIssue purely to
+    // re-arm its watcher (factory.ts, near #resumeWaitingClarification) —
+    // it is never inserted into the batch. Before widening derivation to
+    // consult durable waiting clarifications too, #clarificationIssueStillActive
+    // (which gates the wake) could not read a fallback-backed issue after a
+    // restart, treated it as "left factory scope", and cancelled the wake —
+    // silently discarding a human's answer instead of resuming the team.
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-clarification-fallback-restart-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const number = 703
+      const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+      // #isIssueReady requires 'factory:in-progress' to be ABSENT for
+      // dispatch to accept the issue as ready, but
+      // #clarificationIssueStillActive's GitHub "still active" check
+      // requires it to be PRESENT for the post-answer wake — mirror the
+      // real dispatch-then-implementing transition (as the Linear restart
+      // template does via mount.files.set) so a failure here can only be
+      // the eligibility bug, not a label mismatch.
+      let currentLabels = ['factory']
+      const githubRead: GithubConnectionRead = {
+        getIssue: vi.fn(async (repo: string, num: number) =>
+          repo === 'AgentWorkforce/pear' && num === number
+            ? {
+                outcome: 'found' as const,
+                issue: {
+                  repo,
+                  number: num,
+                  path,
+                  content: githubIssueFile(number, { state: 'open', labels: currentLabels }),
+                },
+              }
+            : { outcome: 'not-found' as const }),
+      }
+      const mount = Object.assign(new ConfirmRecordingSlackMountClient({}), { githubRead })
+      const firstFleet = new FakeFleetClient()
+      firstFleet.setSessionRef(`ar-${number}-impl-pear`, `session-ar-${number}-impl-pear`)
+      firstFleet.setSessionRef(`ar-${number}-review-pear`, `session-ar-${number}-review-pear`)
+      const factoryConfig = config({ issueSource: 'github', slack: slackConfig() })
+      const firstFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: firstFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrResolver: async () => undefined,
+      })
+
+      const triaged = await firstFactory.triageIssue(
+        parseGithubFactoryIssue(path, githubIssueFile(number, { state: 'open', labels: currentLabels })),
+      )
+      const decision: TriageDecision = {
+        ...triaged,
+        issueResolution: {
+          source: 'github-api-fallback',
+          repo: 'AgentWorkforce/pear',
+          detail: 'Relayfile projection could not answer; resolved authoritatively through the GitHub API fallback.',
+          projection: { outcome: 'no-match' },
+        },
+      }
+      await firstFactory.dispatch(decision)
+      currentLabels = ['factory', 'factory:in-progress']
+      firstFleet.emitAgentMessage({
+        from: `ar-${number}-impl-pear`,
+        target: 'factory',
+        body: `[factory-needs-input] Issue: ${number}\nQuestion: Which durable path?`,
+        eventId: `agent-question-${number}`,
+      })
+      await vi.waitFor(() => expect(firstFactory.status().counters.agentQuestionTeamsReleased).toBe(1))
+      // agentQuestionTeamsReleased alone isn't sufficient synchronization —
+      // the durable clarification record isn't reliably queryable by a
+      // fresh FileStateStore instance until delivery also completes.
+      await vi.waitFor(() => expect(firstFactory.status().counters.clarificationQuestionsDelivered).toBe(1))
+      await firstFactory.stop()
+
+      const persisted = new FileStateStore({ batchSize: 2, watchStatePath })
+      const [key] = (await persisted.listWaitingClarifications('factory-test'))[0]!
+      const claimed = await persisted.claimClarificationReply('factory-test', key, {
+        id: `persisted-answer-${number}`,
+        text: 'Resume through the stored session refs.',
+        receivedAtMs: 500,
+      })
+      expect(claimed?.reply?.id).toBe(`persisted-answer-${number}`)
+
+      const restartedFleet = new FakeFleetClient()
+      const restartedFactory = createFactory(factoryConfig, {
+        mount,
+        fleet: restartedFleet,
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrResolver: async () => undefined,
+      })
+      await restartedFactory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+      // Before the fix: #clarificationIssueStillActive can't read the issue
+      // (the restarted process's eligibility set is empty and nothing
+      // registered this identity), treats it as gone, and cancels the wake
+      // (clarificationWakesCancelledStaleIssue) instead of resuming — this
+      // counter never reaches 1 and the waitFor times out.
+      await vi.waitFor(() => expect(restartedFactory.status().counters.clarificationTeamsWoken).toBe(1), { timeout: 4_000 })
+      expect(restartedFleet.resumes.map((resume) => resume.sessionRef).sort()).toEqual([
+        `session-ar-${number}-impl-pear`,
+        `session-ar-${number}-review-pear`,
+      ])
+      await restartedFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
 
   it('dispatch-owner recovers a remote team parked for clarification and preserves its prior dispatch result', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-clarification-dispatch-owner-'))
