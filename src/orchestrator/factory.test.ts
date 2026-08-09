@@ -6738,6 +6738,15 @@ describe('FactoryLoop', () => {
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
+      // attempts increments before the providerReady gate, so a failed
+      // publish counts too — the still-running first process's 1s retry
+      // timer (DISPATCH_LIFECYCLE_RETRY_MS) can fire another failing
+      // attempt in the window between the phase check above and this stop()
+      // resolving. Baseline after stop() rather than asserting an absolute
+      // count, so this can't pass on a pre-restart retry that has nothing
+      // to do with the restarted process.
+      const attemptsBeforeRestart = attempts
+
       providerReady = true
       const restartedFleet = new RemoteLifecycleFleetClient()
       restarted = createFactory(config({ issueSource: 'github' }), {
@@ -6753,9 +6762,9 @@ describe('FactoryLoop', () => {
       // Before the fix: the restarted process's eligibility set is empty and
       // nothing registers it for the 'publishing' phase, so the read inside
       // #publishImplementerPullRequest throws "issue is no longer readable"
-      // before ever calling the publisher — attempts never reaches 2, and
-      // this waitFor times out.
-      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 4_000 })
+      // before ever calling the publisher — attempts never increases past
+      // attemptsBeforeRestart, and this waitFor times out.
+      await vi.waitFor(() => expect(attempts).toBeGreaterThan(attemptsBeforeRestart), { timeout: 4_000 })
       // The lifecycle can race straight past 'published' to 'complete' by
       // the time this polls — either proves the read (and publish) succeeded.
       await vi.waitFor(async () => {
@@ -7074,6 +7083,13 @@ describe('FactoryLoop', () => {
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
+      // attempts increments before the providerReady gate, so the
+      // still-running first process's retry timer could in principle push
+      // it past 1 in the window before stop() resolves — baseline here
+      // rather than asserting the post-restart total is exactly 2, so an
+      // extra pre-restart retry can't turn this into a flaky failure.
+      const attemptsBeforeRestart = attempts
+
       providerReady = true
       const restartedFleet = new RemoteLifecycleFleetClient()
       const restarted = createFactory(config(), {
@@ -7085,7 +7101,7 @@ describe('FactoryLoop', () => {
       })
       await restarted.start({ mode: 'dispatch-owner' })
       await vi.waitFor(() => expect(restarted.status().counters.done).toBe(1), { timeout: 4_000 })
-      expect(attempts).toBe(2)
+      expect(attempts).toBeGreaterThan(attemptsBeforeRestart)
       expect(restartedFleet.releases.map((release) => release.name).sort()).toEqual(['ar-485-impl-pear', 'ar-485-review'])
       await restarted.stop()
     } finally {
