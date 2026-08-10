@@ -16329,6 +16329,7 @@ describe('FactoryLoop PR babysitter', () => {
 
     await factory.runOnce()
     const before = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))[0]?.[1]
+    expect(before).toMatchObject({ repo: 'AgentWorkforce/pear', prNumber: 704 })
     await factory.runOnce({ dryRun: true })
     const after = (await stateStore.listRoutedPrBabysitterClaims('factory-test'))[0]?.[1]
 
@@ -17445,6 +17446,10 @@ describe('FactoryLoop PR babysitter', () => {
       stateStore.failNext = true
       fleet.emitAgentExit('ar-508-impl-pear', 'worker_exited')
       await vi.waitFor(() => expect(factory.status().counters.babysitterSpawnFailures).toBe(1))
+      expect(fleet.releases).toContainEqual({
+        name: 'ar-508-babysit',
+        reason: 'babysitter-spawn-failed',
+      })
       // The failure happened before markRoutedPrBabysitterRunning was ever
       // reached (setBabysitterSession is called first in the try block).
       expect(stateStore.markRunningCalls).toBe(0)

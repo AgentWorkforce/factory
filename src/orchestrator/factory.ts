@@ -10918,11 +10918,14 @@ export class FactoryLoop implements Factory {
       // #babysitterReady) and the durable session under the same
       // "is this still ours to clear" guard this block already applied by
       // hand. If the spawn itself succeeded before a later step in this try
-      // threw, drop the now-orphaned record.agents entry too -- otherwise a
-      // retry's trackedBabysitter search finds a released process and
+      // threw, release it and drop the record.agents entry too -- otherwise a
+      // retry's trackedBabysitter search finds the orphaned process and
       // silently "adopts" it instead of spawning fresh (the same failure
       // mode fixed for the markedRunning case above).
-      if (spawnedAgentName) record.agents.delete(spawnedAgentName)
+      if (spawnedAgentName) {
+        await this.#fleet.release(spawnedAgentName, 'babysitter-spawn-failed')
+        record.agents.delete(spawnedAgentName)
+      }
       await this.#cancelBabysitterWake(babysitterKey)
       this.#increment('babysitterSpawnFailures')
       this.#error(error, record.issue)
