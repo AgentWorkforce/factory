@@ -94,6 +94,7 @@ const multiRepoGithubConfig = (overrides: FactoryConfigOverrides = {}): FactoryC
 })
 
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
+const prResourcePath = (n: number) => `/github/repos/AgentWorkforce__pear/pulls/by-id/${n}.json`
 const readyAliasPath = (n: number) => `/linear/issues/by-state/ready-for-agent/AR-${n}.json`
 const githubIssuePath = (owner: string, repo: string, number: number) => `/github/repos/${owner}/${repo}/issues/by-id/${number}.json`
 const githubIssueCompactPath = (owner: string, repo: string, number: number) => `/github/repos/${owner}__${repo}/issues/by-id/${number}.json`
@@ -17343,7 +17344,7 @@ describe('FactoryLoop PR babysitter', () => {
       // call.
       const readsBeforeRetry = mount.reads.filter((path) => path === issuePath(505)).length
 
-      const prPath = '/github/repos/AgentWorkforce/pear/pulls/505/metadata.json'
+      const prPath = prResourcePath(505)
       mount.files.set(prPath, { content: { number: 505, state: 'open', head_ref: 'ar-505-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-505-retry'))
 
@@ -17395,6 +17396,30 @@ describe('FactoryLoop PR babysitter', () => {
     })
   })
 
+  class FailNextBabysitterPersistStore extends InMemoryStateStore {
+    failNext = false
+    markRunningCalls = 0
+
+    override async setBabysitterSession(
+      workspaceId: string,
+      key: string,
+      session: Parameters<InMemoryStateStore['setBabysitterSession']>[2],
+    ): Promise<void> {
+      if (this.failNext) {
+        this.failNext = false
+        throw new Error('durable session write unavailable')
+      }
+      await super.setBabysitterSession(workspaceId, key, session)
+    }
+
+    override async markRoutedPrBabysitterRunning(
+      ...args: Parameters<InMemoryStateStore['markRoutedPrBabysitterRunning']>
+    ): ReturnType<InMemoryStateStore['markRoutedPrBabysitterRunning']> {
+      this.markRunningCalls += 1
+      return super.markRoutedPrBabysitterRunning(...args)
+    }
+  }
+
   it('retries after a late failure in ensureBabysitter\'s fresh-spawn attempt, not just after a lost claim', async () => {
     // Uncited by any reviewer -- found while fixing 3741674681 (the two
     // markedRunning-failure branches) by noticing this pre-existing catch
@@ -17403,34 +17428,10 @@ describe('FactoryLoop PR babysitter', () => {
     // the just-spawned agent from record.agents. Same class, a third
     // pre-existing instance, found by reading code we were already touching
     // rather than by a new review pass.
-    class FailNextPersistStore extends InMemoryStateStore {
-      failNext = false
-      markRunningCalls = 0
-
-      override async setBabysitterSession(
-        workspaceId: string,
-        key: string,
-        session: Parameters<InMemoryStateStore['setBabysitterSession']>[2],
-      ): Promise<void> {
-        if (this.failNext) {
-          this.failNext = false
-          throw new Error('durable session write unavailable')
-        }
-        await super.setBabysitterSession(workspaceId, key, session)
-      }
-
-      override async markRoutedPrBabysitterRunning(
-        ...args: Parameters<InMemoryStateStore['markRoutedPrBabysitterRunning']>
-      ): ReturnType<InMemoryStateStore['markRoutedPrBabysitterRunning']> {
-        this.markRunningCalls += 1
-        return super.markRoutedPrBabysitterRunning(...args)
-      }
-    }
-
     const issue = realIssueFile(508, ready, { title: 'Real babysitter late spawn failure retry' })
     const mount = new FakeMountClient({ [issuePath(508)]: issue })
     const fleet = new FakeFleetClient()
-    const stateStore = new FailNextPersistStore({ batchSize: 2 })
+    const stateStore = new FailNextBabysitterPersistStore({ batchSize: 2 })
     const factory = createFactory(babysitterConfig(), {
       mount,
       fleet,
@@ -17461,7 +17462,7 @@ describe('FactoryLoop PR babysitter', () => {
       // second read of the issue file is the real discriminator.
       const readsBeforeRetry = mount.reads.filter((path) => path === issuePath(508)).length
 
-      const prPath = '/github/repos/AgentWorkforce/pear/pulls/508/metadata.json'
+      const prPath = prResourcePath(508)
       mount.files.set(prPath, { content: { number: 508, state: 'open', head_ref: 'ar-508-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-508-retry'))
 
@@ -17471,6 +17472,60 @@ describe('FactoryLoop PR babysitter', () => {
       // never reached markRoutedPrBabysitterRunning at all.
       await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(1))
       expect(mount.reads.filter((path) => path === issuePath(508)).length).toBeGreaterThan(readsBeforeRetry)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('clears retry fences but retains tracking when a failed babysitter spawn cannot be released', async () => {
+    class FailFirstBabysitterReleaseFleet extends FakeFleetClient {
+      releaseFailed = false
+
+      override async release(name: string, reason?: string): Promise<void> {
+        if (!this.releaseFailed && name === 'ar-504-babysit' && reason === 'babysitter-spawn-failed') {
+          this.releaseFailed = true
+          throw new Error('fleet release unavailable')
+        }
+        await super.release(name, reason)
+      }
+    }
+
+    const issue = realIssueFile(504, ready, { title: 'Real babysitter release failure recovery' })
+    const mount = new FakeMountClient({ [issuePath(504)]: issue })
+    const fleet = new FailFirstBabysitterReleaseFleet()
+    const stateStore = new FailNextBabysitterPersistStore({ batchSize: 2 })
+    const logger = { warn: vi.fn() }
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      logger,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 504 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(504), issue)))
+
+      stateStore.failNext = true
+      fleet.emitAgentExit('ar-504-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(factory.status().counters.babysitterSpawnFailures).toBe(1))
+      expect(fleet.releaseFailed).toBe(true)
+      expect(factory.status().counters.babysitterReleaseFailures).toBe(1)
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] babysitter release failed during ownership cleanup; retaining tracked agent',
+        expect.objectContaining({ babysitter: 'ar-504-babysit', reason: 'babysitter-spawn-failed' }),
+      )
+
+      const prPath = prResourcePath(504)
+      mount.files.set(prPath, { content: { number: 504, state: 'open', head_ref: 'ar-504-fix', draft: false } })
+      mount.emit(changeEvent(prPath, 'pr-504-retry'))
+
+      // Cleanup removed the local retry fences, while retaining the live agent
+      // allowed the next event to recover it instead of spawning a duplicate.
+      await vi.waitFor(() => expect(stateStore.markRunningCalls).toBe(1))
+      expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-504-babysit')).toHaveLength(1)
     } finally {
       await factory.stop()
     }
@@ -17525,7 +17580,7 @@ describe('FactoryLoop PR babysitter', () => {
       await vi.waitFor(() => expect(fleet.releases.map((release) => release.name)).toContain('ar-506-babysit'))
       expect(stateStore.markRunningCalls).toBe(1)
 
-      const prPath = '/github/repos/AgentWorkforce/pear/pulls/506/metadata.json'
+      const prPath = prResourcePath(506)
       mount.files.set(prPath, { content: { number: 506, state: 'open', head_ref: 'ar-506-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-506-retry'))
 

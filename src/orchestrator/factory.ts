@@ -10608,6 +10608,29 @@ export class FactoryLoop implements Factory {
     await this.#ensureBabysitter(record, { repo: pr.repo, prNumber: pr.prNumber })
   }
 
+  async #releaseBabysitterBestEffort(
+    agentName: string,
+    reason: string,
+    issue: IssueRef,
+  ): Promise<boolean> {
+    try {
+      await this.#fleet.release(agentName, reason)
+      return true
+    } catch (error) {
+      // Local ownership cleanup must still run so a later event can recover.
+      // Keep the agent tracked when release was not confirmed; deleting it
+      // here would turn a visible live process into an orphan.
+      this.#increment('babysitterReleaseFailures')
+      this.#logger.warn?.('[factory] babysitter release failed during ownership cleanup; retaining tracked agent', {
+        issue: issue.key,
+        babysitter: agentName,
+        reason,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+  }
+
   async #ensureBabysitter(record: InFlightIssue, prRef: {
     repo: string
     prNumber: number
@@ -10745,7 +10768,11 @@ export class FactoryLoop implements Factory {
         this.#clock.now(),
       )
       if (!markedRunning) {
-        await this.#fleet.release(tracked.result?.name ?? trackedName, 'pr-work-claim-lost')
+        await this.#releaseBabysitterBestEffort(
+          tracked.result?.name ?? trackedName,
+          'pr-work-claim-lost',
+          record.issue,
+        )
         await this.#cancelBabysitterWake(babysitterKey)
         return
       }
@@ -10870,13 +10897,17 @@ export class FactoryLoop implements Factory {
         this.#clock.now(),
       )
       if (!markedRunning) {
-        await this.#fleet.release(tracked?.result?.name ?? spawned.name, 'pr-work-claim-lost')
+        const released = await this.#releaseBabysitterBestEffort(
+          tracked?.result?.name ?? spawned.name,
+          'pr-work-claim-lost',
+          record.issue,
+        )
         // This agent was spawned solely for this claim attempt (unlike the
         // adopt-branch case above, which reuses an agent that already owned
-        // this PR before the claim check ran) — drop it so a retry's
-        // trackedBabysitter search doesn't find a released process and skip
-        // straight to (incorrectly) re-adopting it instead of spawning fresh.
-        record.agents.delete(spawned.name)
+        // this PR before the claim check ran). Once release is confirmed, drop
+        // it so a retry cannot incorrectly re-adopt a terminated process. A
+        // failed release deliberately leaves the still-live process tracked.
+        if (released) record.agents.delete(spawned.name)
         await this.#cancelBabysitterWake(babysitterKey)
         return
       }
@@ -10923,8 +10954,12 @@ export class FactoryLoop implements Factory {
       // silently "adopts" it instead of spawning fresh (the same failure
       // mode fixed for the markedRunning case above).
       if (spawnedAgentName) {
-        await this.#fleet.release(spawnedAgentName, 'babysitter-spawn-failed')
-        record.agents.delete(spawnedAgentName)
+        const released = await this.#releaseBabysitterBestEffort(
+          spawnedAgentName,
+          'babysitter-spawn-failed',
+          record.issue,
+        )
+        if (released) record.agents.delete(spawnedAgentName)
       }
       await this.#cancelBabysitterWake(babysitterKey)
       this.#increment('babysitterSpawnFailures')
