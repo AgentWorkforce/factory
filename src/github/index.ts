@@ -13,6 +13,12 @@ export {
   readStandalonePullRequest,
   standaloneBabysitterAgentName,
 } from './standalone-babysitter'
+export {
+  ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED,
+  discoverRoutedPullRequests,
+  routedPrIdentity,
+  routedPrRepos,
+} from './routed-pr-babysitter'
 export type {
   GhRunner,
   GhRunResult,
@@ -30,3 +36,4 @@ export type {
   StandaloneBabysitTarget,
   StandalonePullRequest,
 } from './standalone-babysitter'
+export type { RoutedPrCandidate, RoutedPrDiscoveryReport } from './routed-pr-babysitter'

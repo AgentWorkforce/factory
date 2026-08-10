@@ -121,6 +121,18 @@ const slackSchema = z.object({
 
 const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
+  // Select the declarative intake/discovery surface. Routed activation is
+  // deliberately disabled in src/github/routed-pr-babysitter.ts until the
+  // lifecycle design lands, so this value cannot spawn a routed worker yet.
+  mode: z.enum(['factory-created', 'routed-open-prs']).default('factory-created'),
+  // Discovery excludes candidates carrying an author-controlled stop label.
+  excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
+  excludePullRequests: z.array(z.string().regex(
+    /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})#[1-9]\d*$/u,
+    'expected owner/repo#number',
+  )).default([]),
+  // Reserved for the activation design; discovery itself never notifies.
+  notifyHumans: z.boolean().default(false),
 }).default({})
 
 const reportingSchema = z.object({
@@ -307,9 +319,55 @@ const NodeConfigObjectSchema = z.object({
 
 const FactoryConfigObjectSchema = WorkspaceConfigObjectSchema.merge(NodeConfigObjectSchema)
 
-export const WorkspaceConfigSchema = WorkspaceConfigObjectSchema.transform((cfg) => normalizeWorkspaceConfig(cfg))
+// Shared with routedPrRepos (src/github/routed-pr-babysitter.ts): the last
+// step in resolving a repos.names entry to a routable owner/repo slug. A
+// resolved value that already has a slash is used as-is; one that doesn't
+// gets `org` prefixed as a rescue, regardless of whether it came from an
+// explicit byLabel entry, overrides, or the bare name itself -- that rescue
+// used to live only in routedPrRepos, so a validator that ran before
+// normalizeFactoryConfig's transform (and so never saw org get applied)
+// could reject a config routedPrRepos would resolve fine at runtime.
+export const resolveRoutedRepo = (configured: string, org: string | undefined): string | undefined => {
+  const repo = configured.includes('/') ? configured : (org ? `${org}/${configured}` : undefined)
+  return repo && /^[^/]+\/[^/]+$/u.test(repo) ? repo : undefined
+}
+
+const requireRoutedBabysitterRepos = (
+  cfg: z.infer<typeof WorkspaceConfigObjectSchema>,
+  ctx: z.RefinementCtx,
+): void => {
+  if (cfg.babysitter.mode === 'routed-open-prs' && (cfg.repos.names?.length ?? 0) === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['repos', 'names'],
+      message: 'repos.names must contain at least one repository when babysitter.mode is routed-open-prs',
+    })
+    return
+  }
+  if (cfg.babysitter.mode === 'routed-open-prs') {
+    // Mirror resolveRepos' own derivation (overrides win over a bare
+    // org/name, explicit byLabel wins over that) instead of a second,
+    // hand-rolled copy of that fallback chain that can drift from it.
+    const { byLabel } = resolveRepos(cfg.repos, cfg.repos.cloneRoot)
+    const routedRepos = (cfg.repos.names ?? [])
+      .map((name) => resolveRoutedRepo(byLabel[name] ?? name, cfg.repos.org))
+    if (!routedRepos.some(Boolean)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['repos', 'names'],
+        message: 'repos.names must resolve at least one owner/repository route when babysitter.mode is routed-open-prs',
+      })
+    }
+  }
+}
+
+export const WorkspaceConfigSchema = WorkspaceConfigObjectSchema
+  .superRefine(requireRoutedBabysitterRepos)
+  .transform((cfg) => normalizeWorkspaceConfig(cfg))
 export const NodeConfigSchema = NodeConfigObjectSchema.transform((cfg) => normalizeNodeConfig(cfg))
-export const FactoryConfigSchema = FactoryConfigObjectSchema.transform((cfg) => normalizeFactoryConfig(cfg))
+export const FactoryConfigSchema = FactoryConfigObjectSchema
+  .superRefine(requireRoutedBabysitterRepos)
+  .transform((cfg) => normalizeFactoryConfig(cfg))
 
 function normalizeWorkspaceConfig(cfg: z.infer<typeof WorkspaceConfigObjectSchema>) {
   const resolved = resolveRepos(cfg.repos, cfg.repos.cloneRoot)

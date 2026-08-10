@@ -303,6 +303,37 @@ existing PR branch, and always leaves the final review and merge to a human.
 The command prints a spawn receipt and returns; the PR-keyed task-exit worker
 continues on the relay broker and reports completion or access blockers there.
 
+### Routed-PR discovery (activation disabled)
+
+This release adds the declarative configuration and read-only discovery surface
+for widening babysitter intake beyond Factory-created PRs. To configure that
+discovery surface, set:
+
+```json
+{
+  "babysitter": {
+    "enabled": true,
+    "mode": "routed-open-prs",
+    "excludeLabels": ["factory:skip-babysitter"],
+    "excludePullRequests": [],
+    "notifyHumans": false
+  }
+}
+```
+
+Discovery scans only repositories named by `repos.names`; other routing
+fallbacks do not silently expand it. It classifies open, non-draft,
+same-repository PRs, applies `excludeLabels` and `excludePullRequests`,
+deduplicates mount aliases, and reports incomplete or unreadable metadata.
+
+**Routed-PR activation is deliberately disabled.** The named
+`ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED` guard is `false`, and configuration
+cannot turn it on. No routed candidate is claimed, spawned, renewed, released,
+interpreted as complete, advanced to Human Review, or used to notify anyone.
+Activation will be implemented separately after the durable lifecycle and
+completion-CAS design is reviewed. The existing issue-created babysitter path
+is unchanged.
+
 ### Scheduled sync-fidelity canary
 
 `factory canary` is the regression detector for upstream sync drift: if a synced

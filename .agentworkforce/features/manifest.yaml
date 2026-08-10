@@ -1,14 +1,14 @@
 version: '1.1'
-updated: '2026-08-05'
+updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 310
+  feature_count: 313
   tier_counts:
     1: 48
-    2: 124
+    2: 125
     3: 11
     4: 52
-    5: 60
+    5: 62
     6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -820,6 +820,20 @@ categories:
         description: Spawn a Claude babysitter when a non-draft PR opens and let it address CI, conflicts, and review feedback
         location: src/orchestrator/factory.ts, src/triage/heuristic.ts, src/dispatch/templates.ts
         verify_tier: 6
+
+      - id: pr-routed-babysitter-discovery
+        name: Routed Repository PR Babysitter Discovery
+        api: babysitter.mode=routed-open-prs
+        description: Read-only discovery of open non-draft same-repository PRs only from repos.names, with explicit accounting for excluded, unreadable, incomplete, and duplicate candidates; activation remains deliberately disabled
+        location: src/github/routed-pr-babysitter.ts
+        verify_tier: 5
+
+      - id: pr-routed-babysitter-opt-out
+        name: Routed PR Discovery Opt-Out
+        api: babysitter.excludeLabels / babysitter.excludePullRequests
+        description: Exclude configured PR identities or labeled PRs from the read-only routed discovery candidate set
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
+        verify_tier: 5
 
       - id: pr-standalone-babysitter-validation
         name: Standalone Babysitter PR Validation
@@ -2140,6 +2154,13 @@ categories:
         api: factory.config.json#babysitter.enabled
         description: Opt into event-driven PR babysitting after issue-driven dispatch
         location: src/config/schema.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: config-babysitter-routed-intake
+        name: Routed Babysitter Intake Controls
+        api: factory.config.json#babysitter.mode
+        description: Keep factory-created intake as the default while explicitly configuring routed discovery and exclusions; routed activation remains disabled pending lifecycle design
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
         verify_tier: 2
 
       - id: config-merge-policy

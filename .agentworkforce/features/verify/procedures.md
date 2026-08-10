@@ -351,6 +351,16 @@ Verify the PR contains the issue key, commits, tests, and review activity; no dr
 
 Enable `babysitter.enabled`, open a non-draft PR through the issue-driven path, and confirm only one babysitter starts. Make CI fail or add a review request, confirm only the exact repo/PR owner wakes, then enter the documented destructive critical section and prove Factory ACKs only after the no-submit fence persists. Confirm coalesced activity is delivered once after exit, the babysitter fixes the current PR branch, then send/observe its readiness signal. A mismatched signal or draft/closed PR must not advance the issue.
 
+For widened intake, additionally set `babysitter.mode` to
+`routed-open-prs` in a disposable workspace. Provide one eligible PR, one PR
+with `factory:skip-babysitter`, one configured `excludePullRequests` identity,
+one draft, and one same-number PR in a repository absent from `repos.names`.
+Call the read-only discovery function and verify the exact discovery counters
+account for every candidate without spawning, claiming, writing, or notifying.
+Confirm `ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED` remains `false`. Activation,
+ownership, retries, and completion belong to the follow-up lifecycle design and
+are intentionally outside this verification procedure.
+
 Do not attempt a cross-host active/active control-plane test: the supported ownership topology is multiple Factory processes sharing one same-host `FileStateStore`. Remote relay execution nodes are supported and do not need that directory.
 
 ### Standalone babysitter

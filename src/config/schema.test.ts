@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { FactoryConfigSchema, NodeConfigSchema, loadFactoryConfig } from './schema'
+import { routedPrRepos } from '../github/routed-pr-babysitter'
 
 describe('FactoryConfigSchema', () => {
   it('parses a valid config and applies defaults', () => {
@@ -36,7 +37,13 @@ describe('FactoryConfigSchema', () => {
       reviewer: 'spawn:claude',
       babysitter: 'spawn:claude',
     })
-    expect(parsed.babysitter).toEqual({ enabled: false })
+    expect(parsed.babysitter).toEqual({
+      enabled: false,
+      mode: 'factory-created',
+      excludeLabels: ['factory:skip-babysitter'],
+      excludePullRequests: [],
+      notifyHumans: false,
+    })
     expect(parsed.terminalState).toBe('human-review')
     expect(parsed.stateIds.humanReview).toBeUndefined()
     expect(parsed.loop.registryPath).toBe('/tmp/factory-run/factory-loop-registry.json')
@@ -312,6 +319,65 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.default).toBe('pear')
     expect(parsed.repos.org).toBe('AgentWorkforce')
     expect(parsed.repos.names).toEqual(['pear', 'cloud', 'agentswarm'])
+  })
+
+  it('requires explicit routed repositories for routed PR babysitting', () => {
+    expect(() => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+      repos: {},
+    })).toThrow(/repos\.names must contain at least one repository/u)
+
+    expect(FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'factory-created' },
+      repos: {},
+    }).babysitter.mode).toBe('factory-created')
+
+    expect(() => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+      repos: { names: ['pear'] },
+    })).toThrow(/must resolve at least one owner\/repository route/u)
+  })
+
+  it('does not reject a byLabel bare-name entry that org would successfully resolve at runtime', () => {
+    // requireRoutedBabysitterRepos runs in a superRefine BEFORE the
+    // normalizeFactoryConfig transform, so it only sees the raw pre-merge
+    // repos.byLabel the user wrote -- it previously replicated the org-prefix
+    // fallback by hand, but only for names with no byLabel/overrides entry at
+    // all. An explicit byLabel value that itself lacks a slash (a common
+    // shorthand: map a label to a bare repo name, let `org` supply the
+    // owner) got no such rescue and was wrongly rejected here, even though
+    // routedPrRepos applies exactly that rescue to any resolved value
+    // lacking a slash, regardless of where it came from.
+    const parsed = FactoryConfigSchema.parse({
+      babysitter: { enabled: true, mode: 'routed-open-prs' },
+      repos: { names: ['pear'], org: 'AgentWorkforce', byLabel: { pear: 'pear-fork' } },
+    })
+    expect(parsed.repos.byLabel.pear).toBe('pear-fork')
+    expect(routedPrRepos(parsed)).toEqual(['AgentWorkforce/pear-fork'])
+  })
+
+  it('accepts one-character repository opt-out identities', () => {
+    const parsed = FactoryConfigSchema.parse({
+      babysitter: {
+        enabled: true,
+        excludePullRequests: ['owner/r#1'],
+      },
+      repos: {},
+    })
+
+    expect(parsed.babysitter.excludePullRequests).toEqual(['owner/r#1'])
+  })
+
+  it('mirrors the owner-segment length rule onto the repo segment', () => {
+    const withRepo = (repo: string) => FactoryConfigSchema.parse({
+      babysitter: { enabled: true, excludePullRequests: [`owner/${repo}#1`] },
+      repos: {},
+    })
+
+    expect(() => withRepo('')).toThrow(/expected owner\/repo#number/u)
+    expect(withRepo('r').babysitter.excludePullRequests).toEqual(['owner/r#1'])
+    expect(withRepo('r'.repeat(100)).babysitter.excludePullRequests).toEqual([`owner/${'r'.repeat(100)}#1`])
+    expect(() => withRepo('r'.repeat(101))).toThrow(/expected owner\/repo#number/u)
   })
 
   it('lets explicit byLabel/clonePaths/labels override the derived ones', () => {
