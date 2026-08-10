@@ -52,6 +52,8 @@ import {
   type LocalMountHealthEvent,
   type LocalMountOptions,
   type MountClient,
+  type IssueResolution,
+  type LinearIssue,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
@@ -753,8 +755,13 @@ async function runFactoryCommand(
     return result.ok ? 0 : 1
   }
 
-  const issue = await readIssueArg(mount, command.issue, config)
-  const decision = await factory.triageIssue(issue)
+  const resolved = await resolveIssueArg(mount, command.issue, config, async () =>
+    issueProjectionStatus(factory, mount, config),
+  )
+  const decision = {
+    ...await factory.triageIssue(resolved.issue),
+    issueResolution: resolved.resolution,
+  }
   if (command.kind === 'factory-triage') {
     writeJson(out, decision)
     return 0
@@ -1439,9 +1446,31 @@ async function prepareFactoryIntegrations(
   const providers = requiredIntegrationsForCommand(command, config)
   if (providers.length === 0) return
   const dryRun = globals.dryRun || command.kind === 'factory-canary'
+  const providersToEnsure: FactoryIntegrationProvider[] = []
+  for (const provider of providers) {
+    const observation = observed.get(provider) ?? await inspectFactoryIntegration(connections, provider)
+    observed.set(provider, observation)
+    if (
+      provider === 'github' &&
+      observation.kind === 'connected-not-ready' &&
+      mount.githubRead &&
+      (command.kind === 'factory-triage' || command.kind === 'factory-dispatch')
+    ) {
+      const details = [observation.state, observation.initialSyncState]
+        .filter((value): value is string => Boolean(value))
+        .join(', ')
+      err.write(
+        `[factory] warning: GitHub projection is not ready${details ? ` (${details})` : ''}; ` +
+        'targeted resolution remains projection-first and will use the GitHub API fallback only for a miss.\n',
+      )
+      continue
+    }
+    providersToEnsure.push(provider)
+  }
+  if (providersToEnsure.length === 0) return
   await ensureFactoryIntegrations({
     connections,
-    providers,
+    providers: providersToEnsure,
     workspaceId,
     interactive: !dryRun && (deps.isInteractive?.() ?? Boolean(process.stdin.isTTY && process.stderr.isTTY)),
     dryRun,
@@ -1637,21 +1666,65 @@ const scopeIssueFromDraftContent = (content: unknown) => ({
   raw: asRecord(content),
 })
 
-async function readIssueArg(mount: MountClient, issueArg: string, config: FactoryConfig) {
-  const path = issueArg.startsWith('/') ? issueArg : await findIssuePath(mount, issueArg, config)
-  if (githubIssuePathParts(path)) {
-    return parseGithubFactoryIssue(path, (await mount.readFile(path)).content)
-  }
-  return readLinearIssueWithCanonicalFallback(mount, path)
+async function readIssueArg(mount: MountClient, issueArg: string, config: FactoryConfig): Promise<LinearIssue> {
+  return (await resolveIssueArg(mount, issueArg, config)).issue
 }
 
-async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string> {
-  if (config.issueSource === 'github') {
-    const number = Number(key.replace(/^#/, ''))
-    if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`${githubIssueResolutionError(config, key)}: expected a positive issue number`)
+type ResolvedIssueArg = { issue: LinearIssue; resolution: IssueResolution }
+
+async function resolveIssueArg(
+  mount: MountClient,
+  issueArg: string,
+  config: FactoryConfig,
+  projectionStatus?: () => Promise<IssueResolution['projection']>,
+): Promise<ResolvedIssueArg> {
+  const explicitPath = issueArg.startsWith('/')
+  const path = explicitPath ? issueArg : await findIssuePath(mount, issueArg, config)
+  if (path) {
+    const issue = githubIssuePathParts(path)
+      ? parseGithubFactoryIssue(path, (await mount.readFile(path)).content)
+      : await readLinearIssueWithCanonicalFallback(mount, path)
+    return {
+      issue,
+      resolution: {
+        source: 'relayfile-projection',
+        detail: 'Resolved from the preferred Relayfile projection.',
+        projection: { outcome: 'matched' },
+      },
     }
-    const configuredRepos = configuredGithubIssueRepos(config)
+  }
+
+  const selector = parseGithubIssueSelector(issueArg, config)
+  const projection = projectionStatus
+    ? await projectionStatus()
+    : projectionStatusFromMount(mount)
+  const unavailableReason = githubProjectionUnavailableReason(projection)
+  if (!unavailableReason) {
+    throw new Error(
+      `${githubIssueResolutionError(config, issueArg)}: found 0 matches in the healthy Relayfile projection; ` +
+      'the GitHub API fallback was not used',
+    )
+  }
+  const fallback = await findGithubIssueThroughConnection(mount, selector, config, issueArg)
+  if (!fallback) {
+    throw new Error(`${githubIssueResolutionError(config, issueArg)}: found 0 matches in the projection and GitHub API`)
+  }
+  return {
+    issue: parseGithubFactoryIssue(fallback.path, fallback.content),
+    resolution: {
+      source: 'github-api-fallback',
+      repo: fallback.repo,
+      detail: `Relayfile projection could not answer (${unavailableReason}); resolved authoritatively through the GitHub API fallback.`,
+      projection,
+    },
+  }
+}
+
+async function findIssuePath(mount: MountClient, key: string, config: FactoryConfig): Promise<string | undefined> {
+  if (config.issueSource === 'github') {
+    const selector = parseGithubIssueSelector(key, config)
+    const number = selector.number
+    const configuredRepos = selector.repo ? [selector.repo] : configuredGithubIssueRepos(config)
     if (configuredRepos.length === 0 && hasConfiguredGithubIssueRoutes(config)) {
       throw new Error(
         `${githubIssueResolutionError(config, key)}: configured repository routes do not resolve to owner/repo; ` +
@@ -1678,7 +1751,7 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
       })
       .sort((left, right) => githubIssuePathPreference(left) - githubIssuePathPreference(right) || left.localeCompare(right))
     if (matches.length === 0) {
-      throw new Error(`${githubIssueResolutionError(config, key)}: found 0 matches`)
+      return undefined
     }
     const matchesByRepo = new Map<string, { repo: string; path: string }>()
     for (const path of matches) {
@@ -1709,14 +1782,144 @@ async function findIssuePath(mount: MountClient, key: string, config: FactoryCon
   return matches[0]
 }
 
-function configuredGithubIssueRepos(config: FactoryConfig): string[] {
-  const candidates = config.repos.default
-    ? [config.repos.default]
-    : [
-        ...Object.values(config.repos.byLabel),
-        ...Object.values(config.repos.byProject),
-        ...config.repos.keywordRules.map((rule) => rule.repo),
-      ]
+async function findGithubIssueThroughConnection(
+  mount: MountClient,
+  selector: GithubIssueSelector,
+  config: FactoryConfig,
+  issueArg: string,
+) {
+  const github = mount.githubRead
+  if (!github) {
+    throw new Error(
+      `${githubIssueResolutionError(config, issueArg)}: projection cannot answer and the GitHub API fallback is unavailable`,
+    )
+  }
+  const repos = selector.repo ? [selector.repo] : configuredGithubIssueRepos(config)
+  if (repos.length === 0) {
+    throw new Error(
+      `${githubIssueResolutionError(config, issueArg)}: projection cannot answer and no configured owner/repo is available for the GitHub API fallback`,
+    )
+  }
+  const lookups = await Promise.all(repos.map((repo) => github.getIssue(repo, selector.number)))
+  const found = lookups.filter((lookup): lookup is Extract<typeof lookup, { outcome: 'found' }> =>
+    lookup.outcome === 'found',
+  )
+  const indeterminate = lookups.some((lookup) => lookup.outcome === 'indeterminate')
+
+  if (found.length === 0) {
+    if (indeterminate) {
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: the projection could not answer and the GitHub API fallback ` +
+        'could not determine whether the issue exists (one or more configured repositories are not visible without authentication)',
+      )
+    }
+    return undefined
+  }
+  if (!selector.repo && !config.repos.default) {
+    if (found.length > 1) {
+      const matchedRepos = found.map((match) => match.issue.repo).sort((left, right) => left.localeCompare(right))
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: GitHub API matches multiple repositories (${matchedRepos.join(', ')}); ` +
+        'set repos.default or pass a repo-qualified argument',
+      )
+    }
+    if (indeterminate) {
+      // A single confirmed match is not the same as a unique one: at least
+      // one other configured repository could not be checked, so a same-
+      // numbered issue could exist there too. Refuse rather than silently
+      // dispatch to whichever repo happened to answer.
+      throw new Error(
+        `${githubIssueResolutionError(config, issueArg)}: GitHub API found a match in ${found[0]!.issue.repo} but could not ` +
+        'confirm it is unique because one or more other configured repositories could not be checked without authentication; ' +
+        'set repos.default or pass a repo-qualified argument',
+      )
+    }
+  }
+  return found[0]!.issue
+}
+
+async function issueProjectionStatus(
+  factory: Factory,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<IssueResolution['projection']> {
+  const status = await factoryStatusWithMountHealth(
+    factory,
+    mount,
+    config.loop.heartbeatPath,
+    config.loop.heartbeatStaleMs,
+  )
+  const githubConnection = mount.integrationConnections
+    ? await mount.integrationConnections.getStatus('github')
+    : undefined
+  return {
+    outcome: 'no-match',
+    ...(status.localMountDegraded !== undefined ? { localMountDegraded: status.localMountDegraded } : {}),
+    ...(status.localMountDegradedReason ? { localMountDegradedReason: status.localMountDegradedReason } : {}),
+    ...(status.eventListener ? { eventListener: status.eventListener } : {}),
+    ...(githubConnection ? { githubConnection } : {}),
+  }
+}
+
+function projectionStatusFromMount(mount: MountClient): IssueResolution['projection'] {
+  const health = mount.getLocalMountHealth?.()
+  return {
+    outcome: 'no-match',
+    ...(health ? { localMountDegraded: health.degraded } : {}),
+    ...(health?.reason ? { localMountDegradedReason: health.reason } : {}),
+  }
+}
+
+function githubProjectionUnavailableReason(projection: IssueResolution['projection']): string | undefined {
+  if (projection.githubConnection && !projection.githubConnection.ready) {
+    const detail = [projection.githubConnection.state, projection.githubConnection.initialSyncState]
+      .filter((value): value is string => Boolean(value))
+      .join(', ')
+    return `GitHub projection connection is not ready${detail ? ` (${detail})` : ''}`
+  }
+  if (projection.localMountDegraded) {
+    return projection.localMountDegradedReason ?? 'local mount is degraded'
+  }
+  if (projection.eventListener && !['subscribed', 'polling'].includes(projection.eventListener.state)) {
+    return projection.eventListener.reason ?? `event listener is ${projection.eventListener.state}`
+  }
+  return undefined
+}
+
+export type GithubIssueSelector = { number: number; repo?: string }
+
+export function parseGithubIssueSelector(key: string, config: FactoryConfig): GithubIssueSelector {
+  const qualified = key.match(/^([^#]+)#([1-9]\d*)$/u)
+  const bare = key.match(/^#?([1-9]\d*)$/u)
+  const number = Number(qualified?.[2] ?? bare?.[1])
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new Error(
+      `${githubIssueResolutionError(config, key)}: expected a positive issue number or repo-qualified reference (repo#number)`,
+    )
+  }
+  if (!qualified) return { number }
+
+  const requested = qualified[1]!
+  const configured = allConfiguredGithubIssueRepos(config)
+  // Resolve what the caller typed through the exact same canonicalization
+  // every configured route already goes through (label mapping, org
+  // prefixing, canonical-route lookup) instead of a second, ad-hoc
+  // expansion — three review rounds each found a different normalization
+  // gap (default-only, org-only, bare-label-vs-normalized) in a hand-rolled
+  // comparison here. Comparison is only ever normalized against normalized.
+  const [resolved] = resolveGithubIssueRepoCandidates(config, [requested])
+  const repo = resolved
+    ? configured.find((candidate) => candidate.toLowerCase() === resolved.toLowerCase())
+    : undefined
+  if (!repo) {
+    throw new Error(
+      `${githubIssueResolutionError(config, key)}: repository ${requested} is not one of the configured Factory routes`,
+    )
+  }
+  return { number, repo }
+}
+
+function resolveGithubIssueRepoCandidates(config: FactoryConfig, candidates: string[]): string[] {
   const repos = new Map<string, string>()
   const routedRepos = [
     ...Object.values(config.repos.byLabel),
@@ -1739,6 +1942,32 @@ function configuredGithubIssueRepos(config: FactoryConfig): string[] {
     repos.set(repo.toLowerCase(), repo)
   }
   return [...repos.values()]
+}
+
+/** Bare-number resolution stays default-only: when repos.default is set, a
+ *  bare issue number resolves against that single repo, not every route. */
+function configuredGithubIssueRepos(config: FactoryConfig): string[] {
+  const candidates = config.repos.default
+    ? [config.repos.default]
+    : [
+        ...Object.values(config.repos.byLabel),
+        ...Object.values(config.repos.byProject),
+        ...config.repos.keywordRules.map((rule) => rule.repo),
+      ]
+  return resolveGithubIssueRepoCandidates(config, candidates)
+}
+
+/** Qualified `repo#number` selectors must validate against every configured
+ *  route, not just repos.default — a route reachable only through byLabel,
+ *  byProject, or keywordRules is still a valid dispatch target. */
+function allConfiguredGithubIssueRepos(config: FactoryConfig): string[] {
+  const candidates = [
+    ...(config.repos.default ? [config.repos.default] : []),
+    ...Object.values(config.repos.byLabel),
+    ...Object.values(config.repos.byProject),
+    ...config.repos.keywordRules.map((rule) => rule.repo),
+  ]
+  return resolveGithubIssueRepoCandidates(config, candidates)
 }
 
 function hasConfiguredGithubIssueRoutes(config: FactoryConfig): boolean {

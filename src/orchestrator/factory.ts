@@ -345,6 +345,47 @@ const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
 const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
 export const DEFAULT_FACTORY_LOOP_HEARTBEAT_PATH = '/tmp/factory-run/factory-loop-heartbeat.json'
 export const DEFAULT_FACTORY_LOOP_REGISTRY_PATH = '/tmp/factory-run/factory-loop-registry.json'
+// #githubApiFallbackIssues is append-only in memory for the life of the
+// process; bound it so a long-running `factory start --mode live` daemon
+// doesn't accumulate one entry per fallback dispatch forever.
+const GITHUB_API_FALLBACK_ISSUES_MAX = 2_000
+// A small, separately-bounded record of recently evicted identities, so a
+// later miss can be reported as "eligibility was evicted" rather than
+// silently folded into the same signal as "never was eligible" — an
+// operator investigating a false phantom-skip needs to tell those apart.
+const GITHUB_API_FALLBACK_ISSUES_EVICTED_MAX = 200
+
+/**
+ * Adds `identity` to `eligible`, evicting the least-recently-registered
+ * entry once at capacity (Sets preserve insertion order; delete+add
+ * refreshes an existing identity's recency instead of leaving it at its
+ * original position). An evicted identity moves into `evicted` — itself
+ * bounded — so a later caller can tell "eligibility was evicted" apart from
+ * "never was eligible" instead of collapsing both into the same signal.
+ * Exported standalone (pure, no class state) so the bounding and eviction
+ * behavior is directly testable without driving thousands of dispatches
+ * through a full FactoryLoop to fill the production-sized set.
+ */
+export function rememberBoundedFallbackEligibility(
+  eligible: Set<string>,
+  evicted: Set<string>,
+  identity: string,
+  maxEligible: number,
+  maxEvicted: number,
+): void {
+  evicted.delete(identity)
+  eligible.delete(identity)
+  eligible.add(identity)
+  if (eligible.size <= maxEligible) return
+  const oldest = eligible.values().next().value
+  if (oldest === undefined) return
+  eligible.delete(oldest)
+  evicted.delete(oldest)
+  evicted.add(oldest)
+  if (evicted.size <= maxEvicted) return
+  const oldestEvicted = evicted.values().next().value
+  if (oldestEvicted !== undefined) evicted.delete(oldestEvicted)
+}
 
 class DispatchLifecycleCapacityError extends Error {}
 class DispatchLifecycleOwnedElsewhereError extends Error {
@@ -412,6 +453,8 @@ export class FactoryLoop implements Factory {
   readonly #githubIssueAuthors = new Map<string, string | undefined>()
   readonly #githubIssueAuthorLookups = new Map<string, Promise<string | undefined>>()
   readonly #githubIssuePreferredPaths = new Map<string, string>()
+  readonly #githubApiFallbackIssues = new Set<string>()
+  readonly #githubApiFallbackIssuesEvicted = new Set<string>()
   #githubIssuePathIndexReady = false
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
@@ -2388,7 +2431,9 @@ export class FactoryLoop implements Factory {
     const dispatched = this.#dispatchUnlocked(decision, opts)
     this.#dispatchInFlight.set(key, dispatched)
     try {
-      return await dispatched
+      const result = await dispatched
+      if (decision.issueResolution) result.issueResolution = structuredClone(decision.issueResolution)
+      return result
     } finally {
       if (this.#dispatchInFlight.get(key) === dispatched) {
         this.#dispatchInFlight.delete(key)
@@ -2424,7 +2469,11 @@ export class FactoryLoop implements Factory {
       throw error
     }
 
-    const liveIssue = await this.#readIssue(decision.issue.path)
+    // This read runs before `decision` has any tracked record for
+    // #deriveGithubApiFallbackEligibility to find (batch insertion happens
+    // later, once scope/readiness are validated), so pass it directly
+    // rather than registering it into the cache first.
+    const liveIssue = await this.#readIssue(decision.issue.path, decision)
     if (!liveIssue || !isInFactoryScope(liveIssue, this.#config.safety)) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: not factory-e2e scope`)
       this.#error(error, decision.issue)
@@ -3987,7 +4036,11 @@ export class FactoryLoop implements Factory {
   async #resumeDurableDispatch(record: InFlightIssue): Promise<void> {
     let liveIssue: LinearIssue | undefined
     if (!record.dryRun) {
-      liveIssue = await this.#readIssue(record.issue.path)
+      // record is already inserted into the batch by the time any phase
+      // handler runs (BatchTracker.restore, called before this), so
+      // #deriveGithubApiFallbackEligibility would find it there too — the
+      // explicit hint is defense in depth, not a requirement.
+      liveIssue = await this.#readIssue(record.issue.path, record.decision)
       if (!liveIssue) {
         throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is not currently readable`)
       }
@@ -4647,7 +4700,72 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #readGithubIssue(path: string): Promise<GithubIssueSource | undefined> {
+  #rememberGithubApiFallbackEligible(identity: string): void {
+    rememberBoundedFallbackEligibility(
+      this.#githubApiFallbackIssues,
+      this.#githubApiFallbackIssuesEvicted,
+      identity,
+      GITHUB_API_FALLBACK_ISSUES_MAX,
+      GITHUB_API_FALLBACK_ISSUES_EVICTED_MAX,
+    )
+  }
+
+  /**
+   * `#githubApiFallbackIssues` is a cache, not a source of truth: eligibility
+   * is derived here, not remembered by every caller. A restart (or any read
+   * path added later that never registered anything) still resolves
+   * correctly because this checks the actual current state instead of
+   * requiring every entry point to have called a registration method first.
+   *
+   * A decision can durably outlive the original dispatch call in three
+   * shapes, and this checks all three — a fourth found later means this
+   * enumeration is incomplete, not that the approach is wrong:
+   *   1. `batch.inFlight` — an active live-dispatched or durably-restored
+   *      record (`BatchTracker.restore`/`start` insert it before any phase
+   *      handler runs).
+   *   2. `#state.listWaitingClarifications` — an issue parked awaiting a
+   *      human reply. Restoring it (`#restoreClarifications` et al.)
+   *      rebuilds an `InFlightIssue`-shaped record locally to re-arm the
+   *      watcher and does not insert it into the batch, so (1) alone misses
+   *      it.
+   *   3. `#state.listDispatchLifecycles`, non-terminal — a durably-tracked
+   *      dispatch that is not currently in-memory at all yet (e.g. a
+   *      non-durable-fleet dispatch never reaches the batch either).
+   *
+   * `decisionHint` stays a pure optimization ahead of all three: the one
+   * read that happens before its own record exists anywhere (the initial
+   * live dispatch, validating scope before it is tracked) can skip the
+   * scan entirely, but no read site is required to pass it — omitting it
+   * only costs the scan, never correctness.
+   *
+   * Deliberately scans by GitHub identity (owner/repo/number) against each
+   * candidate's own issue path rather than looking up the durable record by
+   * its composite key (uuid/key/path): the real uuid is built from GitHub's
+   * node_id/id when content is available, which a bare path cannot
+   * reconstruct, so a keyed lookup would not reliably match.
+   */
+  async #deriveGithubApiFallbackEligibility(identity: string, decisionHint?: TriageDecision): Promise<boolean> {
+    if (
+      decisionHint?.issueResolution?.source === 'github-api-fallback' &&
+      githubIssueRefIdentity(decisionHint.issue) === identity
+    ) {
+      return true
+    }
+    const inFlight = (await this.#batch()).inFlight
+    if (isGithubApiFallbackEligible(inFlight, identity)) return true
+
+    const [waitingClarifications, dispatchLifecycles] = await Promise.all([
+      this.#state.listWaitingClarifications(this.#workspaceId),
+      this.#state.listDispatchLifecycles(this.#workspaceId),
+    ])
+    const durable = [
+      ...githubApiFallbackCandidatesFromWaitingClarifications(waitingClarifications),
+      ...githubApiFallbackCandidatesFromDispatchLifecycles(dispatchLifecycles),
+    ]
+    return isGithubApiFallbackEligible(durable, identity)
+  }
+
+  async #readGithubIssue(path: string, decisionHint?: TriageDecision): Promise<GithubIssueSource | undefined> {
     const preferredPath = await this.#preferredGithubIssuePath(path)
     const candidatePaths = [...new Set([
       ...githubIssueReadCandidatePaths(preferredPath),
@@ -4669,8 +4787,54 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       if (isMissingIssueFileError(error)) {
+        const parts = githubIssuePathParts(path) ?? githubIssueDirectoryPathParts(path)
+        const identity = parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
+        const eligible = identity
+          ? this.#githubApiFallbackIssues.has(identity) ||
+            await this.#deriveGithubApiFallbackEligibility(identity, decisionHint)
+          : false
+        if (eligible && identity) this.#rememberGithubApiFallbackEligible(identity)
+        if (parts && identity && eligible && this.#mount.githubRead) {
+          const lookup = await this.#mount.githubRead.getIssue(`${parts.owner}/${parts.repo}`, parts.number)
+          if (lookup.outcome === 'found') {
+            const githubIssue = parseGithubIssue(lookup.issue.path, lookup.issue.content)
+            this.#indexDependencyIssue(githubIssueAsFactoryIssue(githubIssue))
+            this.#logger.warn?.('[factory] Relayfile projection missed GitHub issue; using GitHub API fallback', {
+              repo: lookup.issue.repo,
+              number: lookup.issue.number,
+              source: 'github-api-fallback',
+            })
+            return githubIssue
+          }
+          if (lookup.outcome === 'indeterminate') {
+            // The provider lookup could not confirm absence (e.g. an
+            // unauthenticated 404 against a repo it cannot prove is public).
+            // That is not the same claim as "confirmed gone" — count and log
+            // it separately so it stays visible instead of being folded into
+            // the phantom-skip metric.
+            this.#increment('githubIssueUnverifiable')
+            this.#logger.warn?.('[factory] GitHub API fallback could not determine issue existence', {
+              path,
+              repo: `${parts.owner}/${parts.repo}`,
+              number: parts.number,
+              reason: lookup.reason,
+            })
+            return undefined
+          }
+        }
+        if (identity && this.#githubApiFallbackIssuesEvicted.has(identity)) {
+          // identity was eligible for the API fallback but aged out of the
+          // bounded set — a different claim from "never was eligible", and
+          // one this signal must not silently collapse into a confirmed miss.
+          this.#increment('githubIssueApiFallbackEligibilityEvicted')
+          this.#logger.warn?.('[factory] GitHub API fallback eligibility was evicted from the bounded cache before this read', {
+            path,
+            identity,
+          })
+          return undefined
+        }
         this.#increment('githubIssuePhantomSkipped')
-        this.#logger.debug?.('[factory] skipped missing GitHub issue file discovered from issue tree', { path })
+        this.#logger.debug?.('[factory] skipped missing GitHub issue after projection and provider lookup', { path })
         return undefined
       }
       throw error
@@ -5272,10 +5436,10 @@ export class FactoryLoop implements Factory {
     return [...pathsByKey.values()].sort()
   }
 
-  async #readIssue(path: string): Promise<LinearIssue | undefined> {
+  async #readIssue(path: string, decisionHint?: TriageDecision): Promise<LinearIssue | undefined> {
     try {
       if (isGithubIssueFilePath(path)) {
-        const githubIssue = await this.#readGithubIssue(path)
+        const githubIssue = await this.#readGithubIssue(path, decisionHint)
         return githubIssue ? githubIssueAsFactoryIssue(githubIssue) : undefined
       }
       // Newly-synced issues land as a change-event STUB at the primary
@@ -12499,7 +12663,7 @@ export class FactoryLoop implements Factory {
     heartbeat.unref?.()
 
     try {
-      if (!await this.#clarificationIssueStillActive(waiting.issue)) {
+      if (!await this.#clarificationIssueStillActive(waiting.issue, waiting.decision)) {
         this.#assertClarificationWakeRunning()
         await renewLease()
         const completed = await this.#state.completeClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
@@ -12683,8 +12847,8 @@ export class FactoryLoop implements Factory {
     if (this.#stopping) throw new ClarificationWakeStoppedError('factory is stopping')
   }
 
-  async #clarificationIssueStillActive(issueRef: IssueRef): Promise<boolean> {
-    const issue = await this.#readIssue(issueRef.path)
+  async #clarificationIssueStillActive(issueRef: IssueRef, decisionHint?: TriageDecision): Promise<boolean> {
+    const issue = await this.#readIssue(issueRef.path, decisionHint)
     if (!issue || !isInFactoryScope(issue, this.#config.safety) || !isDispatchableIssue(issue)) {
       this.#logger.info?.('[factory] clarification wake cancelled because issue left factory scope', {
         issue: issueRef.key,
@@ -13431,8 +13595,17 @@ const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefin
   return [...pids].sort((a, b) => a - b)
 }
 
-const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
+// `issueResolution.detail` and `projection.localMountDegradedReason` are
+// free text that can carry an absolute local filesystem path (e.g. "mount
+// state is missing at /Users/<name>/...") — safe in the JSON result and in
+// logs, but this comment is posted to a public GitHub issue. Emit only
+// `source`, a closed enum, rather than trying to scrub paths out of free
+// text; free text is not a safe thing to scrub, only a safe thing to omit.
+export const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
   `Factory dispatch for ${decision.issue.key}`,
+  decision.issueResolution
+    ? `Issue resolution: ${decision.issueResolution.source}`
+    : undefined,
   `Implementers: ${agents.filter((agent) => agent.role === 'implementer').map((agent) => agent.name).join(', ') || 'none'}`,
   decision.scope === 'workflow' ? `Workflow: ${agents.find((agent) => agent.role === 'workflow')?.name ?? 'none'}` : undefined,
   `Reviewer: ${agents.find((agent) => agent.role === 'reviewer')?.name ?? 'none'}`,
@@ -14056,12 +14229,67 @@ export const githubIssuePathParts = (path: string): { owner: string; repo: strin
   }
 }
 
-const githubIssueIdentity = (owner: string, repo: string, number: number): string =>
+export const githubIssueIdentity = (owner: string, repo: string, number: number): string =>
   `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`
 
 const githubIssueRefIdentity = (issue: IssueRef): string | undefined => {
   const parts = githubIssuePathParts(issue.path)
   return parts ? githubIssueIdentity(parts.owner, parts.repo, parts.number) : undefined
+}
+
+/**
+ * Whether a GitHub API fallback read is eligible for `identity`, derived
+ * from currently-tracked state rather than a separately-remembered flag:
+ * `decisionHint` (the one read that happens before its own record is
+ * tracked anywhere) or any `{issue, decision}` candidate — drawn from
+ * whichever durable or in-memory store the caller has gathered — whose
+ * decision was resolved through the fallback. Exported standalone so this
+ * is directly testable — no caller has to have registered anything for
+ * this to return true for a candidate that is genuinely present, which is
+ * the property that keeps a future read call site from silently
+ * reintroducing the restart-eligibility bug by omission.
+ *
+ * A decision durably outlives the in-memory batch in more than one shape
+ * (in-flight dispatch, a parked clarification, a durable dispatch
+ * lifecycle — see #deriveGithubApiFallbackEligibility for the full list
+ * this class gathers); this function does not care which shape a
+ * candidate came from, only whether one matches.
+ */
+export function isGithubApiFallbackEligible(
+  candidates: readonly { issue: IssueRef; decision: TriageDecision }[],
+  identity: string,
+  decisionHint?: TriageDecision,
+): boolean {
+  if (
+    decisionHint?.issueResolution?.source === 'github-api-fallback' &&
+    githubIssueRefIdentity(decisionHint.issue) === identity
+  ) {
+    return true
+  }
+  return candidates.some((candidate) =>
+    candidate.decision.issueResolution?.source === 'github-api-fallback' &&
+    githubIssueRefIdentity(candidate.issue) === identity,
+  )
+}
+
+/** Maps durable waiting-clarification records to isGithubApiFallbackEligible candidates. */
+export function githubApiFallbackCandidatesFromWaitingClarifications(
+  waitingClarifications: ReadonlyArray<readonly [string, WaitingClarification]>,
+): Array<{ issue: IssueRef; decision: TriageDecision }> {
+  return waitingClarifications.map(([, waiting]) => ({ issue: waiting.issue, decision: waiting.decision }))
+}
+
+/**
+ * Maps durable dispatch-lifecycle records to isGithubApiFallbackEligible
+ * candidates, excluding terminal ones — a completed or abandoned dispatch's
+ * decision is no longer a reason to trust a live read for that issue.
+ */
+export function githubApiFallbackCandidatesFromDispatchLifecycles(
+  dispatchLifecycles: ReadonlyArray<readonly [string, DispatchLifecycle]>,
+): Array<{ issue: IssueRef; decision: TriageDecision }> {
+  return dispatchLifecycles
+    .filter(([, lifecycle]) => !isTerminalDispatchLifecycle(lifecycle))
+    .map(([, lifecycle]) => ({ issue: lifecycle.issue, decision: lifecycle.decision }))
 }
 
 const githubIssuePathPreference = (path: string): number => {

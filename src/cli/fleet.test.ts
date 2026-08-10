@@ -8,19 +8,20 @@ import type {
   CloseProbePrInput,
   Factory,
   FactoryCloudEventInputV1,
+  FactoryConfig,
   FactoryEventReporter,
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
   FactoryPorts,
   createFactory,
 } from '../index'
-import { stateResolutionFromIds } from '../index'
+import { FactoryConfigSchema, stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
-import type { GithubConnectionWrite, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
-import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -102,7 +103,7 @@ class CompletingRemoteFleetClient extends FakeFleetClient {
   }
 }
 
-const githubIssueFile = (repo: string, number = 48) => ({
+const githubIssueFile = (repo: string, number = 48, owner = 'AgentWorkforce') => ({
   provider: 'github',
   objectType: 'issue',
   objectId: `${repo}-${number}`,
@@ -112,10 +113,34 @@ const githubIssueFile = (repo: string, number = 48) => ({
     body: 'Dispatch the repository-qualified GitHub issue.',
     state: 'open',
     labels: [{ name: 'factory' }, { name: repo }],
-    url: `https://github.com/AgentWorkforce/${repo}/issues/${number}`,
-    repository: { name: repo, owner: { login: 'AgentWorkforce' } },
+    url: `https://github.com/${owner}/${repo}/issues/${number}`,
+    repository: { name: repo, owner: { login: owner } },
   },
 })
+
+const githubConnectionIssue = (
+  repo: string,
+  number: number,
+  content: unknown = githubIssueFile(repo, number),
+) => ({
+  repo: `AgentWorkforce/${repo}`,
+  number,
+  path: `/github/repos/AgentWorkforce__${repo}/issues/by-id/${number}.json`,
+  content,
+})
+
+const githubIssueFound = (repo: string, number: number, content?: unknown): GithubIssueLookup =>
+  ({ outcome: 'found', issue: githubConnectionIssue(repo, number, content) })
+
+const githubIssueNotFound = (): GithubIssueLookup => ({ outcome: 'not-found' })
+
+const githubIssueIndeterminate = (
+  reason = 'repository not visible without authentication',
+): GithubIssueLookup => ({ outcome: 'indeterminate', reason })
+
+const fakeGithubConnectionRead = (
+  resolveIssue: (repo: string, number: number) => ReturnType<GithubConnectionRead['getIssue']>,
+): GithubConnectionRead => ({ getIssue: vi.fn(resolveIssue) })
 
 const mountWithIntegrationConnections = (
   files: Record<string, unknown>,
@@ -454,6 +479,93 @@ describe('fleet CLI parsing', () => {
   })
 })
 
+describe('parseGithubIssueSelector normalization matrix', () => {
+  // Three review rounds each found a different normalization gap in this
+  // resolution (default-only collapse, org-only expansion, bare-label vs
+  // normalized comparison). Every candidate and every configured entry must
+  // pass through the same canonicalization before any comparison — this
+  // table exercises the combinations that produced each of those bugs,
+  // not just the one case each round happened to name.
+  const buildConfig = (overrides: {
+    org?: string
+    byLabel?: Record<string, string>
+    default?: string
+  }): FactoryConfig => FactoryConfigSchema.parse({
+    workspaceId: 'factory-cli-test',
+    repos: {
+      byLabel: overrides.byLabel ?? {},
+      clonePaths: {},
+      ...(overrides.org !== undefined ? { org: overrides.org } : {}),
+      ...(overrides.default !== undefined ? { default: overrides.default } : {}),
+    },
+    stateIds: TEST_STATE_IDS,
+  })
+
+  it.each([
+    [
+      'qualified selector, bare label route, org set: resolves via org-prefixing',
+      'work#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, bare label route, org unset: cannot resolve without an owner',
+      'work#5',
+      { byLabel: { work: 'factory' } },
+      undefined,
+    ],
+    [
+      'qualified selector, cross-owner qualified label route, org set to a different owner: label route wins over org',
+      'work#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'OtherOrg/partner-repo' } },
+      { number: 5, repo: 'OtherOrg/partner-repo' },
+    ],
+    [
+      'qualified selector, cross-owner qualified label route, org unset: resolves without needing org',
+      'work#5',
+      { byLabel: { work: 'OtherOrg/partner-repo' } },
+      { number: 5, repo: 'OtherOrg/partner-repo' },
+    ],
+    [
+      'qualified selector, already fully owner/repo-qualified: resolves directly regardless of byLabel',
+      'AgentWorkforce/factory#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, label match is case-insensitive',
+      'WORK#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      { number: 5, repo: 'AgentWorkforce/factory' },
+    ],
+    [
+      'qualified selector, unconfigured label: rejected regardless of org',
+      'unknown#5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' } },
+      undefined,
+    ],
+    [
+      'bare selector: never carries a repo, independent of org/byLabel shape',
+      '5',
+      { org: 'AgentWorkforce', byLabel: { work: 'factory' }, default: 'AgentWorkforce/factory' },
+      { number: 5 },
+    ],
+    [
+      'bare selector with no default and no org: still just the number',
+      '5',
+      { byLabel: { work: 'factory' } },
+      { number: 5 },
+    ],
+  ] as const)('%s', (_name, key, overrides, expected) => {
+    const config = buildConfig(overrides)
+    if (expected === undefined) {
+      expect(() => parseGithubIssueSelector(key, config)).toThrow(/is not one of the configured Factory routes/)
+    } else {
+      expect(parseGithubIssueSelector(key, config)).toEqual(expected)
+    }
+  })
+})
+
 describe('fleet CLI runtime', () => {
   it.each([
     { name: 'warns after spawning without a discovered connection', started: true, connection: false, warns: true },
@@ -738,6 +850,93 @@ describe('fleet CLI runtime', () => {
       expect(integrations.getStatus).toHaveBeenCalledWith('github')
       expect(integrations.connect).not.toHaveBeenCalled()
       expect(errors.text()).toContain('dry-run will not start an OAuth flow')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a populated projection preferred over the API fallback when the connection is not ready', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-github-fallback-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const issue = '/github/repos/AgentWorkforce__pear/issues/48/meta.json'
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'degraded',
+        initialSyncState: 'complete',
+      }))
+      const githubRead = fakeGithubConnectionRead(async () => {
+        throw new Error('populated projection must remain preferred')
+      })
+      const mount = Object.assign(
+        mountWithIntegrationConnections({ [issue]: githubIssueFile('pear') }, integrations),
+        { githubRead },
+      )
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '48', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: errors,
+      })
+
+      expect(code).toBe(0)
+      expect(errors.text()).toContain('GitHub projection is not ready (degraded, complete)')
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'relayfile-projection' },
+      })
+      expect(githubRead.getIssue).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses connected-not-ready status as the reported reason an empty projection cannot answer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-integration-github-empty-fallback-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const integrations = fakeIntegrationConnections(async () => ({
+        ready: false,
+        state: 'degraded',
+        initialSyncState: 'complete',
+      }))
+      const githubRead = fakeGithubConnectionRead(async (_repo, number) => githubIssueFound('pear', number))
+      const mount = Object.assign(
+        mountWithIntegrationConnections({}, integrations),
+        {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: false }),
+        },
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: {
+          source: 'github-api-fallback',
+          detail: expect.stringContaining('GitHub projection connection is not ready (degraded, complete)'),
+          projection: {
+            githubConnection: { ready: false, state: 'degraded', initialSyncState: 'complete' },
+          },
+        },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', 222)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1555,6 +1754,476 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(1)
       expect(errors.text()).toContain('matches multiple repositories (AgentWorkforce/cloud, AgentWorkforce/pear)')
       expect(errors.text()).toContain('set repos.default or pass a repo-qualified argument')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the GitHub API fallback after an empty projection and reports the existing health signals', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-fallback-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        loop: { heartbeatPath: join(root, 'missing-heartbeat.json'), heartbeatStaleMs: 10_000 },
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'AgentWorkforce/pear' && number === 222
+          ? githubIssueFound('pear', number)
+          : githubIssueNotFound(),
+      )
+      const mount = Object.assign(new FakeMountClient(), {
+        githubRead,
+        getLocalMountHealth: () => ({
+          degraded: true,
+          reason: 'last reconcile is stale',
+          localDir: join(root, '.integrations'),
+        }),
+      })
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issue: { key: '222' },
+        routes: [{ repo: 'AgentWorkforce/pear' }],
+        issueResolution: {
+          source: 'github-api-fallback',
+          repo: 'AgentWorkforce/pear',
+          projection: {
+            outcome: 'no-match',
+            localMountDegraded: true,
+            localMountDegradedReason: 'last reconcile is stale',
+            eventListener: { state: 'not-listening' },
+          },
+        },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', 222)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a populated Relayfile projection preferred and reports that source', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-projection-source-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const issuePath = '/github/repos/AgentWorkforce__pear/issues/by-id/222.json'
+      const githubRead = fakeGithubConnectionRead(async () => {
+        throw new Error('GitHub API must not run when the projection has a match')
+      })
+      const mount = Object.assign(new FakeMountClient({
+        [issuePath]: githubIssueFile('pear', 222),
+      }), { githubRead })
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issue: { key: '222', path: issuePath },
+        issueResolution: {
+          source: 'relayfile-projection',
+          projection: { outcome: 'matched' },
+        },
+      })
+      expect(githubRead.getIssue).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not manufacture a match when GitHub authoritatively has no issue', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-not-found-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueNotFound())
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '999999', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('found 0 matches in the projection and GitHub API')
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', 999999)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports that GitHub could not determine existence instead of a confident 0 matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-indeterminate-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueIndeterminate())
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('could not determine whether the issue exists')
+      expect(errors.text()).not.toContain('found 0 matches')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to dispatch to a found match when another configured repo could not be checked (no silent misroute)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-unconfirmed-unique-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: {
+            factory: 'AgentWorkforce/factory',
+            cloud: 'AgentWorkforce/cloud',
+          },
+          clonePaths: {
+            'AgentWorkforce/factory': '/work/factory',
+            'AgentWorkforce/cloud': '/work/cloud',
+          },
+        },
+      })
+      // A public repo (factory) answers with a match; a repo it cannot see
+      // (cloud) is indeterminate. A same-numbered issue could exist there
+      // too — dispatching to the found match alone would be a silent misroute.
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'AgentWorkforce/factory' ? githubIssueFound('factory', number) : githubIssueIndeterminate(),
+      )
+      const errors = buffer()
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('could not confirm it is unique')
+      expect(errors.text()).toContain('AgentWorkforce/factory')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-reads an API fallback issue during dry-run dispatch and records the source', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-dispatch-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const content = githubIssueFile('pear', 222)
+      content.payload.body = [
+        'Restore dispatch through the GitHub API fallback without changing routing.',
+        '',
+        'Acceptance criteria:',
+        '- Projection misses use the workspace connection.',
+        '- Projection hits remain preferred.',
+        '- Run the focused CLI regression checks.',
+      ].join('\n')
+      const githubRead = fakeGithubConnectionRead(async (_repo, number) =>
+        githubIssueFound('pear', number, content),
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['dispatch', '222', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issue: { key: '222' },
+        issueResolution: { source: 'github-api-fallback' },
+        comments: [expect.stringContaining('Issue resolution: github-api-fallback')],
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledTimes(2)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let the API fallback bypass the existing GitHub safety label gate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-api-safety-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const unsafe = githubIssueFile('pear', 222)
+      unsafe.payload.labels = [{ name: 'pear' }]
+      unsafe.payload.title = 'Missing both configured safety markers'
+      const githubRead = fakeGithubConnectionRead(async (_repo, number) =>
+        githubIssueFound('pear', number, unsafe),
+      )
+      const errors = buffer()
+      const fleet = new FakeFleetClient()
+
+      const code = await runFleetCli(['dispatch', '222', '--dry-run', '--config', configPath], {
+        fleet,
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('not factory-e2e scope')
+      expect(fleet.spawns).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a healthy projection miss as authoritative and does not call the fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-healthy-miss-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        loop: { heartbeatPath, heartbeatStaleMs: 10_000 },
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+          default: 'AgentWorkforce/pear',
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async () => githubIssueFound('pear', 222))
+      const errors = buffer()
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+
+      const code = await runFleetCli(['triage', '222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: false }),
+        }),
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(errors.text()).toContain('found 0 matches in the healthy Relayfile projection')
+      expect(errors.text()).toContain('fallback was not used')
+      expect(githubRead.getIssue).not.toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses a configured repo-qualified reference to make one fallback lookup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-qualified-fallback-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          org: 'AgentWorkforce',
+          byLabel: {
+            factory: 'AgentWorkforce/factory',
+            workforce: 'AgentWorkforce/workforce',
+          },
+          clonePaths: {
+            'AgentWorkforce/factory': '/work/factory',
+            'AgentWorkforce/workforce': '/work/workforce',
+          },
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'AgentWorkforce/factory' ? githubIssueFound('factory', number) : githubIssueNotFound(),
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', 'factory#222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'github-api-fallback', repo: 'AgentWorkforce/factory' },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledTimes(1)
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/factory', 222)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('validates a qualified selector against every configured route, not just repos.default', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-qualified-non-default-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          default: 'AgentWorkforce/factory',
+          byLabel: {
+            factory: 'AgentWorkforce/factory',
+            cloud: 'AgentWorkforce/cloud',
+          },
+          clonePaths: {
+            'AgentWorkforce/factory': '/work/factory',
+            'AgentWorkforce/cloud': '/work/cloud',
+          },
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'AgentWorkforce/cloud' ? githubIssueFound('cloud', number) : githubIssueNotFound(),
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', 'cloud#222', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'github-api-fallback', repo: 'AgentWorkforce/cloud' },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/cloud', 222)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('validates a qualified label selector routed outside repos.org', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-qualified-cross-owner-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          org: 'AgentWorkforce',
+          byLabel: {
+            // Routed to a different owner than repos.org — the org expansion
+            // alone (`${org}/${requested}`) cannot resolve this label.
+            partner: 'OtherOrg/partner-repo',
+          },
+          clonePaths: {
+            'OtherOrg/partner-repo': '/work/partner-repo',
+          },
+        },
+      })
+      const githubRead = fakeGithubConnectionRead(async (repo, number) =>
+        repo === 'OtherOrg/partner-repo'
+          ? {
+              outcome: 'found',
+              issue: {
+                repo: 'OtherOrg/partner-repo',
+                number,
+                path: `/github/repos/OtherOrg__partner-repo/issues/by-id/${number}.json`,
+                content: githubIssueFile('partner-repo', number, 'OtherOrg'),
+              },
+            }
+          : githubIssueNotFound(),
+      )
+      const output = buffer()
+
+      const code = await runFleetCli(['triage', 'partner#5', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: Object.assign(new FakeMountClient(), {
+          githubRead,
+          getLocalMountHealth: () => ({ degraded: true, reason: 'projection reconcile is stale' }),
+        }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        issueResolution: { source: 'github-api-fallback', repo: 'OtherOrg/partner-repo' },
+      })
+      expect(githubRead.getIssue).toHaveBeenCalledWith('OtherOrg/partner-repo', 5)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -28,6 +28,7 @@ import type {
   EventPage,
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
+  GithubConnectionRead,
   GithubConnectionWrite,
   LocalMountOptions,
   LocalMountHealth,
@@ -46,6 +47,7 @@ import {
 } from '../subscriptions'
 import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import { GithubApiIssueRead } from './github-api-issue-read'
 import {
   ensureLocalMount as runLocalMountPreflight,
   type EnsureLocalMountOptions,
@@ -257,6 +259,7 @@ export function relayfileWorkspaceTokenProvider(
 export class RelayfileCloudMountClient implements MountClient {
   readonly workspaceId: string
   readonly writebackTransport = 'relayfile-cloud'
+  readonly githubRead?: GithubConnectionRead
   readonly githubWrite: GithubConnectionWrite
   readonly resourceSubscriptions?: ResourceSubscriptionsClient
   readonly integrationConnections?: FactoryIntegrationConnections
@@ -337,6 +340,7 @@ export class RelayfileCloudMountClient implements MountClient {
         resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
+    this.githubRead = new GithubApiIssueRead()
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
     this.integrationConnections = relayfileIntegrationConnections(
       config.relayfileWorkspace,

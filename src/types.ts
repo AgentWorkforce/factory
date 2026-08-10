@@ -192,6 +192,7 @@ export interface IterationReport {
 
 export interface DispatchResult {
   issue: IssueRef
+  issueResolution?: IssueResolution
   agents: Array<{ name: string; role: AgentSpec['role'] }>
   comments?: string[]
   stateId?: string
@@ -244,6 +245,7 @@ export interface RepoMapEntry {
 
 export interface TriageDecision {
   issue: IssueRef
+  issueResolution?: IssueResolution
   routes: Array<{ repo: string; clonePath?: string; rationale: string }>
   scope: 'single' | 'workflow' | 'team'
   implementers: AgentSpec[]
@@ -252,6 +254,23 @@ export interface TriageDecision {
   thin: boolean
   confidence: 'high' | 'low'
   rationale: string
+}
+
+export interface IssueResolution {
+  source: 'relayfile-projection' | 'github-api-fallback'
+  repo?: string
+  detail: string
+  projection: {
+    outcome: 'matched' | 'no-match'
+    localMountDegraded?: boolean
+    localMountDegradedReason?: string
+    eventListener?: FactoryEventListenerStatus
+    githubConnection?: {
+      ready: boolean
+      state?: string
+      initialSyncState?: string
+    }
+  }
 }
 
 export interface PrSummary {

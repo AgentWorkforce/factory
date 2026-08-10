@@ -71,6 +71,37 @@ export interface GithubPublishPullRequestResult {
   author?: string
 }
 
+/**
+ * Provider-authoritative GitHub issue returned by the direct API fallback.
+ * `content` intentionally uses the same provider record shape as the
+ * Relayfile projection so the existing parser and safety gates stay
+ * authoritative.
+ */
+export interface GithubConnectionIssue {
+  repo: string
+  number: number
+  path: string
+  content: unknown
+}
+
+/**
+ * Outcome of a GitHub issue lookup. A reader that cannot authenticate can
+ * only prove absence within what it can see: `not-found` means the reader
+ * confirmed the repository is visible and the issue is not in it;
+ * `indeterminate` means the reader could not establish that (for example an
+ * unauthenticated 404 against a repository it also cannot confirm is
+ * public — GitHub returns the same 404 for "does not exist" and "private,
+ * hidden from you"). Callers must not treat `indeterminate` as absence.
+ */
+export type GithubIssueLookup =
+  | { outcome: 'found'; issue: GithubConnectionIssue }
+  | { outcome: 'not-found' }
+  | { outcome: 'indeterminate'; reason: string }
+
+export interface GithubConnectionRead {
+  getIssue(repo: string, number: number): Promise<GithubIssueLookup>
+}
+
 export type FactoryIntegrationProvider = 'github' | 'linear'
 
 export interface FactoryIntegrationConnectionStatus {
@@ -104,6 +135,7 @@ export interface GithubConnectionWrite {
 
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
+  readonly githubRead?: GithubConnectionRead
   readonly githubWrite?: GithubConnectionWrite
   /**
    * Optional durable Relayfile resource-subscription API. Its absence means
