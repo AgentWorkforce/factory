@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
 import type { MountClient } from '../ports'
-import { discoverRoutedPullRequests, routedPrRepos } from './routed-pr-babysitter'
+import {
+  ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED,
+  discoverRoutedPullRequests,
+  routedPrRepos,
+} from './routed-pr-babysitter'
 
 const config = (babysitter: Record<string, unknown> = {}) => FactoryConfigSchema.parse({
   repos: {
@@ -36,6 +40,10 @@ const mount = (files: Record<string, unknown>): MountClient => ({
 } as unknown as MountClient)
 
 describe('routed PR babysitter discovery', () => {
+  it('keeps routed-PR activation deliberately disabled', () => {
+    expect(ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED).toBe(false)
+  })
+
   it('bounds widened intake strictly to repos.names', () => {
     expect(routedPrRepos(config())).toEqual(['AgentWorkforce/pear'])
   })

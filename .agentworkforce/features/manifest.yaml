@@ -2,12 +2,12 @@ version: '1.1'
 updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 314
+  feature_count: 313
   tier_counts:
     1: 48
     2: 125
     3: 11
-    4: 53
+    4: 52
     5: 62
     6: 15
 
@@ -824,22 +824,15 @@ categories:
       - id: pr-routed-babysitter-discovery
         name: Routed Repository PR Babysitter Discovery
         api: babysitter.mode=routed-open-prs
-        description: Discover open non-draft same-repository PRs only from repos.names, fall back to PR title and body, and account for every excluded, deferred, unreadable, or failed candidate
-        location: src/github/routed-pr-babysitter.ts, src/orchestrator/factory.ts
+        description: Read-only discovery of open non-draft same-repository PRs only from repos.names, with explicit accounting for excluded, unreadable, incomplete, and duplicate candidates; activation remains deliberately disabled
+        location: src/github/routed-pr-babysitter.ts
         verify_tier: 5
 
-      - id: pr-routed-babysitter-ownership
-        name: Routed PR Work-Unit Ownership
-        api: StateStore.claimRoutedPrBabysitter()
-        description: Atomically claim exact normalized repo and PR work units across routed and issue-created intake before spawn, with durable restart recovery and bounded admission
-        location: src/ports/state.ts, src/state/in-memory-state-store.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
-        verify_tier: 4
-
       - id: pr-routed-babysitter-opt-out
-        name: Routed PR Pre-Write Opt-Out
+        name: Routed PR Discovery Opt-Out
         api: babysitter.excludeLabels / babysitter.excludePullRequests
-        description: Reject configured PR identities or labeled PRs before spawn and require automatic workers to re-check labels before their first provider write
-        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts, src/dispatch/templates.ts
+        description: Exclude configured PR identities or labeled PRs from the read-only routed discovery candidate set
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
         verify_tier: 5
 
       - id: pr-standalone-babysitter-validation
@@ -2166,8 +2159,8 @@ categories:
       - id: config-babysitter-routed-intake
         name: Routed Babysitter Intake Controls
         api: factory.config.json#babysitter.mode
-        description: Keep factory-created intake as the default while explicitly configuring routed discovery, exclusions, and notifications-off behavior
-        location: src/config/schema.ts, src/orchestrator/factory.ts
+        description: Keep factory-created intake as the default while explicitly configuring routed discovery and exclusions; routed activation remains disabled pending lifecycle design
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
         verify_tier: 2
 
       - id: config-merge-policy

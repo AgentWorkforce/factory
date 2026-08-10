@@ -47,10 +47,6 @@ export interface RenderAgentTaskInput {
    */
   standaloneBabysitter?: {
     specSource: 'pull-request' | 'linked-issue'
-    /** Labels which abort this run before its first provider write. */
-    excludeLabels?: string[]
-    /** Human-facing comments, mentions, and escalation are opt-in for sweeps. */
-    notifyHumans?: boolean
   }
   slackDispatchThread?: {
     channel: string
@@ -226,12 +222,6 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       const standaloneMergePolicy = input.config.mergePolicy === 'on-green-with-review'
         ? 'Merge policy: on-green-with-review. This standalone run has no guarded merge executor, so never merge the PR yourself; leave the final merge to a human.'
         : 'Merge policy: never - leave the PR open for human review and approval; never merge it yourself.'
-      const optOutLine = input.standaloneBabysitter.excludeLabels?.length
-        ? `Before your first provider write and again before every later provider write, re-read the live PR labels. If any label in JSON ${JSON.stringify(input.standaloneBabysitter.excludeLabels)} is present, make no further provider writes, report the opt-out, and exit.`
-        : undefined
-      const notificationLine = input.standaloneBabysitter.notifyHumans
-        ? 'You may notify or mention humans when a concrete decision is required.'
-        : 'Do not post status comments, mention humans, send notifications, or escalate this run. Only write the code, commits, pushes, and direct review-thread replies required to shepherd the PR.'
       return [
         `GitHub repo: ${repo}`,
         cloneInstruction,
@@ -239,8 +229,6 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         '',
         `You are the standalone PR babysitter for ${prRef}.`,
         'Your job: drive this PR to genuinely green and correct against the definition of done above, then hand it to a human. Do NOT merge it yourself.',
-        ...(optOutLine ? [optOutLine] : []),
-        notificationLine,
         'Fix things directly and aggressively: inspect the existing implementation, make substantive corrections, and keep the PR scope anchored to the definition of done.',
         ...(branchLine ? [branchLine] : []),
         checkoutLine,
@@ -254,9 +242,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         'After every push, wait for the checks on the newly pushed head commit. Never reuse green results from an older commit when declaring the PR ready.',
         'Commit and push fixes only to the existing PR head branch. Use a normal push when possible; if rebasing requires rewriting the PR head, use `--force-with-lease`, never an unconditional force push.',
         'If the push is denied, stop and report the access blocker. Never search for, read, or substitute credentials or tokens, and never modify Git/GitHub authentication configuration.',
-        ...(input.standaloneBabysitter.notifyHumans
-          ? ['If a human can be reached, proactively offer to discuss the PR status, trade-offs, and open questions.']
-          : []),
+        'If a human can be reached, proactively offer to discuss the PR status, trade-offs, and open questions.',
         'When the PR is green — no failing CI, no merge conflicts, and every review comment addressed — report a concise completion summary and output `/exit` on its own line so the Agent Relay task-exit lifecycle closes cleanly.',
         standaloneFinishLine,
         standaloneMergePolicy,

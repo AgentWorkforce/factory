@@ -186,11 +186,7 @@ describe('renderAgentTask', () => {
         baseRef: 'main',
         headRepo: 'AgentWorkforce/hoopsheet',
       },
-      standaloneBabysitter: {
-        specSource: 'pull-request',
-        excludeLabels: ['factory:skip-babysitter'],
-        notifyHumans: false,
-      },
+      standaloneBabysitter: { specSource: 'pull-request' },
       integrationsMountRoot: '/workspace/.integrations',
     })
 
@@ -214,10 +210,6 @@ describe('renderAgentTask', () => {
     expect(task).toContain('push the same PR head')
     expect(task).toContain('re-read the live merge state and fresh checks')
     expect(task).toContain('never merge it yourself')
-    expect(task).toContain('Before your first provider write')
-    expect(task).toContain('factory:skip-babysitter')
-    expect(task).toContain('Do not post status comments, mention humans, send notifications, or escalate')
-    expect(task).not.toContain('proactively offer to discuss')
     expect(task).toContain('Never search for, read, or substitute credentials or tokens')
     expect(task).toContain('output `/exit` on its own line')
     expect(task).not.toContain('DM `broker`')

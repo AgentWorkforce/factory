@@ -91,28 +91,6 @@ export type BabysitterSessionState = {
   pendingDeliveryClaims?: Array<{ deliveryId: string; claimToken: string }>
 }
 
-export type RoutedPrBabysitterClaim = {
-  /** Opaque fencing token for one admission generation. */
-  claimId: string
-  repo: string
-  prNumber: number
-  /** Stable hash of the mounted PR snapshot which admitted this run. */
-  revision: string
-  source: 'issue-created' | 'routed-open-prs'
-  status: 'claimed' | 'running' | 'complete'
-  owner: string
-  leaseUntilMs: number
-  claimedAtMs: number
-  updatedAtMs: number
-  agentName?: string
-}
-
-export const ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60_000
-
-export type RoutedPrBabysitterClaimResult =
-  | { outcome: 'claimed'; claim: RoutedPrBabysitterClaim }
-  | { outcome: 'owned' | 'already-running' | 'unchanged' | 'capacity'; claim?: RoutedPrBabysitterClaim }
-
 export type ConversationMessage = {
   id: string
   text: string
@@ -401,48 +379,6 @@ export interface StateStore {
   setBabysitterSession(workspaceId: string, issueKey: string, session: BabysitterSessionState): Promise<void>
   listBabysitterSessions(workspaceId: string): Promise<Array<[string, BabysitterSessionState]>>
   clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void>
-
-  claimRoutedPrBabysitter(
-    workspaceId: string,
-    identity: string,
-    seed: Omit<RoutedPrBabysitterClaim, 'claimId' | 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
-    owner: string,
-    nowMs: number,
-    leaseMs: number,
-    maxActive: number,
-  ): Promise<RoutedPrBabysitterClaimResult>
-  markRoutedPrBabysitterRunning(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-    agentName: string,
-    nowMs: number,
-  ): Promise<boolean>
-  adoptRoutedPrBabysitterClaim(
-    workspaceId: string,
-    identity: string,
-    agentName: string,
-    owner: string,
-    nowMs: number,
-    leaseMs: number,
-    allowLiveLeaseTransfer?: boolean,
-  ): Promise<RoutedPrBabysitterClaim | undefined>
-  completeRoutedPrBabysitter(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-    agentName: string,
-    nowMs: number,
-  ): Promise<boolean>
-  releaseRoutedPrBabysitterClaim(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-  ): Promise<boolean>
-  listRoutedPrBabysitterClaims(workspaceId: string): Promise<Array<[string, RoutedPrBabysitterClaim]>>
 
   recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
   getCanonicalState(workspaceId: string, key: string): Promise<string | undefined>

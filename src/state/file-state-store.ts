@@ -5,7 +5,6 @@ import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
 
 import { githubRepositoriesMatch } from '../github/repo-identity'
-import { ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS } from '../ports/state'
 import type {
   BabysitterSessionState,
   ClarificationReply,
@@ -14,8 +13,6 @@ import type {
   GithubIssueCommentWatchState,
   ConversationMessage,
   ConversationSessionState,
-  RoutedPrBabysitterClaim,
-  RoutedPrBabysitterClaimResult,
   WaitingClarification,
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
@@ -25,13 +22,12 @@ type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   waitingClarifications: Record<string, WaitingClarification>
   babysitterSessions: Record<string, BabysitterSessionState>
-  routedPrBabysitterClaims: Record<string, RoutedPrBabysitterClaim>
   conversationSessions: Record<string, ConversationSessionState>
   dispatchLifecycles: Record<string, DispatchLifecycle>
 }
 
 type WatchStateDocument = {
-  version: 4
+  version: 3
   workspaces: Record<string, PersistedWorkspaceState>
 }
 
@@ -652,171 +648,6 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
-  override async claimRoutedPrBabysitter(
-    workspaceId: string,
-    identity: string,
-    seed: Omit<RoutedPrBabysitterClaim, 'claimId' | 'status' | 'owner' | 'leaseUntilMs' | 'claimedAtMs' | 'updatedAtMs' | 'agentName'>,
-    owner: string,
-    nowMs: number,
-    leaseMs: number,
-    maxActive: number,
-  ): Promise<RoutedPrBabysitterClaimResult> {
-    return await this.#exclusive(async () => this.#withMutationLock(async () => {
-      const document = await this.#loadFromDisk()
-      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
-      for (const [key, claim] of Object.entries(workspace.routedPrBabysitterClaims)) {
-        if (
-          (claim.status === 'complete' &&
-            claim.updatedAtMs <= nowMs - ROUTED_PR_BABYSITTER_COMPLETED_RETENTION_MS) ||
-          (claim.status !== 'complete' && claim.leaseUntilMs <= nowMs)
-        ) delete workspace.routedPrBabysitterClaims[key]
-      }
-      const existing = workspace.routedPrBabysitterClaims[identity]
-      if (
-        existing?.status !== 'complete' &&
-        existing?.owner === owner &&
-        existing.leaseUntilMs > nowMs &&
-        (existing.source === 'routed-open-prs' ||
-          (existing.source === seed.source && existing.revision === seed.revision))
-      ) {
-        existing.leaseUntilMs = nowMs + leaseMs
-        existing.updatedAtMs = nowMs
-        await this.#persist(document)
-        return { outcome: 'owned', claim: structuredClone(existing) }
-      }
-      if (existing?.status !== 'complete' && existing && existing.leaseUntilMs > nowMs) {
-        return { outcome: 'already-running', claim: structuredClone(existing) }
-      }
-      if (existing?.status === 'complete' && (existing.source === 'issue-created' || existing.revision === seed.revision)) {
-        return { outcome: 'unchanged', claim: structuredClone(existing) }
-      }
-      const active = Object.entries(workspace.routedPrBabysitterClaims).filter(([key, claim]) =>
-        key !== identity && claim.status !== 'complete' && claim.leaseUntilMs > nowMs
-      ).length
-      if (active >= Math.max(1, Math.trunc(maxActive))) return { outcome: 'capacity' }
-      const claim: RoutedPrBabysitterClaim = {
-        ...seed,
-        claimId: randomUUID(),
-        status: 'claimed',
-        owner,
-        leaseUntilMs: nowMs + leaseMs,
-        claimedAtMs: nowMs,
-        updatedAtMs: nowMs,
-      }
-      workspace.routedPrBabysitterClaims[identity] = claim
-      await this.#persist(document)
-      return { outcome: 'claimed', claim: structuredClone(claim) }
-    }))
-  }
-
-  override async markRoutedPrBabysitterRunning(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-    agentName: string,
-    nowMs: number,
-  ): Promise<boolean> {
-    return await this.#exclusive(async () => this.#withMutationLock(async () => {
-      const document = await this.#loadFromDisk()
-      const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (
-        !claim ||
-        claim.owner !== owner ||
-        claim.claimId !== claimId ||
-        claim.status === 'complete' ||
-        claim.leaseUntilMs <= nowMs
-      ) return false
-      claim.status = 'running'
-      claim.agentName = agentName
-      claim.updatedAtMs = nowMs
-      await this.#persist(document)
-      return true
-    }))
-  }
-
-  override async adoptRoutedPrBabysitterClaim(
-    workspaceId: string,
-    identity: string,
-    agentName: string,
-    owner: string,
-    nowMs: number,
-    leaseMs: number,
-    allowLiveLeaseTransfer = false,
-  ): Promise<RoutedPrBabysitterClaim | undefined> {
-    return await this.#exclusive(async () => this.#withMutationLock(async () => {
-      const document = await this.#loadFromDisk()
-      const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (
-        !claim ||
-        claim.status === 'complete' ||
-        (claim.status === 'running' && claim.agentName !== agentName) ||
-        (claim.status === 'claimed' && !allowLiveLeaseTransfer) ||
-        (claim.owner !== owner && claim.leaseUntilMs > nowMs && !allowLiveLeaseTransfer)
-      ) return undefined
-      if (claim.owner !== owner) claim.claimId = randomUUID()
-      claim.owner = owner
-      claim.status = 'running'
-      claim.agentName = agentName
-      claim.leaseUntilMs = nowMs + leaseMs
-      claim.updatedAtMs = nowMs
-      await this.#persist(document)
-      return structuredClone(claim)
-    }))
-  }
-
-  override async completeRoutedPrBabysitter(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-    agentName: string,
-    nowMs: number,
-  ): Promise<boolean> {
-    return await this.#exclusive(async () => this.#withMutationLock(async () => {
-      const document = await this.#loadFromDisk()
-      const claim = document.workspaces[workspaceId]?.routedPrBabysitterClaims[identity]
-      if (
-        !claim ||
-        claim.owner !== owner ||
-        claim.claimId !== claimId ||
-        claim.agentName !== agentName ||
-        claim.status === 'complete'
-      ) return false
-      claim.status = 'complete'
-      claim.leaseUntilMs = nowMs
-      claim.updatedAtMs = nowMs
-      await this.#persist(document)
-      return true
-    }))
-  }
-
-  override async releaseRoutedPrBabysitterClaim(
-    workspaceId: string,
-    identity: string,
-    owner: string,
-    claimId: string,
-  ): Promise<boolean> {
-    return await this.#exclusive(async () => this.#withMutationLock(async () => {
-      const document = await this.#loadFromDisk()
-      const workspace = document.workspaces[workspaceId]
-      const claim = workspace?.routedPrBabysitterClaims[identity]
-      if (!workspace || !claim || claim.owner !== owner || claim.claimId !== claimId) return false
-      delete workspace.routedPrBabysitterClaims[identity]
-      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
-      await this.#persist(document)
-      return true
-    }))
-  }
-
-  override async listRoutedPrBabysitterClaims(workspaceId: string): Promise<Array<[string, RoutedPrBabysitterClaim]>> {
-    return await this.#exclusive(async () => {
-      const document = await this.#loadFromDisk()
-      return Object.entries(document.workspaces[workspaceId]?.routedPrBabysitterClaims ?? {})
-        .map(([identity, claim]) => [identity, structuredClone(claim)])
-    })
-  }
-
   override async reserveConversationSession(
     workspaceId: string,
     conversationId: string,
@@ -991,7 +822,7 @@ export class FileStateStore extends InMemoryStateStore {
       return parseDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
-      return { version: 4, workspaces: {} }
+      return { version: 3, workspaces: {} }
     }
   }
 
@@ -1045,21 +876,19 @@ const parseDocument = (value: unknown): WatchStateDocument => {
   if (!isRecord(value) || !isRecord(value.workspaces)) {
     throw new Error('Factory GitHub watch state file is invalid')
   }
-  if (value.version === 4 || value.version === 3) {
+  if (value.version === 3) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
     for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
       if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
       const watches = rawWorkspace.githubIssueCommentWatches
       const clarifications = rawWorkspace.waitingClarifications
       const babysitters = rawWorkspace.babysitterSessions
-      const routedClaims = rawWorkspace.routedPrBabysitterClaims
       const conversations = rawWorkspace.conversationSessions
       const lifecycles = rawWorkspace.dispatchLifecycles
       if (
         !isRecord(watches) ||
         !isRecord(clarifications) ||
         (babysitters !== undefined && !isRecord(babysitters)) ||
-        (routedClaims !== undefined && !isRecord(routedClaims)) ||
         (conversations !== undefined && !isRecord(conversations)) ||
         (lifecycles !== undefined && !isRecord(lifecycles))
       ) {
@@ -1069,12 +898,11 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
-        routedPrBabysitterClaims: parseRoutedPrBabysitterClaims(routedClaims ?? {}, value.version === 3),
         conversationSessions: parseConversationSessions(conversations ?? {}),
         dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
       }
     }
-    return { version: 4, workspaces }
+    return { version: 3, workspaces }
   }
   if (value.version === 2) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -1090,12 +918,11 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
-        routedPrBabysitterClaims: {},
         conversationSessions: {},
         dispatchLifecycles: {},
       }
     }
-    return { version: 4, workspaces }
+    return { version: 3, workspaces }
   }
   if (value.version === 1) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -1107,12 +934,11 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: {},
         babysitterSessions: {},
-        routedPrBabysitterClaims: {},
         conversationSessions: {},
         dispatchLifecycles: {},
       }
     }
-    return { version: 4, workspaces }
+    return { version: 3, workspaces }
   }
   throw new Error('Factory GitHub watch state file is invalid')
 }
@@ -1125,39 +951,6 @@ const cloneClarification = (record: WaitingClarification): WaitingClarification 
 
 const cloneBabysitterSession = (session: BabysitterSessionState): BabysitterSessionState =>
   structuredClone(session)
-
-const parseRoutedPrBabysitterClaims = (
-  value: Record<string, unknown>,
-  legacyV3 = false,
-): Record<string, RoutedPrBabysitterClaim> => {
-  const claims: Record<string, RoutedPrBabysitterClaim> = {}
-  for (const [identity, candidate] of Object.entries(value)) {
-    if (
-      !isRecord(candidate) ||
-      (!legacyV3 && typeof candidate.claimId !== 'string') ||
-      typeof candidate.repo !== 'string' ||
-      !Number.isSafeInteger(candidate.prNumber) ||
-      (candidate.prNumber as number) < 1 ||
-      typeof candidate.revision !== 'string' ||
-      !['issue-created', 'routed-open-prs'].includes(String(candidate.source)) ||
-      !['claimed', 'running', 'complete'].includes(String(candidate.status)) ||
-      typeof candidate.owner !== 'string' ||
-      typeof candidate.leaseUntilMs !== 'number' ||
-      typeof candidate.claimedAtMs !== 'number' ||
-      typeof candidate.updatedAtMs !== 'number' ||
-      (candidate.agentName !== undefined && typeof candidate.agentName !== 'string')
-    ) {
-      throw new Error('Factory GitHub watch state file is invalid')
-    }
-    claims[identity] = {
-      ...(structuredClone(candidate) as Omit<RoutedPrBabysitterClaim, 'claimId'>),
-      claimId: typeof candidate.claimId === 'string'
-        ? candidate.claimId
-        : `${candidate.owner}:${candidate.claimedAtMs}:${identity}`,
-    }
-  }
-  return claims
-}
 
 const cloneConversationSession = (session: ConversationSessionState): ConversationSessionState =>
   structuredClone(session)
@@ -1341,7 +1134,6 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
   waitingClarifications: {},
   babysitterSessions: {},
-  routedPrBabysitterClaims: {},
   conversationSessions: {},
   dispatchLifecycles: {},
 })
@@ -1350,7 +1142,6 @@ const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&
   Object.keys(workspace.babysitterSessions).length === 0 &&
-  Object.keys(workspace.routedPrBabysitterClaims).length === 0 &&
   Object.keys(workspace.conversationSessions).length === 0 &&
   Object.keys(workspace.dispatchLifecycles).length === 0
 
