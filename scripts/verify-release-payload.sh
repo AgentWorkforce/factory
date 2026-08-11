@@ -12,7 +12,8 @@ mkdir "$TMP_DIR/local" "$TMP_DIR/registry" "$TMP_DIR/local-x" "$TMP_DIR/registry
 npm pack "$PACKAGE_NAME@$VERSION" --pack-destination "$TMP_DIR/registry" --silent >/dev/null
 tar -xzf "$TMP_DIR/local"/*.tgz -C "$TMP_DIR/local-x"
 tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
-diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"
+node "$(dirname "$0")/compare-package-trees.mjs" \
+  "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"
 
 PROVENANCE=$(npm view "$PACKAGE_NAME@$VERSION" \
   dist.attestations.provenance.predicateType 2>/dev/null || true)

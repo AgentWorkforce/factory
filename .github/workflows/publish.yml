@@ -44,18 +44,7 @@ jobs:
 
       - name: Require current main for a live release
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::Live releases must be dispatched from main, not $GITHUB_REF"
-            exit 1
-          fi
-          REMOTE_MAIN=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-          if [ -z "$REMOTE_MAIN" ] || [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
-            echo "::error::Checked-out SHA $GITHUB_SHA is not current origin/main ($REMOTE_MAIN)"
-            exit 1
-          fi
+        run: scripts/require-current-main.sh
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -210,6 +199,7 @@ jobs:
         shell: bash
         run: |
           V='${{ steps.bump.outputs.version }}'
+          scripts/require-current-main.sh
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "v$V" "$GITHUB_SHA" -m "@agent-relay/factory@$V"
@@ -224,7 +214,9 @@ jobs:
       # repo/workflow as a trusted publisher for @agent-relay/factory on npmjs.com.
       - name: Publish
         if: ${{ steps.release_state.outputs.publish == 'true' }}
-        run: npm publish --provenance --access public --tag '${{ github.event.inputs.tag }}'
+        run: |
+          scripts/require-current-main.sh
+          npm publish --provenance --access public --tag '${{ github.event.inputs.tag }}'
 
       - name: Verify final release state
         if: ${{ github.event.inputs.dry_run != 'true' && steps.bump.outputs.needs_version_pr != 'true' }}
