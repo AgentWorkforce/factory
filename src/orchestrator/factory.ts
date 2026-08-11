@@ -6341,6 +6341,7 @@ export class FactoryLoop implements Factory {
       baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue, implementer.spec.preview),
+      ...(implementer.sessionRef ? { sessionRef: implementer.sessionRef } : {}),
     })
     const published = result.author
       ? result

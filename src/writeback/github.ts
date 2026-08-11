@@ -107,6 +107,14 @@ export class GhCliGithubWriteback implements GithubWriteback {
       ])
     }
 
+    // Best-effort: record a late attestation grant so the session reference
+    // rides through to the attestation ledger. Silently omits when the relay
+    // auth env vars are absent (operator key path, no workspace token).
+    // Prefer the per-agent sessionRef over the process-wide env var so that
+    // concurrent implementers each record their own session.
+    const sessionRef = input.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined)
+    await postAttestationGrant(input.repo, sessionRef).catch(() => undefined)
+
     const created = await this.#run([
       'pr',
       'create',
@@ -299,6 +307,39 @@ export class GhCliGithubWriteback implements GithubWriteback {
 const defaultGitRunner: GhRunner = async (args) => {
   const { stdout, stderr } = await execFileAsync('git', args, { maxBuffer: 1024 * 1024 })
   return { stdout, stderr }
+}
+
+/**
+ * Post a late attestation grant to the relay auth API so the session reference
+ * rides through to the attestation ledger after the commit is pushed. The call
+ * is a best-effort fire-and-forget: it requires RELAYAUTH_URL,
+ * RELAY_ATTEST_API_KEY, and RELAY_ATTEST_AGENT_ID to be set in the agent
+ * environment; when any of those are absent the function resolves immediately.
+ * RELAY_ATTEST_SESSION_ID is optional — when set it threads the session
+ * reference into the ledger entry so attestation records are linkable to the
+ * Claude Code / Codex session that produced the commit.
+ */
+async function postAttestationGrant(repo: string, sessionRef?: string): Promise<void> {
+  const baseUrl = process.env.RELAYAUTH_URL
+  const apiKey = process.env.RELAY_ATTEST_API_KEY
+  const agentId = process.env.RELAY_ATTEST_AGENT_ID
+  if (!baseUrl || !apiKey || !agentId) return
+
+  const url = new URL('v1/attestations/grants', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString()
+  await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+    },
+    body: JSON.stringify({
+      agentId,
+      repo,
+      late: true,
+      ...(sessionRef ? { sessionRef } : {}),
+    }),
+    signal: AbortSignal.timeout(5000),
+  })
 }
 
 const githubPullRequestUrl = (value: string, repo: string): string | undefined => {

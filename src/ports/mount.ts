@@ -59,6 +59,12 @@ export interface GithubPublishPullRequestInput {
   baseRef: string
   title: string
   body: string
+  /**
+   * Per-agent session reference forwarded to the attestation ledger. Takes
+   * precedence over the process-wide RELAY_ATTEST_SESSION_ID env var so that
+   * concurrent implementers each record their own session, not a shared one.
+   */
+  sessionRef?: string
 }
 
 export interface GithubPublishPullRequestResult {
