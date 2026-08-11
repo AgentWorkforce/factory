@@ -1076,6 +1076,7 @@ describe('postAttestationGrant session ref forwarding', () => {
       }
     }
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   function makeGithubWriteback() {

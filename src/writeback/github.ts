@@ -110,7 +110,10 @@ export class GhCliGithubWriteback implements GithubWriteback {
     // Best-effort: record a late attestation grant so the session reference
     // rides through to the attestation ledger. Silently omits when the relay
     // auth env vars are absent (operator key path, no workspace token).
-    await postAttestationGrant(input.repo).catch(() => undefined)
+    // Prefer the per-agent sessionRef over the process-wide env var so that
+    // concurrent implementers each record their own session.
+    const sessionRef = input.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined)
+    await postAttestationGrant(input.repo, sessionRef).catch(() => undefined)
 
     const created = await this.#run([
       'pr',
@@ -316,7 +319,7 @@ const defaultGitRunner: GhRunner = async (args) => {
  * reference into the ledger entry so attestation records are linkable to the
  * Claude Code / Codex session that produced the commit.
  */
-async function postAttestationGrant(repo: string): Promise<void> {
+async function postAttestationGrant(repo: string, sessionRef?: string): Promise<void> {
   const baseUrl = process.env.RELAYAUTH_URL
   const apiKey = process.env.RELAY_ATTEST_API_KEY
   const agentId = process.env.RELAY_ATTEST_AGENT_ID
@@ -333,8 +336,9 @@ async function postAttestationGrant(repo: string): Promise<void> {
       agentId,
       repo,
       late: true,
-      sessionRef: process.env.RELAY_ATTEST_SESSION_ID || undefined,
+      ...(sessionRef ? { sessionRef } : {}),
     }),
+    signal: AbortSignal.timeout(5000),
   })
 }
 
