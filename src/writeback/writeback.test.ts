@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
@@ -1043,6 +1043,133 @@ describe('GhCliGithubWriteback', () => {
         },
       },
     }, 'unsafe')).rejects.toThrow(/source URL does not match AgentWorkforce\/factory#4/)
+  })
+})
+
+describe('postAttestationGrant session ref forwarding', () => {
+  const savedEnv: Record<string, string | undefined> = {}
+  const attestEnvKeys = ['RELAYAUTH_URL', 'RELAY_ATTEST_API_KEY', 'RELAY_ATTEST_AGENT_ID', 'RELAY_ATTEST_SESSION_ID']
+
+  function setAttestation(overrides: Record<string, string | undefined> = {}) {
+    const defaults: Record<string, string> = {
+      RELAYAUTH_URL: 'https://relayauth.test',
+      RELAY_ATTEST_API_KEY: 'ra_test_key',
+      RELAY_ATTEST_AGENT_ID: 'agent_factory_test',
+    }
+    for (const key of attestEnvKeys) {
+      savedEnv[key] = process.env[key]
+      const value = key in overrides ? overrides[key] : defaults[key]
+      if (value === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+  }
+
+  afterEach(() => {
+    for (const key of attestEnvKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = savedEnv[key]
+      }
+    }
+    vi.restoreAllMocks()
+  })
+
+  function makeGithubWriteback() {
+    return new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[1] === 'create') {
+          return { stdout: 'https://github.com/AgentWorkforce/factory/pull/1\n' }
+        }
+        return {
+          stdout: JSON.stringify({
+            number: 1,
+            url: 'https://github.com/AgentWorkforce/factory/pull/1',
+            headRefName: 'feat/attest-test',
+            headRefOid: 'sha-attest',
+            author: { login: 'bot-user' },
+          }),
+        }
+      },
+      gitRunner: async (args) => {
+        if (args.includes('symbolic-ref')) return { stdout: 'feat/attest-test\n' }
+        if (args.includes('rev-parse')) return { stdout: 'sha-attest\n' }
+        return { stdout: '' }
+      },
+    })
+  }
+
+  it('forwards sessionRef to the grants body when RELAY_ATTEST_SESSION_ID is set', async () => {
+    setAttestation({ RELAY_ATTEST_SESSION_ID: 'ses_test_123' })
+    const requests: Array<{ url: string; body: unknown }> = []
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      requests.push({ url, body: JSON.parse(String(init?.body ?? 'null')) })
+      return new Response(JSON.stringify({ jti: 'att_1', finalizeKey: 'fk', notAfter: 'n' }), { status: 201 })
+    })
+
+    await makeGithubWriteback().publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Test PR',
+      body: 'body',
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.url).toBe('https://relayauth.test/v1/attestations/grants')
+    expect(requests[0]?.body).toMatchObject({
+      agentId: 'agent_factory_test',
+      repo: 'AgentWorkforce/factory',
+      late: true,
+      sessionRef: 'ses_test_123',
+    })
+  })
+
+  it('omits sessionRef from the grants body when RELAY_ATTEST_SESSION_ID is absent', async () => {
+    setAttestation({ RELAY_ATTEST_SESSION_ID: undefined })
+    const requests: Array<{ url: string; body: unknown }> = []
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      requests.push({ url, body: JSON.parse(String(init?.body ?? 'null')) })
+      return new Response(JSON.stringify({ jti: 'att_2', finalizeKey: 'fk2', notAfter: 'n2' }), { status: 201 })
+    })
+
+    await makeGithubWriteback().publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Test PR',
+      body: 'body',
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.body).toMatchObject({
+      agentId: 'agent_factory_test',
+      repo: 'AgentWorkforce/factory',
+      late: true,
+    })
+    expect((requests[0]?.body as Record<string, unknown>)['sessionRef']).toBeUndefined()
+  })
+
+  it('silently skips the grants call when RELAYAUTH_URL is absent', async () => {
+    setAttestation({ RELAYAUTH_URL: undefined, RELAY_ATTEST_SESSION_ID: 'ses_skip' })
+    const fetchCalls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      fetchCalls.push(String(url))
+      return new Response('{}', { status: 201 })
+    })
+
+    await makeGithubWriteback().publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      clonePath: '/work/factory',
+      baseRef: 'main',
+      title: 'Test PR',
+      body: 'body',
+    })
+
+    expect(fetchCalls).toHaveLength(0)
   })
 })
 
