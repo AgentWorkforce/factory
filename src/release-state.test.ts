@@ -87,7 +87,7 @@ describe('release state recovery', () => {
 })
 
 describe('packed payload comparison', () => {
-  it('compares file contents and executable modes', async () => {
+  it('compares file contents and all permission modes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-release-payload-'))
     const left = join(root, 'left')
     const right = join(root, 'right')
@@ -100,6 +100,10 @@ describe('packed payload comparison', () => {
       await Promise.all([chmod(join(left, 'cli'), 0o755), chmod(join(right, 'cli'), 0o644)])
       expect(await comparePackageTrees(left, right)).toContain('cli: mode 755 != 644')
       await chmod(join(right, 'cli'), 0o755)
+      expect(await comparePackageTrees(left, right)).toEqual([])
+      await chmod(join(left, 'cli'), 0o4755)
+      expect(await comparePackageTrees(left, right)).toContain('cli: mode 4755 != 755')
+      await chmod(join(right, 'cli'), 0o4755)
       expect(await comparePackageTrees(left, right)).toEqual([])
       await writeFile(join(right, 'cli'), '#!/bin/false\n')
       expect(await comparePackageTrees(left, right)).toContain('cli: content differs')
@@ -114,8 +118,9 @@ describe('publish workflow policy', () => {
 
   it('uses a protected-branch-safe version PR and never pushes HEAD to main', () => {
     expect(workflow).toContain('pull-requests: write')
-    expect(workflow).toContain('name: Require current main for a live release')
+    expect(workflow).toContain('name: Require main branch for a live release')
     expect(workflow.match(/scripts\/require-current-main\.sh/g)).toHaveLength(3)
+    expect(workflow).toContain('scripts/require-current-main.sh --ref-only')
     expect(workflow).toContain('name: Open version PR')
     expect(workflow).toContain('gh pr create')
     expect(workflow).toContain('git add package.json package-lock.json')
@@ -129,6 +134,9 @@ describe('publish workflow policy', () => {
     expect(workflow.match(/scripts\/verify-release-payload\.sh/g)).toHaveLength(3)
     expect(workflow).toContain('git worktree add --detach "$TAG_DIR" "$TAG_TARGET"')
     expect(workflow).toContain("steps.release_state.outputs.publish == 'true'")
+    expect(workflow.match(/RELEASE_STATE: \$\{\{ steps\.release_state\.outputs\.state \}\}/g))
+      .toHaveLength(2)
+    expect(workflow.match(/\[ "\$RELEASE_STATE" = "new-release" \]/g)).toHaveLength(2)
     expect(workflow).toContain('NPM_DIST_TAG: ${{ github.event.inputs.tag }}')
     expect(workflow).toContain('npm publish --provenance --access public --tag "$NPM_DIST_TAG"')
     expect(workflow.indexOf('- name: Create release tag')).toBeLessThan(

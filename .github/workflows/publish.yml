@@ -42,9 +42,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require current main for a live release
+      # A rerun keeps its original GITHUB_SHA. Require the main ref here, then
+      # require the current main SHA only for fresh side effects below. Verified
+      # recovery states remain resumable if unrelated commits advance main.
+      - name: Require main branch for a live release
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: scripts/require-current-main.sh
+        run: scripts/require-current-main.sh --ref-only
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -196,10 +199,14 @@ jobs:
       # matching tag, or restores a missing tag for an identical npm payload.
       - name: Create release tag
         if: ${{ steps.release_state.outputs.create_tag == 'true' }}
+        env:
+          RELEASE_STATE: ${{ steps.release_state.outputs.state }}
         shell: bash
         run: |
           V='${{ steps.bump.outputs.version }}'
-          scripts/require-current-main.sh
+          if [ "$RELEASE_STATE" = "new-release" ]; then
+            scripts/require-current-main.sh
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "v$V" "$GITHUB_SHA" -m "@agent-relay/factory@$V"
@@ -216,8 +223,11 @@ jobs:
         if: ${{ steps.release_state.outputs.publish == 'true' }}
         env:
           NPM_DIST_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_STATE: ${{ steps.release_state.outputs.state }}
         run: |
-          scripts/require-current-main.sh
+          if [ "$RELEASE_STATE" = "new-release" ]; then
+            scripts/require-current-main.sh
+          fi
           npm publish --provenance --access public --tag "$NPM_DIST_TAG"
 
       - name: Verify final release state

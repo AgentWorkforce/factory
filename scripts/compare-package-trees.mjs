@@ -27,8 +27,11 @@ async function compareEntry(leftPath, rightPath, relativePath, differences) {
     return
   }
 
-  const leftMode = left.mode & 0o777
-  const rightMode = right.mode & 0o777
+  // npm tarballs preserve the special permission bits as well as rwx bits.
+  // Include setuid, setgid, and sticky so recovery cannot accept a payload
+  // whose effective package metadata differs from the registry artifact.
+  const leftMode = left.mode & 0o7777
+  const rightMode = right.mode & 0o7777
   if (leftMode !== rightMode) {
     differences.push(
       `${relativePath}: mode ${leftMode.toString(8)} != ${rightMode.toString(8)}`,
