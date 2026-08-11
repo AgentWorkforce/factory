@@ -1,7 +1,11 @@
+import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
 
+import { comparePackageTrees } from '../scripts/compare-package-trees.mjs'
 import { planReleaseState } from '../scripts/release-state.mjs'
 
 const base = {
@@ -82,13 +86,36 @@ describe('release state recovery', () => {
   })
 })
 
+describe('packed payload comparison', () => {
+  it('compares file contents and executable modes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-release-payload-'))
+    const left = join(root, 'left')
+    const right = join(root, 'right')
+    try {
+      await Promise.all([mkdir(left), mkdir(right)])
+      await Promise.all([
+        writeFile(join(left, 'cli'), '#!/bin/sh\n'),
+        writeFile(join(right, 'cli'), '#!/bin/sh\n'),
+      ])
+      await Promise.all([chmod(join(left, 'cli'), 0o755), chmod(join(right, 'cli'), 0o644)])
+      expect(await comparePackageTrees(left, right)).toContain('cli: mode 755 != 644')
+      await chmod(join(right, 'cli'), 0o755)
+      expect(await comparePackageTrees(left, right)).toEqual([])
+      await writeFile(join(right, 'cli'), '#!/bin/false\n')
+      expect(await comparePackageTrees(left, right)).toContain('cli: content differs')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('publish workflow policy', () => {
   const workflow = readFileSync('.github/workflows/publish.yml', 'utf8')
 
   it('uses a protected-branch-safe version PR and never pushes HEAD to main', () => {
     expect(workflow).toContain('pull-requests: write')
     expect(workflow).toContain('name: Require current main for a live release')
-    expect(workflow).toContain('REMOTE_MAIN')
+    expect(workflow.match(/scripts\/require-current-main\.sh/g)).toHaveLength(3)
     expect(workflow).toContain('name: Open version PR')
     expect(workflow).toContain('gh pr create')
     expect(workflow).toContain('git add package.json package-lock.json')
