@@ -19,13 +19,14 @@ on:
         type: choice
         options: [latest, next, beta, alpha]
       dry_run:
-        description: 'Dry run (no publish, no version commit, no tag)'
+        description: 'Dry run (no publish, no version PR, no tag)'
         required: true
         default: false
         type: boolean
 
 permissions:
   contents: write
+  pull-requests: write
   id-token: write   # required for npm OIDC provenance (trusted publisher)
 
 concurrency:
@@ -56,9 +57,11 @@ jobs:
       - name: Test
         run: npm run test --if-present
 
-      - name: Bump version
+      - name: Resolve version
         id: bump
+        shell: bash
         run: |
+          ORIGINAL=$(node -p "require('./package.json').version")
           CUSTOM='${{ github.event.inputs.custom_version }}'
           BUMP='${{ github.event.inputs.version }}'
           if [ -n "$CUSTOM" ]; then
@@ -66,53 +69,182 @@ jobs:
           elif [ "$BUMP" != "none" ]; then
             npm version "$BUMP" --no-git-tag-version
           fi
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          V=$(node -p "require('./package.json').version")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "$ORIGINAL" = "$V" ]; then
+            echo "needs_version_pr=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_version_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Protected main requires a PR. A real release never publishes until its
+      # exact version is already canonical on main. Re-run with version=none
+      # after this PR merges to perform the release.
+      - name: Open version PR
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.bump.outputs.needs_version_pr == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V='${{ steps.bump.outputs.version }}'
+          BRANCH="release/v$V"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            REMOTE_VERSION=$(git show FETCH_HEAD:package.json | node -e \
+              "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
+            if [ "$REMOTE_VERSION" != "$V" ]; then
+              echo "::error::Existing $BRANCH contains version $REMOTE_VERSION, expected $V"
+              exit 1
+            fi
+          else
+            git switch -c "$BRANCH"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add package.json package-lock.json
+            git commit -m "chore(release): @agent-relay/factory@$V"
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+          PR_URL=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --head "$BRANCH" --json url --jq '.[0].url // empty')
+          if [ -z "$PR_URL" ]; then
+            PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main \
+              --head "$BRANCH" --title "chore(release): @agent-relay/factory@$V" \
+              --body "Canonical version metadata for @agent-relay/factory@$V. After merge, re-run Publish with version=none.")
+          fi
+          echo "Prepared $PR_URL; nothing was published or tagged." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify packed end-to-end lifecycle
+        if: ${{ github.event.inputs.dry_run == 'true' || steps.bump.outputs.needs_version_pr != 'true' }}
         run: npm run verify:e2e
         env:
           FACTORY_E2E_HEAD_SHA: ${{ github.sha }}
 
       - name: Upload release E2E attestation
+        if: ${{ github.event.inputs.dry_run == 'true' || steps.bump.outputs.needs_version_pr != 'true' }}
         uses: actions/upload-artifact@v6
         with:
           name: factory-release-e2e-${{ github.sha }}
           path: artifacts/factory-e2e-attestation.json
           if-no-files-found: error
 
-      - name: Verify version is unpublished
+      - name: Dry-run package
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: npm publish --dry-run --access public --tag '${{ github.event.inputs.tag }}'
+
+      - name: Inspect release state
+        id: release_state
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.bump.outputs.needs_version_pr != 'true' }}
+        shell: bash
         run: |
+          set -euo pipefail
           V='${{ steps.bump.outputs.version }}'
-          if [ -n "$(npm view @agent-relay/factory@"$V" version 2>/dev/null || true)" ]; then
-            echo "::error::@agent-relay/factory@$V is already on npm. Pick a higher version."; exit 1
-          fi
-          echo "@agent-relay/factory@$V: unpublished — OK"
-
-      # npm >= 11.5.1 for the OIDC trusted-publisher (provenance) flow.
-      - name: Update npm for OIDC support
-        # npm 12 requires Node >=22.22.2, while this workflow uses Node 22.14.0.
-        # npm 11 supports trusted publishing and remains compatible with Node 22.14.
-        run: npm install -g npm@11.18.0
-
-      # No NPM_TOKEN: relies on npm OIDC trusted-publisher. Register this
-      # repo/workflow as a trusted publisher for @agent-relay/factory on
-      # npmjs.com before the first CI publish.
-      - name: Publish
-        run: |
-          FLAGS=(--access public --tag "${{ github.event.inputs.tag }}")
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            npm publish --dry-run "${FLAGS[@]}"
-          else
-            npm publish --provenance "${FLAGS[@]}"
+          PUBLISHED=false
+          if [ "$(npm view @agent-relay/factory@"$V" version 2>/dev/null || true)" = "$V" ]; then
+            PUBLISHED=true
+            DIST_TAG=$(npm view @agent-relay/factory \
+              'dist-tags.${{ github.event.inputs.tag }}' 2>/dev/null || true)
+            if [ "$DIST_TAG" != "$V" ]; then
+              echo "::error::npm dist-tag ${{ github.event.inputs.tag }} points to $DIST_TAG, expected $V"
+              exit 1
+            fi
           fi
 
-      - name: Commit + tag + push
-        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
+          DIRECT=$(git ls-remote origin "refs/tags/v$V" | awk '{print $1}')
+          PEELED=$(git ls-remote origin "refs/tags/v$V^{}" | awk '{print $1}')
+          TAG_TARGET=${PEELED:-$DIRECT}
+          TAG_PAYLOAD_MATCHES=false
+          if [ -n "$TAG_TARGET" ]; then
+            # These are the tracked inputs which determine the published payload.
+            # CI independently compares the rebuilt tarball when npm already has V.
+            if git diff --quiet "$TAG_TARGET" "$GITHUB_SHA" -- \
+              package.json src schemas bin/factory.mjs README.md LICENSE \
+              scripts/factory-canary.sh scripts/com.agentrelay.factory-canary.plist.example; then
+              TAG_PAYLOAD_MATCHES=true
+            fi
+          fi
+
+          REGISTRY_PAYLOAD_MATCHES=false
+          if [ "$PUBLISHED" = true ]; then
+            TMP_DIR=$(mktemp -d)
+            trap 'rm -rf "$TMP_DIR"' EXIT
+            mkdir "$TMP_DIR/local" "$TMP_DIR/registry" "$TMP_DIR/local-x" "$TMP_DIR/registry-x"
+            npm pack --pack-destination "$TMP_DIR/local" --silent >/dev/null
+            npm pack "@agent-relay/factory@$V" \
+              --pack-destination "$TMP_DIR/registry" --silent >/dev/null
+            tar -xzf "$TMP_DIR/local"/*.tgz -C "$TMP_DIR/local-x"
+            tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
+            PROVENANCE=$(npm view "@agent-relay/factory@$V" \
+              dist.attestations.provenance.predicateType 2>/dev/null || true)
+            if diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package" && \
+               [ "$PROVENANCE" = "https://slsa.dev/provenance/v1" ]; then
+              REGISTRY_PAYLOAD_MATCHES=true
+            fi
+          fi
+
+          PLAN=$(node scripts/release-state.mjs \
+            --published "$PUBLISHED" \
+            --tag-target "$TAG_TARGET" \
+            --head "$GITHUB_SHA" \
+            --tag-payload-matches "$TAG_PAYLOAD_MATCHES" \
+            --registry-payload-matches "$REGISTRY_PAYLOAD_MATCHES")
+          echo "$PLAN"
+          echo "create_tag=$(node -e "const p=JSON.parse(process.argv[1]);console.log(p.createTag)" "$PLAN")" >> "$GITHUB_OUTPUT"
+          echo "publish=$(node -e "const p=JSON.parse(process.argv[1]);console.log(p.publish)" "$PLAN")" >> "$GITHUB_OUTPUT"
+          echo "state=$(node -e "const p=JSON.parse(process.argv[1]);console.log(p.state)" "$PLAN")" >> "$GITHUB_OUTPUT"
+
+      # Tagging a commit is allowed on protected main. Doing it before npm makes
+      # either partial failure safely resumable: a rerun publishes an existing
+      # matching tag, or restores a missing tag for an identical npm payload.
+      - name: Create release tag
+        if: ${{ steps.release_state.outputs.create_tag == 'true' }}
+        shell: bash
         run: |
           V='${{ steps.bump.outputs.version }}'
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          git commit -m "chore(release): @agent-relay/factory@$V" || echo "nothing to commit"
-          git tag -a "v$V" -m "@agent-relay/factory@$V"
-          git push origin HEAD --follow-tags
+          git tag -a "v$V" "$GITHUB_SHA" -m "@agent-relay/factory@$V"
+          git push origin "refs/tags/v$V"
+
+      # npm >= 11.5.1 for the OIDC trusted-publisher (provenance) flow.
+      - name: Update npm for OIDC support
+        if: ${{ steps.release_state.outputs.publish == 'true' }}
+        run: npm install -g npm@11.18.0
+
+      # No NPM_TOKEN: relies on npm OIDC trusted-publisher. Register this
+      # repo/workflow as a trusted publisher for @agent-relay/factory on npmjs.com.
+      - name: Publish
+        if: ${{ steps.release_state.outputs.publish == 'true' }}
+        run: npm publish --provenance --access public --tag '${{ github.event.inputs.tag }}'
+
+      - name: Verify final release state
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.bump.outputs.needs_version_pr != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V='${{ steps.bump.outputs.version }}'
+          for attempt in 1 2 3 4 5; do
+            [ "$(npm view @agent-relay/factory@"$V" version 2>/dev/null || true)" = "$V" ] && break
+            sleep $((attempt * 2))
+          done
+          [ "$(npm view @agent-relay/factory@"$V" version)" = "$V" ]
+          [ "$(npm view @agent-relay/factory 'dist-tags.${{ github.event.inputs.tag }}')" = "$V" ]
+          TAG_TARGET=$(git ls-remote origin "refs/tags/v$V^{}" | awk '{print $1}')
+          if [ -z "$TAG_TARGET" ]; then
+            TAG_TARGET=$(git ls-remote origin "refs/tags/v$V" | awk '{print $1}')
+          fi
+          [ -n "$TAG_TARGET" ]
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir "$TMP_DIR/local" "$TMP_DIR/registry" "$TMP_DIR/local-x" "$TMP_DIR/registry-x"
+          npm pack --pack-destination "$TMP_DIR/local" --silent >/dev/null
+          npm pack "@agent-relay/factory@$V" \
+            --pack-destination "$TMP_DIR/registry" --silent >/dev/null
+          tar -xzf "$TMP_DIR/local"/*.tgz -C "$TMP_DIR/local-x"
+          tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
+          diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"
+          [ "$(npm view "@agent-relay/factory@$V" \
+            dist.attestations.provenance.predicateType)" = "https://slsa.dev/provenance/v1" ]
+          echo "Release state: ${{ steps.release_state.outputs.state }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "npm payload/provenance/dist-tag and v$V are consistent; package metadata was canonical before publish." >> "$GITHUB_STEP_SUMMARY"
