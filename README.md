@@ -163,11 +163,20 @@ instruction to rerun the Factory command in an interactive terminal instead.
 
 ### Mounted Notion specs
 
-Notion is an intake source, not a lifecycle writeback surface. Factory reads a
-Relayfile-mounted page, binds it to a stable `notion:<page-id>` identity and
-digest, then either creates a labeled GitHub issue for a repository target or
-dispatches an exact-path workspace task through the fleet. Existing GitHub and
-Linear discovery continue unchanged.
+Notion is an intake source, not a lifecycle issue source or writeback surface.
+Factory reads a Relayfile-mounted page, binds it to a stable
+`notion:<page-id>` identity and digest, then either creates a labeled GitHub
+issue for a repository target or dispatches an exact-path workspace task
+through the fleet. The config field `issueSource` continues to select the
+discovery and lifecycle-writeback adapter (`linear` or `github`); Notion intake
+normalizes into that lifecycle instead of becoming a third adapter.
+
+The absence of Notion writeback is deliberate. Relayfile supplies the mounted
+page as a read-only execution contract, and Factory has no guarded Notion
+property/comment writeback adapter or operator-defined lifecycle mapping.
+Repository targets reconcile accepted, dispatched, PR, blocked, and completed
+state on their generated GitHub issue. Native Notion lifecycle reconciliation
+requires a separate provider capability and product contract.
 
 New pages fail closed unless the first block is an explicit ready spec:
 
@@ -206,15 +215,35 @@ hatch is deliberately page-specific; there is no title or content heuristic.
 }
 ```
 
-`mountRoot` and `statePath` resolve relative to the manifest file. `workerMountRoot`
-is the repo-relative read-only mount workers receive. With the recommended
+`mountRoot` and `statePath` resolve relative to the manifest file. `statePath`
+is a local receipt cache, not the dispatch authority: before creating an issue
+or spawning an agent, Factory creates one immutable, digest-bound claim in the
+active Agent Relay workspace. Workspace-global claim-channel uniqueness stops
+two machines with independent caches from dispatching the same source key. A
+failed or ambiguous claim write blocks dispatch. All non-dry-run Notion intake
+therefore requires a resolvable active Agent Relay workspace key.
+
+`workerMountRoot` is the repo-relative read-only mount workers receive. With the recommended
 `relay-channel` transport, Factory base64-chunks the digest-bound mounted bytes
 into a workspace-private Agent Relay channel. A worker on any fleet machine can
 reconstruct the exact file at `workerMountRoot`, set it to mode `0444`, and
 apply the source SHA-256 gate without exposing the page in a public issue.
-The field defaults to `{ "kind": "local" }` whenever it is omitted, including
-in new manifests. Portable delivery must be selected explicitly and requires a
-resolvable active Agent Relay workspace key; otherwise dispatch fails closed.
+`workerMountTransport` defaults to `{ "kind": "local" }` whenever it is
+omitted, including in new manifests. Portable delivery must be selected
+explicitly; otherwise the worker uses the local mount path. Missing portable
+delivery or claim capability fails closed.
+
+If dispatch stops after creating the durable claim but before recording its
+receipt, re-running stays blocked rather than guessing whether the downstream
+side effect happened. The blocked result includes the source key. A workspace
+administrator can derive the claim channel as
+`factory-notion-claim-<sha256(sourceKey)>`. After verifying that no matching
+lifecycle issue or workspace agent exists, the administrator may delete that
+channel in Agent Relay and re-run intake. Never clear a claim merely because
+its local receipt is missing: the shared claim, issue marker, and running agent
+must be reconciled first. A blocked portable-mount migration uses the same
+channel formula with `<sourceKey>:portable-mount` as the hashed value; verify
+the worker was not redispatched before clearing it.
 `page` accepts a Notion URL or a bare page ID.
 
 Plan without writes, then dispatch:
@@ -227,9 +256,9 @@ factory intake notion ./ops/notion-intake.json --backend relay
 Repository targets require the `factory-ready` and matching
 `agent:<recipe>` labels to already exist. Factory automatically prefixes their
 issue titles with `[factory]` so the hosted brain's independent safety gate can
-accept them. Re-running is idempotent: GitHub work
-is claimed by a hidden source marker, while exact-path dispatches use a local
-digest-bound receipt. A changed mounted spec blocks instead of silently mutating
+accept them. Re-running reconciles the workspace-global claim with the GitHub
+source marker or the running exact-path agent; the local digest-bound receipt is
+only a cache. A changed mounted spec blocks instead of silently mutating
 already-dispatched work.
 
 ### Feature-map validation
@@ -569,7 +598,13 @@ Tokens involved — set only the first one on the orchestrator host:
 
 ## Configuration
 
-Pass a JSON file via `--config`. Beyond the two required fields above, useful
+Factory resolves exactly one contract: the path passed via `--config`, or
+`./factory.config.json` in the command's current working directory when the
+flag is omitted. It does not search target repositories, walk to a clone root,
+or merge multiple configs; a config in another repository is inert unless it
+is selected explicitly.
+
+Beyond the two required fields above, useful
 knobs include issue **routing** (`repos.byLabel` / `byProject` / `keywordRules` /
 `default`), the **safety gate** (`safety.requireTitlePrefix`, `safety.requireTeamKey`),
 `mergePolicy` (defaults to `never`), per-role **model** overrides, and an optional

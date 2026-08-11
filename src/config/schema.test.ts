@@ -259,6 +259,13 @@ describe('FactoryConfigSchema', () => {
     }
   })
 
+  it('keeps Notion on the separate intake path instead of accepting it as a lifecycle issue source', () => {
+    expect(() => FactoryConfigSchema.parse({
+      issueSource: 'notion',
+      repos: { default: 'AgentWorkforce/factory' },
+    })).toThrow()
+  })
+
   it.each(['app', 'user', 'auto'] as const)('accepts github.identity %s', (identity) => {
     const parsed = FactoryConfigSchema.parse({
       repos: { default: 'AgentWorkforce/factory' },

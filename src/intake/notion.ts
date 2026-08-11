@@ -117,7 +117,23 @@ export interface NotionContractPublisher {
   dispose?(): Promise<void>
 }
 
+export interface NotionIntakeClaim {
+  sourceKey: string
+  digest: string
+  claimedAt: string
+}
+
+export interface NotionIntakeClaimStore {
+  get(sourceKey: string): Promise<NotionIntakeClaim | undefined>
+  claim(input: NotionIntakeClaim): Promise<{
+    status: 'claimed' | 'existing'
+    claim: NotionIntakeClaim
+  }>
+  dispose?(): Promise<void>
+}
+
 export interface WorkspaceTaskDispatcher {
+  find?(name: string): Promise<{ agent: string; node?: string } | undefined>
   dispatch(input: {
     name: string
     invocationId: string
@@ -193,6 +209,7 @@ export async function runNotionIntake(input: {
   github?: GithubIssuePublisher
   workspace?: WorkspaceTaskDispatcher
   contracts?: NotionContractPublisher
+  claims?: NotionIntakeClaimStore
   now?: () => Date
 }): Promise<NotionIntakeReport> {
   if (!input.dispatch) return await runNotionIntakeUnlocked(input)
@@ -419,11 +436,8 @@ async function publishRepoTask(
 
   const existing = await input.github.findBySource(target.repo, task.sourceKey)
   if (existing) {
-    if (!receipt) {
-      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue marker has no authoritative local receipt' }
-    }
-    if (existing.number !== receipt.issue.number || existing.url !== receipt.issue.url) {
-      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue does not match the authoritative local receipt' }
+    if (receipt && (existing.number !== receipt.issue.number || existing.url !== receipt.issue.url)) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue does not match the local receipt cache' }
     }
     const currentDigest = digestFromBody(existing.body)
     if (!currentDigest) {
@@ -432,10 +446,28 @@ async function publishRepoTask(
     if (currentDigest !== task.digest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
+    let claim = await observeNotionClaim(task, input)
+    if (!claim) {
+      if (!receipt) {
+        return {
+          ...base,
+          status: 'blocked',
+          issue: existing,
+          reason: 'lifecycle issue marker has neither a durable shared claim nor a local migration receipt',
+        }
+      }
+      claim = (await claimNotionTask(task, input)).claim
+    }
     const bodyDelivery = contractDeliveryFromBody(existing.body)
     if (input.manifest.workerMountTransport.kind === 'local') {
-      if (receipt.delivery || bodyDelivery) {
+      if (receipt?.delivery || bodyDelivery) {
         return { ...base, status: 'blocked', issue: existing, reason: 'portable Notion delivery cannot be downgraded to a local worker mount' }
+      }
+      state.receipts[task.sourceKey] = receipt ?? {
+        kind: 'github',
+        digest: task.digest,
+        issue: { number: existing.number, url: existing.url },
+        dispatchedAt: claim.claimedAt,
       }
       return { ...base, status: 'already-dispatched', issue: existing }
     }
@@ -453,24 +485,29 @@ async function publishRepoTask(
         reason: 'existing lifecycle issue body was edited; refusing to overwrite it during portable mount migration',
       }
     }
-    if (receipt.delivery && bodyDelivery && !sameContractDelivery(receipt.delivery, bodyDelivery)) {
-      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue portable delivery does not match its authoritative receipt' }
+    if (receipt?.delivery && bodyDelivery && !sameContractDelivery(receipt.delivery, bodyDelivery)) {
+      return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue portable delivery does not match its local receipt cache' }
     }
-    const delivery = await prepareContractDelivery(task, input, receipt.delivery ?? bodyDelivery)
+    const delivery = await prepareContractDelivery(task, input, receipt?.delivery ?? bodyDelivery)
     if (delivery && !bodyDelivery) {
+      await assertMountedTaskUnchanged(task)
       await input.github.updateIssue({
         repo: target.repo,
         number: existing.number,
         body: renderIssueBody(task, summary, delivery),
       })
     }
-    if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
-      state.receipts[task.sourceKey] = { ...receipt, delivery }
+    state.receipts[task.sourceKey] = {
+      kind: 'github',
+      digest: task.digest,
+      issue: { number: existing.number, url: existing.url },
+      ...(delivery ? { delivery } : {}),
+      dispatchedAt: receipt?.dispatchedAt ?? claim.claimedAt,
     }
     return { ...base, status: 'already-dispatched', issue: existing }
   }
   if (receipt) {
-    return { ...base, status: 'blocked', issue: receipt.issue, reason: 'authoritative lifecycle receipt exists but its issue marker was not found' }
+    return { ...base, status: 'blocked', issue: receipt.issue, reason: 'local lifecycle receipt exists but its issue marker was not found' }
   }
 
   const visibility = await input.github.repositoryVisibility(target.repo)
@@ -483,6 +520,15 @@ async function publishRepoTask(
     return { ...base, status: 'blocked', reason: `missing required GitHub labels: ${missing.join(', ')}` }
   }
   const delivery = await prepareContractDelivery(task, input)
+  const claim = await claimNotionTask(task, input)
+  if (claim.status === 'existing') {
+    return {
+      ...base,
+      status: 'blocked',
+      reason: 'durable Notion claim already exists; refusing lifecycle issue creation from this dispatcher',
+    }
+  }
+  await assertMountedTaskUnchanged(task)
   const issue = await input.github.createIssue({
     repo: target.repo,
     title: factoryIssueTitle(task.title),
@@ -494,7 +540,7 @@ async function publishRepoTask(
     digest: task.digest,
     issue,
     ...(delivery ? { delivery } : {}),
-    dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
+    dispatchedAt: claim.claim.claimedAt,
   }
   return { ...base, status: 'dispatched', issue }
 }
@@ -524,6 +570,29 @@ async function dispatchWorkspaceTask(
     }
     if (receipt.digest !== task.digest) {
       return { ...base, status: 'blocked', agent: receipt.agent, node: receipt.node, reason: 'mounted spec changed after workspace dispatch' }
+    }
+    await claimNotionTask(task, input)
+    const needsPortableMigration = input.manifest.workerMountTransport.kind !== 'local' && !receipt.delivery
+    if (needsPortableMigration) {
+      if (!input.workspace?.redispatch) {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'portable workspace mount migration requires a workspace redispatcher',
+        }
+      }
+      const migrationClaim = await claimNotionTask(task, input, `${task.sourceKey}:portable-mount`)
+      if (migrationClaim.status === 'existing') {
+        return {
+          ...base,
+          status: 'blocked',
+          agent: receipt.agent,
+          node: receipt.node,
+          reason: 'durable portable-mount migration claim already exists; refusing a second workspace redispatch',
+        }
+      }
     }
     const delivery = await prepareContractDelivery(task, input, receipt.delivery)
     if (delivery && !sameContractDelivery(receipt.delivery, delivery)) {
@@ -557,10 +626,49 @@ async function dispatchWorkspaceTask(
   }
   if (!input.workspace) return { ...base, status: 'blocked', reason: 'workspace task dispatcher is not configured' }
 
-  const delivery = await prepareContractDelivery(task, input)
-
   const suffix = createHash('sha256').update(task.sourceKey).digest('hex').slice(0, 8)
   const name = `notion-${task.pageId.slice(-8)}-${suffix}`
+  const claim = await claimNotionTask(task, input)
+  if (claim.status === 'existing') {
+    if (!input.workspace.find) {
+      return {
+        ...base,
+        status: 'blocked',
+        reason: 'durable Notion claim already exists but this workspace dispatcher cannot look up running agents; refusing a second spawn',
+      }
+    }
+    const running = await input.workspace.find(name)
+    if (!running) {
+      return {
+        ...base,
+        status: 'blocked',
+        reason: 'durable Notion claim already exists but no running workspace agent was found; refusing a second spawn',
+      }
+    }
+    const migrationSourceKey = `${task.sourceKey}:portable-mount`
+    if (input.manifest.workerMountTransport.kind !== 'local' &&
+      await observeNotionClaim(task, input, migrationSourceKey)) {
+      return {
+        ...base,
+        status: 'blocked',
+        agent: running.agent,
+        node: running.node,
+        reason: 'durable portable-mount migration claim exists without a local completion receipt; refusing to assume the running worker was refreshed',
+      }
+    }
+    const delivery = await prepareContractDelivery(task, input)
+    state.receipts[task.sourceKey] = {
+      kind: 'workspace',
+      digest: task.digest,
+      agent: running.agent,
+      ...(running.node ? { node: running.node } : {}),
+      ...(delivery ? { delivery } : {}),
+      dispatchedAt: claim.claim.claimedAt,
+    }
+    return { ...base, status: 'already-dispatched', agent: running.agent, node: running.node }
+  }
+  const delivery = await prepareContractDelivery(task, input)
+  await assertMountedTaskUnchanged(task)
   const result = await input.workspace.dispatch({
     name,
     invocationId: `factory:${task.sourceKey}:${task.digest}`,
@@ -575,7 +683,7 @@ async function dispatchWorkspaceTask(
     agent: result.agent,
     ...(result.node ? { node: result.node } : {}),
     ...(delivery ? { delivery } : {}),
-    dispatchedAt: (input.now?.() ?? new Date()).toISOString(),
+    dispatchedAt: claim.claim.claimedAt,
   }
   return {
     ...base,
@@ -583,6 +691,46 @@ async function dispatchWorkspaceTask(
     agent: result.agent,
     node: result.node,
   }
+}
+
+async function observeNotionClaim(
+  task: NormalizedNotionTask,
+  input: Parameters<typeof runNotionIntake>[0],
+  sourceKey = task.sourceKey,
+): Promise<NotionIntakeClaim | undefined> {
+  if (!input.claims) {
+    throw new Error('dispatch requires a durable Agent Relay Notion claim store')
+  }
+  const claim = await input.claims.get(sourceKey)
+  if (claim?.sourceKey !== undefined && claim.sourceKey !== sourceKey) {
+    throw new Error('durable Notion claim does not match the requested source key')
+  }
+  if (claim?.digest !== undefined && claim.digest !== task.digest) {
+    throw new Error('durable Notion claim digest does not match the mounted spec')
+  }
+  return claim
+}
+
+async function claimNotionTask(
+  task: NormalizedNotionTask,
+  input: Parameters<typeof runNotionIntake>[0],
+  sourceKey = task.sourceKey,
+): Promise<{ status: 'claimed' | 'existing'; claim: NotionIntakeClaim }> {
+  if (!input.claims) {
+    throw new Error('dispatch requires a durable Agent Relay Notion claim store')
+  }
+  const result = await input.claims.claim({
+    sourceKey,
+    digest: task.digest,
+    claimedAt: (input.now?.() ?? new Date()).toISOString(),
+  })
+  if (result.claim.sourceKey !== sourceKey) {
+    throw new Error('durable Notion claim does not match the requested source key')
+  }
+  if (result.claim.digest !== task.digest) {
+    throw new Error('durable Notion claim digest does not match the mounted spec')
+  }
+  return result
 }
 
 function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pageId: string) {

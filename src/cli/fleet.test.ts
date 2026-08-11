@@ -703,9 +703,21 @@ describe('fleet CLI runtime', () => {
       await writeFile(manifestPath, JSON.stringify(manifest))
       const output = buffer()
       const fleet = new FakeFleetClient()
+      const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
+      const notionClaims = {
+        get: vi.fn(async (sourceKey: string) => durableClaims.get(sourceKey)),
+        claim: vi.fn(async (claim: { sourceKey: string; digest: string; claimedAt: string }) => {
+          const existing = durableClaims.get(claim.sourceKey)
+          if (existing) return { status: 'existing' as const, claim: existing }
+          durableClaims.set(claim.sourceKey, claim)
+          return { status: 'claimed' as const, claim }
+        }),
+        dispose: vi.fn(async () => undefined),
+      }
 
       const code = await runFleetCli(['intake', 'notion', manifestPath], {
         fleet,
+        notionClaims,
         stdout: output,
         stderr: buffer(),
       })
@@ -734,6 +746,7 @@ describe('fleet CLI runtime', () => {
       const migratedErrors = buffer()
       const migratedCode = await runFleetCli(['intake', 'notion', manifestPath], {
         fleet,
+        notionClaims,
         notionContracts: contracts,
         env: {},
         stdout: migratedOutput,
@@ -748,10 +761,41 @@ describe('fleet CLI runtime', () => {
         mode: 'steer',
       })])
       expect(contracts.dispose).toHaveBeenCalledOnce()
+      expect(notionClaims.dispose).toHaveBeenCalledTimes(2)
       expect(migratedErrors.text()).toContain('Notion contract publisher failed during shutdown')
       expect(JSON.parse(migratedOutput.text())).toMatchObject({
         ok: true,
         results: [{ status: 'already-dispatched', target: { projectPath } }],
+      })
+
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Changed exact-path dispatch',
+        'Summary: This digest must not reuse the durable claim.',
+        'Recipe: single',
+        `Project-Paths: ${projectPath}`,
+      ].join('\n'))
+      await writeFile(manifestPath, JSON.stringify({
+        ...manifest,
+        statePath: './changed-state.json',
+      }))
+      const changedOutput = buffer()
+      const changedCode = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet,
+        notionClaims,
+        stdout: changedOutput,
+        stderr: buffer(),
+      })
+
+      expect(changedCode).toBe(1)
+      expect(fleet.spawns).toHaveLength(1)
+      expect(JSON.parse(changedOutput.text())).toMatchObject({
+        ok: false,
+        results: [{
+          status: 'blocked',
+          reason: 'durable Notion claim digest does not match the mounted spec',
+        }],
       })
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -788,7 +832,7 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(1)
-      expect(errors.text()).toContain('requires an active Agent Relay workspace')
+      expect(errors.text()).toContain('requires an active Agent Relay workspace for its durable shared claim')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

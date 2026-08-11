@@ -8,6 +8,8 @@ export {
   type GithubIssuePublisher,
   type ExistingGithubIssue,
   type NotionIntakeManifest,
+  type NotionIntakeClaim,
+  type NotionIntakeClaimStore,
   type NotionIntakeReport,
   type NotionIntakeResult,
   type NotionIntakeTarget,
@@ -17,6 +19,11 @@ export {
   type NormalizedNotionTask,
   type WorkspaceTaskDispatcher,
 } from './notion'
+
+export {
+  RelayChannelNotionClaimStore,
+  notionClaimChannelName,
+} from './notion-relay-claim'
 
 export {
   RelayChannelNotionContractPublisher,
