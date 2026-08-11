@@ -1,7 +1,10 @@
+import { randomUUID } from 'node:crypto'
+
 import { BatchTracker } from '../orchestrator/batch-tracker'
 import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BatchSnapshot,
+  BabysitterGenerationRecord,
   BabysitterSessionState,
   CriticalRecord,
   DispatchLifecycle,
@@ -31,6 +34,7 @@ type WorkspaceState = {
   canonicalIssueStates: Map<string, string>
   dispatchFailureReaperHandoffs: Map<string, RegistryHandoffAgent>
   babysitterSessions: Map<string, BabysitterSessionState>
+  babysitterGenerations: Map<string, BabysitterGenerationRecord>
   dispatchLifecycles: Map<string, DispatchLifecycle>
 }
 
@@ -633,6 +637,75 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).babysitterSessions.delete(issueKey)
   }
 
+  async markRunning(
+    workspaceId: string,
+    ownershipKey: string,
+    agentName: string,
+    nowMs: number,
+    leaseMs: number,
+    options?: { force?: boolean },
+  ): Promise<{ generationId: string } | null> {
+    const generations = this.#workspace(workspaceId).babysitterGenerations
+    const current = generations.get(ownershipKey)
+    if (current && (
+      current.phase !== 'claimed' ||
+      current.leaseUntilMs >= nowMs ||
+      options?.force !== true
+    )) return null
+
+    const generationId = randomUUID()
+    generations.set(ownershipKey, {
+      generationId,
+      agentName,
+      claimedAtMs: nowMs,
+      leaseUntilMs: nowMs + leaseMs,
+      phase: 'claimed',
+    })
+    return { generationId }
+  }
+
+  async renewBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const current = this.#workspace(workspaceId).babysitterGenerations.get(ownershipKey)
+    if (current?.phase !== 'claimed' || current.generationId !== generationId) return false
+    current.leaseUntilMs = nowMs + leaseMs
+    return true
+  }
+
+  async durableCompletionCas(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean> {
+    const current = this.#workspace(workspaceId).babysitterGenerations.get(ownershipKey)
+    if (current?.phase !== 'claimed' || current.generationId !== generationId) return false
+    current.phase = 'completed'
+    return true
+  }
+
+  async getBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+  ): Promise<BabysitterGenerationRecord | undefined> {
+    const current = this.#workspace(workspaceId).babysitterGenerations.get(ownershipKey)
+    return current ? structuredClone(current) : undefined
+  }
+
+  async clearBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean> {
+    const generations = this.#workspace(workspaceId).babysitterGenerations
+    if (generations.get(ownershipKey)?.generationId !== generationId) return false
+    return generations.delete(ownershipKey)
+  }
+
   async recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void> {
     this.#workspace(workspaceId).canonicalIssueStates.set(key, stateId)
   }
@@ -658,6 +731,7 @@ export class InMemoryStateStore implements StateStore {
         canonicalIssueStates: new Map(),
         dispatchFailureReaperHandoffs: new Map(),
         babysitterSessions: new Map(),
+        babysitterGenerations: new Map(),
         dispatchLifecycles: new Map(),
       }
       this.#workspaces.set(workspaceId, state)

@@ -91,6 +91,14 @@ export type BabysitterSessionState = {
   pendingDeliveryClaims?: Array<{ deliveryId: string; claimToken: string }>
 }
 
+export type BabysitterGenerationRecord = {
+  generationId: string
+  agentName: string
+  claimedAtMs: number
+  leaseUntilMs: number
+  phase: 'claimed' | 'completed'
+}
+
 export type ConversationMessage = {
   id: string
   text: string
@@ -379,6 +387,41 @@ export interface StateStore {
   setBabysitterSession(workspaceId: string, issueKey: string, session: BabysitterSessionState): Promise<void>
   listBabysitterSessions(workspaceId: string): Promise<Array<[string, BabysitterSessionState]>>
   clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void>
+
+  /**
+   * Atomically creates a babysitter generation. Returns null when a record
+   * already exists, unless it is a claimed generation whose lease has expired
+   * and force is true. Completed generations must be cleared before reuse.
+   */
+  markRunning(
+    workspaceId: string,
+    ownershipKey: string,
+    agentName: string,
+    nowMs: number,
+    leaseMs: number,
+    options?: { force?: boolean },
+  ): Promise<{ generationId: string } | null>
+  renewBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean>
+  durableCompletionCas(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean>
+  getBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+  ): Promise<BabysitterGenerationRecord | undefined>
+  clearBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean>
 
   recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
   getCanonicalState(workspaceId: string, key: string): Promise<string | undefined>
