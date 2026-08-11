@@ -70,7 +70,7 @@ function readArgs(argv) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     console.log(JSON.stringify(planReleaseState(readArgs(process.argv.slice(2)))))
   } catch (error) {

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
 import { planReleaseState } from '../scripts/release-state.mjs'
@@ -12,6 +13,14 @@ const base = {
 }
 
 describe('release state recovery', () => {
+  it('is importable when the host process has no script path', () => {
+    expect(() => execFileSync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      "process.argv.splice(1); await import('./scripts/release-state.mjs')",
+    ])).not.toThrow()
+  })
+
   it('starts a new release by creating its tag before publishing', () => {
     expect(planReleaseState(base)).toEqual({
       state: 'new-release',
@@ -78,6 +87,8 @@ describe('publish workflow policy', () => {
 
   it('uses a protected-branch-safe version PR and never pushes HEAD to main', () => {
     expect(workflow).toContain('pull-requests: write')
+    expect(workflow).toContain('name: Require current main for a live release')
+    expect(workflow).toContain('REMOTE_MAIN')
     expect(workflow).toContain('name: Open version PR')
     expect(workflow).toContain('gh pr create')
     expect(workflow).toContain('git add package.json package-lock.json')
@@ -88,7 +99,8 @@ describe('publish workflow policy', () => {
   it('gates publish on canonical version metadata and the recovery plan', () => {
     expect(workflow).toContain("steps.bump.outputs.needs_version_pr != 'true'")
     expect(workflow).toContain('node scripts/release-state.mjs')
-    expect(workflow).toContain('diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"')
+    expect(workflow.match(/scripts\/verify-release-payload\.sh/g)).toHaveLength(3)
+    expect(workflow).toContain('git worktree add --detach "$TAG_DIR" "$TAG_TARGET"')
     expect(workflow).toContain("steps.release_state.outputs.publish == 'true'")
     expect(workflow.indexOf('- name: Create release tag')).toBeLessThan(
       workflow.indexOf('- name: Publish\n'),
