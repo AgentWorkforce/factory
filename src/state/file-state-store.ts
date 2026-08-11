@@ -6,6 +6,7 @@ import lockfile from 'proper-lockfile'
 
 import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
+  BabysitterGenerationRecord,
   BabysitterSessionState,
   ClarificationReply,
   DispatchLifecycle,
@@ -22,6 +23,7 @@ type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   waitingClarifications: Record<string, WaitingClarification>
   babysitterSessions: Record<string, BabysitterSessionState>
+  babysitterGenerations: Record<string, BabysitterGenerationRecord>
   conversationSessions: Record<string, ConversationSessionState>
   dispatchLifecycles: Record<string, DispatchLifecycle>
 }
@@ -648,6 +650,93 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
+  override async markRunning(
+    workspaceId: string,
+    ownershipKey: string,
+    agentName: string,
+    nowMs: number,
+    leaseMs: number,
+    options?: { force?: boolean },
+  ): Promise<{ generationId: string } | null> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      const current = workspace.babysitterGenerations[ownershipKey]
+      if (current && (
+        current.phase !== 'claimed' ||
+        current.leaseUntilMs >= nowMs ||
+        options?.force !== true
+      )) return null
+
+      const generationId = randomUUID()
+      workspace.babysitterGenerations[ownershipKey] = {
+        generationId,
+        agentName,
+        claimedAtMs: nowMs,
+        leaseUntilMs: nowMs + leaseMs,
+        phase: 'claimed',
+      }
+      await this.#persist(document)
+      return { generationId }
+    }))
+  }
+
+  override async renewBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const current = document.workspaces[workspaceId]?.babysitterGenerations[ownershipKey]
+      if (current?.phase !== 'claimed' || current.generationId !== generationId) return false
+      current.leaseUntilMs = nowMs + leaseMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async durableCompletionCas(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const current = document.workspaces[workspaceId]?.babysitterGenerations[ownershipKey]
+      if (current?.phase !== 'claimed' || current.generationId !== generationId) return false
+      current.phase = 'completed'
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async getBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+  ): Promise<BabysitterGenerationRecord | undefined> {
+    return await this.#exclusive(async () => {
+      const document = await this.#loadFromDisk()
+      const current = document.workspaces[workspaceId]?.babysitterGenerations[ownershipKey]
+      return current ? cloneBabysitterGeneration(current) : undefined
+    })
+  }
+
+  override async clearBabysitterGeneration(workspaceId: string, ownershipKey: string): Promise<void> {
+    await this.#exclusive(async () => {
+      await this.#withMutationLock(async () => {
+        const document = await this.#loadFromDisk()
+        const workspace = document.workspaces[workspaceId]
+        if (!workspace || !(ownershipKey in workspace.babysitterGenerations)) return
+        delete workspace.babysitterGenerations[ownershipKey]
+        if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+        await this.#persist(document)
+      })
+    })
+  }
+
   override async reserveConversationSession(
     workspaceId: string,
     conversationId: string,
@@ -883,12 +972,14 @@ const parseDocument = (value: unknown): WatchStateDocument => {
       const watches = rawWorkspace.githubIssueCommentWatches
       const clarifications = rawWorkspace.waitingClarifications
       const babysitters = rawWorkspace.babysitterSessions
+      const generations = rawWorkspace.babysitterGenerations
       const conversations = rawWorkspace.conversationSessions
       const lifecycles = rawWorkspace.dispatchLifecycles
       if (
         !isRecord(watches) ||
         !isRecord(clarifications) ||
         (babysitters !== undefined && !isRecord(babysitters)) ||
+        (generations !== undefined && !isRecord(generations)) ||
         (conversations !== undefined && !isRecord(conversations)) ||
         (lifecycles !== undefined && !isRecord(lifecycles))
       ) {
@@ -898,6 +989,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
+        babysitterGenerations: parseBabysitterGenerations(generations ?? {}),
         conversationSessions: parseConversationSessions(conversations ?? {}),
         dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
       }
@@ -918,6 +1010,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: clarifications as Record<string, WaitingClarification>,
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
+        babysitterGenerations: {},
         conversationSessions: {},
         dispatchLifecycles: {},
       }
@@ -934,6 +1027,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
         waitingClarifications: {},
         babysitterSessions: {},
+        babysitterGenerations: {},
         conversationSessions: {},
         dispatchLifecycles: {},
       }
@@ -951,6 +1045,9 @@ const cloneClarification = (record: WaitingClarification): WaitingClarification 
 
 const cloneBabysitterSession = (session: BabysitterSessionState): BabysitterSessionState =>
   structuredClone(session)
+
+const cloneBabysitterGeneration = (record: BabysitterGenerationRecord): BabysitterGenerationRecord =>
+  structuredClone(record)
 
 const cloneConversationSession = (session: ConversationSessionState): ConversationSessionState =>
   structuredClone(session)
@@ -1099,6 +1196,30 @@ const parseBabysitterSessions = (value: Record<string, unknown>): Record<string,
   return sessions
 }
 
+const parseBabysitterGenerations = (
+  value: Record<string, unknown>,
+): Record<string, BabysitterGenerationRecord> => {
+  const generations: Record<string, BabysitterGenerationRecord> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.generationId !== 'string' ||
+      typeof candidate.agentName !== 'string' ||
+      typeof candidate.claimedAtMs !== 'number' ||
+      typeof candidate.leaseUntilMs !== 'number' ||
+      (candidate.phase !== 'claimed' && candidate.phase !== 'completed')
+    ) throw new Error('Factory GitHub watch state file is invalid')
+    generations[key] = {
+      generationId: candidate.generationId,
+      agentName: candidate.agentName,
+      claimedAtMs: candidate.claimedAtMs,
+      leaseUntilMs: candidate.leaseUntilMs,
+      phase: candidate.phase,
+    }
+  }
+  return generations
+}
+
 const cloneLifecycle = (record: DispatchLifecycle): DispatchLifecycle => structuredClone(record)
 
 const dispatchLifecycleLeaseMatches = (
@@ -1134,6 +1255,7 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
   waitingClarifications: {},
   babysitterSessions: {},
+  babysitterGenerations: {},
   conversationSessions: {},
   dispatchLifecycles: {},
 })
@@ -1142,6 +1264,7 @@ const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&
   Object.keys(workspace.babysitterSessions).length === 0 &&
+  Object.keys(workspace.babysitterGenerations).length === 0 &&
   Object.keys(workspace.conversationSessions).length === 0 &&
   Object.keys(workspace.dispatchLifecycles).length === 0
 

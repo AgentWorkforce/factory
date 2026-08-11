@@ -134,6 +134,107 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('never returns a babysitter generation token without atomically storing its record', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-generation-claim-'))
+    try {
+      const memory = new InMemoryStateStore({ batchSize: 2 })
+      const filePath = join(root, 'state.json')
+      const scenarios = [
+        { name: 'memory', first: memory, second: memory },
+        {
+          name: 'file',
+          first: new FileStateStore({ batchSize: 2, watchStatePath: filePath }),
+          second: new FileStateStore({ batchSize: 2, watchStatePath: filePath }),
+        },
+      ]
+
+      for (const { name, first, second } of scenarios) {
+        const workspaceId = `workspace-${name}`
+        const ownershipKey = `AR-230:agentworkforce/factory#230:${name}`
+        const claims = await Promise.all([
+          first.markRunning(workspaceId, ownershipKey, 'babysitter-a', 1_000, 5_000),
+          second.markRunning(workspaceId, ownershipKey, 'babysitter-b', 1_000, 5_000),
+        ])
+        const acquired = claims.filter((claim): claim is { generationId: string } => claim !== null)
+
+        expect(acquired).toHaveLength(1)
+        expect(await second.getBabysitterGeneration(workspaceId, ownershipKey)).toEqual({
+          generationId: acquired[0]!.generationId,
+          agentName: claims[0] ? 'babysitter-a' : 'babysitter-b',
+          claimedAtMs: 1_000,
+          leaseUntilMs: 6_000,
+          phase: 'claimed',
+        })
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fences stale babysitter generations from renewal, completion, and takeover', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-generation-cas-'))
+    try {
+      const memory = new InMemoryStateStore({ batchSize: 2 })
+      const filePath = join(root, 'state.json')
+      const scenarios = [
+        { first: memory, second: memory },
+        {
+          first: new FileStateStore({ batchSize: 2, watchStatePath: filePath }),
+          second: new FileStateStore({ batchSize: 2, watchStatePath: filePath }),
+        },
+      ]
+
+      for (const [index, { first, second }] of scenarios.entries()) {
+        const workspaceId = `workspace-${index}`
+        const ownershipKey = `AR-230:agentworkforce/factory#230:${index}`
+        const initial = await first.markRunning(
+          workspaceId, ownershipKey, 'babysitter-old', 1_000, 100,
+        )
+        expect(initial).not.toBeNull()
+
+        await expect(second.markRunning(
+          workspaceId, ownershipKey, 'babysitter-early', 1_050, 100, { force: true },
+        )).resolves.toBeNull()
+        await expect(second.markRunning(
+          workspaceId, ownershipKey, 'babysitter-unfenced', 1_101, 100,
+        )).resolves.toBeNull()
+
+        const takeover = await second.markRunning(
+          workspaceId, ownershipKey, 'babysitter-new', 1_101, 100, { force: true },
+        )
+        expect(takeover).not.toBeNull()
+        expect(takeover?.generationId).not.toBe(initial?.generationId)
+
+        expect(await first.renewBabysitterGeneration(
+          workspaceId, ownershipKey, initial!.generationId, 1_102, 200,
+        )).toBe(false)
+        expect(await first.durableCompletionCas(
+          workspaceId, ownershipKey, initial!.generationId,
+        )).toBe(false)
+        expect(await second.renewBabysitterGeneration(
+          workspaceId, ownershipKey, takeover!.generationId, 1_102, 200,
+        )).toBe(true)
+        const completions = await Promise.all([
+          first.durableCompletionCas(workspaceId, ownershipKey, takeover!.generationId),
+          second.durableCompletionCas(workspaceId, ownershipKey, takeover!.generationId),
+        ])
+        expect(completions.filter(Boolean)).toHaveLength(1)
+        await expect(first.markRunning(
+          workspaceId, ownershipKey, 'babysitter-after-complete', 2_000, 100, { force: true },
+        )).resolves.toBeNull()
+
+        expect(await second.getBabysitterGeneration(workspaceId, ownershipKey)).toMatchObject({
+          generationId: takeover!.generationId,
+          agentName: 'babysitter-new',
+          leaseUntilMs: 1_302,
+          phase: 'completed',
+        })
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists Slack thread session ownership and coalesced turns across process-equivalent stores', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-session-'))
     try {
