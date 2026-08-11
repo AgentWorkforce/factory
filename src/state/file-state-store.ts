@@ -724,17 +724,20 @@ export class FileStateStore extends InMemoryStateStore {
     })
   }
 
-  override async clearBabysitterGeneration(workspaceId: string, ownershipKey: string): Promise<void> {
-    await this.#exclusive(async () => {
-      await this.#withMutationLock(async () => {
-        const document = await this.#loadFromDisk()
-        const workspace = document.workspaces[workspaceId]
-        if (!workspace || !(ownershipKey in workspace.babysitterGenerations)) return
-        delete workspace.babysitterGenerations[ownershipKey]
-        if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
-        await this.#persist(document)
-      })
-    })
+  override async clearBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      if (workspace?.babysitterGenerations[ownershipKey]?.generationId !== generationId) return false
+      delete workspace.babysitterGenerations[ownershipKey]
+      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+      return true
+    }))
   }
 
   override async reserveConversationSession(

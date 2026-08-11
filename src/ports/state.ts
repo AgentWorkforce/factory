@@ -412,7 +412,11 @@ export interface StateStore {
     workspaceId: string,
     ownershipKey: string,
   ): Promise<BabysitterGenerationRecord | undefined>
-  clearBabysitterGeneration(workspaceId: string, ownershipKey: string): Promise<void>
+  clearBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean>
 
   recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
   getCanonicalState(workspaceId: string, key: string): Promise<string | undefined>

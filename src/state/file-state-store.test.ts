@@ -211,6 +211,9 @@ describe('FileStateStore', () => {
         expect(await first.durableCompletionCas(
           workspaceId, ownershipKey, initial!.generationId,
         )).toBe(false)
+        expect(await first.clearBabysitterGeneration(
+          workspaceId, ownershipKey, initial!.generationId,
+        )).toBe(false)
         expect(await second.renewBabysitterGeneration(
           workspaceId, ownershipKey, takeover!.generationId, 1_102, 200,
         )).toBe(true)
@@ -229,6 +232,10 @@ describe('FileStateStore', () => {
           leaseUntilMs: 1_302,
           phase: 'completed',
         })
+        expect(await second.clearBabysitterGeneration(
+          workspaceId, ownershipKey, takeover!.generationId,
+        )).toBe(true)
+        expect(await first.getBabysitterGeneration(workspaceId, ownershipKey)).toBeUndefined()
       }
     } finally {
       await rm(root, { recursive: true, force: true })

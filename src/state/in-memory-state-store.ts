@@ -696,8 +696,14 @@ export class InMemoryStateStore implements StateStore {
     return current ? structuredClone(current) : undefined
   }
 
-  async clearBabysitterGeneration(workspaceId: string, ownershipKey: string): Promise<void> {
-    this.#workspace(workspaceId).babysitterGenerations.delete(ownershipKey)
+  async clearBabysitterGeneration(
+    workspaceId: string,
+    ownershipKey: string,
+    generationId: string,
+  ): Promise<boolean> {
+    const generations = this.#workspace(workspaceId).babysitterGenerations
+    if (generations.get(ownershipKey)?.generationId !== generationId) return false
+    return generations.delete(ownershipKey)
   }
 
   async recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void> {
