@@ -214,9 +214,11 @@ jobs:
       # repo/workflow as a trusted publisher for @agent-relay/factory on npmjs.com.
       - name: Publish
         if: ${{ steps.release_state.outputs.publish == 'true' }}
+        env:
+          NPM_DIST_TAG: ${{ github.event.inputs.tag }}
         run: |
           scripts/require-current-main.sh
-          npm publish --provenance --access public --tag '${{ github.event.inputs.tag }}'
+          npm publish --provenance --access public --tag "$NPM_DIST_TAG"
 
       - name: Verify final release state
         if: ${{ github.event.inputs.dry_run != 'true' && steps.bump.outputs.needs_version_pr != 'true' }}

@@ -129,6 +129,8 @@ describe('publish workflow policy', () => {
     expect(workflow.match(/scripts\/verify-release-payload\.sh/g)).toHaveLength(3)
     expect(workflow).toContain('git worktree add --detach "$TAG_DIR" "$TAG_TARGET"')
     expect(workflow).toContain("steps.release_state.outputs.publish == 'true'")
+    expect(workflow).toContain('NPM_DIST_TAG: ${{ github.event.inputs.tag }}')
+    expect(workflow).toContain('npm publish --provenance --access public --tag "$NPM_DIST_TAG"')
     expect(workflow.indexOf('- name: Create release tag')).toBeLessThan(
       workflow.indexOf('- name: Publish\n'),
     )
