@@ -42,6 +42,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Require current main for a live release
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Live releases must be dispatched from main, not $GITHUB_REF"
+            exit 1
+          fi
+          REMOTE_MAIN=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          if [ -z "$REMOTE_MAIN" ] || [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
+            echo "::error::Checked-out SHA $GITHUB_SHA is not current origin/main ($REMOTE_MAIN)"
+            exit 1
+          fi
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
@@ -154,30 +169,24 @@ jobs:
           PEELED=$(git ls-remote origin "refs/tags/v$V^{}" | awk '{print $1}')
           TAG_TARGET=${PEELED:-$DIRECT}
           TAG_PAYLOAD_MATCHES=false
-          if [ -n "$TAG_TARGET" ]; then
-            # These are the tracked inputs which determine the published payload.
-            # CI independently compares the rebuilt tarball when npm already has V.
-            if git diff --quiet "$TAG_TARGET" "$GITHUB_SHA" -- \
-              package.json src schemas bin/factory.mjs README.md LICENSE \
-              scripts/factory-canary.sh scripts/com.agentrelay.factory-canary.plist.example; then
+          if [ "$PUBLISHED" = true ] && [ -n "$TAG_TARGET" ] && [ "$TAG_TARGET" != "$GITHUB_SHA" ]; then
+            # The 0.1.58 incident left a release tag on an equivalent orphaned
+            # commit. Rebuild that exact tag and compare its packed payload to
+            # npm; source-path approximations are not sufficient here.
+            TAG_ROOT=$(mktemp -d)
+            TAG_DIR="$TAG_ROOT/checkout"
+            if git worktree add --detach "$TAG_DIR" "$TAG_TARGET" && \
+               (cd "$TAG_DIR" && npm ci && npm run build) && \
+               scripts/verify-release-payload.sh "$V" "$TAG_DIR"; then
               TAG_PAYLOAD_MATCHES=true
             fi
+            git worktree remove --force "$TAG_DIR" 2>/dev/null || true
+            rm -rf "$TAG_ROOT"
           fi
 
           REGISTRY_PAYLOAD_MATCHES=false
           if [ "$PUBLISHED" = true ]; then
-            TMP_DIR=$(mktemp -d)
-            trap 'rm -rf "$TMP_DIR"' EXIT
-            mkdir "$TMP_DIR/local" "$TMP_DIR/registry" "$TMP_DIR/local-x" "$TMP_DIR/registry-x"
-            npm pack --pack-destination "$TMP_DIR/local" --silent >/dev/null
-            npm pack "@agent-relay/factory@$V" \
-              --pack-destination "$TMP_DIR/registry" --silent >/dev/null
-            tar -xzf "$TMP_DIR/local"/*.tgz -C "$TMP_DIR/local-x"
-            tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
-            PROVENANCE=$(npm view "@agent-relay/factory@$V" \
-              dist.attestations.provenance.predicateType 2>/dev/null || true)
-            if diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package" && \
-               [ "$PROVENANCE" = "https://slsa.dev/provenance/v1" ]; then
+            if scripts/verify-release-payload.sh "$V" "$GITHUB_WORKSPACE"; then
               REGISTRY_PAYLOAD_MATCHES=true
             fi
           fi
@@ -235,16 +244,6 @@ jobs:
           fi
           [ -n "$TAG_TARGET" ]
 
-          TMP_DIR=$(mktemp -d)
-          trap 'rm -rf "$TMP_DIR"' EXIT
-          mkdir "$TMP_DIR/local" "$TMP_DIR/registry" "$TMP_DIR/local-x" "$TMP_DIR/registry-x"
-          npm pack --pack-destination "$TMP_DIR/local" --silent >/dev/null
-          npm pack "@agent-relay/factory@$V" \
-            --pack-destination "$TMP_DIR/registry" --silent >/dev/null
-          tar -xzf "$TMP_DIR/local"/*.tgz -C "$TMP_DIR/local-x"
-          tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
-          diff -qr "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"
-          [ "$(npm view "@agent-relay/factory@$V" \
-            dist.attestations.provenance.predicateType)" = "https://slsa.dev/provenance/v1" ]
+          scripts/verify-release-payload.sh "$V" "$GITHUB_WORKSPACE"
           echo "Release state: ${{ steps.release_state.outputs.state }}" >> "$GITHUB_STEP_SUMMARY"
           echo "npm payload/provenance/dist-tag and v$V are consistent; package metadata was canonical before publish." >> "$GITHUB_STEP_SUMMARY"
