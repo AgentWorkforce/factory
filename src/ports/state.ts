@@ -388,6 +388,11 @@ export interface StateStore {
   listBabysitterSessions(workspaceId: string): Promise<Array<[string, BabysitterSessionState]>>
   clearBabysitterSession(workspaceId: string, issueKey: string): Promise<void>
 
+  /**
+   * Atomically creates a babysitter generation. Returns null when a record
+   * already exists, unless it is a claimed generation whose lease has expired
+   * and force is true. Completed generations must be cleared before reuse.
+   */
   markRunning(
     workspaceId: string,
     ownershipKey: string,

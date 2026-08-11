@@ -236,7 +236,48 @@ describe('FileStateStore', () => {
           workspaceId, ownershipKey, takeover!.generationId,
         )).toBe(true)
         expect(await first.getBabysitterGeneration(workspaceId, ownershipKey)).toBeUndefined()
+        const restarted = await first.markRunning(
+          workspaceId, ownershipKey, 'babysitter-restarted', 2_000, 100,
+        )
+        expect(restarted?.generationId).not.toBe(takeover!.generationId)
+        expect(await second.getBabysitterGeneration(workspaceId, ownershipKey)).toMatchObject({
+          generationId: restarted!.generationId,
+          agentName: 'babysitter-restarted',
+          phase: 'claimed',
+        })
       }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects invalid persisted babysitter generation timestamps', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-invalid-generation-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 3,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            babysitterGenerations: {
+              'AR-230:agentworkforce/factory#230': {
+                generationId: 'generation-invalid',
+                agentName: 'babysitter-invalid',
+                claimedAtMs: 1.5,
+                leaseUntilMs: 2_000,
+                phase: 'claimed',
+              },
+            },
+          },
+        },
+      }))
+
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      await expect(store.getBabysitterGeneration(
+        'workspace-1', 'AR-230:agentworkforce/factory#230',
+      )).rejects.toThrow('Factory GitHub watch state file is invalid')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

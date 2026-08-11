@@ -1208,15 +1208,15 @@ const parseBabysitterGenerations = (
       !isRecord(candidate) ||
       typeof candidate.generationId !== 'string' ||
       typeof candidate.agentName !== 'string' ||
-      typeof candidate.claimedAtMs !== 'number' ||
-      typeof candidate.leaseUntilMs !== 'number' ||
+      !Number.isSafeInteger(candidate.claimedAtMs) ||
+      !Number.isSafeInteger(candidate.leaseUntilMs) ||
       (candidate.phase !== 'claimed' && candidate.phase !== 'completed')
     ) throw new Error('Factory GitHub watch state file is invalid')
     generations[key] = {
       generationId: candidate.generationId,
       agentName: candidate.agentName,
-      claimedAtMs: candidate.claimedAtMs,
-      leaseUntilMs: candidate.leaseUntilMs,
+      claimedAtMs: candidate.claimedAtMs as number,
+      leaseUntilMs: candidate.leaseUntilMs as number,
       phase: candidate.phase,
     }
   }
