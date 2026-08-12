@@ -6,6 +6,11 @@ if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
   exit 1
 fi
 
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [--ref-only]" >&2
+  exit 2
+fi
+
 if [ "${1:-}" = "--ref-only" ]; then
   exit 0
 fi
