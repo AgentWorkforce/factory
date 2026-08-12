@@ -143,6 +143,12 @@ const reportingSchema = z.object({
   requestTimeoutMs: z.number().int().min(100).max(60_000).default(15_000),
 }).default({})
 
+const hooksSchema = z.object({
+  onTicketDispatch: z.object({
+    relayChannel: z.string().trim().min(1),
+  }).optional(),
+}).optional()
+
 const previewServiceSchema = z.object({
   /** Local HTTP port the repository's development server listens on. */
   port: z.number().int().min(1).max(65_535),
@@ -283,6 +289,7 @@ const WorkspaceConfigObjectSchema = z.object({
   // analytics. It defaults on for real CLI sessions and remains no-op when no
   // Cloud account is available; delivery failure never changes orchestration.
   reporting: reportingSchema,
+  hooks: hooksSchema,
   preview: previewSchema,
   github: githubSchema,
   verification: verificationSchema,

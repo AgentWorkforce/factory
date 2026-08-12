@@ -116,6 +116,13 @@ import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelC
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
+type TicketDispatchRelayPayload = {
+  eventType: 'ticket.dispatched'
+  issue: { id: string; title: string; url: string }
+  agent: { name: string; sessionRef?: string }
+  sessionOwner: string | null
+  timestamp: string
+}
 type SlackThreadWatcher = { stop(): Promise<void> }
 type GithubIssueCommentWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
@@ -2726,6 +2733,9 @@ export class FactoryLoop implements Factory {
       await this.#saveDispatchLifecycle(record, 'running')
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
+      if (this.#config.hooks?.onTicketDispatch && !dryRun) {
+        await this.#notifyTicketDispatch(decision, liveIssue, record, result)
+      }
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result)
       }
@@ -11098,6 +11108,52 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #notifyTicketDispatch(
+    decision: TriageDecision,
+    issue: LinearIssue,
+    record: InFlightIssue,
+    result: DispatchResult,
+  ): Promise<void> {
+    const hook = this.#config.hooks?.onTicketDispatch
+    if (!hook || result.dryRun) return
+
+    const agent = result.agents.find((candidate) => candidate.role === 'implementer')
+      ?? result.agents.find((candidate) => candidate.role === 'workflow')
+      ?? result.agents[0]
+    if (!agent) return
+
+    const tracked = record.agents.get(agent.name)
+    const payload: TicketDispatchRelayPayload = {
+      eventType: 'ticket.dispatched',
+      issue: {
+        id: issue.uuid,
+        title: issue.title,
+        url: dispatchIssueUrl(issue),
+      },
+      agent: {
+        name: agent.name,
+        ...(tracked?.sessionRef ? { sessionRef: tracked.sessionRef } : {}),
+      },
+      sessionOwner: dispatchSessionOwner(decision) ?? null,
+      timestamp: new Date(this.#clock.now()).toISOString(),
+    }
+
+    try {
+      await this.#fleet.sendMessage({
+        to: `#${hook.relayChannel.replace(/^#/u, '')}`,
+        text: JSON.stringify(payload),
+      })
+      this.#increment('ticketDispatchHookNotifications')
+    } catch (error) {
+      this.#increment('ticketDispatchHookFailures')
+      this.#logger.warn?.('[factory] onTicketDispatch relay hook failed', {
+        issue: issue.key,
+        channel: hook.relayChannel,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
   #error(error: unknown, issue?: IssueRef): void {
     this.#increment('errors')
     const details = describeError(error)
@@ -13618,6 +13674,23 @@ function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
   }
 
   return [...decision.implementers, decision.reviewer]
+}
+
+function dispatchSessionOwner(decision: TriageDecision): string | undefined {
+  for (const spec of dispatchSpecs(decision)) {
+    const sessionOwner = spec.principal?.trim() || spec.owner?.trim()
+    if (sessionOwner) return sessionOwner
+  }
+  return undefined
+}
+
+function dispatchIssueUrl(issue: LinearIssue): string {
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  return stringValue(payload.url)
+    ?? stringValue(payload.html_url)
+    ?? stringValue(source?.url)
+    ?? issue.path
 }
 
 function previewServiceForRepo(

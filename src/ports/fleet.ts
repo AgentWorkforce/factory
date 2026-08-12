@@ -185,6 +185,10 @@ export interface FleetClient {
 export type AgentSpec = {
   name: string
   role: 'implementer' | 'reviewer' | 'babysitter' | 'workflow'
+  /** Principal that initiated the agent session, when supplied by the dispatcher. */
+  principal?: string
+  /** Compatibility alias for dispatchers that identify the initiating principal as an owner. */
+  owner?: string
   capability: Capability
   model?: string
   task: string

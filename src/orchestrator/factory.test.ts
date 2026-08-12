@@ -9623,6 +9623,44 @@ describe('FactoryLoop', () => {
     expect(new Set(fleet.spawns.map((spawn) => spawn.invocationId)).size).toBe(2)
   })
 
+  it('posts the configured onTicketDispatch relay hook with issue and session metadata', async () => {
+    const path = issuePath(124)
+    const mount = new FakeMountClient({ [path]: realIssueFile(124) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-124-impl-pear', 'session-ar-124-impl-pear')
+    const timestamp = '2026-08-13T08:13:00.000Z'
+    const factory = createFactory(config({
+      hooks: { onTicketDispatch: { relayChannel: 'dispatch-notifications' } },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock: { now: () => Date.parse(timestamp), sleep: async () => {} },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, realIssueFile(124)))
+    decision.implementers[0]!.principal = 'broker'
+
+    await factory.dispatch(decision)
+
+    const message = fleet.messages.find((candidate) => candidate.to === '#dispatch-notifications')
+    expect(message).toBeDefined()
+    expect(JSON.parse(message!.text)).toEqual({
+      eventType: 'ticket.dispatched',
+      issue: {
+        id: 'uuid-124',
+        title: '[factory-e2e] Fix factory issue 124',
+        url: 'https://linear.app/agent-relay/issue/AR-124/factory-issue-124',
+      },
+      agent: {
+        name: 'ar-124-impl-pear',
+        sessionRef: 'session-ar-124-impl-pear',
+      },
+      sessionOwner: 'broker',
+      timestamp,
+    })
+    expect(factory.status().counters.ticketDispatchHookNotifications).toBe(1)
+  })
+
   it('derives implementer dispatch identities from repo labels instead of triage implementers', async () => {
     const routedIssue = realIssueFile(720, ready, {
       title: '[factory-e2e] Relayfile webhooks to cloud',
