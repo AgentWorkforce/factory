@@ -201,6 +201,10 @@ export type AgentSpec = {
   channel?: string
   node?: 'self' | string
   sessionRef?: string
+  /** Canonical Relayhistory session that this agent should continue. */
+  resumeSessionId?: string
+  /** CLI that originated the Relayhistory session, when known. */
+  originCli?: 'claude' | 'codex'
   invocationId?: string
   restartPolicy?: RestartPolicy
   /** Durable, exact PR ownership for a lazily-spawned babysitter. */

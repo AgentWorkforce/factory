@@ -13,6 +13,8 @@ export const AgentSpecSchema = z.object({
   channel: z.string().optional(),
   node: z.string().optional(),
   sessionRef: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  originCli: z.enum(['claude', 'codex']).optional(),
   invocationId: z.string().optional(),
   restartPolicy: z.unknown().optional(),
 })
