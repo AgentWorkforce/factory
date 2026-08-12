@@ -113,6 +113,38 @@ describe('packed payload comparison', () => {
   })
 })
 
+describe('require-current-main.sh argument validation', () => {
+  const run = (args) =>
+    execFileSync('bash', ['scripts/require-current-main.sh', ...args], {
+      env: { ...process.env, GITHUB_REF: 'refs/heads/main' },
+      encoding: 'utf8',
+    })
+
+  it('accepts --ref-only alone without contacting the remote', () => {
+    expect(run(['--ref-only'])).toBe('')
+  })
+
+  it('rejects --ref-only with trailing arguments instead of ignoring them', () => {
+    try {
+      run(['--ref-only', 'extra'])
+      expect.unreachable('expected require-current-main.sh to exit non-zero')
+    } catch (error) {
+      expect(error.status).toBe(2)
+      expect(error.stderr.toString()).toContain('usage:')
+    }
+  })
+
+  it('rejects unrecognized single arguments', () => {
+    try {
+      run(['--bogus'])
+      expect.unreachable('expected require-current-main.sh to exit non-zero')
+    } catch (error) {
+      expect(error.status).toBe(2)
+      expect(error.stderr.toString()).toContain('usage:')
+    }
+  })
+})
+
 describe('publish workflow policy', () => {
   const workflow = readFileSync('.github/workflows/publish.yml', 'utf8')
 
