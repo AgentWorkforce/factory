@@ -113,9 +113,18 @@ import {
   type FactoryCloudEventInputV1,
 } from '../observability/events'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
+import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
+type TicketDispatchNotificationPayload = {
+  eventType: 'ticket.dispatched'
+  summary: string
+  issue: { id: string; title: string; url: string }
+  agent: { name: string; sessionRef: string | null }
+  sessionOwner: string | null
+  timestamp: string
+}
 type SlackThreadWatcher = { stop(): Promise<void> }
 type GithubIssueCommentWatcher = { stop(): Promise<void> }
 type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
@@ -407,6 +416,7 @@ export class FactoryLoop implements Factory {
   readonly #mount: MountClient
   readonly #states: FactoryStateResolution
   readonly #fleet: FleetClient
+  readonly #ticketDispatchDelivery: TicketDispatchDelivery
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
   readonly #github: GithubRead
@@ -601,6 +611,9 @@ export class FactoryLoop implements Factory {
     this.#states = ports.stateResolution ?? stateResolutionFromIds(config.stateIds, config.linear.states)
     installFactoryDraftPredicate(this.#mount, config)
     this.#fleet = ports.fleet
+    this.#ticketDispatchDelivery = ports.ticketDispatchDelivery ?? createTicketDispatchDelivery({
+      mountRoot: config.localMountRoot,
+    })
     this.#triage = ports.triage ?? new TieredTriage(new HeuristicTriage())
     this.#linear = ports.linear ?? MountLinearWriteback(ports.mount, {
       safety: config.safety,
@@ -2726,6 +2739,9 @@ export class FactoryLoop implements Factory {
       await this.#saveDispatchLifecycle(record, 'running')
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
+      if (!dryRun && this.#config.hooks?.onTicketDispatch) {
+        await this.#notifyTicketDispatch(decision, liveIssue, record, result)
+      }
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result)
       }
@@ -11098,6 +11114,81 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #notifyTicketDispatch(
+    decision: TriageDecision,
+    issue: LinearIssue,
+    record: InFlightIssue,
+    result: DispatchResult,
+  ): Promise<void> {
+    const hook = this.#config.hooks?.onTicketDispatch
+    if (!hook || result.dryRun) return
+
+    const agent = result.agents.find((candidate) => candidate.role === 'implementer')
+      ?? result.agents.find((candidate) => candidate.role === 'workflow')
+      ?? result.agents[0]
+    if (!agent) return
+
+    const tracked = record.agents.get(agent.name)
+    const payload: TicketDispatchNotificationPayload = {
+      eventType: 'ticket.dispatched',
+      summary: `Ticket dispatched: ${issue.title} → ${agent.name}.`,
+      issue: {
+        id: issue.uuid,
+        title: issue.title,
+        url: dispatchIssueUrl(issue),
+      },
+      agent: {
+        name: agent.name,
+        sessionRef: tracked?.sessionRef ?? null,
+      },
+      sessionOwner: dispatchSessionOwner(decision) ?? null,
+      timestamp: new Date(this.#clock.now()).toISOString(),
+    }
+    const text = ticketDispatchNotificationText(payload)
+
+    for (const target of hook.notify) {
+      if (target.surface === 'linear' && !target.commentOnIssue) continue
+
+      try {
+        switch (target.surface) {
+          case 'relay':
+            await this.#fleet.sendMessage({
+              to: `#${target.channel.replace(/^#/u, '')}`,
+              text,
+            })
+            break
+          case 'slack':
+            if (!target.channel && !target.dm) {
+              throw new Error('Slack ticket-dispatch notification needs channel and/or dm')
+            }
+            await this.#ticketDispatchDelivery.slack({
+              channel: target.channel,
+              dm: target.dm,
+              text,
+            })
+            break
+          case 'telegram':
+            await this.#ticketDispatchDelivery.telegram({ chatId: target.chatId, text })
+            break
+          case 'linear':
+            if (isGithubIssue(issue)) {
+              throw new Error('Linear ticket-dispatch comments require a Linear issue')
+            }
+            await this.#linear.postComment(issue, text)
+            break
+        }
+        this.#increment('ticketDispatchHookNotifications')
+      } catch (error) {
+        this.#increment('ticketDispatchHookFailures')
+        this.#logger.warn?.('[factory] onTicketDispatch notification failed', {
+          issue: issue.key,
+          surface: target.surface,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+  }
+
   #error(error: unknown, issue?: IssueRef): void {
     this.#increment('errors')
     const details = describeError(error)
@@ -13618,6 +13709,27 @@ function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
   }
 
   return [...decision.implementers, decision.reviewer]
+}
+
+function dispatchSessionOwner(decision: TriageDecision): string | undefined {
+  for (const spec of dispatchSpecs(decision)) {
+    const sessionOwner = spec.principal?.trim() || spec.owner?.trim()
+    if (sessionOwner) return sessionOwner
+  }
+  return undefined
+}
+
+function dispatchIssueUrl(issue: LinearIssue): string {
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  return stringValue(payload.url)
+    ?? stringValue(payload.html_url)
+    ?? stringValue(source?.url)
+    ?? issue.path
+}
+
+function ticketDispatchNotificationText(payload: TicketDispatchNotificationPayload): string {
+  return `${payload.summary}\n${JSON.stringify(payload)}`
 }
 
 function previewServiceForRepo(

@@ -9623,6 +9623,88 @@ describe('FactoryLoop', () => {
     expect(new Set(fleet.spawns.map((spawn) => spawn.invocationId)).size).toBe(2)
   })
 
+  it('delivers one onTicketDispatch payload to every configured surface', async () => {
+    const path = issuePath(124)
+    const mount = new FakeMountClient({ [path]: realIssueFile(124) })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-124-impl-pear', 'session-ar-124-impl-pear')
+    const timestamp = '2026-08-13T08:13:00.000Z'
+    const notifications: Array<{ surface: 'slack' | 'telegram'; text: string }> = []
+    const linearComments: string[] = []
+    const factory = createFactory(config({
+      hooks: {
+        onTicketDispatch: {
+          notify: [
+            { surface: 'relay', channel: 'dispatch-notifications' },
+            { surface: 'slack', channel: 'C123', dm: 'U456' },
+            { surface: 'telegram', chatId: '-100789' },
+            { surface: 'linear', commentOnIssue: true },
+          ],
+        },
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: {
+        async setState() {},
+        async postComment(_issue, text) {
+          linearComments.push(text)
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+      ticketDispatchDelivery: {
+        async slack({ text }) {
+          notifications.push({ surface: 'slack', text })
+        },
+        async telegram({ text }) {
+          notifications.push({ surface: 'telegram', text })
+        },
+      },
+      clock: { now: () => Date.parse(timestamp), sleep: async () => {} },
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(path, realIssueFile(124)))
+    decision.implementers[0]!.principal = 'broker'
+
+    await factory.dispatch(decision)
+
+    const relayText = fleet.messages.find((message) => message.to === '#dispatch-notifications')?.text
+    const linearText = linearComments.find((text) => text.startsWith('Ticket dispatched:'))
+    expect(relayText).toBeDefined()
+    expect(notifications.map((notification) => notification.surface)).toEqual(['slack', 'telegram'])
+    expect(linearText).toBeDefined()
+
+    const payloads = [
+      relayText!,
+      ...notifications.map((notification) => notification.text),
+      linearText!,
+    ].map((text) => JSON.parse(text.slice(text.indexOf('\n') + 1)))
+
+    for (const payload of payloads) {
+      expect(payload).toEqual({
+        eventType: 'ticket.dispatched',
+        summary: 'Ticket dispatched: [factory-e2e] Fix factory issue 124 → ar-124-impl-pear.',
+        issue: {
+          id: 'uuid-124',
+          title: '[factory-e2e] Fix factory issue 124',
+          url: 'https://linear.app/agent-relay/issue/AR-124/factory-issue-124',
+        },
+        agent: {
+          name: 'ar-124-impl-pear',
+          sessionRef: 'session-ar-124-impl-pear',
+        },
+        sessionOwner: 'broker',
+        timestamp,
+      })
+    }
+    expect(factory.status().counters.ticketDispatchHookNotifications).toBe(4)
+  })
+
   it('derives implementer dispatch identities from repo labels instead of triage implementers', async () => {
     const routedIssue = realIssueFile(720, ready, {
       title: '[factory-e2e] Relayfile webhooks to cloud',

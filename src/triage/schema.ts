@@ -3,6 +3,8 @@ import { z } from 'zod'
 export const AgentSpecSchema = z.object({
   name: z.string(),
   role: z.enum(['implementer', 'reviewer', 'babysitter', 'workflow']),
+  principal: z.string().optional(),
+  owner: z.string().optional(),
   capability: z.enum(['spawn:codex', 'spawn:claude', 'workflow:run']),
   model: z.string().optional(),
   task: z.string(),
