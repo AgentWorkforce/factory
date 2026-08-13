@@ -9669,7 +9669,7 @@ describe('FactoryLoop', () => {
       clock: { now: () => Date.parse(timestamp), sleep: async () => {} },
     })
     const decision = await factory.triageIssue(parseLinearIssue(path, realIssueFile(124)))
-    decision.implementers[0]!.principal = 'broker'
+    decision.implementers[0]!.principal = 'stale-triage-owner'
 
     await factory.dispatch(decision)
 
@@ -9698,11 +9698,105 @@ describe('FactoryLoop', () => {
           name: 'ar-124-impl-pear',
           sessionRef: 'session-ar-124-impl-pear',
         },
-        sessionOwner: 'broker',
+        sessionOwner: null,
         timestamp,
       })
     }
     expect(factory.status().counters.ticketDispatchHookNotifications).toBe(4)
+  })
+
+  it('fans out onTicketDispatch only after the running lifecycle owner is persisted', async () => {
+    class RejectFirstRunningLifecycleSaveStore extends FileStateStore {
+      rejectedRunningSave = false
+
+      override async saveDispatchLifecycle(
+        ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+      ): Promise<boolean> {
+        const lifecycle = args[5]
+        if (lifecycle.phase === 'running' && !this.rejectedRunningSave) {
+          this.rejectedRunningSave = true
+          return false
+        }
+        return await super.saveDispatchLifecycle(...args)
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-owner-'))
+    const watchStatePath = join(root, 'state.json')
+    const path = issuePath(125)
+    const issue = realIssueFile(125)
+    const mount = new FakeMountClient({ [path]: issue })
+    const stateStore = new RejectFirstRunningLifecycleSaveStore({ batchSize: 2, watchStatePath })
+    const clock = new ManualClock()
+    const notifications: string[] = []
+    const factoryConfig = config({
+      hooks: {
+        onTicketDispatch: {
+          notify: [{ surface: 'slack', channel: 'C123' }],
+        },
+      },
+    })
+    const linear = {
+      async setState() {},
+      async postComment() {},
+      async createIssue() {
+        throw new Error('not used')
+      },
+      async verify() {
+        return true
+      },
+    }
+    const ticketDispatchDelivery = {
+      async slack({ text }: { text: string }) {
+        notifications.push(text)
+      },
+      async telegram() {},
+    }
+    const staleOwner = createFactory(factoryConfig, {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      linear,
+      ticketDispatchDelivery,
+      clock,
+    })
+    let successor: ReturnType<typeof createFactory> | undefined
+
+    try {
+      const decision = await staleOwner.triageIssue(parseLinearIssue(path, issue))
+      decision.implementers[0]!.principal = 'stale-triage-owner'
+
+      await staleOwner.dispatch(decision)
+
+      expect(stateStore.rejectedRunningSave).toBe(true)
+      expect(notifications).toEqual([])
+
+      await stateStore.releaseInFlight('factory-test', decision.issue.key)
+      clock.advance(5 * 60_000 + 1)
+      successor = createFactory(factoryConfig, {
+        mount,
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        linear,
+        ticketDispatchDelivery,
+        clock,
+      })
+
+      await successor.dispatch(decision)
+
+      expect(notifications).toHaveLength(1)
+      const payload = JSON.parse(notifications[0]!.slice(notifications[0]!.indexOf('\n') + 1))
+      expect(payload).toMatchObject({
+        agent: { name: 'ar-125-impl-pear' },
+        sessionOwner: null,
+      })
+    } finally {
+      await successor?.stop()
+      await staleOwner.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('derives implementer dispatch identities from repo labels instead of triage implementers', async () => {

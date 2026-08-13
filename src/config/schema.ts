@@ -159,9 +159,17 @@ const ticketDispatchNotificationSchema = z.discriminatedUnion('surface', [
   }).strict(),
   z.object({
     surface: z.literal('linear'),
-    commentOnIssue: z.boolean(),
+    commentOnIssue: z.literal(true),
   }).strict(),
-])
+]).superRefine((target, ctx) => {
+  if (target.surface === 'slack' && !target.channel && !target.dm) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['channel'],
+      message: 'Slack ticket-dispatch notifications require channel and/or dm',
+    })
+  }
+})
 
 const hooksSchema = z.object({
   onTicketDispatch: z.object({
