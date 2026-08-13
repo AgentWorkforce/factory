@@ -9790,7 +9790,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('delivers an unclaimed running onTicketDispatch notification after startup adoption', async () => {
+  it('delivers an unclaimed running onTicketDispatch notification before startup roster reconciliation', async () => {
     vi.useFakeTimers()
     const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-crash-window-'))
     const watchStatePath = join(root, 'state.json')
@@ -9798,6 +9798,13 @@ describe('FactoryLoop', () => {
     const issue = realIssueFile(127)
     const mount = new FakeMountClient({ [path]: issue })
     const notifications: string[] = []
+    const notificationsSeenAtReconcile: number[] = []
+    class NotificationOrderingFleetClient extends RemoteLifecycleFleetClient {
+      override async reconcileTrackedAgents(): Promise<void> {
+        notificationsSeenAtReconcile.push(notifications.length)
+        await super.reconcileTrackedAgents()
+      }
+    }
     const factoryConfig = config({
       hooks: {
         onTicketDispatch: {
@@ -9876,15 +9883,15 @@ describe('FactoryLoop', () => {
 
       restarted = createFactory(factoryConfig, {
         mount,
-        fleet: new RemoteLifecycleFleetClient(),
+        fleet: new NotificationOrderingFleetClient(),
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
         triage: new StaticTriage(),
         linear,
         ticketDispatchDelivery,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await vi.advanceTimersByTimeAsync(1_000)
-      await vi.waitFor(() => expect(notifications).toHaveLength(1))
+      expect(notificationsSeenAtReconcile).toEqual([1])
+      expect(notifications).toHaveLength(1)
 
       const payload = JSON.parse(notifications[0]!.slice(notifications[0]!.indexOf('\n') + 1))
       expect(payload).toMatchObject({
