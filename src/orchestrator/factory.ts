@@ -3712,6 +3712,9 @@ export class FactoryLoop implements Factory {
         releaseReason ?? previous?.releaseReason,
         cost,
       )
+      if (previous?.ticketDispatchNotification) {
+        lifecycle.ticketDispatchNotification = structuredClone(previous.ticketDispatchNotification)
+      }
       for (const agent of lifecycle.agents) {
         const previousAgent = previous?.agents.find((candidate) => candidate.name === agent.name)
         if (previousAgent?.releasedAtMs !== undefined) agent.releasedAtMs = previousAgent.releasedAtMs
@@ -4130,6 +4133,10 @@ export class FactoryLoop implements Factory {
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
     if (!record.dryRun) {
+      if (!liveIssue) {
+        throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
+      }
+      await this.#notifyTicketDispatch(record.decision, liveIssue, record, record.result)
       await this.#ensureSlackDispatchThread(record, record.result)
       for (const tracked of record.agents.values()) {
         const owned = tracked.spec.ownedPullRequest
@@ -11127,6 +11134,7 @@ export class FactoryLoop implements Factory {
       ?? result.agents.find((candidate) => candidate.role === 'workflow')
       ?? result.agents[0]
     if (!agent) return
+    if (!await this.#claimTicketDispatchNotification(record)) return
 
     const tracked = record.agents.get(agent.name)
     const payload: TicketDispatchNotificationPayload = {
@@ -11187,6 +11195,54 @@ export class FactoryLoop implements Factory {
         })
       }
     }
+  }
+
+  async #claimTicketDispatchNotification(record: InFlightIssue): Promise<boolean> {
+    if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
+    const key = issueKey(record.issue)
+    return this.#serializeDispatchLifecyclePersistence(key, async () => {
+      const epoch = this.#dispatchLifecycleEpochs.get(key)
+      if (epoch === undefined) {
+        this.#scheduleDispatchLifecycleRetry(record)
+        return false
+      }
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      if (!lifecycle) {
+        this.#scheduleDispatchLifecycleRetry(record)
+        return false
+      }
+      const workUnitId = lifecycle.runId
+      if (lifecycle.ticketDispatchNotification?.workUnitId === workUnitId) return false
+
+      // Reserve the work unit before external side effects. Hook delivery is
+      // best-effort per target, so takeover must prefer at-most-once fan-out
+      // over replaying a notification whose provider acknowledgement was lost.
+      const claimedAtMs = this.#clock.now()
+      const claimedLifecycle: DispatchLifecycle = {
+        ...lifecycle,
+        ticketDispatchNotification: { workUnitId, claimedAtMs },
+        updatedAtMs: claimedAtMs,
+      }
+      const saved = await this.#state.saveDispatchLifecycle(
+        this.#workspaceId,
+        key,
+        this.#dispatchLifecycleOwner,
+        epoch,
+        claimedAtMs,
+        claimedLifecycle,
+      )
+      if (!saved) {
+        this.#dispatchLifecycleEpochs.delete(key)
+        this.#increment('dispatchLifecycleFencesRejected')
+        await this.#reportLifecycle(claimedLifecycle, 'factory.anomaly', {
+          level: 'error',
+          errorCode: 'fence_rejected',
+        })
+        this.#scheduleDispatchLifecycleRetry(record)
+        return false
+      }
+      return true
+    })
   }
 
   #error(error: unknown, issue?: IssueRef): void {
