@@ -9790,6 +9790,124 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('delivers an unclaimed running onTicketDispatch notification after startup adoption', async () => {
+    vi.useFakeTimers()
+    const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-crash-window-'))
+    const watchStatePath = join(root, 'state.json')
+    const path = issuePath(127)
+    const issue = realIssueFile(127)
+    const mount = new FakeMountClient({ [path]: issue })
+    const notifications: string[] = []
+    const factoryConfig = config({
+      hooks: {
+        onTicketDispatch: {
+          notify: [{ surface: 'slack', channel: 'C123' }],
+        },
+      },
+    })
+    const linear = {
+      async setState() {},
+      async postComment() {},
+      async createIssue() {
+        throw new Error('not used')
+      },
+      async verify() {
+        return true
+      },
+    }
+    const ticketDispatchDelivery = {
+      async slack({ text }: { text: string }) {
+        notifications.push(text)
+      },
+      async telegram() {},
+    }
+    const firstState = new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(factoryConfig, {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: firstState,
+      triage: new StaticTriage(),
+      linear,
+      ticketDispatchDelivery,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+
+    try {
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
+
+      expect(notifications).toHaveLength(1)
+      const key = issueKey(decision.issue)
+      const running = await firstState.getDispatchLifecycle('factory-test', key)
+      expect(running).toMatchObject({
+        phase: 'running',
+        ticketDispatchNotification: { workUnitId: running?.runId },
+      })
+
+      // Model a process crash after `running` was persisted but before the
+      // notification work unit was claimed.
+      await first.stop()
+      const mutator = new FileStateStore({ batchSize: 2, watchStatePath })
+      const claim = await mutator.claimDispatchLifecycle(
+        'factory-test',
+        key,
+        running!,
+        'test-crash-window-owner',
+        Date.now(),
+        5 * 60_000,
+      )
+      expect(claim.acquired).toBe(true)
+      const { ticketDispatchNotification: _discardedClaim, ...unclaimedRunning } = claim.lifecycle
+      expect(await mutator.saveDispatchLifecycle(
+        'factory-test',
+        key,
+        'test-crash-window-owner',
+        claim.lease!.epoch,
+        Date.now(),
+        unclaimedRunning,
+      )).toBe(true)
+      await mutator.releaseDispatchLifecycleLease(
+        'factory-test',
+        key,
+        'test-crash-window-owner',
+        claim.lease!.epoch,
+      )
+      notifications.length = 0
+
+      restarted = createFactory(factoryConfig, {
+        mount,
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+        triage: new StaticTriage(),
+        linear,
+        ticketDispatchDelivery,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(() => expect(notifications).toHaveLength(1))
+
+      const payload = JSON.parse(notifications[0]!.slice(notifications[0]!.indexOf('\n') + 1))
+      expect(payload).toMatchObject({
+        agent: { name: 'ar-127-impl-pear' },
+        sessionOwner: null,
+      })
+      const adopted = await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getDispatchLifecycle('factory-test', key)
+      expect(adopted).toMatchObject({
+        phase: 'running',
+        ticketDispatchNotification: { workUnitId: adopted?.runId },
+      })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(notifications).toHaveLength(1)
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+  })
+
   it('does not repeat an already claimed onTicketDispatch notification during durable resume', async () => {
     vi.useFakeTimers()
     const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-idempotency-'))

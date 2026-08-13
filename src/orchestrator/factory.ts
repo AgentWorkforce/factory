@@ -3040,7 +3040,12 @@ export class FactoryLoop implements Factory {
         const restored = claim.lifecycle.phase === 'queued' || claim.lifecycle.phase === 'releasing'
           ? durableRecord
           : batch.restore(durableRecord)
-        if (claim.lifecycle.phase !== 'running') this.#scheduleDispatchLifecycleRetry(restored)
+        if (
+          claim.lifecycle.phase !== 'running' ||
+          this.#ticketDispatchNotificationIsPending(claim.lifecycle)
+        ) {
+          this.#scheduleDispatchLifecycleRetry(restored)
+        }
         // Parking agents are cleanup-only. Hydrating them makes relay
         // reconciliation report their expected absence as an ordinary exit
         // before the durable parking driver can release/confirm them.
@@ -3926,6 +3931,15 @@ export class FactoryLoop implements Factory {
         await this.#abandonDurableResume(record, 'source issue became terminal before lifecycle cleanup')
         return
       }
+      if (this.#ticketDispatchNotificationIsPending(lifecycle)) {
+        if (!liveIssue) {
+          throw new Error(`Unable to recover ticket-dispatch notification ${record.issue.key}: issue is not currently readable`)
+        }
+        if (!record.result) {
+          throw new Error(`Unable to recover ticket-dispatch notification ${record.issue.key}: dispatch result is missing`)
+        }
+        await this.#notifyTicketDispatch(record.decision, liveIssue, record, record.result)
+      }
     }
 
     if (acquiredNow && lifecycle.phase === 'running') {
@@ -4132,10 +4146,7 @@ export class FactoryLoop implements Factory {
       record.result = { ...record.result, previews: recoveredPreviews }
     }
     if (!await this.#saveDispatchLifecycle(record, 'running')) return
-    if (!record.dryRun) {
-      if (!liveIssue) {
-        throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
-      }
+    if (liveIssue) {
       await this.#notifyTicketDispatch(record.decision, liveIssue, record, record.result)
       await this.#ensureSlackDispatchThread(record, record.result)
       for (const tracked of record.agents.values()) {
@@ -11243,6 +11254,12 @@ export class FactoryLoop implements Factory {
       }
       return true
     })
+  }
+
+  #ticketDispatchNotificationIsPending(lifecycle: DispatchLifecycle): boolean {
+    return Boolean(this.#config.hooks?.onTicketDispatch) &&
+      !lifecycle.dryRun &&
+      lifecycle.ticketDispatchNotification?.workUnitId !== lifecycle.runId
   }
 
   #error(error: unknown, issue?: IssueRef): void {
