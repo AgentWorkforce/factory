@@ -3007,12 +3007,13 @@ export class FactoryLoop implements Factory {
         this.#hydrateCostLedger(claim.lifecycle)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
+        let liveIssue: LinearIssue | undefined
         if (
           !durableRecord.dryRun &&
           claim.lifecycle.phase !== 'writeback-applied' &&
           claim.lifecycle.phase !== 'releasing'
         ) {
-          const liveIssue = await this.#readIssue(durableRecord.issue.path)
+          liveIssue = await this.#readIssue(durableRecord.issue.path)
           // A babysat Linear issue already at Done may have merged while this
           // process was down. Let authoritative PR restoration drive the
           // normal `complete` path so merged work is not mislabeled abandoned.
@@ -3041,11 +3042,20 @@ export class FactoryLoop implements Factory {
           ? durableRecord
           : batch.restore(durableRecord)
         if (
-          claim.lifecycle.phase !== 'running' ||
+          claim.lifecycle.phase === 'running' &&
           this.#ticketDispatchNotificationIsPending(claim.lifecycle)
         ) {
-          this.#scheduleDispatchLifecycleRetry(restored)
+          if (!liveIssue) {
+            this.#dispatchLifecycleEpochs.delete(claim.key ?? key)
+            this.#scheduleDispatchLifecycleRetry(restored)
+            throw new Error(`Unable to recover ticket-dispatch notification ${restored.issue.key}: issue is not currently readable`)
+          }
+          if (!restored.result) {
+            throw new Error(`Unable to recover ticket-dispatch notification ${restored.issue.key}: dispatch result is missing`)
+          }
+          await this.#notifyTicketDispatch(restored.decision, liveIssue, restored, restored.result)
         }
+        if (claim.lifecycle.phase !== 'running') this.#scheduleDispatchLifecycleRetry(restored)
         // Parking agents are cleanup-only. Hydrating them makes relay
         // reconciliation report their expected absence as an ordinary exit
         // before the durable parking driver can release/confirm them.
