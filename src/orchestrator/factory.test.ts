@@ -9705,29 +9705,98 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.ticketDispatchHookNotifications).toBe(4)
   })
 
-  it('fans out onTicketDispatch only after the running lifecycle owner is persisted', async () => {
-    class RejectFirstRunningLifecycleSaveStore extends FileStateStore {
-      rejectedRunningSave = false
+  it('delivers onTicketDispatch once when a fenced running save resumes durably', async () => {
+    vi.useFakeTimers()
+
+    class RejectFirstRunningLifecycleSaveStore extends InMemoryStateStore {
+      runningSaveAttempts = 0
 
       override async saveDispatchLifecycle(
-        ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+        ...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>
       ): Promise<boolean> {
         const lifecycle = args[5]
-        if (lifecycle.phase === 'running' && !this.rejectedRunningSave) {
-          this.rejectedRunningSave = true
-          return false
+        if (lifecycle.phase === 'running') {
+          this.runningSaveAttempts += 1
+          if (this.runningSaveAttempts === 1) return false
         }
         return await super.saveDispatchLifecycle(...args)
       }
     }
 
-    const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-owner-'))
-    const watchStatePath = join(root, 'state.json')
     const path = issuePath(125)
     const issue = realIssueFile(125)
     const mount = new FakeMountClient({ [path]: issue })
-    const stateStore = new RejectFirstRunningLifecycleSaveStore({ batchSize: 2, watchStatePath })
-    const clock = new ManualClock()
+    const stateStore = new RejectFirstRunningLifecycleSaveStore({ batchSize: 2 })
+    const notifications: string[] = []
+    const factory = createFactory(config({
+      hooks: {
+        onTicketDispatch: {
+          notify: [{ surface: 'slack', channel: 'C123' }],
+        },
+      },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      linear: {
+        async setState() {},
+        async postComment() {},
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      },
+      ticketDispatchDelivery: {
+        async slack({ text }) {
+          notifications.push(text)
+        },
+        async telegram() {},
+      },
+    })
+
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+      decision.implementers[0]!.principal = 'stale-triage-owner'
+
+      await factory.dispatch(decision)
+
+      expect(stateStore.runningSaveAttempts).toBe(1)
+      expect(notifications).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({ phase: 'dispatching' })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(() => expect(notifications).toHaveLength(1))
+
+      const payload = JSON.parse(notifications[0]!.slice(notifications[0]!.indexOf('\n') + 1))
+      expect(payload).toMatchObject({
+        agent: { name: 'ar-125-impl-pear' },
+        sessionOwner: null,
+      })
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      expect(lifecycle).toMatchObject({
+        phase: 'running',
+        ticketDispatchNotification: { workUnitId: lifecycle?.runId },
+      })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(notifications).toHaveLength(1)
+    } finally {
+      await factory.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not repeat an already claimed onTicketDispatch notification during durable resume', async () => {
+    vi.useFakeTimers()
+    const root = await mkdtemp(join(tmpdir(), 'factory-ticket-dispatch-idempotency-'))
+    const watchStatePath = join(root, 'state.json')
+    const path = issuePath(126)
+    const issue = realIssueFile(126)
+    const mount = new FakeMountClient({ [path]: issue })
     const notifications: string[] = []
     const factoryConfig = config({
       hooks: {
@@ -9752,50 +9821,72 @@ describe('FactoryLoop', () => {
       },
       async telegram() {},
     }
-    const staleOwner = createFactory(factoryConfig, {
+    const firstState = new FileStateStore({ batchSize: 2, watchStatePath })
+    const first = createFactory(factoryConfig, {
       mount,
       fleet: new RemoteLifecycleFleetClient(),
-      stateStore,
+      stateStore: firstState,
       triage: new StaticTriage(),
       linear,
       ticketDispatchDelivery,
-      clock,
     })
-    let successor: ReturnType<typeof createFactory> | undefined
+    let resumed: ReturnType<typeof createFactory> | undefined
 
     try {
-      const decision = await staleOwner.triageIssue(parseLinearIssue(path, issue))
-      decision.implementers[0]!.principal = 'stale-triage-owner'
+      const decision = await first.triageIssue(parseLinearIssue(path, issue))
+      await first.dispatch(decision)
 
-      await staleOwner.dispatch(decision)
+      expect(notifications).toHaveLength(1)
+      const key = issueKey(decision.issue)
+      const notified = await firstState.getDispatchLifecycle('factory-test', key)
+      expect(notified).toMatchObject({
+        phase: 'running',
+        ticketDispatchNotification: { workUnitId: notified?.runId },
+      })
 
-      expect(stateStore.rejectedRunningSave).toBe(true)
-      expect(notifications).toEqual([])
+      await first.stop()
+      const mutator = new FileStateStore({ batchSize: 2, watchStatePath })
+      const claim = await mutator.claimDispatchLifecycle(
+        'factory-test',
+        key,
+        notified!,
+        'test-resume-owner',
+        Date.now(),
+        5 * 60_000,
+      )
+      expect(claim.acquired).toBe(true)
+      expect(await mutator.saveDispatchLifecycle(
+        'factory-test',
+        key,
+        'test-resume-owner',
+        claim.lease!.epoch,
+        Date.now(),
+        { ...claim.lifecycle, phase: 'dispatching' },
+      )).toBe(true)
+      await mutator.releaseDispatchLifecycleLease('factory-test', key, 'test-resume-owner', claim.lease!.epoch)
 
-      await stateStore.releaseInFlight('factory-test', decision.issue.key)
-      clock.advance(5 * 60_000 + 1)
-      successor = createFactory(factoryConfig, {
+      resumed = createFactory(factoryConfig, {
         mount,
         fleet: new RemoteLifecycleFleetClient(),
         stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
         triage: new StaticTriage(),
         linear,
         ticketDispatchDelivery,
-        clock,
       })
-
-      await successor.dispatch(decision)
+      await resumed.start({ mode: 'dispatch-owner' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(async () => {
+        const lifecycle = await new FileStateStore({ batchSize: 2, watchStatePath })
+          .getDispatchLifecycle('factory-test', key)
+        expect(lifecycle?.phase).toBe('running')
+      })
 
       expect(notifications).toHaveLength(1)
-      const payload = JSON.parse(notifications[0]!.slice(notifications[0]!.indexOf('\n') + 1))
-      expect(payload).toMatchObject({
-        agent: { name: 'ar-125-impl-pear' },
-        sessionOwner: null,
-      })
     } finally {
-      await successor?.stop()
-      await staleOwner.stop()
+      await resumed?.stop()
+      await first.stop()
       await rm(root, { recursive: true, force: true })
+      vi.useRealTimers()
     }
   })
 

@@ -204,6 +204,15 @@ export type DispatchLifecycle = {
   releaseReason?: string
   /** Bounded token/USD aggregate updated with durable usage and finalized at terminal save. */
   cost?: RunCostTotal
+  /**
+   * Durable at-most-once claim for onTicketDispatch fan-out. The lifecycle
+   * runId is the work-unit identity, so takeover can distinguish a recovered
+   * dispatch from a true reopen before issuing external side effects.
+   */
+  ticketDispatchNotification?: {
+    workUnitId: string
+    claimedAtMs: number
+  }
   lease?: DispatchLifecycleLease
   updatedAtMs: number
 }
