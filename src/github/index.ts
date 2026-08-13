@@ -14,7 +14,6 @@ export {
   standaloneBabysitterAgentName,
 } from './standalone-babysitter'
 export {
-  ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED,
   discoverRoutedPullRequests,
   routedPrIdentity,
   routedPrRepos,

@@ -891,7 +891,10 @@ async function runStandaloneBabysitCommand(
       crossRepository: pr.crossRepository,
       maintainerCanModify: pr.maintainerCanModify,
     },
-    standaloneBabysitter: { specSource },
+    // The explicit CLI command is itself the human opt-in and preserves its
+    // existing conversational behavior. Automatic routed sweeps pass the
+    // safer notification flag from config instead.
+    standaloneBabysitter: { specSource, notifyHumans: true },
     integrationsMountRoot: resolveIntegrationsMountRoot(mount),
     testGuidance,
   })
