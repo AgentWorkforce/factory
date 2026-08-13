@@ -11,6 +11,7 @@ import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
+import type { TicketDispatchDelivery } from './delivery/ticket-dispatch'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -23,6 +24,8 @@ export interface FactoryPorts {
   triage?: TriageEngine
   linear?: LinearWriteback
   slack?: SlackWriteback
+  /** Injectable delivery adapter for onTicketDispatch Slack/Telegram notifications. */
+  ticketDispatchDelivery?: TicketDispatchDelivery
   github?: GithubRead
   githubWriteback?: GithubWriteback
   mergeGate?: GithubMergeGate
