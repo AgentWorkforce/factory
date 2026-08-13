@@ -2736,11 +2736,11 @@ export class FactoryLoop implements Factory {
         dryRun,
       }
       record.result = result
-      await this.#saveDispatchLifecycle(record, 'running')
+      if (!await this.#saveDispatchLifecycle(record, 'running')) return result
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
       if (!dryRun && this.#config.hooks?.onTicketDispatch) {
-        await this.#notifyTicketDispatch(decision, liveIssue, record, result)
+        await this.#notifyTicketDispatch(dispatchDecision, liveIssue, record, result)
       }
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result)

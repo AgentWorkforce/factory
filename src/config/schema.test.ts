@@ -96,6 +96,18 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.environments).toEqual({})
   })
 
+  it('rejects ticket-dispatch notification targets that cannot deliver', () => {
+    const withTarget = (target: Record<string, unknown>) => FactoryConfigSchema.safeParse({
+      repos: { default: 'AgentWorkforce/factory' },
+      hooks: { onTicketDispatch: { notify: [target] } },
+    })
+
+    expect(withTarget({ surface: 'slack' }).success).toBe(false)
+    expect(withTarget({ surface: 'linear', commentOnIssue: false }).success).toBe(false)
+    expect(withTarget({ surface: 'slack', dm: 'U123' }).success).toBe(true)
+    expect(withTarget({ surface: 'linear', commentOnIssue: true }).success).toBe(true)
+  })
+
   it('accepts secret-reference-only Kubernetes BYOC and managed connections', () => {
     const parsed = FactoryConfigSchema.parse({
       repos: { default: 'AgentWorkforce/factory' },
