@@ -11238,6 +11238,7 @@ export class FactoryLoop implements Factory {
       // Reserve the work unit before external side effects. Hook delivery is
       // best-effort per target, so takeover must prefer at-most-once fan-out
       // over replaying a notification whose provider acknowledgement was lost.
+      // Follow-up for provider-idempotent retries: https://github.com/AgentWorkforce/factory/issues/239
       const claimedAtMs = this.#clock.now()
       const claimedLifecycle: DispatchLifecycle = {
         ...lifecycle,
