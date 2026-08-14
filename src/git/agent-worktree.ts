@@ -3,6 +3,7 @@ import { lstat, mkdir, readdir, realpath, rmdir, stat } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { factoryBranchBelongsToIssue } from '../issue-key-match'
 import type {
   AgentWorktree,
   AgentWorktreeCleanupInspection,
@@ -318,6 +319,11 @@ const assertSafeWorktree = (worktree: AgentWorktree): void => {
   const expectedRoot = factoryWorktreeRoot(base)
   if (target === base || !target.startsWith(`${expectedRoot}/`)) {
     throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
+  }
+  if (worktree.branch.startsWith('factory/') && !factoryBranchBelongsToIssue(worktree.branch, worktree.issueKey)) {
+    throw new Error(
+      `Refusing Factory worktree branch ${worktree.branch}: it does not belong to dispatched issue ${worktree.issueKey}`,
+    )
   }
   if (!worktree.branch.startsWith('factory/') && !isAuthorizedExistingPrBranch(worktree)) {
     throw new Error(`Refusing unsafe Factory worktree branch ${worktree.branch}`)

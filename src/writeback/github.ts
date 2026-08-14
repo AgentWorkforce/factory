@@ -88,6 +88,11 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (!headRef) {
       throw new Error('GitHub user PR publication requires headRef or clonePath')
     }
+    if (input.expectedHeadRef && headRef !== input.expectedHeadRef) {
+      throw new Error(
+        `Refusing to publish GitHub PR: expected head branch ${input.expectedHeadRef}, found ${headRef}`,
+      )
+    }
     if (headRef === input.baseRef) {
       throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
     }

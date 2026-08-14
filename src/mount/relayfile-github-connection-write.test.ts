@@ -286,6 +286,25 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('refuses a stale local branch before pushing or opening a pull request', async () => {
+    const mount = new FakeMountClient()
+    const git = gitRunnerForBranch('factory/3022-chief-org-live-population')
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/cloud',
+      clonePath: '/work/cloud',
+      expectedHeadRef: 'factory/3021-agentworkforce-cloud-12345678',
+      baseRef: 'main',
+      title: '3021: repair deployment objective CI',
+      body: 'Fixes #3021',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: expected head branch factory/3021-agentworkforce-cloud-12345678, found factory/3022-chief-org-live-population',
+    )
+    expect(git).toHaveBeenCalledTimes(1)
+    expect(mount.writes).toEqual([])
+  })
+
   it('retries until the created pull request receipt is visible', async () => {
     const draft = 'factory-fix-issue-52-1234567890ab'
     const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`

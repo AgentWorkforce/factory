@@ -46,15 +46,20 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     const headRef = input.headRef ?? (input.clonePath
       ? await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
       : undefined)
-    const headSha = input.headSha ?? (input.clonePath && !input.headRef
-      ? await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
-      : undefined)
     if (!headRef) {
       throw new Error('GitHub PR publication requires headRef or clonePath')
+    }
+    if (input.expectedHeadRef && headRef !== input.expectedHeadRef) {
+      throw new Error(
+        `Refusing to publish GitHub PR: expected head branch ${input.expectedHeadRef}, found ${headRef}`,
+      )
     }
     if (headRef === input.baseRef) {
       throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
     }
+    const headSha = input.headSha ?? (input.clonePath && !input.headRef
+      ? await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
+      : undefined)
     const draftName = githubDraftName(headRef, headSha)
     const repoRoot = `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
     const fullHeadRef = `refs/heads/${headRef}`

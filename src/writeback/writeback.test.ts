@@ -887,6 +887,34 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  it('refuses a mismatched local head before push or PR creation', async () => {
+    const ghCalls: string[][] = []
+    const gitCalls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        ghCalls.push(args)
+        return { stdout: '' }
+      },
+      gitRunner: async (args) => {
+        gitCalls.push(args)
+        return { stdout: 'factory/3022-chief-org-live-population\n' }
+      },
+    })
+
+    await expect(github.publishPullRequest({
+      repo: 'AgentWorkforce/cloud',
+      clonePath: '/work/cloud',
+      expectedHeadRef: 'factory/3021-agentworkforce-cloud-12345678',
+      baseRef: 'main',
+      title: '3021: repair deployment objective CI',
+      body: 'Fixes #3021',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: expected head branch factory/3021-agentworkforce-cloud-12345678, found factory/3022-chief-org-live-population',
+    )
+    expect(gitCalls).toEqual([['-C', '/work/cloud', 'symbolic-ref', '--short', 'HEAD']])
+    expect(ghCalls).toEqual([])
+  })
+
   it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
     const calls: string[][] = []
     const github = new GhCliGithubWriteback({
