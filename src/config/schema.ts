@@ -40,6 +40,8 @@ const liveSubscriptionSchema = z.object({
   pollIntervalMs: z.number().int().min(50).default(5_000),
   eventLimit: z.number().int().min(1).max(1_000).default(1_000),
   replaySkewMarginMs: z.number().int().min(0).default(60_000),
+  /** Independent source-of-truth sweep; live event watermarks remain a latency optimization. */
+  reconcileIntervalMs: z.number().int().min(50).default(60_000),
 }).default({})
 
 const dispatchSchema = z.object({

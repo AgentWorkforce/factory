@@ -94,6 +94,8 @@ export interface FactoryLiveSubscriptionOptions {
   pollIntervalMs: number
   eventLimit: number
   replaySkewMarginMs: number
+  /** Periodic source-of-truth readiness reconciliation, independent of event cursors/watermarks. */
+  reconcileIntervalMs: number
 }
 
 /**
