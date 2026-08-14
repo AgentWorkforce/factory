@@ -18959,6 +18959,176 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('still spawns the babysitter when the PR-open snapshot read fails transiently', async () => {
+    const issue = realIssueFile(2404, ready, { title: 'Real babysitter snapshot retry' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/2404/metadata.json'
+    let failedReads = 0
+    class FlakyReadMountClient extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        // Reproduce the production failure exactly: the very first read of the
+        // PR meta rejects with `fetch failed`, which previously ended the
+        // babysitter's only chance to take ownership of this PR.
+        if (path === prPath && failedReads === 0) {
+          failedReads += 1
+          throw new Error('fetch failed')
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new FlakyReadMountClient({ [issuePath(2404)]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 2404 }),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2404), issue)))
+
+      mount.files.set(prPath, {
+        content: { number: 2404, state: 'open', head_ref: 'ar-2404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2404' },
+      })
+      mount.emit(changeEvent(prPath, 'pr-2404-open'))
+
+      // Wait on the retry itself, not the spawn: other safety nets can also
+      // reach #ensureBabysitter, and this assertion is about the read path.
+      await vi.waitFor(() => expect(factory.status().counters.babysitterPrSnapshotReadRetrySucceeded).toBe(1))
+      expect(failedReads).toBe(1)
+      expect(fleet.spawns.map((s) => s.name)).toContain('ar-2404-babysit')
+      // The read recovered in-line, so nothing was dead-lettered and no
+      // permanent failure was recorded.
+      expect(factory.status().counters.babysitterPrSnapshotReadFailures).toBeUndefined()
+      expect(factory.status().counters.babysitterPrSnapshotReadRetries).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('dead-letters an exhausted PR snapshot read and recovers it on the reconcile sweep', async () => {
+    const issue = realIssueFile(2405, ready, { title: 'Real babysitter snapshot dead letter' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/2405/metadata.json'
+    let mountFaulted = true
+    class FaultedReadMountClient extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === prPath && mountFaulted) {
+          throw new Error('fetch failed')
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new FaultedReadMountClient({ [issuePath(2405)]: issue })
+    const fleet = new FakeFleetClient()
+    const warnings: string[] = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: { warn: (message: string) => { warnings.push(message) } },
+      // The sweep must not depend on the probe resolver to recover a PR whose
+      // meta path Factory already knows about.
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2405), issue)))
+
+      mount.files.set(prPath, {
+        content: { number: 2405, state: 'open', head_ref: 'ar-2405-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2405' },
+      })
+      mount.emit(changeEvent(prPath, 'pr-2405-open'))
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterPrSnapshotReadFailures).toBe(1))
+      expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-2405-babysit')
+      // Visible at default log level, not debug.
+      expect(warnings).toContain('[factory] babysitter could not read PR snapshot')
+
+      mountFaulted = false
+      await factory.runLoop({ maxIterations: 1 })
+
+      await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-2405-babysit'))
+      expect(factory.status().counters.babysitterPrSnapshotDeadLettersRetried).toBe(1)
+      expect(factory.status().counters.babysitterPrSnapshotDeadLettersRecovered).toBe(1)
+      expect(factory.status().counters.babysitterPrSnapshotDeadLetterDepth).toBe(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('adopts an already-open PR that no babysitter owns on the reconcile sweep', async () => {
+    const issue = realIssueFile(2406, ready, { title: 'Real babysitter orphan adoption' })
+    const mount = new FakeMountClient({ [issuePath(2406)]: issue })
+    const fleet = new FakeFleetClient()
+    const warnings: Array<{ message: string; detail?: unknown }> = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: { warn: (message: string, detail?: unknown) => { warnings.push({ message, detail }) } },
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 2406 }),
+    })
+
+    // The PR is open and Factory-created, but its PR-open event never arrived —
+    // the shape `cloud#3024` was found in. No event is emitted here at all.
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2406), issue)))
+    seedPrMeta(mount, 'AgentWorkforce/pear', 2406, { state: 'open', draft: false })
+    expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-2406-babysit')
+
+    await factory.runLoop({ maxIterations: 1 })
+
+    expect(fleet.spawns.map((s) => s.name)).toContain('ar-2406-babysit')
+    expect(factory.status().counters.babysitterOrphanedPrsAdopted).toBe(1)
+    expect(factory.status().counters.babysitterOrphanSweepRuns).toBe(1)
+    expect(warnings.map((entry) => entry.message))
+      .toContain('[factory] adopted an orphaned PR that no babysitter owned')
+
+    // Adoption is idempotent: an owned record is not rescanned into a respawn.
+    const spawnedBabysitters = fleet.spawns.filter((s) => s.name === 'ar-2406-babysit').length
+    await factory.runLoop({ maxIterations: 1 })
+    expect(fleet.spawns.filter((s) => s.name === 'ar-2406-babysit')).toHaveLength(spawnedBabysitters)
+  })
+
+  it('warns once per unowned PR identity instead of silently dropping its events at debug', async () => {
+    const issue = realIssueFile(2407, ready, { title: 'Real babysitter unowned routing' })
+    const mount = new FakeMountClient({ [issuePath(2407)]: issue })
+    const fleet = new FakeFleetClient()
+    const warnings: string[] = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger: { warn: (message: string) => { warnings.push(message) } },
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2407), issue)))
+
+      // Review activity for a PR that was never routed to a babysitter — the
+      // canonical flat record shape written by adapter-github.
+      for (const id of [9401, 9402, 9403]) {
+        const reviewPath = `/github/repos/AgentWorkforce/pear/reviews/${id}.json`
+        mount.files.set(reviewPath, { content: {
+          repository: { full_name: 'AgentWorkforce/pear' },
+          pull_request: { number: 2407 },
+          review: { id, state: 'changes_requested' },
+        } })
+        mount.emit(changeEvent(reviewPath, `review-${id}`))
+      }
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBeGreaterThanOrEqual(1))
+      const unownedWarnings = warnings
+        .filter((message) => message === '[factory] ignored unowned PR event for babysitter routing')
+      expect(unownedWarnings).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('routes and coalesces only the owned PR review/check/comment events with metadata-only fencing', async () => {
     const issue = realIssueFile(420, ready, { title: 'Real babysitter event routing' })
     const mount = new FakeMountClient({ [issuePath(420)]: issue })
@@ -20513,7 +20683,10 @@ describe('FactoryLoop PR babysitter', () => {
       })
       mount.emit(changeEvent(prPath, 'pr-408-open'))
 
-      await vi.waitFor(() => expect(factory.status().counters.babysitterPrDiscoveryWeakMatchIgnored).toBe(1))
+      // The orphan reconcile sweep replays this same PR meta through
+      // #handlePrChange, so the weak-match guard is exercised once per delivery
+      // attempt. What must hold is that it rejects every time.
+      await vi.waitFor(() => expect(factory.status().counters.babysitterPrDiscoveryWeakMatchIgnored).toBeGreaterThanOrEqual(1))
       expect(fleet.spawns.map((s) => s.name)).not.toContain('ar-408-babysit')
     } finally {
       await factory.stop()
