@@ -506,6 +506,78 @@ describe('RelayfileCloudMountClient', () => {
     }
   })
 
+  it('attaches to an externally supervised registered mirror without replacing it when health turns stale', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-08-14T12:00:00.000Z')
+    const root = await mkdtemp(join(tmpdir(), 'factory-external-workspace-mirror-'))
+    const localDir = join(root, 'chief', '.integrations')
+    const stateDir = join(localDir, '.relay')
+    await mkdir(stateDir, { recursive: true })
+    const writeState = async (lastReconcileAt: string): Promise<void> => {
+      await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+        workspaceId: 'cloud-workspace-uuid',
+        lastReconcileAt,
+        intervalMs: 1_000,
+      }))
+    }
+    await writeState('2026-08-14T12:00:00.000Z')
+    await writeFile(join(stateDir, 'mount.pid'), JSON.stringify({
+      pid: process.pid,
+      workspaceId: 'cloud-workspace-uuid',
+      localDir,
+    }))
+
+    const fake = new FakeRelayFileClient()
+    const ensureMountedWorkspace = vi.fn(async () => ({ stop: vi.fn(async () => {}) }))
+    const healthEvents: Array<{ state: string; reason: string; degradedMounts: number }> = []
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_shared',
+      client: fake,
+      relayfileSetup: { joinWorkspace: vi.fn(), ensureMountedWorkspace },
+      relayfileWorkspace: {
+        workspaceId: 'cloud-workspace-uuid',
+        client: () => fake,
+        getToken: async () => 'delegated-relayfile-token',
+        info: { relayfileUrl: 'https://relayfile.example' },
+      },
+      localMountRoot: localDir,
+      localMountHealthIntervalMs: 1_000,
+      onLocalMountHealth: (event) => { healthEvents.push(event) },
+    })
+
+    try {
+      await mount.ensureLocalMount(join(root, 'unrelated-repository'))
+      expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+
+      // The daemon is still alive but has missed its reconcile threshold.
+      // Factory must report that degradation without launching a replacement.
+      await writeState('2026-08-14T11:59:50.000Z')
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+      expect(healthEvents).toEqual([{
+        state: 'degraded',
+        reason: 'mount_stale',
+        degradedMounts: 1,
+      }])
+
+      // Recovery is also observed in place; the external process remains the
+      // only daemon serving the mirror throughout the client lifetime.
+      await writeState('2026-08-14T12:00:02.000Z')
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+      expect(healthEvents).toEqual([
+        { state: 'degraded', reason: 'mount_stale', degradedMounts: 1 },
+        { state: 'recovered', reason: 'mount_stale', degradedMounts: 0 },
+      ])
+    } finally {
+      await mount.dispose()
+      await rm(root, { recursive: true, force: true })
+      vi.useRealTimers()
+    }
+
+    expect(ensureMountedWorkspace).not.toHaveBeenCalled()
+  })
+
   it('resolves a direct client mirror through the cloud workspace identifier alias', async () => {
     const fake = new FakeRelayFileClient()
     const resolver = vi.fn((workspaceIds: readonly string[]) =>

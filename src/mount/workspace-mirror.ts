@@ -39,8 +39,15 @@ function readWorkspaceRegistry(path: string, accepted: ReadonlySet<string>, home
 
   const mirrors = new Set<string>()
   for (const record of workspaceRecords(payload)) {
-    const workspaceId = stringField(record, 'id') ?? stringField(record, 'workspaceId') ?? stringField(record, 'workspace')
-    if (!workspaceId || !accepted.has(workspaceId)) continue
+    // Relayfile's registry records both the stable workspace id and its
+    // operator-facing name. Callers may legitimately hold either identifier,
+    // so match every recorded alias instead of preferring `id` and making a
+    // name lookup miss. This remains a read-only lookup: no-match never adds a
+    // stub record to workspaces.json.
+    const workspaceAliases = ['id', 'workspaceId', 'workspace', 'name']
+      .map((key) => stringField(record, key))
+      .filter((value): value is string => value !== undefined)
+    if (!workspaceAliases.some((alias) => accepted.has(alias))) continue
     const localDir = stringField(record, 'localDir') ?? stringField(record, 'localRoot') ?? stringField(record, 'mirrorDir')
     if (localDir) mirrors.add(resolveRegisteredLocalDir(homeDir, localDir))
   }

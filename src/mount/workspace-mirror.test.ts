@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -27,6 +27,40 @@ describe('resolveRegisteredWorkspaceMirror', () => {
         localDir: mirror,
         source: 'workspace-registry',
       })
+    })
+  })
+
+  it('resolves a registered workspace by its operator-facing name', async () => {
+    await withTempHome(async (home) => {
+      const mirror = join(home, 'chief', '.integrations')
+      await mkdir(join(home, '.relayfile'), { recursive: true })
+      await writeFile(join(home, '.relayfile', 'workspaces.json'), JSON.stringify({
+        workspaces: [{ id: 'rw_7ccfea89', name: 'default', localDir: mirror }],
+      }))
+
+      expect(resolveRegisteredWorkspaceMirror(['default'], home)).toEqual({
+        localDir: mirror,
+        source: 'workspace-registry',
+      })
+      expect(resolveRegisteredWorkspaceMirror(['rw_7ccfea89'], home)).toEqual({
+        localDir: mirror,
+        source: 'workspace-registry',
+      })
+    })
+  })
+
+  it('leaves the workspace registry byte-for-byte unchanged on lookup miss', async () => {
+    await withTempHome(async (home) => {
+      const registryPath = join(home, '.relayfile', 'workspaces.json')
+      await mkdir(join(home, '.relayfile'), { recursive: true })
+      await writeFile(registryPath, JSON.stringify({
+        workspaces: [{ id: 'rw_real', name: 'default', localDir: join(home, 'chief', '.integrations') }],
+      }, null, 2))
+      const before = await readFile(registryPath, 'utf8')
+
+      expect(resolveRegisteredWorkspaceMirror(['rw_missing'], home)).toBeUndefined()
+
+      expect(await readFile(registryPath, 'utf8')).toBe(before)
     })
   })
 

@@ -1,10 +1,11 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   checkMountStaleness,
+  isMountProcessRunning,
   RELAYFILE_SYNC_INTERVAL_MS,
   STALE_RECONCILE_MS,
   STALE_RECONCILE_INTERVALS,
@@ -37,6 +38,13 @@ async function writeState(
   const statePath = join(dir, 'state.json')
   await writeFile(statePath, JSON.stringify(state), 'utf8')
   return statePath
+}
+
+async function writePidState(
+  dir: string,
+  state: { pid: number; workspaceId?: string; localDir?: string } | number,
+): Promise<void> {
+  await writeFile(join(dir, 'mount.pid'), JSON.stringify(state), 'utf8')
 }
 
 describe('checkMountStaleness', () => {
@@ -195,6 +203,38 @@ describe('checkMountStaleness', () => {
     })
   })
 
+  it('uses the registered mount.pid when public state omits process ownership', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+      })
+      await writePidState(dir, {
+        pid: process.pid,
+        workspaceId: 'rw_test',
+        localDir: dirname(dir),
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false, pid: process.pid })
+    })
+  })
+
+  it('ignores a mount.pid registered for a different workspace', async () => {
+    await withTempDir(async (dir) => {
+      const statePath = await writeState(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+      })
+      await writePidState(dir, {
+        pid: 12345,
+        workspaceId: 'rw_other',
+        localDir: dirname(dir),
+      })
+
+      expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false })
+    })
+  })
+
   it('marks a stale mount via a dead daemon.pid even within the reconcile window', async () => {
     await withTempDir(async (dir) => {
       const statePath = await writeState(dir, {
@@ -237,5 +277,23 @@ describe('checkMountStaleness', () => {
 
       expect(checkMountStaleness(statePath, 'rw_test')).toEqual({ stale: false, pid: process.pid })
     })
+  })
+})
+
+describe('isMountProcessRunning', () => {
+  it('treats an EPERM probe as a running process owned by another user', () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('not permitted'), { code: 'EPERM' })
+    })
+
+    expect(isMountProcessRunning(12345)).toBe(true)
+  })
+
+  it('rejects a missing or dead process', () => {
+    expect(isMountProcessRunning(undefined)).toBe(false)
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('not found'), { code: 'ESRCH' })
+    })
+    expect(isMountProcessRunning(12345)).toBe(false)
   })
 })

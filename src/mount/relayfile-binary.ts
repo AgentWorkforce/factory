@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 
 // Relayfile's poll mirror reconciles every 30 seconds by default.  Three
 // intervals allow one missed poll and ordinary filesystem jitter, while still
@@ -30,8 +31,52 @@ type MountState = {
   daemon?: { pid?: unknown }
 }
 
+type MountPidState = {
+  pid?: unknown
+  workspaceId?: unknown
+  localDir?: unknown
+}
+
 export function coercePid(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+/** Read-only liveness probe used to distinguish an attached daemon from a mount Factory owns. */
+export function isMountProcessRunning(pid: number | undefined): boolean {
+  if (pid === undefined) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === 'EPERM'
+  }
+}
+
+function readMountProcessPid(
+  stateFilePath: string,
+  acceptedWorkspaceIds: ReadonlySet<string>,
+): number | undefined {
+  let raw: string
+  try {
+    raw = readFileSync(join(dirname(stateFilePath), 'mount.pid'), 'utf8')
+  } catch {
+    return undefined
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as MountPidState | number
+    if (typeof parsed === 'number') return coercePid(parsed)
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const workspaceId = typeof parsed.workspaceId === 'string' ? parsed.workspaceId : undefined
+    if (workspaceId && !acceptedWorkspaceIds.has(workspaceId)) return undefined
+    const localDir = typeof parsed.localDir === 'string' ? parsed.localDir : undefined
+    const expectedLocalDir = dirname(dirname(stateFilePath))
+    if (localDir && resolve(localDir) !== resolve(expectedLocalDir)) return undefined
+    return coercePid(parsed.pid)
+  } catch {
+    const legacyPid = Number(raw.trim())
+    return coercePid(legacyPid)
+  }
 }
 
 export function checkMountStaleness(
@@ -67,7 +112,9 @@ export function checkMountStaleness(
   }
 
   // Prefer the top-level pid; fall back to the SDK-launched mount's daemon.pid.
-  const pid = coercePid(parsed.pid) ?? coercePid(parsed.daemon?.pid)
+  const pid = coercePid(parsed.pid) ??
+    coercePid(parsed.daemon?.pid) ??
+    readMountProcessPid(stateFilePath, accepted)
 
   const lastReconcileAt = typeof parsed.lastReconcileAt === 'string'
     ? Date.parse(parsed.lastReconcileAt)
@@ -94,12 +141,7 @@ export function checkMountStaleness(
     return { stale: false }
   }
 
-  try {
-    process.kill(pid, 0)
-  } catch (error) {
-    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'EPERM') {
-      return { stale: false, pid }
-    }
+  if (!isMountProcessRunning(pid)) {
     return { stale: true, reason: `mount process (pid ${pid}) is not running`, pid }
   }
 

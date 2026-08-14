@@ -3468,6 +3468,7 @@ describe('fleet CLI runtime', () => {
       const mount = Object.assign(new FakeMountClient(), {
         getLocalMountRoot: () => mirrorDir,
       })
+      const errors = buffer()
 
       await runFleetCli(['start', '--config', configPath], {
         fleet: new FakeFleetClient(),
@@ -3479,13 +3480,15 @@ describe('fleet CLI runtime', () => {
           await vi.waitFor(() => expect(mounted).toHaveLength(1))
         }),
         stdout: buffer(),
-        stderr: buffer(),
+        stderr: errors,
       })
 
       expect(mounted).toEqual([dirname(mirrorDir)])
       expect(ensureLocalMount).toHaveBeenCalledTimes(1)
       expect(mountedWhenFactoryStarted).toBeLessThan(1)
       expect(factory.start).toHaveBeenCalledWith({ mode: 'live' })
+      expect(errors.text()).not.toContain('could not start relayfile mount')
+      expect(errors.text()).not.toContain('could not start Relayfile workspace mirror')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

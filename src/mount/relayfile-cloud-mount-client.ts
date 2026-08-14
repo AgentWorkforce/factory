@@ -52,7 +52,7 @@ import {
   ensureLocalMount as runLocalMountPreflight,
   type EnsureLocalMountOptions,
 } from './local-mount-preflight'
-import { checkMountStaleness } from './relayfile-binary'
+import { checkMountStaleness, isMountProcessRunning } from './relayfile-binary'
 import { MountAuthScopeError } from './mount-auth-error'
 import { resolveRegisteredWorkspaceMirror } from './workspace-mirror'
 
@@ -279,6 +279,11 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #localMountScopes: string[]
   #localMountRoot?: string
   readonly #localMounts = new Map<string, MountedWorkspaceHandleLike>()
+  // A registered mirror that was already being served when Factory attached
+  // belongs to another supervisor. Once observed, keep that ownership boundary
+  // for this client lifetime: Factory may monitor it but must never replace or
+  // stop it, even if a later reconcile is stale while the daemon recovers.
+  readonly #externallyManagedLocalMounts = new Set<string>()
   readonly #localMountSupervisions = new Map<string, {
     startDir: string
     options: LocalMountOptions
@@ -464,11 +469,22 @@ export class RelayfileCloudMountClient implements MountClient {
     const staleBefore = existsSync(statePath)
       ? checkMountStaleness(statePath, this.workspaceId, [...acceptableWorkspaceIds])
       : undefined
+    if (
+      !this.#localMounts.has(localDir) &&
+      staleBefore !== undefined &&
+      (!staleBefore.stale || isMountProcessRunning(staleBefore.pid))
+    ) {
+      this.#externallyManagedLocalMounts.add(localDir)
+    }
     if (staleBefore?.stale) this.#markLocalMountDegraded(localDir, 'mount_stale')
 
     try {
       await this.#localMountPreflight(this.workspaceId, join(localDir, '..'), {
         ...options,
+        // Attaching to a daemon owned by launchd/systemd (or another process)
+        // is read-only. Its supervisor owns recovery; an SDK replacement here
+        // would cancel that daemon and make the two supervisors fight.
+        ...(this.#externallyManagedLocalMounts.has(localDir) ? { refreshStaleMount: false } : {}),
         localDir,
         acceptableWorkspaceIds: [...acceptableWorkspaceIds],
         startMount: async () => {
@@ -573,6 +589,7 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#localMountSupervisions.clear()
     this.#degradedLocalMounts.clear()
     this.#authDegradedLocalMounts.clear()
+    this.#externallyManagedLocalMounts.clear()
     const mounted = [...this.#localMounts.values()]
     this.#localMounts.clear()
     await Promise.allSettled(mounted.map(async (handle) => handle.stop()))
@@ -706,6 +723,7 @@ export class RelayfileCloudMountClient implements MountClient {
       await mounted.stop()
       return
     }
+    this.#externallyManagedLocalMounts.delete(localDir)
     this.#localMounts.set(localDir, mounted)
     const supervision = this.#localMountSupervisions.get(localDir)
     if (supervision) {
@@ -740,6 +758,22 @@ export class RelayfileCloudMountClient implements MountClient {
     const supervision = this.#localMountSupervisions.get(localDir)
     if (!supervision) return
     try {
+      if (this.#externallyManagedLocalMounts.has(localDir)) {
+        // Health supervision for an attached daemon is deliberately
+        // observation-only. Keep reporting stale/recovered transitions while
+        // leaving all restart and cancellation decisions to its owner.
+        const statePath = join(localDir, '.relay', 'state.json')
+        const staleness = existsSync(statePath)
+          ? checkMountStaleness(
+              statePath,
+              this.workspaceId,
+              this.#acceptableWorkspaceIds(supervision.options.acceptableWorkspaceIds),
+            )
+          : { stale: true, reason: `mount state is missing at ${statePath}` }
+        if (staleness.stale) this.#markLocalMountDegraded(localDir, 'mount_stale')
+        else this.#markLocalMountRecovered(localDir)
+        return
+      }
       if (
         supervision.suggestedRefreshAtMs !== undefined &&
         Date.now() >= supervision.suggestedRefreshAtMs
