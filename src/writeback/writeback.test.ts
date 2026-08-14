@@ -936,23 +936,27 @@ describe('GhCliGithubWriteback', () => {
       ['label', 'create', 'factory:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Factory agents are working on this issue.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
     ])
   })
 
   it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
     const calls: string[][] = []
+    const labels = new Set(['factory-ready', 'factory:in-progress', 'factory:human-review'])
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
         if (args[0] === 'issue' && args[1] === 'view') {
           return {
-            stdout: JSON.stringify({
-              labels: [{ name: 'factory-ready' }, { name: 'factory:in-progress' }, { name: 'factory:human-review' }],
-            }),
+            stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }),
           }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
+          labels.delete(args[args.indexOf('--remove-label') + 1]!)
         }
         return { stdout: '' }
       },
@@ -963,7 +967,26 @@ describe('GhCliGithubWriteback', () => {
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
     ])
+  })
+
+  it('rejects an acknowledged lifecycle edit when provider read-back never shows the label', async () => {
+    let edits = 0
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [] }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') edits += 1
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'in-progress')).rejects.toThrow(
+      'GitHub writeback did not confirm factory:in-progress on AgentWorkforce/factory#48',
+    )
+    expect(edits).toBe(1)
   })
 
   it('treats provider human-review status as authoritative over a stale in-progress label', async () => {

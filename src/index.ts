@@ -430,6 +430,8 @@ export type {
   DispatchResult,
   Factory,
   FactoryEventPayload,
+  FactoryDispatchClaimStatus,
+  FactoryInFlightDispatchStatus,
   FactoryInFlightRegistry,
   FactoryInFlightRegistryAgent,
   FactoryInFlightRegistryProcess,

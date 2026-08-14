@@ -346,7 +346,11 @@ class ProviderHumanReviewGithubWriteback extends RecordingGithubWriteback {
 }
 
 class FailingGithubCommentWriteback extends RecordingGithubWriteback {
-  override async postComment(): Promise<void> {
+  override async postComment(issue: LinearIssue, body: string): Promise<void> {
+    if (body.startsWith('Factory dispatch for ')) {
+      await super.postComment(issue, body)
+      return
+    }
     throw new Error('GitHub comment writeback unavailable')
   }
 }
@@ -2323,6 +2327,141 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.closes).toEqual([])
     expect(mergeGate.checks).toEqual([])
     expect(mergeGate.merges).toEqual([])
+  })
+
+  it('retries a failed GitHub dispatch claim, dead-letters it loudly, and preserves registry visibility', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-dispatch-writeback-'))
+    const path = githubIssuePath('AgentWorkforce', 'pear', 242)
+    const registryPath = join(root, 'registry.json')
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(242, { labels: ['factory'] }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    let labelAttempts = 0
+    githubWriteback.setStatus = async (_issue, status) => {
+      if (status !== 'in-progress') return
+      labelAttempts += 1
+      throw new Error('GitHub label write unavailable')
+    }
+    const errors: unknown[][] = []
+    const factory = createFactory(config({
+      issueSource: 'github',
+      loop: { registryPath, heartbeatPath },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+      clock: new ManualClock(),
+      logger: {
+        warn: () => {},
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    try {
+      const decision = await factory.triageIssue(parseGithubFactoryIssue(path, githubIssueFile(242, { labels: ['factory'] })))
+      await expect(factory.dispatch(decision)).rejects.toThrow('GitHub label write unavailable')
+
+      expect(labelAttempts).toBe(3)
+      expect(githubWriteback.comments).toEqual([])
+      expect(factory.status().counters).toMatchObject({
+        dispatchWritebackFailures: 3,
+        dispatchWritebackRetries: 2,
+        dispatchWritebackDeadLetters: 1,
+      })
+      expect(errors.filter(([message]) => message === '[factory] dispatch writeback failed; retrying'))
+        .toHaveLength(2)
+      expect(errors).toContainEqual([
+        '[factory] dispatch writeback dead-lettered after retries exhausted',
+        expect.objectContaining({
+          issue: '242',
+          write: 'GitHub label factory:in-progress',
+          attempts: 3,
+          error: 'GitHub label write unavailable',
+        }),
+      ])
+
+      const registry = await readFactoryInFlightRegistry(registryPath)
+      expect(registry?.agents.map((agent) => ({
+        name: agent.name,
+        issue: agent.issue?.key,
+        claim: agent.dispatchClaim,
+      }))).toEqual([
+        {
+          name: 'ar-242-impl-pear',
+          issue: '242',
+          claim: expect.objectContaining({
+            state: 'degraded',
+            write: 'GitHub label factory:in-progress',
+            attempts: 3,
+            maxAttempts: 3,
+            deadLettered: true,
+            error: 'GitHub label write unavailable',
+          }),
+        },
+        {
+          name: 'ar-242-review-pear',
+          issue: '242',
+          claim: expect.objectContaining({
+            state: 'degraded',
+            deadLettered: true,
+          }),
+        },
+      ])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retries a transient GitHub dispatch comment instead of silently skipping it', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 243)
+    const issue = githubIssueFile(243, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: issue })
+    const githubWriteback = new RecordingGithubWriteback()
+    const originalPostComment = githubWriteback.postComment.bind(githubWriteback)
+    let commentAttempts = 0
+    githubWriteback.postComment = async (target, body) => {
+      commentAttempts += 1
+      if (commentAttempts < 3) throw new Error('transient GitHub comment failure')
+      await originalPostComment(target, body)
+    }
+    const errors: unknown[][] = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+      clock: new ManualClock(),
+      logger: {
+        warn: () => {},
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    await expect(factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue))))
+      .resolves.toMatchObject({ issue: { key: '243' } })
+
+    expect(commentAttempts).toBe(3)
+    expect(githubWriteback.statuses).toEqual([{ key: '243', status: 'in-progress' }])
+    expect(githubWriteback.comments).toEqual([
+      { key: '243', body: expect.stringContaining('Factory dispatch for 243') },
+    ])
+    expect(errors.filter(([message]) => message === '[factory] dispatch writeback failed; retrying'))
+      .toHaveLength(2)
+    expect(factory.status()).toMatchObject({
+      inFlightDispatches: [{
+        issue: { key: '243' },
+        claim: { state: 'verified' },
+      }],
+      counters: {
+        dispatchWritebackFailures: 2,
+        dispatchWritebackRetries: 2,
+      },
+    })
+    await factory.stop()
   })
 
   it('dispatches a dependency chain in order and promotes the next issue after its blocker closes', async () => {
@@ -12185,12 +12324,14 @@ describe('FactoryLoop', () => {
     })
   })
 
-  it('logs and continues when best-effort dispatch comment writeback fails', async () => {
+  it('retries and fails the dispatch when its Linear claim comment cannot be recorded', async () => {
     const mount = new FakeMountClient({ [issuePath(25)]: issueFile(25) })
     const fleet = new FakeFleetClient()
-    const warnings: unknown[] = []
+    const errors: unknown[] = []
+    let commentAttempts = 0
     const linear: LinearWriteback = {
       async postComment() {
+        commentAttempts += 1
         throw new Error('unsupported Linear writeback path')
       },
       async setState(issue, stateId) {
@@ -12208,23 +12349,25 @@ describe('FactoryLoop', () => {
       fleet,
       triage: new StaticTriage(),
       linear,
+      clock: new ManualClock(),
       logger: {
-        warn: (...args: unknown[]) => warnings.push(args),
-        error: () => {},
+        warn: () => {},
+        error: (...args: unknown[]) => errors.push(args),
       },
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(25), issueFile(25)))
 
-    await expect(factory.dispatch(decision)).resolves.toMatchObject({
-      issue: { key: 'AR-25' },
-      stateId: implementing,
-    })
-    expect(warnings[0]).toEqual([
-      '[factory] comment writeback skipped',
+    await expect(factory.dispatch(decision)).rejects.toThrow('unsupported Linear writeback path')
+    expect(commentAttempts).toBe(3)
+    expect(errors.filter((entry) => (entry as unknown[])[0] === '[factory] dispatch writeback failed; retrying'))
+      .toHaveLength(2)
+    expect(errors).toContainEqual([
+      '[factory] dispatch writeback dead-lettered after retries exhausted',
       expect.objectContaining({
-        name: 'Error',
-        message: 'unsupported Linear writeback path',
-        stack: expect.stringContaining('Error: unsupported Linear writeback path'),
+        issue: 'AR-25',
+        write: 'Linear dispatch comment',
+        attempts: 3,
+        error: 'unsupported Linear writeback path',
       }),
     ])
     expect(mount.writes).toContainEqual({ path: issuePath(25), content: { stateId: implementing } })

@@ -2590,6 +2590,88 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('lists registry-backed in-flight issues, agents, and degraded claims in factory status', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-registry-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
+      const configPath = await writeConfig(root, {
+        loop: { heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
+      })
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+      } as unknown as Factory
+      await writeFile(registryPath, JSON.stringify({
+        pid: 4242,
+        heartbeatPath,
+        updatedAt: '2026-08-14T13:30:00.000Z',
+        updatedAtMs: Date.parse('2026-08-14T13:30:00.000Z'),
+        agents: [
+          {
+            name: 'ar-242-impl-factory',
+            role: 'implementer',
+            issue: { uuid: 'AgentWorkforce/factory#242', key: '242', path: '/github/factory/242.json' },
+            sessionRef: 'session-impl',
+            pids: [],
+            node: 'oslo-mini',
+            dispatchClaim: {
+              state: 'degraded',
+              write: 'GitHub dispatch comment',
+              attempts: 3,
+              maxAttempts: 3,
+              deadLettered: true,
+              error: 'GitHub comment write unavailable',
+              updatedAtMs: Date.parse('2026-08-14T13:29:00.000Z'),
+            },
+          },
+          {
+            name: 'ar-242-review',
+            role: 'reviewer',
+            issue: { uuid: 'AgentWorkforce/factory#242', key: '242', path: '/github/factory/242.json' },
+            pids: [],
+            dispatchClaim: {
+              state: 'degraded',
+              write: 'GitHub dispatch comment',
+              attempts: 3,
+              maxAttempts: 3,
+              deadLettered: true,
+              error: 'GitHub comment write unavailable',
+              updatedAtMs: Date.parse('2026-08-14T13:29:00.000Z'),
+            },
+          },
+        ],
+      }))
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        inFlightDispatches: [{
+          issue: { key: '242' },
+          agents: [
+            { name: 'ar-242-impl-factory', role: 'implementer', sessionRef: 'session-impl', node: 'oslo-mini' },
+            { name: 'ar-242-review', role: 'reviewer' },
+          ],
+          claim: {
+            state: 'degraded',
+            write: 'GitHub dispatch comment',
+            attempts: 3,
+            deadLettered: true,
+          },
+        }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces a stale registered workspace mirror in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-status-'))
     try {
