@@ -1,9 +1,9 @@
 export {
-  GhCliGithubMergeGate,
   GithubMergeGate,
-  defaultGhRunner,
+  RelayfileGithubMergeGate,
   evaluateGithubMergeGate,
 } from './merge-gate'
+export { defaultGhRunner } from './gh-runner'
 export {
   closeProbePr,
 } from './probe-closer'
@@ -14,20 +14,18 @@ export {
   standaloneBabysitterAgentName,
 } from './standalone-babysitter'
 export {
-  ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED,
   discoverRoutedPullRequests,
   routedPrIdentity,
   routedPrRepos,
 } from './routed-pr-babysitter'
 export type {
-  GhRunner,
-  GhRunResult,
   GithubMergeInput,
   GithubMergeGateInput,
   GithubMergeResult,
   GithubMergeGateVerdict,
   GithubMergeGate as GithubMergeGatePort,
 } from './merge-gate'
+export type { GhRunner, GhRunResult } from './gh-runner'
 export type {
   CloseProbePrInput,
   CloseProbePrResult,

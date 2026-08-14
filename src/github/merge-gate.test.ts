@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { GhCliGithubMergeGate, evaluateGithubMergeGate, type GhRunner } from './merge-gate'
+import type { GithubConnectionWrite } from '../ports'
+import { FakeMountClient } from '../testing'
+import { RelayfileGithubMergeGate, evaluateGithubMergeGate } from './merge-gate'
 
 const input = {
   repo: 'AgentWorkforce/pear',
@@ -19,9 +21,28 @@ const live = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+const mountWithLivePullRequest = (overrides: Record<string, unknown> = {}): FakeMountClient => new FakeMountClient({
+  '/github/repos/AgentWorkforce/pear/pulls/123/meta.json': {
+    payload: {
+      number: 123,
+      title: 'Connection-authored lifecycle writes',
+      body: 'Issue 221',
+      state: 'OPEN',
+      draft: false,
+      url: 'https://github.com/AgentWorkforce/pear/pull/123',
+      headRefName: 'factory/221',
+      headRefOid: 'abc123',
+      baseRefName: 'main',
+      headRepository: { nameWithOwner: 'AgentWorkforce/pear' },
+      isCrossRepository: false,
+      ...live(overrides),
+    },
+  },
+})
+
 describe('GithubMergeGate', () => {
   it('returns READY only for MERGEABLE+CLEAN, matching head, and no blocking checks', async () => {
-    const gate = new GhCliGithubMergeGate(async () => ({ stdout: JSON.stringify(live()) }))
+    const gate = new RelayfileGithubMergeGate(mountWithLivePullRequest())
 
     await expect(gate.check(input)).resolves.toMatchObject({
       verdict: 'READY',
@@ -82,25 +103,26 @@ describe('GithubMergeGate', () => {
     })
   })
 
-  it('fails closed when gh returns UNKNOWN, errors, or partial output', async () => {
-    const unknown = new GhCliGithubMergeGate(async () => ({
-      stdout: JSON.stringify(live({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' })),
-    }))
+  it('fails closed when the connected mount returns UNKNOWN, errors, or partial output', async () => {
+    const unknown = new RelayfileGithubMergeGate(mountWithLivePullRequest({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' }))
     await expect(unknown.check(input)).resolves.toMatchObject({
       verdict: 'REFUSE',
       ready: false,
     })
 
-    const errorRunner: GhRunner = async () => {
-      throw new Error('gh timed out')
+    class ErrorMount extends FakeMountClient {
+      override async listTree(): Promise<string[]> {
+        throw new Error('mount unavailable')
+      }
     }
-    await expect(new GhCliGithubMergeGate(errorRunner).check(input)).resolves.toMatchObject({
+    await expect(new RelayfileGithubMergeGate(new ErrorMount()).check(input)).resolves.toMatchObject({
       verdict: 'REFUSE',
       ready: false,
     })
 
-    const partial = new GhCliGithubMergeGate(async () => ({
-      stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }),
+    const partial = new RelayfileGithubMergeGate(mountWithLivePullRequest({
+      reviewDecision: undefined,
+      statusCheckRollup: undefined,
     }))
     await expect(partial.check(input)).resolves.toMatchObject({
       verdict: 'REFUSE',
@@ -139,38 +161,43 @@ describe('GithubMergeGate', () => {
     })
   })
 
-  it('merges through gh with squash, delete-branch, and match-head-commit', async () => {
-    const calls: string[][] = []
-    const gate = new GhCliGithubMergeGate(async (args) => {
-      calls.push(args)
-      return { stdout: 'merged' }
+  it('merges through the connected app with squash and an expected-head guard', async () => {
+    const calls: unknown[] = []
+    const githubWrite = connectionWrite({
+      mergePullRequest: async (mergeInput) => {
+        calls.push(mergeInput)
+        return { sha: 'merge-sha' }
+      },
     })
+    const mount = new FakeMountClient({}, githubWrite)
+    const gate = new RelayfileGithubMergeGate(mount)
 
     await expect(gate.merge(input)).resolves.toMatchObject({
       merged: true,
     })
 
-    expect(calls).toEqual([[
-      'pr',
-      'merge',
-      '123',
-      '--repo',
-      'AgentWorkforce/pear',
-      '--squash',
-      '--delete-branch',
-      '--match-head-commit',
-      'abc123',
-    ]])
+    expect(calls).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      number: 123,
+      method: 'squash',
+      expectedHeadSha: 'abc123',
+    }])
   })
 
   it('reports guarded merge failure without claiming success', async () => {
-    const gate = new GhCliGithubMergeGate(async () => {
-      throw new Error('Head commit changed')
-    })
+    const gate = new RelayfileGithubMergeGate(new FakeMountClient({}, connectionWrite({
+      mergePullRequest: async () => { throw new Error('Head commit changed') },
+    })))
 
     await expect(gate.merge(input)).resolves.toMatchObject({
       merged: false,
       reason: expect.stringMatching(/Head commit changed/),
     })
   })
+})
+
+const connectionWrite = (overrides: Partial<GithubConnectionWrite>): GithubConnectionWrite => ({
+  publishPullRequest: async () => { throw new Error('not used') },
+  closePullRequest: async () => undefined,
+  ...overrides,
 })

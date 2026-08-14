@@ -74,10 +74,13 @@ import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import {
-  GhCliIssuePublisher,
+  ConnectionIssuePublisher,
   RelayChannelNotionContractPublisher,
   loadNotionIntakeManifest,
+  normalizeNotionManifest,
   runNotionIntake,
+  supportsConnectionIssuePublisher,
+  type GithubIssuePublisher,
   type NotionContractPublisher,
   type WorkspaceTaskDispatcher,
 } from '../intake'
@@ -102,8 +105,9 @@ interface FleetCliDeps {
   stdout?: Pick<NodeJS.WriteStream, 'write'>
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
+  /** Hermetic app-authored issue publisher for `notion-intake` tests and alternate runtimes. */
+  notionIssuePublisher?: GithubIssuePublisher
   probePrGhRunner?: GhRunner
-  babysitPrGhRunner?: GhRunner
   now?: () => number
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
   daemonExit?: (code: number) => void
@@ -186,6 +190,8 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'notion-intake') {
       const manifest = await loadNotionIntakeManifest(command.manifestPath)
+      const notionTasks = await normalizeNotionManifest(manifest)
+      const needsGithub = notionTasks.some((task) => 'repo' in task.target)
       if (!globals.dryRun && manifest.workerMountTransport.kind === 'relay-channel') {
         notionContracts = deps.notionContracts
         if (!notionContracts) {
@@ -238,7 +244,9 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         manifest,
         dispatch: !globals.dryRun,
         ...(!globals.dryRun ? {
-          github: new GhCliIssuePublisher(),
+          ...(needsGithub ? {
+            github: notionIntakeIssuePublisher(deps, command, globals, err, (adopted) => { mount = adopted }),
+          } : {}),
           workspace,
           ...(notionContracts ? { contracts: notionContracts } : {}),
         } : {}),
@@ -829,7 +837,6 @@ async function runStandaloneBabysitCommand(
   const pr = await readStandalonePullRequest(
     mount,
     { repo, prNumber: command.prNumber, url: command.url },
-    deps.babysitPrGhRunner ?? defaultGhRunner,
   )
   const state = pr.state?.trim().toUpperCase()
   if (pr.merged || state === 'MERGED') {
@@ -891,7 +898,10 @@ async function runStandaloneBabysitCommand(
       crossRepository: pr.crossRepository,
       maintainerCanModify: pr.maintainerCanModify,
     },
-    standaloneBabysitter: { specSource },
+    // The explicit CLI command is itself the human opt-in and preserves its
+    // existing conversational behavior. Automatic routed sweeps pass the
+    // safer notification flag from config instead.
+    standaloneBabysitter: { specSource, notifyHumans: true },
     integrationsMountRoot: resolveIntegrationsMountRoot(mount),
     testGuidance,
   })
@@ -1483,6 +1493,7 @@ function requiredIntegrationsForCommand(
   command: ParsedCommand,
   config: FactoryConfig | undefined,
 ): FactoryIntegrationProvider[] {
+  if (command.kind === 'notion-intake') return ['github']
   if (command.kind === 'factory-close-probe' || command.kind === 'factory-babysit') {
     return ['github']
   }
@@ -1650,8 +1661,74 @@ async function isAllowedFactoryDraft(
   return false
 }
 
+// Every GitHub mutation Factory is allowed to make through the connection.
+// Comments, review replies and issue lifecycle writes are here so the
+// babysitter can write as the workspace GitHub App instead of shelling out to
+// a `gh` CLI authenticated as whichever human is logged in locally.
+/**
+ * Issue publisher for `factory notion-intake`.
+ *
+ * `notion-intake` is deliberately config-free — it loads a Notion manifest,
+ * not a Factory config — so it resolves the active workspace directly and
+ * opens a GitHub-scoped mount for it. There is no `gh` fallback: an intake run
+ * that cannot reach the connection fails loudly rather than quietly filing
+ * issues under whoever is logged into the local CLI.
+ */
+const notionIntakeIssuePublisher = (
+  deps: FleetCliDeps,
+  command: Extract<ParsedCommand, { kind: 'notion-intake' }>,
+  globals: GlobalOptions,
+  err: Pick<NodeJS.WriteStream, 'write'>,
+  adoptMount: (mount: MountClient) => void,
+): GithubIssuePublisher => {
+  const connect = async (): Promise<GithubIssuePublisher> => {
+    if (deps.notionIssuePublisher) return deps.notionIssuePublisher
+    const workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
+    const mount = deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
+      workspaceId,
+      isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
+    })
+    adoptMount(mount)
+    await prepareFactoryIntegrations(command, mount, undefined, globals, deps, workspaceId, err)
+    const githubWrite = mount.githubWrite
+    if (!supportsConnectionIssuePublisher(githubWrite)) {
+      const missing = githubWrite
+        ? supportsConnectionIssuePublisher.missing(githubWrite)
+        : ['workspace GitHub connection']
+      throw new Error(
+        `notion-intake requires app-authored GitHub issue writes (missing ${missing.join(', ')}); ` +
+        'refusing to fall back to the local gh user',
+      )
+    }
+    return new ConnectionIssuePublisher({ githubWrite: githubWrite!, mount })
+  }
+
+  // Connect on first GitHub use, not on every run. A manifest whose targets are
+  // all project paths never touches GitHub, and must not be made to depend on a
+  // workspace connection it has no use for.
+  let pending: Promise<GithubIssuePublisher> | undefined
+  const publisher = async (): Promise<GithubIssuePublisher> => await (pending ??= connect())
+  return {
+    repositoryVisibility: async (repo) => await (await publisher()).repositoryVisibility(repo),
+    missingLabels: async (repo, labels) => await (await publisher()).missingLabels(repo, labels),
+    findBySource: async (repo, sourceKey) => await (await publisher()).findBySource(repo, sourceKey),
+    createIssue: async (input) => await (await publisher()).createIssue(input),
+    updateIssue: async (input) => await (await publisher()).updateIssue(input),
+  }
+}
+
+// `pulls/<n>/merge.json` is the one entry here that lands an irreversible
+// change. Nothing at THIS layer gates it: the predicate below only asks whether
+// the path is writable at all. The single thing preventing an app-identity
+// merge today is the orchestrator's own check — factory.ts refuses the merge
+// gate unless `mergePolicy === 'on-green-with-review'`, and the committed
+// config is `never`. That guard lives in a different layer from this
+// allowlist, so a future caller reaching RelayfileGithubMergeGate.merge()
+// directly would not be stopped here. Merge ownership is the principal's;
+// this entry exists because RelayfileGithubMergeGate is the default merge gate
+// and cannot write without it, not because merging was signed off.
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json|pulls\/[1-9]\d*\/merge\.json|pulls\/[1-9]\d*\/review-comments\/[1-9]\d*\/replies\/factory-[^/]+\.json|issues\/[1-9]\d*\/comments\/factory-[^/]+\.json|issues\/[1-9]\d*\.json|issues\/factory-[^/]+\.json)$/iu.test(path)
 
 const isAllowedFactoryGithubDraft = (
   path: string,

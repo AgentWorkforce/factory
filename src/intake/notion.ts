@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 import { z } from 'zod'
+
+import type { GithubConnectionWrite, MountClient } from '../ports'
 
 const INTAKE_LOCK_STALE_MS = 60_000
 
@@ -352,46 +353,117 @@ export function parseChiefSpecHeader(content: string): {
   return { title, summary, recipe, targets }
 }
 
-/** GitHub CLI publisher with shell-free arguments, bounded output, and source-marker reconciliation. */
-export class GhCliIssuePublisher implements GithubIssuePublisher {
-  async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
-    const output = (await runGh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
-    if (output !== 'public' && output !== 'private' && output !== 'internal') {
-      throw new Error(`GitHub returned unknown visibility for ${repo}: ${output || '(empty)'}`)
+/**
+ * Issue publisher whose GitHub *writes* go through the authenticated workspace
+ * connection, so intake-created issues carry Factory's app identity rather
+ * than the identity of whichever human is logged into the local `gh` CLI.
+ *
+ * Reads use the mounted provider projection. The projection does not expose a
+ * repository label catalogue today, so `missingLabels` cannot preflight label
+ * existence; create acknowledgement remains the provider-authoritative check.
+ * This limitation is explicit and does not introduce a local-CLI fallback.
+ */
+export class ConnectionIssuePublisher implements GithubIssuePublisher {
+  readonly #createIssue: NonNullable<GithubConnectionWrite['createIssue']>
+  readonly #updateIssue: NonNullable<GithubConnectionWrite['updateIssue']>
+  readonly #mount: Pick<MountClient, 'listTree' | 'readFile'>
+
+  constructor(config: {
+    githubWrite: GithubConnectionWrite
+    mount: Pick<MountClient, 'listTree' | 'readFile'>
+  }) {
+    // Bind up front so a connection that cannot author issues is rejected here,
+    // by name, rather than failing partway through a dispatch run.
+    const missing = supportsConnectionIssuePublisher.missing(config.githubWrite)
+    if (missing.length > 0) {
+      throw new Error(
+        `The connected GitHub workspace cannot author issues as the Factory app (missing ${missing.join(', ')})`,
+      )
     }
-    return output
+    this.#createIssue = config.githubWrite.createIssue!.bind(config.githubWrite)
+    this.#updateIssue = config.githubWrite.updateIssue!.bind(config.githubWrite)
+    this.#mount = config.mount
   }
 
-  async missingLabels(repo: string, labels: readonly string[]): Promise<string[]> {
-    const output = await runGh(['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'])
-    const available = new Set(output.split('\n').map((label) => label.trim()).filter(Boolean))
-    return labels.filter((label) => !available.has(label))
+  async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
+    const [owner, name] = githubRepoParts(repo)
+    const content = (await this.#mount.readFile(`/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/meta.json`)).content
+    const payload = wrappedGithubPayload(content)
+    const visibility = stringField(payload.visibility)?.toLowerCase()
+    if (visibility === 'public' || visibility === 'private' || visibility === 'internal') return visibility
+    if (typeof payload.private === 'boolean') return payload.private ? 'private' : 'public'
+    throw new Error(`Mounted GitHub repository metadata has no visibility for ${repo}`)
+  }
+
+  async missingLabels(_repo: string, _labels: readonly string[]): Promise<string[]> {
+    // Relayfile currently materializes labels on issues, not the repository's
+    // complete label catalogue. The acknowledged create will reject a label
+    // that does not exist; returning a guessed missing set would be less safe.
+    return []
   }
 
   async findBySource(repo: string, sourceKey: string): Promise<ExistingGithubIssue | undefined> {
-    const output = await runGh([
-      'issue', 'list', '--repo', repo, '--state', 'all', '--limit', '100',
-      '--search', `"factory-source:${sourceKey}" in:body`,
-      '--json', 'number,url,body',
-    ])
-    const issues = z.array(z.object({ number: z.number().int().positive(), url: z.string().url(), body: z.string() })).parse(JSON.parse(output))
+    const [owner, name] = githubRepoParts(repo)
+    const roots = [
+      `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/`,
+      `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(name)}/issues/`,
+    ]
     const marker = sourceMarker(sourceKey)
-    return issues.find((issue) => issue.body.includes(marker))
+    const seen = new Set<number>()
+    for (const root of roots) {
+      let paths: string[]
+      try {
+        paths = await this.#mount.listTree(root)
+      } catch {
+        continue
+      }
+      for (const path of paths.sort()) {
+        const number = mountedIssueNumber(path)
+        if (!number || seen.has(number)) continue
+        try {
+          const payload = wrappedGithubPayload((await this.#mount.readFile(path)).content)
+          const body = stringField(payload.body)
+          if (!body?.includes(marker)) continue
+          seen.add(number)
+          return {
+            number,
+            url: stringField(payload.html_url) ?? stringField(payload.url) ?? `https://github.com/${repo}/issues/${number}`,
+            body,
+          }
+        } catch {
+          // A projection may contain aliases and transient stubs; keep looking.
+        }
+      }
+    }
+    return undefined
   }
 
   async createIssue(input: { repo: string; title: string; body: string; labels: readonly string[] }): Promise<{ number: number; url: string }> {
-    const args = ['issue', 'create', '--repo', input.repo, '--title', input.title, '--body-file', '-']
-    for (const label of input.labels) args.push('--label', label)
-    const url = (await runGh(args, input.body)).trim()
-    const number = Number(/\/issues\/(\d+)\/?$/u.exec(url)?.[1])
-    if (!Number.isInteger(number) || number <= 0) throw new Error(`GitHub issue create returned an unexpected URL: ${url}`)
-    return { number, url }
+    const created = await this.#createIssue({
+      repo: input.repo,
+      title: input.title,
+      body: input.body,
+      ...(input.labels.length ? { labels: [...input.labels] } : {}),
+    })
+    return { number: created.number, url: created.url }
   }
 
   async updateIssue(input: { repo: string; number: number; body: string }): Promise<void> {
-    await runGh(['issue', 'edit', String(input.number), '--repo', input.repo, '--body-file', '-'], input.body)
+    await this.#updateIssue({ repo: input.repo, number: input.number, body: input.body })
   }
 }
+
+/** Whether a GitHub connection can author intake issues as the Factory app. */
+export const supportsConnectionIssuePublisher = Object.assign(
+  (githubWrite: GithubConnectionWrite | undefined): boolean =>
+    Boolean(githubWrite) && supportsConnectionIssuePublisher.missing(githubWrite!).length === 0,
+  {
+    missing: (githubWrite: GithubConnectionWrite): string[] =>
+      ([['createIssue', githubWrite.createIssue], ['updateIssue', githubWrite.updateIssue]] as const)
+        .filter(([, operation]) => typeof operation !== 'function')
+        .map(([name]) => name),
+  },
+)
 
 async function publishRepoTask(
   task: NormalizedNotionTask,
@@ -704,6 +776,33 @@ function sourceMarker(sourceKey: string): string {
   return `<!-- factory-source:${sourceKey} -->`
 }
 
+function githubRepoParts(repo: string): [string, string] {
+  const match = /^([^/]+)\/([^/]+)$/u.exec(repo.trim())
+  if (!match?.[1] || !match[2]) throw new Error(`GitHub repo must be owner/repo: ${repo}`)
+  return [match[1], match[2]]
+}
+
+function wrappedGithubPayload(content: unknown): Record<string, unknown> {
+  const envelope = objectRecord(content) ?? {}
+  return objectRecord(envelope.payload) ?? envelope
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function mountedIssueNumber(path: string): number | undefined {
+  const match = /\/issues\/(?:by-id\/)?([1-9]\d*)(?:__[^/]+)?(?:\.json|\/(?:meta|metadata)\.json)$/u.exec(path)
+  const number = Number(match?.[1])
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined
+}
+
 function digestFromBody(body: string): string | undefined {
   return /Source digest: `([0-9a-f]{64})`/u.exec(body)?.[1]
 }
@@ -777,50 +876,4 @@ async function writeIntakeState(path: string, state: IntakeState): Promise<void>
   const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
   await rename(temporaryPath, path)
-}
-
-async function runGh(args: string[], input?: string): Promise<string> {
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawn('gh', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 30_000,
-      killSignal: 'SIGKILL',
-    })
-    const stdout: Buffer[] = []
-    const stderr: Buffer[] = []
-    let stdoutSize = 0
-    let stderrSize = 0
-    let settled = false
-    const fail = (error: Error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    }
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdoutSize += chunk.length
-      if (stdoutSize <= 1024 * 1024) stdout.push(chunk)
-    })
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderrSize += chunk.length
-      if (stderrSize <= 1024 * 1024) stderr.push(chunk)
-    })
-    child.once('error', fail)
-    child.stdin.once('error', (error: NodeJS.ErrnoException) => {
-      if (error.code !== 'EPIPE') fail(error)
-    })
-    child.once('close', (code) => {
-      if (settled) return
-      if (code !== 0) {
-        fail(new Error(`gh ${args.slice(0, 2).join(' ')} failed (${code ?? 'signal'}): ${Buffer.concat(stderr).toString('utf8').trim()}`))
-        return
-      }
-      if (stdoutSize > 1024 * 1024 || stderrSize > 1024 * 1024) {
-        fail(new Error(`gh ${stdoutSize > 1024 * 1024 ? 'stdout' : 'stderr'} exceeded 1 MiB`))
-        return
-      }
-      settled = true
-      resolvePromise(Buffer.concat(stdout).toString('utf8'))
-    })
-    child.stdin.end(input)
-  })
 }

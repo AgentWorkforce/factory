@@ -79,7 +79,11 @@ export {
   RelayfileCloudMountClient,
   resolveFactoryWorkspace,
 } from './mount/relayfile-cloud-mount-client'
-export { RelayfileGithubConnectionWrite } from './mount/relayfile-github-connection-write'
+export {
+  RelayfileGithubConnectionWrite,
+  readGithubCommentAuthor,
+  readGithubIssueAuthor,
+} from './mount/relayfile-github-connection-write'
 export { GithubApiIssueRead } from './mount/github-api-issue-read'
 export {
   ensureFactoryIntegrations,
@@ -99,11 +103,12 @@ export type {
 } from './mount/relayfile-cloud-mount-client'
 export type {
   GitCommandRunner,
+  GithubObservedAuthor,
   RelayfileGithubConnectionWriteConfig,
 } from './mount/relayfile-github-connection-write'
 export {
-  GhCliGithubMergeGate,
   GithubMergeGate,
+  RelayfileGithubMergeGate,
   closeProbePr,
   defaultGhRunner,
   evaluateGithubMergeGate,
@@ -172,6 +177,7 @@ export type {
   LlmTriageOptions,
 } from './triage'
 export {
+  ConnectionGithubWriteback,
   GhCliGithubWriteback,
   FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
@@ -179,8 +185,10 @@ export {
   MountLinearWriteback,
   MountSlackWriteback,
   publishFactoryMountHealth,
+  supportsConnectionGithubWriteback,
 } from './writeback'
 export type {
+  ConnectionGithubWritebackConfig,
   FactoryMountHealthRecord,
   GhCliGithubWritebackConfig,
   LinearCommentPayload,
@@ -295,16 +303,24 @@ export type {
   ChangeEvent,
   Clock,
   EventPage,
+  GithubCommentResult,
   GithubConnectionWrite,
   GithubConnectionIssue,
   GithubConnectionRead,
+  GithubIssueCommentInput,
+  GithubIssueCreateInput,
+  GithubIssueCreateResult,
   GithubIssueLookup,
+  GithubIssueUpdateInput,
   FactoryIntegrationConnectionStatus,
   FactoryIntegrationConnections,
   FactoryIntegrationConnectResult,
   FactoryIntegrationProvider,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
+  GithubMergePullRequestInput,
+  GithubMergePullRequestResult,
+  GithubReviewCommentReplyInput,
   LocalMountOptions,
   MountClient,
   ProviderSyncStatus,

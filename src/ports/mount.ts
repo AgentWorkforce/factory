@@ -129,14 +129,94 @@ export interface FactoryIntegrationConnections {
   waitForConnection(provider: FactoryIntegrationProvider, connectionId: string): Promise<void>
 }
 
+export interface GithubIssueCommentInput {
+  repo: string
+  /** Issue or pull request number — GitHub issue comments cover both. */
+  number: number
+  body: string
+}
+
+export interface GithubReviewCommentReplyInput {
+  repo: string
+  /** Pull request number owning the review thread. */
+  number: number
+  /** Provider id of the review comment being replied to. */
+  inReplyTo: number
+  body: string
+}
+
+/**
+ * Receipt for a connection-authored comment. `commentId` is present when the
+ * durable write acknowledgement carried the provider id; `author` is the
+ * identity Factory requested, not a provider read-back. Callers that must
+ * prove the identity read it back from GitHub — see `readGithubCommentAuthor`.
+ */
+export interface GithubCommentResult {
+  repo: string
+  number: number
+  commentId?: number
+  author: 'app'
+}
+
+export interface GithubIssueUpdateInput {
+  repo: string
+  number: number
+  /** Replaces the issue's full label set when present. */
+  labels?: readonly string[]
+  state?: 'open' | 'closed'
+  title?: string
+  body?: string
+}
+
+export interface GithubIssueCreateInput {
+  repo: string
+  title: string
+  body: string
+  labels?: readonly string[]
+}
+
+export interface GithubIssueCreateResult {
+  repo: string
+  number: number
+  url: string
+  author: 'app'
+}
+
+export interface GithubMergePullRequestInput {
+  repo: string
+  number: number
+  /** Guard supplied to GitHub so a head move cannot be merged accidentally. */
+  expectedHeadSha: string
+  method: 'merge' | 'squash' | 'rebase'
+}
+
+export interface GithubMergePullRequestResult {
+  /** Provider-confirmed merge commit SHA, when returned by the adapter. */
+  sha?: string
+}
+
 /**
  * GitHub mutations that require the authenticated workspace connection. The
  * concrete mount translates these operations into file-native Relayfile
  * writeback drafts interpreted by the server-side GitHub adapter.
+ *
+ * Every operation here is authored by the workspace GitHub App installation.
+ * That is the point of the port: Factory has exactly one GitHub write
+ * identity, and it is not whichever human happens to be logged into a local
+ * `gh` CLI. New GitHub mutations belong here, not in a CLI shell-out.
  */
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
+  /** Comment on an issue or pull request conversation. */
+  postIssueComment?(input: GithubIssueCommentInput): Promise<GithubCommentResult>
+  /** Reply inside an existing pull request review thread. */
+  replyToReviewComment?(input: GithubReviewCommentReplyInput): Promise<GithubCommentResult>
+  /** Patch issue fields; `labels` replaces the whole set, so it both adds and removes. */
+  updateIssue?(input: GithubIssueUpdateInput): Promise<void>
+  createIssue?(input: GithubIssueCreateInput): Promise<GithubIssueCreateResult>
+  /** Merge with a provider-enforced expected-head guard. */
+  mergePullRequest?(input: GithubMergePullRequestInput): Promise<GithubMergePullRequestResult>
 }
 
 export interface MountClient {

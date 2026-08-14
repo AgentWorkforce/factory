@@ -357,4 +357,243 @@ describe('RelayfileGithubConnectionWrite', () => {
       url: 'https://github.com/AgentWorkforce/hoopsheet/pull/53',
     })
   })
+
+  it('proves a babysitter comment was recorded by the app after the real provider write', async () => {
+    const providerCommentPath = '/github/repos/AgentWorkforce/factory/issues/221__app-identity/comments/7001/meta.json'
+    class AppCommentMount extends FakeMountClient {
+      constructor() {
+        super({
+          [providerCommentPath]: {
+            payload: { id: 7001, body: 'Fixed in abc123', user: { login: 'factory-app[bot]', type: 'Bot' } },
+          },
+        })
+      }
+
+      async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+        return path.includes('/issues/221/comments/') ? '7001' : undefined
+      }
+    }
+    const mount = new AppCommentMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadDelayMs: 0 })
+
+    await expect(write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Fixed in abc123',
+    })).resolves.toEqual({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      commentId: 7001,
+      author: 'app',
+    })
+
+    const authoredWrite = mount.writes.find((entry) => entry.path.includes('/issues/221/comments/factory-'))
+    expect(authoredWrite?.content).toEqual({ body: 'Fixed in abc123', author: 'app' })
+    expect(mount.reads).toContain(providerCommentPath)
+  })
+
+  it('rejects a comment receipt when GitHub records the local human instead of the app', async () => {
+    class HumanCommentMount extends FakeMountClient {
+      constructor() {
+        super({
+          '/github/repos/AgentWorkforce/factory/issues/221/comments/7002/meta.json': {
+            payload: { id: 7002, user: { login: 'local-human', type: 'User' } },
+          },
+        })
+      }
+
+      async getConfirmedWriteExternalId(): Promise<string> {
+        return '7002'
+      }
+    }
+    const write = new RelayfileGithubConnectionWrite({ mount: new HumanCommentMount(), receiptReadDelayMs: 0 })
+
+    await expect(write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'This must not inherit the process identity',
+    })).rejects.toThrow(/provider recorded local-human/u)
+  })
+
+  it('posts review-thread replies through the adapter reply namespace and verifies the bot author', async () => {
+    class ReviewReplyMount extends FakeMountClient {
+      constructor() {
+        super({
+          '/github/repos/AgentWorkforce/factory/pulls/221/comments/7100.json': {
+            payload: { id: 7100, author: { login: 'factory-app[bot]', type: 'Bot' } },
+          },
+        })
+      }
+
+      async getConfirmedWriteExternalId(): Promise<string> {
+        return '7100'
+      }
+    }
+    const mount = new ReviewReplyMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadDelayMs: 0 })
+
+    await expect(write.replyToReviewComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      inReplyTo: 7099,
+      body: 'Addressed in abc123',
+    })).resolves.toMatchObject({ commentId: 7100, author: 'app' })
+    expect(mount.writes[0]).toMatchObject({
+      path: expect.stringMatching(/\/pulls\/221\/review-comments\/7099\/replies\/factory-.+\.json$/u),
+      content: { body: 'Addressed in abc123', author: 'app' },
+    })
+  })
+
+  it('creates Notion lifecycle issues through the app connection and verifies the provider author', async () => {
+    class AppIssueMount extends FakeMountClient {
+      constructor() {
+        super({
+          '/github/repos/AgentWorkforce/factory/issues/900__notion-lifecycle/meta.json': {
+            payload: { number: 900, user: { login: 'factory-app[bot]', type: 'Bot' } },
+          },
+        })
+      }
+
+      async getConfirmedWriteExternalId(): Promise<string> {
+        return '900'
+      }
+    }
+    const mount = new AppIssueMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadDelayMs: 0 })
+
+    await expect(write.createIssue({
+      repo: 'AgentWorkforce/factory',
+      title: 'Notion lifecycle',
+      body: 'Authorized mounted spec',
+      labels: ['factory'],
+    })).resolves.toMatchObject({ number: 900, author: 'app' })
+    expect(mount.writes[0]).toMatchObject({
+      path: expect.stringMatching(/\/issues\/factory-.+\.json$/u),
+      content: {
+        title: 'Notion lifecycle',
+        body: 'Authorized mounted spec',
+        labels: ['factory'],
+        author: 'app',
+      },
+    })
+  })
+
+  it('merges through the Relayfile connection with app authorship and the expected head', async () => {
+    class MergeMount extends FakeMountClient {
+      async getConfirmedWriteExternalId(): Promise<string> {
+        return 'merge-sha'
+      }
+    }
+    const mount = new MergeMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.mergePullRequest({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      expectedHeadSha: 'abc123',
+      method: 'squash',
+    })).resolves.toEqual({ sha: 'merge-sha' })
+    expect(mount.writes).toContainEqual({
+      path: '/github/repos/AgentWorkforce/factory/pulls/221/merge.json',
+      content: { method: 'squash', sha: 'abc123', author: 'app' },
+    })
+  })
+})
+
+/**
+ * Identity is the point of this suite: a comment Factory writes must be
+ * authored by the GitHub App, never by whichever human happens to be logged
+ * into a `gh` CLI on the host. Each assertion reads the author back from the
+ * projection rather than trusting the write receipt.
+ */
+describe('RelayfileGithubConnectionWrite app-authored comments', () => {
+  const repo = 'AgentWorkforce/factory'
+
+  class CommentMount extends FakeMountClient {
+    readonly #externalIds = new Map<string, string>()
+    #author: unknown
+
+    constructor(author: unknown) {
+      super()
+      this.#author = author
+    }
+
+    override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+      await super.writeFile(path, content, opts)
+      this.#externalIds.set(path, '9001')
+      // The provider projection materializes the created comment with the
+      // identity GitHub actually recorded for it.
+      this.files.set(`/github/repos/AgentWorkforce/factory/issues/221/comments/9001/meta.json`, {
+        content: { payload: { id: 9001, user: this.#author } },
+      })
+      this.files.set(`/github/repos/AgentWorkforce/factory/pulls/221/comments/9001.json`, {
+        content: { payload: { id: 9001, user: this.#author } },
+      })
+    }
+
+    override async getConfirmedWriteExternalId(path: string): Promise<string | undefined> {
+      return this.#externalIds.get(path)
+    }
+  }
+
+  const appAuthor = { login: 'agent-relay[bot]', type: 'Bot' }
+  const humanAuthor = { login: 'khaliqgant', type: 'User' }
+
+  it('writes an issue comment through the connection and confirms GitHub recorded the app as its author', async () => {
+    const mount = new CommentMount(appAuthor)
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadAttempts: 1, receiptReadDelayMs: 0 })
+
+    await expect(write.postIssueComment({ repo, number: 221, body: 'babysitter status' }))
+      .resolves.toEqual({ repo, number: 221, commentId: 9001, author: 'app' })
+
+    const comment = mount.writes.find((write) => write.path.includes('/issues/221/comments/'))
+    expect(comment?.path).toMatch(
+      /^\/github\/repos\/AgentWorkforce\/factory\/issues\/221\/comments\/factory-[0-9a-f]{12}-\d+\.json$/u,
+    )
+    expect(comment?.content).toMatchObject({ body: 'babysitter status' })
+    // No `gh` anywhere: the only side effect is a mount write.
+    expect(mount.writes).toHaveLength(1)
+  })
+
+  it('refuses to report app authorship when GitHub recorded a human author', async () => {
+    const mount = new CommentMount(humanAuthor)
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadAttempts: 1, receiptReadDelayMs: 0 })
+
+    await expect(write.postIssueComment({ repo, number: 221, body: 'babysitter status' }))
+      .rejects.toThrow(/authorship check failed.*khaliqgant/u)
+  })
+
+  it('refuses to report app authorship when the author cannot be read back at all', async () => {
+    const mount = new CommentMount(undefined)
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadAttempts: 1, receiptReadDelayMs: 0 })
+
+    await expect(write.postIssueComment({ repo, number: 221, body: 'babysitter status' }))
+      .rejects.toThrow(/authorship check failed.*unavailable/u)
+  })
+
+  it('threads a review reply onto the original comment through the connection', async () => {
+    const mount = new CommentMount(appAuthor)
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadAttempts: 1, receiptReadDelayMs: 0 })
+
+    await expect(write.replyToReviewComment({ repo, number: 221, inReplyTo: 4242, body: 'fixed in abc123' }))
+      .resolves.toMatchObject({ commentId: 9001, author: 'app' })
+
+    expect(mount.writes[0]?.path).toMatch(
+      /^\/github\/repos\/AgentWorkforce\/factory\/pulls\/221\/review-comments\/4242\/replies\/factory-[0-9a-f]{12}-\d+\.json$/u,
+    )
+    // The reply target is carried by the path segment, not the payload: the
+    // adapter's replies route derives `in_reply_to` from `.../review-comments/
+    // <id>/replies/`, and its payload parser accepts only `body`.
+    expect(mount.writes[0]?.content).toMatchObject({ body: 'fixed in abc123' })
+  })
+
+  it('gives two identical comment bodies on one thread distinct draft paths', async () => {
+    const mount = new CommentMount(appAuthor)
+    const write = new RelayfileGithubConnectionWrite({ mount, receiptReadAttempts: 1, receiptReadDelayMs: 0 })
+
+    await write.postIssueComment({ repo, number: 221, body: 'ping' })
+    await write.postIssueComment({ repo, number: 221, body: 'ping' })
+
+    expect(new Set(mount.writes.map((write) => write.path)).size).toBe(2)
+  })
 })

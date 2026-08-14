@@ -232,6 +232,12 @@ is claimed by a hidden source marker, while exact-path dispatches use a local
 digest-bound receipt. A changed mounted spec blocks instead of silently mutating
 already-dispatched work.
 
+Repository-target writes use the workspace GitHub App connection. There is no
+`gh` fallback. Relayfile does not currently materialize the repository's full
+label catalogue, so intake cannot preflight label existence; the acknowledged
+provider create is the authoritative label check and fails the intake result if
+a configured label is unavailable.
+
 ### Feature-map validation
 
 Repositories with `.agentworkforce/features/manifest.yaml` can run
@@ -303,11 +309,10 @@ existing PR branch, and always leaves the final review and merge to a human.
 The command prints a spawn receipt and returns; the PR-keyed task-exit worker
 continues on the relay broker and reports completion or access blockers there.
 
-### Routed-PR discovery (activation disabled)
+### Automatic routed-PR babysitting
 
-This release adds the declarative configuration and read-only discovery surface
-for widening babysitter intake beyond Factory-created PRs. To configure that
-discovery surface, set:
+`babysitter.enabled` continues to cover Factory-created PRs by default. To
+admit existing PRs independently of issue dispatch, set:
 
 ```json
 {
@@ -321,18 +326,28 @@ discovery surface, set:
 }
 ```
 
-Discovery scans only repositories named by `repos.names`; other routing
-fallbacks do not silently expand it. It classifies open, non-draft,
-same-repository PRs, applies `excludeLabels` and `excludePullRequests`,
-deduplicates mount aliases, and reports incomplete or unreadable metadata.
+The widened mode scans only repositories named by `repos.names`; other routing
+fallbacks do not silently expand the sweep. It admits open, non-draft,
+same-repository PRs and uses their title/body as the standalone definition of
+done when no Factory issue lifecycle exists. Such PRs never gain an issue state
+transition or automatic merge. The exact normalized `owner/repo#number` work
+unit is claimed durably before spawn, so issue-driven and routed discovery
+cannot start two babysitters for one PR.
 
-**Routed-PR activation is deliberately disabled.** The named
-`ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED` guard is `false`, and configuration
-cannot turn it on. No routed candidate is claimed, spawned, renewed, released,
-interpreted as complete, advanced to Human Review, or used to notify anyone.
-Activation will be implemented separately after the durable lifecycle and
-completion-CAS design is reviewed. The existing issue-created babysitter path
-is unchanged.
+Opt-out labels and `excludePullRequests` are checked before spawn. Automatic
+workers re-check the labels before their first and every later provider write.
+Human-facing status comments, mentions, and escalation stay disabled unless
+`notifyHumans` is explicitly enabled. Admission uses `batchSize` as its active
+ceiling and starts no more than one new routed PR per sweep. Every sweep logs
+exact scanned, eligible, excluded, incomplete, already-owned, admitted,
+capacity-deferred, unchanged, and failed counts; deferred work is retried, not
+silently truncated. This bounded intake is deliberate: issue #222 recorded a
+GitHub API measurement of 302 open PRs, 248 ready for review, across 41 routed
+repositories on 2026-08-07.
+
+Do not enable `routed-open-prs` until the GitHub App identity path from #221 is
+deployed and validated. The code can land first because the default mode remains
+`factory-created`.
 
 ### Scheduled sync-fidelity canary
 
@@ -600,10 +615,25 @@ Factory PR authorship is controlled explicitly with `github.identity`:
   then fall back to the local `gh` user when the app writer is unavailable.
 
 Each successful publication log includes `identity` (`app` or `user`) and the
-confirmed `author`. This setting currently controls PR creation only. GitHub
-issue comments and lifecycle status labels still use the existing local `gh`
-writeback; extending the identity policy to those operations requires a
-connected-app issue writeback surface.
+confirmed `author`. This setting controls PR creation only. Babysitter comments,
+review-thread replies, lifecycle labels, issue close/create operations, and the
+guarded merge gate always use the connected workspace GitHub App; they never
+fall back to the local `gh` user. Comment and issue creates are accepted only
+after Factory reads the provider record back from the mount and verifies a bot
+author. A missing connection operation fails with an explicit limitation.
+
+The App installation must grant the repository the write permissions needed by
+those resources (`issues` for issue lifecycle work and `pull_requests` for PR
+work). Validate a real comment and provider-author read-back with:
+
+```bash
+npm run build
+node scripts/verify-github-write-identity.mjs --repo OWNER/REPO --issue NUMBER
+```
+
+The probe exits `0` only after observing a bot author. Permission denial,
+missing read-back, or a human author are distinct non-zero exits; successful
+write acknowledgement text is never treated as identity proof.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,

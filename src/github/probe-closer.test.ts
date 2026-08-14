@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { closeProbePr } from './probe-closer'
-import type { GhRunner } from './merge-gate'
+import type { GhRunner } from './gh-runner'
 import type { GithubConnectionWrite } from '../ports'
 
 const openProbe = {

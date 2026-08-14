@@ -355,11 +355,14 @@ For widened intake, additionally set `babysitter.mode` to
 `routed-open-prs` in a disposable workspace. Provide one eligible PR, one PR
 with `factory:skip-babysitter`, one configured `excludePullRequests` identity,
 one draft, and one same-number PR in a repository absent from `repos.names`.
-Call the read-only discovery function and verify the exact discovery counters
-account for every candidate without spawning, claiming, writing, or notifying.
-Confirm `ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED` remains `false`. Activation,
-ownership, retries, and completion belong to the follow-up lifecycle design and
-are intentionally outside this verification procedure.
+Run a dry/read-only sweep and verify the exact discovery counters account for
+every candidate without spawning or writing. Then use a fake fleet/state test
+to prove the eligible PR is atomically claimed before spawn, two owners cannot
+claim it, the opt-outs spawn nothing, only one new routed PR is admitted per
+sweep, capacity deferrals are logged, restart restores the exact repo/PR owner,
+and the automatic prompt disables notifications and checks labels before its
+first provider write. Do not run a provider-writing widened sweep until the
+GitHub App identity path is independently validated.
 
 Do not attempt a cross-host active/active control-plane test: the supported ownership topology is multiple Factory processes sharing one same-host `FileStateStore`. Remote relay execution nodes are supported and do not need that directory.
 

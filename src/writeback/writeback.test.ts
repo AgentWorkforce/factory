@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import { ConnectionGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
 import type { MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
@@ -1228,5 +1228,114 @@ describe('createFactory writeback defaults', () => {
       { body, issueId: issue.uuid },
       { guarded: true },
     )).resolves.toBeUndefined()
+  })
+})
+
+describe('ConnectionGithubWriteback', () => {
+  const githubIssue: LinearIssue = {
+    ...issue,
+    uuid: 'github-221',
+    key: '221',
+    title: 'Babysitter GitHub identity',
+    description: 'Route babysitter writes through the connection.',
+    stateId: '',
+    labels: ['factory', 'factory:in-progress'],
+    path: '/github/repos/AgentWorkforce/factory/issues/by-id/221.json',
+    raw: {
+      payload: {
+        source: {
+          provider: 'github',
+          id: 'github-221',
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          number: 221,
+          url: 'https://github.com/AgentWorkforce/factory/issues/221',
+        },
+      },
+    },
+  }
+
+  const recordingConnection = () => {
+    const comments: Array<{ repo: string; number: number; body: string }> = []
+    const updates: Array<{ repo: string; number: number; labels?: readonly string[]; state?: string }> = []
+    return {
+      comments,
+      updates,
+      write: {
+        publishPullRequest: async () => { throw new Error('unused') },
+        closePullRequest: async () => { throw new Error('unused') },
+        postIssueComment: async (input: { repo: string; number: number; body: string }) => {
+          comments.push(input)
+          return { repo: input.repo, number: input.number, commentId: 1, author: 'app' as const }
+        },
+        updateIssue: async (input: { repo: string; number: number; labels?: readonly string[]; state?: 'open' | 'closed' }) => {
+          updates.push(input)
+        },
+      },
+    }
+  }
+
+  it('posts issue comments through the connection instead of the gh CLI', async () => {
+    const connection = recordingConnection()
+    const mount = new FakeMountClient()
+    const writeback = new ConnectionGithubWriteback({ githubWrite: connection.write, mount })
+
+    await writeback.postComment(githubIssue, 'Factory update')
+
+    expect(connection.comments).toEqual([
+      { repo: 'AgentWorkforce/factory', number: 221, body: 'Factory update' },
+    ])
+  })
+
+  it('moves status labels by patching the live label set, preserving third-party labels', async () => {
+    const connection = recordingConnection()
+    const mount = new FakeMountClient({
+      [githubIssue.path]: {
+        payload: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }, { name: 'needs-design' }] },
+      },
+    })
+    const writeback = new ConnectionGithubWriteback({ githubWrite: connection.write, mount })
+
+    await writeback.setStatus(githubIssue, 'human-review')
+
+    expect(connection.updates).toEqual([{
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'needs-design', 'factory:human-review'],
+    }])
+  })
+
+  it('reports provider status from the live projection', async () => {
+    const connection = recordingConnection()
+    const mount = new FakeMountClient({
+      [githubIssue.path]: { payload: { labels: [{ name: 'Factory:Human-Review' }] } },
+    })
+    const writeback = new ConnectionGithubWriteback({ githubWrite: connection.write, mount })
+
+    await expect(writeback.getIssueStatus(githubIssue)).resolves.toBe('human-review')
+  })
+
+  it('closes an issue with a comment and a state patch, never a gh call', async () => {
+    const connection = recordingConnection()
+    const mount = new FakeMountClient()
+    const writeback = new ConnectionGithubWriteback({ githubWrite: connection.write, mount })
+
+    await writeback.closeIssue(githubIssue, 'Done in #400')
+
+    expect(connection.comments).toHaveLength(1)
+    expect(connection.updates).toEqual([
+      { repo: 'AgentWorkforce/factory', number: 221, state: 'closed' },
+    ])
+  })
+
+  it('refuses construction against a connection that cannot author as the app', () => {
+    const mount = new FakeMountClient()
+    expect(() => new ConnectionGithubWriteback({
+      githubWrite: {
+        publishPullRequest: async () => { throw new Error('unused') },
+        closePullRequest: async () => { throw new Error('unused') },
+      },
+      mount,
+    })).toThrow(/cannot author issue writes as the Factory app.*postIssueComment/u)
   })
 })

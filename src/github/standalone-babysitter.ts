@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 
-import type { GhRunner } from './merge-gate'
 import type { MountClient } from '../ports'
 
 export interface StandaloneBabysitTarget {
@@ -25,7 +24,11 @@ export interface StandalonePullRequest {
   crossRepository?: boolean
   maintainerCanModify?: boolean
   filesChanged?: string[]
-  source: 'mount' | 'gh' | 'mount+gh'
+  mergeable?: string
+  mergeStateStatus?: string
+  reviewDecision?: string
+  statusCheckRollup?: unknown[]
+  source: 'mount'
 }
 
 export function parseStandaloneBabysitTarget(value: string | undefined): StandaloneBabysitTarget {
@@ -78,34 +81,13 @@ export function parseStandaloneBabysitTarget(value: string | undefined): Standal
 export async function readStandalonePullRequest(
   mount: MountClient,
   target: { repo: string; prNumber: number; url?: string },
-  ghRunner: GhRunner,
 ): Promise<StandalonePullRequest> {
   const mounted = await readPullRequestFromMount(mount, target)
-  let ghFailure: string | undefined
-  try {
-    const result = await ghRunner([
-      'pr',
-      'view',
-      String(target.prNumber),
-      '--repo',
-      target.repo,
-      '--json',
-      'number,title,body,state,isDraft,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,isCrossRepository,maintainerCanModify,files',
-    ])
-    const parsed = parsePullRequestPayload(JSON.parse(result.stdout), target)
-    if (parsed) {
-      const merged = mergePullMetadata(mounted, parsed)
-      if (hasRequiredPullMetadata(merged)) {
-        return { ...merged, source: mounted ? 'mount+gh' : 'gh' }
-      }
-    }
-  } catch (error) {
-    ghFailure = error instanceof Error ? error.message : String(error)
-  }
-
   if (mounted && hasRequiredPullMetadata(mounted)) return mounted
-  const suffix = ghFailure ? `: ${ghFailure}` : ''
-  throw new Error(`Unable to read complete metadata for ${target.repo} PR #${target.prNumber} from the connected GitHub mount or gh${suffix}`)
+  throw new Error(
+    `Unable to read complete metadata for ${target.repo} PR #${target.prNumber} from the connected GitHub mount; ` +
+    'Factory does not fall back to the local GitHub CLI identity',
+  )
 }
 
 export function standaloneBabysitterAgentName(repo: string, prNumber: number): string {
@@ -164,7 +146,7 @@ async function readPullRequestFromMount(
       const parsed = parsePullRequestPayload((await mount.readFile(path)).content, target)
       if (parsed) return { ...parsed, source: 'mount' }
     } catch {
-      // Try the next mounted representation before falling back to gh.
+      // Try the next mounted representation before failing closed.
     }
   }
   return undefined
@@ -217,6 +199,12 @@ function parsePullRequestPayload(
       ?? (headRepo ? headRepo.toLowerCase() !== target.repo.toLowerCase() : undefined),
     maintainerCanModify: booleanValue(payload.maintainerCanModify) ?? booleanValue(payload.maintainer_can_modify),
     filesChanged: changedFiles(payload.filesChanged ?? payload.files),
+    mergeable: mergeableValue(payload.mergeable),
+    mergeStateStatus: stringValue(payload.mergeStateStatus)
+      ?? stringValue(payload.merge_state_status)
+      ?? stringValue(payload.mergeable_state)?.toUpperCase(),
+    reviewDecision: stringValue(payload.reviewDecision) ?? stringValue(payload.review_decision),
+    statusCheckRollup: arrayValue(payload.statusCheckRollup) ?? arrayValue(payload.status_check_rollup),
   }
 }
 
@@ -229,30 +217,6 @@ const hasRequiredPullMetadata = (pr: Omit<StandalonePullRequest, 'source'>): boo
   Boolean(pr.headRepo?.trim()) &&
   Boolean(pr.baseRef?.trim()) &&
   pr.crossRepository !== undefined
-
-function mergePullMetadata(
-  mounted: Omit<StandalonePullRequest, 'source'> | undefined,
-  live: Omit<StandalonePullRequest, 'source'>,
-): Omit<StandalonePullRequest, 'source'> {
-  if (!mounted) return live
-  return {
-    repo: live.repo,
-    number: live.number,
-    title: live.title || mounted.title,
-    body: live.body || mounted.body,
-    state: live.state ?? mounted.state,
-    draft: live.draft ?? mounted.draft,
-    merged: live.merged ?? mounted.merged,
-    url: live.url || mounted.url,
-    headRef: live.headRef ?? mounted.headRef,
-    headSha: live.headSha ?? mounted.headSha,
-    baseRef: live.baseRef ?? mounted.baseRef,
-    headRepo: live.headRepo ?? mounted.headRepo,
-    crossRepository: live.crossRepository ?? mounted.crossRepository,
-    maintainerCanModify: live.maintainerCanModify ?? mounted.maintainerCanModify,
-    filesChanged: live.filesChanged ?? mounted.filesChanged,
-  }
-}
 
 function changedFiles(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined
@@ -293,3 +257,11 @@ const numberValue = (value: unknown): number | undefined =>
 
 const booleanValue = (value: unknown): boolean | undefined =>
   typeof value === 'boolean' ? value : undefined
+
+const arrayValue = (value: unknown): unknown[] | undefined => Array.isArray(value) ? value : undefined
+
+const mergeableValue = (value: unknown): string | undefined => {
+  if (value === true) return 'MERGEABLE'
+  if (value === false) return 'CONFLICTING'
+  return stringValue(value)?.toUpperCase()
+}

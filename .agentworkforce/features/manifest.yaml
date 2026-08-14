@@ -2,14 +2,14 @@ version: '1.1'
 updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 313
+  feature_count: 314
   tier_counts:
     1: 48
     2: 125
     3: 11
-    4: 52
-    5: 62
-    6: 15
+    4: 53
+    5: 61
+    6: 16
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
 #
@@ -98,7 +98,7 @@ categories:
       - id: cli-notion-intake-dispatch
         name: Mounted Notion Spec Dispatch
         cli: factory intake notion <manifest>
-        description: Idempotently publish privacy-safe repository work into the GitHub lifecycle or dispatch an exact-path task through the fleet
+        description: Idempotently publish privacy-safe repository work through the workspace GitHub App connection or dispatch an exact-path task through the fleet, with no local gh write fallback
         location: src/intake/notion.ts, src/cli/fleet.ts
         verify_tier: 4
 
@@ -824,15 +824,22 @@ categories:
       - id: pr-routed-babysitter-discovery
         name: Routed Repository PR Babysitter Discovery
         api: babysitter.mode=routed-open-prs
-        description: Read-only discovery of open non-draft same-repository PRs only from repos.names, with explicit accounting for excluded, unreadable, incomplete, and duplicate candidates; activation remains deliberately disabled
-        location: src/github/routed-pr-babysitter.ts
+        description: Discover open non-draft same-repository PRs only from repos.names, fall back to PR title and body, and account for every excluded, deferred, unreadable, or failed candidate
+        location: src/github/routed-pr-babysitter.ts, src/orchestrator/factory.ts
         verify_tier: 5
 
+      - id: pr-routed-babysitter-ownership
+        name: Routed PR Work-Unit Ownership
+        api: StateStore.claimRoutedPrBabysitter()
+        description: Atomically claim exact normalized repo and PR work units across routed and issue-created intake before spawn, with durable restart recovery and bounded admission
+        location: src/ports/state.ts, src/state/in-memory-state-store.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
       - id: pr-routed-babysitter-opt-out
-        name: Routed PR Discovery Opt-Out
+        name: Routed PR Pre-Write Opt-Out
         api: babysitter.excludeLabels / babysitter.excludePullRequests
-        description: Exclude configured PR identities or labeled PRs from the read-only routed discovery candidate set
-        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
+        description: Reject configured PR identities or labeled PRs before spawn and require automatic workers to re-check labels before their first provider write
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts, src/dispatch/templates.ts
         verify_tier: 5
 
       - id: pr-standalone-babysitter-validation
@@ -908,8 +915,8 @@ categories:
       - id: pr-guarded-merge
         name: Head-Guarded Squash Merge
         api: GithubMergeGate.merge()
-        description: Squash merge and delete the branch only when the live head still matches the approved SHA
-        location: src/github/merge-gate.ts
+        description: Squash merge through the workspace GitHub App connection only when the mounted live head still matches the approved SHA
+        location: src/github/merge-gate.ts, src/mount/relayfile-github-connection-write.ts
         verify_tier: 6
 
       - id: pr-never-auto-merge
@@ -1113,10 +1120,10 @@ categories:
 
       - id: writeback-github-lifecycle
         name: GitHub Issue Lifecycle Writeback
-        api: GhCliGithubWriteback
-        description: Post comments, apply in-progress or human-review labels, and close GitHub-native issues
-        location: src/writeback/github.ts
-        verify_tier: 5
+        api: ConnectionGithubWriteback / RelayfileGithubConnectionWrite
+        description: Post comments, reply to review threads, apply lifecycle labels, and close or create GitHub issues through the workspace App; verify provider-recorded bot authorship for comment and issue creates and never fall back to the local gh user
+        location: src/writeback/github.ts, src/mount/relayfile-github-connection-write.ts, src/orchestrator/factory.ts
+        verify_tier: 6
 
       - id: writeback-github-pr-publication
         name: Workspace GitHub PR Publication
@@ -2159,8 +2166,8 @@ categories:
       - id: config-babysitter-routed-intake
         name: Routed Babysitter Intake Controls
         api: factory.config.json#babysitter.mode
-        description: Keep factory-created intake as the default while explicitly configuring routed discovery and exclusions; routed activation remains disabled pending lifecycle design
-        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
+        description: Keep factory-created intake as the default while explicitly configuring routed discovery, exclusions, and notifications-off behavior
+        location: src/config/schema.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
       - id: config-merge-policy

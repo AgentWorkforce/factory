@@ -17,3 +17,4 @@ artifacts/
 .agent-relay/step-outputs/
 .agent-relay/workflow-runs.jsonl
 .agentworkforce/trajectories/
+opencode.json

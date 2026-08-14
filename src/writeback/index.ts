@@ -17,10 +17,13 @@ export type {
   MountSlackWritebackConfig,
 } from './slack'
 export {
+  ConnectionGithubWriteback,
   GhCliGithubWriteback,
   MountGithubRead,
+  supportsConnectionGithubWriteback,
 } from './github'
 export type {
+  ConnectionGithubWritebackConfig,
   GhCliGithubWritebackConfig,
 } from './github'
 export {

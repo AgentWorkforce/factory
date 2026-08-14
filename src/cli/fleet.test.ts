@@ -2803,7 +2803,6 @@ describe('fleet CLI runtime', () => {
           mountCalls.push(startDir)
           if (startDir === clonePath) throw new Error('mount unavailable')
         },
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: output,
         stderr: errors,
       })
@@ -2868,7 +2867,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: errors,
       })
@@ -2905,7 +2903,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: errors,
       })
@@ -2947,7 +2944,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: output,
         stderr: buffer(),
       })

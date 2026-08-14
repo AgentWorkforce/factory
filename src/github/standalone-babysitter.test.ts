@@ -32,7 +32,7 @@ describe('standalone PR babysitter helpers', () => {
     }
   })
 
-  it('uses a complete mounted snapshot when gh is unavailable', async () => {
+  it('uses a complete mounted snapshot without consulting a local GitHub identity', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: {
@@ -51,7 +51,6 @@ describe('standalone PR babysitter helpers', () => {
     const pr = await readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => { throw new Error('gh unavailable') },
     )
 
     expect(pr).toMatchObject({
@@ -65,108 +64,16 @@ describe('standalone PR babysitter helpers', () => {
     })
   })
 
-  it('uses live gh metadata to hydrate and supersede an incomplete mounted snapshot', async () => {
+  it('refuses an incomplete mounted snapshot instead of falling back to gh', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: { number: 10, state: 'open', head_ref: 'stale-branch' },
       },
     })
-    const pr = await readStandalonePullRequest(
+    await expect(readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({
-          number: 10,
-          title: 'Live title',
-          body: 'Live body',
-          state: 'OPEN',
-          isDraft: false,
-          url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
-          headRefName: 'codex/league-public-sites',
-          headRefOid: 'live-sha',
-          baseRefName: 'main',
-          headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
-          files: [{ path: 'src/routes/league.ts' }, { path: 'src/pages/league.tsx' }],
-        }),
-      }),
-    )
-
-    expect(pr).toMatchObject({
-      source: 'mount+gh',
-      title: 'Live title',
-      body: 'Live body',
-      headRef: 'codex/league-public-sites',
-      headSha: 'live-sha',
-      filesChanged: ['src/routes/league.ts', 'src/pages/league.tsx'],
-    })
-  })
-
-  it('preserves mounted identity fields while live gh guard fields override stale mount state', async () => {
-    const mount = new FakeMountClient({
-      '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
-        payload: {
-          number: 10,
-          title: 'Mounted title',
-          body: 'Mounted body',
-          state: 'open',
-          draft: false,
-          head: { ref: 'feature', sha: 'mounted-sha', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
-          base: { ref: 'main' },
-        },
-      },
-    })
-    const pr = await readStandalonePullRequest(
-      mount,
-      { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({ number: 10, state: 'CLOSED', isDraft: false }),
-      }),
-    )
-
-    expect(pr).toMatchObject({
-      source: 'mount+gh',
-      state: 'CLOSED',
-      headRef: 'feature',
-      headSha: 'mounted-sha',
-      headRepo: 'AgentWorkforce/hoopsheet',
-      baseRef: 'main',
-      crossRepository: false,
-    })
-  })
-
-  it('preserves the mounted PR body when live metadata has an empty body', async () => {
-    const mount = new FakeMountClient({
-      '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
-        payload: {
-          number: 10,
-          title: 'Mounted title',
-          body: 'Mounted definition of done',
-          state: 'open',
-          draft: false,
-          head: { ref: 'feature', sha: 'mounted-sha', repo: { full_name: 'AgentWorkforce/hoopsheet' } },
-          base: { ref: 'main' },
-        },
-      },
-    })
-    const pr = await readStandalonePullRequest(
-      mount,
-      { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({
-          number: 10,
-          title: 'Live title',
-          body: '',
-          state: 'OPEN',
-          isDraft: false,
-          headRefName: 'feature',
-          headRefOid: 'live-sha',
-          baseRefName: 'main',
-          headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
-        }),
-      }),
-    )
-
-    expect(pr.body).toBe('Mounted definition of done')
+    )).rejects.toThrow(/does not fall back to the local GitHub CLI identity/u)
   })
 
   it('only selects an unambiguous explicit linked issue', () => {

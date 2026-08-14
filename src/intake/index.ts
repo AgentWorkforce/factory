@@ -1,5 +1,6 @@
 export {
-  GhCliIssuePublisher,
+  ConnectionIssuePublisher,
+  supportsConnectionIssuePublisher,
   loadNotionIntakeManifest,
   normalizeNotionManifest,
   normalizeNotionPageId,

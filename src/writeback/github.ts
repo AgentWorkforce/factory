@@ -1,10 +1,10 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import type { MountClient } from '../ports'
+import type { GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
-import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
+import { defaultGhRunner, type GhRunner } from '../github/gh-runner'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
 
@@ -58,6 +58,134 @@ export const MountGithubRead = (mount: MountClient) => ({
   },
 })
 
+export interface ConnectionGithubWritebackConfig {
+  githubWrite: GithubConnectionWrite
+  mount: Pick<MountClient, 'readFile'>
+}
+
+/**
+ * Whether a GitHub connection can carry the whole issue writeback surface as
+ * the Factory app. Callers use this to select the app-authored writeback or an
+ * explicit fail-closed adapter, rather than discovering a missing operation
+ * mid-transition or falling back to a local human identity.
+ */
+export const supportsConnectionGithubWriteback = Object.assign(
+  (githubWrite: GithubConnectionWrite | undefined): boolean =>
+    Boolean(githubWrite) && supportsConnectionGithubWriteback.missing(githubWrite!).length === 0,
+  {
+    missing: (githubWrite: GithubConnectionWrite): string[] =>
+      ([['postIssueComment', githubWrite.postIssueComment], ['updateIssue', githubWrite.updateIssue]] as const)
+        .filter(([, operation]) => typeof operation !== 'function')
+        .map(([name]) => name),
+  },
+)
+
+/**
+ * GitHub issue lifecycle writeback through the authenticated workspace
+ * connection — the same identity that opens Factory's pull requests.
+ *
+ * This is the default writeback whenever the mount exposes a GitHub
+ * connection. Its predecessor, {@link GhCliGithubWriteback}, shells out to the
+ * `gh` CLI and therefore authors every comment and label as whichever human
+ * happens to be logged in on the host, which split Factory's audit trail in
+ * two: app-authored PRs, person-authored everything else.
+ *
+ * Deliberately-omitted capabilities, rather than silent fallbacks:
+ *
+ * - `getIssueAuthor` and `hasCommentMarker` are absent. Both need a
+ *   provider-authoritative read the connection does not expose as a write
+ *   draft, and the orchestrator already has mount-projection fallbacks for
+ *   both. Answering them from a possibly-stale projection while claiming
+ *   provider authority would be worse than not answering.
+ * - `publishPullRequest` is absent. PR creation goes through
+ *   `GithubConnectionWrite.publishPullRequest`, which already requests
+ *   `author: 'app'`; nothing here should offer a second route to it.
+ */
+export class ConnectionGithubWriteback implements GithubWriteback {
+  readonly #postIssueComment: NonNullable<GithubConnectionWrite['postIssueComment']>
+  readonly #updateIssue: NonNullable<GithubConnectionWrite['updateIssue']>
+  readonly #mount: ConnectionGithubWritebackConfig['mount']
+
+  constructor(config: ConnectionGithubWritebackConfig) {
+    // The connection operations are declared optional so older mounts still
+    // satisfy the port. Bind them once, here, so a mount that cannot author
+    // comments fails at construction with a named cause instead of throwing
+    // "not a function" halfway through an issue lifecycle transition.
+    const missing = supportsConnectionGithubWriteback.missing(config.githubWrite)
+    if (missing.length > 0) {
+      throw new Error(
+        `The connected GitHub workspace cannot author issue writes as the Factory app (missing ${missing.join(', ')})`,
+      )
+    }
+    this.#postIssueComment = config.githubWrite.postIssueComment!.bind(config.githubWrite)
+    this.#updateIssue = config.githubWrite.updateIssue!.bind(config.githubWrite)
+    this.#mount = config.mount
+  }
+
+  async postComment(issue: LinearIssue, body: string): Promise<void> {
+    const ref = githubIssueRef(issue)
+    await this.#postIssueComment({ repo: ref.repo, number: ref.number, body })
+  }
+
+  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
+    const labels = lowercased(await this.#labels(issue))
+    if (labels.has(STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
+    if (labels.has(STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
+    return 'ready'
+  }
+
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
+    const ref = githubIssueRef(issue)
+    // GitHub's issue PATCH replaces the whole label set, so the new set is
+    // computed from the live one rather than sent blind. A label added between
+    // this read and the write is lost — the same read-modify-write window the
+    // `gh issue edit --add-label/--remove-label` path avoided. Factory only
+    // ever moves its own `factory:` labels here, so the exposure is bounded to
+    // a concurrent third-party label on the same issue in the same instant.
+    const current = [...await this.#labels(issue)]
+    const present = lowercased(current)
+    const remove = new Set<string>()
+    const add: string[] = []
+    if (status === 'ready') {
+      remove.add(STATUS_LABELS['in-progress'].name.toLowerCase())
+    } else {
+      const target = STATUS_LABELS[status]
+      const previous = STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
+      remove.add(previous.name.toLowerCase())
+      if (!present.has(target.name.toLowerCase())) add.push(target.name)
+    }
+
+    const next = current
+      .filter((label) => !remove.has(label.toLowerCase()))
+      .concat(add)
+    if (next.length === current.length && add.length === 0) return
+    await this.#updateIssue({ repo: ref.repo, number: ref.number, labels: next })
+  }
+
+  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+    const ref = githubIssueRef(issue)
+    await this.postComment(issue, body)
+    await this.#updateIssue({ repo: ref.repo, number: ref.number, state: 'closed' })
+  }
+
+  /**
+   * Live label set for the issue, preferring the mounted provider projection
+   * and falling back to the labels carried on the dispatched issue record.
+   * Returns the original casing so a rewrite does not silently re-case a
+   * third-party label.
+   */
+  async #labels(issue: LinearIssue): Promise<Set<string>> {
+    try {
+      const payload = wrappedPayload((await this.#mount.readFile(issue.path)).content)
+      const labels = issueLabelNames(payload.labels)
+      if (labels) return new Set(labels)
+    } catch {
+      // Fall back to the labels captured when the issue was read for dispatch.
+    }
+    return new Set(issue.labels.map((label) => label.trim()).filter(Boolean))
+  }
+}
+
 export interface GhCliGithubWritebackConfig {
   runner?: GhRunner
   gitRunner?: GhRunner
@@ -65,8 +193,13 @@ export interface GhCliGithubWritebackConfig {
 
 /**
  * GitHub issue lifecycle writeback using authenticated `gh` primitives.
- * TODO(issue-52): migrate issue labels/comments to the mounted GitHub
- * connection after the PR publication path has proven stable.
+ *
+ * Never used for issue lifecycle or babysitter writes. `gh` authenticates as whatever user is
+ * logged in on the host, so every comment and label it writes is attributed to
+ * a person rather than to Factory's GitHub App. Prefer
+ * {@link ConnectionGithubWriteback}; this class remains only for
+ * `github.identity: user` PR publication, whose gh-user authorship is a
+ * deliberate, separately-selected compatibility behaviour.
  *
  * Labels are created idempotently before use so a newly-onboarded repository
  * does not need factory status labels to be provisioned by hand.
@@ -368,6 +501,18 @@ const githubIssueRef = (issue: LinearIssue): { repo: string; number: number; url
     throw new Error(`GitHub writeback source URL does not match ${repo}#${number}`)
   }
   return { repo, number: number!, url }
+}
+
+const lowercased = (values: Iterable<string>): Set<string> =>
+  new Set([...values].map((value) => value.toLowerCase()))
+
+const issueLabelNames = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  const names = value
+    .map((entry) => typeof entry === 'string' ? entry : stringValue(asRecord(entry)?.name))
+    .map((name) => name?.trim())
+    .filter((name): name is string => Boolean(name))
+  return names.length > 0 || value.length === 0 ? names : undefined
 }
 
 const matchesBoundary = (value: string, prefix: string): boolean => {

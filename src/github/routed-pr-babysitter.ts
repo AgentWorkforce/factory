@@ -3,14 +3,6 @@ import { resolveRoutedRepo } from '../config/schema'
 import type { MountClient } from '../ports'
 import { asRecord, stableHash, wrappedPayload } from '../writeback/shared'
 
-/**
- * Routed-PR activation is deliberately held until the lifecycle design lands.
- * This PR ships only configuration and read-only discovery. Part 2 must replace
- * this guard when it adds the reviewed claim/activation lifecycle; changing
- * configuration alone can never spawn a routed-PR babysitter.
- */
-export const ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED = false
-
 export type RoutedPrCandidate = {
   repo: string
   number: number

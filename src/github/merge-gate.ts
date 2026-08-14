@@ -1,14 +1,5 @@
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-
-const execFileAsync = promisify(execFile)
-
-export interface GhRunResult {
-  stdout: string
-  stderr?: string
-}
-
-export type GhRunner = (args: string[]) => Promise<GhRunResult>
+import type { MountClient } from '../ports'
+import { readStandalonePullRequest } from './standalone-babysitter'
 
 export interface GithubMergeGateInput {
   repo: string
@@ -47,31 +38,28 @@ export interface GithubMergeGate {
   merge(input: GithubMergeInput): Promise<GithubMergeResult>
 }
 
-export class GhCliGithubMergeGate implements GithubMergeGate {
-  readonly #run: GhRunner
+export class RelayfileGithubMergeGate implements GithubMergeGate {
+  readonly #mount: MountClient
 
-  constructor(run: GhRunner = defaultGhRunner) {
-    this.#run = run
+  constructor(mount: MountClient) {
+    this.#mount = mount
   }
 
   async check(input: GithubMergeGateInput): Promise<GithubMergeGateVerdict> {
     try {
-      const result = await this.#run([
-        'pr',
-        'view',
-        String(input.number),
-        '--repo',
-        input.repo,
-        '--json',
-        'mergeable,mergeStateStatus,statusCheckRollup,headRefOid,reviewDecision',
-      ])
-      if (result.stdout.trim().length === 0) {
-        return refuse('gh returned empty output', { checkStates: [] })
-      }
-
-      return evaluateGithubMergeGate(input, parseGhJson(result.stdout))
+      const pullRequest = await readStandalonePullRequest(this.#mount, {
+        repo: input.repo,
+        prNumber: input.number,
+      })
+      return evaluateGithubMergeGate(input, {
+        mergeable: pullRequest.mergeable,
+        mergeStateStatus: pullRequest.mergeStateStatus,
+        headRefOid: pullRequest.headSha,
+        reviewDecision: pullRequest.reviewDecision,
+        statusCheckRollup: pullRequest.statusCheckRollup,
+      })
     } catch (error) {
-      return refuse(`gh merge gate failed: ${error instanceof Error ? error.message : String(error)}`, {
+      return refuse(`Relayfile GitHub merge gate failed: ${error instanceof Error ? error.message : String(error)}`, {
         checkStates: [],
       })
     }
@@ -79,33 +67,34 @@ export class GhCliGithubMergeGate implements GithubMergeGate {
 
   async merge(input: GithubMergeInput): Promise<GithubMergeResult> {
     try {
-      const result = await this.#run([
-        'pr',
-        'merge',
-        String(input.number),
-        '--repo',
-        input.repo,
-        '--squash',
-        '--delete-branch',
-        '--match-head-commit',
-        input.expectedHeadSha,
-      ])
+      const mergePullRequest = this.#mount.githubWrite?.mergePullRequest
+      if (!mergePullRequest) {
+        throw new Error('connected GitHub App merge write path is unavailable')
+      }
+      // Relayfile currently exposes the guarded merge itself, but not a branch
+      // deletion mutation. Leave the merged head branch in place rather than
+      // reintroducing `gh --delete-branch` under a local human identity.
+      const result = await mergePullRequest.call(this.#mount.githubWrite, {
+        repo: input.repo,
+        number: input.number,
+        expectedHeadSha: input.expectedHeadSha,
+        method: 'squash',
+      })
       return {
         merged: true,
         reason: `merged ${input.repo}#${input.number} at ${input.expectedHeadSha}`,
-        stdout: result.stdout,
-        stderr: result.stderr,
+        stdout: result.sha,
       }
     } catch (error) {
       return {
         merged: false,
-        reason: `gh guarded merge failed: ${error instanceof Error ? error.message : String(error)}`,
+        reason: `Relayfile GitHub App guarded merge failed: ${error instanceof Error ? error.message : String(error)}`,
       }
     }
   }
 }
 
-export const GithubMergeGate = GhCliGithubMergeGate
+export const GithubMergeGate = RelayfileGithubMergeGate
 
 export function evaluateGithubMergeGate(
   input: GithubMergeGateInput,
@@ -171,15 +160,6 @@ export function evaluateGithubMergeGate(
     live: { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates },
   }
 }
-
-export const defaultGhRunner: GhRunner = async (args) => {
-  // TODO(issue-52): retire this compatibility runner when merge-gate reads and
-  // guarded merges are fully represented by the mounted GitHub connection.
-  const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
-  return { stdout, stderr }
-}
-
-const parseGhJson = (stdout: string): unknown => JSON.parse(stdout)
 
 const refuse = (reason: string, live: GithubMergeGateVerdict['live']): GithubMergeGateVerdict => ({
   verdict: 'REFUSE',

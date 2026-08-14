@@ -1,0 +1,51 @@
+{
+  "subscription": {
+    "teams": [
+      "AR"
+    ]
+  },
+  "repos": {
+    "org": "AgentWorkforce",
+    "cloneRoot": "/Users/khaliqgant/Projects/AgentWorkforce",
+    "names": [
+      "factory"
+    ],
+    "default": "AgentWorkforce/factory"
+  },
+  "safety": {
+    "requireTitlePrefix": "[factory]",
+    "requireLabel": "factory",
+    "requireTeamKey": "AR"
+  },
+  "linear": {
+    "states": {
+      "readyForAgent": "Ready for Agent",
+      "agentImplementing": "Agent Implementing",
+      "inPlanning": "In Planning",
+      "done": "Done",
+      "humanReview": "In Human Review"
+    },
+    "statesByTeam": {}
+  },
+  "batchSize": 5,
+  "issueSource": "github",
+  "mergePolicy": "never",
+  "babysitter": {
+    "enabled": true
+  },
+  "terminalState": "human-review",
+  "models": {
+    "babysitter": "sonnet"
+  },
+  "slack": {
+    "channel": "C0BAC2KSTGV",
+    "staleAfterMs": 2592000000
+  },
+  "capabilities": [
+    "spawn:codex",
+    "spawn:claude",
+    "workflow:run"
+  ],
+  "factoryLoopHeartbeatPath": "/tmp/factory-run/factory-loop-heartbeat.json",
+  "factoryLoopRegistryPath": "/tmp/factory-run/factory-loop-registry.json"
+}

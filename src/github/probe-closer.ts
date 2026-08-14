@@ -1,6 +1,6 @@
 import { containsIssueKey } from '../issue-key-match'
 import type { GithubConnectionWrite } from '../ports'
-import { defaultGhRunner, type GhRunner } from './merge-gate'
+import { defaultGhRunner, type GhRunner } from './gh-runner'
 
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 

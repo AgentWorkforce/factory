@@ -4,7 +4,10 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { GithubConnectionWrite } from '../ports'
+import { FakeMountClient } from '../testing'
 import {
+  ConnectionIssuePublisher,
   loadNotionIntakeManifest,
   normalizeNotionManifest,
   normalizeNotionPageId,
@@ -608,6 +611,60 @@ describe('Notion spec intake', () => {
       expect.objectContaining({ status: 'dispatched', target: { repo: 'AgentWorkforce/cloud', labels: [] } }),
       expect.objectContaining({ status: 'blocked', reason: 'GitHub unavailable' }),
     ])
+  })
+})
+
+describe('ConnectionIssuePublisher', () => {
+  it('uses mounted reads and app-connection writes without a local gh path', async () => {
+    const creates: unknown[] = []
+    const updates: unknown[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      createIssue: async (input) => {
+        creates.push(input)
+        return {
+          repo: input.repo,
+          number: 222,
+          url: 'https://github.com/AgentWorkforce/factory/issues/222',
+          author: 'app',
+        }
+      },
+      updateIssue: async (input) => { updates.push(input) },
+    }
+    const mount = new FakeMountClient({
+      '/github/repos/AgentWorkforce/factory/meta.json': { payload: { visibility: 'private' } },
+      '/github/repos/AgentWorkforce/factory/issues/221__identity/meta.json': {
+        payload: {
+          number: 221,
+          html_url: 'https://github.com/AgentWorkforce/factory/issues/221',
+          body: '<!-- factory-source:notion:page:repo:agentworkforce/factory -->',
+        },
+      },
+    })
+    const publisher = new ConnectionIssuePublisher({ githubWrite, mount })
+
+    await expect(publisher.repositoryVisibility('AgentWorkforce/factory')).resolves.toBe('private')
+    await expect(publisher.findBySource(
+      'AgentWorkforce/factory',
+      'notion:page:repo:agentworkforce/factory',
+    )).resolves.toMatchObject({ number: 221 })
+    await expect(publisher.missingLabels('AgentWorkforce/factory', ['factory-ready'])).resolves.toEqual([])
+    await expect(publisher.createIssue({
+      repo: 'AgentWorkforce/factory',
+      title: 'Lifecycle issue',
+      body: 'Safe summary',
+      labels: ['factory-ready'],
+    })).resolves.toMatchObject({ number: 222 })
+    await publisher.updateIssue({ repo: 'AgentWorkforce/factory', number: 222, body: 'Updated' })
+
+    expect(creates).toEqual([{
+      repo: 'AgentWorkforce/factory',
+      title: 'Lifecycle issue',
+      body: 'Safe summary',
+      labels: ['factory-ready'],
+    }])
+    expect(updates).toEqual([{ repo: 'AgentWorkforce/factory', number: 222, body: 'Updated' }])
   })
 })
 

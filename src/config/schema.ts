@@ -121,17 +121,21 @@ const slackSchema = z.object({
 
 const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
-  // Select the declarative intake/discovery surface. Routed activation is
-  // deliberately disabled in src/github/routed-pr-babysitter.ts until the
-  // lifecycle design lands, so this value cannot spawn a routed worker yet.
+  // Preserve the historical issue-created intake unless an operator
+  // deliberately opts into the wider routed-repository sweep. Keeping the
+  // rollout switch separate from `enabled` lets the identity fix in #221 land
+  // before automated writes are attributed across existing human PRs.
   mode: z.enum(['factory-created', 'routed-open-prs']).default('factory-created'),
-  // Discovery excludes candidates carrying an author-controlled stop label.
+  // This label is an author-controlled hard stop. Discovery reads it before
+  // spawning an agent, and routed babysitters are instructed to re-check it
+  // before their first provider write.
   excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
   excludePullRequests: z.array(z.string().regex(
     /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})#[1-9]\d*$/u,
     'expected owner/repo#number',
   )).default([]),
-  // Reserved for the activation design; discovery itself never notifies.
+  // Routed intake stays quiet until an operator explicitly approves the
+  // notification shape observed in a read-only sweep.
   notifyHumans: z.boolean().default(false),
 }).default({})
 
