@@ -172,6 +172,12 @@ type BabysitterPrRef = {
   resourceSubscription?: BabysitterResourceSubscription
   pendingDeliveryClaims?: BabysitterPendingDeliveryClaim[]
 }
+type BabysitterPrSnapshotDeadLetter = {
+  /** Read attempts that exhausted their in-line retries, including sweep retries. */
+  failures: number
+  lastErrorMessage: string
+  firstFailedAtMs: number
+}
 type BabysitterWakeState = {
   issue: IssueRef
   repo: string
@@ -308,6 +314,29 @@ const BABYSITTER_SUBSCRIPTION_EVENT_TYPES = [
   'check_run.completed',
 ]
 const BABYSITTER_SUBSCRIPTION_TERMINAL_EVENT_TYPES = ['pull_request.closed']
+// The PR-open snapshot read is the single gate that decides whether a PR ever
+// gets a babysitter, so a transient mount fetch failure must not be allowed to
+// settle that question. Retry in-line, then dead-letter for the reconcile sweep.
+const BABYSITTER_PR_SNAPSHOT_READ_ATTEMPTS = 3
+const BABYSITTER_PR_SNAPSHOT_READ_BACKOFF_MS = 250
+// Escalate from warn to error once in-line retries plus this many sweep retries
+// have all failed: the PR is durably unreadable, not momentarily unlucky.
+const BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_ESCALATE_AFTER = 3
+// Bound the dead-letter book so a sustained mount outage cannot grow it without
+// limit. Oldest entries are evicted first; the reconcile sweep still adopts
+// their PRs through the ownerless-record path.
+const BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_LIMIT = 256
+// Retries carry backoff sleeps, so a sweep drains a slice rather than the whole
+// book; failed entries rotate to the end so successive sweeps cover all of it.
+const BABYSITTER_PR_SNAPSHOT_DRAIN_PER_SWEEP = 16
+// A durably faulted mount would otherwise log an error per path per sweep.
+const BABYSITTER_PR_SNAPSHOT_ESCALATED_LOG_EVERY = 20
+// Adoption probes an issue's open PR through the (already gh-backed-off) probe
+// resolver, so it runs on its own slower cadence than the completion sweep.
+const BABYSITTER_ORPHAN_SWEEP_INTERVAL_MS = 60_000
+// Warn once per PR identity that arrives unowned, then fall back to debug. The
+// counter carries the true volume; the log only has to make it discoverable.
+const BABYSITTER_UNOWNED_PR_WARN_LIMIT = 64
 const BABYSITTER_RESOURCE_DELIVERY_RETRY_MS = 5_000
 const BABYSITTER_RESOURCE_SUBSCRIPTION_RENEW_MS = (BABYSITTER_SUBSCRIPTION_TTL_SECONDS * 1_000) / 2
 // A babysitter wake fails with a "registration lag" error (agent_not_found /
@@ -561,6 +590,18 @@ export class FactoryLoop implements Factory {
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, BabysitterPrRef>()
   readonly #babysitterIssueRefs = new Map<string, IssueRef>()
+  // PR meta paths whose snapshot read exhausted its in-line retries. Without
+  // this book a single failed read permanently orphans the PR: no babysitter is
+  // spawned, so no owner exists, so every later event for it is discarded. The
+  // reconcile sweep drains this and clears entries that recover.
+  readonly #babysitterPrSnapshotDeadLetters = new Map<string, BabysitterPrSnapshotDeadLetter>()
+  // PR identities already warned about as unowned, so the routing log reports
+  // the condition at default level without repeating per event.
+  readonly #babysitterUnownedPrWarned = new Set<string>()
+  #babysitterOrphanSweepActive = false
+  #babysitterOrphanSweepLastRunMs = 0
+  #babysitterOrphanReportedFailures = 0
+  #babysitterOrphanReportedUnowned = 0
   // Relayfile matches subscription IDs server-side. This direct index means a
   // delivery claim never requires the legacy local repo/PR scan to find an
   // owning babysitter.
@@ -1002,6 +1043,9 @@ export class FactoryLoop implements Factory {
       this.#babysitterSubscriptionOwners.clear()
       this.#babysitterReady.clear()
       this.#babysitterCriticalAgents.clear()
+      this.#babysitterPrSnapshotDeadLetters.clear()
+      this.#babysitterUnownedPrWarned.clear()
+      this.#babysitterOrphanSweepLastRunMs = 0
       const subscription = this.#subscription
       this.#subscription = undefined
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
@@ -1596,6 +1640,10 @@ export class FactoryLoop implements Factory {
     // not this polling sweep. Disabling it here is what makes the babysitter path
     // webhook-driven rather than polled.
     if (this.#config.babysitter.enabled) {
+      // Webhook-driven is not the same as one-shot: a PR-open event that was
+      // missed or whose snapshot read failed leaves its PR with no shepherd
+      // forever. This is the reconciliation that recovers those.
+      await this.#sweepOrphanedBabysitterPrs(reason)
       return
     }
     if (this.#completionSweepActive) {
@@ -1660,6 +1708,202 @@ export class FactoryLoop implements Factory {
     } finally {
       this.#completionSweepActive = false
     }
+  }
+
+  // Reconciliation for the babysitter's one-shot PR-open path. Two failure
+  // modes converge on the same end state — an open Factory PR that no
+  // babysitter owns, whose reviews, CI results and conflicts are then silently
+  // discarded by #routeBabysitterEvent:
+  //   1. the PR-open snapshot read failed and exhausted its retries, or
+  //   2. the PR-open event never arrived at all (restart, drain loss, gap).
+  // Neither is self-healing from events alone, so this sweep re-reads the
+  // dead-lettered paths and adopts still-ownerless in-flight records.
+  async #sweepOrphanedBabysitterPrs(reason: 'live-timer' | 'run-loop' | 'forced' = 'forced'): Promise<void> {
+    if (!this.#config.babysitter.enabled || this.#stopping || this.#babysitterOrphanSweepActive) {
+      return
+    }
+    const now = this.#clock.now()
+    // Adoption probes every ownerless in-flight record, so it runs on the slow
+    // cadence. A dead-lettered read is a PR we already know is unshepherded —
+    // it retries at every sweep opportunity rather than waiting out that cadence.
+    const adoptionDue = reason === 'forced' ||
+      now - this.#babysitterOrphanSweepLastRunMs >= BABYSITTER_ORPHAN_SWEEP_INTERVAL_MS
+    if (!adoptionDue && this.#babysitterPrSnapshotDeadLetters.size === 0) {
+      return
+    }
+    this.#babysitterOrphanSweepActive = true
+    try {
+      this.#increment('babysitterOrphanSweepRuns')
+      await this.#retryDeadLetteredPrSnapshots()
+      if (adoptionDue) {
+        this.#babysitterOrphanSweepLastRunMs = now
+        await this.#adoptOrphanedBabysitterPrs()
+      }
+      this.#reportBabysitterOrphanHealth()
+    } finally {
+      this.#babysitterOrphanSweepActive = false
+    }
+  }
+
+  async #retryDeadLetteredPrSnapshots(): Promise<void> {
+    // Each retry costs up to BABYSITTER_PR_SNAPSHOT_READ_ATTEMPTS reads with
+    // backoff sleeps between them, so drain a bounded slice per sweep rather
+    // than stalling the sweep behind a full book during a mount outage. A
+    // failed retry re-inserts its entry at the end, so successive sweeps
+    // rotate through the whole book.
+    const batch = [...this.#babysitterPrSnapshotDeadLetters.keys()].slice(0, BABYSITTER_PR_SNAPSHOT_DRAIN_PER_SWEEP)
+    if (this.#babysitterPrSnapshotDeadLetters.size > batch.length) {
+      this.#logger.warn?.('[factory] babysitter dead-letter drain is rate limited', {
+        deadLettered: this.#babysitterPrSnapshotDeadLetters.size,
+        retryingThisSweep: batch.length,
+      })
+    }
+    for (const path of batch) {
+      if (this.#stopping) return
+      this.#increment('babysitterPrSnapshotDeadLettersRetried')
+      // #handlePrChange clears the entry itself on a successful read and
+      // re-records the failure (bumping `failures`, escalating the log) if the
+      // mount is still faulted, so the whole retry contract lives in one place.
+      await this.#handlePrChange(path)
+    }
+  }
+
+  async #adoptOrphanedBabysitterPrs(): Promise<void> {
+    const batch = await this.#batch()
+    for (const record of batch.inFlight) {
+      if (this.#stopping) return
+      if (record.dryRun || this.#hasBabysitterForIssue(record.issue)) continue
+      if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
+      this.#increment('babysitterOrphanCandidatesScanned')
+      try {
+        for (const path of await this.#orphanedPrMetaPaths(record)) {
+          if (this.#stopping || this.#hasBabysitterForIssue(record.issue)) break
+          // Replay the PR meta through the normal PR-open handler rather than
+          // spawning directly. Adoption must be subject to exactly the same
+          // ownership, weak-match and path/payload-identity guards as a live
+          // PR-open event — a reconcile sweep is a second delivery of a missed
+          // event, never a way around the checks that event would have faced.
+          await this.#handlePrChange(path)
+        }
+      } catch (error) {
+        this.#increment('babysitterOrphanAdoptionErrors')
+        this.#logger.warn?.('[factory] babysitter orphan adoption failed', {
+          issue: record.issue.key,
+          error: describeError(error).errorMessage,
+        })
+        continue
+      }
+      if (!this.#hasBabysitterForIssue(record.issue)) continue
+      this.#increment('babysitterOrphanedPrsAdopted')
+      this.#logger.warn?.('[factory] adopted an orphaned PR that no babysitter owned', {
+        issue: record.issue.key,
+        ...this.#babysitterPrForIssue(record.issue),
+      })
+    }
+  }
+
+  // Candidate PR meta paths for an ownerless record, newest PR first. Resolution
+  // reuses the durable dispatch receipts and then the probe resolver (which
+  // carries its own gh backoff, so a record whose implementer has not opened a
+  // PR yet costs no more than a cached miss).
+  async #orphanedPrMetaPaths(record: InFlightIssue): Promise<string[]> {
+    const wanted: Array<{ repo: string; prNumber: number }> = []
+    if (this.#usesDurableDispatchLifecycle()) {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
+      for (const receipt of receipts) wanted.push({ repo: receipt.repo, prNumber: receipt.number })
+    }
+    if (wanted.length === 0) {
+      const issue = await this.#readIssue(record.issue.path)
+      const pr = issue ? await this.#openPrForIssue(issue) : undefined
+      if (pr) wanted.push({ repo: pr.repo, prNumber: pr.prNumber })
+    }
+
+    const paths: string[] = []
+    for (const { repo, prNumber } of wanted) {
+      for (const root of githubPullRoots(repo)) {
+        let candidates: string[]
+        try {
+          candidates = await this.#mount.listTree(root)
+        } catch {
+          continue
+        }
+        const match = candidates.find((path) => {
+          const parts = githubPullPathParts(path)
+          return parts?.number === prNumber &&
+            `${parts.owner}/${parts.repo}`.toLowerCase() === repo.toLowerCase()
+        })
+        if (match && !paths.includes(match)) {
+          paths.push(match)
+          break
+        }
+      }
+    }
+    if (paths.length === 0 && wanted.length > 0) {
+      // The PR exists but its meta has not materialized in the mount yet. Leave
+      // it for the next sweep rather than spawning off an unvalidated receipt.
+      this.#increment('babysitterOrphanPrMetaUnavailable')
+    }
+    return paths
+  }
+
+  #hasBabysitterForIssue(issue: IssueRef): boolean {
+    return this.#babysitterPrForIssue(issue) !== undefined
+  }
+
+  #babysitterPrForIssue(issue: IssueRef): { repo: string; prNumber: number } | undefined {
+    const wanted = issueKey(issue)
+    for (const [key, ref] of this.#babysitterPr) {
+      // Ownership keys are composite (issue + PR), so resolve the issue the same
+      // way #babysitterOwnerFor does: the recorded ref, else the key itself for
+      // the legacy issue-keyed form. Never fall back to the issue being tested,
+      // which would make every entry match.
+      const owningIssue = this.#babysitterIssueRefs.get(key)
+      if ((owningIssue ? issueKey(owningIssue) : key) !== wanted) continue
+      // An empty agentName is the pre-spawn reservation #ensureBabysitter takes
+      // before its first await; that is ownership in progress, not an orphan.
+      return { repo: ref.repo, prNumber: ref.prNumber }
+    }
+    return undefined
+  }
+
+  // The two counters that mark a PR losing its shepherd are otherwise only
+  // visible by diffing `status().counters`. Report the deltas so the condition
+  // reaches an operator reading logs at default level.
+  #reportBabysitterOrphanHealth(): void {
+    const readFailures = this.#counters.babysitterPrSnapshotReadFailures ?? 0
+    const unownedEvents = this.#counters.babysitterEventsIgnoredUnownedPr ?? 0
+    const newReadFailures = readFailures - this.#babysitterOrphanReportedFailures
+    const newUnownedEvents = unownedEvents - this.#babysitterOrphanReportedUnowned
+    const deadLettered = this.#babysitterPrSnapshotDeadLetters.size
+    this.#counters.babysitterPrSnapshotDeadLetterDepth = deadLettered
+    if (newReadFailures <= 0 && newUnownedEvents <= 0 && deadLettered === 0) {
+      return
+    }
+    this.#babysitterOrphanReportedFailures = readFailures
+    this.#babysitterOrphanReportedUnowned = unownedEvents
+    // The oldest stuck entry is what an operator needs to act on: it names the
+    // PR and how long it has been unshepherded.
+    let oldest: { path: string; entry: BabysitterPrSnapshotDeadLetter } | undefined
+    for (const [path, entry] of this.#babysitterPrSnapshotDeadLetters) {
+      if (!oldest || entry.firstFailedAtMs < oldest.entry.firstFailedAtMs) oldest = { path, entry }
+    }
+    this.#logger.warn?.('[factory] babysitter PR routing is dropping work', {
+      prSnapshotReadFailures: readFailures,
+      newPrSnapshotReadFailures: Math.max(0, newReadFailures),
+      unownedPrEventsIgnored: unownedEvents,
+      newUnownedPrEventsIgnored: Math.max(0, newUnownedEvents),
+      deadLetteredPrSnapshots: deadLettered,
+      flatEventsUnreadable: this.#counters.babysitterFlatEventsUnreadable ?? 0,
+      orphanedPrsAdopted: this.#counters.babysitterOrphanedPrsAdopted ?? 0,
+      ...(oldest
+        ? {
+            oldestDeadLetterPath: oldest.path,
+            oldestDeadLetterError: oldest.entry.lastErrorMessage,
+            oldestDeadLetterAgeMs: Math.max(0, this.#clock.now() - oldest.entry.firstFailedAtMs),
+          }
+        : {}),
+    })
   }
 
   async #completionPrForIssue(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
@@ -9761,7 +10005,23 @@ export class FactoryLoop implements Factory {
       const owner = await this.#babysitterOwnerFor(`${event.owner}/${event.repo}`, target.prNumber)
       if (!owner) {
         this.#increment('babysitterEventsIgnoredUnownedPr')
-        this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', { ...event, prNumber: target.prNumber })
+        // "Unowned" means no babysitter was ever registered for this PR — the
+        // downstream symptom of a missed or failed PR-open. Warn once per PR so
+        // it is visible at default level, then fall back to debug for the
+        // repeats; #sweepOrphanedBabysitterPrs is what actually recovers it.
+        const identity = githubPrIdentity(`${event.owner}/${event.repo}`, target.prNumber)
+        const detail = { ...event, prNumber: target.prNumber }
+        // The size cap gates the warn itself, not just the bookkeeping: an
+        // unbounded set of identities must not become an unbounded warn stream.
+        const firstForPr = Boolean(identity) &&
+          !this.#babysitterUnownedPrWarned.has(identity!) &&
+          this.#babysitterUnownedPrWarned.size < BABYSITTER_UNOWNED_PR_WARN_LIMIT
+        if (firstForPr) {
+          this.#babysitterUnownedPrWarned.add(identity!)
+          this.#logger.warn?.('[factory] ignored unowned PR event for babysitter routing', detail)
+        } else {
+          this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', detail)
+        }
         continue
       }
       if (
@@ -10233,19 +10493,91 @@ export class FactoryLoop implements Factory {
   // through the durable Relay lifecycle action; the orchestrator never runs `gh`. PR meta events here
   // only (a) spawn the babysitter on open and (b) carry the latest open/draft/
   // merged state used to guard the final transition.
+  async #readPrSnapshotContent(path: string): Promise<unknown> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= BABYSITTER_PR_SNAPSHOT_READ_ATTEMPTS; attempt += 1) {
+      try {
+        const { content } = await this.#mount.readFile(path)
+        if (attempt > 1) this.#increment('babysitterPrSnapshotReadRetrySucceeded')
+        return content
+      } catch (error) {
+        lastError = error
+        if (attempt < BABYSITTER_PR_SNAPSHOT_READ_ATTEMPTS && !this.#stopping) {
+          this.#increment('babysitterPrSnapshotReadRetries')
+          await this.#clock.sleep(BABYSITTER_PR_SNAPSHOT_READ_BACKOFF_MS * attempt)
+          continue
+        }
+        break
+      }
+    }
+    throw lastError
+  }
+
+  #recordBabysitterPrSnapshotFailure(path: string, error: unknown): void {
+    const { errorMessage } = describeError(error)
+    const existing = this.#babysitterPrSnapshotDeadLetters.get(path)
+    const failures = (existing?.failures ?? 0) + 1
+    // Re-insert last so the eviction below stays insertion-ordered by recency.
+    this.#babysitterPrSnapshotDeadLetters.delete(path)
+    this.#babysitterPrSnapshotDeadLetters.set(path, {
+      failures,
+      lastErrorMessage: errorMessage,
+      firstFailedAtMs: existing?.firstFailedAtMs ?? this.#clock.now(),
+    })
+    while (this.#babysitterPrSnapshotDeadLetters.size > BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_LIMIT) {
+      const oldest = this.#babysitterPrSnapshotDeadLetters.keys().next().value
+      if (oldest === undefined) break
+      this.#babysitterPrSnapshotDeadLetters.delete(oldest)
+      this.#increment('babysitterPrSnapshotDeadLettersEvicted')
+    }
+    this.#increment('babysitterPrSnapshotReadFailures')
+    const detail = {
+      path,
+      error: errorMessage,
+      failures,
+      attemptsPerTry: BABYSITTER_PR_SNAPSHOT_READ_ATTEMPTS,
+      deadLettered: this.#babysitterPrSnapshotDeadLetters.size,
+    }
+    // A PR whose meta cannot be read is a PR with no shepherd, which is not
+    // debug-level information. Escalate once the sweep retries also fail.
+    if (failures >= BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_ESCALATE_AFTER) {
+      this.#increment('babysitterPrSnapshotReadFailuresEscalated')
+      // The sweep keeps retrying for as long as the mount stays faulted, so the
+      // escalation logs on the transition and then only periodically. The
+      // counters carry the true volume.
+      const sinceEscalation = failures - BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_ESCALATE_AFTER
+      if (sinceEscalation % BABYSITTER_PR_SNAPSHOT_ESCALATED_LOG_EVERY === 0) {
+        this.#logger.error?.('[factory] babysitter PR snapshot still unreadable after repeated retries', detail)
+      }
+      return
+    }
+    this.#logger.warn?.('[factory] babysitter could not read PR snapshot', detail)
+  }
+
   async #handlePrChange(path: string): Promise<void> {
     const parts = githubPullPathParts(path)
     if (!parts) {
       return
     }
 
-    let snapshot: PullSnapshot | undefined
+    // This read is the only gate between a PR opening and it getting a
+    // babysitter, so it retries rather than treating one `fetch failed` as a
+    // verdict. On exhaustion the path is dead-lettered for the reconcile sweep
+    // (#sweepOrphanedBabysitterPrs) instead of being dropped.
+    let content: unknown
     try {
-      snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, parts.number)
+      content = await this.#readPrSnapshotContent(path)
     } catch (error) {
-      this.#logger.debug?.('[factory] babysitter could not read PR snapshot', { path, error: describeError(error).errorMessage })
+      this.#recordBabysitterPrSnapshotFailure(path, error)
       return
     }
+    if (this.#babysitterPrSnapshotDeadLetters.delete(path)) {
+      this.#increment('babysitterPrSnapshotDeadLettersRecovered')
+      this.#logger.info?.('[factory] babysitter recovered a dead-lettered PR snapshot read', { path })
+    }
+    // parsePullSnapshot never throws; an undefined result is a structurally
+    // mismatched payload, which a retry cannot fix.
+    const snapshot = parsePullSnapshot(content, parts.number)
     if (!snapshot) {
       return
     }
