@@ -2590,6 +2590,60 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('surfaces live daemon counters from the heartbeat in top-level status', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-daemon-counters-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const now = Date.now()
+      await writeFile(heartbeatPath, `${JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+        counters: {
+          babysitterEventsIgnoredUnownedPr: 7,
+          babysitterFlatEventsUnreadable: 2,
+        },
+      })}\n`, 'utf8')
+      const output = buffer()
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: { localStatusRead: 1 } })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        eventListener: { state: 'subscribed' },
+        counters: {
+          babysitterEventsIgnoredUnownedPr: 7,
+          babysitterFlatEventsUnreadable: 2,
+          localStatusRead: 1,
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces a stale registered workspace mirror in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-status-'))
     try {
@@ -3135,7 +3189,12 @@ describe('fleet CLI runtime', () => {
       expect(result.reports).toHaveLength(2)
       expect(result.status.counters.loopIdle).toBe(1)
       const heartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8'))
-      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 2, maxIterations: 2 })
+      expect(heartbeat).toMatchObject({
+        status: 'idle',
+        iteration: 2,
+        maxIterations: 2,
+        counters: { loopIdle: 1 },
+      })
 
       const statusOut = buffer()
       const statusCode = await runFleetCli([

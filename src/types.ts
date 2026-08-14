@@ -125,6 +125,8 @@ export interface FactoryLoopHeartbeat {
   updatedAtMs: number
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
+  /** Daemon-owned operational counters surfaced to out-of-process status clients. */
+  counters?: Record<string, number>
 }
 
 export interface FactoryInFlightRegistryAgent {

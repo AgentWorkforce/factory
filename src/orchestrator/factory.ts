@@ -131,6 +131,8 @@ type TerminationRoots = { pids: number[]; status: AgentPidResolution['status'] }
 type ResolvedIssuePr = {
   repo: string
   prNumber: number
+  /** Resolver evidence: branch=30, title=20, explicit body reference=10. */
+  matchScore?: number
   draft?: boolean
   headRef?: string
   headRepo?: string
@@ -164,6 +166,15 @@ type BabysitterResourceSubscription = Pick<
   'subscriptionId' | 'provider' | 'resourceRef' | 'subscriberId' | 'ownerId' | 'expiresAt'
 > & { terminal?: boolean }
 type BabysitterPendingDeliveryClaim = { deliveryId: string; claimToken: string }
+type BabysitterPrSnapshotDeadLetter = {
+  path: string
+  repo: string
+  prNumber: number
+  attempts: number
+  exhaustions: number
+  error: string
+  failedAtMs: number
+}
 type BabysitterPrRef = {
   repo: string
   prNumber: number
@@ -292,6 +303,11 @@ const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
 const INJECTION_MAX_ATTEMPTS = 6
 const BABYSITTER_EVENT_COALESCE_MS = 750
 const BABYSITTER_EVENT_RETRY_MS = 1_000
+const BABYSITTER_PR_SNAPSHOT_READ_MAX_ATTEMPTS = 5
+const BABYSITTER_PR_SNAPSHOT_READ_RETRY_BASE_MS = 250
+const BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_LIMIT = 200
+const BABYSITTER_UNOWNED_EVENT_ESCALATION_COUNT = 3
+const BABYSITTER_UNOWNED_EVENT_OBSERVATION_LIMIT = 500
 const BABYSITTER_SUBSCRIPTION_TTL_SECONDS = 60 * 60
 // Relayfile receives provider-native GitHub events, not the materialized file
 // changes that the legacy local router consumed. `closed` is separately
@@ -557,6 +573,9 @@ export class FactoryLoop implements Factory {
   // owner per PR.
   readonly #babysitterSpawned = new Set<string>()
   readonly #babysitterSpawnInFlight = new Map<string, Promise<void>>()
+  readonly #babysitterPrSnapshotReads = new Map<string, Promise<PullSnapshot | undefined>>()
+  readonly #babysitterPrSnapshotDeadLetters = new Map<string, BabysitterPrSnapshotDeadLetter>()
+  readonly #babysitterUnownedEventOccurrences = new Map<string, number>()
   // Composite issue + PR identity -> the open PR the babysitter is shepherding, including the
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
   readonly #babysitterPr = new Map<string, BabysitterPrRef>()
@@ -997,6 +1016,9 @@ export class FactoryLoop implements Factory {
       this.#liveEventQueue.length = 0
       this.#completionInFlight.clear()
       this.#babysitterSpawned.clear()
+      this.#babysitterPrSnapshotReads.clear()
+      this.#babysitterPrSnapshotDeadLetters.clear()
+      this.#babysitterUnownedEventOccurrences.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
       this.#babysitterSubscriptionOwners.clear()
@@ -1591,18 +1613,19 @@ export class FactoryLoop implements Factory {
     // while the event loop was busy (for example during a large startup pull).
     // Keep reconciliation active even when babysitters own PR completion.
     await this.#fleet.reconcileTrackedAgents?.()
-    // When the babysitter owns PR-open, completion is driven by PR webhooks +
-    // the babysitter's readiness signal (see #handlePrChange / #handleAgentExit),
-    // not this polling sweep. Disabling it here is what makes the babysitter path
-    // webhook-driven rather than polled.
-    if (this.#config.babysitter.enabled) {
-      return
-    }
     if (this.#completionSweepActive) {
       return
     }
     this.#completionSweepActive = true
     try {
+      // Babysitter readiness remains webhook-driven, but PR ownership cannot
+      // be. A transient miss of the one PR-open event must be recoverable from
+      // current open-PR state, so this same timer adopts only ownerless PRs and
+      // never evaluates merge readiness itself.
+      if (this.#config.babysitter.enabled) {
+        await this.#reconcileOrphanedBabysitters(reason)
+        return
+      }
       const batch = await this.#batch()
       const records = batch.inFlight
         .filter((record) => !record.dryRun && !this.#completionInFlight.has(issueKey(record.issue)))
@@ -1660,6 +1683,147 @@ export class FactoryLoop implements Factory {
     } finally {
       this.#completionSweepActive = false
     }
+  }
+
+  async #reconcileOrphanedBabysitters(reason: 'live-timer' | 'run-loop'): Promise<void> {
+    this.#increment('babysitterReconcileRuns')
+
+    // Redrive exhausted event paths first. This preserves the exact webhook
+    // context when the mount recovers, while the issue/PR scan below remains an
+    // independent restart-safe path if the one-shot event is gone for good.
+    await Promise.all([...this.#babysitterPrSnapshotDeadLetters.values()]
+      .slice(0, COMPLETION_SWEEP_BATCH_SIZE)
+      .map(async (deadLetter) => {
+        if (this.#stopping) return
+        this.#increment('babysitterPrSnapshotDeadLetterRedriveAttempts')
+        await this.#handlePrChange(deadLetter.path)
+      }))
+
+    const batch = await this.#batch()
+    const records = batch.inFlight.filter((record) => !record.dryRun)
+    for (let index = 0; index < records.length; index += COMPLETION_SWEEP_BATCH_SIZE) {
+      await Promise.all(records.slice(index, index + COMPLETION_SWEEP_BATCH_SIZE).map(async (record) => {
+        try {
+          await this.#reconcileOrphanedBabysitterForIssue(record, batch, reason)
+        } catch (error) {
+          this.#increment('babysitterReconcileFailures')
+          this.#logger.error?.('[factory] babysitter orphan reconcile failed', {
+            issue: record.issue.key,
+            reason,
+            error: describeError(error).errorMessage,
+          })
+        }
+      }))
+      await this.#refreshLiveHeartbeatIfDue()
+      if (index + COMPLETION_SWEEP_BATCH_SIZE < records.length) await liveEventYield()
+    }
+  }
+
+  async #reconcileOrphanedBabysitterForIssue(
+    record: InFlightIssue,
+    batch: BatchSnapshot,
+    reason: 'live-timer' | 'run-loop',
+  ): Promise<void> {
+    if (batch.getIssue(record.issue) !== record) return
+    const expectedRepoOwners = new Set(record.decision.implementers.map((implementer) => implementer.repo.toLowerCase())).size || 1
+    const currentOwners = [...this.#babysitterPr.entries()].filter(([key, ref]) => {
+      const ownerIssue = this.#babysitterIssueRefs.get(key)
+      return Boolean(ref.agentName && ownerIssue && issueKey(ownerIssue) === issueKey(record.issue))
+    })
+    if (currentOwners.length >= expectedRepoOwners) return
+
+    const issue = await this.#readIssue(record.issue.path)
+    if (!issue || !isInFactoryScope(issue, this.#config.safety)) return
+    const pr = await this.#openPrForIssue(issue)
+    if (!pr) return
+    const exactFactoryBranch = Boolean(pr.headRef && factoryBranchMatchesIssue(pr.headRef, issue.key))
+    // Some app-created branches can carry the originating work-unit number
+    // rather than the mirrored issue number (cloud#3024 is a production
+    // example). The resolver may still prove the issue through the PR title.
+    // Accept that strong association only for same-repository `factory/`
+    // branches; an explicit body mention alone remains insufficient.
+    const factoryTitleMatch = Boolean(
+      pr.headRef?.toLowerCase().startsWith('factory/') &&
+      pr.crossRepository !== true &&
+      (pr.matchScore ?? 0) >= 20,
+    )
+    if (
+      pr.draft !== false ||
+      pr.state?.trim().toUpperCase() !== 'OPEN' ||
+      !pr.headRef ||
+      (!exactFactoryBranch && !factoryTitleMatch)
+    ) return
+    if (pr.path) {
+      const pathParts = githubPullPathParts(pr.path)
+      if (!pathParts || githubPrIdentity(`${pathParts.owner}/${pathParts.repo}`, pathParts.number) !== githubPrIdentity(pr.repo, pr.prNumber)) {
+        this.#increment('babysitterReconcileInvalidPrIdentity')
+        this.#logger.warn?.('[factory] skipped babysitter orphan reconcile for PR metadata with inconsistent path identity', {
+          issue: record.issue.key,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          path: pr.path,
+        })
+        return
+      }
+    }
+    if (await this.#babysitterOwnerFor(pr.repo, pr.prNumber)) return
+
+    const sameRepoOwner = currentOwners.find(([, ref]) => ref.repo.toLowerCase() === pr.repo.toLowerCase())
+    if (sameRepoOwner) return
+
+    this.#increment('babysitterOrphanedPrsDetected')
+    this.#logger.warn?.('[factory] detected open Factory PR without a babysitter; adopting during reconcile', {
+      issue: record.issue.key,
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      reason,
+    })
+    await this.#ensureBabysitter(record, {
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      url: pr.url,
+      path: pr.path,
+      headRef: pr.headRef,
+    })
+    const owner = await this.#babysitterOwnerFor(pr.repo, pr.prNumber)
+    if (!owner) {
+      this.#increment('babysitterOrphanedPrAdoptionFailures')
+      this.#logger.error?.('[factory] open Factory PR remains ownerless after babysitter reconcile', {
+        issue: record.issue.key,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+        reason,
+      })
+      void this.#report({
+        type: 'factory.anomaly',
+        level: 'error',
+        attributes: {
+          component: 'babysitter',
+          operation: 'reconcile_pr_owner',
+          errorCode: 'orphan_adoption_failed',
+          retryable: true,
+          count: 1,
+        },
+      })
+      return
+    }
+
+    const identity = githubPrIdentity(pr.repo, pr.prNumber)
+    if (!identity) return
+    this.#babysitterUnownedEventOccurrences.delete(identity)
+    for (const [path, deadLetter] of this.#babysitterPrSnapshotDeadLetters) {
+      if (githubPrIdentity(deadLetter.repo, deadLetter.prNumber) !== identity) continue
+      this.#babysitterPrSnapshotDeadLetters.delete(path)
+      this.#increment('babysitterPrSnapshotReadDeadLettersRecoveredByReconcile')
+    }
+    this.#increment('babysitterOrphanedPrsAdopted')
+    this.#logger.info?.('[factory] orphaned open Factory PR adopted by babysitter reconcile', {
+      issue: record.issue.key,
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      babysitter: owner.ref.agentName,
+      reason,
+    })
   }
 
   async #completionPrForIssue(issue: LinearIssue): Promise<ResolvedIssuePr | undefined> {
@@ -5312,6 +5476,7 @@ export class FactoryLoop implements Factory {
       updatedAtMs,
       registryPath,
       eventListener: this.#eventListenerStatus(),
+      counters: { ...this.#counters },
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
@@ -9761,9 +9926,38 @@ export class FactoryLoop implements Factory {
       const owner = await this.#babysitterOwnerFor(`${event.owner}/${event.repo}`, target.prNumber)
       if (!owner) {
         this.#increment('babysitterEventsIgnoredUnownedPr')
-        this.#logger.debug?.('[factory] ignored unowned PR event for babysitter routing', { ...event, prNumber: target.prNumber })
+        const identity = githubPrIdentity(`${event.owner}/${event.repo}`, target.prNumber)
+        if (!identity) continue
+        const occurrences = (this.#babysitterUnownedEventOccurrences.get(identity) ?? 0) + 1
+        this.#babysitterUnownedEventOccurrences.delete(identity)
+        this.#babysitterUnownedEventOccurrences.set(identity, occurrences)
+        if (this.#babysitterUnownedEventOccurrences.size > BABYSITTER_UNOWNED_EVENT_OBSERVATION_LIMIT) {
+          const oldest = this.#babysitterUnownedEventOccurrences.keys().next().value
+          if (oldest !== undefined) this.#babysitterUnownedEventOccurrences.delete(oldest)
+        }
+        const details = { ...event, prNumber: target.prNumber, occurrences }
+        if (occurrences === BABYSITTER_UNOWNED_EVENT_ESCALATION_COUNT || occurrences % 10 === 0) {
+          this.#increment('babysitterEventsIgnoredUnownedPrEscalations')
+          this.#logger.error?.('[factory] repeated unowned PR events have no babysitter; reconcile has not adopted the PR', details)
+          void this.#report({
+            type: 'factory.anomaly',
+            level: 'error',
+            attributes: {
+              component: 'babysitter',
+              operation: 'route_pr_event',
+              errorCode: 'unowned_pr',
+              count: occurrences,
+            },
+          })
+        } else if (occurrences === 1) {
+          this.#logger.warn?.('[factory] ignored unowned PR event for babysitter routing; periodic reconcile will attempt adoption', details)
+        } else {
+          this.#logger.debug?.('[factory] ignored repeated unowned PR event while awaiting babysitter reconcile', details)
+        }
         continue
       }
+      const identity = githubPrIdentity(`${event.owner}/${event.repo}`, target.prNumber)
+      if (identity) this.#babysitterUnownedEventOccurrences.delete(identity)
       if (
         this.#mount.resourceSubscriptions &&
         !this.#babysitterResourceSubscriptionUnavailable &&
@@ -10239,13 +10433,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    let snapshot: PullSnapshot | undefined
-    try {
-      snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, parts.number)
-    } catch (error) {
-      this.#logger.debug?.('[factory] babysitter could not read PR snapshot', { path, error: describeError(error).errorMessage })
-      return
-    }
+    const snapshot = await this.#readBabysitterPrSnapshot(path, parts)
     if (!snapshot) {
       return
     }
@@ -10350,6 +10538,105 @@ export class FactoryLoop implements Factory {
     if (alreadyOwned) {
       await this.#routeBabysitterEvent(path, babysitterWakeKindsFromSnapshot(snapshot))
     }
+  }
+
+  async #readBabysitterPrSnapshot(
+    path: string,
+    parts: { owner: string; repo: string; number: number },
+  ): Promise<PullSnapshot | undefined> {
+    const inFlight = this.#babysitterPrSnapshotReads.get(path)
+    if (inFlight) return inFlight
+
+    const read = this.#readBabysitterPrSnapshotWithRetry(path, parts)
+    this.#babysitterPrSnapshotReads.set(path, read)
+    try {
+      return await read
+    } finally {
+      if (this.#babysitterPrSnapshotReads.get(path) === read) {
+        this.#babysitterPrSnapshotReads.delete(path)
+      }
+    }
+  }
+
+  async #readBabysitterPrSnapshotWithRetry(
+    path: string,
+    parts: { owner: string; repo: string; number: number },
+  ): Promise<PullSnapshot | undefined> {
+    let lastError = 'unknown PR snapshot read failure'
+    for (let attempt = 1; attempt <= BABYSITTER_PR_SNAPSHOT_READ_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, parts.number)
+        if (!snapshot) throw new Error('PR snapshot did not match its mount path identity')
+        const deadLetter = this.#babysitterPrSnapshotDeadLetters.get(path)
+        if (deadLetter) {
+          this.#babysitterPrSnapshotDeadLetters.delete(path)
+          this.#increment('babysitterPrSnapshotReadDeadLettersRecovered')
+          this.#logger.info?.('[factory] recovered dead-lettered PR snapshot', {
+            path,
+            repo: deadLetter.repo,
+            prNumber: deadLetter.prNumber,
+            priorExhaustions: deadLetter.exhaustions,
+          })
+        }
+        return snapshot
+      } catch (error) {
+        lastError = describeError(error).errorMessage
+        this.#increment('babysitterPrSnapshotReadFailures')
+        if (this.#stopping) return undefined
+        if (attempt < BABYSITTER_PR_SNAPSHOT_READ_MAX_ATTEMPTS) {
+          const retryDelayMs = BABYSITTER_PR_SNAPSHOT_READ_RETRY_BASE_MS * 2 ** (attempt - 1)
+          this.#increment('babysitterPrSnapshotReadRetries')
+          this.#logger.warn?.('[factory] babysitter could not read PR snapshot; retrying', {
+            path,
+            attempt,
+            maxAttempts: BABYSITTER_PR_SNAPSHOT_READ_MAX_ATTEMPTS,
+            retryDelayMs,
+            error: lastError,
+          })
+          await this.#clock.sleep(retryDelayMs)
+          continue
+        }
+      }
+    }
+
+    const previous = this.#babysitterPrSnapshotDeadLetters.get(path)
+    const deadLetter: BabysitterPrSnapshotDeadLetter = {
+      path,
+      repo: `${parts.owner}/${parts.repo}`,
+      prNumber: parts.number,
+      attempts: BABYSITTER_PR_SNAPSHOT_READ_MAX_ATTEMPTS,
+      exhaustions: (previous?.exhaustions ?? 0) + 1,
+      error: lastError,
+      failedAtMs: this.#clock.now(),
+    }
+    this.#babysitterPrSnapshotDeadLetters.delete(path)
+    this.#babysitterPrSnapshotDeadLetters.set(path, deadLetter)
+    if (this.#babysitterPrSnapshotDeadLetters.size > BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_LIMIT) {
+      const oldest = this.#babysitterPrSnapshotDeadLetters.keys().next().value
+      if (oldest !== undefined) this.#babysitterPrSnapshotDeadLetters.delete(oldest)
+    }
+    this.#increment(previous ? 'babysitterPrSnapshotReadDeadLetterRedrives' : 'babysitterPrSnapshotReadDeadLetters')
+    this.#logger.error?.('[factory] babysitter PR snapshot read retries exhausted; dead-lettered for reconcile', {
+      path,
+      repo: deadLetter.repo,
+      prNumber: deadLetter.prNumber,
+      attempts: deadLetter.attempts,
+      exhaustions: deadLetter.exhaustions,
+      error: deadLetter.error,
+    })
+    void this.#report({
+      type: 'factory.anomaly',
+      level: 'error',
+      attributes: {
+        component: 'babysitter',
+        operation: 'read_pr_snapshot',
+        errorCode: 'snapshot_read_exhausted',
+        retryable: true,
+        attempt: deadLetter.attempts,
+        count: 1,
+      },
+    })
+    return undefined
   }
 
   #inFlightIssueForPrSnapshot(snapshot: PullSnapshot, batch: BatchSnapshot, eventRepo: string): InFlightIssue | undefined {
@@ -14747,6 +15034,7 @@ const resolveIssuePrFromMount = async (
       candidates.push({
         repo,
         prNumber: pr.number,
+        matchScore: score,
         draft: pr.draft,
         headRef: pr.headRef,
         headRepo: pr.headRepo,
@@ -14833,6 +15121,7 @@ const resolveIssuePrFromGh = async (
       candidates.push({
         repo,
         prNumber: pr.number,
+        matchScore: score,
         draft: pr.draft,
         headRef: pr.headRef,
         headRepo: pr.headRepo,

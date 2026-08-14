@@ -18959,6 +18959,196 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('retries a transient PR-open snapshot read and still spawns the babysitter', async () => {
+    const issue = realIssueFile(418, ready, { title: 'Real transient babysitter snapshot' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/418/metadata.json'
+    class FailOncePrSnapshotMount extends FakeMountClient {
+      failed = false
+
+      override async readFile(path: string) {
+        if (path === prPath && !this.failed) {
+          this.failed = true
+          this.reads.push(path)
+          throw new Error('fetch failed')
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new FailOncePrSnapshotMount({ [issuePath(418)]: issue })
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock: { now: Date.now, sleep: async () => undefined },
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: () => undefined,
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(418), issue)))
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await vi.waitFor(() => expect(factory.status().counters.babysitterReconcileRuns).toBeGreaterThan(0))
+      mount.files.set(prPath, {
+        content: {
+          number: 418,
+          state: 'open',
+          head_ref: 'factory/ar-418-transient-read',
+          isDraft: false,
+          url: 'https://github.com/AgentWorkforce/pear/pull/418',
+        },
+      })
+      mount.emit(changeEvent(prPath, 'pr-418-open'))
+
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-418-babysit'))
+      expect(mount.reads.filter((path) => path === prPath)).toHaveLength(2)
+      expect(factory.status().counters.babysitterPrSnapshotReadFailures).toBe(1)
+      expect(factory.status().counters.babysitterPrSnapshotReadRetries).toBe(1)
+      expect(factory.status().counters.babysitterPrSnapshotReadDeadLetters).toBeUndefined()
+      expect(warnings.some((warning) => warning[0] === '[factory] babysitter could not read PR snapshot; retrying')).toBe(true)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('dead-letters exhausted PR snapshot reads at error level for periodic redrive', async () => {
+    const issue = realIssueFile(419, ready, { title: 'Real exhausted babysitter snapshot' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/419/metadata.json'
+    class UnreadablePrSnapshotMount extends FakeMountClient {
+      override async readFile(path: string) {
+        if (path === prPath) {
+          this.reads.push(path)
+          throw new Error('fetch failed')
+        }
+        return super.readFile(path)
+      }
+    }
+    const mount = new UnreadablePrSnapshotMount({ [issuePath(419)]: issue })
+    const fleet = new FakeFleetClient()
+    const warnings: unknown[][] = []
+    const errors: unknown[][] = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock: { now: Date.now, sleep: async () => undefined },
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(419), issue)))
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await vi.waitFor(() => expect(factory.status().counters.babysitterReconcileRuns).toBeGreaterThan(0))
+      mount.files.set(prPath, {
+        content: { number: 419, state: 'open', head_ref: 'factory/ar-419-unreadable', isDraft: false },
+      })
+      mount.emit(changeEvent(prPath, 'pr-419-open'))
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterPrSnapshotReadDeadLetters).toBe(1))
+      expect(mount.reads.filter((path) => path === prPath)).toHaveLength(5)
+      expect(factory.status().counters.babysitterPrSnapshotReadFailures).toBe(5)
+      expect(factory.status().counters.babysitterPrSnapshotReadRetries).toBe(4)
+      expect(warnings.filter((warning) => warning[0] === '[factory] babysitter could not read PR snapshot; retrying')).toHaveLength(4)
+      expect(errors.some((error) => error[0] === '[factory] babysitter PR snapshot read retries exhausted; dead-lettered for reconcile')).toBe(true)
+      expect(fleet.spawns.map((spawn) => spawn.name)).not.toContain('ar-419-babysit')
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('adopts an ownerless open Factory PR during the periodic reconcile sweep', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-babysitter-orphan-reconcile-'))
+    const path = githubIssuePath('AgentWorkforce', 'cloud', 3021)
+    const issue = githubIssueFile(3021, {
+      repo: 'cloud',
+      labels: ['factory'],
+      title: '[factory] Fix failing CI checks on PR #3017',
+    })
+    const prPath = '/github/repos/AgentWorkforce/cloud/pulls/3024/metadata.json'
+    const prUrl = 'https://github.com/AgentWorkforce/cloud/pull/3024'
+    const mount = new FakeMountClient({
+      [path]: issue,
+      [prPath]: {
+        number: 3024,
+        title: '3021: [factory] Fix 2 failing CI checks on PR #3017 (deployment objective metadata)',
+        body: '',
+        state: 'open',
+        head_ref: 'factory/3022-chief-org-live-population',
+        isDraft: false,
+        isCrossRepository: false,
+        url: prUrl,
+      },
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: { cloud: 'AgentWorkforce/cloud' },
+        clonePaths: { 'AgentWorkforce/cloud': '/work/cloud' },
+        default: 'AgentWorkforce/cloud',
+      },
+      safety: { requireLabel: 'factory' },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+
+      await factory.runLoop({
+        maxIterations: 1,
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      })
+
+      const babysitter = fleet.spawns.find((spawn) => spawn.name.includes('3021-babysit'))
+      expect(babysitter?.repo).toBe('AgentWorkforce/cloud')
+      expect(babysitter?.task).toContain(prUrl)
+      expect(factory.status().counters.babysitterOrphanedPrsDetected).toBe(1)
+      expect(factory.status().counters.babysitterOrphanedPrsAdopted).toBe(1)
+      expect(factory.status().counters.babysitterOrphanedPrAdoptionFailures).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('warns for the first unowned PR event and escalates repeated occurrences', async () => {
+    const mount = new FakeMountClient()
+    const warnings: unknown[][] = []
+    const errors: unknown[][] = []
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+        error: (...args: unknown[]) => errors.push(args),
+      },
+    })
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/499/comments/1.json', 'unowned-499-1'))
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/499/comments/2.json', 'unowned-499-2'))
+      mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/499/comments/3.json', 'unowned-499-3'))
+
+      await vi.waitFor(() => expect(factory.status().counters.babysitterEventsIgnoredUnownedPr).toBe(3))
+      expect(warnings.some((warning) => warning[0] === '[factory] ignored unowned PR event for babysitter routing; periodic reconcile will attempt adoption')).toBe(true)
+      expect(errors.some((error) => error[0] === '[factory] repeated unowned PR events have no babysitter; reconcile has not adopted the PR')).toBe(true)
+      expect(factory.status().counters.babysitterEventsIgnoredUnownedPrEscalations).toBe(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('routes and coalesces only the owned PR review/check/comment events with metadata-only fencing', async () => {
     const issue = realIssueFile(420, ready, { title: 'Real babysitter event routing' })
     const mount = new FakeMountClient({ [issuePath(420)]: issue })
@@ -20493,7 +20683,15 @@ describe('FactoryLoop PR babysitter', () => {
       mount,
       fleet,
       triage: new StaticTriage(),
-      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 408 }),
+      probePrResolver: async () => ({
+        repo: 'AgentWorkforce/pear',
+        prNumber: 408,
+        matchScore: 10,
+        draft: false,
+        state: 'OPEN',
+        headRef: 'factory/unrelated-work',
+        crossRepository: false,
+      }),
     })
 
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })

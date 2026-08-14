@@ -1064,8 +1064,16 @@ async function factoryStatusWithMountHealth(
     root?: string
   }
 }> {
-  const status = factory.status()
+  const processStatus = factory.status()
   const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+  // `factory status` runs in a fresh CLI process, so its in-memory Factory has
+  // no knowledge of counters accumulated by the live daemon. The heartbeat is
+  // the daemon-owned status handoff; local counters win only when this helper
+  // is used in the same process as active work.
+  const status = {
+    ...processStatus,
+    counters: { ...(heartbeat?.counters ?? {}), ...processStatus.counters },
+  }
   const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
