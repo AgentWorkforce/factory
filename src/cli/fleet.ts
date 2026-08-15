@@ -1633,14 +1633,18 @@ const hasExplicitFixtureFiles = (loaded: LoadedConfig | undefined): loaded is Lo
   loaded?.fixtureFiles !== undefined
 
 /** Hermetic fixture runs have no server event feed, so expose the in-memory
- * tree digest as their change watermark. This keeps built-CLI verification
- * faithful to the production event watermark while still invalidating if a
- * fixture changes between calls. */
+ * tree shape as their change watermark. The discovery tree cache only
+ * remembers which paths exist under a prefix, not their content, so the
+ * watermark must track path membership only. Hashing full file entries
+ * (as an earlier version of this did) also hashes each file's `revision`,
+ * which FakeMountClient.writeFile bumps on every write — so any factory
+ * writeback mid-sweep (a draft, a confirmed write) would change the digest
+ * with no fixture change-event to explain the gap, and the checkpoint
+ * would never persist across a sweep that actually dispatched anything. */
 class FixtureMountClient extends FakeMountClient {
   override async getEventHighWatermark(): Promise<string> {
-    const snapshot = [...this.files.entries()]
-      .sort(([left], [right]) => left.localeCompare(right))
-    return `fixture:${createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')}`
+    const paths = [...this.files.keys()].sort()
+    return `fixture:${createHash('sha256').update(JSON.stringify(paths)).digest('hex')}`
   }
 }
 

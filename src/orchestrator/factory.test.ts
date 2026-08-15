@@ -3083,10 +3083,10 @@ describe('FactoryLoop', () => {
     // re-list of the repository root — the prefix count must stay flat.
     expect(mount.listTreePrefixes).toHaveLength(2)
 
-    // Reading the now-deleted path is what actually masks an unevicted cache
-    // entry on a single sweep (a failed read just drops it from `pulled`),
-    // so assert on the read itself rather than only on `pulled`.
-    expect(mount.reads).toContain(secondPath)
+    // A read of the deleted path on this sweep alone wouldn't prove eviction
+    // (a failed read just drops the path from `pulled` regardless of whether
+    // the cache still holds it), so reset here and prove it on the next
+    // sweep's reads instead, where staleness would otherwise persist forever.
     mount.reads.length = 0
 
     // With no further events, the watermark is unchanged and the third sweep

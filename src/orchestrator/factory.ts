@@ -2116,6 +2116,12 @@ export class FactoryLoop implements Factory {
       this.#discoverySession = undefined
       this.#discoverySweepEpoch = undefined
       this.#discoveryOverloadError = undefined
+      // This sweep is over either way (committed, deferred, or lease lost) —
+      // a stale `true` here would otherwise make every #listRelayfileTree
+      // call outside a fresh claim (Slack lookups, PR confirmation, the
+      // merge-advance scan) throw "lease was lost" until the next sweep
+      // happens to run and reset it at the top of this method.
+      this.#discoverySweepLeaseLost = false
       if (!leaseReleased) {
         await this.#state.releaseDiscoverySweep(
           this.#workspaceId,
@@ -7194,7 +7200,8 @@ export class FactoryLoop implements Factory {
       let paths: string[]
       try {
         paths = await this.#listRelayfileTree(root, 'exact-head PR confirmation')
-      } catch {
+      } catch (error) {
+        if (relayfileOverload(error)) throw error
         continue
       }
       for (const path of paths) {
@@ -7464,7 +7471,8 @@ export class FactoryLoop implements Factory {
       const paths = (await Promise.all(roots.map(async (root) => {
         try {
           return await this.#listRelayfileTree(root, 'published PR confirmation')
-        } catch {
+        } catch (error) {
+          if (relayfileOverload(error)) throw error
           return []
         }
       }))).flat()
@@ -9223,6 +9231,7 @@ export class FactoryLoop implements Factory {
           }
         }
       } catch (error) {
+        if (relayfileOverload(error)) throw error
         this.#logger.warn?.('[factory] unable to list GitHub issue comments for replay', { prefix, error })
       }
     }
@@ -11726,7 +11735,8 @@ export class FactoryLoop implements Factory {
       try {
         const tree = await this.#listRelayfileTree(root, 'PR meta path discovery')
         found.push(...tree.filter((path) => path.endsWith('.json') && numberSegment.test(path)))
-      } catch {
+      } catch (error) {
+        if (relayfileOverload(error)) throw error
         // try the next root
       }
     }
@@ -12946,7 +12956,8 @@ export class FactoryLoop implements Factory {
     const list = async (prefix: string): Promise<string[]> => {
       try {
         return await this.#listRelayfileTree(prefix, 'Slack identity lookup')
-      } catch {
+      } catch (error) {
+        if (relayfileOverload(error)) throw error
         return []
       }
     }
@@ -15513,6 +15524,7 @@ const resolveIssuePrFromMount = async (
       try {
         for (const path of await listTree(root)) paths.add(path)
       } catch (error) {
+        if (relayfileOverload(error)) throw error
         listErrors.push(error)
       }
     }
