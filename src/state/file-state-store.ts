@@ -125,7 +125,11 @@ export class FileStateStore extends InMemoryStateStore {
       const document = await this.#loadFromDisk()
       const state = document.workspaces[workspaceId]?.discoverySweep
       if (!state || !discoveryLeaseMatches(state, owner, epoch)) return false
-      state.checkpoint = checkpoint ? cloneDiscoveryCheckpoint(checkpoint) : undefined
+      // A missing checkpoint means finalization couldn't get a watermark or
+      // change window this cycle (a transient feed hiccup, not "the tree is
+      // now empty") — keep the last good checkpoint so the next sweep can
+      // still diff from it instead of falling back to a full walk.
+      if (checkpoint) state.checkpoint = cloneDiscoveryCheckpoint(checkpoint)
       state.consecutiveOverloads = 0
       state.backoffUntilMs = 0
       delete state.lease
