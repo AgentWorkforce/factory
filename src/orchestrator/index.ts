@@ -20,6 +20,7 @@ export {
 export {
   FactoryEnvironmentReaper,
   FactoryReaper,
+  heldAgentsFromRegistry,
   readFactoryInFlightRegistry,
   reapFactoryEnvironmentsOnce,
   reapFactoryOrphansOnce,

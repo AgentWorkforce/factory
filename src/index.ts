@@ -6,7 +6,7 @@ export * from './cost/index.js'
 export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
 export type { FileStateStoreOptions } from './state/file-state-store.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
-export { FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
+export { DEFAULT_AGENT_HOLD_TIMEOUT_MS, FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export * from './environments/index.js'
 export {
   resolveFactoryStates,
@@ -140,6 +140,7 @@ export {
   isDispatchableIssue,
   isRealLinearIssue,
   githubIssuePathParts,
+  heldAgentsFromRegistry,
   parseGithubFactoryIssue,
   parseBlockedBy,
   parseLinearIssue,
@@ -432,6 +433,7 @@ export type {
   FactoryEventPayload,
   FactoryDispatchClaimStatus,
   FactoryInFlightDispatchStatus,
+  FactoryHeldAgent,
   FactoryInFlightRegistry,
   FactoryInFlightRegistryAgent,
   FactoryInFlightRegistryProcess,

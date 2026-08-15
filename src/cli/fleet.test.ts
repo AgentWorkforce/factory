@@ -427,6 +427,12 @@ describe('fleet CLI parsing', () => {
       kind: 'factory',
       action: 'reap-orphans',
     })
+    expect(parseFleetCommand(['reap-orphans', '--include-held'])).toEqual({
+      kind: 'factory',
+      action: 'reap-orphans',
+      includeHeld: true,
+    })
+    expect(() => parseFleetCommand(['reap-orphans', '--unknown'])).toThrow(/Unknown factory reap-orphans option/u)
   })
 
   it('parses the factory live start command', () => {
@@ -1202,6 +1208,8 @@ describe('fleet CLI runtime', () => {
       const output = buffer()
 
       const code = await runFleetCli([
+        '--backend',
+        'relay',
         'run-once',
         '--dry-run',
         '--config',
@@ -1604,9 +1612,10 @@ describe('fleet CLI runtime', () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-maintenance-clone-'))
     try {
       const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
       const configPath = await writeConfig(root, {
         repos: { org: 'AgentWorkforce', names: ['pear'] },
-        loop: { heartbeatPath, heartbeatStaleMs: 10_000 },
+        loop: { heartbeatPath, registryPath, heartbeatStaleMs: 10_000 },
       })
       const git = vi.fn(async () => {
         throw new Error('status must not inspect local git state')
@@ -1634,6 +1643,7 @@ describe('fleet CLI runtime', () => {
       expect(JSON.parse(output.text())).toEqual({
         ...factoryStatus,
         ...currentVersionInfo,
+        heldAgents: [],
         eventListener: {
           state: 'not-listening',
           reason: 'heartbeat missing',
@@ -2583,7 +2593,24 @@ describe('fleet CLI runtime', () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-status-'))
     try {
       const heartbeatPath = join(root, 'heartbeat.json')
-      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const registryPath = join(root, 'registry.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, registryPath, heartbeatStaleMs: 10_000 } })
+      const heldSinceAtMs = Date.now() - 5_000
+      await writeFile(registryPath, JSON.stringify({
+        pid: 4242,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: [{
+          name: 'ar-252-impl-factory',
+          role: 'implementer',
+          issue: { key: '252', uuid: 'uuid-252', path: '/linear/issues/252.json' },
+          pids: [],
+          heldSinceAtMs,
+          holdDeadlineAtMs: heldSinceAtMs + 60_000,
+          waitingForTerminalState: 'human-review',
+          lifecyclePhase: 'running',
+        }],
+      }))
       const output = buffer()
       const factoryStatus = { inFlight: [], queued: [], counters: { pulled: 0 } }
       const factory = {
@@ -2612,9 +2639,16 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).toEqual({
+      expect(JSON.parse(output.text())).toMatchObject({
         ...factoryStatus,
         ...staleVersionInfo,
+        heldAgents: [{
+          name: 'ar-252-impl-factory',
+          issue: { key: '252' },
+          lifecyclePhase: 'running',
+          waitingForTerminalState: 'human-review',
+          pastDeadline: false,
+        }],
         eventListener: {
           state: 'not-listening',
           reason: 'heartbeat missing',
@@ -4014,8 +4048,24 @@ describe('fleet CLI runtime', () => {
         updatedAtMs: Date.now(),
         registryPath,
       }))
-      await writeFile(registryPath, JSON.stringify({ pid: 4242, updatedAt: new Date().toISOString(), updatedAtMs: Date.now(), agents: [] }))
+      const heldSinceAtMs = Date.now() - 30_000
+      await writeFile(registryPath, JSON.stringify({
+        pid: 4242,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: [{
+          name: 'ar-252-impl-factory',
+          role: 'implementer',
+          issue: { key: '252', uuid: 'uuid-252', path: '/linear/issues/252.json' },
+          pids: [],
+          heldSinceAtMs,
+          holdDeadlineAtMs: heldSinceAtMs + 10_000,
+          waitingForTerminalState: 'human-review',
+          lifecyclePhase: 'running',
+        }],
+      }))
       const output = buffer()
+      const reapEnvironments = vi.fn(async () => ({ reaped: [], retained: [] }))
 
       const code = await runFleetCli([
         'reap-orphans',
@@ -4027,7 +4077,7 @@ describe('fleet CLI runtime', () => {
           return fleet
         },
         cloudMountFromConfig,
-        reapEnvironments: async () => ({ reaped: [], retained: [] }),
+        reapEnvironments,
         stdout: output,
         stderr: buffer(),
       })
@@ -4036,7 +4086,24 @@ describe('fleet CLI runtime', () => {
       expect(createFleetCalls).toHaveLength(1)
       expect(cloudMountFromConfig).not.toHaveBeenCalled()
       expect(dispose).toHaveBeenCalledTimes(1)
-      expect(JSON.parse(output.text())).toMatchObject({ stale: false, reaped: [], skipped: [] })
+      expect(JSON.parse(output.text())).toMatchObject({
+        stale: false,
+        reaped: [],
+        skipped: [],
+        heldAgents: [{
+          name: 'ar-252-impl-factory',
+          issue: { key: '252' },
+          pastDeadline: true,
+          waitingForTerminalState: 'human-review',
+        }],
+        environments: {
+          applicable: false,
+          reason: 'kubernetes environment provider is not configured',
+          reaped: [],
+          retained: [],
+        },
+      })
+      expect(reapEnvironments).not.toHaveBeenCalled()
     } finally {
       await rm(root, { recursive: true, force: true })
     }

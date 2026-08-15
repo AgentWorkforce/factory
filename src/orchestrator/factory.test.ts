@@ -53,7 +53,8 @@ const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 const planning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
 
-type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'loop' | 'safety'> & {
+type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'dispatch' | 'loop' | 'safety'> & {
+  dispatch?: Partial<FactoryConfig['dispatch']>
   loop?: Partial<FactoryConfig['loop']>
   safety?: Partial<FactoryConfig['safety']>
 }
@@ -8144,7 +8145,18 @@ describe('FactoryLoop', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(363), issueFile(363))))
       await factory.stop()
 
-      expect(reaperReports).toEqual([{ stale: false, reason: 'loop stopping', reaped: [], skipped: [] }])
+      expect(reaperReports).toEqual([{
+        stale: false,
+        reason: 'loop stopping',
+        reaped: [],
+        skipped: [],
+        heldAgents: [
+          expect.objectContaining({ name: 'ar-363-impl-pear', issue: expect.objectContaining({ key: 'AR-363' }) }),
+          expect.objectContaining({ name: 'ar-363-review', issue: expect.objectContaining({ key: 'AR-363' }) }),
+        ],
+        releasedHeldAgents: [],
+        heldAgentReleaseFailures: [],
+      }])
       expect(fleet.releases.map((release) => release.name)).toEqual(['ar-363-impl-pear', 'ar-363-review'])
       expect((await readFactoryLoopHeartbeat(heartbeatPath))?.updatedAtMs).toBe(clock.now())
       expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([])
@@ -9059,6 +9071,69 @@ describe('FactoryLoop', () => {
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-11'])
     expect(factory.status().queued).toEqual([])
     await factory.stop()
+  })
+
+  it('releases a durable team after the wall-clock hold deadline when no terminal event arrives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-held-deadline-'))
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const mount = new FakeMountClient({ [issuePath(252)]: issueFile(252) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      dispatch: { agentHoldTimeoutMs: 100 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(252), issueFile(252)))
+      await factory.dispatch(decision)
+
+      expect(factory.status().heldAgents).toEqual([
+        expect.objectContaining({
+          name: 'ar-252-impl-pear',
+          issue: expect.objectContaining({ key: 'AR-252' }),
+          lifecyclePhase: 'running',
+          waitingForTerminalState: 'human-review',
+          pastDeadline: false,
+        }),
+        expect.objectContaining({
+          name: 'ar-252-review',
+          issue: expect.objectContaining({ key: 'AR-252' }),
+          lifecyclePhase: 'running',
+          waitingForTerminalState: 'human-review',
+          pastDeadline: false,
+        }),
+      ])
+
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: 'ar-252-impl-pear', reason: 'held-past-deadline' },
+        { name: 'ar-252-review', reason: 'held-past-deadline' },
+      ]), { timeout: 2_000 })
+      await vi.waitFor(async () => expect(
+        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+      ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 2_000 })
+      expect(factory.status().heldAgents).toEqual([])
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] released agents held past deadline',
+        expect.objectContaining({
+          issue: 'AR-252',
+          heldForMs: expect.any(Number),
+          reason: 'held-past-deadline',
+          waitingForTerminalState: 'human-review',
+        }),
+      ), { timeout: 2_000 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('stop releases each in-flight factory-dispatched agent', async () => {

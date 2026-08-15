@@ -247,6 +247,8 @@ export type DispatchLifecycle = {
     claimedAtMs: number
   }
   lease?: DispatchLifecycleLease
+  /** First successful agent placement for this active team generation. */
+  heldSinceAtMs?: number
   updatedAtMs: number
 }
 

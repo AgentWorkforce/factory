@@ -2,10 +2,10 @@ version: '1.1'
 updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 317
+  feature_count: 318
   tier_counts:
     1: 48
-    2: 126
+    2: 127
     3: 11
     4: 52
     5: 65
@@ -129,7 +129,7 @@ categories:
         name: Factory Status
         cli: factory status
         api: Factory.status()
-        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, and running version identity as JSON
+        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, running version identity, and held agents (age, deadline, terminal state awaited) as JSON
         location: src/cli/fleet.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
@@ -158,9 +158,9 @@ categories:
 
       - id: cli-reap-orphans
         name: Reap Orphaned Factory Agents
-        cli: factory reap-orphans
+        cli: factory reap-orphans [--include-held]
         api: reapFactoryOrphansOnce()
-        description: Reconcile stale heartbeat and registry state and terminate factory-owned orphan processes
+        description: Reconcile stale heartbeat and registry state, terminate factory-owned orphan processes, and list held-but-idle agents past their release deadline (opt in to release them with --include-held); reports Kubernetes environment cleanup as not applicable when no cluster provider is configured
         location: src/cli/fleet.ts, src/orchestrator/reaper.ts
         verify_tier: 4
 
@@ -598,6 +598,13 @@ categories:
         name: Dispatch Attempt Limit
         api: dispatch.maxAttempts
         description: Mark repeatedly failing dispatches terminal after the configured bounded retry count
+        location: src/orchestrator/factory.ts, src/config/schema.ts
+        verify_tier: 2
+
+      - id: dispatch-agent-hold-backstop
+        name: Agent Hold Wall-Clock Backstop
+        api: dispatch.agentHoldTimeoutMs
+        description: Release an agent team with reason held-past-deadline, logging the issue and hold duration, when its issue has not reached the configured terminal state within the configured wall-clock window since first successful agent placement
         location: src/orchestrator/factory.ts, src/config/schema.ts
         verify_tier: 2
 

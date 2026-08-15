@@ -27,14 +27,15 @@ import {
   parseGithubFactoryIssue,
   parseLinearIssue,
   publishFactoryMountHealth,
+  heldAgentsFromRegistry,
   parseOwnedBrokerAgentExitTimeoutMs,
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
   readLinearIssueWithCanonicalFallback,
   reapFactoryOrphansOnce,
   reapFactoryEnvironmentsOnce,
-  readFactoryLoopHeartbeat,
   readFactoryInFlightRegistry,
+  readFactoryLoopHeartbeat,
   resolveFactoryStates,
   stateResolutionFromIds,
   standaloneBabysitterAgentName,
@@ -156,7 +157,7 @@ type ParsedCommand =
   | { kind: 'spawn'; input: { capability: Capability; name?: string; node?: 'self' | string; task?: string; workflow?: string; model?: string; sessionRef?: string; cwd?: string } }
   | { kind: 'roster' }
   | { kind: 'release'; name: string; reason?: string }
-  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans' }
+  | { kind: 'factory'; action: 'run-once' | 'loop' | 'status' | 'loop-status' | 'kill-loop' | 'reap-orphans'; includeHeld?: boolean }
   | { kind: 'factory'; action: 'start'; mode?: 'live' }
   | { kind: 'factory-canary'; issue: string }
   | { kind: 'factory-triage'; issue: string }
@@ -356,8 +357,16 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
             registryPath: loaded.config.loop.registryPath,
             staleMs: loaded.config.loop.heartbeatStaleMs,
             fleet,
+            includeHeld: command.includeHeld,
+            logger: streamLogger(err),
           })
-          writeJson(out, { ...processes, environments: await safeEnvironmentReap(deps.reapEnvironments) })
+          writeJson(out, {
+            ...processes,
+            environments: await safeEnvironmentReap(
+              Boolean(loaded.config.environments.kubernetes),
+              deps.reapEnvironments,
+            ),
+          })
           return 0
         }
         // Derive the workspace from the cloud session when it isn't pinned in
@@ -1118,9 +1127,12 @@ async function factoryStatusWithMountHealth(
     readFactoryLoopHeartbeat(heartbeatPath),
     readFactoryInFlightRegistry(registryPath),
   ])
-  const registryDispatches = registry?.heartbeatPath && registry.heartbeatPath !== heartbeatPath
-    ? []
-    : inFlightDispatchesFromRegistry(registry)
+  // A registry stamped for a different heartbeat file belongs to another
+  // daemon instance; neither its dispatch nor held-agent view applies here.
+  const registryMatchesHeartbeat = !registry?.heartbeatPath || registry.heartbeatPath === heartbeatPath
+  const registryDispatches = registryMatchesHeartbeat ? inFlightDispatchesFromRegistry(registry) : []
+  const registryHeldAgents = registryMatchesHeartbeat ? heldAgentsFromRegistry(registry) : []
+  const heldAgents = registryHeldAgents.length > 0 ? registryHeldAgents : (status.heldAgents ?? [])
   const observableStatus = registryDispatches.length > 0
     ? { ...status, inFlightDispatches: registryDispatches }
     : status
@@ -1135,10 +1147,11 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...observableStatus, ...versionInfo, eventListener }
+  if (!health) return { ...observableStatus, ...versionInfo, heldAgents, eventListener }
   return {
     ...observableStatus,
     ...versionInfo,
+    heldAgents,
     eventListener,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
@@ -1301,7 +1314,17 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
   if (action === 'start') {
     return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
   }
-  if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop' || action === 'reap-orphans') {
+  if (action === 'reap-orphans') {
+    const values = [issueOrPr, ...flags].filter((value): value is string => Boolean(value))
+    const unexpected = values.find((value) => value !== '--include-held')
+    if (unexpected) throw new Error(`Unknown factory reap-orphans option: ${unexpected}`)
+    return {
+      kind: 'factory',
+      action,
+      ...(values.includes('--include-held') ? { includeHeld: true } : {}),
+    }
+  }
+  if (action === 'run-once' || action === 'loop' || action === 'status' || action === 'loop-status' || action === 'kill-loop') {
     return { kind: 'factory', action }
   }
   if (action === 'canary') {
@@ -1483,7 +1506,10 @@ async function buildFleet(
   deps: FleetCliDeps,
 ): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
-  if (globals.backend === 'internal' && hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
+  // fixtureFiles are an explicit hermetic harness opt-in. Keep both backend
+  // command paths off real fleet infrastructure so the durable relay CLI path
+  // can be exercised end-to-end with deterministic fixtures too.
+  if (hasExplicitFixtureFiles(loaded)) return new FakeFleetClient()
 
   const cwd = process.cwd()
   const env = deps.env ?? process.env
@@ -2256,18 +2282,34 @@ function writeJson(out: Pick<NodeJS.WriteStream, 'write'>, value: unknown): void
 }
 
 async function safeEnvironmentReap(
+  configured: boolean,
   reap: typeof reapFactoryEnvironmentsOnce = reapFactoryEnvironmentsOnce,
-): Promise<Awaited<ReturnType<typeof reapFactoryEnvironmentsOnce>> | {
+): Promise<({ applicable: true } & Awaited<ReturnType<typeof reapFactoryEnvironmentsOnce>>) | {
+  applicable: false
+  reason: string
+  reaped: never[]
+  retained: never[]
+} | {
+  applicable: true
   reaped: never[]
   retained: never[]
   error: string
 }> {
+  if (!configured) {
+    return {
+      applicable: false,
+      reason: 'kubernetes environment provider is not configured',
+      reaped: [],
+      retained: [],
+    }
+  }
   try {
-    return await reap()
+    return { applicable: true, ...await reap() }
   } catch (error) {
     // Process cleanup remains useful on hosts without kubectl or an active
     // cluster. Surface the skipped backstop without failing the whole command.
     return {
+      applicable: true,
       reaped: [],
       retained: [],
       error: error instanceof Error ? error.message : String(error),
@@ -2381,7 +2423,8 @@ Commands:
   loop                  Run the bounded loop configured in factory.config.json
   loop-status           Print heartbeat/liveness status for the loop
   kill-loop             Send SIGTERM to the heartbeat pid
-  reap-orphans          Reap stale factory-owned agents
+  reap-orphans [--include-held]
+                        Report stale processes and held agents; opt in to release held agents past deadline
   canary <KEY|path>     Check that a known issue is dispatch-ready
   triage <KEY|path>     Triage one issue and print the decision
   dispatch <KEY|path>   Triage and dispatch one issue
