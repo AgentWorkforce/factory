@@ -3155,6 +3155,65 @@ describe('FactoryLoop', () => {
     expect(mount.listTreePrefixes).toHaveLength(2)
   })
 
+  it('coalesces same-mode runOnce() callers who both waited out a mismatched-dryRun sweep', async () => {
+    class BlockingDiscoveryMount extends CountingListTreeMount {
+      readonly started: Promise<void>
+      #resolveStarted: () => void = () => undefined
+      #release: () => void = () => undefined
+      #blocked = false
+
+      constructor(files: Record<string, unknown>) {
+        super(files)
+        this.started = new Promise((resolve) => { this.#resolveStarted = resolve })
+      }
+
+      release(): void {
+        this.#release()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        if (!this.#blocked) {
+          this.#blocked = true
+          this.#resolveStarted()
+          await new Promise<void>((resolve) => { this.#release = resolve })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    const path = githubIssueCompactPath('AgentWorkforce', 'pear', 63)
+    const mount = new BlockingDiscoveryMount({
+      [path]: githubIssueFile(63, { labels: ['reference-only'] }),
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore: new InMemoryStateStore({ batchSize: 2 }),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const liveSweep = factory.runOnce({ dryRun: false })
+    await mount.started
+
+    // Neither dry-run caller can coalesce onto the live sweep (mismatched
+    // dryRun), so both wait for it to settle before deciding what to do next.
+    const dryRunA = factory.runOnce({ dryRun: true })
+    const dryRunB = factory.runOnce({ dryRun: true })
+
+    mount.release()
+    const [liveReport, reportA, reportB] = await Promise.all([liveSweep, dryRunA, dryRunB])
+
+    expect(liveReport.dryRun).toBe(false)
+    expect(reportA.dryRun).toBe(true)
+    // Without re-checking for a newly-started matching sweep after the wait,
+    // both dry-run callers would each start their own #runOnceWithDiscoveryFence
+    // once the live sweep settled — one would win the durable lease and
+    // return a real report, the other would lose it and get back an empty
+    // `discoveryDeferred: 'sweep-in-flight'` stub instead of the same result.
+    expect(reportB).toBe(reportA)
+  })
+
   it('honours Relayfile retryAfterSeconds and stops the sweep after a 429', async () => {
     class OverloadedDiscoveryMount extends CountingListTreeMount {
       overloadsRemaining = 1
