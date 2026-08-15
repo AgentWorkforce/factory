@@ -680,10 +680,17 @@ describe('factory-feature-guardian runtime paths', () => {
 
   it('accepts every repository-relative location in the production manifest', async () => {
     const production = exactStateContext(JSON.stringify(progressState(1)), productionManifest);
+    // Derived from the manifest's own declared total rather than restated here.
+    // This asserts the loader parses every feature the catalog claims — the point
+    // of the test — and stops adding a feature from breaking an unrelated file.
+    const declaredFeatureCount = Number(
+      productionManifest.match(/^ {2}feature_count: (\d+)$/mu)?.[1]
+    );
 
     const catalog = await loadFactoryGuardianCatalog(production.ctx);
 
-    expect(catalog.features).toHaveLength(316);
+    expect(declaredFeatureCount).toBeGreaterThan(0);
+    expect(catalog.features).toHaveLength(declaredFeatureCount);
     expect(catalog.features.flatMap((feature) => feature.locations)).toEqual(
       expect.arrayContaining(['src/environments/', 'src/triage/', 'src/fleet/', 'src/writeback/'])
     );

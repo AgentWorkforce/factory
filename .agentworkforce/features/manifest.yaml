@@ -2,10 +2,10 @@ version: '1.1'
 updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 316
+  feature_count: 317
   tier_counts:
     1: 48
-    2: 125
+    2: 126
     3: 11
     4: 52
     5: 65
@@ -79,6 +79,13 @@ categories:
         location: src/cli/fleet.ts, package.json
         verify_tier: 1
 
+      - id: cli-version-drift
+        name: Version Drift Detection
+        api: readFactoryVersionInfo()
+        description: Log the running version at daemon startup and warn when the artifact is meaningfully behind the published latest, degrading to local metadata when the registry is unreachable
+        location: src/version-info.ts, src/cli/fleet.ts
+        verify_tier: 2
+
       - id: cli-featuremap-check
         name: Repository Feature-Map Check
         cli: factory featuremap check [--manifest <path>] [--base <ref>]
@@ -122,7 +129,7 @@ categories:
         name: Factory Status
         cli: factory status
         api: Factory.status()
-        description: Print in-flight issues, queued issues, counters, and Slack degradation state as JSON
+        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, and running version identity as JSON
         location: src/cli/fleet.ts, src/orchestrator/factory.ts
         verify_tier: 2
 

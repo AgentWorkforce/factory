@@ -77,6 +77,12 @@ import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import {
+  isMeaningfullyBehind,
+  readFactoryVersionInfo,
+  type FactoryVersionInfo,
+  type FactoryVersionInfoOptions,
+} from '../version-info'
+import {
   GhCliIssuePublisher,
   RelayChannelNotionClaimStore,
   RelayChannelNotionContractPublisher,
@@ -127,6 +133,10 @@ interface FleetCliDeps {
   notionClaims?: NotionIntakeClaimStore
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
   reapEnvironments?: typeof reapFactoryEnvironmentsOnce
+  /** Hermetic package/registry metadata for CLI tests and alternate runtimes. */
+  versionInfo?: (options?: FactoryVersionInfoOptions) => Promise<FactoryVersionInfo>
+  /** Override the six-hour daemon drift check cadence in tests. */
+  versionCheckIntervalMs?: number
 }
 
 interface GlobalOptions {
@@ -650,6 +660,18 @@ async function runFactoryCommand(
     if (command.action === 'start') {
       const waiter = createStopSignalWaiter()
       let stoppedBySignal = false
+      const logger = streamLogger(mountStderr)
+      const installedVersion = await safeFactoryVersionInfo(deps.versionInfo, false)
+      logger.info?.('[factory] daemon starting', installedVersion)
+      // The registry lookup is deliberately detached from the startup path.
+      // stop() only joins the bounded in-flight lookup during shutdown.
+      const versionMonitor = deps.versionInfo || !hasInjectedFactoryRuntime(deps)
+        ? startFactoryVersionMonitor({
+            versionInfo: deps.versionInfo,
+            intervalMs: deps.versionCheckIntervalMs,
+            logger,
+          })
+        : { stop: async () => {} }
       const flushAndResolve = async (code: number): Promise<void> => {
         try {
           await (deps.flushDaemonOutput ?? flushProcessOutput)()
@@ -718,6 +740,7 @@ async function runFactoryCommand(
         const code = await (deps.waitForStopSignal?.() ?? waiter.promise)
         return typeof code === 'number' ? code : 0
       } finally {
+        await versionMonitor.stop()
         removeSignalHandlers()
         if (!stoppedBySignal) {
           await factory.stop()
@@ -736,12 +759,17 @@ async function runFactoryCommand(
       return 0
     }
     if (command.action === 'status') {
+      const versionInfo = await safeFactoryVersionInfo(
+        deps.versionInfo,
+        Boolean(deps.versionInfo) || !hasInjectedFactoryRuntime(deps),
+      )
       writeJson(out, await factoryStatusWithMountHealth(
         factory,
         mount,
         config.loop.heartbeatPath,
         config.loop.registryPath,
         config.loop.heartbeatStaleMs,
+        versionInfo,
       ))
       return 0
     }
@@ -1068,7 +1096,12 @@ async function factoryStatusWithMountHealth(
   heartbeatPath: string,
   registryPath: string,
   heartbeatStaleMs: number,
+  versionInfo?: FactoryVersionInfo,
 ): Promise<ReturnType<Factory['status']> & {
+  version?: string
+  installedAt?: string
+  latestVersion?: string
+  versionsBehind?: number
   localMountDegraded?: boolean
   localMountDegradedReason?: string
   localMountRoot?: string
@@ -1102,9 +1135,10 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...observableStatus, eventListener }
+  if (!health) return { ...observableStatus, ...versionInfo, eventListener }
   return {
     ...observableStatus,
+    ...versionInfo,
     eventListener,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
@@ -1159,6 +1193,56 @@ function inFlightDispatchesFromRegistry(
       agents: entry.agents.sort((left, right) => left.name.localeCompare(right.name)),
     }))
     .sort((left, right) => left.issue.key.localeCompare(right.issue.key))
+}
+
+const DEFAULT_VERSION_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000
+
+async function safeFactoryVersionInfo(
+  provider: FleetCliDeps['versionInfo'],
+  includeRegistry: boolean,
+): Promise<FactoryVersionInfo> {
+  try {
+    return await (provider ?? readFactoryVersionInfo)({ includeRegistry })
+  } catch {
+    return { version: 'unknown' }
+  }
+}
+
+export async function reportFactoryVersionDrift(
+  provider: FleetCliDeps['versionInfo'],
+  logger: Logger,
+): Promise<void> {
+  const info = await safeFactoryVersionInfo(provider, true)
+  if (!isMeaningfullyBehind(info) || !info.latestVersion) return
+  logger.warn?.(
+    `[factory] version drift detected: running ${info.version}; published latest ${info.latestVersion}`,
+    {
+      ...(info.versionsBehind !== undefined ? { versionsBehind: info.versionsBehind } : {}),
+      ...(info.installedAt ? { installedAt: info.installedAt } : {}),
+    },
+  )
+}
+
+function startFactoryVersionMonitor(input: {
+  versionInfo: FleetCliDeps['versionInfo']
+  intervalMs?: number
+  logger: Logger
+}): { stop: () => Promise<void> } {
+  let pending: Promise<void> | undefined
+  const check = (): void => {
+    if (pending) return
+    pending = reportFactoryVersionDrift(input.versionInfo, input.logger)
+      .finally(() => { pending = undefined })
+  }
+  check()
+  const interval = setInterval(check, input.intervalMs ?? DEFAULT_VERSION_CHECK_INTERVAL_MS)
+  interval.unref?.()
+  return {
+    stop: async () => {
+      clearInterval(interval)
+      await pending
+    },
+  }
 }
 
 function writeMountRefreshSummary(
