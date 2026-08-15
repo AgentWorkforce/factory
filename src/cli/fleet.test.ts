@@ -21,7 +21,7 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
-import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -43,6 +43,20 @@ const config = {
     default: 'AgentWorkforce/pear',
   },
   stateIds: TEST_STATE_IDS,
+}
+
+const currentVersionInfo = {
+  version: '0.1.58',
+  installedAt: '2026-08-14T12:00:00.000Z',
+  latestVersion: '0.1.58',
+  versionsBehind: 0,
+}
+
+const staleVersionInfo = {
+  version: '0.1.20',
+  installedAt: '2026-07-17T12:00:00.000Z',
+  latestVersion: '0.1.58',
+  versionsBehind: 38,
 }
 
 const fakeHarnessClient = (): HarnessDriverClientLike => ({
@@ -185,6 +199,23 @@ describe('fleet CLI logging', () => {
     expect(output).toContain('also kept')
     expect(output).toContain('"42n"')
     expect(output).toContain(' tail')
+  })
+
+  it.each([
+    { name: 'warns for a meaningfully stale artifact', info: staleVersionInfo, warns: true },
+    { name: 'stays quiet for the current artifact', info: currentVersionInfo, warns: false },
+  ])('$name', async ({ info, warns }) => {
+    const logger = { warn: vi.fn() }
+
+    await reportFactoryVersionDrift(async () => info, logger)
+
+    expect(logger.warn).toHaveBeenCalledTimes(warns ? 1 : 0)
+    if (warns) {
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] version drift detected: running 0.1.20; published latest 0.1.58',
+        { versionsBehind: 38, installedAt: staleVersionInfo.installedAt },
+      )
+    }
   })
 })
 
@@ -1593,6 +1624,7 @@ describe('fleet CLI runtime', () => {
         fleet: new FakeFleetClient(),
         mount: mountWithIntegrationConnections({}, integrations),
         createFactory: () => factory,
+        versionInfo: async () => currentVersionInfo,
         localClonePathOptions: { cwd: '/not/a/checkout', git, validateConfiguredCheckouts: true },
         stdout: output,
         stderr: buffer(),
@@ -1601,6 +1633,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toEqual({
         ...factoryStatus,
+        ...currentVersionInfo,
         eventListener: {
           state: 'not-listening',
           reason: 'heartbeat missing',
@@ -2573,6 +2606,7 @@ describe('fleet CLI runtime', () => {
         fleet: new FakeFleetClient(),
         mount: new FakeMountClient(),
         createFactory: () => factory,
+        versionInfo: async () => staleVersionInfo,
         stdout: output,
         stderr: buffer(),
       })
@@ -2580,6 +2614,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(JSON.parse(output.text())).toEqual({
         ...factoryStatus,
+        ...staleVersionInfo,
         eventListener: {
           state: 'not-listening',
           reason: 'heartbeat missing',
@@ -3481,6 +3516,7 @@ describe('fleet CLI runtime', () => {
       const waitForStopSignal = vi.fn(async () => undefined)
       const createFactory = vi.fn(() => factory)
       const ensureLocalMount = vi.fn(async () => {})
+      const stderr = buffer()
 
       const code = await runFleetCli([
         'start',
@@ -3494,8 +3530,14 @@ describe('fleet CLI runtime', () => {
         createFactory,
         ensureLocalMount,
         waitForStopSignal,
+        versionInfo: async ({ includeRegistry } = {}) => includeRegistry
+          ? staleVersionInfo
+          : {
+              version: staleVersionInfo.version,
+              installedAt: staleVersionInfo.installedAt,
+            },
         stdout: buffer(),
-        stderr: buffer(),
+        stderr,
       })
 
       expect(code).toBe(0)
@@ -3509,6 +3551,12 @@ describe('fleet CLI runtime', () => {
       expect(factory.runLoop).not.toHaveBeenCalled()
       expect(waitForStopSignal).toHaveBeenCalledTimes(1)
       expect(factory.stop).toHaveBeenCalledTimes(1)
+      expect(stderr.text()).toContain(
+        '[factory] daemon starting {"version":"0.1.20","installedAt":"2026-07-17T12:00:00.000Z"}',
+      )
+      expect(stderr.text()).toContain(
+        '[factory] version drift detected: running 0.1.20; published latest 0.1.58',
+      )
     } finally {
       await rm(root, { recursive: true, force: true })
     }
