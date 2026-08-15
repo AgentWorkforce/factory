@@ -190,6 +190,8 @@ export interface IterationReport {
   skipped: Array<{ issue: IssueRef; reason: string }>
   dryRun: boolean
   slackDegraded?: boolean
+  /** A cross-process owner was already enumerating this workspace. */
+  discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }
 }
 

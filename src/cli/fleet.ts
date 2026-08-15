@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import readline from 'node:readline/promises'
 import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
@@ -1617,7 +1617,7 @@ async function buildMount(
   } = {},
 ): Promise<MountClient> {
   if (deps.mount) return deps.mount
-  if (hasExplicitFixtureFiles(loaded)) return new FakeMountClient(loaded.fixtureFiles)
+  if (hasExplicitFixtureFiles(loaded)) return new FixtureMountClient(loaded.fixtureFiles)
   let mount: MountClient
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
@@ -1631,6 +1631,18 @@ async function buildMount(
 
 const hasExplicitFixtureFiles = (loaded: LoadedConfig | undefined): loaded is LoadedConfig & { fixtureFiles: Record<string, unknown> } =>
   loaded?.fixtureFiles !== undefined
+
+/** Hermetic fixture runs have no server event feed, so expose the in-memory
+ * tree digest as their change watermark. This keeps built-CLI verification
+ * faithful to the production event watermark while still invalidating if a
+ * fixture changes between calls. */
+class FixtureMountClient extends FakeMountClient {
+  override async getEventHighWatermark(): Promise<string> {
+    const snapshot = [...this.files.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+    return `fixture:${createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')}`
+  }
+}
 
 async function isAllowedFactoryDraft(
   path: string,

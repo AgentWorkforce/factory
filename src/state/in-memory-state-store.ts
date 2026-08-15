@@ -14,6 +14,9 @@ import type {
   RegistryHandoffAgent,
   ConversationMessage,
   ConversationSessionState,
+  DiscoveryCheckpoint,
+  DiscoverySweepClaim,
+  DiscoverySweepState,
   StateStore,
   WaitingClarification,
   ClarificationReply,
@@ -36,6 +39,7 @@ type WorkspaceState = {
   babysitterSessions: Map<string, BabysitterSessionState>
   babysitterGenerations: Map<string, BabysitterGenerationRecord>
   dispatchLifecycles: Map<string, DispatchLifecycle>
+  discoverySweep: DiscoverySweepState
 }
 
 export type InMemoryStateStoreOptions = {
@@ -71,6 +75,77 @@ export class InMemoryStateStore implements StateStore {
     if (attempt) {
       attempt.inFlight = false
     }
+  }
+
+  async claimDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepClaim> {
+    const state = this.#workspace(workspaceId).discoverySweep
+    if (state.backoffUntilMs > nowMs) {
+      return { acquired: false, reason: 'backoff', state: cloneDiscoverySweepState(state) }
+    }
+    if (state.lease && state.lease.leaseUntilMs > nowMs) {
+      return { acquired: false, reason: 'in-flight', state: cloneDiscoverySweepState(state) }
+    }
+    const epoch = state.lastEpoch + 1
+    state.lastEpoch = epoch
+    state.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+    return {
+      acquired: true,
+      state: cloneDiscoverySweepState(state),
+      lease: { ...state.lease },
+    }
+  }
+
+  async renewDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const lease = this.#workspace(workspaceId).discoverySweep.lease
+    if (!lease || lease.owner !== owner || lease.epoch !== epoch || lease.leaseUntilMs <= nowMs) return false
+    lease.leaseUntilMs = nowMs + leaseMs
+    return true
+  }
+
+  async completeDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint?: DiscoveryCheckpoint,
+  ): Promise<boolean> {
+    const state = this.#workspace(workspaceId).discoverySweep
+    if (!discoveryLeaseMatches(state, owner, epoch)) return false
+    state.checkpoint = checkpoint ? cloneDiscoveryCheckpoint(checkpoint) : undefined
+    state.consecutiveOverloads = 0
+    state.backoffUntilMs = 0
+    delete state.lease
+    return true
+  }
+
+  async deferDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    backoffUntilMs: number,
+    consecutiveOverloads: number,
+  ): Promise<boolean> {
+    const state = this.#workspace(workspaceId).discoverySweep
+    if (!discoveryLeaseMatches(state, owner, epoch)) return false
+    state.backoffUntilMs = backoffUntilMs
+    state.consecutiveOverloads = consecutiveOverloads
+    delete state.lease
+    return true
+  }
+
+  async releaseDiscoverySweep(workspaceId: string, owner: string, epoch: number): Promise<void> {
+    const state = this.#workspace(workspaceId).discoverySweep
+    if (discoveryLeaseMatches(state, owner, epoch)) delete state.lease
   }
 
   async claimDispatchLifecycle(
@@ -733,6 +808,7 @@ export class InMemoryStateStore implements StateStore {
         babysitterSessions: new Map(),
         babysitterGenerations: new Map(),
         dispatchLifecycles: new Map(),
+        discoverySweep: emptyDiscoverySweepState(),
       }
       this.#workspaces.set(workspaceId, state)
     }
@@ -741,6 +817,21 @@ export class InMemoryStateStore implements StateStore {
 }
 
 const cloneDispatchLifecycle = (lifecycle: DispatchLifecycle): DispatchLifecycle => structuredClone(lifecycle)
+
+const emptyDiscoverySweepState = (): DiscoverySweepState => ({
+  consecutiveOverloads: 0,
+  backoffUntilMs: 0,
+  lastEpoch: 0,
+})
+
+const cloneDiscoveryCheckpoint = (checkpoint: DiscoveryCheckpoint): DiscoveryCheckpoint =>
+  structuredClone(checkpoint)
+
+const cloneDiscoverySweepState = (state: DiscoverySweepState): DiscoverySweepState =>
+  structuredClone(state)
+
+const discoveryLeaseMatches = (state: DiscoverySweepState, owner: string, epoch: number): boolean =>
+  state.lease?.owner === owner && state.lease.epoch === epoch
 
 const dispatchLifecycleLeaseMatches = (
   current: DispatchLifecycle['lease'],

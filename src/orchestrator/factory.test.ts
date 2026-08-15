@@ -2995,6 +2995,152 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('updates durable GitHub discovery trees from events without re-listing unchanged repository roots', async () => {
+    const firstPath = githubIssueCompactPath('AgentWorkforce', 'pear', 60)
+    const secondPath = githubIssueCompactPath('AgentWorkforce', 'pear', 61)
+    const mount = new CountingListTreeMount({
+      [firstPath]: githubIssueFile(60, { labels: ['reference-only'] }),
+    })
+    mount.emit(changeEvent(firstPath, 'event-60'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = () => createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    const first = create()
+
+    const firstReport = await first.runOnce()
+    expect(firstReport.pulled.map((issue) => issue.key)).toEqual(['60'])
+    expect(mount.listTreePrefixes).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
+    ])
+
+    mount.files.set(secondPath, { content: githubIssueFile(61, { labels: ['reference-only'] }) })
+    mount.emit(changeEvent(secondPath, 'event-61'))
+    const second = create()
+    const secondReport = await second.runOnce()
+
+    expect(secondReport.pulled.map((issue) => issue.key)).toEqual(['60', '61'])
+    expect(mount.listTreePrefixes).toHaveLength(2)
+    expect(second.status().counters.discoveryIncrementalChangedSweeps).toBe(1)
+
+    mount.files.delete(secondPath)
+    mount.emit({ ...changeEvent(secondPath, 'event-62'), digest: 'deleted:2026-08-15T00:00:00Z' })
+    const thirdReport = await create().runOnce()
+
+    expect(thirdReport.pulled.map((issue) => issue.key)).toEqual(['60'])
+    expect(mount.listTreePrefixes).toHaveLength(2)
+
+    mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/issues/_index.json', 'event-63'))
+    await create().runOnce()
+
+    expect(mount.listTreePrefixes).toHaveLength(4)
+  })
+
+  it('fences overlapping discovery sweeps across factory instances', async () => {
+    class BlockingDiscoveryMount extends CountingListTreeMount {
+      readonly started: Promise<void>
+      #resolveStarted: () => void = () => undefined
+      #release: () => void = () => undefined
+      #blocked = false
+
+      constructor(files: Record<string, unknown>) {
+        super(files)
+        this.started = new Promise((resolve) => { this.#resolveStarted = resolve })
+      }
+
+      release(): void {
+        this.#release()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        if (!this.#blocked) {
+          this.#blocked = true
+          this.#resolveStarted()
+          await new Promise<void>((resolve) => { this.#release = resolve })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    const path = githubIssueCompactPath('AgentWorkforce', 'pear', 62)
+    const mount = new BlockingDiscoveryMount({
+      [path]: githubIssueFile(62, { labels: ['reference-only'] }),
+    })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = () => createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    const first = create()
+    const second = create()
+    const firstSweep = first.runOnce()
+    await mount.started
+
+    await expect(second.runOnce()).resolves.toMatchObject({
+      pulled: [],
+      discoveryDeferred: 'sweep-in-flight',
+    })
+    expect(mount.listTreePrefixes).toEqual([])
+
+    mount.release()
+    await firstSweep
+    expect(mount.listTreePrefixes).toHaveLength(2)
+  })
+
+  it('honours Relayfile retryAfterSeconds and stops the sweep after a 429', async () => {
+    class OverloadedDiscoveryMount extends CountingListTreeMount {
+      overloadsRemaining = 1
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.listTreePrefixes.push(prefix)
+        if (this.overloadsRemaining > 0) {
+          this.overloadsRemaining -= 1
+          throw Object.assign(new Error('workspace busy'), {
+            status: 429,
+            details: { reason: 'durable_object_overloaded', retryAfterSeconds: 7 },
+          })
+        }
+        return FakeMountClient.prototype.listTree.call(this, prefix)
+      }
+    }
+
+    const clock = new ManualClock()
+    const warnings: Array<{ message: string; details?: unknown }> = []
+    const mount = new OverloadedDiscoveryMount()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore: new InMemoryStateStore({ batchSize: 2 }),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      clock,
+      logger: {
+        warn: (message, details) => warnings.push({ message, details }),
+      },
+    })
+
+    await expect(factory.runOnce()).rejects.toThrow('workspace busy')
+
+    expect(clock.now()).toBe(7_000)
+    expect(mount.listTreePrefixes).toEqual(['/github/repos/AgentWorkforce/pear/issues'])
+    expect(warnings).toContainEqual(expect.objectContaining({
+      message: '[factory] Relayfile discovery overloaded; backing off before another sweep',
+      details: expect.objectContaining({
+        reason: 'durable_object_overloaded',
+        retryAfterSeconds: 7,
+        delayMs: 7_000,
+      }),
+    }))
+  })
+
   it('filters GitHub startup discovery through the Relayfile issue index', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-github-index-discovery-'))
     const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 70)
@@ -4531,6 +4677,7 @@ describe('FactoryLoop', () => {
         labels: [{ name: 'pear' }],
       }),
     })
+    mount.emit(changeEvent(ghPath, 'event-1116'))
     const fleet = new FakeFleetClient()
     const factory = createFactory(config({
       safety: { requireTitlePrefix: '[factory]', requireTeamKey: 'AR' },
