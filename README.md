@@ -143,6 +143,10 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 | `factory intake notion <manifest>` | Normalize ready specs from a read-only Notion mount into GitHub lifecycle issues or exact-path fleet work. Honors `--dry-run`. |
 
+Factory-created PRs carry a reference-only trajectory pointer whose durable
+session id survives worker handoffs and dispatch-owner restarts. See
+[Factory PR trajectory references](docs/pr-trajectory.md).
+
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
 backend reuses a relay broker that's already running for your workspace, and

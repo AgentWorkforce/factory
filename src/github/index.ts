@@ -12,6 +12,7 @@ export {
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
   standaloneBabysitterAgentName,
+  trajectorySessionRefFromBody,
 } from './standalone-babysitter'
 export {
   ROUTED_PR_BABYSITTER_ACTIVATION_ENABLED,

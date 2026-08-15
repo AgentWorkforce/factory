@@ -5555,12 +5555,14 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       const decision = await first.triageIssue(parseLinearIssue(issuePath(85), issueFile(85)))
-      const originalResult = await first.dispatch(decision)
+      const originSessionRef = '0198b179-c6c2-7e63-9177-4ef52f56c193'
+      const originalResult = await first.dispatch(decision, { sessionRef: originSessionRef })
 
       const key = issueKey(decision.issue)
       const crashedState = new FileStateStore({ batchSize: 2, watchStatePath })
       const beforeCrash = await crashedState.getDispatchLifecycle('factory-test', key)
       expect(beforeCrash?.phase).toBe('running')
+      expect(beforeCrash?.decision.trajectorySessionRef).toBe(originSessionRef)
       expect(beforeCrash?.agents.find((agent) => agent.name === 'ar-85-impl-pear')?.tracked.result?.node).toBe('sf-mini')
 
       // The replacement starts while the crashed owner's nominal lease is
@@ -5609,6 +5611,10 @@ describe('FactoryLoop', () => {
       expect(publishInputs).toEqual([expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         headRef: expect.stringMatching(/^factory\/ar-85-agentworkforce-pear-[0-9a-f]{8}$/u),
+        sessionRef: originSessionRef,
+        body: expect.stringContaining(
+          `<!-- trajectory: work_unit_id=AR-85 work_unit_surface=linear session_ref=${originSessionRef} -->`,
+        ),
       })])
       expect(publishInputs[0]).not.toHaveProperty('clonePath')
       expect(restartedFleet.releases.map((release) => release.name).sort()).toEqual(['ar-85-impl-pear', 'ar-85-review'])
@@ -10719,7 +10725,8 @@ describe('FactoryLoop', () => {
     const issue = parseGithubFactoryIssue(path, issueFile)
     const decision = await factory.triageIssue(issue)
 
-    await factory.dispatch(decision)
+    const originSessionRef = '0198b179-c6c2-7e63-9177-4ef52f56c194'
+    await factory.dispatch(decision, { sessionRef: originSessionRef })
     const pearImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/pear' && spawn.name.includes('-impl-'))!
     const hoopsheetImplementer = fleet.spawns.find((spawn) => spawn.repo === 'AgentWorkforce/hoopsheet' && spawn.name.includes('-impl-'))!
     fleet.emitAgentExit(pearImplementer.name, 'worker_exited')
@@ -10732,6 +10739,12 @@ describe('FactoryLoop', () => {
       'AgentWorkforce/hoopsheet',
       'AgentWorkforce/pear',
     ])
+    for (const input of publishInputs) {
+      expect(input.sessionRef).toBe(originSessionRef)
+      expect(input.body).toContain(
+        `<!-- trajectory: work_unit_id=AgentWorkforce/pear#${number} work_unit_surface=github session_ref=${originSessionRef} -->`,
+      )
+    }
     await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
       pullRequest: { repo: 'AgentWorkforce/pear', number: 126 },
       pullRequests: expect.arrayContaining([
@@ -10741,6 +10754,9 @@ describe('FactoryLoop', () => {
     })
 
     const babysitters = fleet.spawns.filter((spawn) => spawn.name.includes('-babysit'))
+    for (const babysitter of babysitters) {
+      expect(babysitter.task).toContain(`Trajectory session reference (durable ai-hist id): ${originSessionRef}`)
+    }
     fleet.emitAgentMessage({
       from: babysitters[0]!.name,
       target: 'factory',
@@ -10966,6 +10982,109 @@ describe('FactoryLoop', () => {
       fleet.terminalEvents.indexOf('agent:release:ar-52-impl-pear'),
     )
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+  })
+
+  it('publishes the originating prompt trajectory instead of a spawned worker session', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 260,
+          url: 'https://github.com/AgentWorkforce/pear/pull/260',
+          headRef: 'factory/ar-260-agentworkforce-pear',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(260)]: issueFile(260),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-260-impl-pear', 'spawned-implementer-session')
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    const origin = '0198b179-c6c2-7e63-9177-4ef52f56c192'
+
+    await factory.dispatch(
+      await factory.triageIssue(parseLinearIssue(issuePath(260), issueFile(260))),
+      { sessionRef: origin },
+    )
+
+    expect(fleet.spawns).toHaveLength(2)
+    for (const spawn of fleet.spawns) {
+      expect(spawn.task).toContain(`Trajectory session reference (durable ai-hist id): ${origin}`)
+      expect(spawn.task).toContain('do not replace it with a spawned worker session id')
+    }
+
+    fleet.emitAgentExit('ar-260-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(origin)
+    expect(publishInputs[0]?.sessionRef).not.toBe('spawned-implementer-session')
+    expect(publishInputs[0]?.body).toContain(
+      `<!-- trajectory: work_unit_id=AR-260 work_unit_surface=linear session_ref=${origin} -->`,
+    )
+  })
+
+  it('publishes an explicit missing ref and surfaces the error in Factory status', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 261,
+          url: 'https://github.com/AgentWorkforce/pear/pull/261',
+          headRef: 'factory/ar-261-agentworkforce-pear',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(261)]: issueFile(261),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const logger = { error: vi.fn() }
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      logger,
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(
+      await factory.triageIssue(parseLinearIssue(issuePath(261), issueFile(261))),
+      { sessionRef: 'unknown-session-v3b' },
+    )
+    fleet.emitAgentExit('ar-261-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]).not.toHaveProperty('sessionRef')
+    expect(publishInputs[0]?.body).toContain(
+      '<!-- trajectory: work_unit_id=AR-261 work_unit_surface=linear session_ref=missing -->',
+    )
+    expect(publishInputs[0]?.body).not.toContain('unknown-session-v3b')
+    expect(logger.error).toHaveBeenCalledWith(
+      '[factory] published PR without a resolvable trajectory session_ref',
+      expect.objectContaining({ issue: 'AR-261', prNumber: 261 }),
+    )
+    expect(factory.status()).toMatchObject({
+      counters: { trajectorySessionRefErrors: 1 },
+      trajectoryErrors: [{
+        issue: { key: 'AR-261' },
+        pullRequests: [{ repo: 'AgentWorkforce/pear', number: 261 }],
+        reason: 'missing-session-ref',
+      }],
+    })
   })
 
   it('prepares a fresh issue worktree before running a bootstrap-inclusive preview command', async () => {

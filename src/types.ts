@@ -75,7 +75,7 @@ export interface Factory {
   runOnce(opts?: { dryRun?: boolean }): Promise<IterationReport>
   runLoop(opts?: FactoryLoopRunOptions): Promise<IterationReport[]>
   triageIssue(issue: LinearIssue): Promise<TriageDecision>
-  dispatch(decision: TriageDecision, opts?: { dryRun?: boolean }): Promise<DispatchResult>
+  dispatch(decision: TriageDecision, opts?: { dryRun?: boolean; sessionRef?: string }): Promise<DispatchResult>
   waitForDispatchTerminal(issue: IssueRef): Promise<void>
   status(): FactoryStatus
   on(
@@ -222,6 +222,14 @@ export interface FactoryStatus {
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */
   eventListener?: FactoryEventListenerStatus
+  /** PRs that explicitly disclose that their durable trajectory reference is unresolved. */
+  trajectoryErrors?: FactoryTrajectoryError[]
+}
+
+export interface FactoryTrajectoryError {
+  issue: IssueRef
+  pullRequests: Array<{ repo: string; number: number; url: string }>
+  reason: 'missing-session-ref'
 }
 
 export type FactoryEventPayload =
@@ -249,6 +257,11 @@ export interface RepoMapEntry {
 export interface TriageDecision {
   issue: IssueRef
   issueResolution?: IssueResolution
+  /** Durable ai-hist session UUID captured where this work was first expressed. */
+  trajectorySessionRef?: string
+  /** Durable surface identity captured with the originating session reference. */
+  trajectoryWorkUnitId?: string
+  trajectoryWorkUnitSurface?: 'linear' | 'github' | 'factory'
   routes: Array<{ repo: string; clonePath?: string; rationale: string }>
   scope: 'single' | 'workflow' | 'team'
   implementers: AgentSpec[]

@@ -111,7 +111,15 @@ export {
   parseStandaloneBabysitTarget,
   readStandalonePullRequest,
   standaloneBabysitterAgentName,
+  trajectorySessionRefFromBody,
 } from './github'
+export {
+  MISSING_TRAJECTORY_SESSION_REF,
+  renderTrajectoryPointer,
+  resolvableTrajectorySessionRef,
+  stripTrajectoryPointers,
+} from './trajectory'
+export type { TrajectoryPointer, TrajectoryWorkUnitSurface } from './trajectory'
 export type {
   CloseProbePrInput,
   CloseProbePrResult,
@@ -441,6 +449,7 @@ export type {
   FactoryRelayflowDispatchPort,
   FactoryStartOptions,
   FactoryStatus,
+  FactoryTrajectoryError,
   IssueRef,
   IssueResolution,
   IterationReport,

@@ -7,6 +7,7 @@ import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
+import { resolvableTrajectorySessionRef } from '../trajectory'
 
 const execFileAsync = promisify(execFile)
 
@@ -112,7 +113,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
     // auth env vars are absent (operator key path, no workspace token).
     // Prefer the per-agent sessionRef over the process-wide env var so that
     // concurrent implementers each record their own session.
-    const sessionRef = input.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined)
+    const sessionRef = resolvableTrajectorySessionRef(input.sessionRef)
+      ?? resolvableTrajectorySessionRef(process.env.RELAY_ATTEST_SESSION_ID)
     await postAttestationGrant(input.repo, sessionRef).catch(() => undefined)
 
     const created = await this.#run([

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 
 import type { GhRunner } from './merge-gate'
 import type { MountClient } from '../ports'
+import { trajectorySessionRefFromBody } from '../trajectory'
 
 export interface StandaloneBabysitTarget {
   repo?: string
@@ -129,6 +130,8 @@ export function explicitLinkedIssueKey(body: string): string | undefined {
   }
   return keys.size === 1 ? [...keys][0] : undefined
 }
+
+export { trajectorySessionRefFromBody }
 
 async function readPullRequestFromMount(
   mount: MountClient,

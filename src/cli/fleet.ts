@@ -37,6 +37,8 @@ import {
   resolveFactoryStates,
   stateResolutionFromIds,
   standaloneBabysitterAgentName,
+  trajectorySessionRefFromBody,
+  resolvableTrajectorySessionRef,
   renderAgentTask,
   resolveFactoryWorkspace,
   type Capability,
@@ -54,10 +56,12 @@ import {
   type MountClient,
   type IssueResolution,
   type LinearIssue,
+  type FactoryTrajectoryError,
   type ProbeCloser,
   type RelayfileCloudMountClientConfig,
   type ResolvedFactoryWorkspace,
 } from '../index'
+import type { DispatchLifecycle, StateStore } from '../ports/state'
 import { resolveTestGuidance } from '../dispatch/test-guidance'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
@@ -443,7 +447,19 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
         })
-        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
+        return await runFactoryCommand(
+          command,
+          factory,
+          mount,
+          fleet,
+          loaded.config,
+          globals,
+          out,
+          deps,
+          workspaceId,
+          acceptableMountIds,
+          stateStore,
+        )
       }
     }
     return 1
@@ -639,6 +655,7 @@ async function runFactoryCommand(
   deps: FleetCliDeps = {},
   workspaceId: string = config.workspaceId ?? '',
   acceptableMountIds?: readonly string[],
+  stateStore?: StateStore,
 ): Promise<number> {
   const mountFn = resolveLocalMountFn(deps, mount)
   const mountStderr = deps.stderr ?? process.stderr
@@ -733,7 +750,14 @@ async function runFactoryCommand(
       return 0
     }
     if (command.action === 'status') {
-      writeJson(out, await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs))
+      writeJson(out, await factoryStatusWithMountHealth(
+        factory,
+        mount,
+        config.loop.heartbeatPath,
+        config.loop.heartbeatStaleMs,
+        stateStore,
+        workspaceId,
+      ))
       return 0
     }
     if (command.action === 'loop-status') {
@@ -764,7 +788,14 @@ async function runFactoryCommand(
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
       writeJson(out, {
         reports,
-        status: await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs),
+        status: await factoryStatusWithMountHealth(
+          factory,
+          mount,
+          config.loop.heartbeatPath,
+          config.loop.heartbeatStaleMs,
+          stateStore,
+          workspaceId,
+        ),
       })
     } finally {
       removeSignalHandlers()
@@ -798,7 +829,10 @@ async function runFactoryCommand(
     // and stays through takeover/publication/writeback/release to terminal.
     await factory.start({ mode: 'dispatch-owner' })
     try {
-      const result = await factory.dispatch(decision, { dryRun: false })
+      const result = await factory.dispatch(decision, {
+        dryRun: false,
+        sessionRef: (deps.env ?? process.env).RELAY_ATTEST_SESSION_ID,
+      })
       writeJson(out, result)
       await factory.waitForDispatchTerminal(result.issue)
       return 0
@@ -807,7 +841,10 @@ async function runFactoryCommand(
     }
   }
 
-  writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
+  writeJson(out, await factory.dispatch(decision, {
+    dryRun: globals.dryRun,
+    sessionRef: (deps.env ?? process.env).RELAY_ATTEST_SESSION_ID,
+  }))
   return 0
 }
 
@@ -900,6 +937,7 @@ async function runStandaloneBabysitCommand(
     issue,
     changedFiles: pr.filesChanged,
   })
+  const trajectorySessionRef = trajectorySessionRefFromBody(pr.body)
   const task = renderAgentTask({
     issue,
     route: { repo, clonePath },
@@ -919,6 +957,7 @@ async function runStandaloneBabysitCommand(
     standaloneBabysitter: { specSource },
     integrationsMountRoot: resolveIntegrationsMountRoot(mount),
     testGuidance,
+    trajectorySessionRef,
   })
   const receiptBase = {
     agent: agentName,
@@ -1052,6 +1091,8 @@ async function factoryStatusWithMountHealth(
   mount: MountClient,
   heartbeatPath: string,
   heartbeatStaleMs: number,
+  stateStore?: StateStore,
+  workspaceId?: string,
 ): Promise<ReturnType<Factory['status']> & {
   localMountDegraded?: boolean
   localMountDegradedReason?: string
@@ -1065,6 +1106,10 @@ async function factoryStatusWithMountHealth(
   }
 }> {
   const status = factory.status()
+  const durableTrajectoryErrors = stateStore && workspaceId
+    ? await trajectoryErrorsFromState(stateStore, workspaceId)
+    : []
+  const trajectoryErrors = mergeTrajectoryErrors(status.trajectoryErrors ?? [], durableTrajectoryErrors)
   const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
   const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
   const eventListener = liveness.ok
@@ -1077,10 +1122,15 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...status, eventListener }
+  if (!health) return {
+    ...status,
+    eventListener,
+    ...(trajectoryErrors.length > 0 ? { trajectoryErrors } : {}),
+  }
   return {
     ...status,
     eventListener,
+    ...(trajectoryErrors.length > 0 ? { trajectoryErrors } : {}),
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),
@@ -1091,6 +1141,52 @@ async function factoryStatusWithMountHealth(
       ...(health.localDir ? { root: health.localDir } : {}),
     },
   }
+}
+
+async function trajectoryErrorsFromState(
+  stateStore: StateStore,
+  workspaceId: string,
+): Promise<FactoryTrajectoryError[]> {
+  const lifecycles = await stateStore.listDispatchLifecycles(workspaceId)
+  return lifecycles.flatMap(([, lifecycle]) => trajectoryErrorFromLifecycle(lifecycle) ?? [])
+}
+
+function trajectoryErrorFromLifecycle(lifecycle: DispatchLifecycle): FactoryTrajectoryError | undefined {
+  const pullRequests = [
+    ...(lifecycle.pullRequests ?? []),
+    ...(lifecycle.pullRequest ? [lifecycle.pullRequest] : []),
+  ]
+  if (pullRequests.length === 0 || resolvableTrajectorySessionRef(lifecycle.decision.trajectorySessionRef)) {
+    return undefined
+  }
+  return {
+    issue: { ...lifecycle.issue },
+    pullRequests: [...new Map(pullRequests.map((pullRequest) => [
+      `${pullRequest.repo.toLowerCase()}#${pullRequest.number}`,
+      { repo: pullRequest.repo, number: pullRequest.number, url: pullRequest.url },
+    ])).values()],
+    reason: 'missing-session-ref',
+  }
+}
+
+function mergeTrajectoryErrors(
+  first: FactoryTrajectoryError[],
+  second: FactoryTrajectoryError[],
+): FactoryTrajectoryError[] {
+  const merged = new Map<string, FactoryTrajectoryError>()
+  for (const error of [...first, ...second]) {
+    const key = `${error.issue.path}:${error.reason}`
+    const previous = merged.get(key)
+    merged.set(key, {
+      issue: { ...error.issue },
+      pullRequests: [...new Map([...(previous?.pullRequests ?? []), ...error.pullRequests].map((pullRequest) => [
+        `${pullRequest.repo.toLowerCase()}#${pullRequest.number}`,
+        { ...pullRequest },
+      ])).values()],
+      reason: error.reason,
+    })
+  }
+  return [...merged.values()]
 }
 
 function writeMountRefreshSummary(

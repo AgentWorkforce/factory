@@ -77,6 +77,8 @@ export interface RenderAgentTaskInput {
   agentName?: string
   /** Durable Relay action owned by the active Factory process. */
   lifecycleActionName?: string
+  /** Originating prompt session; distinct from each spawned worker's resume id. */
+  trajectorySessionRef?: string
   /**
    * Absolute path to the .integrations mount root. The agent runs in its repo
    * clonePath, not the daemon cwd where .integrations lives, so every
@@ -104,6 +106,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     `Linear issue: ${input.issue.key} - ${input.issue.title}`,
     'Full Linear issue description:',
     input.issue.description,
+    ...(input.trajectorySessionRef ? [
+      '',
+      `Trajectory session reference (durable ai-hist id): ${input.trajectorySessionRef}`,
+      'Preserve this same reference through implementer, reviewer, and babysitter handoffs; do not replace it with a spawned worker session id.',
+    ] : []),
     ...(input.previewUrl ? [
       '',
       `Live preview: ${input.previewUrl}`,
@@ -226,6 +233,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         `GitHub repo: ${repo}`,
         cloneInstruction,
         ...specHeader,
+        ...(input.trajectorySessionRef ? [
+          '',
+          `Trajectory session reference (durable ai-hist id): ${input.trajectorySessionRef}`,
+          'Preserve this existing PR lineage while babysitting; do not replace it with the babysitter session id.',
+        ] : []),
         '',
         `You are the standalone PR babysitter for ${prRef}.`,
         'Your job: drive this PR to genuinely green and correct against the definition of done above, then hand it to a human. Do NOT merge it yourself.',

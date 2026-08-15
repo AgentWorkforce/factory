@@ -15,11 +15,12 @@ import type {
   FactoryPorts,
   createFactory,
 } from '../index'
-import { FactoryConfigSchema, stateResolutionFromIds } from '../index'
+import { FactoryConfigSchema, githubWatchStatePath, stateResolutionFromIds } from '../index'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import type { DispatchLifecycle } from '../ports/state'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -2590,6 +2591,90 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('surfaces a durable published PR whose trajectory session is unresolved after restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-trajectory-status-'))
+    try {
+      const registryPath = join(root, 'registry.json')
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, {
+        loop: { registryPath, heartbeatPath, heartbeatStaleMs: 10_000 },
+      })
+      const issue = { uuid: 'uuid-77', key: 'AR-77', path: issuePath }
+      const lifecycle: DispatchLifecycle = {
+        runId: 'run-77',
+        issue,
+        decision: {
+          issue,
+          routes: [],
+          scope: 'single',
+          implementers: [],
+          reviewer: {
+            name: 'ar-77-review',
+            role: 'reviewer',
+            capability: 'spawn:claude',
+            task: 'Review the implementation.',
+            repo: 'AgentWorkforce/pear',
+          },
+          thin: false,
+          confidence: 'high',
+          rationale: 'test',
+        },
+        dryRun: false,
+        phase: 'published',
+        agents: [],
+        invocationIds: [],
+        pullRequests: [{
+          repo: 'AgentWorkforce/pear',
+          number: 77,
+          url: 'https://github.com/AgentWorkforce/pear/pull/77',
+          headRef: 'factory/ar-77-agentworkforce-pear-12345678',
+        }],
+        updatedAtMs: 1,
+      }
+      const state = new FileStateStore({
+        batchSize: 2,
+        watchStatePath: githubWatchStatePath(registryPath),
+      })
+      await state.claimDispatchLifecycle(config.workspaceId, issue.path, lifecycle, 'crashed-owner', 1, 60_000)
+
+      const output = buffer()
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(),
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        trajectoryErrors: [{
+          issue,
+          reason: 'missing-session-ref',
+          pullRequests: [{
+            repo: 'AgentWorkforce/pear',
+            number: 77,
+            url: 'https://github.com/AgentWorkforce/pear/pull/77',
+          }],
+        }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces a stale registered workspace mirror in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-stale-status-'))
     try {
@@ -2826,7 +2911,11 @@ describe('fleet CLI runtime', () => {
           payload: {
             number: 10,
             title: 'Add league subdomain routing',
-            body: 'Full PR definition of done',
+            body: [
+              'Full PR definition of done',
+              '',
+              '<!-- trajectory: work_unit_id=AgentWorkforce/hoopsheet#10 work_unit_surface=github session_ref=0198b179-c6c2-7e63-9177-4ef52f56c195 -->',
+            ].join('\n'),
             state: 'open',
             draft: false,
             html_url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
@@ -2868,6 +2957,10 @@ describe('fleet CLI runtime', () => {
       })
       expect(fleet.spawns[0]?.task).toContain('standalone PR babysitter')
       expect(fleet.spawns[0]?.task).toContain('Full PR definition of done')
+      expect(fleet.spawns[0]?.task).toContain(
+        'Trajectory session reference (durable ai-hist id): 0198b179-c6c2-7e63-9177-4ef52f56c195',
+      )
+      expect(fleet.spawns[0]?.task).toContain('do not replace it with the babysitter session id')
       expect(fleet.spawns[0]?.task).toContain('League routing (`league-routing`)')
       expect(fleet.spawns[0]?.task).toContain('npm run test:league-routing')
       expect(fleet.spawns[0]?.task).not.toContain('[factory-pr-ready]')

@@ -77,6 +77,7 @@ import type {
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
   FactoryInFlightRegistry,
+  FactoryTrajectoryError,
   FactoryInFlightRegistryAgent,
   IssueRef,
   IterationReport,
@@ -114,6 +115,12 @@ import {
 } from '../observability/events'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
+import {
+  renderTrajectoryPointer,
+  resolvableTrajectorySessionRef,
+  stripTrajectoryPointers,
+  type TrajectoryWorkUnitSurface,
+} from '../trajectory'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -450,6 +457,7 @@ export class FactoryLoop implements Factory {
   #batchReady: Promise<BatchSnapshot>
   readonly #listeners = new Map<FactoryEvent, Set<Listener>>()
   readonly #counters: Record<string, number> = {}
+  readonly #trajectoryErrors = new Map<string, FactoryTrajectoryError>()
   readonly #resumeInFlight = new Map<string, Promise<void>>()
   readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
@@ -2431,7 +2439,10 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  async dispatch(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
+  async dispatch(
+    decision: TriageDecision,
+    opts: { dryRun?: boolean; labelsValidated?: boolean; sessionRef?: string } = {},
+  ): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
     const key = `${issueStateKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
@@ -2454,7 +2465,10 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
+  async #dispatchUnlocked(
+    decision: TriageDecision,
+    opts: { dryRun?: boolean; labelsValidated?: boolean; sessionRef?: string } = {},
+  ): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const batch = await this.#batch()
     const existingRecord = batch.getIssue(decision.issue)
@@ -2532,6 +2546,21 @@ export class FactoryLoop implements Factory {
     }
 
     let dispatchDecision = authoritativeRoutedDecision(decision, labelDispatch.decision)
+    const trajectorySessionRef = resolvableTrajectorySessionRef(decision.trajectorySessionRef)
+      ?? resolvableTrajectorySessionRef(opts.sessionRef)
+      ?? resolvableTrajectorySessionRef(process.env.RELAY_ATTEST_SESSION_ID)
+    const trajectoryWorkUnit = decision.trajectoryWorkUnitId && decision.trajectoryWorkUnitSurface
+      ? {
+          workUnitId: decision.trajectoryWorkUnitId,
+          workUnitSurface: decision.trajectoryWorkUnitSurface,
+        }
+      : trajectoryWorkUnitForIssue(liveIssue)
+    dispatchDecision = {
+      ...dispatchDecision,
+      trajectorySessionRef,
+      trajectoryWorkUnitId: trajectoryWorkUnit.workUnitId,
+      trajectoryWorkUnitSurface: trajectoryWorkUnit.workUnitSurface,
+    }
     // A valid label resolution clears any prior failure notice so a later
     // regression posts a fresh, actionable comment instead of being deduped.
     this.#labelDispatchFailures.delete(issueStateKey(dispatchDecision.issue))
@@ -2859,6 +2888,9 @@ export class FactoryLoop implements Factory {
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
+      ...(this.#trajectoryErrors.size > 0
+        ? { trajectoryErrors: [...this.#trajectoryErrors.values()].map((error) => structuredClone(error)) }
+        : {}),
     }
   }
 
@@ -6333,9 +6365,16 @@ export class FactoryLoop implements Factory {
     opts: { reconcileExisting?: boolean } = {},
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
+    // The environment fallback was resolved at dispatch admission, before any
+    // spawn. Never re-read it here: after a crash a replacement process must
+    // use the persisted originating prompt id, not its own startup session.
+    const sessionRef = resolvableTrajectorySessionRef(record.decision.trajectorySessionRef)
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
     const cached = this.#publishedPullRequests.get(key)
-    if (cached) return cached
+    if (cached) {
+      if (!sessionRef) this.#recordMissingTrajectorySessionRef(record, cached)
+      return cached
+    }
 
     const { identity, publisher } = this.#githubPullRequestPublisher()
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
@@ -6363,7 +6402,10 @@ export class FactoryLoop implements Factory {
     if (
       durableReceipt &&
       (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
-    ) return durableReceipt
+    ) {
+      if (!sessionRef) this.#recordMissingTrajectorySessionRef(record, durableReceipt)
+      return durableReceipt
+    }
     if (opts.reconcileExisting && expectedHeadRef) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
@@ -6375,6 +6417,7 @@ export class FactoryLoop implements Factory {
           prNumber: existing.number,
           url: existing.url,
         })
+        if (!sessionRef) this.#recordMissingTrajectorySessionRef(record, existing)
         return existing
       }
     }
@@ -6384,8 +6427,11 @@ export class FactoryLoop implements Factory {
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
       baseRef,
       title: `${issue.key}: ${issue.title}`,
-      body: githubPullRequestBody(issue, implementer.spec.preview),
-      ...(implementer.sessionRef ? { sessionRef: implementer.sessionRef } : {}),
+      body: githubPullRequestBody(issue, implementer.spec.preview, sessionRef, {
+        workUnitId: record.decision.trajectoryWorkUnitId,
+        workUnitSurface: record.decision.trajectoryWorkUnitSurface,
+      }),
+      ...(sessionRef ? { sessionRef } : {}),
     })
     const published = result.author
       ? result
@@ -6404,6 +6450,7 @@ export class FactoryLoop implements Factory {
     }
     this.#publishedPullRequests.set(key, published)
     this.#increment('githubPullRequestsPublished')
+    if (!sessionRef) this.#recordMissingTrajectorySessionRef(record, published)
     this.#logger.info?.('[factory] published PR', {
       issue: issue.key,
       repo: published.repo,
@@ -6413,6 +6460,34 @@ export class FactoryLoop implements Factory {
       author: published.author,
     })
     return published
+  }
+
+  #recordMissingTrajectorySessionRef(
+    record: InFlightIssue,
+    published: GithubPublishPullRequestResult,
+  ): void {
+    const statusKey = issueKey(record.issue)
+    const previous = this.#trajectoryErrors.get(statusKey)
+    if (previous?.pullRequests.some((pullRequest) =>
+      pullRequest.repo.toLowerCase() === published.repo.toLowerCase() &&
+      pullRequest.number === published.number
+    )) return
+
+    this.#increment('trajectorySessionRefErrors')
+    this.#trajectoryErrors.set(statusKey, {
+      issue: { ...record.issue },
+      pullRequests: [
+        ...(previous?.pullRequests ?? []),
+        { repo: published.repo, number: published.number, url: published.url },
+      ],
+      reason: 'missing-session-ref',
+    })
+    this.#logger.error?.('[factory] published PR without a resolvable trajectory session_ref', {
+      issue: record.issue.key,
+      repo: published.repo,
+      prNumber: published.number,
+      url: published.url,
+    })
   }
 
   #githubPullRequestPublisher(): {
@@ -8893,6 +8968,7 @@ export class FactoryLoop implements Factory {
           branchName: spec.branch ?? decision.implementers.find((candidate) => candidate.repo === spec.repo)?.branch,
           branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
           agentName: spec.name,
+          trajectorySessionRef: decision.trajectorySessionRef,
           ...(previewUrl ? {
             previewUrl,
             previewTargetPort: spec.preview?.targetPort,
@@ -10653,6 +10729,7 @@ export class FactoryLoop implements Factory {
         branchName: spec.branch,
         branchPrepared: Boolean(spec.baseClonePath && spec.clonePath && spec.baseClonePath !== spec.clonePath),
         agentName: spec.name,
+        trajectorySessionRef: record.decision.trajectorySessionRef,
         ...(spec.preview ? {
           previewUrl: spec.preview.url,
           previewTargetPort: spec.preview.targetPort,
@@ -15795,8 +15872,16 @@ const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
   return `${owner}/${repo}`
 }
 
-const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): string => [
-  issue.description,
+const githubPullRequestBody = (
+  issue: LinearIssue,
+  preview: PreviewReference | undefined,
+  sessionRef: string | undefined,
+  persistedWorkUnit?: {
+    workUnitId?: string
+    workUnitSurface?: TrajectoryWorkUnitSurface
+  },
+): string => [
+  stripTrajectoryPointers(issue.description),
   '',
   isGithubIssue(issue) && /^\d+$/u.test(issue.key)
     ? `Fixes #${issue.key}`
@@ -15806,7 +15891,33 @@ const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): 
     `Live preview: ${preview.url}`,
     'Access: Tailscale tailnet membership and the tailnet grants/ACLs are required; this URL is not public.',
   ] : []),
+  '',
+  renderTrajectoryPointer({
+    ...(persistedWorkUnit?.workUnitId && persistedWorkUnit.workUnitSurface
+      ? {
+          workUnitId: persistedWorkUnit.workUnitId,
+          workUnitSurface: persistedWorkUnit.workUnitSurface,
+        }
+      : trajectoryWorkUnitForIssue(issue)),
+    sessionRef,
+  }),
 ].join('\n').trim()
+
+const trajectoryWorkUnitForIssue = (
+  issue: LinearIssue,
+): { workUnitId: string; workUnitSurface: TrajectoryWorkUnitSurface } => {
+  const github = githubIssueSourceRef(issue)
+  if (github) {
+    return {
+      workUnitId: `${github.owner}/${github.repo}#${github.number}`,
+      workUnitSurface: 'github',
+    }
+  }
+  if (isRealLinearIssue(issue)) {
+    return { workUnitId: issue.key, workUnitSurface: 'linear' }
+  }
+  return { workUnitId: `factory:${issue.uuid}`, workUnitSurface: 'factory' }
+}
 
 // The broker rejects re-registering a name it never released on exit
 // (relay#1116-family) with a 500 "agent '<name>' already exists". Detect it from
