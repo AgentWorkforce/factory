@@ -139,6 +139,30 @@ export interface FactoryInFlightRegistryAgent {
   // Remote (relay-backend) placement facts; pids are meaningless off-machine.
   invocationId?: string
   node?: string
+  /** Durable-claim visibility independent of the provider writeback surface. */
+  dispatchClaim?: FactoryDispatchClaimStatus
+}
+
+export interface FactoryDispatchClaimStatus {
+  state: 'pending' | 'verified' | 'degraded'
+  write?: string
+  attempts?: number
+  maxAttempts?: number
+  error?: string
+  deadLettered?: boolean
+  updatedAtMs: number
+}
+
+export interface FactoryInFlightDispatchStatus {
+  issue: IssueRef
+  agents: Array<{
+    name: string
+    role?: AgentSpec['role']
+    sessionRef?: string
+    invocationId?: string
+    node?: string
+  }>
+  claim: FactoryDispatchClaimStatus
 }
 
 export interface FactoryInFlightRegistryProcess {
@@ -214,6 +238,8 @@ export interface DispatchResult {
 
 export interface FactoryStatus {
   inFlight: IssueRef[]
+  /** Registry-backed issue/agent ownership, including degraded GitHub claims. */
+  inFlightDispatches?: FactoryInFlightDispatchStatus[]
   queued: IssueRef[]
   parked?: Array<{
     issue: IssueRef

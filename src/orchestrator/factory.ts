@@ -78,6 +78,8 @@ import type {
   FactoryLoopRunOptions,
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
+  FactoryDispatchClaimStatus,
+  FactoryInFlightDispatchStatus,
   FactoryInFlightRegistry,
   FactoryInFlightRegistryAgent,
   IssueRef,
@@ -374,6 +376,8 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
+const DISPATCH_WRITEBACK_MAX_ATTEMPTS = 3
+const DISPATCH_WRITEBACK_RETRY_MS = 250
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
@@ -547,6 +551,7 @@ export class FactoryLoop implements Factory {
   readonly #abandonedDispatchReasons = new Map<string, string>()
   readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
   readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
+  readonly #dispatchClaimStatuses = new Map<string, FactoryDispatchClaimStatus>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
@@ -3644,6 +3649,13 @@ export class FactoryLoop implements Factory {
         }
         agents.push({ name: spawned.name, role: spec.role })
       }
+      if (!dryRun) {
+        record.dispatchClaim = {
+          state: 'pending',
+          updatedAtMs: this.#clock.now(),
+        }
+        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+      }
       await this.#writeInFlightRegistry()
 
       const comment = dispatchComment(dispatchDecision, agents)
@@ -3653,17 +3665,7 @@ export class FactoryLoop implements Factory {
         if (!issue || !this.#isIssueReady(issue)) {
           throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
         }
-        try {
-          await this.#postIssueComment(issue, comment)
-        } catch (error) {
-          this.#logger.warn?.('[factory] comment writeback skipped', error)
-        }
-        if (isGithubIssue(issue)) {
-          await this.#githubWriteback.setStatus(issue, 'in-progress')
-        } else {
-          implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
-          await this.#linear.setState(issue, implementingStateId)
-        }
+        implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
         this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
@@ -3788,8 +3790,27 @@ export class FactoryLoop implements Factory {
 
   status(): FactoryStatus {
     const batch = this.#batchView
+    const inFlightDispatches: FactoryInFlightDispatchStatus[] = batch?.inFlight
+      .filter((record) => !record.dryRun)
+      .map((record) => ({
+        issue: { ...record.issue },
+        agents: [...record.agents].map(([name, tracked]) => ({
+          name,
+          role: tracked.spec.role,
+          ...(tracked.sessionRef ? { sessionRef: tracked.sessionRef } : {}),
+          ...(tracked.spec.invocationId ? { invocationId: tracked.spec.invocationId } : {}),
+          ...(tracked.result?.node ? { node: tracked.result.node } : {}),
+        })),
+        claim: {
+          ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(issueKey(record.issue)) ?? {
+            state: 'pending' as const,
+            updatedAtMs: this.#clock.now(),
+          }),
+        },
+      })) ?? []
     return {
       inFlight: batch?.inFlight.map((record) => record.issue) ?? [],
+      ...(inFlightDispatches.length > 0 ? { inFlightDispatches } : {}),
       queued: batch?.queued.map((queued) => queued.issue) ?? [],
       parked: batch?.parked.map((parked) => ({
         issue: parked.issue,
@@ -5072,16 +5093,21 @@ export class FactoryLoop implements Factory {
       const spawned = await this.#spawnAgent(record, spec, record.dryRun)
       agents.push({ name: spawned.name, role: spec.role })
     }
+    const comment = dispatchComment(record.decision, agents)
+    let implementingStateId: string | undefined
+    if (!record.dryRun) {
+      record.dispatchClaim = {
+        state: 'pending',
+        updatedAtMs: this.#clock.now(),
+      }
+      this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+    }
     await this.#writeInFlightRegistry()
     if (!record.dryRun) {
       const issue = liveIssue ?? await this.#readIssue(record.issue.path)
       if (!issue) throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
       await this.#ensureGithubAgentQuestionWatch(record, issue)
-      if (isGithubIssue(issue)) {
-        await this.#githubWriteback.setStatus(issue, 'in-progress')
-      } else {
-        await this.#linear.setState(issue, this.#states.idFor(issue.team, 'agentImplementing'))
-      }
+      implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
     }
     const recoveredPreviews = uniquePreviewReferences([
       ...dispatchSpecs(record.decision).map((spec) => spec.preview),
@@ -5090,7 +5116,8 @@ export class FactoryLoop implements Factory {
     record.result ??= {
       issue: record.issue,
       agents,
-      comments: [dispatchComment(record.decision, agents)],
+      comments: [comment],
+      stateId: implementingStateId,
       ...(recoveredPreviews.length > 0 ? { previews: recoveredPreviews } : {}),
       dryRun: record.dryRun,
     }
@@ -5416,6 +5443,116 @@ export class FactoryLoop implements Factory {
       return
     }
     await this.#linear.postComment(issue, body)
+  }
+
+  async #applyDispatchClaim(
+    record: InFlightIssue,
+    issue: LinearIssue,
+    comment: string,
+  ): Promise<string | undefined> {
+    let implementingStateId: string | undefined
+    if (isGithubIssue(issue)) {
+      await this.#retryDispatchWriteback(record, issue, 'GitHub label factory:in-progress', async () => {
+        await this.#githubWriteback.setStatus(issue, 'in-progress')
+      })
+
+      const commentApplied = this.#githubWriteback.hasCommentMarker
+        ? async (): Promise<boolean> => this.#githubWriteback.hasCommentMarker!(issue, comment)
+        : undefined
+      await this.#retryDispatchWriteback(
+        record,
+        issue,
+        'GitHub dispatch comment',
+        async () => this.#githubWriteback.postComment(issue, comment),
+        commentApplied,
+      )
+    } else {
+      implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
+      await this.#retryDispatchWriteback(record, issue, `Linear state ${implementingStateId}`, async () => {
+        await this.#linear.setState(issue, implementingStateId!)
+      })
+      await this.#retryDispatchWriteback(record, issue, 'Linear dispatch comment', async () => {
+        await this.#linear.postComment(issue, comment)
+      })
+    }
+
+    record.dispatchClaim = {
+      state: 'verified',
+      updatedAtMs: this.#clock.now(),
+    }
+    this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+    await this.#writeDispatchClaimRegistry(record.issue)
+    return implementingStateId
+  }
+
+  async #retryDispatchWriteback(
+    record: InFlightIssue,
+    issue: LinearIssue,
+    write: string,
+    apply: () => Promise<void>,
+    isApplied?: () => Promise<boolean>,
+  ): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= DISPATCH_WRITEBACK_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        if (isApplied && await isApplied()) return
+        await apply()
+        if (isApplied && !await isApplied()) {
+          throw new Error(`${write} returned without a provider read-back acknowledgement`)
+        }
+        return
+      } catch (error) {
+        lastError = error
+        const deadLettered = attempt === DISPATCH_WRITEBACK_MAX_ATTEMPTS
+        this.#increment('dispatchWritebackFailures')
+        record.dispatchClaim = {
+          state: 'degraded',
+          write,
+          attempts: attempt,
+          maxAttempts: DISPATCH_WRITEBACK_MAX_ATTEMPTS,
+          error: describeError(error).errorMessage,
+          ...(deadLettered ? { deadLettered: true } : {}),
+          updatedAtMs: this.#clock.now(),
+        }
+        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        await this.#writeDispatchClaimRegistry(record.issue)
+
+        if (deadLettered) {
+          this.#increment('dispatchWritebackDeadLetters')
+          this.#logger.error?.('[factory] dispatch writeback dead-lettered after retries exhausted', {
+            issue: issue.key,
+            write,
+            attempts: attempt,
+            error: describeError(error).errorMessage,
+          })
+          throw error
+        }
+
+        this.#increment('dispatchWritebackRetries')
+        this.#logger.error?.('[factory] dispatch writeback failed; retrying', {
+          issue: issue.key,
+          write,
+          attempt,
+          maxAttempts: DISPATCH_WRITEBACK_MAX_ATTEMPTS,
+          retryMs: DISPATCH_WRITEBACK_RETRY_MS,
+          error: describeError(error).errorMessage,
+        })
+        await this.#clock.sleep(DISPATCH_WRITEBACK_RETRY_MS)
+      }
+    }
+    throw lastError
+  }
+
+  async #writeDispatchClaimRegistry(issue: IssueRef): Promise<void> {
+    try {
+      await this.#writeInFlightRegistry()
+    } catch (error) {
+      this.#increment('dispatchClaimRegistryWriteFailures')
+      this.#logger.error?.('[factory] failed to persist dispatch claim visibility', {
+        issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+    }
   }
 
   // Probes the GitHub issue sub-root at most once and caches the verdict so
@@ -6742,6 +6879,7 @@ export class FactoryLoop implements Factory {
         }
       }
       const fleetTracked = this.#fleet.trackedAgents?.().get(agentName)
+      const dispatchClaim = this.#dispatchClaimStatuses.get(issueKey(issue))
       agents.push({
         name: agentName,
         role: tracked.spec.role,
@@ -6751,12 +6889,16 @@ export class FactoryLoop implements Factory {
         processes,
         ...(fleetTracked?.invocationId ? { invocationId: fleetTracked.invocationId } : {}),
         ...(fleetTracked?.node ? { node: fleetTracked.node } : {}),
+        ...(dispatchClaim ? { dispatchClaim: { ...dispatchClaim } } : {}),
       })
     }
 
     if (!empty) {
       for (const record of (await this.#batch()).inFlight) {
         if (record.dryRun) continue
+        if (record.dispatchClaim) {
+          this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        }
         for (const [agentName, tracked] of record.agents) {
           await appendAgent(record.issue, agentName, tracked)
         }
@@ -17258,6 +17400,7 @@ const lifecycleFromInFlightRecord = (
   agents: [...record.agents].map(([name, tracked]) => ({ name, tracked: cloneTrackedAgent(tracked) })),
   invocationIds: [...record.invocationIds],
   result: record.result ? structuredClone(record.result) : undefined,
+  ...(record.dispatchClaim ? { dispatchClaim: { ...record.dispatchClaim } } : {}),
   ...(pullRequests.length > 0 ? { pullRequests: pullRequests.map((receipt) => ({ ...receipt })) } : {}),
   ...(pullRequest ? { pullRequest: { ...pullRequest } } : {}),
   ...(releaseReason ? { releaseReason } : {}),
@@ -17272,6 +17415,7 @@ const inFlightRecordFromLifecycle = (lifecycle: DispatchLifecycle): InFlightIssu
   agents: new Map(lifecycle.agents.map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)])),
   invocationIds: new Set(lifecycle.invocationIds),
   result: lifecycle.result ? structuredClone(lifecycle.result) : undefined,
+  ...(lifecycle.dispatchClaim ? { dispatchClaim: { ...lifecycle.dispatchClaim } } : {}),
 })
 
 const dispatchResultFromLifecycle = (lifecycle: DispatchLifecycle): DispatchResult =>

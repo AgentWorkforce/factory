@@ -7,7 +7,7 @@ import type {
   QueuedIssue,
   TrackedAgent,
 } from '../orchestrator/batch-tracker'
-import type { IssueRef, TriageDecision } from '../types'
+import type { FactoryDispatchClaimStatus, IssueRef, TriageDecision } from '../types'
 import type { RunCostTotal } from '../cost/ledger'
 
 export type CriticalRecord = { issue: IssueRef; input: SendInput }
@@ -229,6 +229,8 @@ export type DispatchLifecycle = {
   agents: DispatchLifecycleAgent[]
   invocationIds: string[]
   result?: import('../types').DispatchResult
+  /** Durable provider claim status retained across dispatch-owner restarts. */
+  dispatchClaim?: FactoryDispatchClaimStatus
   /** All repository-specific PR receipts for team dispatches. `pullRequest` remains the primary receipt for compatibility. */
   pullRequests?: import('./mount').GithubPublishPullRequestResult[]
   pullRequest?: import('./mount').GithubPublishPullRequestResult

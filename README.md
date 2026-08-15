@@ -143,6 +143,19 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 | `factory intake notion <manifest>` | Normalize ready specs from a read-only Notion mount into GitHub lifecycle issues or exact-path fleet work. Honors `--dry-run`. |
 
+`factory status` includes `inFlightDispatches`, grouped by issue with agent
+names and the provider-claim state (`pending`, `verified`, or `degraded`). This
+view is read from Factory's local in-flight registry, so it remains available
+when GitHub lifecycle writeback is the degraded subsystem.
+
+Dispatch lifecycle writes are claim-critical. Factory applies the
+`factory:in-progress` label/state before the dispatch comment, confirms the
+GitHub label by provider read-back, and retries either write three times. An
+exhausted write is logged at error level as dead-lettered, recorded as a
+degraded claim in the registry, and fails the dispatch instead of reporting a
+clean dispatch with missing GitHub state. Durable lifecycle recovery repeats
+the same label-and-comment claim without respawning acknowledged agents.
+
 Global options work anywhere in the args: `--config <path>`, `--dry-run`,
 `--backend <internal|relay>`, and `--agent-exit-timeout <ms>`. The internal
 backend reuses a relay broker that's already running for your workspace, and

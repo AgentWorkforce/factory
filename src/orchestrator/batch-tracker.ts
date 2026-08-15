@@ -1,5 +1,5 @@
 import type { AgentSpec, SpawnResult } from '../ports'
-import type { DispatchResult, IssueRef, TriageDecision } from '../types'
+import type { DispatchResult, FactoryDispatchClaimStatus, IssueRef, TriageDecision } from '../types'
 import { githubRepositoriesMatch } from '../github/repo-identity'
 
 export interface TrackedAgent {
@@ -17,6 +17,7 @@ export interface InFlightIssue {
   agents: Map<string, TrackedAgent>
   invocationIds: Set<string>
   result?: DispatchResult
+  dispatchClaim?: FactoryDispatchClaimStatus
 }
 
 export interface QueuedIssue {

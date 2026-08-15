@@ -223,6 +223,10 @@ export class GhCliGithubWriteback implements GithubWriteback {
       if (editArgs.length > 5) {
         await this.#run(editArgs)
       }
+      const confirmed = await this.#issueLabels(ref)
+      if (confirmed.has(inProgress.name.toLowerCase())) {
+        throw new Error(`GitHub writeback did not confirm removal of ${inProgress.name} on ${ref.repo}#${ref.number}`)
+      }
       return
     }
     const target = STATUS_LABELS[status]
@@ -256,6 +260,11 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (editArgs.length > 5) {
       await this.#run(editArgs)
     }
+    const confirmed = await this.#issueLabels(ref)
+    if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
+      return
+    }
+    throw new Error(`GitHub writeback did not confirm ${target.name} on ${ref.repo}#${ref.number}`)
   }
 
   async #issueLabels(ref: { repo: string; number: number }): Promise<Set<string>> {

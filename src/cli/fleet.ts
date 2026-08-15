@@ -34,6 +34,7 @@ import {
   reapFactoryOrphansOnce,
   reapFactoryEnvironmentsOnce,
   readFactoryLoopHeartbeat,
+  readFactoryInFlightRegistry,
   resolveFactoryStates,
   stateResolutionFromIds,
   standaloneBabysitterAgentName,
@@ -42,6 +43,8 @@ import {
   type Capability,
   type Factory,
   type FactoryEventReporter,
+  type FactoryInFlightDispatchStatus,
+  type FactoryInFlightRegistry,
   type FactoryConfig,
   type IterationReport,
   type FleetBackend,
@@ -733,7 +736,13 @@ async function runFactoryCommand(
       return 0
     }
     if (command.action === 'status') {
-      writeJson(out, await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs))
+      writeJson(out, await factoryStatusWithMountHealth(
+        factory,
+        mount,
+        config.loop.heartbeatPath,
+        config.loop.registryPath,
+        config.loop.heartbeatStaleMs,
+      ))
       return 0
     }
     if (command.action === 'loop-status') {
@@ -764,7 +773,13 @@ async function runFactoryCommand(
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
       writeJson(out, {
         reports,
-        status: await factoryStatusWithMountHealth(factory, mount, config.loop.heartbeatPath, config.loop.heartbeatStaleMs),
+        status: await factoryStatusWithMountHealth(
+          factory,
+          mount,
+          config.loop.heartbeatPath,
+          config.loop.registryPath,
+          config.loop.heartbeatStaleMs,
+        ),
       })
     } finally {
       removeSignalHandlers()
@@ -1051,6 +1066,7 @@ async function factoryStatusWithMountHealth(
   factory: Factory,
   mount: MountClient,
   heartbeatPath: string,
+  registryPath: string,
   heartbeatStaleMs: number,
 ): Promise<ReturnType<Factory['status']> & {
   localMountDegraded?: boolean
@@ -1065,7 +1081,16 @@ async function factoryStatusWithMountHealth(
   }
 }> {
   const status = factory.status()
-  const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+  const [heartbeat, registry] = await Promise.all([
+    readFactoryLoopHeartbeat(heartbeatPath),
+    readFactoryInFlightRegistry(registryPath),
+  ])
+  const registryDispatches = registry?.heartbeatPath && registry.heartbeatPath !== heartbeatPath
+    ? []
+    : inFlightDispatchesFromRegistry(registry)
+  const observableStatus = registryDispatches.length > 0
+    ? { ...status, inFlightDispatches: registryDispatches }
+    : status
   const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
@@ -1077,9 +1102,9 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...status, eventListener }
+  if (!health) return { ...observableStatus, eventListener }
   return {
-    ...status,
+    ...observableStatus,
     eventListener,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
@@ -1091,6 +1116,49 @@ async function factoryStatusWithMountHealth(
       ...(health.localDir ? { root: health.localDir } : {}),
     },
   }
+}
+
+function inFlightDispatchesFromRegistry(
+  registry: FactoryInFlightRegistry | undefined,
+): FactoryInFlightDispatchStatus[] {
+  if (!registry) return []
+  const grouped = new Map<string, FactoryInFlightDispatchStatus>()
+  const claimPriority = { verified: 0, pending: 1, degraded: 2 } as const
+
+  for (const agent of registry.agents) {
+    if (!agent.issue) continue
+    const key = `${agent.issue.key}\u0000${agent.issue.uuid}\u0000${agent.issue.path}`
+    const claim = agent.dispatchClaim ?? {
+      state: 'pending' as const,
+      updatedAtMs: registry.updatedAtMs,
+    }
+    const existing = grouped.get(key)
+    const entry = existing ?? {
+      issue: { ...agent.issue },
+      agents: [],
+      claim: { ...claim },
+    }
+    if (claimPriority[claim.state] > claimPriority[entry.claim.state]) {
+      entry.claim = { ...claim }
+    }
+    if (!entry.agents.some((candidate) => candidate.name === agent.name)) {
+      entry.agents.push({
+        name: agent.name,
+        ...(agent.role ? { role: agent.role } : {}),
+        ...(agent.sessionRef ? { sessionRef: agent.sessionRef } : {}),
+        ...(agent.invocationId ? { invocationId: agent.invocationId } : {}),
+        ...(agent.node ? { node: agent.node } : {}),
+      })
+    }
+    grouped.set(key, entry)
+  }
+
+  return [...grouped.values()]
+    .map((entry) => ({
+      ...entry,
+      agents: entry.agents.sort((left, right) => left.name.localeCompare(right.name)),
+    }))
+    .sort((left, right) => left.issue.key.localeCompare(right.issue.key))
 }
 
 function writeMountRefreshSummary(
@@ -1888,6 +1956,7 @@ async function issueProjectionStatus(
     factory,
     mount,
     config.loop.heartbeatPath,
+    config.loop.registryPath,
     config.loop.heartbeatStaleMs,
   )
   const githubConnection = mount.integrationConnections
