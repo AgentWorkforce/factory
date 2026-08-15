@@ -1,15 +1,15 @@
 version: '1.1'
-updated: '2026-08-07'
+updated: '2026-08-15'
 catalog:
   category_count: 25
-  feature_count: 313
+  feature_count: 315
   tier_counts:
     1: 48
-    2: 125
+    2: 126
     3: 11
     4: 52
     5: 62
-    6: 15
+    6: 16
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
 #
@@ -813,6 +813,20 @@ categories:
         description: Keep an issue in flight while its matching pull request remains a draft
         location: src/orchestrator/factory.ts
         verify_tier: 5
+
+      - id: pr-trajectory-pointer
+        name: Pull Request Trajectory Pointer
+        api: Factory.dispatch()
+        description: Emit the ruled trajectory pointer on every Factory-opened pull request, populating session_ref from the originating prompt session captured at dispatch admission and preserved across implementer, reviewer, and babysitter handoffs
+        location: src/trajectory.ts, src/orchestrator/factory.ts, src/dispatch/templates.ts
+        verify_tier: 6
+
+      - id: pr-trajectory-missing-ref-report
+        name: Unresolvable Trajectory Reference Reporting
+        api: Factory.status()
+        description: Reject placeholder and unsafe session references, disclose the unresolved state in the emitted pointer instead of shipping a placeholder, and surface every affected pull request at error level in factory status
+        location: src/trajectory.ts, src/orchestrator/factory.ts, src/cli/fleet.ts
+        verify_tier: 2
 
       - id: pr-babysitter-opt-in
         name: Event-Driven PR Babysitter
