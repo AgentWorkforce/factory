@@ -2,13 +2,13 @@ version: '1.1'
 updated: '2026-08-07'
 catalog:
   category_count: 25
-  feature_count: 313
+  feature_count: 316
   tier_counts:
     1: 48
     2: 125
     3: 11
     4: 52
-    5: 62
+    5: 65
     6: 15
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
@@ -414,6 +414,27 @@ categories:
         api: dispatchRelayflowForChangeEvent()
         description: Normalize provider change events, resolve registered trigger policies, and run the selected Relayflow
         location: src/dispatch/relayflow-registry.ts, src/orchestrator/factory.ts
+        verify_tier: 5
+
+      - id: discovery-incremental-checkpoint
+        name: Incremental Discovery Tree Checkpoint
+        api: Factory.runOnce()
+        description: Reuse a durable per-prefix issue tree checkpoint advanced from the Relayfile change feed, so a sweep over an unchanged tree issues no repeated per-repository listTree calls and a change-window gap falls back to one full refresh
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/
+        verify_tier: 5
+
+      - id: discovery-overload-backoff
+        name: Relayfile Overload Discovery Backoff
+        api: Factory.runOnce()
+        description: Treat a 429 durable_object_overloaded response as sweep back-pressure by pausing for at least retryAfterSeconds, escalating exponentially per consecutive overload, and persisting the backoff so other processes also defer
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/
+        verify_tier: 5
+
+      - id: discovery-sweep-lease
+        name: Non-Overlapping Discovery Sweep Lease
+        api: Factory.runOnce()
+        description: Serialize discovery with an in-process coalescing guard and a renewed durable fencing lease, so a second sweep cannot start while one is in flight and a lost lease stops further tree requests instead of committing a checkpoint
+        location: src/orchestrator/factory.ts, src/ports/state.ts, src/state/
         verify_tier: 5
 
   triage-routing:
@@ -1423,7 +1444,7 @@ categories:
       - id: api-state-stores
         name: State Store API
         api: InMemoryStateStore / FileStateStore
-        description: Persist batch, retry, critical delivery, human-loop, handoff, and canonical-state records
+        description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records
         location: src/ports/state.ts, src/state/
         verify_tier: 1
 
