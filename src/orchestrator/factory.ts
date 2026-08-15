@@ -36,6 +36,8 @@ import type {
   DispatchLifecycleAgentUsage,
   DispatchLifecycle,
   DispatchLifecyclePhase,
+  DiscoveryCheckpoint,
+  DiscoverySweepClaim,
   GithubIssueCommentWatchPending,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
@@ -140,6 +142,14 @@ type ResolvedIssuePr = {
   path?: string
 }
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
+type DiscoveryHighWatermarkResult = { available: boolean; highWatermark?: string }
+type DiscoverySession = {
+  checkpoint: DiscoveryCheckpoint
+  mode: 'full' | 'incremental'
+  highWatermarkAvailable: boolean
+  observedHighWatermark?: string
+  listedPrefixes: Set<string>
+}
 type PreparedLiveEvent = { path?: string; dispatchRelayflow: boolean }
 type GithubPullRequestPublisher = Pick<GithubConnectionWrite, 'publishPullRequest'>
 type GithubPullRequestIdentity = 'app' | 'user'
@@ -375,6 +385,10 @@ const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
+const DISCOVERY_SWEEP_LEASE_MS = 5 * 60_000
+const DISCOVERY_SWEEP_RENEW_MS = 30_000
+const DISCOVERY_CHANGE_EVENT_LIMIT = 1_000
+const DISCOVERY_OVERLOAD_BACKOFF_MAX_MS = 5 * 60_000
 const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
@@ -523,6 +537,7 @@ export class FactoryLoop implements Factory {
   readonly #clarificationWakeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #clarificationWakeOwner = `${process.pid}:${randomUUID()}`
   readonly #dispatchLifecycleOwner = `${process.pid}:${randomUUID()}`
+  readonly #discoverySweepOwner = `${process.pid}:${randomUUID()}`
   readonly #dispatchLifecycleEpochs = new Map<string, number>()
   readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -634,6 +649,12 @@ export class FactoryLoop implements Factory {
   // undefined = readiness not yet probed; resolved lazily so the standalone
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
+  #runOnceInFlight?: Promise<IterationReport>
+  #discoverySession?: DiscoverySession
+  #discoverySweepEpoch?: number
+  #discoverySweepRenewTimer?: ReturnType<typeof setInterval>
+  #discoverySweepLeaseLost = false
+  #discoveryOverloadError?: unknown
   #resolvedIssueSource?: IssueSource
   #integrationInstructions?: string
   #integrationInstructionsRefresh?: Promise<string | undefined>
@@ -1970,6 +1991,122 @@ export class FactoryLoop implements Factory {
   }
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
+    if (this.#runOnceInFlight) {
+      this.#increment('discoverySweepsCoalesced')
+      this.#logger.info?.('[factory] coalesced overlapping discovery request into the in-flight sweep')
+      return await this.#runOnceInFlight
+    }
+    const sweep = this.#runOnceWithDiscoveryFence(opts)
+    this.#runOnceInFlight = sweep
+    try {
+      return await sweep
+    } finally {
+      if (this.#runOnceInFlight === sweep) this.#runOnceInFlight = undefined
+    }
+  }
+
+  async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
+    let claim = await this.#state.claimDiscoverySweep(
+      this.#workspaceId,
+      this.#discoverySweepOwner,
+      this.#clock.now(),
+      DISCOVERY_SWEEP_LEASE_MS,
+    )
+    if (!claim.acquired && claim.reason === 'backoff') {
+      const delayMs = Math.max(0, claim.state.backoffUntilMs - this.#clock.now())
+      this.#increment('discoveryBackoffWaits')
+      this.#logger.warn?.('[factory] discovery sweep waiting for Relayfile overload backoff', {
+        delayMs,
+        backoffUntilMs: claim.state.backoffUntilMs,
+        consecutiveOverloads: claim.state.consecutiveOverloads,
+      })
+      await this.#clock.sleep(delayMs)
+      claim = await this.#state.claimDiscoverySweep(
+        this.#workspaceId,
+        this.#discoverySweepOwner,
+        this.#clock.now(),
+        DISCOVERY_SWEEP_LEASE_MS,
+      )
+    }
+    if (!claim.acquired || !claim.lease) {
+      this.#increment('discoverySweepsSkippedInFlight')
+      this.#logger.info?.('[factory] skipped discovery because another process owns the sweep lease', {
+        leaseUntilMs: claim.state.lease?.leaseUntilMs,
+      })
+      return {
+        pulled: [],
+        triaged: [],
+        dispatched: [],
+        skipped: [],
+        dryRun: opts.dryRun ?? this.#config.dryRun,
+        discoveryDeferred: 'sweep-in-flight',
+      }
+    }
+
+    this.#discoverySweepEpoch = claim.lease.epoch
+    this.#discoverySweepLeaseLost = false
+    this.#discoveryOverloadError = undefined
+    this.#startDiscoverySweepRenewal(claim.lease.epoch)
+    let leaseReleased = false
+    try {
+      this.#discoverySession = await this.#prepareDiscoverySession(claim)
+      const report = await this.#performRunOnce(opts)
+      if (this.#discoveryOverloadError) throw this.#discoveryOverloadError
+      const checkpoint = await this.#finalizeDiscoveryCheckpoint()
+      if (this.#discoverySweepLeaseLost) {
+        throw new Error('discovery sweep lease was lost before checkpoint commit')
+      }
+      const completed = await this.#state.completeDiscoverySweep(
+        this.#workspaceId,
+        this.#discoverySweepOwner,
+        claim.lease.epoch,
+        checkpoint,
+      )
+      leaseReleased = completed
+      if (!completed) throw new Error('discovery sweep lease was lost before completion')
+      return report
+    } catch (error) {
+      const overload = relayfileOverload(error)
+      if (overload) {
+        const consecutiveOverloads = claim.state.consecutiveOverloads + 1
+        const delayMs = discoveryOverloadBackoffMs(overload.retryAfterSeconds, consecutiveOverloads)
+        const backoffUntilMs = this.#clock.now() + delayMs
+        leaseReleased = await this.#state.deferDiscoverySweep(
+          this.#workspaceId,
+          this.#discoverySweepOwner,
+          claim.lease.epoch,
+          backoffUntilMs,
+          consecutiveOverloads,
+        )
+        this.#increment('discoveryOverloadBackoffs')
+        this.#logger.warn?.('[factory] Relayfile discovery overloaded; backing off before another sweep', {
+          status: overload.status,
+          reason: overload.reason,
+          retryAfterSeconds: overload.retryAfterSeconds,
+          delayMs,
+          backoffUntilMs,
+          consecutiveOverloads,
+        })
+        await this.#clock.sleep(delayMs)
+      }
+      throw error
+    } finally {
+      if (this.#discoverySweepRenewTimer) clearInterval(this.#discoverySweepRenewTimer)
+      this.#discoverySweepRenewTimer = undefined
+      this.#discoverySession = undefined
+      this.#discoverySweepEpoch = undefined
+      this.#discoveryOverloadError = undefined
+      if (!leaseReleased) {
+        await this.#state.releaseDiscoverySweep(
+          this.#workspaceId,
+          this.#discoverySweepOwner,
+          claim.lease.epoch,
+        )
+      }
+    }
+  }
+
+  async #performRunOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const startedAtMs = this.#clock.now()
     const relayfileWaitWarningsAtStart = this.#counters.relayfileOperationWaitWarnings ?? 0
@@ -2153,6 +2290,223 @@ export class FactoryLoop implements Factory {
           relayfileSlowOperations: (this.#counters.relayfileSlowOperations ?? 0) - relayfileSlowOperationsAtStart,
           relayfileOperationFailures: (this.#counters.relayfileOperationFailures ?? 0) - relayfileOperationFailuresAtStart,
         })
+      }
+    }
+  }
+
+  #startDiscoverySweepRenewal(epoch: number): void {
+    let renewalInFlight = false
+    this.#discoverySweepRenewTimer = setInterval(() => {
+      if (renewalInFlight || this.#discoverySweepLeaseLost) return
+      renewalInFlight = true
+      void this.#state.renewDiscoverySweep(
+        this.#workspaceId,
+        this.#discoverySweepOwner,
+        epoch,
+        this.#clock.now(),
+        DISCOVERY_SWEEP_LEASE_MS,
+      ).then((renewed) => {
+        if (!renewed && this.#discoverySweepEpoch === epoch) {
+          this.#discoverySweepLeaseLost = true
+          this.#increment('discoverySweepLeaseLosses')
+          this.#logger.warn?.('[factory] discovery sweep lease renewal was rejected; fencing further tree requests')
+        }
+      }).catch((error: unknown) => {
+        this.#logger.warn?.('[factory] discovery sweep lease renewal failed; retaining the current lease window', {
+          error: describeError(error).errorMessage,
+        })
+      }).finally(() => {
+        renewalInFlight = false
+      })
+    }, DISCOVERY_SWEEP_RENEW_MS)
+    this.#discoverySweepRenewTimer.unref?.()
+  }
+
+  async #prepareDiscoverySession(claim: DiscoverySweepClaim): Promise<DiscoverySession> {
+    const checkpoint = structuredClone(claim.state.checkpoint ?? {
+      trees: {},
+      updatedAtMs: 0,
+    })
+    const watermark = await this.#discoveryHighWatermark()
+    if (!watermark.available) {
+      this.#increment('discoveryIncrementalUnavailable')
+      return {
+        checkpoint,
+        mode: 'full',
+        highWatermarkAvailable: false,
+        listedPrefixes: new Set(),
+      }
+    }
+
+    if (claim.state.checkpoint) {
+      if (watermark.highWatermark === checkpoint.highWatermark) {
+        this.#increment('discoveryIncrementalUnchangedSweeps')
+        this.#logger.info?.('[factory] discovery checkpoint unchanged; reusing cached issue trees', {
+          highWatermark: watermark.highWatermark,
+          cachedPrefixes: Object.keys(checkpoint.trees).length,
+        })
+        return {
+          checkpoint,
+          mode: 'incremental',
+          highWatermarkAvailable: true,
+          observedHighWatermark: watermark.highWatermark,
+          listedPrefixes: new Set(),
+        }
+      }
+
+      const changes = await this.#discoveryEventsSince(checkpoint.highWatermark, watermark.highWatermark)
+      if (changes) {
+        this.#applyDiscoveryEvents(checkpoint, changes)
+        this.#increment('discoveryIncrementalChangedSweeps')
+        this.#logger.info?.('[factory] updated discovery checkpoint from Relayfile changes', {
+          previousHighWatermark: checkpoint.highWatermark,
+          highWatermark: watermark.highWatermark,
+          changes: changes.length,
+          cachedPrefixes: Object.keys(checkpoint.trees).length,
+        })
+        return {
+          checkpoint,
+          mode: 'incremental',
+          highWatermarkAvailable: true,
+          observedHighWatermark: watermark.highWatermark,
+          listedPrefixes: new Set(),
+        }
+      }
+      this.#increment('discoveryIncrementalGapFallbacks')
+      this.#logger.warn?.('[factory] discovery change window did not cover the prior checkpoint; refreshing tree prefixes once', {
+        previousHighWatermark: checkpoint.highWatermark,
+        highWatermark: watermark.highWatermark,
+      })
+    }
+
+    // A missing change window means no retained prefix can be trusted. Start
+    // the fallback snapshot empty so prefixes not touched by the current
+    // configuration cannot resurface later with stale membership.
+    checkpoint.trees = {}
+    return {
+      checkpoint,
+      mode: 'full',
+      highWatermarkAvailable: true,
+      observedHighWatermark: watermark.highWatermark,
+      listedPrefixes: new Set(),
+    }
+  }
+
+  async #finalizeDiscoveryCheckpoint(): Promise<DiscoveryCheckpoint | undefined> {
+    const session = this.#discoverySession
+    if (!session?.highWatermarkAvailable) return undefined
+    const watermark = await this.#discoveryHighWatermark()
+    if (!watermark.available) return undefined
+    if (watermark.highWatermark !== session.observedHighWatermark) {
+      const changes = await this.#discoveryEventsSince(
+        session.observedHighWatermark,
+        watermark.highWatermark,
+      )
+      if (!changes) {
+        this.#increment('discoveryCheckpointCommitGaps')
+        this.#logger.warn?.('[factory] discovery checkpoint not saved because its change window overflowed during the sweep')
+        return undefined
+      }
+      this.#applyDiscoveryEvents(session.checkpoint, changes)
+    }
+    session.checkpoint.highWatermark = watermark.highWatermark
+    session.checkpoint.updatedAtMs = this.#clock.now()
+    for (const [prefix, paths] of Object.entries(session.checkpoint.trees)) {
+      session.checkpoint.trees[prefix] = [...new Set(paths)].sort()
+    }
+    return structuredClone(session.checkpoint)
+  }
+
+  async #discoveryHighWatermark(): Promise<DiscoveryHighWatermarkResult> {
+    if (!this.#mount.getEventHighWatermark) return { available: false }
+    try {
+      const highWatermark = await this.#mount.getEventHighWatermark()
+      // `undefined` also means that an older Relayfile client cannot expose a
+      // watermark. Treat it as unavailable so a compatibility fallback never
+      // turns into an indefinitely stale cache.
+      return highWatermark === undefined
+        ? { available: false }
+        : { available: true, highWatermark }
+    } catch (error) {
+      if (relayfileOverload(error)) throw error
+      this.#increment('discoveryHighWatermarkFailures')
+      this.#logger.warn?.('[factory] discovery high-watermark unavailable; using a full sweep without caching', {
+        error: describeError(error).errorMessage,
+      })
+      return { available: false }
+    }
+  }
+
+  async #discoveryEventsSince(
+    previousHighWatermark: string | undefined,
+    currentHighWatermark: string | undefined,
+  ): Promise<ChangeEvent[] | undefined> {
+    if (previousHighWatermark === currentHighWatermark) return []
+    if (!currentHighWatermark) return undefined
+    let events: ChangeEvent[]
+    try {
+      const page = await this.#mount.getEvents({
+        last: DISCOVERY_CHANGE_EVENT_LIMIT,
+        limit: DISCOVERY_CHANGE_EVENT_LIMIT,
+      })
+      events = [...page.events].sort(compareDiscoveryEvents)
+    } catch (error) {
+      if (relayfileOverload(error)) throw error
+      this.#logger.warn?.('[factory] discovery change feed unavailable; refreshing tree prefixes once', {
+        error: describeError(error).errorMessage,
+      })
+      return undefined
+    }
+
+    const currentIndex = events.findIndex((event) => discoveryEventId(event) === currentHighWatermark)
+    if (currentIndex < 0) return undefined
+    if (previousHighWatermark === undefined) {
+      return events.length < DISCOVERY_CHANGE_EVENT_LIMIT
+        ? events.slice(0, currentIndex + 1)
+        : undefined
+    }
+    const previousIndex = events.findIndex((event) => discoveryEventId(event) === previousHighWatermark)
+    if (previousIndex >= 0 && previousIndex <= currentIndex) {
+      return events.slice(previousIndex + 1, currentIndex + 1)
+    }
+
+    const previousSequence = eventSequenceNumber(previousHighWatermark)
+    const currentSequence = eventSequenceNumber(currentHighWatermark)
+    const sequenced = events.map((event) => ({ event, sequence: eventSequenceNumber(discoveryEventId(event) ?? '') }))
+    if (
+      previousSequence !== undefined &&
+      currentSequence !== undefined &&
+      sequenced.every((entry) => entry.sequence !== undefined) &&
+      sequenced.some((entry) => entry.sequence! <= previousSequence)
+    ) {
+      return sequenced
+        .filter((entry) => entry.sequence! > previousSequence && entry.sequence! <= currentSequence)
+        .map((entry) => entry.event)
+    }
+    return undefined
+  }
+
+  #applyDiscoveryEvents(checkpoint: DiscoveryCheckpoint, events: ChangeEvent[]): void {
+    for (const event of events) {
+      const path = changeEventPath(event)
+      if (!path) continue
+      const deletion = discoveryEventIsDeletion(event)
+      const indexRepoRoots = githubIssueIndexRepoRoots(path)
+      for (const [prefix, cachedPaths] of Object.entries(checkpoint.trees)) {
+        if (indexRepoRoots.some((root) => prefix === root || prefix.startsWith(`${root}/`))) {
+          delete checkpoint.trees[prefix]
+          continue
+        }
+        if (!path.startsWith(prefix)) continue
+        const paths = new Set(cachedPaths)
+        if (deletion) {
+          for (const candidate of paths) {
+            if (candidate === path || candidate.startsWith(`${path}/`)) paths.delete(candidate)
+          }
+        } else {
+          paths.add(path)
+        }
+        checkpoint.trees[prefix] = [...paths]
       }
     }
   }
@@ -2499,12 +2853,47 @@ export class FactoryLoop implements Factory {
   }
 
   async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
-    return this.#withRelayfileOperation('listTree', { phase, prefix }, () => this.#mount.listTree(prefix), {
+    if (this.#discoverySweepLeaseLost) {
+      throw new Error('discovery sweep lease was lost; refusing another tree request')
+    }
+    const cached = this.#cachedDiscoveryTree(prefix)
+    if (cached) {
+      this.#increment('discoveryTreeCacheHits')
+      this.#logger.debug?.('[factory] reused cached Relayfile tree', { phase, prefix, count: cached.length })
+      return cached
+    }
+    this.#increment('discoveryTreeCacheMisses')
+    const paths = await this.#withRelayfileOperation('listTree', { phase, prefix }, () => this.#mount.listTree(prefix), {
       count: (paths) => paths.length,
       logFailure: true,
       logStart: true,
       logComplete: true,
     })
+    await this.#rememberDiscoveryTree(prefix, paths)
+    return paths
+  }
+
+  #cachedDiscoveryTree(prefix: string): string[] | undefined {
+    const session = this.#discoverySession
+    if (!session) return undefined
+    if (session.mode === 'full' && !session.listedPrefixes.has(prefix)) return undefined
+    const paths = session.checkpoint.trees[prefix]
+    return paths ? [...paths] : undefined
+  }
+
+  async #rememberDiscoveryTree(prefix: string, paths: string[]): Promise<void> {
+    const session = this.#discoverySession
+    if (!session) return
+    const uniquePaths = new Set<string>()
+    for (let index = 0; index < paths.length; index += 1) {
+      uniquePaths.add(paths[index]!)
+      if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+        await this.#refreshLiveHeartbeatIfDue()
+        if (index + 1 < paths.length) await liveEventYield()
+      }
+    }
+    session.checkpoint.trees[prefix] = [...uniquePaths].sort()
+    session.listedPrefixes.add(prefix)
   }
 
   async #ensureRelayfileSubRoot(prefix: string, phase: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
@@ -2574,6 +2963,9 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
+      if (relayfileOverload(error) && this.#discoverySweepEpoch !== undefined) {
+        this.#discoveryOverloadError ??= error
+      }
       if (opts.logFailure || waitWarnings > 0) {
         this.#increment('relayfileOperationFailures')
         this.#logger.warn?.('[factory] relayfile operation failed', {
@@ -4818,19 +5210,30 @@ export class FactoryLoop implements Factory {
     try {
       const issuePaths = new Map<string, string>()
       for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
-        const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
         const roots = githubIssueRepoRoots(owner, repo)
+        const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
+        const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
+        const indexedPaths = allRootsCached
+          ? undefined
+          : await this.#githubIssuePathsFromIndex(owner, repo)
         // Keep the fallback roots as separate batches. Flattening a very large
         // provider result is synchronous work and can starve the durable loop
         // heartbeat before the bounded scan below gets a chance to yield.
-        const pathBatches = indexedPaths
-          ? [indexedPaths]
-          : await Promise.all(
-            roots.map(async (root) => await this.#listRelayfileTree(root, 'GitHub issue ingestion')),
-          )
-        if (indexedPaths) {
+        let pathBatches: string[][]
+        if (allRootsCached) {
+          pathBatches = cachedBatches
+          this.#increment('githubIssueDiscoveryCacheReposUsed')
+        } else if (indexedPaths) {
+          pathBatches = [indexedPaths]
+          for (const root of roots) {
+            await this.#rememberDiscoveryTree(root, indexedPaths.filter((path) => path.startsWith(root)))
+          }
           this.#increment('githubIssueIndexReposUsed')
         } else {
+          pathBatches = []
+          for (const root of roots) {
+            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion'))
+          }
           this.#increment('githubIssueIndexFallbacks')
         }
         for (const paths of pathBatches) {
@@ -4870,6 +5273,7 @@ export class FactoryLoop implements Factory {
       this.#githubIssuePathIndexReady = true
       return [...issuePaths.values()].sort()
     } catch (error) {
+      if (relayfileOverload(error)) throw error
       this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
@@ -4883,7 +5287,8 @@ export class FactoryLoop implements Factory {
     try {
       const { content } = await this.#readRelayfileFile(indexPath, 'GitHub issue index discovery')
       parsed = parseJsonContent(content)
-    } catch {
+    } catch (error) {
+      if (relayfileOverload(error)) throw error
       return undefined
     }
     if (!Array.isArray(parsed)) return undefined
@@ -4984,6 +5389,7 @@ export class FactoryLoop implements Factory {
       }
       this.#increment('githubIssueMirrorsCreated')
     } catch (error) {
+      if (relayfileOverload(error)) throw error
       this.#logger.error?.('[factory] failed to ingest GitHub issue', error)
     }
   }
@@ -5749,6 +6155,7 @@ export class FactoryLoop implements Factory {
       this.#indexDependencyIssue(resolvedIssue)
       return resolvedIssue
     } catch (error) {
+      if (relayfileOverload(error)) throw error
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
         this.#logger.debug?.('[factory] skipped missing issue file discovered from issue tree', { path })
@@ -16062,6 +16469,85 @@ const eventOccurredAtMs = (event: ChangeEvent): number | undefined => {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
+const discoveryEventId = (event: ChangeEvent): string | undefined => {
+  const flat = asRecord(event) ?? {}
+  const id = flat.id ?? flat.eventId ?? flat.event_id ?? flat.seq
+  return typeof id === 'string' || typeof id === 'number' ? String(id) : undefined
+}
+
+const compareDiscoveryEvents = (left: ChangeEvent, right: ChangeEvent): number => {
+  const leftOccurredAt = eventOccurredAtMs(left)
+  const rightOccurredAt = eventOccurredAtMs(right)
+  if (leftOccurredAt !== undefined && rightOccurredAt !== undefined && leftOccurredAt !== rightOccurredAt) {
+    return leftOccurredAt - rightOccurredAt
+  }
+  const leftId = discoveryEventId(left) ?? ''
+  const rightId = discoveryEventId(right) ?? ''
+  const leftSequence = eventSequenceNumber(leftId)
+  const rightSequence = eventSequenceNumber(rightId)
+  if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
+    return leftSequence - rightSequence
+  }
+  return leftId.localeCompare(rightId)
+}
+
+const discoveryEventIsDeletion = (event: ChangeEvent): boolean => {
+  const flat = asRecord(event) ?? {}
+  const summary = asRecord(flat.summary) ?? {}
+  const type = stringValue(flat.type)?.toLowerCase()
+  const action = stringValue(flat.action)?.toLowerCase()
+  const status = stringValue(summary.status)?.toLowerCase()
+  const digest = stringValue(flat.digest)?.toLowerCase()
+  return type === 'file.deleted' || type === 'dir.deleted' || action === 'delete' || status === 'deleted' ||
+    digest?.startsWith('deleted:') === true
+}
+
+const githubIssueIndexRepoRoots = (path: string): string[] => {
+  const slash = /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/_index\.json$/u.exec(path)
+  const flat = /^\/github\/repos\/([^/]+)__([^/]+)\/issues\/_index\.json$/u.exec(path)
+  const parts = slash ?? flat
+  if (!parts) return []
+  const [, owner, repo] = parts
+  return [
+    `/github/repos/${owner}/${repo}/issues`,
+    `/github/repos/${owner}__${repo}/issues`,
+  ]
+}
+
+type RelayfileOverload = {
+  status: number
+  reason: string
+  retryAfterSeconds?: number
+}
+
+const relayfileOverload = (error: unknown): RelayfileOverload | undefined => {
+  const flat = asRecord(error) ?? {}
+  const response = asRecord(flat.response) ?? {}
+  const data = asRecord(flat.data) ?? asRecord(response.data) ?? {}
+  const details = asRecord(flat.details) ?? asRecord(data.details) ?? {}
+  const statusValue = flat.status ?? flat.statusCode ?? response.status ?? response.statusCode
+  const status = typeof statusValue === 'number' ? statusValue : Number(statusValue)
+  if (status !== 429) return undefined
+  const retryValue = flat.retryAfterSeconds ?? details.retryAfterSeconds ?? data.retryAfterSeconds
+  const parsedRetry = typeof retryValue === 'number' ? retryValue : Number(retryValue)
+  const retryAfterSeconds = Number.isFinite(parsedRetry) && parsedRetry >= 0 ? parsedRetry : undefined
+  const reason = stringValue(flat.reason) ?? stringValue(details.reason) ?? stringValue(data.reason) ??
+    stringValue(flat.code) ?? stringValue(data.code) ?? 'rate_limited'
+  return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
+}
+
+const discoveryOverloadBackoffMs = (
+  retryAfterSeconds: number | undefined,
+  consecutiveOverloads: number,
+): number => {
+  const retryAfterMs = Math.max(0, Math.ceil((retryAfterSeconds ?? 0) * 1_000))
+  const exponentialMs = Math.min(
+    DISCOVERY_OVERLOAD_BACKOFF_MAX_MS,
+    5_000 * (2 ** Math.min(10, Math.max(0, consecutiveOverloads - 1))),
+  )
+  return Math.max(retryAfterMs, exponentialMs)
+}
+
 const eventSequenceNumber = (eventId: string): number | undefined => {
   const whole = Number(eventId)
   if (Number.isFinite(whole)) return whole
@@ -16186,7 +16672,8 @@ const eventIdentity = (event: ChangeEvent): string | undefined => {
 // subscription/poll handler) crash-loops. Returns undefined for such events so
 // callers skip them and keep processing the well-formed ones.
 export const changeEventPath = (event: ChangeEvent): string | undefined => {
-  const path = (event as { resource?: { path?: unknown } } | undefined)?.resource?.path
+  const candidate = event as ({ resource?: { path?: unknown }; path?: unknown } | undefined)
+  const path = candidate?.resource?.path ?? candidate?.path
   return typeof path === 'string' && path ? path : undefined
 }
 

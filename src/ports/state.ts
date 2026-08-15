@@ -148,6 +148,37 @@ export type DispatchAttemptState = {
   backoffUntilMs: number
 }
 
+/**
+ * Durable discovery snapshot. Tree entries are keyed by the exact prefix
+ * passed to Relayfile so a later process can update them from the change feed
+ * without re-enumerating every configured repository.
+ */
+export type DiscoveryCheckpoint = {
+  highWatermark?: string
+  trees: Record<string, string[]>
+  updatedAtMs: number
+}
+
+export type DiscoverySweepState = {
+  checkpoint?: DiscoveryCheckpoint
+  consecutiveOverloads: number
+  backoffUntilMs: number
+  /** Monotonic fencing token retained after a lease is released. */
+  lastEpoch: number
+  lease?: {
+    owner: string
+    epoch: number
+    leaseUntilMs: number
+  }
+}
+
+export type DiscoverySweepClaim = {
+  acquired: boolean
+  reason?: 'in-flight' | 'backoff'
+  state: DiscoverySweepState
+  lease?: NonNullable<DiscoverySweepState['lease']>
+}
+
 export type DispatchLifecyclePhase =
   | 'queued'
   | 'dispatching'
@@ -287,6 +318,34 @@ export interface StateStore {
   recordDispatchAttempt(workspaceId: string, issueKey: string, attempt: DispatchAttemptState): Promise<void>
   getDispatchAttempts(workspaceId: string, issueKey: string): Promise<DispatchAttemptState | undefined>
   releaseInFlight(workspaceId: string, issueKey: string): Promise<void>
+
+  claimDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepClaim>
+  renewDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean>
+  completeDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint?: DiscoveryCheckpoint,
+  ): Promise<boolean>
+  deferDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    backoffUntilMs: number,
+    consecutiveOverloads: number,
+  ): Promise<boolean>
+  releaseDiscoverySweep(workspaceId: string, owner: string, epoch: number): Promise<void>
 
   claimDispatchLifecycle(
     workspaceId: string,

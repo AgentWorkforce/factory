@@ -14,6 +14,9 @@ import type {
   GithubIssueCommentWatchState,
   ConversationMessage,
   ConversationSessionState,
+  DiscoveryCheckpoint,
+  DiscoverySweepClaim,
+  DiscoverySweepState,
   WaitingClarification,
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
@@ -26,6 +29,7 @@ type PersistedWorkspaceState = {
   babysitterGenerations: Record<string, BabysitterGenerationRecord>
   conversationSessions: Record<string, ConversationSessionState>
   dispatchLifecycles: Record<string, DispatchLifecycle>
+  discoverySweep: DiscoverySweepState
 }
 
 type WatchStateDocument = {
@@ -64,6 +68,101 @@ export class FileStateStore extends InMemoryStateStore {
     super(options)
     this.#watchStatePath = options.watchStatePath
     this.#batchSize = options.batchSize
+  }
+
+  override async claimDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepClaim> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      const state = workspace.discoverySweep
+      if (state.backoffUntilMs > nowMs) {
+        return { acquired: false, reason: 'backoff', state: cloneDiscoverySweepState(state) }
+      }
+      if (state.lease && state.lease.leaseUntilMs > nowMs) {
+        return { acquired: false, reason: 'in-flight', state: cloneDiscoverySweepState(state) }
+      }
+      const epoch = state.lastEpoch + 1
+      state.lastEpoch = epoch
+      state.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+      await this.#persist(document)
+      return {
+        acquired: true,
+        state: cloneDiscoverySweepState(state),
+        lease: { ...state.lease },
+      }
+    }))
+  }
+
+  override async renewDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const state = document.workspaces[workspaceId]?.discoverySweep
+      if (!state || !discoveryLeaseMatches(state, owner, epoch) || state.lease!.leaseUntilMs <= nowMs) return false
+      state.lease!.leaseUntilMs = nowMs + leaseMs
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async completeDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint?: DiscoveryCheckpoint,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const state = document.workspaces[workspaceId]?.discoverySweep
+      if (!state || !discoveryLeaseMatches(state, owner, epoch)) return false
+      state.checkpoint = checkpoint ? cloneDiscoveryCheckpoint(checkpoint) : undefined
+      state.consecutiveOverloads = 0
+      state.backoffUntilMs = 0
+      delete state.lease
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async deferDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    backoffUntilMs: number,
+    consecutiveOverloads: number,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const state = document.workspaces[workspaceId]?.discoverySweep
+      if (!state || !discoveryLeaseMatches(state, owner, epoch)) return false
+      state.backoffUntilMs = backoffUntilMs
+      state.consecutiveOverloads = consecutiveOverloads
+      delete state.lease
+      await this.#persist(document)
+      return true
+    }))
+  }
+
+  override async releaseDiscoverySweep(workspaceId: string, owner: string, epoch: number): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const state = document.workspaces[workspaceId]?.discoverySweep
+      if (!state || !discoveryLeaseMatches(state, owner, epoch)) return
+      delete state.lease
+      const workspace = document.workspaces[workspaceId]!
+      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+    }))
   }
 
   override async claimDispatchLifecycle(
@@ -978,13 +1077,15 @@ const parseDocument = (value: unknown): WatchStateDocument => {
       const generations = rawWorkspace.babysitterGenerations
       const conversations = rawWorkspace.conversationSessions
       const lifecycles = rawWorkspace.dispatchLifecycles
+      const discoverySweep = rawWorkspace.discoverySweep
       if (
         !isRecord(watches) ||
         !isRecord(clarifications) ||
         (babysitters !== undefined && !isRecord(babysitters)) ||
         (generations !== undefined && !isRecord(generations)) ||
         (conversations !== undefined && !isRecord(conversations)) ||
-        (lifecycles !== undefined && !isRecord(lifecycles))
+        (lifecycles !== undefined && !isRecord(lifecycles)) ||
+        (discoverySweep !== undefined && !isRecord(discoverySweep))
       ) {
         throw new Error('Factory GitHub watch state file is invalid')
       }
@@ -995,6 +1096,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         babysitterGenerations: parseBabysitterGenerations(generations ?? {}),
         conversationSessions: parseConversationSessions(conversations ?? {}),
         dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
+        discoverySweep: parseDiscoverySweepState(discoverySweep),
       }
     }
     return { version: 3, workspaces }
@@ -1016,6 +1118,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         babysitterGenerations: {},
         conversationSessions: {},
         dispatchLifecycles: {},
+        discoverySweep: emptyDiscoverySweepState(),
       }
     }
     return { version: 3, workspaces }
@@ -1033,6 +1136,7 @@ const parseDocument = (value: unknown): WatchStateDocument => {
         babysitterGenerations: {},
         conversationSessions: {},
         dispatchLifecycles: {},
+        discoverySweep: emptyDiscoverySweepState(),
       }
     }
     return { version: 3, workspaces }
@@ -1054,6 +1158,42 @@ const cloneBabysitterGeneration = (record: BabysitterGenerationRecord): Babysitt
 
 const cloneConversationSession = (session: ConversationSessionState): ConversationSessionState =>
   structuredClone(session)
+
+const cloneDiscoveryCheckpoint = (checkpoint: DiscoveryCheckpoint): DiscoveryCheckpoint =>
+  structuredClone(checkpoint)
+
+const cloneDiscoverySweepState = (state: DiscoverySweepState): DiscoverySweepState =>
+  structuredClone(state)
+
+const discoveryLeaseMatches = (state: DiscoverySweepState, owner: string, epoch: number): boolean =>
+  state.lease?.owner === owner && state.lease.epoch === epoch
+
+const emptyDiscoverySweepState = (): DiscoverySweepState => ({
+  consecutiveOverloads: 0,
+  backoffUntilMs: 0,
+  lastEpoch: 0,
+})
+
+const parseDiscoverySweepState = (value: unknown): DiscoverySweepState => {
+  if (value === undefined) return emptyDiscoverySweepState()
+  if (!isRecord(value)) throw new Error('Factory GitHub watch state file is invalid')
+  const checkpoint = value.checkpoint
+  const lease = value.lease
+  const lastEpoch = value.lastEpoch ?? (isRecord(lease) ? lease.epoch : 0)
+  if (
+    !Number.isSafeInteger(value.consecutiveOverloads) || (value.consecutiveOverloads as number) < 0 ||
+    !Number.isSafeInteger(value.backoffUntilMs) ||
+    !Number.isSafeInteger(lastEpoch) || (lastEpoch as number) < 0 ||
+    (lease !== undefined && (!isRecord(lease) || typeof lease.owner !== 'string' ||
+      !Number.isSafeInteger(lease.epoch) || !Number.isSafeInteger(lease.leaseUntilMs))) ||
+    (checkpoint !== undefined && (!isRecord(checkpoint) || !isRecord(checkpoint.trees) ||
+      !Number.isSafeInteger(checkpoint.updatedAtMs) ||
+      (checkpoint.highWatermark !== undefined && typeof checkpoint.highWatermark !== 'string') ||
+      !Object.values(checkpoint.trees).every((paths) =>
+        Array.isArray(paths) && paths.every((path) => typeof path === 'string'))))
+  ) throw new Error('Factory GitHub watch state file is invalid')
+  return structuredClone({ ...value, lastEpoch }) as DiscoverySweepState
+}
 
 const CONVERSATION_HISTORY_LIMIT = 50
 
@@ -1261,6 +1401,7 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   babysitterGenerations: {},
   conversationSessions: {},
   dispatchLifecycles: {},
+  discoverySweep: emptyDiscoverySweepState(),
 })
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
@@ -1269,7 +1410,12 @@ const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.babysitterSessions).length === 0 &&
   Object.keys(workspace.babysitterGenerations).length === 0 &&
   Object.keys(workspace.conversationSessions).length === 0 &&
-  Object.keys(workspace.dispatchLifecycles).length === 0
+  Object.keys(workspace.dispatchLifecycles).length === 0 &&
+  workspace.discoverySweep.checkpoint === undefined &&
+  workspace.discoverySweep.lease === undefined &&
+  workspace.discoverySweep.backoffUntilMs <= 0 &&
+  workspace.discoverySweep.consecutiveOverloads <= 0 &&
+  workspace.discoverySweep.lastEpoch <= 0
 
 const syncParentDirectory = async (filePath: string): Promise<void> => {
   const handle = await open(dirname(filePath), 'r')

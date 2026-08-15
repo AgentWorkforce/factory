@@ -9,6 +9,45 @@ import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
 
 describe('FileStateStore', () => {
+  it('persists discovery checkpoints, overload backoff, and cross-process sweep fencing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-state-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      const second = new FileStateStore({ batchSize: 2, watchStatePath })
+      const initial = await first.claimDiscoverySweep('workspace-1', 'owner-a', 1_000, 5_000)
+      expect(initial).toMatchObject({ acquired: true, lease: { owner: 'owner-a', epoch: 1 } })
+
+      await expect(second.claimDiscoverySweep('workspace-1', 'owner-b', 2_000, 5_000)).resolves.toMatchObject({
+        acquired: false,
+        reason: 'in-flight',
+        state: { lease: { owner: 'owner-a', epoch: 1 } },
+      })
+      expect(await first.completeDiscoverySweep('workspace-1', 'owner-a', 1, {
+        highWatermark: 'event-10',
+        trees: { '/github/repos/AgentWorkforce__factory/issues': ['/github/repos/AgentWorkforce__factory/issues/by-id/1.json'] },
+        updatedAtMs: 2_001,
+      })).toBe(true)
+
+      const next = await second.claimDiscoverySweep('workspace-1', 'owner-b', 2_002, 5_000)
+      expect(next).toMatchObject({
+        acquired: true,
+        lease: { owner: 'owner-b', epoch: 2 },
+        state: { checkpoint: { highWatermark: 'event-10' } },
+      })
+      expect(await second.deferDiscoverySweep('workspace-1', 'owner-b', 2, 9_002, 1)).toBe(true)
+
+      await expect(new FileStateStore({ batchSize: 2, watchStatePath })
+        .claimDiscoverySweep('workspace-1', 'owner-c', 4_000, 5_000)).resolves.toMatchObject({
+        acquired: false,
+        reason: 'backoff',
+        state: { consecutiveOverloads: 1, backoffUntilMs: 9_002 },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists and fences dispatch lifecycle ownership across processes and crash takeover', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-'))
     try {
