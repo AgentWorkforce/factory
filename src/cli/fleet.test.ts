@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -1204,6 +1204,7 @@ describe('fleet CLI runtime', () => {
         mergePolicy: 'never',
       })
       const outputPath = join(root, 'node', 'factory.khaliq.config.json')
+      const requestedOutputPath = join(root, 'node', 'staging', '..', 'factory.khaliq.config.json')
       const output = buffer()
       const createFleet = vi.fn(() => {
         throw new Error('cloud-node prepare must not construct a fleet')
@@ -1215,7 +1216,7 @@ describe('fleet CLI runtime', () => {
         '--config',
         configPath,
         '--output',
-        outputPath,
+        requestedOutputPath,
         '--clone-root',
         '/srv/agent-workforce',
         '--runtime-root',
@@ -1232,6 +1233,8 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(createFleet).not.toHaveBeenCalled()
       const written = JSON.parse(await readFile(outputPath, 'utf8'))
+      expect((await stat(outputPath)).mode & 0o777).toBe(0o600)
+      expect((await stat(dirname(outputPath))).mode & 0o777).toBe(0o700)
       expect(written).toMatchObject({
         workspaceId: 'rw_factory',
         mergePolicy: 'never',

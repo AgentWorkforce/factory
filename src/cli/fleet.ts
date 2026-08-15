@@ -216,6 +216,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       if (!globals.config) {
         throw new Error('factory cloud-node prepare requires an explicit --config <source-path>')
       }
+      const outputPath = resolve(command.outputPath)
       const raw = JSON.parse(await readFile(globals.config, 'utf8')) as unknown
       let workspaceId = command.workspaceId
       if (!workspaceId && !configuredWorkspaceId(raw)) {
@@ -226,12 +227,12 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         cloneRoot: command.cloneRoot,
         runtimeRoot: command.runtimeRoot,
         workspaceId,
-        configPath: command.outputPath,
+        configPath: outputPath,
         instanceName: command.instanceName,
       })
-      await writeNewPrivateJson(command.outputPath, prepared.config)
+      await writeNewPrivateJson(outputPath, prepared.config)
       writeJson(out, {
-        configPath: command.outputPath,
+        configPath: outputPath,
         workspaceId: prepared.config.workspaceId,
         instanceName: prepared.config.reporting.instanceName,
         commands: prepared.commands,

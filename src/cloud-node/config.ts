@@ -33,21 +33,29 @@ export function prepareCloudNodeConfig(input: PrepareCloudNodeConfigInput): Prep
   assertAbsolutePath(input.runtimeRoot, 'runtimeRoot')
   assertAbsolutePath(input.configPath, 'configPath')
 
+  // Normalize lexical `.`/`..` segments once so the path written into the
+  // config and the path printed in every command are byte-for-byte identical.
+  // realpath() is intentionally not used: the output and runtime directories
+  // are allowed not to exist yet.
+  const cloneRoot = resolve(input.cloneRoot)
+  const runtimeRoot = resolve(input.runtimeRoot)
+  const configPath = resolve(input.configPath)
+
   const source = asRecord(structuredClone(input.source), 'factory config')
   const workspaceId = input.workspaceId?.trim() || configuredWorkspaceId(source)
   if (!workspaceId) {
     throw new Error('cloud-node config requires a resolved workspaceId')
   }
 
-  const heartbeatPath = join(input.runtimeRoot, 'factory-loop-heartbeat.json')
-  const registryPath = join(input.runtimeRoot, 'factory-loop-registry.json')
-  const outboxPath = join(input.runtimeRoot, 'factory-cloud-events.json')
-  const previewRegistryPath = join(input.runtimeRoot, 'tailscale-previews.json')
+  const heartbeatPath = join(runtimeRoot, 'factory-loop-heartbeat.json')
+  const registryPath = join(runtimeRoot, 'factory-loop-registry.json')
+  const outboxPath = join(runtimeRoot, 'factory-cloud-events.json')
+  const previewRegistryPath = join(runtimeRoot, 'tailscale-previews.json')
   const instanceName = input.instanceName?.trim() || 'factory-cloud-node'
 
   const overrides = {
     workspaceId,
-    cloneRoot: input.cloneRoot,
+    cloneRoot,
     heartbeatPath,
     registryPath,
     outboxPath,
@@ -68,9 +76,9 @@ export function prepareCloudNodeConfig(input: PrepareCloudNodeConfigInput): Prep
   return {
     config,
     commands: {
-      status: factoryCommand('status', input.configPath),
-      dryRun: factoryCommand('run-once', input.configPath, '--dry-run'),
-      start: factoryCommand('start', input.configPath, '--mode', 'live', '--backend', 'relay'),
+      status: factoryCommand('status', configPath),
+      dryRun: factoryCommand('run-once', configPath, '--dry-run'),
+      start: factoryCommand('start', configPath, '--mode', 'live', '--backend', 'relay'),
     },
   }
 }

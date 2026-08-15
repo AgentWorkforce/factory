@@ -38,9 +38,10 @@ does. In particular, do not restart `daytona-fleet-proof-0811`.
 Do not start the cloud dispatcher until all of these are merged, released, and
 deployed in the target workspace:
 
-1. Relayfile delegated credential re-mint uses the SDK and does not interpret
-   `AGENT_RELAY_BIN` as the Node CLI. Relayfile 0.10.42 contains that fix; this
-   package pins `@relayfile/sdk` 0.10.43.
+1. Relayfile delegated credential re-mint reads the canonical Cloud session and
+   does not interpret `AGENT_RELAY_BIN` as the Node CLI. Relayfile CLI 0.10.42
+   contains that fix and must be present in every execution image. Separately,
+   Factory pins `@relayfile/sdk` 0.10.43 for its direct SDK mount path.
 2. `relayfile-adapters#263` supplies labels in the issue index.
 3. `relayfile-cloud#155` restores GitHub App writeback.
 4. `factory#267` bounds the readiness fallback and surfaces reconciliation
@@ -83,9 +84,15 @@ copy explicitly before regenerating it. The generated config:
 
 The config is created mode `0600`; its parent directory is created mode `0700`
 when absent. It contains policy, not credentials. Supply the cloud session or
-workspace credentials through the host's secret manager. Do not set
-`AGENT_RELAY_BIN` for Relayfile. Factory's mount path uses the Relayfile SDK and
-the canonical rotating Cloud session.
+workspace credentials through the host's secret manager. Factory's mount path
+uses the Relayfile SDK and the canonical rotating Cloud session.
+
+Do not unset or rewrite Relay's broker-valued `AGENT_RELAY_BIN` merely to make
+the proof pass. Relayfile CLI 0.10.42 and newer ignores that variable for Cloud
+auth, so the credential-rotation exercise below must run with the normal
+`AGENT_RELAY_BIN=.../agent-relay-broker` inheritance still present. A pass with
+the collision removed would not demonstrate that the fleet-wide outage is
+fixed.
 
 ## Stop/start handover
 
@@ -132,10 +139,13 @@ only with evidence for all of the following:
    node becoming `online`/`live`, the agent process on that target host, terminal
    agent state, and sandbox destruction. No sandbox ID may be reused by another
    agent in the proof.
-3. **Credential rotation:** force the staging access credential to expire while
-   the cloud daemon remains alive. Capture a successful SDK refresh, advancing
-   Relayfile reconciliation, another built-CLI `status`, and a subsequent
-   dry-run or dispatch. Merely observing a long expiry time does not pass.
+3. **Credential rotation:** with `AGENT_RELAY_BIN` still pointing at the broker,
+   force the staging access credential to expire while the cloud daemon remains
+   alive. Capture the inherited variable's broker path, a successful SDK/CLI
+   Cloud-session refresh without executing that path as the Node CLI, advancing
+   Relayfile reconciliation, another built-CLI `status`, and a subsequent dry-run
+   or dispatch. Merely observing a long expiry time, or unsetting the collision,
+   does not pass.
 4. **Single dispatcher:** capture the laptop stop proof before cloud start and
    show that only `factory-khaliq-cloud` emits dispatch events during the live
    issue. Also exercise the reverse-order rollback once with a dry run.

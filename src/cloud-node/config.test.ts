@@ -125,6 +125,26 @@ describe('prepareCloudNodeConfig', () => {
     expect(JSON.stringify(prepared.config)).not.toContain('/Users/operator')
   })
 
+  it('normalizes absolute paths before writing config values and commands', () => {
+    const prepared = prepareCloudNodeConfig({
+      source: source(),
+      workspaceId: 'rw_factory',
+      cloneRoot: '/srv/temporary/../agent-workforce',
+      runtimeRoot: '/var/lib/factory/./runtime',
+      configPath: '/etc/factory/staging/../factory.khaliq.config.json',
+    })
+
+    expect(prepared.config.cloneRoot).toBe('/srv/agent-workforce')
+    expect(prepared.config.loop.heartbeatPath).toBe('/var/lib/factory/runtime/factory-loop-heartbeat.json')
+    expect(prepared.commands.status).toEqual([
+      'node',
+      'bin/factory.mjs',
+      'status',
+      '--config',
+      '/etc/factory/factory.khaliq.config.json',
+    ])
+  })
+
   it('fails closed without an explicit workspace, absolute paths, or mergePolicy never', () => {
     const base = {
       source: source(),
