@@ -3041,6 +3041,66 @@ describe('FactoryLoop', () => {
     expect(mount.listTreePrefixes).toHaveLength(4)
   })
 
+  it('evicts a deleted path from the discovery cache when the watcher reports it via filesystemEventType', async () => {
+    // filesystemEventToChangeEvent normalizes filesystem watcher deletions to
+    // type: 'relayfile.changed' with the real operation carried on
+    // filesystemEventType, not on digest/action/summary.status. A predicate
+    // that only inspects those other fields misses the deletion, so the
+    // durable checkpoint keeps serving a path that no longer exists.
+    const firstPath = githubIssueCompactPath('AgentWorkforce', 'pear', 70)
+    const secondPath = githubIssueCompactPath('AgentWorkforce', 'pear', 71)
+    const mount = new CountingListTreeMount({
+      [firstPath]: githubIssueFile(70, { labels: ['reference-only'] }),
+      [secondPath]: githubIssueFile(71, { labels: ['reference-only'] }),
+    })
+    // A watermark must already be available before the first sweep, or the
+    // checkpoint it produces is never persisted and the second sweep has
+    // nothing to diff against — matching the pattern the sibling test above
+    // uses to get an incremental (rather than full) second sweep.
+    mount.emit(changeEvent(firstPath, 'event-70'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = () => createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const firstReport = await create().runOnce()
+    expect(firstReport.pulled.map((issue) => issue.key)).toEqual(['70', '71'])
+    expect(mount.listTreePrefixes).toEqual([
+      '/github/repos/AgentWorkforce/pear/issues',
+      '/github/repos/AgentWorkforce__pear/issues',
+    ])
+
+    mount.files.delete(secondPath)
+    mount.emit({ ...changeEvent(secondPath, 'event-71-deleted'), filesystemEventType: 'file.deleted' })
+    const secondReport = await create().runOnce()
+
+    expect(secondReport.pulled.map((issue) => issue.key)).toEqual(['70'])
+    // The deletion is applied as a surgical cache eviction, not a forced
+    // re-list of the repository root — the prefix count must stay flat.
+    expect(mount.listTreePrefixes).toHaveLength(2)
+
+    // Reading the now-deleted path is what actually masks an unevicted cache
+    // entry on a single sweep (a failed read just drops it from `pulled`),
+    // so assert on the read itself rather than only on `pulled`.
+    expect(mount.reads).toContain(secondPath)
+    mount.reads.length = 0
+
+    // With no further events, the watermark is unchanged and the third sweep
+    // takes the "checkpoint unchanged; reusing cached issue trees" path,
+    // reading straight from the cached prefix list with zero listTree calls.
+    // If the deletion had not been recognized, that cached list would still
+    // contain the deleted path and this sweep would read it again forever.
+    const thirdReport = await create().runOnce()
+
+    expect(thirdReport.pulled.map((issue) => issue.key)).toEqual(['70'])
+    expect(mount.listTreePrefixes).toHaveLength(2)
+    expect(mount.reads).not.toContain(secondPath)
+  })
+
   it('fences overlapping discovery sweeps across factory instances', async () => {
     class BlockingDiscoveryMount extends CountingListTreeMount {
       readonly started: Promise<void>

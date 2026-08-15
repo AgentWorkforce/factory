@@ -16508,11 +16508,17 @@ const discoveryEventIsDeletion = (event: ChangeEvent): boolean => {
   const flat = asRecord(event) ?? {}
   const summary = asRecord(flat.summary) ?? {}
   const type = stringValue(flat.type)?.toLowerCase()
+  // filesystemEventToChangeEvent normalizes filesystem watcher events to
+  // type: 'relayfile.changed' and stashes the real operation here, so a
+  // deletion arrives as filesystemEventType: 'file.deleted' / 'dir.deleted'
+  // with an outer type that does not itself say "deleted".
+  const filesystemEventType = stringValue(flat.filesystemEventType)?.toLowerCase()
   const action = stringValue(flat.action)?.toLowerCase()
   const status = stringValue(summary.status)?.toLowerCase()
   const digest = stringValue(flat.digest)?.toLowerCase()
-  return type === 'file.deleted' || type === 'dir.deleted' || action === 'delete' || status === 'deleted' ||
-    digest?.startsWith('deleted:') === true
+  return type === 'file.deleted' || type === 'dir.deleted' ||
+    filesystemEventType === 'file.deleted' || filesystemEventType === 'dir.deleted' ||
+    action === 'delete' || status === 'deleted' || digest?.startsWith('deleted:') === true
 }
 
 const githubIssueIndexRepoRoots = (path: string): string[] => {
