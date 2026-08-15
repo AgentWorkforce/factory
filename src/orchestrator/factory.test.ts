@@ -308,7 +308,7 @@ class PublishingGithubWriteback extends RecordingGithubWriteback {
       repo: input.repo,
       number: this.receipt.number,
       url: `https://github.com/${input.repo}/pull/${this.receipt.number}`,
-      headRef: input.headRef ?? `factory/${this.receipt.number}-user`,
+      headRef: input.headRef ?? input.expectedHeadRef ?? `factory/${this.receipt.number}-user`,
       author: this.receipt.author,
     }
   }
@@ -11228,6 +11228,9 @@ describe('FactoryLoop', () => {
       expect.stringMatching(/^factory:AR-14:/u),
       'reviewer-invocation',
     ])
+    expect(fleet.spawns[0]?.task).toMatch(
+      /Create or reset the exact branch `factory\/ar-14-agentworkforce-pear-[0-9a-f]{8}`/u,
+    )
   })
 
   it('resumes exited open agents by sessionRef with the original capability', async () => {
@@ -11266,10 +11269,11 @@ describe('FactoryLoop', () => {
         publishInputs.push(input)
         const repoSlug = input.repo.split('/').at(-1)!
         const prNumber = repoSlug === 'pear' ? 126 : 127
+        const headRef = input.headRef ?? input.expectedHeadRef!
         mount.files.set(`/github/repos/${input.repo}/pulls/${prNumber}/metadata.json`, {
           content: {
             number: prNumber,
-            head_ref: `factory/${number}-${repoSlug}`,
+            head_ref: headRef,
             url: `https://github.com/${input.repo}/pull/${prNumber}`,
             state: 'open',
             draft: false,
@@ -11279,7 +11283,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: prNumber,
           url: `https://github.com/${input.repo}/pull/${prNumber}`,
-          headRef: `factory/${number}-${repoSlug}`,
+          headRef,
         }
       },
       closePullRequest: async () => undefined,
@@ -11359,7 +11363,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: input.repo.endsWith('/pear') ? 128 : 129,
           url: `https://github.com/${input.repo}/pull/${input.repo.endsWith('/pear') ? 128 : 129}`,
-          headRef: input.headRef ?? `factory/${number}-${input.repo.split('/').at(-1)}`,
+          headRef: input.headRef ?? input.expectedHeadRef!,
         }
       },
       closePullRequest: async () => undefined,
@@ -11412,7 +11416,7 @@ describe('FactoryLoop', () => {
             repo: input.repo,
             number,
             url: `https://github.com/${input.repo}/pull/${number}`,
-            headRef: `factory/${number}-app`,
+            headRef: input.headRef ?? input.expectedHeadRef!,
             author: 'relayfile[bot]',
           }
         },
@@ -11478,7 +11482,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: 52,
           url: 'https://github.com/AgentWorkforce/pear/pull/52',
-          headRef: 'fix/ar-52',
+          headRef: input.headRef ?? input.expectedHeadRef!,
           headSha: 'sha-52',
         }
       },
@@ -11540,6 +11544,7 @@ describe('FactoryLoop', () => {
     expect(publishInputs).toEqual([{
       repo: 'AgentWorkforce/pear',
       clonePath: '/work/pear',
+      expectedHeadRef: expect.stringMatching(/^factory\/ar-52-agentworkforce-pear-[0-9a-f]{8}$/u),
       baseRef: 'main',
       title: 'AR-52: [factory-e2e] Fix factory issue 52',
       body: expect.stringContaining('Live preview: https://factory-node.tailnet.ts.net:10052/'),
@@ -11635,7 +11640,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: 54,
           url: 'https://github.com/acme/pear/pull/54',
-          headRef: 'fix/ar-54',
+          headRef: input.headRef ?? input.expectedHeadRef!,
         }
       },
       closePullRequest: async () => undefined,
@@ -12265,7 +12270,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: 92,
           url: 'https://github.com/AgentWorkforce/pear/pull/92',
-          headRef: 'ar-92-impl-pear',
+          headRef: input.headRef ?? input.expectedHeadRef!,
           headSha: 'sha-92',
         }
       },
@@ -14929,7 +14934,7 @@ describe('FactoryLoop', () => {
           repo: input.repo,
           number: 158,
           url: 'https://github.com/AgentWorkforce/pear/pull/158',
-          headRef: 'factory/58-agentworkforce-pear',
+          headRef: input.headRef ?? input.expectedHeadRef!,
           headSha: 'sha-58',
         }
       },
@@ -18413,7 +18418,7 @@ describe('FactoryLoop PR babysitter', () => {
           repo: input.repo,
           number,
           url: `https://github.com/${input.repo}/pull/${number}`,
-          headRef: `ar-${number}-impl-${input.repo.split('/').at(-1)}`,
+          headRef: input.headRef ?? input.expectedHeadRef!,
         }
       },
       closePullRequest: async () => undefined,
@@ -19034,12 +19039,13 @@ describe('FactoryLoop PR babysitter', () => {
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => {
         publishInputs.push(input)
-        seedPrMeta(mount, input.repo, 402, { state: 'open', draft: false })
+        const headRef = input.headRef ?? input.expectedHeadRef!
+        seedPrMeta(mount, input.repo, 402, { state: 'open', draft: false, head_ref: headRef })
         return {
           repo: input.repo,
           number: 402,
           url: `https://github.com/${input.repo}/pull/402`,
-          headRef: 'factory/ar-402-agentworkforce-pear',
+          headRef,
         }
       },
       closePullRequest: async () => undefined,

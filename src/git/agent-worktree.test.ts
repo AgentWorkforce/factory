@@ -50,6 +50,36 @@ describe('GitAgentWorktreeManager', () => {
     }
   })
 
+  it('refuses a pre-created branch owned by a different issue', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agent-worktree-issue-collision-'))
+    const base = join(root, 'CloudCheckout')
+    try {
+      await mkdir(base)
+      await git(base, ['init', '-b', 'main'])
+      await git(base, ['config', 'user.email', 'factory@example.test'])
+      await git(base, ['config', 'user.name', 'Factory Test'])
+      await writeFile(join(base, 'README.md'), '# cloud\n', 'utf8')
+      await git(base, ['add', 'README.md'])
+      await git(base, ['commit', '-m', 'initial'])
+      await git(base, ['branch', 'factory/3022-chief-org-live-population'])
+
+      const manager = new GitAgentWorktreeManager()
+      const worktreePath = factoryWorktreePath(base, '3021', 'AgentWorkforce/cloud', 'collision')
+      await expect(manager.prepare({
+        repo: 'AgentWorkforce/cloud',
+        issueKey: '3021',
+        baseClonePath: base,
+        worktreePath,
+        branch: 'factory/3022-chief-org-live-population',
+      })).rejects.toThrow(
+        'Refusing Factory worktree branch factory/3022-chief-org-live-population: it does not belong to dispatched issue 3021',
+      )
+      await expect(stat(worktreePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('refuses cleanup outside the Factory worktree root', async () => {
     const manager = new GitAgentWorktreeManager()
     const unsafe = {

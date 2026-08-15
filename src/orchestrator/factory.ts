@@ -49,7 +49,7 @@ import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
-import { containsExplicitIssueReference, containsIssueKey } from '../issue-key-match'
+import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
@@ -3512,7 +3512,10 @@ export class FactoryLoop implements Factory {
     // ones. Without it, every worker starts in the configured shared checkout
     // and concurrent issues can switch each other back to the base branch.
     const isolateLocalWorktree = this.#fleet.placementLocality === 'local' && Boolean(this.#worktrees)
-    const lifecycleRunId = !dryRun && (durableDispatch || isolateLocalWorktree) ? randomUUID() : undefined
+    // Every live dispatch gets an issue-owned branch, including legacy local
+    // fleets without a durable lifecycle or worktree manager. The publication
+    // boundary uses this exact ref to reject a stale shared checkout.
+    const lifecycleRunId = !dryRun ? randomUUID() : undefined
     if (lifecycleRunId) {
       dispatchDecision = decisionWithLifecycleBranches(dispatchDecision, lifecycleRunId, {
         isolateLocalWorktree,
@@ -7442,9 +7445,29 @@ export class FactoryLoop implements Factory {
     opts: { reconcileExisting?: boolean } = {},
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
+    const expectedHeadRef = implementer.spec.branch
+    if (!expectedHeadRef) {
+      throw new Error(`Refusing to publish ${record.issue.key}: implementer has no Factory-derived branch`)
+    }
+    const matchesCurrentConvention = factoryBranchBelongsToIssue(expectedHeadRef, record.issue.key)
+    const matchesAuthorizedLegacyBranch = implementer.spec.existingPullRequestBranch === true &&
+      /^\d+$/u.test(record.issue.key) &&
+      expectedHeadRef.toLowerCase().startsWith(`${record.issue.key.toLowerCase()}-`)
+    if (!matchesCurrentConvention && !matchesAuthorizedLegacyBranch) {
+      throw new Error(
+        `Refusing to publish ${record.issue.key}: branch ${expectedHeadRef} belongs to a different issue`,
+      )
+    }
     const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
     const cached = this.#publishedPullRequests.get(key)
-    if (cached) return cached
+    if (cached) {
+      if (cached.headRef !== expectedHeadRef) {
+        throw new Error(
+          `Refusing cached PR for ${record.issue.key}: expected head branch ${expectedHeadRef}, found ${cached.headRef}`,
+        )
+      }
+      return cached
+    }
 
     const { identity, publisher } = this.#githubPullRequestPublisher()
     const remoteBranch = implementer.result?.locality === 'remote' && implementer.spec.branch
@@ -7468,12 +7491,15 @@ export class FactoryLoop implements Factory {
     const durableReceipt = publishedPullRequests(durable).find((receipt) =>
       receipt.repo.toLowerCase() === repo.toLowerCase()
     )
-    const expectedHeadRef = implementer.spec.branch ?? remoteBranch
-    if (
-      durableReceipt &&
-      (!opts.reconcileExisting || !expectedHeadRef || durableReceipt.headRef === expectedHeadRef)
-    ) return durableReceipt
-    if (opts.reconcileExisting && expectedHeadRef) {
+    if (durableReceipt) {
+      if (durableReceipt.headRef !== expectedHeadRef) {
+        throw new Error(
+          `Refusing durable PR receipt for ${record.issue.key}: expected head branch ${expectedHeadRef}, found ${durableReceipt.headRef}`,
+        )
+      }
+      return durableReceipt
+    }
+    if (opts.reconcileExisting) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
         this.#publishedPullRequests.set(key, existing)
@@ -7491,6 +7517,7 @@ export class FactoryLoop implements Factory {
     const result = await publisher.publishPullRequest({
       repo,
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
+      expectedHeadRef,
       baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue, implementer.spec.preview),
@@ -7501,7 +7528,7 @@ export class FactoryLoop implements Factory {
       : { ...result, author: identity }
     if (
       published.repo.toLowerCase() !== repo.toLowerCase() ||
-      published.headRef !== (remoteBranch ?? published.headRef) ||
+      published.headRef !== expectedHeadRef ||
       !Number.isInteger(published.number) ||
       published.number <= 0 ||
       !published.url
@@ -15427,7 +15454,8 @@ function decisionWithLifecycleBranches(
       ...(opts.isolateLocalWorktree && baseClonePath && branch ? { baseClonePath, clonePath } : {}),
       // The same persisted lifecycle reuses this id after takeover, while a
       // genuine reopen gets a new id and cannot replay an old placement ack.
-      invocationId: `factory:${decision.issue.key}:${runId}:${spec.role}:${sanitizeAgentSlug(spec.name)}`,
+      invocationId: spec.invocationId ??
+        `factory:${decision.issue.key}:${runId}:${spec.role}:${sanitizeAgentSlug(spec.name)}`,
     }
     return branch ? { ...lifecycleSpec, branch } : lifecycleSpec
   }
@@ -16256,8 +16284,7 @@ const hasTitlePrefix = (title: string, marker: string): boolean =>
 
 const factoryBranchMatchesIssue = (headRef: string, issueKey: string): boolean =>
   /^\d+$/u.test(issueKey)
-    ? headRef.toLowerCase() === `factory/${issueKey.toLowerCase()}` ||
-      headRef.toLowerCase().startsWith(`factory/${issueKey.toLowerCase()}-`)
+    ? factoryBranchBelongsToIssue(headRef, issueKey)
     : containsIssueKey(headRef, issueKey)
 
 // Legacy Factory runs created GitHub-native branches as `<issue-number>-*`

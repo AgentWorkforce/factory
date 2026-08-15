@@ -55,6 +55,8 @@ export interface GithubPublishPullRequestInput {
   clonePath?: string
   /** Exact branch already pushed by a remote implementer. Avoids reading its node-local clone. */
   headRef?: string
+  /** Factory-derived branch that must be the PR head before any push or PR mutation occurs. */
+  expectedHeadRef?: string
   headSha?: string
   baseRef: string
   title: string

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { containsExplicitIssueReference, containsIssueKey } from './issue-key-match'
+import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from './issue-key-match'
 
 describe('issue key matching', () => {
   it('matches dispatch branch conventions without numeric-prefix collisions', () => {
@@ -22,5 +22,13 @@ describe('issue key matching', () => {
     expect(containsExplicitIssueReference('Fixes #52', '52')).toBe(true)
     expect(containsExplicitIssueReference('Issue: 52', '52')).toBe(true)
     expect(containsExplicitIssueReference('https://github.com/AgentWorkforce/hoopsheet/issues/52', '52')).toBe(true)
+  })
+
+  it('matches Factory branches only to their dispatched issue key', () => {
+    expect(factoryBranchBelongsToIssue('factory/3021-cloud-deployment-fix', '3021')).toBe(true)
+    expect(factoryBranchBelongsToIssue('factory/3022-chief-org-live-population', '3021')).toBe(false)
+    expect(factoryBranchBelongsToIssue('factory/30210-not-3021', '3021')).toBe(false)
+    expect(factoryBranchBelongsToIssue('factory/ar-244-agentworkforce-factory', 'AR-244')).toBe(true)
+    expect(factoryBranchBelongsToIssue('feature/ar-244-agentworkforce-factory', 'AR-244')).toBe(false)
   })
 })

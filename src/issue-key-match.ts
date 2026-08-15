@@ -37,3 +37,17 @@ export const containsExplicitIssueReference = (value: string, issueKey: string):
   const issue = `${prefix}-${number}(?=$|[^A-Za-z0-9-]|-(?!\\d))`
   return new RegExp(`(^|\\n)\\s*(?:linear|issue|closes|fixes|resolves)\\b[^\\n]*${issue}`, 'i').test(value)
 }
+
+/**
+ * Factory-owned implementation branches always start with `factory/` and
+ * carry the dispatched issue key. Numeric GitHub issue keys need an anchored
+ * match so issue 3021 can never claim a branch owned by 3022 (or 30210).
+ */
+export const factoryBranchBelongsToIssue = (headRef: string, issueKey: string): boolean => {
+  const normalizedHead = headRef.trim().toLowerCase()
+  const normalizedKey = issueKey.trim().toLowerCase()
+  if (!normalizedHead.startsWith('factory/') || !normalizedKey) return false
+  return /^\d+$/u.test(normalizedKey)
+    ? normalizedHead === `factory/${normalizedKey}` || normalizedHead.startsWith(`factory/${normalizedKey}-`)
+    : containsIssueKey(normalizedHead, normalizedKey)
+}
