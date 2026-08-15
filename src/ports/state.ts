@@ -159,17 +159,19 @@ export type DiscoveryCheckpoint = {
   updatedAtMs: number
 }
 
+export type DiscoverySweepLease = {
+  owner: string
+  epoch: number
+  leaseUntilMs: number
+}
+
 export type DiscoverySweepState = {
   checkpoint?: DiscoveryCheckpoint
   consecutiveOverloads: number
   backoffUntilMs: number
   /** Monotonic fencing token retained after a lease is released. */
   lastEpoch: number
-  lease?: {
-    owner: string
-    epoch: number
-    leaseUntilMs: number
-  }
+  lease?: DiscoverySweepLease
 }
 
 export type DiscoverySweepClaim = {
@@ -177,7 +179,17 @@ export type DiscoverySweepClaim = {
   reason?: 'in-flight' | 'backoff'
   state: DiscoverySweepState
   lease?: NonNullable<DiscoverySweepState['lease']>
+  /** Active lease reclaimed because its process owner is no longer running. */
+  reclaimedLease?: DiscoverySweepLease
 }
+
+export type DiscoverySweepRenewal =
+  | { renewed: true; lease: DiscoverySweepLease }
+  | {
+    renewed: false
+    reason: 'missing' | 'contended' | 'expired' | 'unknown'
+    observedLease?: DiscoverySweepLease
+  }
 
 export type DispatchLifecyclePhase =
   | 'queued'
@@ -336,6 +348,14 @@ export interface StateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean>
+  /** Atomic rejection diagnostics; legacy/custom stores may omit this. */
+  renewDiscoverySweepWithDetails?(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepRenewal>
   completeDiscoverySweep(
     workspaceId: string,
     owner: string,

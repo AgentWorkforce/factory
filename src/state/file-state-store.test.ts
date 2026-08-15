@@ -48,6 +48,88 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('reports why a discovery lease renewal was rejected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-renewal-'))
+    try {
+      const store = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+      await store.claimDiscoverySweep('workspace-1', 'owner-a', 1_000, 5_000)
+
+      await expect(store.renewDiscoverySweep('workspace-1', 'owner-a', 1, 1_500, 5_000)).resolves.toBe(true)
+      await expect(store.renewDiscoverySweepWithDetails('workspace-1', 'owner-a', 1, 2_000, 5_000)).resolves.toEqual({
+        renewed: true,
+        lease: { owner: 'owner-a', epoch: 1, leaseUntilMs: 7_000 },
+      })
+      await expect(store.renewDiscoverySweepWithDetails('workspace-1', 'owner-b', 2, 3_000, 5_000)).resolves.toEqual({
+        renewed: false,
+        reason: 'contended',
+        observedLease: { owner: 'owner-a', epoch: 1, leaseUntilMs: 7_000 },
+      })
+      await expect(store.renewDiscoverySweepWithDetails('workspace-1', 'owner-a', 1, 7_000, 5_000)).resolves.toEqual({
+        renewed: false,
+        reason: 'expired',
+        observedLease: { owner: 'owner-a', epoch: 1, leaseUntilMs: 7_000 },
+      })
+
+      await store.releaseDiscoverySweep('workspace-1', 'owner-a', 1)
+      await expect(store.renewDiscoverySweepWithDetails('workspace-1', 'owner-a', 1, 7_001, 5_000)).resolves.toEqual({
+        renewed: false,
+        reason: 'missing',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reclaims an unexpired discovery lease whose process owner was killed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-orphan-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.claimDiscoverySweep('workspace-1', '41001:dead-generation', 1_000, 5_000)
+
+      const restarted = new FileStateStore({
+        batchSize: 2,
+        watchStatePath,
+        isProcessAlive: (pid) => pid !== 41001,
+      })
+      await expect(restarted.claimDiscoverySweep(
+        'workspace-1',
+        '41002:new-generation',
+        2_000,
+        5_000,
+      )).resolves.toMatchObject({
+        acquired: true,
+        reclaimedLease: { owner: '41001:dead-generation', epoch: 1, leaseUntilMs: 6_000 },
+        lease: { owner: '41002:new-generation', epoch: 2, leaseUntilMs: 7_000 },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not reclaim another active factory instance in the same process', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-same-process-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      const second = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.claimDiscoverySweep('workspace-1', `${process.pid}:first`, 1_000, 5_000)
+
+      await expect(second.claimDiscoverySweep(
+        'workspace-1',
+        `${process.pid}:second`,
+        2_000,
+        5_000,
+      )).resolves.toMatchObject({
+        acquired: false,
+        reason: 'in-flight',
+        state: { lease: { owner: `${process.pid}:first`, epoch: 1 } },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists and fences dispatch lifecycle ownership across processes and crash takeover', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-'))
     try {

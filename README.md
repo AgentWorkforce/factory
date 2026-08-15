@@ -135,7 +135,7 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
-| `factory status` | Print current factory status as JSON, including held agents, hold age, deadline, lifecycle phase, and terminal state awaited. |
+| `factory status` | Print current factory status as JSON, including held agents, lifecycle deadlines, and periodic readiness-reconcile health. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
@@ -148,6 +148,11 @@ After init, add the `factory` label to an open issue and run a dry run below.
 names and the provider-claim state (`pending`, `verified`, or `degraded`). This
 view is read from Factory's local in-flight registry, so it remains available
 when GitHub lifecycle writeback is the degraded subsystem.
+
+For a live daemon, `factory status` also includes `readinessReconcile`. Its
+state advances from `retrying` to `degraded` after three consecutive periodic
+discovery failures and returns to `healthy` after a successful checkpoint.
+The same record includes the last error, attempt duration, and failure count.
 
 Dispatch lifecycle writes are claim-critical. Factory applies the
 `factory:in-progress` label/state before the dispatch comment, confirms the

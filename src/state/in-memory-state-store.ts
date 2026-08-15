@@ -16,6 +16,7 @@ import type {
   ConversationSessionState,
   DiscoveryCheckpoint,
   DiscoverySweepClaim,
+  DiscoverySweepRenewal,
   DiscoverySweepState,
   StateStore,
   WaitingClarification,
@@ -107,10 +108,26 @@ export class InMemoryStateStore implements StateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean> {
+    return (await this.renewDiscoverySweepWithDetails(workspaceId, owner, epoch, nowMs, leaseMs)).renewed
+  }
+
+  async renewDiscoverySweepWithDetails(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepRenewal> {
     const lease = this.#workspace(workspaceId).discoverySweep.lease
-    if (!lease || lease.owner !== owner || lease.epoch !== epoch || lease.leaseUntilMs <= nowMs) return false
+    if (!lease) return { renewed: false, reason: 'missing' }
+    if (lease.owner !== owner || lease.epoch !== epoch) {
+      return { renewed: false, reason: 'contended', observedLease: { ...lease } }
+    }
+    if (lease.leaseUntilMs <= nowMs) {
+      return { renewed: false, reason: 'expired', observedLease: { ...lease } }
+    }
     lease.leaseUntilMs = nowMs + leaseMs
-    return true
+    return { renewed: true, lease: { ...lease } }
   }
 
   async completeDiscoverySweep(
