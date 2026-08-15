@@ -773,7 +773,7 @@ export class FactoryLoop implements Factory {
           }
         },
         listPaths: async (prefix: string): Promise<string[]> => {
-          return this.#mount.listTree(prefix)
+          return this.#listRelayfileTree(prefix, 'integration descriptor discovery')
         },
       }
       const descriptors = await deriveDescriptorsFromMount(reader)
@@ -1964,7 +1964,13 @@ export class FactoryLoop implements Factory {
       return cached.pr
     }
 
-    const mountPr = await resolveIssuePrFromMount(this.#mount, this.#config, issue, opts)
+    const mountPr = await resolveIssuePrFromMount(
+      this.#mount,
+      this.#config,
+      issue,
+      opts,
+      (prefix) => this.#listRelayfileTree(prefix, 'PR probe resolution'),
+    )
     if (mountPr) {
       return mountPr
     }
@@ -5774,10 +5780,16 @@ export class FactoryLoop implements Factory {
     if (!issue) return false
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     if (!repo) return false
-    const pullRequest = await resolveIssuePrFromMount(this.#mount, this.#config, issue, {
-      allowLegacyGithubBranch: true,
-      repo,
-    })
+    const pullRequest = await resolveIssuePrFromMount(
+      this.#mount,
+      this.#config,
+      issue,
+      {
+        allowLegacyGithubBranch: true,
+        repo,
+      },
+      (prefix) => this.#listRelayfileTree(prefix, 'dependency PR probe resolution'),
+    )
     if (normalizePrState(pullRequest?.state) !== 'MERGED') return false
     this.#terminalDependencyIdentities.add(identity)
     return true
@@ -7153,7 +7165,7 @@ export class FactoryLoop implements Factory {
     for (const root of roots) {
       let paths: string[]
       try {
-        paths = await this.#mount.listTree(root)
+        paths = await this.#listRelayfileTree(root, 'exact-head PR confirmation')
       } catch {
         continue
       }
@@ -7423,7 +7435,7 @@ export class FactoryLoop implements Factory {
     for (let attempt = 0; attempt < PUBLISHED_PR_CONFIRM_ATTEMPTS; attempt += 1) {
       const paths = (await Promise.all(roots.map(async (root) => {
         try {
-          return await this.#mount.listTree(root)
+          return await this.#listRelayfileTree(root, 'published PR confirmation')
         } catch {
           return []
         }
@@ -8852,7 +8864,7 @@ export class FactoryLoop implements Factory {
       `${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues`,
     ]) {
       try {
-        for (const path of await this.#mount.listTree(prefix)) {
+        for (const path of await this.#listRelayfileTree(prefix, 'GitHub escalation marker listing')) {
           const parts = githubIssueCommentPathParts(path)
           if (
             parts &&
@@ -9171,7 +9183,7 @@ export class FactoryLoop implements Factory {
         ]
     for (const prefix of prefixes) {
       try {
-        for (const path of await this.#mount.listTree(prefix)) {
+        for (const path of await this.#listRelayfileTree(prefix, 'GitHub issue comment replay listing')) {
           const parts = githubIssueCommentPathParts(path)
           if (
             parts &&
@@ -11187,7 +11199,7 @@ export class FactoryLoop implements Factory {
     // tracked PR identity left. Keep the scan simple and prefer branch identity
     // over title/body references to avoid "related to AR-N" body false positives.
     const githubSource = await this.#issueSource() === 'github'
-    const paths = githubSource ? await this.#githubIssuePaths() : await this.#mount.listTree(ISSUE_ROOT)
+    const paths = githubSource ? await this.#githubIssuePaths() : await this.#listRelayfileTree(ISSUE_ROOT, 'merge advance issue scan')
     for (const path of paths) {
       if (githubSource ? !isGithubIssueFilePath(path) : !isIssueFilePath(path)) {
         continue
@@ -11684,7 +11696,7 @@ export class FactoryLoop implements Factory {
     const found: string[] = []
     for (const root of roots) {
       try {
-        const tree = await this.#mount.listTree(root)
+        const tree = await this.#listRelayfileTree(root, 'PR meta path discovery')
         found.push(...tree.filter((path) => path.endsWith('.json') && numberSegment.test(path)))
       } catch {
         // try the next root
@@ -12905,7 +12917,7 @@ export class FactoryLoop implements Factory {
   async #findSlackUserIdByIdentity(identity: string): Promise<string | undefined> {
     const list = async (prefix: string): Promise<string[]> => {
       try {
-        return await this.#mount.listTree(prefix)
+        return await this.#listRelayfileTree(prefix, 'Slack identity lookup')
       } catch {
         return []
       }
@@ -13975,7 +13987,7 @@ export class FactoryLoop implements Factory {
 
     let paths: string[]
     try {
-      paths = await this.#mount.listTree('/slack/channels')
+      paths = await this.#listRelayfileTree('/slack/channels', 'Slack channel resolution')
     } catch (error) {
       this.#logger.warn?.('[factory] unable to resolve Slack channel from mount; using configured channel value', {
         channel: configured,
@@ -15463,6 +15475,7 @@ const resolveIssuePrFromMount = async (
     allowLegacyGithubBranch?: boolean
     repo?: string
   } = {},
+  listTree: (prefix: string) => Promise<string[]> = (prefix) => mount.listTree(prefix),
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
@@ -15470,7 +15483,7 @@ const resolveIssuePrFromMount = async (
     const paths = new Set<string>()
     for (const root of githubPullRoots(repo)) {
       try {
-        for (const path of await mount.listTree(root)) paths.add(path)
+        for (const path of await listTree(root)) paths.add(path)
       } catch (error) {
         listErrors.push(error)
       }
