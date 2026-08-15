@@ -564,8 +564,71 @@ describe('factory reaper', () => {
         },
       })
 
-      expect(report).toEqual({ stale: false, reason: undefined, reaped: [], skipped: [] })
+      expect(report).toEqual({
+        stale: false,
+        reason: undefined,
+        reaped: [],
+        skipped: [],
+        heldAgents: [],
+        releasedHeldAgents: [],
+        heldAgentReleaseFailures: [],
+      })
       expect(killed).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports held agents while the owner heartbeat is fresh and releases only with explicit opt-in', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-reaper-held-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
+      const heldRegistry = registry()
+      heldRegistry.agents[0] = {
+        ...heldRegistry.agents[0]!,
+        heldSinceAtMs: 1_000,
+        holdDeadlineAtMs: 2_000,
+        waitingForTerminalState: 'human-review',
+        lifecyclePhase: 'running',
+      }
+      await writeJson(heartbeatPath, heartbeat(4_500))
+      await writeJson(registryPath, heldRegistry)
+      const release = vi.fn(async () => undefined)
+
+      const reported = await reapFactoryOrphansOnce({
+        heartbeatPath,
+        registryPath,
+        staleMs: 1_000,
+        nowMs: 5_000,
+        fleet: { release },
+      })
+
+      expect(reported.stale).toBe(false)
+      expect(reported.heldAgents).toEqual([expect.objectContaining({
+        name: 'ar-1-impl',
+        issue: expect.objectContaining({ key: 'AR-1' }),
+        heldForMs: 4_000,
+        pastDeadline: true,
+        waitingForTerminalState: 'human-review',
+        lifecyclePhase: 'running',
+      })])
+      expect(release).not.toHaveBeenCalled()
+
+      const released = await reapFactoryOrphansOnce({
+        heartbeatPath,
+        registryPath,
+        staleMs: 1_000,
+        nowMs: 5_000,
+        includeHeld: true,
+        fleet: { release },
+      })
+      expect(release).toHaveBeenCalledWith('ar-1-impl', 'held-past-deadline')
+      expect(released.releasedHeldAgents).toEqual([{
+        name: 'ar-1-impl',
+        issue: 'AR-1',
+        reason: 'held-past-deadline',
+      }])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

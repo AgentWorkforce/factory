@@ -82,6 +82,7 @@ import type {
   FactoryInFlightDispatchStatus,
   FactoryInFlightRegistry,
   FactoryInFlightRegistryAgent,
+  FactoryHeldAgent,
   IssueRef,
   IterationReport,
   LinearIssue,
@@ -378,6 +379,8 @@ const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
 const DISPATCH_WRITEBACK_MAX_ATTEMPTS = 3
 const DISPATCH_WRITEBACK_RETRY_MS = 250
+const HELD_PAST_DEADLINE_RELEASE_REASON = 'held-past-deadline'
+const HELD_DEADLINE_OVERDUE_RETRY_MS = 1_000
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
@@ -554,6 +557,9 @@ export class FactoryLoop implements Factory {
   readonly #dispatchClaimStatuses = new Map<string, FactoryDispatchClaimStatus>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
   #dispatchLifecycleRenewTimer?: ReturnType<typeof setInterval>
+  #heldAgentDeadlineTimer?: ReturnType<typeof setTimeout>
+  #heldAgentDeadlineDueAtMs?: number
+  #heldAgentDeadlineSweepInFlight?: Promise<void>
   #clarificationSweepTimer?: ReturnType<typeof setTimeout>
   #clarificationSweepDueAtMs?: number
   #clarificationSweepInFlight?: Promise<void>
@@ -1025,6 +1031,10 @@ export class FactoryLoop implements Factory {
     this.#babysitterResourceSubscriptionRenewTimer = undefined
     if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
     this.#dispatchLifecycleRenewTimer = undefined
+    if (this.#heldAgentDeadlineTimer) clearTimeout(this.#heldAgentDeadlineTimer)
+    this.#heldAgentDeadlineTimer = undefined
+    this.#heldAgentDeadlineDueAtMs = undefined
+    await this.#heldAgentDeadlineSweepInFlight
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
     this.#abandonedDispatchReasons.clear()
@@ -3793,6 +3803,7 @@ export class FactoryLoop implements Factory {
 
   status(): FactoryStatus {
     const batch = this.#batchView
+    const nowMs = this.#clock.now()
     const inFlightDispatches: FactoryInFlightDispatchStatus[] = batch?.inFlight
       .filter((record) => !record.dryRun)
       .map((record) => ({
@@ -3807,7 +3818,7 @@ export class FactoryLoop implements Factory {
         claim: {
           ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(issueKey(record.issue)) ?? {
             state: 'pending' as const,
-            updatedAtMs: this.#clock.now(),
+            updatedAtMs: nowMs,
           }),
         },
       })) ?? []
@@ -3825,6 +3836,12 @@ export class FactoryLoop implements Factory {
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
+      heldAgents: batch?.inFlight.flatMap((record) => heldAgentsForRecord(
+        record,
+        nowMs,
+        this.#config.dispatch.agentHoldTimeoutMs,
+        this.#config.terminalState,
+      )) ?? [],
     }
   }
 
@@ -4122,6 +4139,7 @@ export class FactoryLoop implements Factory {
           })
         }
       }
+      this.#rescheduleHeldAgentDeadlineSweep()
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
     }
@@ -4237,6 +4255,92 @@ export class FactoryLoop implements Factory {
       void this.#renewDispatchLifecycles()
     }, DISPATCH_LIFECYCLE_RENEW_MS)
     this.#dispatchLifecycleRenewTimer.unref?.()
+  }
+
+  #scheduleHeldAgentDeadline(record: InFlightIssue): void {
+    if (this.#stopping || record.dryRun || record.heldSinceAtMs === undefined || record.agents.size === 0) return
+    const dueAtMs = record.heldSinceAtMs + this.#config.dispatch.agentHoldTimeoutMs
+    if (
+      this.#heldAgentDeadlineTimer &&
+      this.#heldAgentDeadlineDueAtMs !== undefined &&
+      this.#heldAgentDeadlineDueAtMs <= dueAtMs
+    ) return
+    if (this.#heldAgentDeadlineTimer) clearTimeout(this.#heldAgentDeadlineTimer)
+    this.#heldAgentDeadlineDueAtMs = dueAtMs
+    const remainingMs = dueAtMs - this.#clock.now()
+    // An overdue lifecycle can temporarily be fenced by another owner. Avoid
+    // a zero-delay reschedule loop while its lease is being reclaimed.
+    const delayMs = remainingMs <= 0
+      ? HELD_DEADLINE_OVERDUE_RETRY_MS
+      : Math.min(remainingMs, 2_147_483_647)
+    this.#heldAgentDeadlineTimer = setTimeout(() => {
+      this.#heldAgentDeadlineTimer = undefined
+      this.#heldAgentDeadlineDueAtMs = undefined
+      const sweep = this.#sweepHeldAgentDeadlines()
+        .catch((error) => {
+          this.#logger.warn?.('[factory] held-agent deadline sweep failed; retrying', {
+            error: describeError(error).errorMessage,
+          })
+        })
+        .finally(() => {
+          if (this.#heldAgentDeadlineSweepInFlight === sweep) this.#heldAgentDeadlineSweepInFlight = undefined
+          this.#rescheduleHeldAgentDeadlineSweep()
+        })
+      this.#heldAgentDeadlineSweepInFlight = sweep
+    }, delayMs)
+    this.#heldAgentDeadlineTimer.unref?.()
+  }
+
+  #rescheduleHeldAgentDeadlineSweep(): void {
+    if (this.#stopping) return
+    for (const record of this.#batchView?.inFlight ?? []) this.#scheduleHeldAgentDeadline(record)
+  }
+
+  async #sweepHeldAgentDeadlines(): Promise<void> {
+    const nowMs = this.#clock.now()
+    const timeoutMs = this.#config.dispatch.agentHoldTimeoutMs
+    for (const record of [...(await this.#batch()).inFlight]) {
+      const heldSinceAtMs = record.heldSinceAtMs
+      if (
+        record.dryRun ||
+        heldSinceAtMs === undefined ||
+        record.agents.size === 0 ||
+        nowMs - heldSinceAtMs < timeoutMs
+      ) continue
+
+      const key = issueKey(record.issue)
+      if (this.#abandonedDispatchReasons.has(key)) continue
+      if (this.#usesDurableDispatchLifecycle()) {
+        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) continue
+        // Terminal writeback already won the race. Finish its normal release
+        // reason instead of relabeling an acknowledged completion as a timeout.
+        if (lifecycle.phase === 'releasing') {
+          await this.#finishDurableRelease(record, lifecycle.releaseReason)
+          continue
+        }
+        if (!await this.#assertDispatchLifecycleOwner(record)) continue
+      }
+
+      const heldForMs = Math.max(0, this.#clock.now() - heldSinceAtMs)
+      const details = {
+        issue: record.issue.key,
+        heldForMs,
+        holdTimeoutMs: timeoutMs,
+        waitingForTerminalState: this.#config.terminalState,
+        reason: HELD_PAST_DEADLINE_RELEASE_REASON,
+        agents: [...record.agents.keys()].sort(),
+      }
+      this.#logger.warn?.('[factory] releasing agents held past deadline', details)
+      await this.#abandonStuckDispatch(record, HELD_PAST_DEADLINE_RELEASE_REASON)
+      const lifecycle = this.#usesDurableDispatchLifecycle()
+        ? await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        : undefined
+      if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) {
+        this.#increment('heldPastDeadlineReleases')
+        this.#logger.warn?.('[factory] released agents held past deadline', details)
+      }
+    }
   }
 
   async #renewDispatchLifecycles(): Promise<void> {
@@ -4667,6 +4771,7 @@ export class FactoryLoop implements Factory {
     releasedAgentNames: ReadonlySet<string> = new Set(),
     telemetry: { cancellationReason?: FactoryCloudCancellationReasonV1 } = {},
   ): Promise<boolean> {
+    record.lifecyclePhase = phase
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
     const key = issueKey(record.issue)
@@ -4892,6 +4997,7 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const durableRecord = inFlightRecordFromLifecycle(lifecycle)
     const record = lifecycle.phase === 'releasing' ? durableRecord : batch.restore(durableRecord)
+    this.#scheduleHeldAgentDeadline(record)
     if (!await this.#assertDispatchLifecycleOwner(record)) return
     if (acquiredNow && this.#config.babysitter.enabled) await this.#restoreBabysitterOwnership()
 
@@ -6867,7 +6973,12 @@ export class FactoryLoop implements Factory {
     const updatedAtMs = this.#clock.now()
     const agents: FactoryInFlightRegistryAgent[] = []
     const seenAgents = new Set<string>()
-    const appendAgent = async (issue: IssueRef, agentName: string, tracked: TrackedAgent): Promise<void> => {
+    const appendAgent = async (
+      issue: IssueRef,
+      agentName: string,
+      tracked: TrackedAgent,
+      hold?: Pick<InFlightIssue, 'heldSinceAtMs' | 'lifecyclePhase'>,
+    ): Promise<void> => {
       const key = registryHandoffKey(issue, agentName)
       if (seenAgents.has(key)) {
         return
@@ -6893,6 +7004,12 @@ export class FactoryLoop implements Factory {
         ...(fleetTracked?.invocationId ? { invocationId: fleetTracked.invocationId } : {}),
         ...(fleetTracked?.node ? { node: fleetTracked.node } : {}),
         ...(dispatchClaim ? { dispatchClaim: { ...dispatchClaim } } : {}),
+        ...(hold?.heldSinceAtMs !== undefined ? {
+          heldSinceAtMs: hold.heldSinceAtMs,
+          holdDeadlineAtMs: hold.heldSinceAtMs + this.#config.dispatch.agentHoldTimeoutMs,
+          waitingForTerminalState: this.#config.terminalState,
+          ...(hold.lifecyclePhase ? { lifecyclePhase: hold.lifecyclePhase } : {}),
+        } : {}),
       })
     }
 
@@ -6903,7 +7020,7 @@ export class FactoryLoop implements Factory {
           this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
         }
         for (const [agentName, tracked] of record.agents) {
-          await appendAgent(record.issue, agentName, tracked)
+          await appendAgent(record.issue, agentName, tracked, record)
         }
       }
     }
@@ -6927,6 +7044,7 @@ export class FactoryLoop implements Factory {
     const invocationId = batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
     if (existing?.result) {
+      this.#scheduleHeldAgentDeadline(record)
       return { name: existing.result?.name ?? spec.name }
     }
 
@@ -6956,6 +7074,7 @@ export class FactoryLoop implements Factory {
     const rosterAgent = roster.agents.find((agent) => agent.name === spec.name)
     if (rosterAgent) {
       const trackedPlacement = this.#fleet.trackedAgents?.().get(spec.name)
+      record.heldSinceAtMs ??= this.#clock.now()
       batch.recordSpawn(record, spec, invocationId, {
         name: spec.name,
         sessionRef: existing?.sessionRef ?? spec.sessionRef,
@@ -6965,6 +7084,7 @@ export class FactoryLoop implements Factory {
       if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
         throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
       }
+      this.#scheduleHeldAgentDeadline(record)
       const adopted = record.agents.get(spec.name)
       if (adopted) await this.#reportAgent(record, adopted, 'agent.adopted')
       return { name: spec.name }
@@ -6999,10 +7119,12 @@ export class FactoryLoop implements Factory {
           : 'agent_spawn_failed' as const,
       })
     }
+    record.heldSinceAtMs ??= this.#clock.now()
     batch.recordSpawn(record, spec, invocationId, result)
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
       throw new Error(`Dispatch lifecycle ownership lost after spawning ${spec.name}`)
     }
+    this.#scheduleHeldAgentDeadline(record)
     const spawned = record.agents.get(result.name)
     if (spawned) await this.#reportAgent(record, spawned, 'agent.spawned')
     return { name: result.name }
@@ -8053,6 +8175,8 @@ export class FactoryLoop implements Factory {
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
     const key = issueKey(record.issue)
+    const heldPastDeadline = reason === HELD_PAST_DEADLINE_RELEASE_REASON
+    const agentReleaseReason = heldPastDeadline ? HELD_PAST_DEADLINE_RELEASE_REASON : 'issue-abandoned'
     this.#abandonedDispatchReasons.set(key, reason)
     if (!await this.#saveDispatchLifecycle(
       record,
@@ -8084,8 +8208,11 @@ export class FactoryLoop implements Factory {
     }
     const agents = [...record.agents]
     for (const [agentName, tracked] of agents) {
-      if (tracked.spec.role === 'implementer') continue
-      this.#fleet.markAgentTerminal?.(agentName, `implementer-terminal:${reason}`)
+      if (!heldPastDeadline && tracked.spec.role === 'implementer') continue
+      this.#fleet.markAgentTerminal?.(
+        agentName,
+        heldPastDeadline ? HELD_PAST_DEADLINE_RELEASE_REASON : `implementer-terminal:${reason}`,
+      )
     }
     const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
     let cleanupComplete = true
@@ -8098,12 +8225,12 @@ export class FactoryLoop implements Factory {
       const worktreeAgentNames = new Set(worktreeHandoffs.map((handoff) => handoff.name))
       const nonWorktreeAgents = agents.filter(([name]) => !worktreeAgentNames.has(name))
       if (nonWorktreeAgents.length > 0) {
-        const failed = await this.#releaseAndTerminateAgents(nonWorktreeAgents, 'issue-abandoned', 'completion')
+        const failed = await this.#releaseAndTerminateAgents(nonWorktreeAgents, agentReleaseReason, 'completion')
         cleanupComplete = failed.length === 0
       }
-      cleanupComplete = await this.#teardownFailedDispatchWorktrees(worktreeHandoffs) && cleanupComplete
+      cleanupComplete = await this.#teardownFailedDispatchWorktrees(worktreeHandoffs, agentReleaseReason) && cleanupComplete
     } else if (agents.length > 0) {
-      const failed = await this.#releaseAndTerminateAgents(agents, 'issue-abandoned', 'completion')
+      const failed = await this.#releaseAndTerminateAgents(agents, agentReleaseReason, 'completion')
       cleanupComplete = failed.length === 0
     }
     if (!cleanupComplete) {
@@ -14131,6 +14258,9 @@ export class FactoryLoop implements Factory {
         this.#increment('clarificationWakesQueuedForCapacity')
         return
       }
+      // A human-answer wake starts a new agent-hold generation. Time spent
+      // parked with the previous team released must not consume its deadline.
+      record.heldSinceAtMs = undefined
       if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
         batch.complete(waiting.issue)
         await this.#state.releaseClarificationWake(this.#workspaceId, key, this.#clarificationWakeOwner)
@@ -14161,8 +14291,10 @@ export class FactoryLoop implements Factory {
               }
             : await this.#resumeOrColdStartClarificationAgent(parked.name, tracked, waiting)
           const invocationId = batch.invocationIdFor(record.issue, tracked.spec)
+          record.heldSinceAtMs ??= this.#clock.now()
           batch.recordSpawn(record, tracked.spec, invocationId, result)
           await this.#saveDispatchLifecycle(record, 'dispatching')
+          this.#scheduleHeldAgentDeadline(record)
           const live = record.agents.get(result.name)
           if (live) {
             resumed.push([result.name, live])
@@ -17360,6 +17492,33 @@ const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
 const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): boolean =>
   phase === 'complete' || phase === 'abandoned'
 
+const heldAgentsForRecord = (
+  record: InFlightIssue,
+  nowMs: number,
+  holdTimeoutMs: number,
+  terminalState: FactoryConfig['terminalState'],
+): FactoryHeldAgent[] => {
+  if (record.dryRun || record.heldSinceAtMs === undefined) return []
+  const heldSinceAtMs = record.heldSinceAtMs
+  const holdDeadlineAtMs = heldSinceAtMs + holdTimeoutMs
+  const heldForMs = Math.max(0, nowMs - heldSinceAtMs)
+  return [...record.agents]
+    .filter(([, tracked]) => Boolean(tracked.result))
+    .map(([name, tracked]) => ({
+      name,
+      role: tracked.spec.role,
+      issue: { ...record.issue },
+      ...(record.lifecyclePhase ? { lifecyclePhase: record.lifecyclePhase } : {}),
+      waitingForTerminalState: terminalState,
+      heldSince: new Date(heldSinceAtMs).toISOString(),
+      heldSinceAtMs,
+      heldForMs,
+      holdDeadline: new Date(holdDeadlineAtMs).toISOString(),
+      holdDeadlineAtMs,
+      pastDeadline: nowMs >= holdDeadlineAtMs,
+    }))
+}
+
 const costUsageGroupId = (runId: string, tracked: TrackedAgent): string =>
   JSON.stringify([runId, tracked.spec.invocationId ?? tracked.spec.name])
 
@@ -17432,6 +17591,7 @@ const lifecycleFromInFlightRecord = (
   ...(pullRequest ? { pullRequest: { ...pullRequest } } : {}),
   ...(releaseReason ? { releaseReason } : {}),
   ...(cost ? { cost: structuredClone(cost) } : {}),
+  ...(record.heldSinceAtMs !== undefined ? { heldSinceAtMs: record.heldSinceAtMs } : {}),
   updatedAtMs,
 })
 
@@ -17443,6 +17603,12 @@ const inFlightRecordFromLifecycle = (lifecycle: DispatchLifecycle): InFlightIssu
   invocationIds: new Set(lifecycle.invocationIds),
   result: lifecycle.result ? structuredClone(lifecycle.result) : undefined,
   ...(lifecycle.dispatchClaim ? { dispatchClaim: { ...lifecycle.dispatchClaim } } : {}),
+  heldSinceAtMs: lifecycle.heldSinceAtMs ?? (
+    lifecycle.agents.some((agent) => agent.releasedAtMs === undefined)
+      ? lifecycle.updatedAtMs
+      : undefined
+  ),
+  lifecyclePhase: lifecycle.phase,
 })
 
 const dispatchResultFromLifecycle = (lifecycle: DispatchLifecycle): DispatchResult =>

@@ -135,11 +135,12 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
-| `factory status` | Print current factory status as JSON. |
+| `factory status` | Print current factory status as JSON, including held agents, hold age, deadline, lifecycle phase, and terminal state awaited. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
+| `factory reap-orphans [--include-held]` | Report stale factory processes and held agents. By default held agents are visible but retained; `--include-held` releases held agents whose configured deadline has elapsed. Kubernetes cleanup is reported as not applicable when no environment provider is configured. |
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 | `factory intake notion <manifest>` | Normalize ready specs from a read-only Notion mount into GitHub lifecycle issues or exact-path fleet work. Honors `--dry-run`. |
 
@@ -622,6 +623,22 @@ knobs include issue **routing** (`repos.byLabel` / `byProject` / `keywordRules` 
 `default`), the **safety gate** (`safety.requireTitlePrefix`, `safety.requireTeamKey`),
 `mergePolicy` (defaults to `never`), per-role **model** overrides, and an optional
 **Slack** channel for status threads.
+
+Every successfully placed agent team has a wall-clock release backstop. Configure
+the window with `dispatch.agentHoldTimeoutMs`; it defaults to four hours. The
+clock starts at the first successful agent placement, not while a dispatch waits
+for capacity or while a released team waits for human clarification. If the issue
+has not reached its configured `terminalState` before the deadline, Factory
+releases the team with reason `held-past-deadline` and records the lifecycle as
+abandoned so a restart cannot respawn it:
+
+```jsonc
+{
+  "dispatch": {
+    "agentHoldTimeoutMs": 14400000
+  }
+}
+```
 
 The full schema — every field and default — is validated by Zod at load time, so
 an invalid config fails fast with a field-level error. See

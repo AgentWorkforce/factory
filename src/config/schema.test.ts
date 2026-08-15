@@ -29,6 +29,11 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.keywordRules).toEqual([])
     expect(parsed.repos.clonePaths).toEqual({})
     expect(parsed.batchSize).toBe(5)
+    expect(parsed.dispatch).toEqual({
+      errorCooldownMs: 60_000,
+      maxAttempts: 2,
+      agentHoldTimeoutMs: 4 * 60 * 60_000,
+    })
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
     // Agent CLI per role defaults to today's behavior: codex implements, claude
     // reviews/babysits — so existing configs are unaffected unless set.
@@ -176,6 +181,15 @@ describe('FactoryConfigSchema', () => {
     })).toThrow()
     expect(() => FactoryConfigSchema.parse({
       repos: {}, slack: { channel: 'C123', conversationCoalesceMs: 60_001 },
+    })).toThrow()
+  })
+
+  it('accepts a bounded agent hold timeout and rejects an unbounded disable value', () => {
+    expect(FactoryConfigSchema.parse({ repos: {}, dispatch: { agentHoldTimeoutMs: 2_500 } })
+      .dispatch.agentHoldTimeoutMs).toBe(2_500)
+    expect(() => FactoryConfigSchema.parse({ repos: {}, dispatch: { agentHoldTimeoutMs: 0 } })).toThrow()
+    expect(() => FactoryConfigSchema.parse({
+      repos: {}, dispatch: { agentHoldTimeoutMs: 7 * 24 * 60 * 60_000 + 1 },
     })).toThrow()
   })
 

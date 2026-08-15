@@ -1,7 +1,7 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
-import type { StateStore } from './ports/state'
+import type { DispatchLifecyclePhase, StateStore } from './ports/state'
 import type { Clock, Logger } from './ports/system'
 import type { FactoryEventReporter } from './ports/observability'
 import type { AgentWorktreeManager } from './ports/worktree'
@@ -141,6 +141,10 @@ export interface FactoryInFlightRegistryAgent {
   node?: string
   /** Durable-claim visibility independent of the provider writeback surface. */
   dispatchClaim?: FactoryDispatchClaimStatus
+  heldSinceAtMs?: number
+  holdDeadlineAtMs?: number
+  waitingForTerminalState?: FactoryConfig['terminalState']
+  lifecyclePhase?: DispatchLifecyclePhase
 }
 
 export interface FactoryDispatchClaimStatus {
@@ -186,6 +190,20 @@ export interface FactoryLoopLiveness {
   ageMs?: number
   heartbeat?: FactoryLoopHeartbeat
   reason?: string
+}
+
+export interface FactoryHeldAgent {
+  name: string
+  role?: AgentSpec['role']
+  issue: IssueRef
+  lifecyclePhase?: DispatchLifecyclePhase
+  waitingForTerminalState: FactoryConfig['terminalState']
+  heldSince: string
+  heldSinceAtMs: number
+  heldForMs: number
+  holdDeadline: string
+  holdDeadlineAtMs: number
+  pastDeadline: boolean
 }
 
 export interface LinearIssue {
@@ -252,6 +270,8 @@ export interface FactoryStatus {
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */
   eventListener?: FactoryEventListenerStatus
+  /** Agents retained while their issue waits for its configured terminal state. */
+  heldAgents?: FactoryHeldAgent[]
 }
 
 export type FactoryEventPayload =

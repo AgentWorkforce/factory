@@ -5,7 +5,12 @@ import { promisify } from 'node:util'
 import { parseJsonContent } from '../writeback/shared'
 import type { Clock, FleetClient, Logger } from '../ports'
 import { normalizeLogger } from '../logging'
-import type { FactoryInFlightRegistry, FactoryInFlightRegistryAgent, FactoryInFlightRegistryProcess } from '../types'
+import type {
+  FactoryHeldAgent,
+  FactoryInFlightRegistry,
+  FactoryInFlightRegistryAgent,
+  FactoryInFlightRegistryProcess,
+} from '../types'
 import { checkFactoryLoopLiveness, readFactoryLoopHeartbeat } from './factory'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder, type ProcessIdentity } from './process-identity'
 import {
@@ -30,7 +35,9 @@ export interface FactoryReaperOptions {
   readParentPid?: (pid: number) => Promise<number | undefined>
   readProcessIdentity?: (pid: number) => Promise<ProcessIdentity | undefined>
   processFinder?: AgentProcessFinder
-  fleet?: Pick<FleetClient, 'protectedPids' | 'resolveAgentPid'>
+  fleet?: Pick<FleetClient, 'protectedPids' | 'resolveAgentPid'> & Partial<Pick<FleetClient, 'release'>>
+  /** Explicit operator opt-in to release held agents whose deadline has elapsed. */
+  includeHeld?: boolean
 }
 
 
@@ -39,6 +46,9 @@ export interface FactoryReaperReport {
   reason?: string
   reaped: Array<{ pid: number; signals: Array<NodeJS.Signals> }>
   skipped: Array<{ pid?: number; reason: string }>
+  heldAgents: FactoryHeldAgent[]
+  releasedHeldAgents: Array<{ name: string; issue: string; reason: 'held-past-deadline' }>
+  heldAgentReleaseFailures: Array<{ name: string; issue: string; reason: string }>
 }
 
 export interface TerminatePidsOptions {
@@ -183,15 +193,56 @@ const parsePidList = (stdout: string | Buffer | undefined): number[] => {
 
 export async function reapFactoryOrphansOnce(opts: FactoryReaperOptions): Promise<FactoryReaperReport> {
   const logger = opts.logger ? normalizeLogger(opts.logger) : undefined
+  const nowMs = opts.nowMs ?? opts.clock?.now() ?? Date.now()
+  const registry = await readFactoryInFlightRegistry(opts.registryPath)
+  const heldAgents = heldAgentsFromRegistry(registry, nowMs)
+  const releasedHeldAgents: FactoryReaperReport['releasedHeldAgents'] = []
+  const heldAgentReleaseFailures: FactoryReaperReport['heldAgentReleaseFailures'] = []
+  if (opts.includeHeld) {
+    for (const held of heldAgents.filter((agent) => agent.pastDeadline)) {
+      try {
+        if (!opts.fleet?.release) throw new Error('fleet release is unavailable')
+        await opts.fleet.release(held.name, 'held-past-deadline')
+        releasedHeldAgents.push({ name: held.name, issue: held.issue.key, reason: 'held-past-deadline' })
+        logger?.warn?.('[factory-reaper] released held agent past deadline', {
+          agent: held.name,
+          issue: held.issue.key,
+          heldForMs: held.heldForMs,
+          reason: 'held-past-deadline',
+        })
+      } catch (error) {
+        heldAgentReleaseFailures.push({
+          name: held.name,
+          issue: held.issue.key,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+  }
   const heartbeat = await readFactoryLoopHeartbeat(opts.heartbeatPath)
-  const liveness = checkFactoryLoopLiveness(heartbeat, { nowMs: opts.nowMs ?? opts.clock?.now(), staleMs: opts.staleMs })
+  const liveness = checkFactoryLoopLiveness(heartbeat, { nowMs, staleMs: opts.staleMs })
   if (!liveness.stale) {
-    return { stale: false, reason: liveness.reason, reaped: [], skipped: [] }
+    return {
+      stale: false,
+      reason: liveness.reason,
+      reaped: [],
+      skipped: [],
+      heldAgents,
+      releasedHeldAgents,
+      heldAgentReleaseFailures,
+    }
   }
 
-  const registry = await readFactoryInFlightRegistry(opts.registryPath)
   if (!registry) {
-    return { stale: true, reason: 'registry missing', reaped: [], skipped: [{ reason: 'registry missing' }] }
+    return {
+      stale: true,
+      reason: 'registry missing',
+      reaped: [],
+      skipped: [{ reason: 'registry missing' }],
+      heldAgents,
+      releasedHeldAgents,
+      heldAgentReleaseFailures,
+    }
   }
 
   const termGraceMs = opts.termGraceMs ?? 1_000
@@ -230,7 +281,44 @@ export async function reapFactoryOrphansOnce(opts: FactoryReaperOptions): Promis
     }
   }
 
-  return { stale: true, reason: liveness.reason, reaped, skipped }
+  return {
+    stale: true,
+    reason: liveness.reason,
+    reaped,
+    skipped,
+    heldAgents,
+    releasedHeldAgents,
+    heldAgentReleaseFailures,
+  }
+}
+
+export function heldAgentsFromRegistry(
+  registry: FactoryInFlightRegistry | undefined,
+  nowMs = Date.now(),
+): FactoryHeldAgent[] {
+  return (registry?.agents ?? []).flatMap((agent) => {
+    if (
+      !agent.issue ||
+      agent.heldSinceAtMs === undefined ||
+      agent.holdDeadlineAtMs === undefined
+    ) return []
+    return [{
+      name: agent.name,
+      ...(agent.role ? { role: agent.role } : {}),
+      issue: { ...agent.issue },
+      ...(agent.lifecyclePhase ? { lifecyclePhase: agent.lifecyclePhase } : {}),
+      waitingForTerminalState: agent.waitingForTerminalState ?? 'human-review',
+      heldSince: new Date(agent.heldSinceAtMs).toISOString(),
+      heldSinceAtMs: agent.heldSinceAtMs,
+      heldForMs: Math.max(0, nowMs - agent.heldSinceAtMs),
+      holdDeadline: new Date(agent.holdDeadlineAtMs).toISOString(),
+      holdDeadlineAtMs: agent.holdDeadlineAtMs,
+      pastDeadline: nowMs >= agent.holdDeadlineAtMs,
+    }]
+  }).sort((left, right) =>
+    right.heldForMs - left.heldForMs ||
+    left.issue.key.localeCompare(right.issue.key) ||
+    left.name.localeCompare(right.name))
 }
 
 export class FactoryReaper {

@@ -1,4 +1,5 @@
 import type { AgentSpec, SpawnResult } from '../ports'
+import type { DispatchLifecyclePhase } from '../ports/state'
 import type { DispatchResult, FactoryDispatchClaimStatus, IssueRef, TriageDecision } from '../types'
 import { githubRepositoriesMatch } from '../github/repo-identity'
 
@@ -18,6 +19,10 @@ export interface InFlightIssue {
   invocationIds: Set<string>
   result?: DispatchResult
   dispatchClaim?: FactoryDispatchClaimStatus
+  /** Wall-clock anchor set when the first agent placement succeeds. */
+  heldSinceAtMs?: number
+  /** Latest durable phase, used only for operator-facing held-agent status. */
+  lifecyclePhase?: DispatchLifecyclePhase
 }
 
 export interface QueuedIssue {
@@ -257,6 +262,8 @@ export class BatchTracker {
       }])),
       invocationIds: new Set(record.invocationIds),
       result: record.result ? structuredClone(record.result) : undefined,
+      heldSinceAtMs: record.heldSinceAtMs,
+      lifecyclePhase: record.lifecyclePhase,
     }
     this.#inFlight.set(key, restored)
     this.#parked.delete(key)

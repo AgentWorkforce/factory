@@ -1,0 +1,63 @@
+{
+  "workspaceId": "factory-held-backstop-verification",
+  "repos": {
+    "byLabel": {
+      "factory": "AgentWorkforce/factory"
+    },
+    "clonePaths": {
+      "AgentWorkforce/factory": "/tmp/factory-252-held-agent-checkout"
+    },
+    "default": "AgentWorkforce/factory"
+  },
+  "batchSize": 1,
+  "dispatch": {
+    "agentHoldTimeoutMs": 15000
+  },
+  "github": {
+    "identity": "auto"
+  },
+  "reporting": {
+    "enabled": false
+  },
+  "verification": {
+    "enabled": false
+  },
+  "mergePolicy": "never",
+  "terminalState": "human-review",
+  "stateIds": {
+    "readyForAgent": "state-ready-for-agent",
+    "agentImplementing": "state-agent-implementing",
+    "done": "state-done",
+    "inPlanning": "state-in-planning",
+    "humanReview": "state-human-review"
+  },
+  "loop": {
+    "heartbeatPath": "/tmp/factory-held-backstop-verification-252/heartbeat.json",
+    "registryPath": "/tmp/factory-held-backstop-verification-252/registry.json",
+    "heartbeatStaleMs": 60000
+  },
+  "fixtureFiles": {
+    "/linear/issues/AR-2520__uuid-2520.json": {
+      "provider": "linear",
+      "objectType": "issue",
+      "objectId": "uuid-2520",
+      "payload": {
+        "id": "uuid-2520",
+        "identifier": "AR-2520",
+        "title": "[factory-e2e] Hold deadline verification",
+        "description": "Implement and test a representative Factory lifecycle change. The terminal lifecycle event is intentionally never delivered so the built CLI can demonstrate held-agent visibility and automatic wall-clock release.",
+        "url": "https://linear.app/agent-relay/issue/AR-2520/hold-deadline-verification",
+        "stateId": "state-ready-for-agent",
+        "labels": ["factory"],
+        "team": {
+          "key": "AR",
+          "name": "Agent Relay"
+        },
+        "state": {
+          "id": "state-ready-for-agent",
+          "name": "Ready for Agent"
+        }
+      }
+    }
+  }
+}

@@ -44,9 +44,17 @@ const liveSubscriptionSchema = z.object({
   reconcileIntervalMs: z.number().int().min(50).default(60_000),
 }).default({})
 
+export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
+
 const dispatchSchema = z.object({
   errorCooldownMs: z.number().int().min(0).default(60_000),
   maxAttempts: z.number().int().min(1).max(5).default(2),
+  // Terminal delivery is not guaranteed: a daemon crash, stalled reviewer, or
+  // dropped writeback can otherwise leave an already-idle team allocated
+  // forever. This bounds the wall-clock interval from the first successful
+  // agent placement until terminal cleanup.
+  agentHoldTimeoutMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000)
+    .default(DEFAULT_AGENT_HOLD_TIMEOUT_MS),
 }).default({})
 
 const loopSchema = z.object({
