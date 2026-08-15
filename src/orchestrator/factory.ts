@@ -1999,15 +1999,23 @@ export class FactoryLoop implements Factory {
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
-    if (this.#runOnceInFlight && this.#runOnceInFlightDryRun === dryRun) {
-      this.#increment('discoverySweepsCoalesced')
-      this.#logger.info?.('[factory] coalesced overlapping discovery request into the in-flight sweep')
-      return await this.#runOnceInFlight
+    // Loop rather than a single check-then-wait: while this call was waiting
+    // out a mismatched sweep, another mismatched caller may have raced it to
+    // start the *next* sweep first — in which case that one might match us
+    // and we should coalesce onto it rather than starting a third.
+    for (;;) {
+      if (this.#runOnceInFlight && this.#runOnceInFlightDryRun === dryRun) {
+        this.#increment('discoverySweepsCoalesced')
+        this.#logger.info?.('[factory] coalesced overlapping discovery request into the in-flight sweep')
+        return await this.#runOnceInFlight
+      }
+      // A mismatched dryRun cannot coalesce onto the in-flight sweep (it
+      // would hand a live caller a dry-run report, or vice versa), but it
+      // still must not race it — wait for it to settle before either
+      // re-checking for a newly-started matching sweep or claiming the lease.
+      if (!this.#runOnceInFlight) break
+      await this.#runOnceInFlight.catch(() => undefined)
     }
-    // A mismatched dryRun cannot coalesce onto the in-flight sweep (it would
-    // hand a live caller a dry-run report, or vice versa), but it still must
-    // not race it — wait for it to settle before claiming the sweep lease.
-    if (this.#runOnceInFlight) await this.#runOnceInFlight.catch(() => undefined)
     const sweep = this.#runOnceWithDiscoveryFence({ dryRun })
     this.#runOnceInFlight = sweep
     this.#runOnceInFlightDryRun = dryRun
