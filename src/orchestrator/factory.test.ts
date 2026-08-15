@@ -3367,6 +3367,100 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('releases a dead durable GitHub claim and redispatches the issue', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dead-lifecycle-claim-'))
+    try {
+      class MissingDeadAgentsFleet extends RemoteLifecycleFleetClient {
+        override async release(name: string, reason?: string): Promise<void> {
+          this.releases.push({ name, reason })
+          throw new Error(`agent ${name} not found`)
+        }
+      }
+      const path = githubIssuePath('AgentWorkforce', 'pear', 242)
+      const content = githubIssueFile(242, {
+        title: '[factory-e2e] Release dead claims',
+        labels: ['factory', 'pear', 'factory:in-progress'],
+      })
+      const mount = new FakeMountClient({ [path]: content })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const fleet = new MissingDeadAgentsFleet()
+      const githubWriteback = new RecordingGithubWriteback()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+      const issue = parseGithubFactoryIssue(path, content)
+      const decision = await factory.triageIssue(issue)
+      const staleSpecs = [
+        { ...decision.implementers[0]!, name: 'ar-242-impl-pear' },
+        { ...decision.reviewer, name: 'ar-242-review-pear' },
+      ]
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(issue),
+        {
+          runId: 'crashed-run-242',
+          issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
+          decision,
+          dryRun: false,
+          // GitHub applies `factory:in-progress` immediately before this row
+          // advances to running, so dispatching is the narrow crash window.
+          phase: 'dispatching',
+          agents: staleSpecs.map((spec) => ({
+            name: spec.name,
+            tracked: {
+              spec,
+              result: { name: spec.name, node: 'sf-mini', locality: 'remote' },
+            },
+          })),
+          invocationIds: ['factory:242:implementer', 'factory:242:reviewer'],
+          updatedAtMs: 0,
+        },
+        'dead-factory-owner',
+        0,
+        1,
+      )
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['242'])
+      expect(fleet.releases).toEqual([
+        { name: 'ar-242-impl-pear', reason: 'orphaned-claim' },
+        { name: 'ar-242-review-pear', reason: 'orphaned-claim' },
+      ])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        'ar-242-impl-pear',
+        'ar-242-review-pear',
+      ])
+      expect(githubWriteback.statuses).toEqual([
+        { key: '242', status: 'ready' },
+        { key: '242', status: 'in-progress' },
+      ])
+      expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
+      expect(factory.status().counters.githubOrphanedLifecycleAgentReleaseFailures).toBe(2)
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+        phase: 'running',
+        runId: expect.not.stringMatching(/^crashed-run-242$/u),
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('consumes an orphan-recovery readiness exemption after a failed dispatch transition', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-one-shot-'))
     try {
@@ -3592,7 +3686,7 @@ describe('FactoryLoop', () => {
         expect(report.dispatched).toEqual([])
         expect(report.skipped).toEqual([{
           issue: { uuid: 'AgentWorkforce/pear#53', key: '53', path },
-          reason: 'already tracked',
+          reason: 'active dispatch claim or live agent still owns the issue',
         }])
         expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-53-babysit-pear'])
         expect(fleet.spawns[0]).toMatchObject({
@@ -3750,7 +3844,7 @@ describe('FactoryLoop', () => {
       expect(report.dispatched).toEqual([])
       expect(report.skipped).toEqual([expect.objectContaining({
         issue: expect.objectContaining({ key: '53' }),
-        reason: 'live state is not ready-for-agent',
+        reason: 'matching open PR still owns the issue',
       })])
       expect(fleet.spawns).toEqual([])
       expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBeUndefined()
@@ -3885,6 +3979,7 @@ describe('FactoryLoop', () => {
       const fleet = new FakeFleetClient()
       fleet.hydrateTracked([{ name: 'ar-55-impl-pear' }])
       const githubWriteback = new RecordingGithubWriteback()
+      const infos: unknown[][] = []
       const factory = createFactory(config({
         issueSource: 'github',
         loop: { registryPath },
@@ -3894,6 +3989,7 @@ describe('FactoryLoop', () => {
         triage: new StaticTriage(),
         githubWriteback,
         probePrResolver: async () => undefined,
+        logger: { info: (...args: unknown[]) => infos.push(args) },
       })
 
       const report = await factory.runOnce()
@@ -3901,6 +3997,14 @@ describe('FactoryLoop', () => {
       expect(report.dispatched).toEqual([])
       expect(githubWriteback.statuses).toEqual([])
       expect(factory.status().counters.githubOrphanRecoveriesBlockedActive).toBe(1)
+      expect(infos).toContainEqual([
+        '[factory] readiness reconciliation skipped dispatch',
+        {
+          issue: '55',
+          path,
+          reason: 'active dispatch claim or live agent still owns the issue',
+        },
+      ])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -4130,7 +4234,7 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
       expect(report.skipped).toContainEqual(expect.objectContaining({
         issue: expect.objectContaining({ key: '56' }),
-        reason: 'live state is not ready-for-agent',
+        reason: 'matching open-PR absence could not be verified',
       }))
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -9558,6 +9662,69 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-41-impl-pear', 'ar-41-review'])
     expect(factory.status().counters.liveStartupBackfills).toBe(1)
     expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBeUndefined()
+    await factory.stop()
+  })
+
+  it('dispatches a GitHub issue labeled while Factory was stopped even when its event is below the startup watermark', async () => {
+    const path = githubIssueCompactPath('AgentWorkforce', 'pear', 240)
+    const mount = new CountingEventsMount({
+      [path]: githubIssueFile(240, {
+        title: '[factory-e2e] Reconcile readiness independently of event watermarks',
+        labels: ['factory', 'pear'],
+      }),
+    })
+    mount.setSubRoot('/linear/issues', 'absent')
+    // This is the label event the previous daemon consumed before stopping.
+    // The successor starts above it and therefore cannot rely on redelivery.
+    mount.emit(changeEvent(path, 'evt-before-restart-240'))
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-240-impl-pear',
+      'ar-240-review-pear',
+    ])
+    expect(factory.status().counters.liveStartupBackfills).toBe(1)
+    expect(factory.status().counters.liveReplayEventsSuppressedByWatermark).toBeUndefined()
+    await factory.stop()
+  })
+
+  it('periodically dispatches a readiness-labeled GitHub issue without a live event', async () => {
+    const path = githubIssueCompactPath('AgentWorkforce', 'pear', 241)
+    const mount = new CountingEventsMount()
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({
+      mode: 'live',
+      liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+    })
+    mount.files.set(path, {
+      content: githubIssueFile(241, {
+        title: '[factory-e2e] Periodically reconcile readiness',
+        labels: ['factory', 'pear'],
+      }),
+    })
+
+    await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+      'ar-241-impl-pear',
+      'ar-241-review-pear',
+    ]), { timeout: 3_000 })
+    expect(mount.getEventsCalls).toBe(0)
+    expect(factory.status().counters.readinessReconcileSweeps).toBeGreaterThanOrEqual(1)
     await factory.stop()
   })
 
@@ -20728,6 +20895,7 @@ describe('FactoryLoop PR babysitter', () => {
       pollIntervalMs: 50,
       eventLimit: 1,
       replaySkewMarginMs: 60_000,
+      reconcileIntervalMs: 60_000,
     }
     const factory = createFactory(babysitterConfig({ liveSubscription }), {
       mount,

@@ -157,7 +157,9 @@ type GithubOrphanRecoveryContext = {
   activeIssueIdentities: Set<string>
   onlineAgentNames: Set<string>
   legacyUnownedAgentsByIssue: Map<string, FactoryInFlightRegistryAgent[]>
+  orphanedLifecycleClaimsByIssue: Map<string, { key: string; lifecycle: DispatchLifecycle }>
 }
+type GithubOrphanRecoveryResult = { recovered: boolean; reason?: string }
 type BabysitterWakeKind =
   | 'pull-request-state'
   | 'review'
@@ -575,6 +577,9 @@ export class FactoryLoop implements Factory {
   #liveHeartbeatRefresh?: Promise<void>
   #liveHeartbeatLastWriteMs = 0
   #stoppingHeartbeatRefreshActive = false
+  #readinessReconcileTimer?: ReturnType<typeof setTimeout>
+  #readinessReconcileInFlight?: Promise<void>
+  #readinessReconcileIntervalMs = 60_000
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -964,6 +969,7 @@ export class FactoryLoop implements Factory {
         await this.#rearmSlackReplyWatchers()
         await this.#drainReadyClarificationWake()
         await this.#rearmGithubIssueCommentWatchers()
+        this.#scheduleReadinessReconcile()
         this.#scheduleCompletionSweep(0)
         return
       } catch (error) {
@@ -1020,8 +1026,11 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
+    if (this.#readinessReconcileTimer) clearTimeout(this.#readinessReconcileTimer)
+    this.#readinessReconcileTimer = undefined
     if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
     this.#previewSweepTimer = undefined
+    await this.#readinessReconcileInFlight
     await this.#previewSweepInFlight
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
@@ -1178,6 +1187,7 @@ export class FactoryLoop implements Factory {
   ): Promise<void> {
     const options = this.#liveOptions(overrides)
     this.#liveTransport = options.transport
+    this.#readinessReconcileIntervalMs = options.reconcileIntervalMs
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -1318,6 +1328,7 @@ export class FactoryLoop implements Factory {
       pollIntervalMs: overrides.pollIntervalMs ?? this.#config.liveSubscription.pollIntervalMs,
       eventLimit: overrides.eventLimit ?? this.#config.liveSubscription.eventLimit,
       replaySkewMarginMs: overrides.replaySkewMarginMs ?? this.#config.liveSubscription.replaySkewMarginMs,
+      reconcileIntervalMs: overrides.reconcileIntervalMs ?? this.#config.liveSubscription.reconcileIntervalMs,
     }
   }
 
@@ -1342,6 +1353,48 @@ export class FactoryLoop implements Factory {
       return {
         routeUnavailable: isHighWatermarkRouteUnavailable(error),
       }
+    }
+  }
+
+  #scheduleReadinessReconcile(delayMs = this.#readinessReconcileIntervalMs): void {
+    if (
+      !this.#started ||
+      this.#stopping ||
+      this.#readinessReconcileTimer ||
+      this.#readinessReconcileInFlight
+    ) return
+    this.#readinessReconcileTimer = setTimeout(() => {
+      this.#readinessReconcileTimer = undefined
+      if (!this.#started || this.#stopping) return
+      const sweep = this.#reconcileReadyIssues()
+      this.#readinessReconcileInFlight = sweep
+      void sweep.finally(() => {
+        if (this.#readinessReconcileInFlight === sweep) {
+          this.#readinessReconcileInFlight = undefined
+        }
+        if (this.#started && !this.#stopping) this.#scheduleReadinessReconcile()
+      })
+    }, delayMs)
+    this.#readinessReconcileTimer.unref?.()
+  }
+
+  async #reconcileReadyIssues(): Promise<void> {
+    this.#increment('readinessReconcileSweeps')
+    this.#logger.info?.('[factory] periodic readiness reconciliation started', {
+      intervalMs: this.#readinessReconcileIntervalMs,
+    })
+    try {
+      const report = await this.runOnce()
+      this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
+        candidates: report.pulled.length,
+        dispatched: report.dispatched.length,
+        skipped: report.skipped.length,
+      })
+    } catch (error) {
+      this.#increment('readinessReconcileErrors')
+      this.#logger.warn?.('[factory] periodic readiness reconciliation failed; retry remains scheduled', {
+        error: describeError(error).errorMessage,
+      })
     }
   }
 
@@ -2170,6 +2223,14 @@ export class FactoryLoop implements Factory {
       const triaged: TriageDecision[] = []
       const dispatched: DispatchResult[] = []
       const skipped: IterationReport['skipped'] = []
+      const recordSkip = (entry: IterationReport['skipped'][number]): void => {
+        skipped.push(entry)
+        this.#logger.info?.('[factory] readiness reconciliation skipped dispatch', {
+          issue: entry.issue.key,
+          path: entry.issue.path,
+          reason: entry.reason,
+        })
+      }
       let lastReadyReadProgressAtMs = this.#clock.now()
       let readyIssueReads = 0
 
@@ -2221,7 +2282,6 @@ export class FactoryLoop implements Factory {
         const mayRecoverGithubOrphan = !wasReady &&
           !dryRun &&
           issueSource === 'github' &&
-          Boolean(orphanRecovery) &&
           Boolean(requiredLabel) &&
           Boolean(labels?.has(requiredLabel)) &&
           Boolean(labels?.has('factory:in-progress')) &&
@@ -2229,28 +2289,32 @@ export class FactoryLoop implements Factory {
         if (!mayRecoverGithubOrphan) {
           const dispatchBlock = await this.#dispatchBlockReason(issue)
           if (dispatchBlock) {
-            skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+            recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
             continue
           }
         }
 
+        const orphanResult = mayRecoverGithubOrphan
+          ? await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
+          : { recovered: false }
+        const recoveredOrphan = orphanResult.recovered
         const batch = await this.#batch()
         if (batch.isInFlight(issue) || batch.isQueued(issue)) {
-          skipped.push({ issue: issueRef(issue), reason: 'already tracked' })
+          recordSkip({ issue: issueRef(issue), reason: orphanResult.reason ?? 'already tracked' })
           continue
         }
-
-        const recoveredOrphan = mayRecoverGithubOrphan &&
-          await this.#reconcileOrphanedGithubInProgress(issue, orphanRecovery, dryRun)
         if (!wasReady && !recoveredOrphan) {
           if (mayRecoverGithubOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
               continue
             }
           }
-          skipped.push({ issue: issueRef(issue), reason: 'live state is not ready-for-agent' })
+          recordSkip({
+            issue: issueRef(issue),
+            reason: orphanResult.reason ?? 'live state is not ready-for-agent',
+          })
           continue
         }
         const recoveredIdentity = recoveredOrphan ? githubIssueRefIdentity(issueRef(issue)) : undefined
@@ -2258,18 +2322,18 @@ export class FactoryLoop implements Factory {
           if (recoveredOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              skipped.push({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
               continue
             }
           }
 
           if (!isInFactoryScope(issue, this.#config.safety)) {
-            skipped.push({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+            recordSkip({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
             continue
           }
 
           if (!isDispatchableIssue(issue)) {
-            skipped.push({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+            recordSkip({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
             continue
           }
 
@@ -2280,7 +2344,7 @@ export class FactoryLoop implements Factory {
             result = await this.dispatch(decision, { dryRun })
           } catch (error) {
             if (!(error instanceof LiveDispatchStateChangedError)) throw error
-            skipped.push({ issue: decision.issue, reason: 'live state changed during dispatch' })
+            recordSkip({ issue: decision.issue, reason: 'live state changed during dispatch' })
             this.#logger.info?.('[factory] skipped issue whose live state changed during dispatch', {
               issue: decision.issue.key,
             })
@@ -2292,7 +2356,7 @@ export class FactoryLoop implements Factory {
               : result.hold?.kind === 'dependency'
                 ? `parked on dependencies: ${result.hold.blockers?.join(', ') ?? 'unresolved dependency'}`
                 : 'queued or escalated'
-            skipped.push({ issue: decision.issue, reason })
+            recordSkip({ issue: decision.issue, reason })
           } else {
             dispatched.push(result)
           }
@@ -2558,14 +2622,40 @@ export class FactoryLoop implements Factory {
       const onlineAgents = new Set(roster.agents.map((agent) => agent.name))
       const activeIssueIdentities = new Set<string>()
       const legacyUnownedAgentsByIssue = new Map<string, FactoryInFlightRegistryAgent[]>()
-      for (const [, lifecycle] of lifecycles) {
-        if (isTerminalDispatchLifecycle(lifecycle)) continue
-        const identity = githubIssueRefIdentity(lifecycle.issue)
-        if (identity) activeIssueIdentities.add(identity)
-      }
+      const orphanedLifecycleClaimsByIssue = new Map<string, { key: string; lifecycle: DispatchLifecycle }>()
       for (const [, waiting] of waitingClarifications) {
         const identity = githubIssueRefIdentity(waiting.issue)
         if (identity) activeIssueIdentities.add(identity)
+      }
+      for (const [key, lifecycle] of lifecycles) {
+        const identity = githubIssueRefIdentity(lifecycle.issue)
+        if (!identity) continue
+        if (isTerminalDispatchLifecycle(lifecycle)) {
+          if (!activeIssueIdentities.has(identity)) {
+            orphanedLifecycleClaimsByIssue.set(identity, { key, lifecycle })
+          }
+          continue
+        }
+        const activeAgents = lifecycle.agents.filter((agent) => agent.releasedAtMs === undefined)
+        const hasLiveAgent = activeAgents.some((agent) => onlineAgents.has(agent.name))
+        const exitRecoveryActive = activeAgents.some((agent) => this.#agentExitsInFlight.has(agent.name))
+        const dispatchCallActive = this.#dispatchInFlight.has(issueKey(lifecycle.issue))
+        // The provider's `factory:in-progress` transition happens immediately
+        // before the durable lifecycle advances from dispatching to running.
+        // A crash can therefore leave any nonterminal phase behind while the
+        // external claim survives. The caller still verifies provider status,
+        // open-PR absence, a second roster, and the lifecycle lease before it
+        // releases this orphan-shaped row.
+        if (
+          !activeIssueIdentities.has(identity) &&
+          !hasLiveAgent &&
+          !exitRecoveryActive &&
+          !dispatchCallActive
+        ) {
+          orphanedLifecycleClaimsByIssue.set(identity, { key, lifecycle })
+        } else {
+          activeIssueIdentities.add(identity)
+        }
       }
       for (const agent of registry?.agents ?? []) {
         if (!onlineAgents.has(agent.name) || !agent.issue) continue
@@ -2588,6 +2678,7 @@ export class FactoryLoop implements Factory {
         activeIssueIdentities,
         onlineAgentNames: onlineAgents,
         legacyUnownedAgentsByIssue,
+        orphanedLifecycleClaimsByIssue,
       }
     } catch (error) {
       this.#increment('githubOrphanRecoveryContextFailures')
@@ -2602,8 +2693,10 @@ export class FactoryLoop implements Factory {
     issue: LinearIssue,
     context: GithubOrphanRecoveryContext | undefined,
     dryRun: boolean,
-  ): Promise<boolean> {
-    if (dryRun || !context || !isGithubIssue(issue)) return false
+  ): Promise<GithubOrphanRecoveryResult> {
+    if (dryRun) return { recovered: false, reason: 'dry run does not release an in-progress claim' }
+    if (!context) return { recovered: false, reason: 'orphan-recovery safety context is unavailable' }
+    if (!isGithubIssue(issue)) return { recovered: false, reason: 'issue is not GitHub-native' }
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
     const required = this.#config.safety.requireLabel.trim().toLowerCase()
     if (
@@ -2611,7 +2704,7 @@ export class FactoryLoop implements Factory {
       !labels.has(required) ||
       !labels.has('factory:in-progress') ||
       labels.has('factory:human-review')
-    ) return false
+    ) return { recovered: false, reason: 'issue is not an orphan-recovery candidate' }
 
     const identity = githubIssueRefIdentity(issueRef(issue))
     const legacyUnownedAgents = identity
@@ -2627,13 +2720,13 @@ export class FactoryLoop implements Factory {
       )
     ) {
       this.#increment('githubOrphanRecoveriesBlockedActive')
-      return false
+      return { recovered: false, reason: 'active dispatch claim or live agent still owns the issue' }
     }
 
     const getProviderStatus = this.#githubWriteback.getIssueStatus
     if (!getProviderStatus) {
       this.#increment('githubOrphanRecoveryStatusLookupUnavailable')
-      return false
+      return { recovered: false, reason: 'provider-authoritative issue status lookup is unavailable' }
     }
     let providerStatus: GithubIssueStatus | undefined
     try {
@@ -2644,11 +2737,16 @@ export class FactoryLoop implements Factory {
         issue: issue.key,
         error: describeError(error).errorMessage,
       })
-      return false
+      return { recovered: false, reason: 'provider-authoritative issue status could not be verified' }
     }
     if (!providerStatus || providerStatus === 'human-review') {
       this.#increment('githubOrphanRecoveriesBlockedProviderStatus')
-      return false
+      return {
+        recovered: false,
+        reason: providerStatus === 'human-review'
+          ? 'provider-authoritative issue status is human-review'
+          : 'provider-authoritative issue status is unavailable',
+      }
     }
 
     let openPr: ResolvedIssuePr | undefined
@@ -2660,7 +2758,7 @@ export class FactoryLoop implements Factory {
         issue: issue.key,
         error: describeError(error).errorMessage,
       })
-      return false
+      return { recovered: false, reason: 'matching open-PR absence could not be verified' }
     }
     if (openPr) {
       let adopted = false
@@ -2683,7 +2781,12 @@ export class FactoryLoop implements Factory {
         repo: openPr.repo,
         prNumber: openPr.prNumber,
       })
-      return false
+      return {
+        recovered: false,
+        reason: adopted
+          ? 'matching open PR was adopted'
+          : 'matching open PR still owns the issue',
+      }
     }
 
     // A pre-durable local Factory may have left live, registry-proven workers
@@ -2692,7 +2795,12 @@ export class FactoryLoop implements Factory {
     // and workers instead of redispatching duplicate agents.
     if (legacyUnownedAgents.length > 0) {
       this.#increment('githubOrphanRecoveriesBlockedActive')
-      return false
+      return { recovered: false, reason: 'legacy registry-proven agents still own the issue' }
+    }
+
+    const lifecycleClaim = context.orphanedLifecycleClaimsByIssue.get(identity)
+    if (lifecycleClaim && !await this.#releaseOrphanedGithubLifecycle(issue, identity, lifecycleClaim)) {
+      return { recovered: false, reason: 'orphaned durable lifecycle claim could not be safely released' }
     }
 
     try {
@@ -2702,18 +2810,172 @@ export class FactoryLoop implements Factory {
       // A crashed dispatch may leave its durable attempt marked in-flight even
       // after every agent and lifecycle disappeared. Only clear that stale bit
       // after all provider, agent, lifecycle, and open-PR safety checks pass.
-      await this.#clearDispatchInFlight(issue)
+      const attempt = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
+      if (attempt?.terminal) {
+        await this.#state.recordDispatchAttempt(this.#workspaceId, issueStateKey(issue), {
+          attempts: 0,
+          inFlight: false,
+          terminal: false,
+          backoffUntilMs: 0,
+        })
+      } else {
+        await this.#clearDispatchInFlight(issue)
+      }
       this.#reconciledGithubInProgress.add(identity)
       this.#increment('githubOrphanedInProgressRecovered')
       this.#logger.warn?.('[factory] recovered orphaned GitHub in-progress issue for redispatch', {
         issue: issue.key,
         path: issue.path,
       })
-      return true
+      return { recovered: true }
     } catch (error) {
       this.#increment('githubOrphanRecoveryWritebackFailures')
       this.#logger.warn?.('[factory] failed to clear orphaned GitHub lifecycle status; preserving in-progress issue', {
         issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return { recovered: false, reason: 'orphaned provider lifecycle status could not be cleared' }
+    }
+  }
+
+  async #releaseOrphanedGithubLifecycle(
+    issue: LinearIssue,
+    identity: string,
+    candidate: { key: string; lifecycle: DispatchLifecycle },
+  ): Promise<boolean> {
+    let key = candidate.key
+    let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    if (!lifecycle) return true
+    if (
+      lifecycle.runId !== candidate.lifecycle.runId ||
+      githubIssueRefIdentity(lifecycle.issue) !== identity
+    ) {
+      this.#logger.info?.('[factory] preserved orphan-shaped GitHub claim because its durable lifecycle changed', {
+        issue: issue.key,
+        lifecycleKey: key,
+      })
+      return false
+    }
+
+    const activeAgents = lifecycle.agents.filter((agent) => agent.releasedAtMs === undefined)
+    const roster = await this.#fleet.roster()
+    const online = new Set(roster.agents.map((agent) => agent.name))
+    if (
+      activeAgents.some((agent) => online.has(agent.name)) ||
+      roster.agents.some((agent) => githubAgentNameMatchesIssue(agent.name, issue))
+    ) {
+      this.#increment('githubOrphanRecoveriesBlockedActive')
+      return false
+    }
+
+    let epoch: number | undefined
+    if (!isTerminalDispatchLifecycle(lifecycle)) {
+      epoch = this.#dispatchLifecycleEpochs.get(key)
+      if (epoch !== undefined) {
+        const renewed = await this.#state.renewDispatchLifecycle(
+          this.#workspaceId,
+          key,
+          this.#dispatchLifecycleOwner,
+          epoch,
+          this.#clock.now(),
+          DISPATCH_LIFECYCLE_LEASE_MS,
+        )
+        if (!renewed) {
+          this.#dispatchLifecycleEpochs.delete(key)
+          return false
+        }
+      } else {
+        const claim = await this.#state.claimDispatchLifecycle(
+          this.#workspaceId,
+          key,
+          lifecycle,
+          this.#dispatchLifecycleOwner,
+          this.#clock.now(),
+          DISPATCH_LIFECYCLE_LEASE_MS,
+        )
+        if (!claim.acquired || !claim.lease) {
+          this.#logger.info?.('[factory] preserved orphan-shaped GitHub claim because another publisher still owns its lease', {
+            issue: issue.key,
+            owner: claim.lifecycle.lease?.owner,
+            leaseUntilMs: claim.lifecycle.lease?.leaseUntilMs,
+          })
+          return false
+        }
+        key = claim.key ?? key
+        lifecycle = claim.lifecycle
+        epoch = claim.lease.epoch
+        this.#dispatchLifecycleEpochs.set(key, epoch)
+      }
+    }
+
+    try {
+      for (const agent of lifecycle.agents.filter((entry) => entry.releasedAtMs === undefined)) {
+        try {
+          await this.#fleet.release(agent.name, 'orphaned-claim')
+        } catch (error) {
+          // The roster was checked twice before fencing this lifecycle, so a
+          // missing/dead worker is the expected crash-recovery shape. Do not
+          // let a control-plane "agent not found" response make the durable
+          // claim immortal; a failed fresh spawn remains visible to the normal
+          // dispatch retry machinery.
+          this.#increment('githubOrphanedLifecycleAgentReleaseFailures')
+          this.#logger.warn?.('[factory] dead claim agent release failed; clearing fenced lifecycle anyway', {
+            issue: issue.key,
+            agent: agent.name,
+            error: describeError(error).errorMessage,
+          })
+        }
+        this.#fleet.markAgentTerminal?.(agent.name, 'orphaned-claim')
+      }
+      if (epoch !== undefined && !await this.#state.renewDispatchLifecycle(
+        this.#workspaceId,
+        key,
+        this.#dispatchLifecycleOwner,
+        epoch,
+        this.#clock.now(),
+        DISPATCH_LIFECYCLE_LEASE_MS,
+      )) {
+        this.#dispatchLifecycleEpochs.delete(key)
+        return false
+      }
+
+      const retryTimer = this.#dispatchLifecycleRetryTimers.get(key)
+      if (retryTimer) clearTimeout(retryTimer)
+      this.#dispatchLifecycleRetryTimers.delete(key)
+      const batch = await this.#batch()
+      batch.abandon(lifecycle.issue)
+      await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
+      await this.#state.clearBabysitterSession(this.#workspaceId, issueKey(lifecycle.issue))
+      this.#dispatchLifecycleEpochs.delete(key)
+      this.#abandonedDispatchReasons.delete(key)
+      this.#resolveDispatchTerminalWaiters(lifecycle.issue)
+      await this.#writeInFlightRegistry().catch((error: unknown) => {
+        this.#logger.warn?.('[factory] failed to rewrite registry after orphaned claim release', {
+          issue: issue.key,
+          error: describeError(error).errorMessage,
+        })
+      })
+      this.#increment('githubOrphanedLifecycleClaimsReleased')
+      this.#logger.warn?.('[factory] released orphaned GitHub dispatch claim with no live agents', {
+        issue: issue.key,
+        lifecycleKey: key,
+        runId: lifecycle.runId,
+        agents: activeAgents.map((agent) => agent.name),
+      })
+      return true
+    } catch (error) {
+      if (epoch !== undefined) {
+        await this.#state.releaseDispatchLifecycleLease(
+          this.#workspaceId,
+          key,
+          this.#dispatchLifecycleOwner,
+          epoch,
+        ).catch(() => undefined)
+        this.#dispatchLifecycleEpochs.delete(key)
+      }
+      this.#logger.warn?.('[factory] failed to release orphaned GitHub dispatch claim; preserving it', {
+        issue: issue.key,
+        lifecycleKey: key,
         error: describeError(error).errorMessage,
       })
       return false
