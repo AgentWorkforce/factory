@@ -24,6 +24,14 @@ describe('trajectory pointer', () => {
     'unknown-session-v3b',
     'placeholder',
     'missing',
+    'undefined',
+    'NaN',
+    'n/a',
+    'TODO',
+    'false',
+    '0',
+    'ar-260-impl-factory',
+    '00000000-0000-0000-0000-000000000000',
     'unsafe --> comment',
   ])('discloses an unresolved ref instead of shipping placeholder %j', (sessionRef) => {
     expect(resolvableTrajectorySessionRef(sessionRef)).toBeUndefined()
@@ -46,12 +54,12 @@ describe('trajectory pointer', () => {
     const first = renderTrajectoryPointer({
       workUnitId: 'AR-1',
       workUnitSurface: 'linear',
-      sessionRef: 'session-one',
+      sessionRef: '0198b179-c6c2-7e63-9177-4ef52f56c196',
     })
     const second = renderTrajectoryPointer({
       workUnitId: 'AR-1',
       workUnitSurface: 'linear',
-      sessionRef: 'session-two',
+      sessionRef: '0198b179-c6c2-7e63-9177-4ef52f56c197',
     })
     expect(trajectorySessionRefFromBody(`${first}\n${second}`)).toBeUndefined()
   })

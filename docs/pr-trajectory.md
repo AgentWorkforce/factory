@@ -18,7 +18,12 @@ then copied into implementer, reviewer, and babysitter prompts. Worker spawn and
 resume session ids never replace it. A restart therefore recovers the same
 originating reference before reconciling or publishing the PR.
 
-If the value is absent, unsafe, or a known placeholder, Factory writes
+The same originating prompt reference is passed to the existing attestation
+grant write, replacing the former per-implementer value so SOC-2 traceability
+and trajectory replay use one lineage substrate.
+
+If the value is absent, not a canonical non-nil ai-hist session UUID, or unsafe,
+Factory writes
 `session_ref=missing`, logs an error after the PR is opened, increments
 `trajectorySessionRefErrors`, and reports the affected PR under
 `factory status` → `trajectoryErrors`. This is an explicit coverage failure,

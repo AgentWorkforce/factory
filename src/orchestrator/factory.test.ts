@@ -5523,7 +5523,7 @@ describe('FactoryLoop', () => {
     }
   }, 8_000)
 
-  it('rehydrates durable remote lifecycle before reconciliation and publishes one PR after owner crash', async () => {
+  it('publishes the same originating trajectory ref after durable owner crash and takeover', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-remote-lifecycle-'))
     const watchStatePath = join(root, 'state.json')
     const clock = new ManualClock()
@@ -5583,7 +5583,8 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await expect(restarted.dispatch(decision)).resolves.toEqual(originalResult)
+      const replacementProcessRef = '0198b179-c6c2-7e63-9177-4ef52f56c198'
+      await expect(restarted.dispatch(decision, { sessionRef: replacementProcessRef })).resolves.toEqual(originalResult)
       const terminal = restarted.waitForDispatchTerminal(decision.issue)
       await new Promise((resolve) => setTimeout(resolve, 2_200))
       expect(restartedFleet.hydrated).toEqual([])
@@ -5616,6 +5617,7 @@ describe('FactoryLoop', () => {
           `<!-- trajectory: work_unit_id=AR-85 work_unit_surface=linear session_ref=${originSessionRef} -->`,
         ),
       })])
+      expect(publishInputs[0]?.sessionRef).not.toBe(replacementProcessRef)
       expect(publishInputs[0]).not.toHaveProperty('clonePath')
       expect(restartedFleet.releases.map((release) => release.name).sort()).toEqual(['ar-85-impl-pear', 'ar-85-review'])
       await first.stop()

@@ -824,7 +824,7 @@ categories:
       - id: pr-trajectory-missing-ref-report
         name: Unresolvable Trajectory Reference Reporting
         api: Factory.status()
-        description: Reject placeholder and unsafe session references, disclose the unresolved state in the emitted pointer instead of shipping a placeholder, and surface every affected pull request at error level in factory status
+        description: Accept only canonical non-nil ai-hist session UUIDs, disclose the unresolved state in the emitted pointer instead of shipping a placeholder or coerced value, and surface every affected pull request at error level in factory status
         location: src/trajectory.ts, src/orchestrator/factory.ts, src/cli/fleet.ts
         verify_tier: 2
 

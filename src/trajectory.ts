@@ -11,17 +11,18 @@ export const MISSING_TRAJECTORY_SESSION_REF = 'missing'
 const TRAJECTORY_POINTER_PATTERN =
   /<!-- trajectory: work_unit_id=([^\s>]+) work_unit_surface=(linear|github|factory) session_ref=([^\s>]+) -->/gu
 
-const PLACEHOLDER_SESSION_REFS = /^(?:missing|none|null|placeholder|unknown)(?:[-_:].*)?$/iu
-const SAFE_SESSION_REF = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u
+const AI_HIST_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
+const NIL_SESSION_UUID = '00000000-0000-0000-0000-000000000000'
 
 /**
- * Accept only opaque, comment-safe identifiers and reject the known family of
- * placeholder values. Resolution itself remains access-controlled by the
- * relay-side session service; Factory never reads session contents.
+ * The accepted value comes only from a real session-id source at dispatch
+ * admission. Requiring its canonical UUID representation prevents placeholder,
+ * agent-name, and ticket-derived strings from masquerading as coverage without
+ * asking Factory to resolve or read the access-controlled session contents.
  */
 export function resolvableTrajectorySessionRef(value: string | undefined): string | undefined {
   const normalized = value?.trim()
-  if (!normalized || !SAFE_SESSION_REF.test(normalized) || PLACEHOLDER_SESSION_REFS.test(normalized)) {
+  if (!normalized || !AI_HIST_SESSION_UUID.test(normalized) || normalized.toLowerCase() === NIL_SESSION_UUID) {
     return undefined
   }
   return normalized
