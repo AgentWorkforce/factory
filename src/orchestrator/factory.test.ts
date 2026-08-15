@@ -3189,7 +3189,11 @@ describe('FactoryLoop', () => {
 
     await expect(factory.runOnce()).rejects.toThrow('workspace busy')
 
-    expect(clock.now()).toBe(7_000)
+    // The failing call itself does not block for the backoff window — the
+    // backoff is durably recorded (deferDiscoverySweep) and enforced by the
+    // *next* runOnce() instead, so a caller coalesced onto this one, or the
+    // runLoop iteration awaiting it, is not held hostage for retryAfterSeconds.
+    expect(clock.now()).toBe(0)
     expect(mount.listTreePrefixes).toEqual(['/github/repos/AgentWorkforce/pear/issues'])
     expect(warnings).toContainEqual(expect.objectContaining({
       message: '[factory] Relayfile discovery overloaded; backing off before another sweep',
@@ -3198,6 +3202,17 @@ describe('FactoryLoop', () => {
         retryAfterSeconds: 7,
         delayMs: 7_000,
       }),
+    }))
+
+    // The next sweep is where the reduced cadence actually shows up: it
+    // waits out the persisted backoff before claiming the lease again.
+    const report = await factory.runOnce()
+
+    expect(clock.now()).toBe(7_000)
+    expect(report.discoveryDeferred).toBeUndefined()
+    expect(warnings).toContainEqual(expect.objectContaining({
+      message: '[factory] discovery sweep waiting for Relayfile overload backoff',
+      details: expect.objectContaining({ delayMs: 7_000 }),
     }))
   })
 

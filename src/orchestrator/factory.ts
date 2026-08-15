@@ -650,6 +650,7 @@ export class FactoryLoop implements Factory {
   // runOnce() path (which skips #start) still ingests when the mount is present.
   #githubIngestionEnabled?: boolean
   #runOnceInFlight?: Promise<IterationReport>
+  #runOnceInFlightDryRun?: boolean
   #discoverySession?: DiscoverySession
   #discoverySweepEpoch?: number
   #discoverySweepRenewTimer?: ReturnType<typeof setInterval>
@@ -1997,17 +1998,26 @@ export class FactoryLoop implements Factory {
   }
 
   async runOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
-    if (this.#runOnceInFlight) {
+    const dryRun = opts.dryRun ?? this.#config.dryRun
+    if (this.#runOnceInFlight && this.#runOnceInFlightDryRun === dryRun) {
       this.#increment('discoverySweepsCoalesced')
       this.#logger.info?.('[factory] coalesced overlapping discovery request into the in-flight sweep')
       return await this.#runOnceInFlight
     }
-    const sweep = this.#runOnceWithDiscoveryFence(opts)
+    // A mismatched dryRun cannot coalesce onto the in-flight sweep (it would
+    // hand a live caller a dry-run report, or vice versa), but it still must
+    // not race it — wait for it to settle before claiming the sweep lease.
+    if (this.#runOnceInFlight) await this.#runOnceInFlight.catch(() => undefined)
+    const sweep = this.#runOnceWithDiscoveryFence({ dryRun })
     this.#runOnceInFlight = sweep
+    this.#runOnceInFlightDryRun = dryRun
     try {
       return await sweep
     } finally {
-      if (this.#runOnceInFlight === sweep) this.#runOnceInFlight = undefined
+      if (this.#runOnceInFlight === sweep) {
+        this.#runOnceInFlight = undefined
+        this.#runOnceInFlightDryRun = undefined
+      }
     }
   }
 
@@ -2093,7 +2103,11 @@ export class FactoryLoop implements Factory {
           backoffUntilMs,
           consecutiveOverloads,
         })
-        await this.#clock.sleep(delayMs)
+        // backoffUntilMs is already durable via deferDiscoverySweep, and the
+        // next runOnce() honors it at the pre-claim wait above — sleeping
+        // here too would additionally block this failing call (and every
+        // caller coalesced onto it) for up to the full backoff window while
+        // still holding the coalescing slot.
       }
       throw error
     } finally {
@@ -2503,7 +2517,9 @@ export class FactoryLoop implements Factory {
           delete checkpoint.trees[prefix]
           continue
         }
-        if (!path.startsWith(prefix)) continue
+        // A plain startsWith would let `/…/issues-archive/…` match the
+        // cached prefix `/…/issues`, folding an unrelated path into it.
+        if (path !== prefix && !path.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`)) continue
         const paths = new Set(cachedPaths)
         if (deletion) {
           for (const candidate of paths) {
@@ -2858,24 +2874,32 @@ export class FactoryLoop implements Factory {
     return true
   }
 
-  async #listRelayfileTree(prefix: string, phase: string): Promise<string[]> {
+  // `cache` is opt-in and must stay limited to call sites that walk a full
+  // repository/issue root to enumerate everything under it — the sweep this
+  // whole feature exists to make incremental. A cached listing can lag the
+  // live tree by up to one sweep, which is fine for enumeration but wrong
+  // for a point lookup that needs the current state: a PR-confirmation poll
+  // that expects a specific PR to appear, or an escalation/comment-replay
+  // scan that must not miss a marker or reply that landed after the cache
+  // was populated. Those callers must omit `cache` and pay for a fresh list.
+  async #listRelayfileTree(prefix: string, phase: string, opts: { cache?: boolean } = {}): Promise<string[]> {
     if (this.#discoverySweepLeaseLost) {
       throw new Error('discovery sweep lease was lost; refusing another tree request')
     }
-    const cached = this.#cachedDiscoveryTree(prefix)
+    const cached = opts.cache ? this.#cachedDiscoveryTree(prefix) : undefined
     if (cached) {
       this.#increment('discoveryTreeCacheHits')
       this.#logger.debug?.('[factory] reused cached Relayfile tree', { phase, prefix, count: cached.length })
       return cached
     }
-    this.#increment('discoveryTreeCacheMisses')
+    if (opts.cache) this.#increment('discoveryTreeCacheMisses')
     const paths = await this.#withRelayfileOperation('listTree', { phase, prefix }, () => this.#mount.listTree(prefix), {
       count: (paths) => paths.length,
       logFailure: true,
       logStart: true,
       logComplete: true,
     })
-    await this.#rememberDiscoveryTree(prefix, paths)
+    if (opts.cache) await this.#rememberDiscoveryTree(prefix, paths)
     return paths
   }
 
@@ -5187,7 +5211,7 @@ export class FactoryLoop implements Factory {
     const candidates: LinearIssue[] = []
     let scanned = 0
     let lastProgressAtMs = startedAtMs
-    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading')) {
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading', { cache: true })) {
       await this.#refreshLiveHeartbeatIfDue()
       if (!isLinearIssueMirrorCandidatePath(path)) {
         continue
@@ -5230,15 +5254,18 @@ export class FactoryLoop implements Factory {
           pathBatches = cachedBatches
           this.#increment('githubIssueDiscoveryCacheReposUsed')
         } else if (indexedPaths) {
+          // Do not feed this into the discovery cache: the index only covers
+          // open, labeled issues, so it is a filtered subset of the real
+          // tree (and an empty result for whichever root form the index
+          // doesn't use) — not something a later fresh listTree call may
+          // treat as "the tree", including on the escalation-marker and
+          // comment-replay call sites that share this cache.
           pathBatches = [indexedPaths]
-          for (const root of roots) {
-            await this.#rememberDiscoveryTree(root, indexedPaths.filter((path) => path.startsWith(root)))
-          }
           this.#increment('githubIssueIndexReposUsed')
         } else {
           pathBatches = []
           for (const root of roots) {
-            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion'))
+            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true }))
           }
           this.#increment('githubIssueIndexFallbacks')
         }
@@ -5730,7 +5757,7 @@ export class FactoryLoop implements Factory {
         // The pass-scoped flag also lets every later blocked issue reuse the
         // resulting dependency index instead of rescanning the full tree.
         this.#dependencyLinearTreeLoaded = true
-        for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery')) {
+        for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery', { cache: true })) {
           if (isIssueFilePath(path)) await this.#readIssue(path)
         }
       }
@@ -6118,7 +6145,7 @@ export class FactoryLoop implements Factory {
     }
     const pathsByKey = new Map<string, string>()
     const canonicalPathsByKey = new Map<string, string>()
-    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery')) {
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery', { cache: true })) {
       if (isIssueFilePath(path)) {
         const key = keyFromPath(path)
         canonicalPathsByKey.set(key, path)
@@ -6128,6 +6155,7 @@ export class FactoryLoop implements Factory {
     for (const path of await this.#listRelayfileTree(
       linearByStatePath('ready-for-agent'),
       'Linear ready issue alias discovery',
+      { cache: true },
     )) {
       if (isIssueAliasFilePath(path)) {
         const canonicalPath = canonicalPathsByKey.get(keyFromPath(path))
