@@ -1537,6 +1537,7 @@ describe('fleet CLI runtime', () => {
       const fleet = new CompletingRemoteFleetClient()
       const output = buffer()
       const errors = buffer()
+      const originSessionRef = '0198b179-c6c2-7e63-9177-4ef52f56c196'
 
       const code = await runFleetCli([
         'dispatch',
@@ -1548,6 +1549,7 @@ describe('fleet CLI runtime', () => {
       ], {
         fleet,
         mount,
+        env: { RELAY_ATTEST_SESSION_ID: originSessionRef },
         stdout: output,
         stderr: errors,
         probePrGhRunner: async () => ({ stdout: '[]' }),
@@ -1558,6 +1560,10 @@ describe('fleet CLI runtime', () => {
       expect(publishes).toEqual([expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         headRef: expect.stringMatching(/^factory\/ar-77-agentworkforce-pear-[0-9a-f]{8}$/u),
+        sessionRef: originSessionRef,
+        body: expect.stringContaining(
+          `<!-- trajectory: work_unit_id=AR-77 work_unit_surface=linear session_ref=${originSessionRef} -->`,
+        ),
       })])
       expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-human-review', 'issue-human-review'])
       const firstDispose = fleet.lifecycleOrder.indexOf('dispose')
