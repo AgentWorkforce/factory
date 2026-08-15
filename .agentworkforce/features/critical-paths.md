@@ -203,6 +203,13 @@ The daemon must register live intake before startup fallback pulls, suppress rep
 
 Cross-host active/active Factory control planes are intentionally unsupported: separate local files cannot provide a truthful compare-and-set fence. Relay execution nodes may be remote and do not need the control-plane state directory, but all simultaneously active control-plane owners must share the same host state store.
 
+For a laptop-to-cloud migration, `factory cloud-node prepare` must remove every
+source-host checkout/state path, retain `mergePolicy: never`, pin an explicit
+workspace and instance name, and print commands carrying the absolute config
+path. Run status and dry-run on the destination first, stop and prove the
+laptop daemon absent, then start the cloud daemon. Reversing or overlapping
+that order is a failed safety check.
+
 **What breaks if this fails:** ready issues are missed or duplicated, agents leak, healthy infrastructure is killed, or hosted work is orphaned after restart.
 
 ---

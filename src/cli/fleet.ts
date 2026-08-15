@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdir, open, readFile, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import readline from 'node:readline/promises'
@@ -63,6 +63,7 @@ import {
   type ResolvedFactoryWorkspace,
 } from '../index'
 import { resolveTestGuidance } from '../dispatch/test-guidance'
+import { prepareCloudNodeConfig } from '../cloud-node/config'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { GitAgentWorktreeManager } from '../git/agent-worktree'
 import { checkFeatureMap, type CheckFeatureMapOptions, type FeatureMapCheckReport } from '../featuremap'
@@ -166,6 +167,14 @@ type ParsedCommand =
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
   | { kind: 'factory-init'; repo?: string; workspaceId?: string }
+  | {
+      kind: 'cloud-node-prepare'
+      outputPath: string
+      cloneRoot: string
+      runtimeRoot: string
+      workspaceId?: string
+      instanceName?: string
+    }
   | { kind: 'notion-intake'; manifestPath: string }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
@@ -200,6 +209,33 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'factory-init') {
       await initializeFactory({ repo: command.repo, workspaceId: command.workspaceId, stdout: out, stderr: err })
+      return 0
+    }
+
+    if (command.kind === 'cloud-node-prepare') {
+      if (!globals.config) {
+        throw new Error('factory cloud-node prepare requires an explicit --config <source-path>')
+      }
+      const raw = JSON.parse(await readFile(globals.config, 'utf8')) as unknown
+      let workspaceId = command.workspaceId
+      if (!workspaceId && !configuredWorkspaceId(raw)) {
+        workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
+      }
+      const prepared = prepareCloudNodeConfig({
+        source: raw,
+        cloneRoot: command.cloneRoot,
+        runtimeRoot: command.runtimeRoot,
+        workspaceId,
+        configPath: command.outputPath,
+        instanceName: command.instanceName,
+      })
+      await writeNewPrivateJson(command.outputPath, prepared.config)
+      writeJson(out, {
+        configPath: command.outputPath,
+        workspaceId: prepared.config.workspaceId,
+        instanceName: prepared.config.reporting.instanceName,
+        commands: prepared.commands,
+      })
       return 0
     }
 
@@ -549,7 +585,31 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
     return parseIntakeCommand(rest)
   }
 
+  if (verb === 'cloud-node') {
+    return parseCloudNodeCommand(rest)
+  }
+
   throw new Error(`Unknown factory command: ${verb}`)
+}
+
+function parseCloudNodeCommand(args: string[]): ParsedCommand {
+  const [action, ...flags] = args
+  if (action !== 'prepare') throw new Error('factory cloud-node requires the prepare command')
+  const parsed = parseFlags(flags)
+  const expected = new Set(['output', 'clone-root', 'runtime-root', 'workspace', 'instance-name'])
+  const unexpected = Object.keys(parsed).find((key) => !expected.has(key))
+  if (unexpected) throw new Error(`Unknown factory cloud-node option: --${unexpected}`)
+  if (!parsed.output) throw new Error('factory cloud-node prepare requires --output <absolute-path>')
+  if (!parsed['clone-root']) throw new Error('factory cloud-node prepare requires --clone-root <absolute-path>')
+  if (!parsed['runtime-root']) throw new Error('factory cloud-node prepare requires --runtime-root <absolute-path>')
+  return {
+    kind: 'cloud-node-prepare',
+    outputPath: parsed.output,
+    cloneRoot: parsed['clone-root'],
+    runtimeRoot: parsed['runtime-root'],
+    ...(parsed.workspace ? { workspaceId: parsed.workspace } : {}),
+    ...(parsed['instance-name'] ? { instanceName: parsed['instance-name'] } : {}),
+  }
 }
 
 function parseIntakeCommand(args: string[]): ParsedCommand {
@@ -2408,6 +2468,37 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {}
 }
 
+function configuredWorkspaceId(value: unknown): string | undefined {
+  const record = asRecord(value)
+  const node = asRecord(record.nodeConfig)
+  const workspace = asRecord(record.workspaceConfig)
+  const factory = asRecord(record.factoryConfig)
+  const candidate = record.workspaceId ?? node.workspaceId ?? workspace.workspaceId ?? factory.workspaceId
+  return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : undefined
+}
+
+async function writeNewPrivateJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  let handle
+  try {
+    handle = await open(path, 'wx', 0o600)
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
+      throw new Error(`refusing to overwrite existing cloud-node config at ${path}`)
+    }
+    throw error
+  }
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8')
+    await handle.sync()
+  } catch (error) {
+    await unlink(path).catch(() => undefined)
+    throw error
+  } finally {
+    await handle.close()
+  }
+}
+
 function usage(): string {
   return 'usage: factory <command> [options]'
 }
@@ -2430,13 +2521,17 @@ Commands:
   dispatch <KEY|path>   Triage and dispatch one issue
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
+  cloud-node prepare    Write a resolved, node-local Factory config copy
   featuremap check      Validate .agentworkforce/features/manifest.yaml
   intake notion <file>  Normalize mounted Notion specs into Factory work
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
-  --workspace <id>      Relay workspace to use with init (otherwise active workspace)
+  --workspace <id>      Relay workspace for init/cloud-node prepare (otherwise active)
   --config <path>       Factory config JSON path (default: ./factory.config.json)
+  --output <path>       New absolute config path for cloud-node prepare
+  --clone-root <path>   Absolute repository root on the cloud node
+  --runtime-root <path> Absolute state/log root on the cloud node
   --dry-run             Discover and triage without writes or agent spawns
   --backend <backend>   Fleet backend: internal or relay
   --agent-exit-timeout <ms>

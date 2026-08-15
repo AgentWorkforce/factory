@@ -451,6 +451,33 @@ describe('fleet CLI parsing', () => {
     })
   })
 
+  it('parses cloud-node config preparation with explicit node-local paths', () => {
+    expect(parseFleetCommand([
+      'cloud-node',
+      'prepare',
+      '--output',
+      '/etc/factory/factory.khaliq.config.json',
+      '--clone-root',
+      '/srv/agent-workforce',
+      '--runtime-root',
+      '/var/lib/factory',
+      '--workspace',
+      'rw_factory',
+      '--instance-name',
+      'factory-khaliq-cloud',
+    ])).toEqual({
+      kind: 'cloud-node-prepare',
+      outputPath: '/etc/factory/factory.khaliq.config.json',
+      cloneRoot: '/srv/agent-workforce',
+      runtimeRoot: '/var/lib/factory',
+      workspaceId: 'rw_factory',
+      instanceName: 'factory-khaliq-cloud',
+    })
+    expect(() => parseFleetCommand(['cloud-node', 'provision'])).toThrow(
+      'factory cloud-node requires the prepare command',
+    )
+  })
+
   it('defaults factory start to live mode', () => {
     expect(parseFleetCommand(['start'])).toEqual({
       kind: 'factory',
@@ -1161,6 +1188,96 @@ describe('fleet CLI runtime', () => {
     expect(output.text()).toContain('default: ./factory.config.json')
     expect(output.text()).toContain('fleet <command>')
     expect(output.text()).not.toContain('usage: fleet')
+  })
+
+  it('writes one private resolved cloud-node config without constructing runtime clients', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cloud-node-prepare-'))
+    try {
+      const configPath = await writeConfig(root, {
+        workspaceId: undefined,
+        issueSource: 'github',
+        repos: {
+          org: 'AgentWorkforce',
+          names: ['pear'],
+          cloneRoot: '/Users/operator/AgentWorkforce',
+        },
+        mergePolicy: 'never',
+      })
+      const outputPath = join(root, 'node', 'factory.khaliq.config.json')
+      const output = buffer()
+      const createFleet = vi.fn(() => {
+        throw new Error('cloud-node prepare must not construct a fleet')
+      })
+
+      const code = await runFleetCli([
+        'cloud-node',
+        'prepare',
+        '--config',
+        configPath,
+        '--output',
+        outputPath,
+        '--clone-root',
+        '/srv/agent-workforce',
+        '--runtime-root',
+        '/var/lib/factory',
+        '--instance-name',
+        'factory-khaliq-cloud',
+      ], {
+        resolveWorkspace: async () => ({ workspaceId: 'rw_factory', cloudWorkspaceId: 'cloud-uuid' }),
+        createFleet,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(createFleet).not.toHaveBeenCalled()
+      const written = JSON.parse(await readFile(outputPath, 'utf8'))
+      expect(written).toMatchObject({
+        workspaceId: 'rw_factory',
+        mergePolicy: 'never',
+        cloneRoot: '/srv/agent-workforce',
+        clonePaths: { 'AgentWorkforce/pear': '/srv/agent-workforce/pear' },
+        loop: {
+          heartbeatPath: '/var/lib/factory/factory-loop-heartbeat.json',
+          registryPath: '/var/lib/factory/factory-loop-registry.json',
+        },
+        reporting: {
+          instanceName: 'factory-khaliq-cloud',
+          outboxPath: '/var/lib/factory/factory-cloud-events.json',
+        },
+      })
+      expect(JSON.stringify(written)).not.toContain('/Users/operator')
+      expect(JSON.parse(output.text())).toMatchObject({
+        configPath: outputPath,
+        workspaceId: 'rw_factory',
+        commands: {
+          status: ['node', 'bin/factory.mjs', 'status', '--config', outputPath],
+          dryRun: ['node', 'bin/factory.mjs', 'run-once', '--config', outputPath, '--dry-run'],
+        },
+      })
+
+      const secondErrors = buffer()
+      const secondCode = await runFleetCli([
+        'cloud-node',
+        'prepare',
+        '--config',
+        configPath,
+        '--output',
+        outputPath,
+        '--clone-root',
+        '/srv/agent-workforce',
+        '--runtime-root',
+        '/var/lib/factory',
+      ], {
+        resolveWorkspace: async () => ({ workspaceId: 'rw_factory' }),
+        stdout: buffer(),
+        stderr: secondErrors,
+      })
+      expect(secondCode).toBe(1)
+      expect(secondErrors.text()).toContain('refusing to overwrite existing cloud-node config')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('prints factory help for --help even when passed after the fleet namespace', async () => {

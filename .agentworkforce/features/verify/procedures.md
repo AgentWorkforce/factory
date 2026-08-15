@@ -165,6 +165,28 @@ node bin/factory.mjs loop-status --config /tmp/factory-feature-verify/config.jso
 
 Do not run `kill-loop` at this tier; process signaling is tier 6.
 
+### Cloud-node config preparation
+
+Prepare a source config containing a laptop `cloneRoot`, `mergePolicy: "never"`,
+and no `workspaceId`, then run:
+
+```bash
+node bin/factory.mjs cloud-node prepare \
+  --config /tmp/factory-cloud-source.json \
+  --output /tmp/factory-cloud-node/factory.khaliq.config.json \
+  --clone-root /srv/agent-workforce \
+  --runtime-root /var/lib/factory \
+  --workspace rw_verify \
+  --instance-name factory-verify-cloud
+```
+
+Pass criteria: the output is created once with mode `0600`; it contains no
+laptop path, has `rw_verify`, derives every repo checkout under
+`/srv/agent-workforce`, retains `mergePolicy: "never"`, and places loop and
+reporting state under `/var/lib/factory`. The printed status, dry-run, and start
+commands must all contain the exact absolute output path. A second invocation
+against the same output and any source with an auto-merge policy must fail.
+
 ---
 
 ## Tier 3 — Reachable Ticket Provider

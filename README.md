@@ -136,6 +136,7 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
 | `factory status` | Print current factory status as JSON, including held agents, hold age, deadline, lifecycle phase, and terminal state awaited. |
+| `factory cloud-node prepare` | Create a non-overwriting, fully resolved config copy with cloud-node checkout/state paths and exact verification/start commands. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
@@ -164,6 +165,11 @@ starts one if none is. For self-started brokers, the agent-exit timeout defaults
 to 30 minutes and can also be set with `FACTORY_AGENT_EXIT_TIMEOUT_MS`. Set
 `FACTORY_LOG_LEVEL=debug` to include per-checkout details for summarized local
 mount refreshes.
+
+For a stop-then-start migration from a laptop to a cloud control-plane host,
+including the fresh-sandbox-per-agent acceptance bar, see the
+[cloud-node dispatch runbook](docs/cloud-node-dispatch.md). The laptop and
+cloud host must never run active Factory CLI control planes concurrently.
 
 Integration connection prompts only run for commands that need provider data or
 GitHub write access. Maintenance commands such as `status`, `loop-status`,

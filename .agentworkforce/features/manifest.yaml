@@ -1,11 +1,11 @@
 version: '1.1'
-updated: '2026-08-07'
+updated: '2026-08-16'
 catalog:
   category_count: 25
-  feature_count: 318
+  feature_count: 319
   tier_counts:
     1: 48
-    2: 127
+    2: 128
     3: 11
     4: 52
     5: 65
@@ -215,6 +215,13 @@ categories:
         description: Load factory configuration from a caller-selected JSON path instead of ./factory.config.json
         location: src/cli/fleet.ts
         verify_tier: 1
+
+      - id: cli-cloud-node-prepare
+        name: Cloud-Node Config Preparation
+        cli: factory cloud-node prepare --config <source> --output <absolute-path> --clone-root <absolute-path> --runtime-root <absolute-path>
+        description: Create one non-overwriting resolved config copy that preserves dispatch policy, replaces source-host paths, pins the workspace and instance identity, and emits exact status, dry-run, and relay-backed start commands for a stop-then-start migration
+        location: src/cloud-node/config.ts, src/cli/fleet.ts, docs/cloud-node-dispatch.md
+        verify_tier: 2
 
       - id: cli-dry-run-option
         name: Dry-Run Execution
