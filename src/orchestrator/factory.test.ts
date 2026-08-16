@@ -3050,6 +3050,7 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(fleet.resumes).toContainEqual({
         name: 'ar-26-review-hoopsheet',
         sessionRef: 'session-review-hoopsheet-26',
+        identityKey: 'factory:dispatch:v1:github:agentworkforce/hoopsheet#26:reviewer',
         node: 'self',
         capability: 'spawn:claude',
         repo: 'AgentWorkforce/hoopsheet',
@@ -10274,6 +10275,10 @@ describe('FactoryLoop', () => {
       ['ar-124-impl-factory', 'AgentWorkforce/factory', '/work/factory'],
       ['ar-124-review-factory', 'AgentWorkforce/factory', '/work/factory'],
     ])
+    expect(fleet.spawns.map((spawn) => spawn.identityKey)).toEqual([
+      'factory:dispatch:v1:github:agentworkforce/factory#124:implementer',
+      'factory:dispatch:v1:github:agentworkforce/factory#124:reviewer',
+    ])
     expect(factory.status().counters.triageEscalations).toBeUndefined()
   })
 
@@ -11553,6 +11558,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-6-review',
       sessionRef: 'session-review-6',
+      identityKey: 'factory:dispatch:v1:linear:uuid-6:reviewer',
       node: 'self',
       capability: 'spawn:claude',
       repo: 'AgentWorkforce/pear',
@@ -12639,6 +12645,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-256-impl-pear',
       sessionRef: 'session-impl-256',
+      identityKey: 'factory:dispatch:v1:linear:uuid-256:implementer',
       node: 'self',
       capability: 'spawn:codex',
       repo: 'AgentWorkforce/pear',
@@ -12673,6 +12680,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-255-impl-pear',
       sessionRef: 'session-impl-255',
+      identityKey: 'factory:dispatch:v1:linear:uuid-255:implementer',
       node: 'self',
       capability: 'spawn:codex',
       repo: 'AgentWorkforce/pear',
@@ -12699,6 +12707,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-10-review',
       sessionRef: 'session-review-10',
+      identityKey: 'factory:dispatch:v1:linear:uuid-10:reviewer',
       node: 'self',
       capability: 'spawn:claude',
       repo: 'AgentWorkforce/pear',

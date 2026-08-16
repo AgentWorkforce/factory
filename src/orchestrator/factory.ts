@@ -54,6 +54,7 @@ import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsT
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
+import { dispatchAgentIdentityKey } from '../dispatch/work-unit-identity'
 import {
   deriveDescriptorsFromMount,
   prescriptiveInstructions,
@@ -7237,6 +7238,7 @@ export class FactoryLoop implements Factory {
       result = await this.#fleet.spawn({
         name: spec.name,
         capability: spec.capability,
+        identityKey: dispatchAgentIdentityKey(record.issue, spec.role),
         node: spec.node ?? 'self',
         repo: spec.repo,
         task: spec.task,
@@ -7578,6 +7580,7 @@ export class FactoryLoop implements Factory {
           const result = await this.#fleet.spawn({
             name: tracked.spec.name,
             capability: tracked.spec.capability,
+            identityKey: dispatchAgentIdentityKey(record.issue, tracked.spec.role),
             node: tracked.result?.node ?? tracked.spec.node ?? 'self',
             repo: tracked.spec.repo,
             task: tracked.spec.task,
@@ -8526,6 +8529,7 @@ export class FactoryLoop implements Factory {
     const result = await this.#fleet.resume({
       name,
       sessionRef: tracked.sessionRef,
+      identityKey: dispatchAgentIdentityKey(record.issue, tracked.spec.role),
       node: tracked.result?.node ?? tracked.spec.node ?? 'self',
       capability: tracked.spec.capability,
       repo: tracked.spec.repo,
@@ -8658,6 +8662,7 @@ export class FactoryLoop implements Factory {
         const result = await this.#fleet.spawn({
           name: replacementSpec.name,
           capability: replacementSpec.capability,
+          identityKey: dispatchAgentIdentityKey(record.issue, replacementSpec.role),
           node: tracked.result?.node ?? replacementSpec.node ?? 'self',
           repo: replacementSpec.repo,
           task: replacementSpec.task,
@@ -13393,9 +13398,15 @@ export class FactoryLoop implements Factory {
     heartbeat.unref?.()
 
     try {
+      const conversationRecord = (await this.#batch()).getIssueByAgent(claimed.agent.name)
+      const conversationRole = conversationRecord?.agents.get(claimed.agent.name)?.spec.role
+      if (!conversationRole) {
+        throw new Error(`Cannot resume ${claimed.agent.name}: its dispatch role is unavailable for identity proof`)
+      }
       const result = await this.#fleet.resume({
         name: claimed.agent.name,
         sessionRef: claimed.agent.sessionRef,
+        identityKey: dispatchAgentIdentityKey(claimed.issue, conversationRole),
         node: claimed.agent.node ?? 'self',
         capability: claimed.agent.capability,
         repo: claimed.agent.repo,
@@ -14669,6 +14680,7 @@ export class FactoryLoop implements Factory {
         const resumed = await this.#fleet.resume({
           name,
           sessionRef: tracked.sessionRef,
+          identityKey: dispatchAgentIdentityKey(waiting.issue, tracked.spec.role),
           node: tracked.result?.node ?? tracked.spec.node ?? 'self',
           capability: tracked.spec.capability,
           repo: tracked.spec.repo,
@@ -14698,6 +14710,7 @@ export class FactoryLoop implements Factory {
     return await this.#fleet.spawn({
       name,
       capability: tracked.spec.capability,
+      identityKey: dispatchAgentIdentityKey(waiting.issue, tracked.spec.role),
       node: tracked.result?.node ?? tracked.spec.node ?? 'self',
       task,
       workflow: tracked.spec.workflow,

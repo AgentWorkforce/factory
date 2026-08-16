@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 import { basename, extname, join, resolve, sep } from 'node:path'
 
-import { action, defineNode, type FleetActionContext, type FleetCapabilityValue, type FleetNodeDefinition } from '@agent-relay/fleet'
-import type { AgentSpec, JsonValue, RestartPolicy, SpawnMode } from '@agent-relay/harness-driver/protocol'
+import { action, defineNode, type FleetActionContext, type FleetActionDefinition, type FleetCapabilityValue, type FleetNodeDefinition, type FleetSpawnAgentInput } from '@agent-relay/fleet'
+import type { JsonValue, RestartPolicy, SpawnMode } from '@agent-relay/harness-driver/protocol'
 import type { SpawnPtyInput } from '@agent-relay/harness-driver'
 import { runScriptWorkflow, runWorkflow } from '@relayflows/core'
 import type { WorkflowRunRow } from '@relayflows/core'
@@ -53,6 +53,8 @@ const spawnCapabilityInputSchema = z.object({
   sessionRef: z.string().min(1).optional(),
   invocationId: z.string().min(1).optional(),
   invocation_id: z.string().min(1).optional(),
+  identityKey: z.string().min(1).optional(),
+  identity_key: z.string().min(1).optional(),
   channels: z.array(z.string().min(1)).optional(),
   channel: z.string().min(1).optional(),
   args: z.array(z.string()).optional(),
@@ -69,6 +71,7 @@ const spawnCapabilityInputSchema = z.object({
   clonePath: input.clonePath ?? input.clone_path,
   sessionRef: input.sessionRef ?? input.session_ref,
   invocationId: input.invocationId ?? input.invocation_id,
+  identityKey: input.identityKey ?? input.identity_key,
   channels: input.channels ?? (input.channel ? [input.channel] : undefined),
   restartPolicy: input.restartPolicy ?? input.restart_policy,
   spawnMode: input.spawnMode ?? input.spawn_mode,
@@ -150,6 +153,15 @@ type CheckoutPathInput = {
   inputs?: Record<string, unknown>
 }
 
+// Fleet 11 models its schema seam with Zod 4 types, while Factory still uses
+// Zod 3. The runtime contract is intentionally only safeParse(), so keep the
+// version boundary here instead of leaking either Zod major through handlers.
+function fleetInputSchema<T>(
+  schema: { safeParse(input: unknown): unknown },
+): NonNullable<FleetActionDefinition<T>['input']> {
+  return schema as unknown as NonNullable<FleetActionDefinition<T>['input']>
+}
+
 export interface FactoryNodeDefinitionOptions {
   config: NodeConfig
   name?: string
@@ -211,14 +223,14 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
         throw new Error('preview:tailscale-serve requires NodeConfig.preview')
       }
       handlers[capability] = action<PreviewCapabilityInput>({
-        input: previewCapabilityInputSchema,
+        input: fleetInputSchema<PreviewCapabilityInput>(previewCapabilityInputSchema),
         metadata: { ...metadata, handler: 'tailscale-serve', access: 'tailnet' },
       }, async (input, ctx) => runPreviewCapability(input, ctx, previewManager, config)) as unknown as FleetCapabilityValue
       continue
     }
     if (capability === 'workflow:run') {
       handlers[capability] = action<WorkflowCapabilityInput>({
-        input: workflowCapabilityInputSchema,
+        input: fleetInputSchema<WorkflowCapabilityInput>(workflowCapabilityInputSchema),
         metadata: { ...metadata, handler: 'relayflows' },
       }, async (input, ctx) => runWorkflowCapability(input, ctx, {
         config,
@@ -228,7 +240,7 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
     }
 
     handlers[capability] = action<SpawnCapabilityInput>({
-      input: spawnCapabilityInputSchema,
+      input: fleetInputSchema<SpawnCapabilityInput>(spawnCapabilityInputSchema),
       metadata: { ...metadata, handler: 'harness', cli: capabilityCli[capability] },
     }, async (input, ctx) => runSpawnCapability(capability, input, ctx, {
       config,
@@ -347,6 +359,9 @@ async function runSpawnCapability(
   const cwd = resolveCheckoutPath(deps.config, input)
   const cli = capabilityCli[capability]
   const command = deps.resolveAgentRelayMcpCommand?.()
+  if (input.identityKey && !command) {
+    throw new Error(`${capability} cannot install the requested agent identity proof without agent-relay MCP`)
+  }
   const spawnInput: SpawnPtyInput = {
     name: input.name,
     cli,
@@ -358,10 +373,17 @@ async function runSpawnCapability(
     continueFrom: input.sessionRef,
     restartPolicy: input.restartPolicy,
   }
-  const harnessConfig = command ? buildRelayMcpHarnessConfig(spawnInput, command) : undefined
+  const harnessConfig: FleetSpawnAgentInput['agent']['harness_config'] = command
+    ? buildRelayMcpHarnessConfig(
+        spawnInput,
+        command,
+        undefined,
+        input.identityKey,
+      ) as FleetSpawnAgentInput['agent']['harness_config']
+    : undefined
   // spawn_mode/exit_after_task ride the agent spec onto the broker's spawn
   // input; the broker ends the agent when its task completes.
-  const agent: AgentSpec = {
+  const agent: FleetSpawnAgentInput['agent'] = {
     name: input.name,
     runtime: 'pty',
     cli,
