@@ -206,6 +206,13 @@ export type DispatchLifecyclePhase =
   | 'complete'
   | 'abandoned'
 
+/**
+ * The phases a dispatch lifecycle can end in. Callers that wait for a terminal
+ * outcome — the CLI derives an exit code from one — must not be handed an
+ * intermediate phase they could mistake for a result.
+ */
+export type TerminalDispatchLifecyclePhase = Extract<DispatchLifecyclePhase, 'complete' | 'abandoned'>
+
 export type DispatchLifecycleLease = {
   owner: string
   epoch: number

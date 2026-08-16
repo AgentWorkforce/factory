@@ -4515,6 +4515,49 @@ describe('fleet CLI exit-code contract', () => {
     }
   })
 
+  // A relay dispatch waits for the durable lifecycle to reach terminal. A
+  // dependency park, a triage escalation, and a label refusal all return
+  // BEFORE the lifecycle claim, so there is no row that can ever become
+  // terminal. The wait must not become an infinite poll: a command that never
+  // returns produces no exit code at all, which is strictly worse than the
+  // wrong one.
+  it('returns an exit code instead of waiting forever when a relay dispatch created no lifecycle', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-nolifecycle-'))
+    try {
+      const configPath = await writeConfig(root)
+      const waited: string[] = []
+      const factory = stubFactory({
+        dispatch: vi.fn(async () => dispatchResult({
+          hold: { kind: 'dependency', blockers: ['AR-70'] },
+        })),
+        // Mirrors the real method once the no-row early return is in place.
+        waitForDispatchTerminal: vi.fn(async (issue: { key: string }) => {
+          waited.push(issue.key)
+          return undefined
+        }),
+      })
+
+      const code = await Promise.race([
+        runFleetCli(['dispatch', 'AR-77', '--backend', 'relay', '--config', configPath], {
+          fleet: new FakeFleetClient(),
+          mount: new FakeMountClient({ [issuePath]: issueFile }),
+          createFactory: () => factory,
+          ensureLocalMount: async () => undefined,
+          env: { RELAY_WORKSPACE_KEY: 'rk_live_test' },
+          stdout: buffer(),
+          stderr: buffer(),
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('relay dispatch never returned')), 5_000)),
+      ])
+
+      expect(code).toBe(3)
+      expect(waited).toEqual(['AR-77'])
+      expect(factory.stop).toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // Sibling command — `run-once` had the same hard-coded 0.
   it('exits non-zero when a run-once cycle records an error, and zero when it does not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-runonce-'))

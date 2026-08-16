@@ -1,7 +1,7 @@
 import type { FactoryConfig } from './config/schema'
 import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
-import type { DispatchLifecyclePhase, StateStore } from './ports/state'
+import type { DispatchLifecyclePhase, StateStore, TerminalDispatchLifecyclePhase } from './ports/state'
 import type { Clock, Logger } from './ports/system'
 import type { FactoryEventReporter } from './ports/observability'
 import type { AgentWorktreeManager } from './ports/worktree'
@@ -78,12 +78,16 @@ export interface Factory {
   dispatch(decision: TriageDecision, opts?: { dryRun?: boolean }): Promise<DispatchResult>
   /**
    * Resolves once the issue's durable dispatch row reaches a terminal phase,
-   * reporting which one, or `undefined` if the wait ended without observing
-   * one. Callers deriving an exit code need the phase: a dispatch held on
-   * capacity returns an empty hold result and schedules a durable retry, so
-   * the pre-wait result cannot say how the run ended.
+   * reporting which one. Callers deriving an exit code need the phase: a
+   * dispatch held on capacity returns an empty hold result and schedules a
+   * durable retry, so the pre-wait result cannot say how the run ended.
+   *
+   * `undefined` means no terminal phase was observed — either this dispatch
+   * never created a lifecycle row (a dependency park, a triage escalation, or
+   * a label refusal all return before the claim) or the wait ended because
+   * Factory is stopping.
    */
-  waitForDispatchTerminal(issue: IssueRef): Promise<DispatchLifecyclePhase | undefined>
+  waitForDispatchTerminal(issue: IssueRef): Promise<TerminalDispatchLifecyclePhase | undefined>
   status(): FactoryStatus
   on(
     event: 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error',

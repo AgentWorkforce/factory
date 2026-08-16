@@ -1,6 +1,6 @@
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { isLiveDispatchStateChangedError } from '../orchestrator'
-import type { DispatchLifecyclePhase } from '../ports/state'
+import type { TerminalDispatchLifecyclePhase } from '../ports/state'
 import type { DispatchResult, IterationReport } from '../types'
 
 /**
@@ -78,12 +78,13 @@ export function exitCodeForDispatchResult(result: DispatchResult): FactoryExitCo
  */
 export function exitCodeForRelayDispatch(
   result: DispatchResult,
-  terminalPhase: DispatchLifecyclePhase | undefined,
+  terminalPhase: TerminalDispatchLifecyclePhase | undefined,
 ): FactoryExitCode {
   if (terminalPhase === 'complete') return FACTORY_EXIT.OK
   if (terminalPhase === 'abandoned') return FACTORY_EXIT.FAILED
-  // The wait ended without observing a terminal phase — Factory is stopping.
-  // Nothing better is known than what the dispatch itself reported.
+  // No terminal phase was observed: either this dispatch never created a
+  // lifecycle row, or the wait ended because Factory is stopping. Nothing
+  // better is known than what the dispatch itself reported.
   return exitCodeForDispatchResult(result)
 }
 

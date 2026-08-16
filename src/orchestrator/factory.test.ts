@@ -2060,6 +2060,31 @@ describe('github API fallback eligibility candidate gathering', () => {
   })
 })
 
+describe('waitForDispatchTerminal', () => {
+  it('returns immediately when the dispatch never created a lifecycle row', async () => {
+    // A dependency park, a triage escalation, and a label refusal all return
+    // before the lifecycle claim, so no row exists and none can ever become
+    // terminal. Polling for one would never stop, and a caller deriving an exit
+    // code would never produce one at all.
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const phase = await Promise.race([
+        factory.waitForDispatchTerminal({ key: 'AR-404', uuid: 'uuid-404', path: '/linear/issues/AR-404.json' }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('waitForDispatchTerminal never returned')), 3_000)),
+      ])
+
+      expect(phase).toBeUndefined()
+    } finally {
+      await factory.stop()
+    }
+  })
+})
+
 describe('FactoryLoop', () => {
   it('sweeps preview orphans on daemon startup using durable active issue owners', async () => {
     const mount = new FakeMountClient()

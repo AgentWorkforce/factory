@@ -44,6 +44,7 @@ import type {
   RegistryHandoffAgent,
   ConversationSessionState,
   StateStore,
+  TerminalDispatchLifecyclePhase,
   WaitingClarification,
 } from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
@@ -849,13 +850,25 @@ export class FactoryLoop implements Factory {
    * and reports which one. A caller that turns the run into an exit code needs
    * the phase: a dispatch that hit capacity returns an empty hold result and
    * schedules a durable retry, so the pre-wait result says nothing about how
-   * the run actually ended. `undefined` means the wait gave up without
-   * observing a terminal phase (Factory is stopping).
+   * the run actually ended.
+   *
+   * `undefined` means no terminal phase was observed — there was no lifecycle
+   * row to wait on, or the wait ended because Factory is stopping.
    */
-  async waitForDispatchTerminal(issue: IssueRef): Promise<DispatchLifecyclePhase | undefined> {
+  async waitForDispatchTerminal(issue: IssueRef): Promise<TerminalDispatchLifecyclePhase | undefined> {
     const key = issueKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    if (lifecycle && isTerminalDispatchLifecycle(lifecycle)) return lifecycle.phase
+    // No durable row means this dispatch never claimed a lifecycle: a
+    // dependency park, a triage escalation, and a label refusal all return
+    // before the claim. Nothing can ever become terminal, so polling would
+    // never stop and the caller would never produce an exit code at all.
+    if (!lifecycle) return undefined
+    if (isTerminalDispatchLifecycle(lifecycle)) return lifecycle.phase
+    // Capture the phase at the moment this waiter observes it. The waiters are
+    // shared across callers of one row and carry no payload, so a re-read after
+    // the fact can race lifecycle cleanup or a reopened dispatch for the same
+    // issue and report a different run — or none.
+    let observedPhase: TerminalDispatchLifecyclePhase | undefined
     await new Promise<void>((resolve) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -887,6 +900,7 @@ export class FactoryLoop implements Factory {
         try {
           const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
           if (latest && isTerminalDispatchLifecycle(latest)) {
+            observedPhase = latest.phase
             this.#resolveDispatchTerminalWaiters(issue)
             return
           }
@@ -915,10 +929,10 @@ export class FactoryLoop implements Factory {
       }
       void poll()
     })
-    // The waiters are resolved without carrying a phase — several of them share
-    // one row — so read the row back rather than threading it through. A wait
-    // that ended because Factory is stopping leaves a non-terminal phase here,
-    // which correctly reports `undefined`.
+    if (observedPhase) return observedPhase
+    // Another code path resolved the waiters without this poll seeing the row.
+    // Fall back to a read; a wait that ended because Factory is stopping leaves
+    // a non-terminal phase here, which correctly reports `undefined`.
     const settledLifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     return settledLifecycle && isTerminalDispatchLifecycle(settledLifecycle)
       ? settledLifecycle.phase
@@ -17824,10 +17838,15 @@ const durableBabysitterTrackedAgent = (
   result: { name: session.agentName },
 })
 
-const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
+// Type guards, not plain predicates: callers that report the terminal phase
+// outward must be able to narrow it, so an intermediate phase cannot leak into
+// a terminal-phase contract.
+const isTerminalDispatchLifecycle = (
+  lifecycle: DispatchLifecycle,
+): lifecycle is DispatchLifecycle & { phase: TerminalDispatchLifecyclePhase } =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
-const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): boolean =>
+const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): phase is TerminalDispatchLifecyclePhase =>
   phase === 'complete' || phase === 'abandoned'
 
 const heldAgentsForRecord = (
