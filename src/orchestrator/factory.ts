@@ -4943,17 +4943,23 @@ export class FactoryLoop implements Factory {
       }
       for (const agent of lifecycle.agents) {
         const previousAgent = previous?.agents.find((candidate) => candidate.name === agent.name)
-        // Inherit a release stamp only within the same invocation. A respawn
-        // reuses the agent name with a new invocation, and inheriting the dead
-        // generation's stamp would durably mark the live worker as released.
-        if (
-          previousAgent?.releasedAtMs !== undefined &&
-          previousAgent.tracked.spec.invocationId === agent.tracked.spec.invocationId
-        ) {
-          agent.releasedAtMs = previousAgent.releasedAtMs
-        }
+        // The in-flight record is authoritative for release state: the stamp
+        // now lives on the tracked agent and round-trips through the lifecycle,
+        // so a still-released agent brings its own stamp here. Inheriting the
+        // previous row's stamp instead would refile a respawned worker as
+        // released — a respawn reuses both the agent name and the deterministic
+        // invocation id, so neither can tell the generations apart — and every
+        // consumer that filters on `releasedAtMs` would then treat a live
+        // worker as gone.
         if (previousAgent?.costUsage) agent.costUsage = structuredClone(previousAgent.costUsage)
-        if (releasedAgentNames.has(agent.name)) agent.releasedAtMs ??= this.#clock.now()
+        if (releasedAgentNames.has(agent.name)) {
+          const releasedAtMs = agent.releasedAtMs ?? this.#clock.now()
+          agent.releasedAtMs = releasedAtMs
+          // Keep the record the single source of the stamp, so the next save
+          // carries it without having to read it back off the durable row.
+          const tracked = record.agents.get(agent.name)
+          if (tracked) tracked.releasedAtMs ??= releasedAtMs
+        }
       }
       const saved = await this.#state.saveDispatchLifecycle(
         this.#workspaceId,

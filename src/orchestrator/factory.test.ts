@@ -10552,6 +10552,15 @@ describe('FactoryLoop', () => {
       const respawns = fleet.spawns.filter((spawn) => spawn.name === implementer.name)
       expect(respawns).toHaveLength(1)
       expect(respawns[0]?.invocationId).toBe(releasedInvocationId)
+      // The respawn reuses the deterministic invocation id, so neither the
+      // agent name nor the id can tell the generations apart. The durable row
+      // must still not carry the dead generation's release stamp forward:
+      // every consumer that filters on it would treat the live worker as gone.
+      const persisted = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const respawned = persisted?.agents.find((agent) => agent.name === implementer.name)
+      expect(respawned?.tracked.result?.name).toBe(implementer.name)
+      expect(respawned?.releasedAtMs).toBeUndefined()
+      expect(respawned?.tracked.releasedAtMs).toBeUndefined()
     } finally {
       await factory.stop()
     }
