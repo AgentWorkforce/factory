@@ -325,6 +325,7 @@ export interface BatchSnapshot {
     result: SpawnResult,
   ): void
   recordPlanned(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer']): void
+  recordRelease(record: InFlightIssue, agentName: string, releasedAtMs: number): string | undefined
   recordDryRun(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer'], invocationId: string): void
   restore(record: InFlightIssue): InFlightIssue
 }

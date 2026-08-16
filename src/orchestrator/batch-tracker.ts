@@ -9,6 +9,12 @@ export interface TrackedAgent {
   sessionRef?: string
   /** Session lineage already resumed after Relay could not address a babysitter wake. */
   unreachableWakeResumedSessionRef?: string
+  /**
+   * Set when this placement was deliberately released. A released agent keeps
+   * its bookkeeping entry for reporting, but it is no longer a live worker, so
+   * it can never suppress a later respawn of the same invocation.
+   */
+  releasedAtMs?: number
 }
 
 export interface InFlightIssue {
@@ -217,8 +223,23 @@ export class BatchTracker {
     return spec.invocationId ?? `factory:${issue.key}:${stableHash(`${issue.uuid}:${spec.role}:${spec.name}:${spec.repo}`)}`
   }
 
+  /**
+   * A recorded invocation suppresses a respawn only while a live worker still
+   * carries it. `recordPlanned` deliberately records nothing here: an owner
+   * that dies between planning and spawn confirmation leaves the invocation
+   * unrecorded, so takeover retries it as-is and the roster lookup in
+   * `#spawnAgent` adopts the surviving worker instead of duplicating it.
+   *
+   * A deliberate release is the opposite case. The worker is gone, so the
+   * memory of its spawn must not answer for it — otherwise the dispatch gate
+   * reports a synthetic success and the state store believes work is running
+   * that no process exists for. This derives liveness from the tracked agents
+   * rather than trusting the id set, so a release path that drops or marks its
+   * agent invalidates the claim without having to remember to say so.
+   */
   shouldSpawn(record: InFlightIssue, invocationId: string): boolean {
-    return !record.invocationIds.has(invocationId) && !this.#invocationIds.has(invocationId)
+    if (!record.invocationIds.has(invocationId) && !this.#invocationIds.has(invocationId)) return true
+    return !this.#hasLiveInvocation(record, invocationId)
   }
 
   recordSpawn(record: InFlightIssue, spec: AgentSpec, invocationId: string, result: SpawnResult): void {
@@ -231,8 +252,38 @@ export class BatchTracker {
     })
   }
 
+  /**
+   * Invalidate the spawn memory for an agent that was deliberately released.
+   * Returns the invocation id that was released, for callers that log it.
+   */
+  recordRelease(record: InFlightIssue, agentName: string, releasedAtMs: number): string | undefined {
+    const tracked = record.agents.get(agentName)
+      ?? [...record.agents.values()].find((candidate) => candidate.result?.name === agentName)
+    if (!tracked) return undefined
+    tracked.releasedAtMs ??= releasedAtMs
+    const invocationId = tracked.spec.invocationId ?? this.invocationIdFor(record.issue, tracked.spec)
+    record.invocationIds.delete(invocationId)
+    // The tracker-global set is what blocks a different in-flight record from
+    // reusing the id, so a release has to clear both or the claim survives the
+    // worker in another record's name.
+    if (!this.#hasLiveInvocation(record, invocationId)) this.#invocationIds.delete(invocationId)
+    return invocationId
+  }
+
+  #hasLiveInvocation(record: InFlightIssue, invocationId: string): boolean {
+    const records = [record, ...this.#inFlight.values()]
+    return records.some((candidate) => [...candidate.agents.values()].some((tracked) =>
+      tracked.result !== undefined &&
+      tracked.releasedAtMs === undefined &&
+      tracked.spec.invocationId === invocationId))
+  }
+
   recordPlanned(record: InFlightIssue, spec: AgentSpec): void {
-    if (record.agents.has(spec.name)) return
+    // A released placement is not a plan still in flight. Replace it so the
+    // retry's own spec is what a takeover reads, instead of the dead
+    // generation's spawn result.
+    const existing = record.agents.get(spec.name)
+    if (existing && existing.releasedAtMs === undefined) return
     record.agents.set(spec.name, { spec: { ...spec }, sessionRef: spec.sessionRef })
   }
 
@@ -259,6 +310,7 @@ export class BatchTracker {
         spec: structuredClone(tracked.spec),
         result: tracked.result ? { ...tracked.result } : undefined,
         sessionRef: tracked.sessionRef,
+        releasedAtMs: tracked.releasedAtMs,
       }])),
       invocationIds: new Set(record.invocationIds),
       result: record.result ? structuredClone(record.result) : undefined,

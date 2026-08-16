@@ -10503,6 +10503,112 @@ describe('FactoryLoop', () => {
     expect(tracker.shouldSpawn(recordB!, invocationId)).toBe(false)
   })
 
+  // The pair below is one guarantee seen from both sides. A deliberate release
+  // must invalidate the spawn memory (or the dispatch gate reports a synthetic
+  // success for a worker that no longer exists), and an owner that dies between
+  // planning and spawn confirmation must still not create a duplicate worker.
+  it('respawns a deliberately released invocation instead of reporting a synthetic success', async () => {
+    const path = issuePath(2291)
+    const content = issueFile(2291)
+    const mount = new FakeMountClient({ [path]: content })
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, content))
+      const implementer = decision.implementers[0]!
+      const releasedInvocationId = new BatchTracker(1).invocationIdFor(decision.issue, implementer)
+
+      // The durable shape a deliberate mid-dispatch release leaves behind: the
+      // agent was really spawned, the invocation is still recorded, and the
+      // placement is gone.
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: 'released-run-2291',
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'dispatching',
+          agents: [{
+            name: implementer.name,
+            tracked: {
+              spec: { ...implementer, invocationId: releasedInvocationId },
+              result: { name: implementer.name, node: 'sf-mini', locality: 'remote' },
+            },
+            releasedAtMs: 1_000,
+          }],
+          invocationIds: [releasedInvocationId],
+          updatedAtMs: 0,
+        },
+        'dead-factory-owner',
+        0,
+        1,
+      )
+
+      await factory.dispatch(decision)
+
+      const respawns = fleet.spawns.filter((spawn) => spawn.name === implementer.name)
+      expect(respawns).toHaveLength(1)
+      expect(respawns[0]?.invocationId).toBe(releasedInvocationId)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('adopts a planned invocation whose owner died before spawn confirmation instead of duplicating it', async () => {
+    const path = issuePath(2292)
+    const content = issueFile(2292)
+    const mount = new FakeMountClient({ [path]: content })
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, content))
+      const implementer = decision.implementers[0]!
+      const plannedInvocationId = new BatchTracker(1).invocationIdFor(decision.issue, implementer)
+
+      // recordPlanned persists intent without an outcome and without recording
+      // the invocation, so the durable row cannot say whether the spawn landed.
+      // The worker did land, and the fleet still reports it.
+      fleet.hydrateTracked([{ name: implementer.name, invocationId: plannedInvocationId, node: 'sf-mini' }])
+      await stateStore.claimDispatchLifecycle(
+        'factory-test',
+        issueKey(decision.issue),
+        {
+          runId: 'planned-run-2292',
+          issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
+          decision,
+          dryRun: false,
+          phase: 'dispatching',
+          agents: [{
+            name: implementer.name,
+            tracked: { spec: { ...implementer, invocationId: plannedInvocationId } },
+          }],
+          invocationIds: [],
+          updatedAtMs: 0,
+        },
+        'dead-factory-owner',
+        0,
+        1,
+      )
+
+      await factory.dispatch(decision)
+
+      expect(fleet.spawns.filter((spawn) => spawn.name === implementer.name)).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        .resolves.toMatchObject({
+          agents: expect.arrayContaining([expect.objectContaining({
+            name: implementer.name,
+            tracked: expect.objectContaining({ result: expect.objectContaining({ name: implementer.name }) }),
+          })]),
+        })
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('dedupes repeated dispatch by stable invocation id', async () => {
     const mount = new FakeMountClient({ [issuePath(5)]: issueFile(5) })
     const fleet = new FakeFleetClient()

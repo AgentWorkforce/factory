@@ -114,6 +114,73 @@ describe('BatchTracker implementation capacity', () => {
   })
 })
 
+describe('BatchTracker spawn idempotency', () => {
+  it('lets a deliberately released invocation spawn again', () => {
+    const tracker = new BatchTracker(2)
+    const record = tracker.start(decision(10, 'pear'), false)!
+    const spec = record.decision.implementers[0]!
+    const invocationId = tracker.invocationIdFor(record.issue, spec)
+
+    tracker.recordSpawn(record, spec, invocationId, { name: spec.name })
+    expect(tracker.shouldSpawn(record, invocationId)).toBe(false)
+
+    expect(tracker.recordRelease(record, spec.name, 1_000)).toBe(invocationId)
+
+    expect(tracker.shouldSpawn(record, invocationId)).toBe(true)
+    expect(record.agents.get(spec.name)?.releasedAtMs).toBe(1_000)
+  })
+
+  it('keeps blocking a live invocation, including from another in-flight record', () => {
+    const tracker = new BatchTracker(2)
+    const first = tracker.start(decision(11, 'pear'), false)!
+    const second = tracker.start(decision(12, 'pear'), false)!
+    const spec = first.decision.implementers[0]!
+    const invocationId = 'shared-live-invocation'
+
+    tracker.recordSpawn(first, spec, invocationId, { name: spec.name })
+
+    expect(tracker.shouldSpawn(first, invocationId)).toBe(false)
+    expect(tracker.shouldSpawn(second, invocationId)).toBe(false)
+
+    // Releasing the only worker that carries the id frees it everywhere; the
+    // cross-record guard exists to protect a live placement, not a dead one.
+    tracker.recordRelease(first, spec.name, 2_000)
+    expect(tracker.shouldSpawn(second, invocationId)).toBe(true)
+  })
+
+  it('leaves a planned invocation retryable so takeover adopts instead of duplicating', () => {
+    const tracker = new BatchTracker(2)
+    const record = tracker.start(decision(13, 'pear'), false)!
+    const spec = record.decision.implementers[0]!
+    const invocationId = tracker.invocationIdFor(record.issue, spec)
+
+    // recordPlanned is the pre-spawn intent write. It must not claim the
+    // invocation: the owner can die before the outcome is known, and the
+    // takeover has to retry the same deterministic id.
+    tracker.recordPlanned(record, { ...spec, invocationId })
+
+    expect(tracker.shouldSpawn(record, invocationId)).toBe(true)
+    expect(record.agents.get(spec.name)?.result).toBeUndefined()
+
+    const restored = new BatchTracker(2).restore(record)
+    expect(restored.agents.get(spec.name)?.result).toBeUndefined()
+  })
+
+  it('rearms the gate when a released agent is respawned', () => {
+    const tracker = new BatchTracker(2)
+    const record = tracker.start(decision(14, 'pear'), false)!
+    const spec = record.decision.implementers[0]!
+    const invocationId = tracker.invocationIdFor(record.issue, spec)
+
+    tracker.recordSpawn(record, spec, invocationId, { name: spec.name })
+    tracker.recordRelease(record, spec.name, 3_000)
+    tracker.recordSpawn(record, spec, invocationId, { name: spec.name })
+
+    expect(record.agents.get(spec.name)?.releasedAtMs).toBeUndefined()
+    expect(tracker.shouldSpawn(record, invocationId)).toBe(false)
+  })
+})
+
 const decision = (number: number, repo: string): TriageDecision => {
   const issue = { key: String(number), uuid: `uuid-${number}`, path: `/issues/${number}.json` }
   return {
