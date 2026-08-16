@@ -4424,6 +4424,95 @@ describe('fleet CLI exit-code contract', () => {
     }
   })
 
+  // Class 3b — one scope-403, two verdicts, one mount-freshness apart.
+  //
+  // Both arms run the REAL preflight, so the wording and the exit code are read
+  // off one mechanism instead of being asserted independently. That matters
+  // here: the refusal text and the warning text were once the same string, so
+  // an operator could not tell a startup that aborted from one that went on to
+  // spawn. The pair pins that the refusal reaches the shell as non-zero and
+  // says so, while the degraded branch exits 0 and never claims to refuse.
+  it('reports a scope-403 refusal as non-zero and the degraded warning as zero', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-scope-verdict-'))
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      const configPath = await writeConfig(root, {
+        repos: { byLabel: { pear: 'AgentWorkforce/pear' }, default: 'AgentWorkforce/pear' },
+      })
+      const openPr = () => new FakeMountClient({
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Scoped PR',
+            body: 'Babysit me.',
+            state: 'open',
+            draft: false,
+            head: { ref: 'scoped-pr', sha: 'scope-sha', repo: { full_name: 'AgentWorkforce/pear' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+
+      // A mirror recording a 403 scope shortfall. `lastReconcileAt` is the only
+      // thing that differs between the two arms.
+      const runWithMirror = async (label: string, lastReconcileAt: string) => {
+        const mirrorRoot = join(root, label)
+        const fleet = new FakeFleetClient()
+        const injected = buffer()
+        stderrSpy.mockClear()
+        const code = await runFleetCli(['babysit', '10', '--config', configPath], {
+          fleet,
+          mount: openPr(),
+          ensureLocalMount: async (workspaceId, _startDir, options) => {
+            const stateDir = join(mirrorRoot, '.integrations', '.relay')
+            await mkdir(stateDir, { recursive: true })
+            await writeFile(join(stateDir, 'state.json'), JSON.stringify({
+              workspaceId,
+              lastReconcileAt,
+              pid: process.pid,
+              lastError: { message: 'http 403 forbidden: missing required scope: fs:read' },
+            }), 'utf8')
+            return runLocalMountPreflight(workspaceId, mirrorRoot, {
+              ...options,
+              startMount: async () => {},
+            })
+          },
+          babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+          stdout: buffer(),
+          stderr: injected,
+        })
+        // Two sinks: the refusal is raised and surfaced through the CLI's
+        // injected stream, while the degraded branch writes straight to
+        // process.stderr. Read both so neither arm can pass by looking at the
+        // wrong one.
+        const emitted = injected.text()
+          + stderrSpy.mock.calls.map(([chunk]) => String(chunk)).join('')
+        return { code, emitted, spawns: fleet.spawns }
+      }
+
+      const stale = await runWithMirror('stale', new Date(Date.now() - 30 * 60 * 1000).toISOString())
+      expect(stale.code).toBe(2)
+      // Refused, said so, and kept the promise.
+      expect(stale.emitted).toContain('Factory will not spawn agents against a read-denied mirror')
+      expect(stale.spawns).toEqual([])
+
+      const fresh = await runWithMirror('fresh', new Date().toISOString())
+      expect(fresh.code).toBe(0)
+      expect(fresh.emitted).toContain('lacks the filesystem scope')
+      expect(fresh.emitted).toContain('continuing')
+      // The defect this splits: a branch that spawns must not print the
+      // sentence promising it will not.
+      expect(fresh.emitted).not.toContain('Factory will not spawn agents against a read-denied mirror')
+      expect(fresh.spawns).toHaveLength(1)
+    } finally {
+      // This file installs no global mock restoration, so an un-restored spy on
+      // process.stderr leaks into every later test in the suite. Restore it
+      // here rather than leaving the next test to fail for our reasons.
+      stderrSpy.mockRestore()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // Class 4 — `factory.dispatch()` returned normally having placed no agents.
   // This is the path the CLI hard-coded to 0 regardless of the result.
   it.each([
