@@ -18,7 +18,7 @@ import type {
 import { FactoryConfigSchema, LiveDispatchStateChangedError, stateResolutionFromIds } from '../index'
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { FileStateStore } from '../state/file-state-store'
-import { FakeFleetClient, FakeMountClient } from '../testing'
+import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
@@ -4615,21 +4615,4 @@ const writeConfig = async (root: string, overrides: Record<string, unknown> = {}
 
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
-}
-
-/**
- * Fail a test that hangs, without leaving the guard timer armed. An uncleared
- * timer rejects a promise nobody is observing any more and keeps the event loop
- * alive to do it — a test harness must not fail in ways of its own invention.
- */
-async function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
 }

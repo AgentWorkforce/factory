@@ -28,7 +28,7 @@ import {
 } from '../index'
 import { changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
-import { FakeFleetClient, FakeMountClient } from '../testing'
+import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
@@ -22013,20 +22013,3 @@ describe('changeEventPath (resource-less event tolerance)', () => {
     expect(changeEventPath({ resource: { path: 123 } } as unknown as ChangeEvent)).toBeUndefined()
   })
 })
-
-/**
- * Fail a test that hangs, without leaving the guard timer armed. An uncleared
- * timer rejects a promise nobody is observing any more and keeps the event loop
- * alive to do it — a test harness must not fail in ways of its own invention.
- */
-async function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
