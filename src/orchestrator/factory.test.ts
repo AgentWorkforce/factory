@@ -2072,11 +2072,11 @@ describe('waitForDispatchTerminal', () => {
       triage: new StaticTriage(),
     })
     try {
-      const phase = await Promise.race([
+      const phase = await withDeadline(
         factory.waitForDispatchTerminal({ key: 'AR-404', uuid: 'uuid-404', path: '/linear/issues/AR-404.json' }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('waitForDispatchTerminal never returned')), 3_000)),
-      ])
+        3_000,
+        'waitForDispatchTerminal never returned',
+      )
 
       expect(phase).toBeUndefined()
     } finally {
@@ -6446,6 +6446,12 @@ describe('FactoryLoop', () => {
       await attached.start({ mode: 'dispatch-owner' })
       await expect(attached.dispatch(decision)).resolves.toEqual(result)
       const terminal = attached.waitForDispatchTerminal(decision.issue)
+      // A SECOND waiter on the same row. Only the poller that observes the
+      // terminal row learns the phase first-hand; every other waiter has to be
+      // handed it through the resolution. A waiter that re-read the shared row
+      // after release could find it cleared, or find the next dispatch for the
+      // same issue, and report the wrong run.
+      const secondWaiter = attached.waitForDispatchTerminal(decision.issue)
 
       mount.files.set(issuePath(number), { content: issueFile(number, implementing) })
       firstFleet.emitAgentMessage({
@@ -6503,7 +6509,9 @@ describe('FactoryLoop', () => {
       if (crashAfterPark) expect(firstFleet.resumes).toEqual([])
       else expect(attachedFleet.resumes).toEqual([])
       completingFleet.emitAgentExit(`ar-${number}-review`, 'completed')
-      await terminal
+      // Both waiters report the phase the row settled in, not `undefined` and
+      // not each other's opposite.
+      expect(await Promise.all([terminal, secondWaiter])).toEqual(['complete', 'complete'])
       expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
         .toMatchObject({ phase: 'complete' })
       expect(attachedFleet.spawns).toEqual([])
@@ -22005,3 +22013,20 @@ describe('changeEventPath (resource-less event tolerance)', () => {
     expect(changeEventPath({ resource: { path: 123 } } as unknown as ChangeEvent)).toBeUndefined()
   })
 })
+
+/**
+ * Fail a test that hangs, without leaving the guard timer armed. An uncleared
+ * timer rejects a promise nobody is observing any more and keeps the event loop
+ * alive to do it — a test harness must not fail in ways of its own invention.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}

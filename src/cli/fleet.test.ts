@@ -4537,7 +4537,7 @@ describe('fleet CLI exit-code contract', () => {
         }),
       })
 
-      const code = await Promise.race([
+      const code = await withDeadline(
         runFleetCli(['dispatch', 'AR-77', '--backend', 'relay', '--config', configPath], {
           fleet: new FakeFleetClient(),
           mount: new FakeMountClient({ [issuePath]: issueFile }),
@@ -4547,8 +4547,9 @@ describe('fleet CLI exit-code contract', () => {
           stdout: buffer(),
           stderr: buffer(),
         }),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('relay dispatch never returned')), 5_000)),
-      ])
+        5_000,
+        'relay dispatch never returned',
+      )
 
       expect(code).toBe(3)
       expect(waited).toEqual(['AR-77'])
@@ -4614,4 +4615,21 @@ const writeConfig = async (root: string, overrides: Record<string, unknown> = {}
 
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * Fail a test that hangs, without leaving the guard timer armed. An uncleared
+ * timer rejects a promise nobody is observing any more and keeps the event loop
+ * alive to do it — a test harness must not fail in ways of its own invention.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }

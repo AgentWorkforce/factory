@@ -557,7 +557,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleOwner = `${process.pid}:${randomUUID()}`
   readonly #discoverySweepOwner = `${process.pid}:${randomUUID()}`
   readonly #dispatchLifecycleEpochs = new Map<string, number>()
-  readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
+  readonly #dispatchTerminalWaiters = new Map<string, Set<DispatchTerminalWaiter>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #abandonedDispatchReasons = new Map<string, string>()
@@ -877,9 +877,10 @@ export class FactoryLoop implements Factory {
         waiters = new Set()
         this.#dispatchTerminalWaiters.set(key, waiters)
       }
-      const finish = (): void => {
+      const finish: DispatchTerminalWaiter = (phase): void => {
         if (settled) return
         settled = true
+        observedPhase = phase
         if (timer) clearTimeout(timer)
         const current = this.#dispatchTerminalWaiters.get(key)
         current?.delete(finish)
@@ -900,8 +901,7 @@ export class FactoryLoop implements Factory {
         try {
           const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
           if (latest && isTerminalDispatchLifecycle(latest)) {
-            observedPhase = latest.phase
-            this.#resolveDispatchTerminalWaiters(issue)
+            this.#resolveDispatchTerminalWaiters(issue, latest.phase)
             return
           }
           if (latest?.phase === 'waiting-for-human' && this.#startMode === 'dispatch-owner') {
@@ -929,14 +929,10 @@ export class FactoryLoop implements Factory {
       }
       void poll()
     })
-    if (observedPhase) return observedPhase
-    // Another code path resolved the waiters without this poll seeing the row.
-    // Fall back to a read; a wait that ended because Factory is stopping leaves
-    // a non-terminal phase here, which correctly reports `undefined`.
-    const settledLifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    return settledLifecycle && isTerminalDispatchLifecycle(settledLifecycle)
-      ? settledLifecycle.phase
-      : undefined
+    // `observedPhase` is whatever resolved THIS waiter. It stays undefined only
+    // when the wait ended without a terminal resolution at all — Factory is
+    // stopping — which is exactly what `undefined` reports.
+    return observedPhase
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {
@@ -3103,7 +3099,7 @@ export class FactoryLoop implements Factory {
       await this.#state.clearBabysitterSession(this.#workspaceId, issueKey(lifecycle.issue))
       this.#dispatchLifecycleEpochs.delete(key)
       this.#abandonedDispatchReasons.delete(key)
-      this.#resolveDispatchTerminalWaiters(lifecycle.issue)
+      this.#resolveDispatchTerminalWaiters(lifecycle.issue, 'abandoned')
       await this.#writeInFlightRegistry().catch((error: unknown) => {
         this.#logger.warn?.('[factory] failed to rewrite registry after orphaned claim release', {
           issue: issue.key,
@@ -5014,9 +5010,13 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  #resolveDispatchTerminalWaiters(issue: IssueRef): void {
+  // Every caller of this knows the phase the row settled in, and each waiter
+  // must be handed it directly. A waiter that instead re-read the shared row
+  // after release could see it cleared, or see the next dispatch for the same
+  // issue, and classify the wrong run.
+  #resolveDispatchTerminalWaiters(issue: IssueRef, phase: TerminalDispatchLifecyclePhase): void {
     const key = issueKey(issue)
-    for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve()
+    for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve(phase)
     this.#dispatchTerminalWaiters.delete(key)
   }
 
@@ -5100,7 +5100,7 @@ export class FactoryLoop implements Factory {
     let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return
     if (isTerminalDispatchLifecycle(lifecycle)) {
-      this.#resolveDispatchTerminalWaiters(lifecycle.issue)
+      this.#resolveDispatchTerminalWaiters(lifecycle.issue, lifecycle.phase)
       return
     }
     if (lifecycle.phase === 'waiting-for-human') return
@@ -5510,7 +5510,7 @@ export class FactoryLoop implements Factory {
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     this.#increment('dispatchLifecycleStaleIssuesAbandoned')
-    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#resolveDispatchTerminalWaiters(record.issue, 'abandoned')
     this.#logger.info?.('[factory] abandoned durable dispatch whose live issue is no longer ready', {
       issue: record.issue.key,
       reason,
@@ -5581,7 +5581,7 @@ export class FactoryLoop implements Factory {
     this.#increment(releaseReason === 'issue-human-review' ? 'humanReview' : 'done')
     this.#emit('issue-done', { issue: record.issue })
     await this.#writeInFlightRegistry()
-    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#resolveDispatchTerminalWaiters(record.issue, 'complete')
     return true
   }
 
@@ -17841,6 +17841,9 @@ const durableBabysitterTrackedAgent = (
 // Type guards, not plain predicates: callers that report the terminal phase
 // outward must be able to narrow it, so an intermediate phase cannot leak into
 // a terminal-phase contract.
+/** Resolves one `waitForDispatchTerminal` caller with the phase the row settled in. */
+type DispatchTerminalWaiter = (phase?: TerminalDispatchLifecyclePhase) => void
+
 const isTerminalDispatchLifecycle = (
   lifecycle: DispatchLifecycle,
 ): lifecycle is DispatchLifecycle & { phase: TerminalDispatchLifecyclePhase } =>
