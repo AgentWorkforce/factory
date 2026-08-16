@@ -11902,7 +11902,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const issue = await this.#findMergeAdvanceIssueForPr(snapshot)
+    const issue = await this.#findMergeAdvanceIssueForPr(snapshot, repo)
     if (!issue) {
       this.#increment('mergedPrAdvanceNoIssue')
       return
@@ -11960,7 +11960,7 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #findMergeAdvanceIssueForPr(snapshot: PullSnapshot): Promise<LinearIssue | undefined> {
+  async #findMergeAdvanceIssueForPr(snapshot: PullSnapshot, eventRepo: string): Promise<LinearIssue | undefined> {
     // An issue is "upstream" of a merge if it sits in the agent-implementing or
     // human-review role for its team. UUIDs are globally unique, so the reverse
     // role lookup covers every team without per-team scoping here.
@@ -11969,15 +11969,33 @@ export class FactoryLoop implements Factory {
       return role === 'agentImplementing' || role === 'humanReview'
     }
     let best: { issue: LinearIssue; score: number } | undefined
+    let ambiguous = false
     const scanStartedAtMs = this.#clock.now()
     // This no-record path runs after agents are released, so there is no
     // tracked PR identity left. Keep the scan simple and prefer branch identity
     // over title/body references to avoid "related to AR-N" body false positives.
     const githubSource = await this.#issueSource() === 'github'
+    // A GitHub-native issue key is a bare number; the same number exists
+    // independently in every configured repository. Only a same-repo candidate
+    // may complete the merge, so a merged PR in one repo can never close an
+    // unrelated issue that happens to share its number in another. #276.
+    const eventRepoKey = validGithubRepo(eventRepo) ? eventRepo.toLowerCase() : undefined
+    if (githubSource && !eventRepoKey) {
+      this.#logger.warn?.('[factory] merge advance skipped: event repo is not identifiable', {
+        prNumber: snapshot.number,
+      })
+      return undefined
+    }
     const paths = githubSource ? await this.#githubIssuePaths() : await this.#listRelayfileTree(ISSUE_ROOT, 'merge advance issue scan')
     for (const path of paths) {
       if (githubSource ? !isGithubIssueFilePath(path) : !isIssueFilePath(path)) {
         continue
+      }
+      if (githubSource) {
+        const issueParts = githubIssuePathParts(path)
+        if (!issueParts || `${issueParts.owner}/${issueParts.repo}`.toLowerCase() !== eventRepoKey) {
+          continue
+        }
       }
       const issue = await this.#readIssue(path)
       if (!issue || (githubSource
@@ -11991,10 +12009,26 @@ export class FactoryLoop implements Factory {
       const score = prSnapshotIssueMatchScore(snapshot, issue.key)
       if (score > 0 && (!best || score > best.score)) {
         best = { issue, score }
+        ambiguous = false
+      } else if (score > 0 && best && score === best.score) {
+        ambiguous = true
       }
+    }
+    // Fail-closed on a tie. A silent first-wins on unrelated same-score
+    // candidates is the exact class of quiet corruption we are removing.
+    if (ambiguous) {
+      this.#increment('mergedPrAdvanceAmbiguous')
+      this.#logger.warn?.('[factory] merge advance skipped: multiple candidates tied on match score', {
+        prNumber: snapshot.number,
+        eventRepo,
+        matchedIssue: best?.issue.key,
+        matchScore: best?.score,
+      })
+      return undefined
     }
     this.#logger.debug?.(`[factory] scanned ${githubSource ? 'GitHub' : 'Linear'} issues for merged PR advance`, {
       prNumber: snapshot.number,
+      eventRepo,
       durationMs: this.#clock.now() - scanStartedAtMs,
       matchedIssue: best?.issue.key,
       matchScore: best?.score,

@@ -21782,6 +21782,116 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  // Regression pair for #276: the record-less merge-advance fallback must
+  // repository-qualify its candidate scan. Modelled on real observed pairs:
+  // AgentWorkforce/cloud#2891 must not close AgentWorkforce/factory#139, while
+  // AgentWorkforce/factory PR #250 must still close AgentWorkforce/factory#222.
+  it('does not close a same-numbered issue in another repository via the merge-advance fallback', async () => {
+    const factoryIssuePath = githubIssuePath('AgentWorkforce', 'factory', 139)
+    const cloudPrPath = '/github/repos/AgentWorkforce/cloud/pulls/2891/metadata.json'
+    const mount = new FakeMountClient({
+      [factoryIssuePath]: githubIssueFile(139, {
+        owner: 'AgentWorkforce',
+        repo: 'factory',
+        state: 'open',
+        labels: ['factory', 'factory:human-review'],
+      }),
+      [cloudPrPath]: prFile(2891, {
+        title: 'fix(relayauth): dormant emergency source mint gate',
+        // The URL-form of a cloud#139 reference reproduces the observed
+        // false positive: `containsExplicitIssueReference` matched any
+        // owner/repo, so cloud's body qualified for factory's issue.
+        body: 'Fixes https://github.com/AgentWorkforce/cloud/issues/139',
+        head_ref: 'relayauth/dormant-mint-gate',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: {
+          factory: 'AgentWorkforce/factory',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        clonePaths: {
+          'AgentWorkforce/factory': '/work/factory',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+        default: 'AgentWorkforce/factory',
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(cloudPrPath, 'pr-cloud-2891-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrAdvanceNoIssue).toBe(1))
+      expect(githubWriteback.closes).toEqual([])
+      expect(githubWriteback.comments).toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('still closes a same-repository issue via the merge-advance fallback (legitimate factory#222 <- factory PR #250)', async () => {
+    const factoryIssuePath = githubIssuePath('AgentWorkforce', 'factory', 222)
+    const factoryPrPath = '/github/repos/AgentWorkforce/factory/pulls/250/metadata.json'
+    const mount = new FakeMountClient({
+      [factoryIssuePath]: githubIssueFile(222, {
+        owner: 'AgentWorkforce',
+        repo: 'factory',
+        state: 'open',
+        labels: ['factory', 'factory:human-review'],
+      }),
+      [factoryPrPath]: prFile(250, {
+        title: 'fix: address factory#222',
+        body: 'Fixes #222',
+        head_ref: 'factory/222-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: {
+          factory: 'AgentWorkforce/factory',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        clonePaths: {
+          'AgentWorkforce/factory': '/work/factory',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+        default: 'AgentWorkforce/factory',
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(factoryPrPath, 'pr-factory-250-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrAdvancedDone).toBe(1))
+      expect(githubWriteback.closes).toEqual([
+        { key: '222', body: 'Factory observed pull request #250 merge and completed this issue.' },
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('advances an in-flight implementing issue to Done if the PR merges before the ready signal', async () => {
     const issue = realIssueFile(411, ready, { title: 'Real merged before ready' })
     const prPath = '/github/repos/AgentWorkforce/pear/pulls/411/metadata.json'
