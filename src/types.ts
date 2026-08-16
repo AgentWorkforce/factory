@@ -76,7 +76,14 @@ export interface Factory {
   runLoop(opts?: FactoryLoopRunOptions): Promise<IterationReport[]>
   triageIssue(issue: LinearIssue): Promise<TriageDecision>
   dispatch(decision: TriageDecision, opts?: { dryRun?: boolean }): Promise<DispatchResult>
-  waitForDispatchTerminal(issue: IssueRef): Promise<void>
+  /**
+   * Resolves once the issue's durable dispatch row reaches a terminal phase,
+   * reporting which one, or `undefined` if the wait ended without observing
+   * one. Callers deriving an exit code need the phase: a dispatch held on
+   * capacity returns an empty hold result and schedules a durable retry, so
+   * the pre-wait result cannot say how the run ended.
+   */
+  waitForDispatchTerminal(issue: IssueRef): Promise<DispatchLifecyclePhase | undefined>
   status(): FactoryStatus
   on(
     event: 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error',

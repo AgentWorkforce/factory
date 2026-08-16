@@ -4479,6 +4479,42 @@ describe('fleet CLI exit-code contract', () => {
     }
   })
 
+  // A scope shortfall is one failure. `factory start` reaches it by two
+  // different branches depending on whether a mirror is already registered,
+  // and both must report the same code — a supervising script cannot act on a
+  // code that depends on which branch happened to run.
+  it.each([
+    { label: 'no registered mirror (inline warm-up)', registeredRoot: undefined },
+    { label: 'an existing mirror (background warm-up)', registeredRoot: '/registered/.integrations' },
+  ])('reports one refusal code for a scope shortfall regardless of branch: $label', async ({ registeredRoot }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-startup-'))
+    try {
+      const configPath = await writeConfig(root)
+      const mount = new FakeMountClient({ [issuePath]: issueFile })
+      if (registeredRoot) {
+        ;(mount as unknown as { getLocalMountRoot: () => string }).getLocalMountRoot = () => registeredRoot
+      }
+      const errors = buffer()
+      const code = await runFleetCli(['start', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount,
+        createFactory: () => stubFactory(),
+        ensureLocalMount: async () => {
+          throw new MountAuthScopeError(mountAuthRemediation({ missingScope: 'fs:read', detail: 'http 403' }), {
+            missingScope: 'fs:read',
+          })
+        },
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(2)
+      expect(errors.text()).toContain('lacks the filesystem scope the mount needs')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // Sibling command — `run-once` had the same hard-coded 0.
   it('exits non-zero when a run-once cycle records an error, and zero when it does not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-runonce-'))

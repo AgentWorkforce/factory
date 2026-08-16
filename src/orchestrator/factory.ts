@@ -844,10 +844,18 @@ export class FactoryLoop implements Factory {
     return batch
   }
 
-  async waitForDispatchTerminal(issue: IssueRef): Promise<void> {
+  /**
+   * Resolves once this issue's durable dispatch row reaches a terminal phase,
+   * and reports which one. A caller that turns the run into an exit code needs
+   * the phase: a dispatch that hit capacity returns an empty hold result and
+   * schedules a durable retry, so the pre-wait result says nothing about how
+   * the run actually ended. `undefined` means the wait gave up without
+   * observing a terminal phase (Factory is stopping).
+   */
+  async waitForDispatchTerminal(issue: IssueRef): Promise<DispatchLifecyclePhase | undefined> {
     const key = issueKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    if (lifecycle && isTerminalDispatchLifecycle(lifecycle)) return
+    if (lifecycle && isTerminalDispatchLifecycle(lifecycle)) return lifecycle.phase
     await new Promise<void>((resolve) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -907,6 +915,14 @@ export class FactoryLoop implements Factory {
       }
       void poll()
     })
+    // The waiters are resolved without carrying a phase — several of them share
+    // one row — so read the row back rather than threading it through. A wait
+    // that ended because Factory is stopping leaves a non-terminal phase here,
+    // which correctly reports `undefined`.
+    const settledLifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    return settledLifecycle && isTerminalDispatchLifecycle(settledLifecycle)
+      ? settledLifecycle.phase
+      : undefined
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {

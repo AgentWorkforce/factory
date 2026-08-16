@@ -1,5 +1,6 @@
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { isLiveDispatchStateChangedError } from '../orchestrator'
+import type { DispatchLifecyclePhase } from '../ports/state'
 import type { DispatchResult, IterationReport } from '../types'
 
 /**
@@ -65,6 +66,28 @@ export function exitCodeForDispatchResult(result: DispatchResult): FactoryExitCo
 }
 
 /**
+ * Classify a relay-backend dispatch, which stays attached from placement
+ * through takeover, publication, writeback and release.
+ *
+ * The pre-wait result cannot classify such a run. A dispatch that hits capacity
+ * returns an empty capacity-hold result *and* schedules a durable retry, and
+ * the wait then runs on until that retry reaches terminal. Classifying the
+ * stale result would report failure for a run that ultimately did dispatch —
+ * the same false signal as exiting 0 on a refusal, pointed the other way. The
+ * terminal phase is the outcome.
+ */
+export function exitCodeForRelayDispatch(
+  result: DispatchResult,
+  terminalPhase: DispatchLifecyclePhase | undefined,
+): FactoryExitCode {
+  if (terminalPhase === 'complete') return FACTORY_EXIT.OK
+  if (terminalPhase === 'abandoned') return FACTORY_EXIT.FAILED
+  // The wait ended without observing a terminal phase — Factory is stopping.
+  // Nothing better is known than what the dispatch itself reported.
+  return exitCodeForDispatchResult(result)
+}
+
+/**
  * Classify the outcome of a `factory run-once` / `factory loop` iteration.
  *
  * `skipped` entries are ordinary: a sweep that examines issues and dispatches
@@ -88,5 +111,13 @@ export function exitCodeForIterationReport(report: IterationReport): FactoryExit
  * pointed the other way.
  */
 export function exitCodeForLoopReports(reports: readonly IterationReport[]): FactoryExitCode {
-  return reports.some((report) => report.error) ? FACTORY_EXIT.FAILED : FACTORY_EXIT.OK
+  if (reports.some((report) => report.error)) return FACTORY_EXIT.FAILED
+  // Losing ONE sweep to another owner is ordinary contention. Losing EVERY
+  // sweep means the loop performed nothing at all — a shared daemon can hold
+  // the workspace sweep lease for the loop's whole duration — and reporting
+  // that as success is the exact false signal this contract exists to remove.
+  if (reports.length > 0 && reports.every((report) => report.discoveryDeferred)) {
+    return FACTORY_EXIT.RETRYABLE
+  }
+  return FACTORY_EXIT.OK
 }

@@ -14,6 +14,7 @@ import {
   exitCodeForError,
   exitCodeForIterationReport,
   exitCodeForLoopReports,
+  exitCodeForRelayDispatch,
 } from './exit-codes'
 import {
   FileStateStore,
@@ -714,15 +715,20 @@ async function runFactoryCommand(
         mountStderr,
         debugMountRefreshes,
       )
-      const handleWarmMountError = (error: unknown): void => {
+      // Returns the code the failure classifies to, so the inline branch below
+      // can surface it directly. The background branch reads the same value
+      // back off the waiter; both must report one code for one failure.
+      const handleWarmMountError = (error: unknown): number => {
         if (error instanceof MountAuthScopeError) {
+          const code = exitCodeForError(error)
           mountStderr.write(`${error.message}\n`)
           mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-          void flushAndResolve(exitCodeForError(error))
-          return
+          void flushAndResolve(code)
+          return code
         }
         const message = error instanceof Error ? error.message : String(error)
         mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        return FACTORY_EXIT.FAILED
       }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
@@ -741,12 +747,12 @@ async function runFactoryCommand(
             if (!result.mounted) {
               mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
               if (stoppedBySignal) return await waiter.promise
-              return 1
+              return FACTORY_EXIT.FAILED
             }
           } catch (error) {
-            handleWarmMountError(error)
+            const code = handleWarmMountError(error)
             if (stoppedBySignal) return await waiter.promise
-            return 1
+            return code
           }
         } else {
           void warmMount().catch(handleWarmMountError)
@@ -862,8 +868,8 @@ async function runFactoryCommand(
     try {
       const result = await factory.dispatch(decision, { dryRun: false })
       writeJson(out, result)
-      await factory.waitForDispatchTerminal(result.issue)
-      return exitCodeForDispatchResult(result)
+      const terminalPhase = await factory.waitForDispatchTerminal(result.issue)
+      return exitCodeForRelayDispatch(result, terminalPhase)
     } finally {
       await factory.stop()
     }

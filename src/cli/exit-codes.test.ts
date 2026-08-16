@@ -8,6 +8,7 @@ import {
   exitCodeForError,
   exitCodeForIterationReport,
   exitCodeForLoopReports,
+  exitCodeForRelayDispatch,
 } from './exit-codes'
 
 const issue = { key: 'AR-77', uuid: 'uuid-77', path: '/linear/issues/AR-77__uuid-77.json' }
@@ -28,9 +29,10 @@ const iterationReport = (overrides: Partial<IterationReport> = {}): IterationRep
   ...overrides,
 })
 
-// The claim race is thrown from deep inside the orchestrator and is not
-// exported as a class. Reproduce it the way the CLI actually receives it:
-// whatever `factory.dispatch()` rejected with.
+// A deliberate LOOK-ALIKE: a plain Error wearing the real class's name and
+// message. `LiveDispatchStateChangedError` is exported, so the CLI could match
+// it by type; this fixture exists to prove that it does, and that a forgeable
+// `error.name` is not enough to claim a retryable exit.
 const liveStateChangedError = (): Error => {
   const error = new Error(`Live state changed before writeback for ${issue.key}`)
   error.name = 'LiveDispatchStateChangedError'
@@ -94,6 +96,32 @@ describe('exitCodeForDispatchResult', () => {
   })
 })
 
+describe('exitCodeForRelayDispatch', () => {
+  const heldOnCapacity = dispatchResult({ hold: { kind: 'capacity' } })
+
+  it('is OK when the run reached a complete terminal phase', () => {
+    // The pre-wait result is an empty capacity hold, which on its own classifies
+    // as retryable. The durable retry then dispatched and completed, so the run
+    // DID perform the action — classifying the stale result would report
+    // failure for a successful run.
+    expect(exitCodeForDispatchResult(heldOnCapacity)).toBe(FACTORY_EXIT.RETRYABLE)
+    expect(exitCodeForRelayDispatch(heldOnCapacity, 'complete')).toBe(FACTORY_EXIT.OK)
+  })
+
+  it('fails when the run was abandoned', () => {
+    expect(exitCodeForRelayDispatch(dispatchResult({
+      agents: [{ name: 'ar-77-impl', role: 'implementer' }],
+    }), 'abandoned')).toBe(FACTORY_EXIT.FAILED)
+  })
+
+  it('falls back to the dispatch result when no terminal phase was observed', () => {
+    expect(exitCodeForRelayDispatch(heldOnCapacity, undefined)).toBe(FACTORY_EXIT.RETRYABLE)
+    expect(exitCodeForRelayDispatch(dispatchResult({
+      agents: [{ name: 'ar-77-impl', role: 'implementer' }],
+    }), undefined)).toBe(FACTORY_EXIT.OK)
+  })
+})
+
 describe('exitCodeForIterationReport', () => {
   it('is OK for a clean sweep, including one that dispatched nothing', () => {
     expect(exitCodeForIterationReport(iterationReport())).toBe(FACTORY_EXIT.OK)
@@ -121,7 +149,18 @@ describe('exitCodeForIterationReport', () => {
     ])).toBe(FACTORY_EXIT.FAILED)
   })
 
-  it('does not fail a bounded loop for a deferred sweep', () => {
+  it('is retryable when EVERY iteration was deferred and nothing ran', () => {
+    // One deferral out of several is contention; all of them means the loop
+    // performed nothing, which must not read as success.
+    expect(exitCodeForLoopReports([
+      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
+      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
+    ])).toBe(FACTORY_EXIT.RETRYABLE)
+    expect(exitCodeForLoopReports([iterationReport({ discoveryDeferred: 'sweep-in-flight' })]))
+      .toBe(FACTORY_EXIT.RETRYABLE)
+  })
+
+  it('does not fail a bounded loop when only SOME iterations were deferred', () => {
     // `run-once` was asked for ONE sweep, so a deferral means it never ran.
     // A loop was asked for several, and losing one to another owner is
     // ordinary contention. Escalating it would make a healthy loop exit
