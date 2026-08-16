@@ -2659,6 +2659,64 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('surfaces degraded readiness reconciliation from the live daemon heartbeat', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reconcile-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+        readinessReconcile: {
+          state: 'degraded',
+          consecutiveFailures: 3,
+          failureThreshold: 3,
+          lastFailureAtMs: now - 1_000,
+          lastError: 'discovery sweep lease expired',
+        },
+      }))
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({
+          inFlight: [],
+          queued: [],
+          counters: {},
+          readinessReconcile: {
+            state: 'not-running' as const,
+            consecutiveFailures: 0,
+            failureThreshold: 3,
+          },
+        })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        readinessReconcile: {
+          state: 'degraded',
+          consecutiveFailures: 3,
+          failureThreshold: 3,
+          lastError: 'discovery sweep lease expired',
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('lists registry-backed in-flight issues, agents, and degraded claims in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-registry-status-'))
     try {

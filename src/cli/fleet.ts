@@ -1137,6 +1137,12 @@ async function factoryStatusWithMountHealth(
     ? { ...status, inFlightDispatches: registryDispatches }
     : status
   const liveness = checkFactoryLoopLiveness(heartbeat, { staleMs: heartbeatStaleMs })
+  // A live heartbeat belongs to the daemon, while `status` is a fresh local
+  // Factory instance. Do not misreport that local instance's `not-running`
+  // state when an older daemon heartbeat predates this health field.
+  const readinessReconcile = liveness.ok
+    ? heartbeat?.readinessReconcile
+    : observableStatus.readinessReconcile
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
       state: 'unknown' as const,
@@ -1147,12 +1153,13 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...observableStatus, ...versionInfo, heldAgents, eventListener }
+  if (!health) return { ...observableStatus, ...versionInfo, heldAgents, eventListener, readinessReconcile }
   return {
     ...observableStatus,
     ...versionInfo,
     heldAgents,
     eventListener,
+    readinessReconcile,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),

@@ -16,6 +16,8 @@ import type {
   ConversationSessionState,
   DiscoveryCheckpoint,
   DiscoverySweepClaim,
+  DiscoverySweepLease,
+  DiscoverySweepRenewal,
   DiscoverySweepState,
   WaitingClarification,
 } from '../ports/state'
@@ -39,6 +41,8 @@ type WatchStateDocument = {
 
 export type FileStateStoreOptions = InMemoryStateStoreOptions & {
   watchStatePath: string
+  /** Injectable for deterministic stale-process lease recovery tests. */
+  isProcessAlive?: (pid: number) => boolean
 }
 
 export const githubWatchStatePath = (registryPath: string): string =>
@@ -62,12 +66,14 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
 export class FileStateStore extends InMemoryStateStore {
   readonly #watchStatePath: string
   readonly #batchSize: number
+  readonly #isProcessAlive: (pid: number) => boolean
   #operation: Promise<void> = Promise.resolve()
 
   constructor(options: FileStateStoreOptions) {
     super(options)
     this.#watchStatePath = options.watchStatePath
     this.#batchSize = options.batchSize
+    this.#isProcessAlive = options.isProcessAlive ?? processIsAlive
   }
 
   override async claimDiscoverySweep(
@@ -83,7 +89,12 @@ export class FileStateStore extends InMemoryStateStore {
       if (state.backoffUntilMs > nowMs) {
         return { acquired: false, reason: 'backoff', state: cloneDiscoverySweepState(state) }
       }
-      if (state.lease && state.lease.leaseUntilMs > nowMs) {
+      const reclaimedLease = state.lease &&
+        state.lease.leaseUntilMs > nowMs &&
+        discoveryLeaseOwnerIsOrphaned(state.lease.owner, owner, this.#isProcessAlive)
+        ? { ...state.lease }
+        : undefined
+      if (state.lease && state.lease.leaseUntilMs > nowMs && !reclaimedLease) {
         return { acquired: false, reason: 'in-flight', state: cloneDiscoverySweepState(state) }
       }
       const epoch = state.lastEpoch + 1
@@ -94,6 +105,7 @@ export class FileStateStore extends InMemoryStateStore {
         acquired: true,
         state: cloneDiscoverySweepState(state),
         lease: { ...state.lease },
+        ...(reclaimedLease ? { reclaimedLease } : {}),
       }
     }))
   }
@@ -105,13 +117,29 @@ export class FileStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean> {
+    return (await this.renewDiscoverySweepWithDetails(workspaceId, owner, epoch, nowMs, leaseMs)).renewed
+  }
+
+  override async renewDiscoverySweepWithDetails(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepRenewal> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const state = document.workspaces[workspaceId]?.discoverySweep
-      if (!state || !discoveryLeaseMatches(state, owner, epoch) || state.lease!.leaseUntilMs <= nowMs) return false
+      if (!state?.lease) return { renewed: false, reason: 'missing' }
+      if (!discoveryLeaseMatches(state, owner, epoch)) {
+        return { renewed: false, reason: 'contended', observedLease: { ...state.lease } }
+      }
+      if (state.lease.leaseUntilMs <= nowMs) {
+        return { renewed: false, reason: 'expired', observedLease: { ...state.lease } }
+      }
       state.lease!.leaseUntilMs = nowMs + leaseMs
       await this.#persist(document)
-      return true
+      return { renewed: true, lease: { ...state.lease } }
     }))
   }
 
@@ -1171,6 +1199,33 @@ const cloneDiscoverySweepState = (state: DiscoverySweepState): DiscoverySweepSta
 
 const discoveryLeaseMatches = (state: DiscoverySweepState, owner: string, epoch: number): boolean =>
   state.lease?.owner === owner && state.lease.epoch === epoch
+
+const discoveryLeaseOwnerIsOrphaned = (
+  incumbentOwner: string,
+  claimantOwner: string,
+  isProcessAlive: (pid: number) => boolean,
+): boolean => {
+  if (incumbentOwner === claimantOwner) return false
+  const incumbentPid = discoveryLeaseOwnerPid(incumbentOwner)
+  if (incumbentPid === undefined) return false
+  return !isProcessAlive(incumbentPid)
+}
+
+const discoveryLeaseOwnerPid = (owner: string): number | undefined => {
+  const match = /^(\d+):/u.exec(owner)
+  if (!match) return undefined
+  const pid = Number(match[1])
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
+const processIsAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
 
 const emptyDiscoverySweepState = (): DiscoverySweepState => ({
   consecutiveOverloads: 0,

@@ -127,6 +127,18 @@ export interface FactoryLoopHeartbeat {
   updatedAtMs: number
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
+  readinessReconcile?: FactoryReadinessReconcileStatus
+}
+
+export interface FactoryReadinessReconcileStatus {
+  state: 'not-running' | 'healthy' | 'retrying' | 'degraded'
+  consecutiveFailures: number
+  failureThreshold: number
+  lastDurationMs?: number
+  lastStartedAtMs?: number
+  lastCompletedAtMs?: number
+  lastFailureAtMs?: number
+  lastError?: string
 }
 
 export interface FactoryInFlightRegistryAgent {
@@ -270,6 +282,8 @@ export interface FactoryStatus {
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */
   eventListener?: FactoryEventListenerStatus
+  /** Periodic ready-issue backfill health as reported by the live daemon. */
+  readinessReconcile?: FactoryReadinessReconcileStatus
   /** Agents retained while their issue waits for its configured terminal state. */
   heldAgents?: FactoryHeldAgent[]
 }

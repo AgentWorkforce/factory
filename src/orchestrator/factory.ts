@@ -38,6 +38,7 @@ import type {
   DispatchLifecyclePhase,
   DiscoveryCheckpoint,
   DiscoverySweepClaim,
+  DiscoverySweepRenewal,
   GithubIssueCommentWatchPending,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
@@ -78,6 +79,7 @@ import type {
   FactoryLoopRunOptions,
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
+  FactoryReadinessReconcileStatus,
   FactoryDispatchClaimStatus,
   FactoryInFlightDispatchStatus,
   FactoryInFlightRegistry,
@@ -401,6 +403,7 @@ const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
 const DISCOVERY_SWEEP_LEASE_MS = 5 * 60_000
 const DISCOVERY_SWEEP_RENEW_MS = 30_000
+const READINESS_RECONCILE_FAILURE_THRESHOLD = 3
 const DISCOVERY_CHANGE_EVENT_LIMIT = 1_000
 const DISCOVERY_OVERLOAD_BACKOFF_MAX_MS = 5 * 60_000
 const GITHUB_FACTORY_LABEL = 'factory'
@@ -596,6 +599,12 @@ export class FactoryLoop implements Factory {
   #readinessReconcileTimer?: ReturnType<typeof setTimeout>
   #readinessReconcileInFlight?: Promise<void>
   #readinessReconcileIntervalMs = 60_000
+  #readinessReconcileConsecutiveFailures = 0
+  #readinessReconcileLastDurationMs?: number
+  #readinessReconcileLastStartedAtMs?: number
+  #readinessReconcileLastCompletedAtMs?: number
+  #readinessReconcileLastFailureAtMs?: number
+  #readinessReconcileLastError?: string
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -674,7 +683,9 @@ export class FactoryLoop implements Factory {
   #runOnceInFlightDryRun?: boolean
   #discoverySession?: DiscoverySession
   #discoverySweepEpoch?: number
+  #discoverySweepStartedAtMs?: number
   #discoverySweepRenewTimer?: ReturnType<typeof setInterval>
+  #discoverySweepRenewalInFlight?: Promise<void>
   #discoverySweepLeaseLost = false
   #discoveryOverloadError?: unknown
   #resolvedIssueSource?: IssueSource
@@ -1399,23 +1410,39 @@ export class FactoryLoop implements Factory {
   }
 
   async #reconcileReadyIssues(): Promise<void> {
+    const startedAtMs = this.#clock.now()
+    this.#readinessReconcileLastStartedAtMs = startedAtMs
     this.#increment('readinessReconcileSweeps')
     this.#logger.info?.('[factory] periodic readiness reconciliation started', {
       intervalMs: this.#readinessReconcileIntervalMs,
     })
     try {
       const report = await this.runOnce()
+      this.#readinessReconcileConsecutiveFailures = 0
+      this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
+      this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+      this.#readinessReconcileLastError = undefined
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
+        durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
         dispatched: report.dispatched.length,
         skipped: report.skipped.length,
       })
     } catch (error) {
+      const errorMessage = describeError(error).errorMessage
+      this.#readinessReconcileConsecutiveFailures += 1
+      this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
+      this.#readinessReconcileLastFailureAtMs = this.#clock.now()
+      this.#readinessReconcileLastError = errorMessage
       this.#increment('readinessReconcileErrors')
       this.#logger.warn?.('[factory] periodic readiness reconciliation failed; retry remains scheduled', {
-        error: describeError(error).errorMessage,
+        error: errorMessage,
+        durationMs: this.#readinessReconcileLastDurationMs,
+        consecutiveFailures: this.#readinessReconcileConsecutiveFailures,
+        degraded: this.#readinessReconcileConsecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD,
       })
     }
+    await this.#refreshLiveHeartbeat()
   }
 
   #scheduleLivePoll(delayMs: number, options: FactoryLiveSubscriptionOptions): void {
@@ -2103,6 +2130,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
+    const sweepStartedAtMs = this.#clock.now()
     let claim = await this.#state.claimDiscoverySweep(
       this.#workspaceId,
       this.#discoverySweepOwner,
@@ -2128,6 +2156,8 @@ export class FactoryLoop implements Factory {
     if (!claim.acquired || !claim.lease) {
       this.#increment('discoverySweepsSkippedInFlight')
       this.#logger.info?.('[factory] skipped discovery because another process owns the sweep lease', {
+        owner: claim.state.lease?.owner,
+        epoch: claim.state.lease?.epoch,
         leaseUntilMs: claim.state.lease?.leaseUntilMs,
       })
       return {
@@ -2140,7 +2170,23 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    if (claim.reclaimedLease) {
+      this.#increment('discoverySweepOrphanTakeovers')
+      this.#logger.warn?.('[factory] reclaimed discovery sweep lease from a stopped process', {
+        owner: claim.lease.owner,
+        epoch: claim.lease.epoch,
+        previousOwner: claim.reclaimedLease.owner,
+        previousEpoch: claim.reclaimedLease.epoch,
+        previousLeaseUntilMs: claim.reclaimedLease.leaseUntilMs,
+      })
+    }
+    this.#logger.info?.('[factory] discovery sweep lease claimed', {
+      owner: claim.lease.owner,
+      epoch: claim.lease.epoch,
+      leaseUntilMs: claim.lease.leaseUntilMs,
+    })
     this.#discoverySweepEpoch = claim.lease.epoch
+    this.#discoverySweepStartedAtMs = sweepStartedAtMs
     this.#discoverySweepLeaseLost = false
     this.#discoveryOverloadError = undefined
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
@@ -2150,6 +2196,11 @@ export class FactoryLoop implements Factory {
       const report = await this.#performRunOnce(opts)
       if (this.#discoveryOverloadError) throw this.#discoveryOverloadError
       const checkpoint = await this.#finalizeDiscoveryCheckpoint()
+      // Do not clear the durable lease while a renewal can still be waiting on
+      // the same state-file lock. A late renewal that observes the completed
+      // (lease-less) checkpoint is a false lease-loss signal and can poison an
+      // otherwise successful reconcile cycle.
+      await this.#stopDiscoverySweepRenewal()
       if (this.#discoverySweepLeaseLost) {
         throw new Error('discovery sweep lease was lost before checkpoint commit')
       }
@@ -2161,8 +2212,15 @@ export class FactoryLoop implements Factory {
       )
       leaseReleased = completed
       if (!completed) throw new Error('discovery sweep lease was lost before completion')
+      this.#logger.info?.('[factory] discovery sweep checkpoint committed', {
+        owner: claim.lease.owner,
+        epoch: claim.lease.epoch,
+        durationMs: this.#elapsedSince(sweepStartedAtMs),
+        checkpointUpdatedAtMs: checkpoint?.updatedAtMs,
+      })
       return report
     } catch (error) {
+      await this.#stopDiscoverySweepRenewal()
       const overload = relayfileOverload(error)
       if (overload) {
         const consecutiveOverloads = claim.state.consecutiveOverloads + 1
@@ -2192,10 +2250,10 @@ export class FactoryLoop implements Factory {
       }
       throw error
     } finally {
-      if (this.#discoverySweepRenewTimer) clearInterval(this.#discoverySweepRenewTimer)
-      this.#discoverySweepRenewTimer = undefined
+      await this.#stopDiscoverySweepRenewal()
       this.#discoverySession = undefined
       this.#discoverySweepEpoch = undefined
+      this.#discoverySweepStartedAtMs = undefined
       this.#discoveryOverloadError = undefined
       // This sweep is over either way (committed, deferred, or lease lost) —
       // a stale `true` here would otherwise make every #listRelayfileTree
@@ -2413,31 +2471,78 @@ export class FactoryLoop implements Factory {
   }
 
   #startDiscoverySweepRenewal(epoch: number): void {
-    let renewalInFlight = false
     this.#discoverySweepRenewTimer = setInterval(() => {
-      if (renewalInFlight || this.#discoverySweepLeaseLost) return
-      renewalInFlight = true
-      void this.#state.renewDiscoverySweep(
-        this.#workspaceId,
-        this.#discoverySweepOwner,
-        epoch,
-        this.#clock.now(),
-        DISCOVERY_SWEEP_LEASE_MS,
-      ).then((renewed) => {
-        if (!renewed && this.#discoverySweepEpoch === epoch) {
-          this.#discoverySweepLeaseLost = true
-          this.#increment('discoverySweepLeaseLosses')
-          this.#logger.warn?.('[factory] discovery sweep lease renewal was rejected; fencing further tree requests')
+      if (this.#discoverySweepRenewalInFlight || this.#discoverySweepLeaseLost) return
+      const renewal = this.#renewDiscoverySweepLease(epoch)
+      this.#discoverySweepRenewalInFlight = renewal
+      void renewal.finally(() => {
+        if (this.#discoverySweepRenewalInFlight === renewal) {
+          this.#discoverySweepRenewalInFlight = undefined
         }
-      }).catch((error: unknown) => {
-        this.#logger.warn?.('[factory] discovery sweep lease renewal failed; retaining the current lease window', {
-          error: describeError(error).errorMessage,
-        })
-      }).finally(() => {
-        renewalInFlight = false
       })
     }, DISCOVERY_SWEEP_RENEW_MS)
     this.#discoverySweepRenewTimer.unref?.()
+  }
+
+  async #renewDiscoverySweepLease(epoch: number): Promise<void> {
+    const requestedAtMs = this.#clock.now()
+    try {
+      let renewal: DiscoverySweepRenewal
+      if (this.#state.renewDiscoverySweepWithDetails) {
+        renewal = await this.#state.renewDiscoverySweepWithDetails(
+          this.#workspaceId,
+          this.#discoverySweepOwner,
+          epoch,
+          requestedAtMs,
+          DISCOVERY_SWEEP_LEASE_MS,
+        )
+      } else {
+        const renewed = await this.#state.renewDiscoverySweep(
+          this.#workspaceId,
+          this.#discoverySweepOwner,
+          epoch,
+          requestedAtMs,
+          DISCOVERY_SWEEP_LEASE_MS,
+        )
+        renewal = renewed
+          ? {
+            renewed: true,
+            lease: {
+              owner: this.#discoverySweepOwner,
+              epoch,
+              leaseUntilMs: requestedAtMs + DISCOVERY_SWEEP_LEASE_MS,
+            },
+          }
+          : { renewed: false, reason: 'unknown' }
+      }
+      if (!renewal.renewed && this.#discoverySweepEpoch === epoch) {
+        this.#discoverySweepLeaseLost = true
+        this.#increment('discoverySweepLeaseLosses')
+        this.#logger.warn?.('[factory] discovery sweep lease renewal was rejected; fencing further tree requests', {
+          reason: renewal.reason,
+          requestedOwner: this.#discoverySweepOwner,
+          requestedEpoch: epoch,
+          requestedAtMs,
+          elapsedMs: this.#elapsedSince(this.#discoverySweepStartedAtMs ?? requestedAtMs),
+          observedOwner: renewal.observedLease?.owner,
+          observedEpoch: renewal.observedLease?.epoch,
+          observedLeaseUntilMs: renewal.observedLease?.leaseUntilMs,
+        })
+      }
+    } catch (error) {
+      this.#logger.warn?.('[factory] discovery sweep lease renewal failed; retaining the current lease window', {
+        owner: this.#discoverySweepOwner,
+        epoch,
+        requestedAtMs,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
+  async #stopDiscoverySweepRenewal(): Promise<void> {
+    if (this.#discoverySweepRenewTimer) clearInterval(this.#discoverySweepRenewTimer)
+    this.#discoverySweepRenewTimer = undefined
+    await this.#discoverySweepRenewalInFlight
   }
 
   async #prepareDiscoverySession(claim: DiscoverySweepClaim): Promise<DiscoverySession> {
@@ -3841,6 +3946,7 @@ export class FactoryLoop implements Factory {
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
+      readinessReconcile: this.#readinessReconcileStatus(),
       heldAgents: batch?.inFlight.flatMap((record) => heldAgentsForRecord(
         record,
         nowMs,
@@ -3867,6 +3973,35 @@ export class FactoryLoop implements Factory {
       return { state: 'polling' }
     }
     return { state: 'starting' }
+  }
+
+  #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
+    const consecutiveFailures = this.#readinessReconcileConsecutiveFailures
+    const state = this.#startMode !== 'live'
+      ? 'not-running'
+      : consecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD
+        ? 'degraded'
+        : consecutiveFailures > 0
+          ? 'retrying'
+          : 'healthy'
+    return {
+      state,
+      consecutiveFailures,
+      failureThreshold: READINESS_RECONCILE_FAILURE_THRESHOLD,
+      ...(this.#readinessReconcileLastDurationMs !== undefined
+        ? { lastDurationMs: this.#readinessReconcileLastDurationMs }
+        : {}),
+      ...(this.#readinessReconcileLastStartedAtMs !== undefined
+        ? { lastStartedAtMs: this.#readinessReconcileLastStartedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastCompletedAtMs !== undefined
+        ? { lastCompletedAtMs: this.#readinessReconcileLastCompletedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastFailureAtMs !== undefined
+        ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
+    }
   }
 
   on(event: FactoryEvent, listener: Listener): () => void {
@@ -6528,6 +6663,7 @@ export class FactoryLoop implements Factory {
       updatedAtMs,
       registryPath,
       eventListener: this.#eventListenerStatus(),
+      readinessReconcile: this.#readinessReconcileStatus(),
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')

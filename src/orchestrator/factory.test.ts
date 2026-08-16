@@ -45,7 +45,7 @@ import {
   type ResourceSubscriptionsClient,
 } from '../subscriptions'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
-import type { ConversationMessage, ConversationSessionState, DispatchLifecycle } from '../ports/state'
+import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim, DiscoverySweepRenewal, DispatchLifecycle } from '../ports/state'
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
@@ -3272,6 +3272,7 @@ describe('FactoryLoop', () => {
       [path]: githubIssueFile(62, { labels: ['reference-only'] }),
     })
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    mount.emit(changeEvent(path, 'event-62'))
     const create = () => createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet: new FakeFleetClient(),
@@ -3293,6 +3294,101 @@ describe('FactoryLoop', () => {
     mount.release()
     await firstSweep
     expect(mount.listTreePrefixes).toHaveLength(2)
+
+    // Prove the losing overlap did not invalidate the winning sweep's
+    // checkpoint: with no new events, a successor reuses it without another
+    // full repository walk.
+    mount.listTreePrefixes.length = 0
+    await create().runOnce()
+    expect(mount.listTreePrefixes).toEqual([])
+  })
+
+  it('settles an outstanding lease renewal before committing the discovery checkpoint', async () => {
+    class BlockingDiscoveryMount extends CountingListTreeMount {
+      readonly started: Promise<void>
+      #resolveStarted: () => void = () => undefined
+      #release: () => void = () => undefined
+      #blocked = false
+
+      constructor(files: Record<string, unknown>) {
+        super(files)
+        this.started = new Promise((resolve) => { this.#resolveStarted = resolve })
+      }
+
+      release(): void {
+        this.#release()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        if (!this.#blocked) {
+          this.#blocked = true
+          this.#resolveStarted()
+          await new Promise<void>((resolve) => { this.#release = resolve })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    class BlockingRenewalStateStore extends InMemoryStateStore {
+      readonly renewalStarted: Promise<void>
+      completionCalls = 0
+      #resolveRenewalStarted: () => void = () => undefined
+      #resolveRenewal: (renewal: DiscoverySweepRenewal) => void = () => undefined
+
+      constructor() {
+        super({ batchSize: 2 })
+        this.renewalStarted = new Promise((resolve) => { this.#resolveRenewalStarted = resolve })
+      }
+
+      resolveRenewal(renewal: DiscoverySweepRenewal): void {
+        this.#resolveRenewal(renewal)
+      }
+
+      override async renewDiscoverySweepWithDetails(): Promise<DiscoverySweepRenewal> {
+        this.#resolveRenewalStarted()
+        return await new Promise((resolve) => { this.#resolveRenewal = resolve })
+      }
+
+      override async completeDiscoverySweep(
+        ...args: Parameters<InMemoryStateStore['completeDiscoverySweep']>
+      ): Promise<boolean> {
+        this.completionCalls += 1
+        return await super.completeDiscoverySweep(...args)
+      }
+    }
+
+    vi.useFakeTimers()
+    try {
+      const path = githubIssueCompactPath('AgentWorkforce', 'pear', 64)
+      const mount = new BlockingDiscoveryMount({
+        [path]: githubIssueFile(64, { labels: ['reference-only'] }),
+      })
+      const stateStore = new BlockingRenewalStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      const sweep = factory.runOnce()
+      await mount.started
+      await vi.advanceTimersByTimeAsync(30_000)
+      await stateStore.renewalStarted
+      mount.release()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(stateStore.completionCalls).toBe(0)
+      stateStore.resolveRenewal({
+        renewed: true,
+        lease: { owner: 'test-owner', epoch: 1, leaseUntilMs: Date.now() + 300_000 },
+      })
+      await expect(sweep).resolves.toMatchObject({ dryRun: false })
+      expect(stateStore.completionCalls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('coalesces same-mode runOnce() callers who both waited out a mismatched-dryRun sweep', async () => {
@@ -9943,6 +10039,138 @@ describe('FactoryLoop', () => {
     expect(mount.getEventsCalls).toBe(0)
     expect(factory.status().counters.readinessReconcileSweeps).toBeGreaterThanOrEqual(1)
     await factory.stop()
+  })
+
+  it('does not start another periodic readiness sweep while its predecessor is still running', async () => {
+    class BlockingPeriodicMount extends CountingEventsMount {
+      readonly periodicStarted: Promise<void>
+      blockPeriodic = false
+      listCalls = 0
+      #resolvePeriodicStarted: () => void = () => undefined
+      #releasePeriodic: () => void = () => undefined
+      #blocked = false
+
+      constructor() {
+        super()
+        this.periodicStarted = new Promise((resolve) => { this.#resolvePeriodicStarted = resolve })
+        this.setSubRoot('/linear/issues', 'absent')
+      }
+
+      releasePeriodic(): void {
+        this.#releasePeriodic()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        this.listCalls += 1
+        if (this.blockPeriodic && !this.#blocked) {
+          this.#blocked = true
+          this.#resolvePeriodicStarted()
+          await new Promise<void>((resolve) => { this.#releasePeriodic = resolve })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    const mount = new BlockingPeriodicMount()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.start({
+      mode: 'live',
+      liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+    })
+    try {
+      mount.blockPeriodic = true
+      await mount.periodicStarted
+      const listCallsWhileBlocked = mount.listCalls
+
+      await new Promise((resolve) => setTimeout(resolve, 180))
+
+      expect(factory.status().counters.readinessReconcileSweeps).toBe(1)
+      expect(mount.listCalls).toBe(listCallsWhileBlocked)
+      mount.releasePeriodic()
+      await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+        state: 'healthy',
+        consecutiveFailures: 0,
+        lastCompletedAtMs: expect.any(Number),
+      }))
+    } finally {
+      mount.releasePeriodic()
+      await factory.stop()
+    }
+  })
+
+  it('marks periodic readiness reconciliation degraded after repeated failures and clears it on recovery', async () => {
+    class FailingPeriodicStateStore extends InMemoryStateStore {
+      failClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        if (this.failClaims) throw new Error('periodic discovery unavailable')
+        return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
+      }
+    }
+
+    const mount = new CountingEventsMount()
+    mount.setSubRoot('/linear/issues', 'absent')
+    const stateStore = new FailingPeriodicStateStore({ batchSize: 2 })
+    const root = await mkdtemp(join(tmpdir(), 'factory-readiness-health-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const factory = createFactory(config({
+      issueSource: 'github',
+      loop: {
+        heartbeatPath,
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    })
+
+    await factory.start({
+      mode: 'live',
+      liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+    })
+    try {
+      stateStore.failClaims = true
+      await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+        state: 'degraded',
+        failureThreshold: 3,
+        lastError: 'periodic discovery unavailable',
+      }), { timeout: 3_000 })
+      expect(factory.status().readinessReconcile?.consecutiveFailures).toBeGreaterThanOrEqual(3)
+      await vi.waitFor(async () => expect(await readFactoryLoopHeartbeat(heartbeatPath)).toMatchObject({
+        readinessReconcile: {
+          state: 'degraded',
+          consecutiveFailures: expect.any(Number),
+          failureThreshold: 3,
+          lastError: 'periodic discovery unavailable',
+        },
+      }))
+
+      stateStore.failClaims = false
+      await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+        state: 'healthy',
+        consecutiveFailures: 0,
+        lastCompletedAtMs: expect.any(Number),
+      }), { timeout: 3_000 })
+    } finally {
+      stateStore.failClaims = false
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('derives a repo-scoped subscription and startup backfill from the simple hoopsheet config', async () => {
