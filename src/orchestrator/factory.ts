@@ -4943,9 +4943,23 @@ export class FactoryLoop implements Factory {
       }
       for (const agent of lifecycle.agents) {
         const previousAgent = previous?.agents.find((candidate) => candidate.name === agent.name)
-        if (previousAgent?.releasedAtMs !== undefined) agent.releasedAtMs = previousAgent.releasedAtMs
+        // The in-flight record is authoritative for release state: the stamp
+        // now lives on the tracked agent and round-trips through the lifecycle,
+        // so a still-released agent brings its own stamp here. Inheriting the
+        // previous row's stamp instead would refile a respawned worker as
+        // released — a respawn reuses both the agent name and the deterministic
+        // invocation id, so neither can tell the generations apart — and every
+        // consumer that filters on `releasedAtMs` would then treat a live
+        // worker as gone.
         if (previousAgent?.costUsage) agent.costUsage = structuredClone(previousAgent.costUsage)
-        if (releasedAgentNames.has(agent.name)) agent.releasedAtMs ??= this.#clock.now()
+        if (releasedAgentNames.has(agent.name)) {
+          const releasedAtMs = agent.releasedAtMs ?? this.#clock.now()
+          agent.releasedAtMs = releasedAtMs
+          // Keep the record the single source of the stamp, so the next save
+          // carries it without having to read it back off the durable row.
+          const tracked = record.agents.get(agent.name)
+          if (tracked) tracked.releasedAtMs ??= releasedAtMs
+        }
       }
       const saved = await this.#state.saveDispatchLifecycle(
         this.#workspaceId,
@@ -6930,6 +6944,22 @@ export class FactoryLoop implements Factory {
 
       try {
         await this.#fleet.release(agentName, reason)
+        // Invalidate the spawn memory the moment the release is confirmed, so a
+        // retry for the same deterministic invocation spawns a real worker
+        // instead of inheriting this one's claim. Shutdown is excluded on
+        // purpose: nothing is being retried there, and a takeover must still be
+        // free to adopt agents this process merely stopped supervising.
+        if (record && batch && context !== 'stop') {
+          const releasedInvocationId = batch.recordRelease(record, agentName, this.#clock.now())
+          if (releasedInvocationId) {
+            this.#logger.debug?.('[factory] released agent invocation is no longer dispatchable', {
+              issue: record.issue.key,
+              agentName,
+              reason,
+              invocationId: releasedInvocationId,
+            })
+          }
+        }
         if (record) await this.#reportAgent(record, tracked, 'agent.released', { releaseReason: reason })
       } catch (error) {
         failed.push(agentName)
@@ -7184,7 +7214,10 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     const invocationId = batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
-    if (existing?.result) {
+    // A released placement keeps its bookkeeping entry, but it is not a worker.
+    // Answering with its old spawn result here would report a synthetic success
+    // for a process that no longer exists.
+    if (existing?.result && existing.releasedAtMs === undefined) {
       this.#scheduleHeldAgentDeadline(record)
       return { name: existing.result?.name ?? spec.name }
     }
@@ -17822,6 +17855,7 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
   result: tracked.result ? { ...tracked.result } : undefined,
   sessionRef: tracked.sessionRef,
   unreachableWakeResumedSessionRef: tracked.unreachableWakeResumedSessionRef,
+  releasedAtMs: tracked.releasedAtMs,
 })
 
 const durableBabysitterTrackedAgent = (
@@ -17939,7 +17973,11 @@ const lifecycleFromInFlightRecord = (
   decision: structuredClone(record.decision),
   dryRun: record.dryRun,
   phase,
-  agents: [...record.agents].map(([name, tracked]) => ({ name, tracked: cloneTrackedAgent(tracked) })),
+  agents: [...record.agents].map(([name, tracked]) => ({
+    name,
+    tracked: cloneTrackedAgent(tracked),
+    ...(tracked.releasedAtMs !== undefined ? { releasedAtMs: tracked.releasedAtMs } : {}),
+  })),
   invocationIds: [...record.invocationIds],
   result: record.result ? structuredClone(record.result) : undefined,
   ...(record.dispatchClaim ? { dispatchClaim: { ...record.dispatchClaim } } : {}),
@@ -17955,7 +17993,13 @@ const inFlightRecordFromLifecycle = (lifecycle: DispatchLifecycle): InFlightIssu
   issue: { ...lifecycle.issue },
   decision: structuredClone(lifecycle.decision),
   dryRun: lifecycle.dryRun,
-  agents: new Map(lifecycle.agents.map((agent) => [agent.name, cloneTrackedAgent(agent.tracked)])),
+  // Release state has to survive takeover with the agents themselves. Without
+  // it the rebuilt record reads a released placement as a live worker and the
+  // spawn gate answers for a process that no longer exists.
+  agents: new Map(lifecycle.agents.map((agent) => [agent.name, {
+    ...cloneTrackedAgent(agent.tracked),
+    releasedAtMs: agent.releasedAtMs ?? agent.tracked.releasedAtMs,
+  }])),
   invocationIds: new Set(lifecycle.invocationIds),
   result: lifecycle.result ? structuredClone(lifecycle.result) : undefined,
   ...(lifecycle.dispatchClaim ? { dispatchClaim: { ...lifecycle.dispatchClaim } } : {}),
