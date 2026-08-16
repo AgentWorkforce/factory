@@ -1,12 +1,12 @@
 version: '1.1'
-updated: '2026-08-07'
+updated: '2026-08-17'
 catalog:
   category_count: 25
-  feature_count: 318
+  feature_count: 319
   tier_counts:
     1: 48
     2: 127
-    3: 11
+    3: 12
     4: 52
     5: 65
     6: 15
@@ -101,6 +101,14 @@ categories:
         description: Fail closed on malformed or unapproved mounted Notion specs, normalize exact page identities and destinations, and report the dispatch plan without writes
         location: src/intake/notion.ts, src/cli/fleet.ts
         verify_tier: 1
+
+      - id: cli-notion-manifest-generate
+        name: Factory Tasks Notion Manifest Generation
+        cli: factory intake notion generate
+        api: '@agent-relay/factory/intake generateFactoryTasksManifest()'
+        description: Query the Factory Tasks data source without writeback, map only Ready for Agent rows and complete page briefs into schema-validated intake bootstrap authorizations, and emit them in stable page-id order
+        location: src/intake/notion-manifest.ts, src/cli/fleet.ts
+        verify_tier: 3
 
       - id: cli-notion-intake-dispatch
         name: Mounted Notion Spec Dispatch

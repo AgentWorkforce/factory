@@ -1,8 +1,10 @@
 export {
   GhCliIssuePublisher,
   loadNotionIntakeManifest,
+  manifestSchema,
   normalizeNotionManifest,
   normalizeNotionPageId,
+  notionRecipeSchema,
   parseChiefSpecHeader,
   runNotionIntake,
   type GithubIssuePublisher,
@@ -19,6 +21,18 @@ export {
   type NormalizedNotionTask,
   type WorkspaceTaskDispatcher,
 } from './notion'
+
+export {
+  FACTORY_TASKS_DATA_SOURCE_ID,
+  NOTION_API_VERSION,
+  READY_FOR_AGENT_STATUS,
+  NotionApiFactoryTasksClient,
+  generateFactoryTasksManifest,
+  type FactoryTasksNotionClient,
+  type FactoryTasksNotionPage,
+  type GenerateFactoryTasksManifestOptions,
+  type NotionApiFactoryTasksClientOptions,
+} from './notion-manifest'
 
 export {
   RelayChannelNotionClaimStore,

@@ -221,6 +221,29 @@ pages can be admitted only with a bootstrap entry containing the exact
 `authorizedPageId`, destination, safe summary, and operator reason. That escape
 hatch is deliberately page-specific; there is no title or content heuristic.
 
+Factory can generate that manifest directly from the **Factory Tasks** Notion
+data source. The generator uses `NOTION_API_KEY` for read-only data-source and
+page-markdown requests, selects only rows whose `Status` is `Ready for Agent`,
+and never updates a row or its status. `Labels` and `Route` values are combined
+for repository issue labels. The output order is stable by page ID, so the same
+database state produces the same manifest on every run.
+
+```bash
+factory intake notion generate \
+  --mount-root ../.integrations/notion \
+  --worker-mount-root .integrations/notion \
+  --worker-mount-transport relay-channel \
+  --state-path ../.factory/notion-intake-state.json \
+  > ./ops/notion-intake.json
+```
+
+`--data-source` can override the built-in Factory Tasks data source ID. Paths in
+the generated manifest retain the existing intake semantics: `mountRoot` and
+`statePath` are resolved relative to the saved manifest, while
+`workerMountRoot` is the path workers receive. Generation fails closed if there
+are no ready rows, a required property is missing, a row sets both (or neither)
+of `Repo` and `Project Path`, or Notion returns a truncated page body.
+
 ```json
 {
   "version": 1,

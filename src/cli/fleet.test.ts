@@ -332,6 +332,19 @@ describe('fleet CLI parsing', () => {
     expect(() => parseFleetCommand(['intake', 'notion'])).toThrow(
       'requires a manifest path',
     )
+    expect(parseFleetCommand([
+      'intake',
+      'notion',
+      'generate',
+      '--data-source',
+      'collection://a7fb83ad-c667-4003-a1dc-132c6826aac1',
+      '--worker-mount-transport',
+      'relay-channel',
+    ])).toEqual({
+      kind: 'notion-manifest',
+      dataSourceId: 'collection://a7fb83ad-c667-4003-a1dc-132c6826aac1',
+      workerMountTransport: 'relay-channel',
+    })
   })
 
   it('parses global backend, config, and dry-run independently of subcommand position', () => {

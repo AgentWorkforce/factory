@@ -8,7 +8,7 @@ import { z } from 'zod'
 
 const INTAKE_LOCK_STALE_MS = 60_000
 
-const recipeSchema = z.enum(['single', 'workflow', 'team'])
+export const notionRecipeSchema = z.enum(['single', 'workflow', 'team'])
 
 const repoTargetSchema = z.object({
   repo: z.string().regex(/^[^/\s]+\/[^/\s]+$/u, 'repo must be owner/name'),
@@ -45,12 +45,12 @@ const bootstrapSchema = z.object({
   reason: z.string().trim().min(1),
   status: z.literal('ready'),
   title: z.string().trim().min(1),
-  recipe: recipeSchema,
+  recipe: notionRecipeSchema,
   summary: z.string().trim().min(1),
   targets: z.array(targetSchema).min(1),
 }).strict()
 
-const manifestSchema = z.object({
+export const manifestSchema = z.object({
   version: z.literal(1),
   mountRoot: z.string().trim().min(1).default('.integrations/notion'),
   workerMountRoot: z.string().trim().min(1).default('.integrations/notion'),
@@ -62,7 +62,7 @@ const manifestSchema = z.object({
   }).strict()).min(1),
 }).strict()
 
-export type NotionRecipe = z.infer<typeof recipeSchema>
+export type NotionRecipe = z.infer<typeof notionRecipeSchema>
 export type NotionIntakeTarget = z.infer<typeof targetSchema>
 export type NotionIntakeManifest = z.infer<typeof manifestSchema>
 
@@ -355,7 +355,7 @@ export function parseChiefSpecHeader(content: string): {
   }
   const title = requiredField(fields, 'title')
   const summary = requiredField(fields, 'summary')
-  const recipe = recipeSchema.parse(requiredField(fields, 'recipe').toLowerCase())
+  const recipe = notionRecipeSchema.parse(requiredField(fields, 'recipe').toLowerCase())
   const repos = splitField(fields.get('repos')).map((repo) => repoTargetSchema.parse({
     repo,
     ...(fields.get('public-summary') ? { publicSummary: fields.get('public-summary') } : {}),
