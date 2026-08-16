@@ -57,9 +57,11 @@ describe('dispatch identity against a real Agent Relay broker', () => {
     const killBroker = async (client: HarnessDriverClient): Promise<void> => {
       const pid = client.brokerPid
       if (!pid) throw new Error('real-broker identity test did not receive a broker PID')
+      let timeout: NodeJS.Timeout
+      let unsubscribe: () => void
       const exited = new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error(`broker ${pid} did not exit after SIGKILL`)), 10_000)
-        const unsubscribe = client.onBrokerExit(() => {
+        timeout = setTimeout(() => reject(new Error(`broker ${pid} did not exit after SIGKILL`)), 10_000)
+        unsubscribe = client.onBrokerExit(() => {
           clearTimeout(timeout)
           unsubscribe()
           resolve()
@@ -69,8 +71,12 @@ describe('dispatch identity against a real Agent Relay broker', () => {
         process.kill(pid, 'SIGKILL')
       } catch (error) {
         // Already exited: nothing left to wait for, and onBrokerExit may
-        // never fire since the process ended before this call.
+        // never fire since the process ended before this call. Tear down the
+        // still-armed timer/subscription so they can't fire after this
+        // function returns.
         if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+          clearTimeout(timeout!)
+          unsubscribe!()
           client.disconnect()
           return
         }
