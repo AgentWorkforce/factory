@@ -47,4 +47,19 @@ describe('dispatch work-unit identity', () => {
       'factory:dispatch:v1:linear:7f08f5b7-issue-identity:implementer',
     )
   })
+
+  it('classifies Linear issues by their key shape, not by a /linear/ mount path', () => {
+    const issue = { uuid: '7f08f5b7-issue-identity', key: 'AR-244', path: '/some/other/mount/AR-244.json' }
+    expect(dispatchIssueIdentity(issue)).toBe('linear:7f08f5b7-issue-identity')
+  })
+
+  it('falls back to a generic provider tag for a non-GitHub, non-Linear-shaped key', () => {
+    const issue = { uuid: 'opaque-provider-id', key: 'opaque-key', path: '/some/other/mount/opaque-key.json' }
+    expect(dispatchIssueIdentity(issue)).toBe('issue:opaque-provider-id')
+  })
+
+  it('throws when the provider identity is empty', () => {
+    const issue = { uuid: '   ', key: 'opaque-key', path: '/some/other/mount/opaque-key.json' }
+    expect(() => dispatchIssueIdentity(issue)).toThrow(/provider identity is empty/u)
+  })
 })

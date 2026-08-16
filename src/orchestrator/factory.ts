@@ -13282,6 +13282,7 @@ export class FactoryLoop implements Factory {
         const rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
           name: agentName!,
           sessionRef,
+          role: owned.tracked.spec.role,
           node: owned.tracked.result?.node ?? owned.tracked.spec.node,
           capability: owned.tracked.spec.capability,
           repo: owned.tracked.spec.repo,
@@ -13316,6 +13317,7 @@ export class FactoryLoop implements Factory {
       agent: {
         name: agentName,
         sessionRef,
+        role: owned.tracked.spec.role,
         node: owned.tracked.result?.node ?? owned.tracked.spec.node,
         capability: owned.tracked.spec.capability,
         repo: owned.tracked.spec.repo,
@@ -13398,8 +13400,13 @@ export class FactoryLoop implements Factory {
     heartbeat.unref?.()
 
     try {
-      const conversationRecord = (await this.#batch()).getIssueByAgent(claimed.agent.name)
-      const conversationRole = conversationRecord?.agents.get(claimed.agent.name)?.spec.role
+      // Sessions bound after this field was introduced carry their role
+      // durably, so resume never depends on a live lookup by the agent's
+      // current name — which a since-completed rename (e.g. babysitter
+      // retarget) can otherwise leave unresolvable forever. Older
+      // already-persisted sessions fall back to the live lookup.
+      const conversationRole = claimed.agent.role
+        ?? (await this.#batch()).getIssueByAgent(claimed.agent.name)?.agents.get(claimed.agent.name)?.spec.role
       if (!conversationRole) {
         throw new Error(`Cannot resume ${claimed.agent.name}: its dispatch role is unavailable for identity proof`)
       }

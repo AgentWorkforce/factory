@@ -65,7 +65,17 @@ describe('dispatch identity against a real Agent Relay broker', () => {
           resolve()
         })
       })
-      process.kill(pid, 'SIGKILL')
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch (error) {
+        // Already exited: nothing left to wait for, and onBrokerExit may
+        // never fire since the process ended before this call.
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+          client.disconnect()
+          return
+        }
+        throw error
+      }
       await exited
       client.disconnect()
     }
@@ -85,7 +95,13 @@ describe('dispatch identity against a real Agent Relay broker', () => {
       await killBroker(active)
       active = undefined
 
-      await expect(spawnBroker(differentKey, 3)).rejects.toThrow(
+      const rejectedSpawn = spawnBroker(differentKey, 3).then((client) => {
+        // The guard is supposed to reject this spawn. If it unexpectedly
+        // resolves instead, track the client so `finally` can still kill it.
+        active = client
+        return client
+      })
+      await expect(rejectedSpawn).rejects.toThrow(
         /did not prove ownership of that identity|agent_identity_mismatch/iu,
       )
       const stillOwned = await relay.messaging.agents.get(name)

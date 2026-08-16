@@ -1,4 +1,5 @@
-const ISSUE_KEY_PARTS = /^([A-Z]+)-(\d+)$/iu
+/** Linear-style issue key shape (`TEAM-123`), as opposed to a bare GitHub issue number. */
+export const ISSUE_KEY_PARTS = /^([A-Z]+)-(\d+)$/iu
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 

@@ -1,5 +1,6 @@
 import type { AgentSpec } from '../ports/fleet'
 import type { IssueRef } from '../types'
+import { ISSUE_KEY_PARTS } from '../issue-key-match'
 import { githubLifecycleIdentity } from '../state/github-lifecycle-identity'
 
 const DISPATCH_IDENTITY_VERSION = 'factory:dispatch:v1'
@@ -14,7 +15,10 @@ export function dispatchIssueIdentity(issue: IssueRef): string {
 
   const uuid = issue.uuid.trim()
   if (!uuid) throw new Error(`Cannot derive dispatch identity for ${issue.key}: provider identity is empty`)
-  return `${issue.path.startsWith('/linear/') ? 'linear' : 'issue'}:${uuid}`
+  // Classified from the issue key's own shape (`TEAM-123` vs. a bare number),
+  // not the mount path, so the same work unit gets the same identity
+  // regardless of which Relayfile alias surfaced it.
+  return `${ISSUE_KEY_PARTS.test(issue.key) ? 'linear' : 'issue'}:${uuid}`
 }
 
 /**
