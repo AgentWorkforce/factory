@@ -17954,7 +17954,14 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
 
-class LiveDispatchStateChangedError extends Error {
+/**
+ * The dispatch claim race: another writer changed the issue's live state
+ * between this process reading it and writing back, so the dispatch was
+ * abandoned. Exported so callers outside this module — notably the CLI, which
+ * turns it into a distinct exit code — can recognize it by type rather than by
+ * matching on `error.name`, and so tests can construct a genuine instance.
+ */
+export class LiveDispatchStateChangedError extends Error {
   readonly issueKey: string
 
   constructor(issueKey: string) {
@@ -17962,6 +17969,11 @@ class LiveDispatchStateChangedError extends Error {
     this.name = 'LiveDispatchStateChangedError'
     this.issueKey = issueKey
   }
+}
+
+/** Whether a thrown value is a {@link LiveDispatchStateChangedError}. */
+export function isLiveDispatchStateChangedError(error: unknown): error is LiveDispatchStateChangedError {
+  return error instanceof LiveDispatchStateChangedError
 }
 
 const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {

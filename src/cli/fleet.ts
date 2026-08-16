@@ -9,6 +9,13 @@ import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import { initializeFactory } from './init'
 import {
+  FACTORY_EXIT,
+  exitCodeForDispatchResult,
+  exitCodeForError,
+  exitCodeForIterationReport,
+  exitCodeForIterationReports,
+} from './exit-codes'
+import {
   FileStateStore,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
@@ -483,7 +490,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       }
     }
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
-    return 1
+    return exitCodeForError(error)
   } finally {
     try {
       try {
@@ -711,7 +718,7 @@ async function runFactoryCommand(
         if (error instanceof MountAuthScopeError) {
           mountStderr.write(`${error.message}\n`)
           mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-          void flushAndResolve(1)
+          void flushAndResolve(exitCodeForError(error))
           return
         }
         const message = error instanceof Error ? error.message : String(error)
@@ -764,8 +771,9 @@ async function runFactoryCommand(
         acceptableMountIds,
         mountStderr,
       )
-      writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
-      return 0
+      const report = await factory.runOnce({ dryRun: globals.dryRun })
+      writeJson(out, report)
+      return exitCodeForIterationReport(report)
     }
     if (command.action === 'status') {
       const versionInfo = await safeFactoryVersionInfo(
@@ -806,8 +814,10 @@ async function runFactoryCommand(
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
+    let loopCode: number = FACTORY_EXIT.OK
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
+      loopCode = exitCodeForIterationReports(reports)
       writeJson(out, {
         reports,
         status: await factoryStatusWithMountHealth(
@@ -822,7 +832,7 @@ async function runFactoryCommand(
       removeSignalHandlers()
       await factory.stop()
     }
-    return 0
+    return loopCode
   }
 
   if (command.kind === 'factory-canary') {
@@ -853,14 +863,15 @@ async function runFactoryCommand(
       const result = await factory.dispatch(decision, { dryRun: false })
       writeJson(out, result)
       await factory.waitForDispatchTerminal(result.issue)
-      return 0
+      return exitCodeForDispatchResult(result)
     } finally {
       await factory.stop()
     }
   }
 
-  writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
-  return 0
+  const dispatched = await factory.dispatch(decision, { dryRun: globals.dryRun })
+  writeJson(out, dispatched)
+  return exitCodeForDispatchResult(dispatched)
 }
 
 async function warmStartPathMounts(

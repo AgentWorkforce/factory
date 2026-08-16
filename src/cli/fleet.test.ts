@@ -15,7 +15,8 @@ import type {
   FactoryPorts,
   createFactory,
 } from '../index'
-import { FactoryConfigSchema, stateResolutionFromIds } from '../index'
+import { FactoryConfigSchema, LiveDispatchStateChangedError, stateResolutionFromIds } from '../index'
+import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
@@ -4238,6 +4239,275 @@ describe('fleet CLI runtime', () => {
     expect(calls).toEqual(['stop', 'exit'])
     expect(exits).toEqual([1])
     expect(listeners.size).toBe(0)
+  })
+})
+
+// Every case below is a PAIR. The refusal arm proves the CLI reports failure;
+// the success arm proves the code still discriminates — a command that always
+// exited non-zero would satisfy the refusal arm alone and carry just as little
+// information as one that always exited 0.
+describe('fleet CLI exit-code contract', () => {
+  const stubFactory = (overrides: Partial<Record<keyof Factory, unknown>> = {}): Factory => ({
+    start: vi.fn(async () => {}),
+    stop: vi.fn(async () => {}),
+    runLoop: vi.fn(async () => []),
+    runOnce: vi.fn(async () => ({
+      pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: false,
+    })),
+    status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+    triageIssue: vi.fn(async (issue: { identifier?: string }) => ({
+      issue: { key: issue.identifier ?? 'AR-77', uuid: 'uuid-77', path: issuePath },
+      routes: [{ repo: 'AgentWorkforce/pear', clonePath: '/work/pear' }],
+    })),
+    dispatch: vi.fn(),
+    waitForDispatchTerminal: vi.fn(async () => {}),
+    on: vi.fn(),
+    dispose: vi.fn(async () => {}),
+    ...overrides,
+  } as unknown as Factory)
+
+  const dispatchCli = async (root: string, dispatch: () => Promise<unknown>): Promise<{
+    code: number
+    output: string
+    errors: string
+  }> => {
+    const configPath = await writeConfig(root)
+    const output = buffer()
+    const errors = buffer()
+    const code = await runFleetCli(['dispatch', 'AR-77', '--config', configPath], {
+      fleet: new FakeFleetClient(),
+      mount: new FakeMountClient({ [issuePath]: issueFile }),
+      createFactory: () => stubFactory({ dispatch: vi.fn(dispatch) }),
+      ensureLocalMount: async () => undefined,
+      stdout: output,
+      stderr: errors,
+    })
+    return { code, output: output.text(), errors: errors.text() }
+  }
+
+  const dispatchResult = (overrides: Record<string, unknown> = {}) => ({
+    issue: { key: 'AR-77', uuid: 'uuid-77', path: issuePath },
+    agents: [],
+    dryRun: false,
+    ...overrides,
+  })
+
+  // Class 1 — the issue argument never resolved to one issue.
+  it('exits non-zero when the issue key is ambiguous, and zero when it resolves', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-ambiguous-'))
+    try {
+      const ambiguous = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear', cloud: 'AgentWorkforce/cloud' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear', 'AgentWorkforce/cloud': '/work/cloud' },
+        },
+      })
+      const bothRepos = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
+        '/github/repos/AgentWorkforce/cloud/issues/by-id/48.json': githubIssueFile('cloud'),
+      })
+      const refusalErrors = buffer()
+      const refused = await runFleetCli(['dispatch', '48', '--dry-run', '--config', ambiguous], {
+        fleet: new FakeFleetClient(),
+        mount: bothRepos,
+        stdout: buffer(),
+        stderr: refusalErrors,
+      })
+
+      expect(refused).not.toBe(0)
+      expect(refusalErrors.text()).toContain('matches multiple repositories')
+
+      // Must-not-fire: the same command against a key that resolves to exactly
+      // one repository is a completed dry run and must still exit 0.
+      const unambiguous = await writeConfig(root, {
+        issueSource: 'github',
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear' },
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        },
+      })
+      const onlyPear = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/48.json': githubIssueFile('pear'),
+      })
+      const performed = await runFleetCli(['dispatch', '48', '--dry-run', '--config', unambiguous], {
+        fleet: new FakeFleetClient(),
+        mount: onlyPear,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(performed).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // Class 2 — another writer won the race for the same work unit.
+  it('exits retryable on a dispatch claim race, and zero when the dispatch lands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-race-'))
+    try {
+      const raced = await dispatchCli(root, async () => {
+        throw new LiveDispatchStateChangedError('AR-77')
+      })
+
+      expect(raced.code).toBe(3)
+      expect(raced.errors).toContain('Live state changed before writeback for AR-77')
+
+      const landed = await dispatchCli(root, async () => dispatchResult({
+        agents: [{ name: 'ar-77-impl-factory', role: 'implementer' }],
+      }))
+
+      expect(landed.code).toBe(0)
+      expect(JSON.parse(landed.output)).toMatchObject({
+        agents: [{ name: 'ar-77-impl-factory' }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // Class 3 — the cloud session cannot mint the mount's filesystem scopes.
+  it('exits refused when the mount lacks its filesystem scope, and zero when the mount is healthy', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-scope-'))
+    try {
+      const configPath = await writeConfig(root, {
+        repos: { byLabel: { pear: 'AgentWorkforce/pear' }, default: 'AgentWorkforce/pear' },
+      })
+      const openPr = () => new FakeMountClient({
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/10.json': {
+          payload: {
+            number: 10,
+            title: 'Scoped PR',
+            body: 'Babysit me.',
+            state: 'open',
+            draft: false,
+            head: { ref: 'scoped-pr', sha: 'scope-sha', repo: { full_name: 'AgentWorkforce/pear' } },
+            base: { ref: 'main' },
+          },
+        },
+      })
+      const deniedFleet = new FakeFleetClient()
+      const deniedErrors = buffer()
+      const denied = await runFleetCli(['babysit', '10', '--config', configPath], {
+        fleet: deniedFleet,
+        mount: openPr(),
+        ensureLocalMount: async () => {
+          throw new MountAuthScopeError(mountAuthRemediation({ missingScope: 'fs:read', detail: 'http 403' }), {
+            missingScope: 'fs:read',
+          })
+        },
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: buffer(),
+        stderr: deniedErrors,
+      })
+
+      expect(denied).toBe(2)
+      expect(deniedErrors.text()).toContain('lacks the filesystem scope the mount needs')
+      // The refusal message promises no agents; assert the promise was kept.
+      expect(deniedFleet.spawns).toEqual([])
+
+      const grantedFleet = new FakeFleetClient()
+      const granted = await runFleetCli(['babysit', '10', '--config', configPath], {
+        fleet: grantedFleet,
+        mount: openPr(),
+        ensureLocalMount: async () => undefined,
+        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(granted).toBe(0)
+      expect(grantedFleet.spawns).toHaveLength(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // Class 4 — `factory.dispatch()` returned normally having placed no agents.
+  // This is the path the CLI hard-coded to 0 regardless of the result.
+  it.each([
+    { label: 'a capacity hold', result: { hold: { kind: 'capacity' } }, code: 3 },
+    { label: 'a dependency hold', result: { hold: { kind: 'dependency', blockers: ['AR-70'] } }, code: 3 },
+    { label: 'a dependency cycle', result: { hold: { kind: 'dependency-cycle', cycle: ['AR-77', 'AR-77'] } }, code: 2 },
+    { label: 'a queued or escalated issue', result: {}, code: 2 },
+  ])('exits non-zero when dispatch placed no agents: $label', async ({ result, code }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-nodispatch-'))
+    try {
+      const held = await dispatchCli(root, async () => dispatchResult(result))
+
+      expect(held.code).toBe(code)
+      // The receipt is still printed — the exit code adds a signal, it does not
+      // replace the diagnostic.
+      expect(JSON.parse(held.output)).toMatchObject({ issue: { key: 'AR-77' } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('exits zero when dispatch placed at least one agent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-dispatched-'))
+    try {
+      const placed = await dispatchCli(root, async () => dispatchResult({
+        agents: [{ name: 'ar-77-impl-factory', role: 'implementer' }],
+      }))
+
+      expect(placed.code).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('exits zero for a dry run, whose requested action is the dry run itself', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-dryrun-'))
+    try {
+      const configPath = await writeConfig(root)
+      const code = await runFleetCli(['dispatch', 'AR-77', '--dry-run', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient({ [issuePath]: issueFile }),
+        createFactory: () => stubFactory({
+          dispatch: vi.fn(async () => dispatchResult({ dryRun: true })),
+        }),
+        ensureLocalMount: async () => undefined,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // Sibling command — `run-once` had the same hard-coded 0.
+  it('exits non-zero when a run-once cycle records an error, and zero when it does not', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-exit-runonce-'))
+    try {
+      const configPath = await writeConfig(root)
+      const runOnceCli = async (report: Record<string, unknown>): Promise<number> =>
+        runFleetCli(['run-once', '--config', configPath], {
+          fleet: new FakeFleetClient(),
+          mount: new FakeMountClient({ [issuePath]: issueFile }),
+          createFactory: () => stubFactory({ runOnce: vi.fn(async () => report) }),
+          ensureLocalMount: async () => undefined,
+          stdout: buffer(),
+          stderr: buffer(),
+        })
+
+      const clean = { pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: false }
+
+      expect(await runOnceCli({ ...clean, error: { message: 'discovery failed' } })).toBe(1)
+      expect(await runOnceCli({ ...clean, discoveryDeferred: 'sweep-in-flight' })).toBe(3)
+      // Must-not-fire: a sweep that examined issues and dispatched none of them
+      // still did what it was asked.
+      expect(await runOnceCli(clean)).toBe(0)
+      expect(await runOnceCli({
+        ...clean,
+        skipped: [{ issue: { key: 'AR-77' }, reason: 'queued or escalated' }],
+      })).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
 
