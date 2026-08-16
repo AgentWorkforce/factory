@@ -11,6 +11,13 @@ describe('issue key matching', () => {
     expect(containsIssueKey('ar-22-9-not-229', 'AR-229')).toBe(false)
   })
 
+  it('matches Linear team prefixes that embed digits, without a nearby suffix colliding', () => {
+    expect(containsIssueKey('core23-456-is-positive', 'CORE23-456')).toBe(true)
+    expect(containsIssueKey('CORE23-456: add util', 'CORE23-456')).toBe(true)
+    expect(containsIssueKey('core23-4567-is-positive', 'CORE23-456')).toBe(false)
+    expect(containsIssueKey('core23-456-1-is-positive', 'CORE23-456')).toBe(false)
+  })
+
   it('requires explicit body issue references instead of loose mentions', () => {
     expect(containsExplicitIssueReference('Linear: AR-229', 'AR-229')).toBe(true)
     expect(containsExplicitIssueReference('Closes AR-229', 'AR-229')).toBe(true)
