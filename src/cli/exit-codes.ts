@@ -78,21 +78,15 @@ export function exitCodeForIterationReport(report: IterationReport): FactoryExit
 }
 
 /**
- * Collapse several iteration reports into one exit code, keeping the most
- * severe. A loop that failed one of its iterations did not complete cleanly,
- * and a caller reading only `$?` has to see that.
+ * Collapse a bounded loop's iteration reports into one exit code.
+ *
+ * A failed iteration means the loop did not complete cleanly and a caller
+ * reading only `$?` has to see that. A *deferred* iteration does not: the loop
+ * was asked to run several sweeps, and another owner holding the sweep for one
+ * of them is ordinary contention, not a refusal. Escalating that would make a
+ * healthy loop exit non-zero — the same defect as exiting 0 on a refusal, just
+ * pointed the other way.
  */
-export function exitCodeForIterationReports(reports: readonly IterationReport[]): FactoryExitCode {
-  const severity: Record<FactoryExitCode, number> = {
-    [FACTORY_EXIT.OK]: 0,
-    [FACTORY_EXIT.RETRYABLE]: 1,
-    [FACTORY_EXIT.REFUSED]: 2,
-    [FACTORY_EXIT.FAILED]: 3,
-  }
-  let worst: FactoryExitCode = FACTORY_EXIT.OK
-  for (const report of reports) {
-    const code = exitCodeForIterationReport(report)
-    if (severity[code] > severity[worst]) worst = code
-  }
-  return worst
+export function exitCodeForLoopReports(reports: readonly IterationReport[]): FactoryExitCode {
+  return reports.some((report) => report.error) ? FACTORY_EXIT.FAILED : FACTORY_EXIT.OK
 }

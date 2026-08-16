@@ -7,7 +7,7 @@ import {
   exitCodeForDispatchResult,
   exitCodeForError,
   exitCodeForIterationReport,
-  exitCodeForIterationReports,
+  exitCodeForLoopReports,
 } from './exit-codes'
 
 const issue = { key: 'AR-77', uuid: 'uuid-77', path: '/linear/issues/AR-77__uuid-77.json' }
@@ -112,17 +112,26 @@ describe('exitCodeForIterationReport', () => {
       .toBe(FACTORY_EXIT.RETRYABLE)
   })
 
-  it('keeps the most severe code across a loop of reports', () => {
-    expect(exitCodeForIterationReports([])).toBe(FACTORY_EXIT.OK)
-    expect(exitCodeForIterationReports([iterationReport(), iterationReport()])).toBe(FACTORY_EXIT.OK)
-    expect(exitCodeForIterationReports([
+  it('fails a bounded loop when any iteration recorded an error', () => {
+    expect(exitCodeForLoopReports([])).toBe(FACTORY_EXIT.OK)
+    expect(exitCodeForLoopReports([iterationReport(), iterationReport()])).toBe(FACTORY_EXIT.OK)
+    expect(exitCodeForLoopReports([
       iterationReport(),
-      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
-    ])).toBe(FACTORY_EXIT.RETRYABLE)
-    expect(exitCodeForIterationReports([
-      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
       iterationReport({ error: { message: 'boom' } }),
-      iterationReport(),
     ])).toBe(FACTORY_EXIT.FAILED)
+  })
+
+  it('does not fail a bounded loop for a deferred sweep', () => {
+    // `run-once` was asked for ONE sweep, so a deferral means it never ran.
+    // A loop was asked for several, and losing one to another owner is
+    // ordinary contention. Escalating it would make a healthy loop exit
+    // non-zero — the same defect as exiting 0 on a refusal, pointed the
+    // other way.
+    expect(exitCodeForIterationReport(iterationReport({ discoveryDeferred: 'sweep-in-flight' })))
+      .toBe(FACTORY_EXIT.RETRYABLE)
+    expect(exitCodeForLoopReports([
+      iterationReport(),
+      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
+    ])).toBe(FACTORY_EXIT.OK)
   })
 })

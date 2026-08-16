@@ -13,7 +13,7 @@ import {
   exitCodeForDispatchResult,
   exitCodeForError,
   exitCodeForIterationReport,
-  exitCodeForIterationReports,
+  exitCodeForLoopReports,
 } from './exit-codes'
 import {
   FileStateStore,
@@ -817,7 +817,7 @@ async function runFactoryCommand(
     let loopCode: number = FACTORY_EXIT.OK
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
-      loopCode = exitCodeForIterationReports(reports)
+      loopCode = exitCodeForLoopReports(reports)
       writeJson(out, {
         reports,
         status: await factoryStatusWithMountHealth(
