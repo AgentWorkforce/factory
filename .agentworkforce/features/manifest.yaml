@@ -749,7 +749,7 @@ categories:
       - id: human-slack-dispatch-thread
         name: Slack Dispatch Thread
         api: SlackWriteback.postThread()
-        description: Post and persist a per-issue Slack status thread after dispatch
+        description: Post and persist per-issue Slack status threads with a clickable repo-qualified issue subject, bounded title, secondary scheduling detail, and linked pull requests in completion updates
         location: src/orchestrator/factory.ts, src/writeback/slack.ts
         verify_tier: 5
 

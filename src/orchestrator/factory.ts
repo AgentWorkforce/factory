@@ -144,6 +144,11 @@ type ResolvedIssuePr = {
   url?: string
   path?: string
 }
+type SlackPullRequestRef = {
+  repo: string
+  number: number
+  url?: string
+}
 type EventHighWatermarkResult = { highWatermark?: string; routeUnavailable: boolean }
 type DiscoveryHighWatermarkResult = { available: boolean; highWatermark?: string }
 type DiscoverySession = {
@@ -3700,7 +3705,7 @@ export class FactoryLoop implements Factory {
         await this.#notifyTicketDispatch(dispatchDecision, liveIssue, record, result)
       }
       if (!dryRun) {
-        await this.#ensureSlackDispatchThread(record, result)
+        await this.#ensureSlackDispatchThread(record, result, liveIssue)
       }
       return result
     } catch (error) {
@@ -8108,9 +8113,11 @@ export class FactoryLoop implements Factory {
     try {
       const thread = await this.#slackDispatchThreadFor(record)
       if (thread && this.#slack) {
+        const issue = await this.#readIssue(record.issue.path)
+        if (!issue) return
         await this.#slack.reply(
           thread.threadId,
-          `:warning: ${record.issue.key}: the implementer exited without opening a PR (after a retry). It needs a human look.`,
+          `:warning: ${slackIssueSubject(issue, slackNotificationRepos(record.decision))}\nThe implementer exited without opening a PR after a retry; this needs a human look.`,
         )
       }
     } catch (error) {
@@ -8863,9 +8870,18 @@ export class FactoryLoop implements Factory {
     }
 
     try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) {
+        throw new Error(`Unable to describe Slack question notification for unreadable issue ${record.issue.key}`)
+      }
       await this.#slack.reply(
         threadId,
-        agentQuestionSlackText(record.issue, question, this.#config.slack.stakeholderUserIds),
+        agentQuestionSlackText(
+          issue,
+          question,
+          this.#config.slack.stakeholderUserIds,
+          slackNotificationRepos(record.decision),
+        ),
       )
       this.#increment('agentQuestionsPostedToSlack')
       this.#recordSlackWritebackSuccess('agent-question')
@@ -9015,12 +9031,15 @@ export class FactoryLoop implements Factory {
     }
 
     try {
+      if (!claimedIssue) {
+        throw new Error(`Unable to describe Slack question notification for unreadable issue ${claimed.issue.key}`)
+      }
       await this.#slack.reply(
         claimed.threadId,
-        agentQuestionSlackText(claimed.issue, {
+        agentQuestionSlackText(claimedIssue, {
           agentName: claimed.askerName,
           question: claimed.question,
-        }, this.#config.slack.stakeholderUserIds),
+        }, this.#config.slack.stakeholderUserIds, slackNotificationRepos(claimed.decision)),
       )
       const completed = await this.#state.completeClarificationQuestionDelivery(
         this.#workspaceId,
@@ -9258,9 +9277,18 @@ export class FactoryLoop implements Factory {
       return
     }
     try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) {
+        throw new Error(`Unable to describe Slack question mirror for unreadable issue ${record.issue.key}`)
+      }
       await this.#slack.reply(
         threadId,
-        agentQuestionSlackText(record.issue, question, this.#config.slack.stakeholderUserIds),
+        agentQuestionSlackText(
+          issue,
+          question,
+          this.#config.slack.stakeholderUserIds,
+          slackNotificationRepos(record.decision),
+        ),
       )
       this.#increment('agentQuestionsMirroredToSlack')
       this.#recordSlackWritebackSuccess('agent-question-mirror')
@@ -10467,7 +10495,7 @@ export class FactoryLoop implements Factory {
         prSnapshotIssueMatchScore(snapshot, session.issue.key) >= 30
       ) {
         await this.#state.clearBabysitterSession(this.#workspaceId, persistedKey)
-        await this.#advanceMergedPrToDone(snapshot, record)
+        await this.#advanceMergedPrToDone(snapshot, session.repo, record)
         this.#increment('babysitterOwnershipRestoreMerged')
         this.#logger.info?.('[factory] completed restored lifecycle whose pull request was already merged', {
           issue: session.issue.key,
@@ -11611,7 +11639,7 @@ export class FactoryLoop implements Factory {
     const owned = await this.#babysitterOwnerFor(repo, snapshot.number)
     if (owned) {
       if (prMetaShowsMerged(snapshot)) {
-        if (owned.record) await this.#advanceMergedPrToDone(snapshot, owned.record)
+        if (owned.record) await this.#advanceMergedPrToDone(snapshot, repo, owned.record)
         else await this.#cancelBabysitterWake(owned.key)
         return
       }
@@ -11666,7 +11694,7 @@ export class FactoryLoop implements Factory {
     }
 
     if (prMetaShowsMerged(snapshot)) {
-      await this.#advanceMergedPrToDone(snapshot, record)
+      await this.#advanceMergedPrToDone(snapshot, repo, record)
       return
     }
 
@@ -11726,9 +11754,15 @@ export class FactoryLoop implements Factory {
     return best?.record
   }
 
-  async #advanceMergedPrToDone(snapshot: PullSnapshot, record?: InFlightIssue): Promise<void> {
+  async #advanceMergedPrToDone(snapshot: PullSnapshot, repo: string, record?: InFlightIssue): Promise<void> {
+    const mergedPullRequest = { repo, number: snapshot.number, url: snapshot.url }
     if (record) {
-      await this.#completeIssue(record, { targetState: 'done', runMergeGate: false, completionReason: 'pr-merged' })
+      await this.#completeIssue(record, {
+        targetState: 'done',
+        runMergeGate: false,
+        completionReason: 'pr-merged',
+        mergedPullRequest,
+      })
       return
     }
 
@@ -11771,11 +11805,13 @@ export class FactoryLoop implements Factory {
           const channel = await this.#slackChannelDir()
           if (channel) {
             const systemOfRecord = githubIssue ? 'GitHub issue closed' : 'Linear state set to Done'
+            const subject = slackIssueSubject(issue, [repo])
+            const pullRequest = slackPullRequestLink(mergedPullRequest)
             const root = await this.#slack.postThread({
               channel,
-              text: `${issue.key}: PR merged; ${systemOfRecord}.`,
+              text: `${subject}\nPR merged · ${pullRequest} · ${systemOfRecord}`,
             })
-            await this.#slack.reply(root.threadId, `${issue.key}: ${systemOfRecord}.`)
+            await this.#slack.reply(root.threadId, `${subject}\n${systemOfRecord} · ${pullRequest}`)
             this.#recordSlackWritebackSuccess('merge-done-thread')
           }
         } catch (error) {
@@ -12336,7 +12372,12 @@ export class FactoryLoop implements Factory {
 
   async #completeIssue(
     record: InFlightIssue,
-    opts: { targetState?: 'configured' | 'done'; runMergeGate?: boolean; completionReason?: 'agents-completed' | 'pr-merged' } = {},
+    opts: {
+      targetState?: 'configured' | 'done'
+      runMergeGate?: boolean
+      completionReason?: 'agents-completed' | 'pr-merged'
+      mergedPullRequest?: SlackPullRequestRef
+    } = {},
   ): Promise<void> {
     const completionKey = issueKey(record.issue)
     if (this.#completionInFlight.has(completionKey)) {
@@ -12417,20 +12458,29 @@ export class FactoryLoop implements Factory {
       }
       if (!await this.#saveDispatchLifecycle(record, 'writeback-applied')) return
 
-      if (this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('completion-thread')) {
+      if (issue && this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('completion-thread')) {
         try {
           const channel = await this.#slackChannelDir()
           if (channel) {
             const merged = opts.completionReason === 'pr-merged'
             const systemOfRecord = githubIssue ? 'GitHub status' : 'Linear state'
-            const completionText = merged
-              ? `${record.issue.key}: PR merged; ${systemOfRecord} set to ${statusLabel}.`
-              : `${record.issue.key}: factory agents completed${humanReview ? '; awaiting human review' : ''}.\nStatus: ${statusLabel}\nMerge policy: ${this.#config.mergePolicy}`
-            const stateText = merged
-              ? `${record.issue.key}: ${systemOfRecord} set to ${statusLabel}.`
-              : humanReview
-                ? `${record.issue.key}: awaiting human review; ${systemOfRecord} set to ${statusLabel}.`
-                : `${record.issue.key}: ${systemOfRecord} set to ${statusLabel}.`
+            const pullRequests = await this.#slackPullRequestRefs(
+              record,
+              opts.mergedPullRequest ? [opts.mergedPullRequest] : [],
+            )
+            const pullRequestLinks = pullRequests.map(slackPullRequestLink).join(' · ')
+            const subject = slackIssueSubject(issue, slackNotificationRepos(record.decision))
+            const stateResult = githubIssue && merged && !humanReview
+              ? 'GitHub issue closed'
+              : `${systemOfRecord} set to ${statusLabel}`
+            const completionText = [
+              subject,
+              merged
+                ? `PR merged${pullRequestLinks ? ` · ${pullRequestLinks}` : ''} · ${stateResult}`
+                : `Completed${humanReview ? ' · awaiting human review' : ''}${pullRequestLinks ? ` · ${pullRequestLinks}` : ''}`,
+              ...(!merged ? [`Status: ${statusLabel} · Merge policy: ${this.#config.mergePolicy}`] : []),
+            ].join('\n')
+            const stateText = `${subject}\n${stateResult}${pullRequestLinks ? ` · ${pullRequestLinks}` : ''}`
             const root = await this.#slack.postThread({
               channel,
               text: completionText,
@@ -12939,7 +12989,39 @@ export class FactoryLoop implements Factory {
     return undefined
   }
 
-  async #ensureSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
+  async #slackPullRequestRefs(
+    record: InFlightIssue,
+    additional: SlackPullRequestRef[] = [],
+  ): Promise<SlackPullRequestRef[]> {
+    const lifecycle = await this.#state
+      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .catch(() => undefined)
+    const lifecycleRefs = publishedPullRequests(lifecycle).map((receipt) => ({
+      repo: receipt.repo,
+      number: receipt.number,
+      url: receipt.url,
+    }))
+    const trackedRefs = [...record.agents.values()]
+      .map((tracked) => tracked.spec.ownedPullRequest)
+      .filter((ref): ref is NonNullable<typeof ref> => Boolean(ref))
+      .map((ref) => ({ repo: ref.repo, number: ref.number }))
+    const babysitterRefs = [...this.#babysitterPr.entries()]
+      .filter(([key]) => issueKey(this.#babysitterIssueRefs.get(key) ?? record.issue) === issueKey(record.issue))
+      .map(([, ref]) => ({ repo: ref.repo, number: ref.prNumber }))
+
+    return uniqueSlackPullRequestRefs([
+      ...additional,
+      ...lifecycleRefs,
+      ...babysitterRefs,
+      ...trackedRefs,
+    ])
+  }
+
+  async #ensureSlackDispatchThread(
+    record: InFlightIssue,
+    result: DispatchResult,
+    sourceIssue?: LinearIssue,
+  ): Promise<void> {
     if (!this.#slack || !this.#config.slack || result.dryRun) {
       return
     }
@@ -12982,7 +13064,7 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    const start = this.#postAndWatchSlackDispatchThread(record, result)
+    const start = this.#postAndWatchSlackDispatchThread(record, result, sourceIssue)
     this.#slackWatcherStarts.set(key, start)
     try {
       await start
@@ -12994,22 +13076,33 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #postAndWatchSlackDispatchThread(record: InFlightIssue, result: DispatchResult): Promise<void> {
+  async #postAndWatchSlackDispatchThread(
+    record: InFlightIssue,
+    result: DispatchResult,
+    sourceIssue?: LinearIssue,
+  ): Promise<void> {
     if (!this.#slack || !this.#config.slack) {
       return
     }
 
-    const previews = uniquePreviewReferences(result.previews ?? [])
+    const issue = sourceIssue ?? await this.#readIssue(record.issue.path)
+    if (!issue) {
+      throw new Error(`Unable to describe Slack dispatch notification for unreadable issue ${record.issue.key}`)
+    }
+    const previews = uniquePreviewReferences(
+      result.previews ?? this.#previewReferences.get(issueKey(record.issue)) ?? [],
+    )
+    const repos = slackNotificationRepos(record.decision)
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
-        `${record.issue.key}: factory agents dispatched.`,
-        `State: ${result.stateId ?? 'dispatching'} · Agents: ${result.agents.map((agent) => agent.name).join(', ') || 'none'}`,
+        slackIssueSubject(issue, repos),
+        `Dispatched · ${result.agents.map((agent) => agent.name).join(', ') || 'no agents'} · Repos: ${slackRepoList(repos)}`,
         ...(previews.length > 0
           ? [previews.map((preview) =>
               `Live preview (${preview.repo}, tailnet access required): ${preview.url}`,
             ).join(' · ')]
-          : []),
+          : [`State: ${result.stateId ?? 'dispatching'}`]),
       ].join('\n'),
     })
     await this.#state.setSlackThread(this.#workspaceId, issueKey(record.issue), root.threadId)
@@ -13434,13 +13527,13 @@ export class FactoryLoop implements Factory {
       .filter((part): part is string => Boolean(part))
       .join(' ')
     const replyInstruction = source?.url
-      ? `Reply on the GitHub issue so Factory can resume: ${source.url}`
+      ? 'Reply on the linked GitHub issue so Factory can resume.'
       : 'Reply on the source GitHub issue so Factory can resume.'
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
-        `${audience ? `${audience} ` : ''}${decision.issue.key}: factory triage escalation for ${issue.title}`,
-        `Reason: ${reason}`,
+        `${audience ? `${audience} ` : ''}${slackIssueSubject(issue, slackNotificationRepos(decision))}`,
+        `Triage blocked · Reason: ${reason}`,
         `Question: ${triageEscalationQuestion(decision, issue)} ${replyInstruction}`,
       ].join('\n'),
     })
@@ -13563,12 +13656,15 @@ export class FactoryLoop implements Factory {
     }
 
     const issue = await this.#readIssue(decision.issue.path)
+    if (!issue) {
+      throw new Error(`Unable to describe Slack triage escalation for unreadable issue ${decision.issue.key}`)
+    }
     const stakeholderMentions = slackMentions(this.#config.slack.stakeholderUserIds)
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
-        `${stakeholderMentions ? `${stakeholderMentions} ` : ''}${decision.issue.key}: factory triage escalation for ${issue?.title ?? decision.issue.key}`,
-        `Reason: ${reason}`,
+        `${stakeholderMentions ? `${stakeholderMentions} ` : ''}${slackIssueSubject(issue, slackNotificationRepos(decision))}`,
+        `Triage blocked · Reason: ${reason}`,
         `Question: ${triageEscalationQuestion(decision, issue)}`,
       ].join('\n'),
     })
@@ -13952,9 +14048,13 @@ export class FactoryLoop implements Factory {
         waitingAgeMs,
       })
       try {
+        const issue = await this.#readIssue(escalated.issue.path)
+        if (!issue) {
+          throw new Error(`Unable to describe stale Slack clarification for unreadable issue ${escalated.issue.key}`)
+        }
         await this.#slack.reply(
           waiting.threadId,
-          clarificationStaleSlackText(escalated, this.#config.slack.stakeholderUserIds),
+          clarificationStaleSlackText(escalated, issue, this.#config.slack.stakeholderUserIds),
         )
         const completed = await this.#state.completeClarificationEscalation(
           this.#workspaceId,
@@ -15171,6 +15271,92 @@ function dispatchIssueUrl(issue: LinearIssue): string {
     ?? stringValue(payload.html_url)
     ?? stringValue(source?.url)
     ?? issue.path
+}
+
+const SLACK_ISSUE_TITLE_MAX_LENGTH = 120
+
+function slackEscapeText(value: string): string {
+  return value
+    .replace(/&/gu, '&amp;')
+    .replace(/</gu, '&lt;')
+    .replace(/>/gu, '&gt;')
+}
+
+function slackLinkUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined
+    return url.toString()
+      .replace(/\|/gu, '%7C')
+      .replace(/</gu, '%3C')
+      .replace(/>/gu, '%3E')
+  } catch {
+    return undefined
+  }
+}
+
+function truncateSlackIssueTitle(title: string): string {
+  const normalized = title.replace(/\s+/gu, ' ').trim() || 'Untitled issue'
+  const characters = Array.from(normalized)
+  if (characters.length <= SLACK_ISSUE_TITLE_MAX_LENGTH) return normalized
+  return `${characters.slice(0, SLACK_ISSUE_TITLE_MAX_LENGTH - 1).join('').trimEnd()}…`
+}
+
+function slackRepoName(repo: string): string {
+  const normalized = repo.trim().replace(/^\/+|\/+$/gu, '')
+  return normalized.slice(normalized.lastIndexOf('/') + 1) || normalized || 'unknown repo'
+}
+
+function slackNotificationRepos(decision: TriageDecision): string[] {
+  const repos = [
+    ...decision.routes.map((route) => route.repo),
+    ...decision.implementers.map((implementer) => implementer.repo),
+  ]
+  return [...new Map(repos
+    .filter((repo) => Boolean(repo.trim()))
+    .map((repo) => [repo.trim().toLowerCase(), repo.trim()])).values()]
+}
+
+function slackRepoList(repos: string[]): string {
+  const names = [...new Set(repos.map(slackRepoName))]
+  return slackEscapeText(names.join(', ') || 'unknown repo')
+}
+
+function slackIssueSubject(issue: LinearIssue, repos: string[] = []): string {
+  const githubSource = githubIssueSourceRef(issue)
+  const githubPath = githubIssuePathParts(issue.path)
+  const githubIdentity = githubSource ?? githubPath
+  const payload = wrappedPayload(issue.raw)
+  const source = asRecord(payload.source)
+  const fallbackIssueUrl = githubIdentity
+    ? `https://github.com/${githubIdentity.owner}/${githubIdentity.repo}/issues/${githubIdentity.number}`
+    : `https://linear.app/issue/${encodeURIComponent(issue.key)}`
+  const issueUrl = slackLinkUrl(
+    githubSource?.url
+      ?? stringValue(payload.url)
+      ?? stringValue(payload.html_url)
+      ?? stringValue(source?.url)
+      ?? fallbackIssueUrl,
+  ) ?? fallbackIssueUrl
+
+  const repoNames = [...new Set(repos.map(slackRepoName))]
+  const label = githubIdentity
+    ? `${githubIdentity.repo}#${githubIdentity.number}`
+    : `${repoNames.join(', ') || 'unknown repo'} · ${issue.key}`
+  return `<${issueUrl}|${slackEscapeText(label)}> — ${slackEscapeText(truncateSlackIssueTitle(issue.title))}`
+}
+
+function slackPullRequestLink(pullRequest: SlackPullRequestRef): string {
+  const fallbackUrl = `https://github.com/${pullRequest.repo}/pull/${pullRequest.number}`
+  const url = slackLinkUrl(pullRequest.url ?? fallbackUrl) ?? fallbackUrl
+  const label = `${slackRepoName(pullRequest.repo)}#${pullRequest.number}`
+  return `<${url}|${slackEscapeText(label)}>`
+}
+
+function uniqueSlackPullRequestRefs(refs: SlackPullRequestRef[]): SlackPullRequestRef[] {
+  return [...new Map(refs
+    .filter((ref) => Boolean(ref.repo.trim()) && Number.isSafeInteger(ref.number) && ref.number > 0)
+    .map((ref) => [`${ref.repo.trim().toLowerCase()}#${ref.number}`, { ...ref, repo: ref.repo.trim() }])).values()]
 }
 
 function ticketDispatchNotificationText(payload: TicketDispatchNotificationPayload): string {
@@ -17845,18 +18031,24 @@ const slackUserIdMatchingIdentity = (
     : undefined
 }
 
-const agentQuestionSlackText = (issue: IssueRef, question: AgentQuestion, stakeholderUserIds: string[] = []): string => [
-  slackMentions(stakeholderUserIds),
-  `${issue.key}: ${question.agentName} needs input.`,
+const agentQuestionSlackText = (
+  issue: LinearIssue,
+  question: AgentQuestion,
+  stakeholderUserIds: string[] = [],
+  repos: string[] = [],
+): string => [
+  `${slackMentions(stakeholderUserIds) ?? ''} ${slackIssueSubject(issue, repos)}`.trim(),
+  `${question.agentName} needs input.`,
   `Question: ${question.question}`,
 ].filter((line): line is string => Boolean(line)).join('\n')
 
 const clarificationStaleSlackText = (
   waiting: WaitingClarification,
+  issue: LinearIssue,
   stakeholderUserIds: string[] = [],
 ): string => [
-  slackMentions(stakeholderUserIds),
-  `${waiting.issue.key} has been parked for seven days without a reply.`,
+  `${slackMentions(stakeholderUserIds) ?? ''} ${slackIssueSubject(issue, slackNotificationRepos(waiting.decision))}`.trim(),
+  'This issue has been parked for seven days without a reply.',
   `Question from ${waiting.askerName}: ${waiting.question} Reply in this thread to wake the saved agent team, or move the issue out of Agent Implementing to cancel the wake.`,
 ].filter((line): line is string => Boolean(line)).join('\n')
 

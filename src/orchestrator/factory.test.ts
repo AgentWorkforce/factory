@@ -4583,9 +4583,12 @@ describe('FactoryLoop', () => {
       expect(githubWriteback.closes[0]?.body).toContain('linked pull request merge')
       const completionTexts = mount.writes
         .map((write) => (write.content as { text?: string }).text)
-        .filter((text): text is string => Boolean(text?.startsWith('51:')))
-      expect(completionTexts).toContain('51: PR merged; GitHub status set to Done.')
-      expect(completionTexts).toContain('51: GitHub status set to Done.')
+        .filter((text): text is string => Boolean(text?.includes('GitHub issue closed')))
+      const subject = '<https://github.com/AgentWorkforce/pear/issues/51|pear#51> — GitHub factory issue 51'
+      const pullRequest = '<https://github.com/AgentWorkforce/pear/pull/51|pear#51>'
+      expect(completionTexts).toContain(`${subject}\nPR merged · ${pullRequest} · GitHub issue closed`)
+      expect(completionTexts).toContain(`${subject}\nGitHub issue closed · ${pullRequest}`)
+      expect(completionTexts.every((text) => !text.startsWith('51:'))).toBe(true)
     } finally {
       await factory.stop()
     }
@@ -14120,8 +14123,8 @@ describe('FactoryLoop', () => {
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(2)
     expect(slackRoots.map((write) => (write.content as { text?: string }).text)).toEqual([
-      expect.stringContaining('AR-140: factory agents dispatched.'),
-      expect.stringContaining('AR-141: factory agents dispatched.'),
+      expect.stringContaining('|pear · AR-140> — [factory-e2e] Fix factory issue 140'),
+      expect.stringContaining('|pear · AR-141> — [factory-e2e] Fix factory issue 141'),
     ])
     expect(factory.status()).toMatchObject({
       slackDegraded: false,
@@ -14497,11 +14500,40 @@ describe('FactoryLoop', () => {
     expect(report.slackDegraded).toBe(false)
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-47: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain(
+      '<https://linear.app/agent-relay/issue/AR-47/factory-issue-47|pear · AR-47> — [factory-e2e] Fix factory issue 47',
+    )
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Dispatched · ar-47-impl-pear, ar-47-review')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain(
       'Live preview (AgentWorkforce/pear, tailnet access required): https://factory-node.tailnet.ts.net:10000/',
     )
     expect(factory.status().slackDegraded).toBe(false)
+  })
+
+  it('posts a repo-qualified GitHub issue link and truncated title before Slack dispatch details', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 269)
+    const title = `Slack notification ${'x'.repeat(140)}`
+    const issue = githubIssueFile(269, { title, labels: ['factory'] })
+    const mount = new ConfirmRecordingSlackMountClient({ [path]: issue })
+    const factory = createFactory(config({ issueSource: 'github', slack: slackConfig() }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    const text = (slackRoots[0]?.content as { text?: string }).text ?? ''
+    const [subject, dispatch, scheduling] = text.split('\n')
+    expect(subject).toMatch(/^<https:\/\/github\.com\/AgentWorkforce\/pear\/issues\/269\|pear#269> — Slack notification x+…$/u)
+    expect(Array.from(subject!.split(' — ')[1] ?? '')).toHaveLength(120)
+    expect(dispatch).toBe('Dispatched · ar-269-impl-pear, ar-269-review-pear · Repos: pear')
+    expect(scheduling).toBe('State: dispatching')
+    expect(text).not.toContain('269: factory agents dispatched')
+    await factory.stop()
   })
 
   it('falls back to Slack event freshness when sync status lookup fails', async () => {
@@ -14562,7 +14594,7 @@ describe('FactoryLoop', () => {
 
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-49: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('|pear · AR-49> — [factory-e2e] Fix factory issue 49')
     expect(factory.status()).toMatchObject({
       slackDegraded: false,
       counters: {
@@ -14596,7 +14628,7 @@ describe('FactoryLoop', () => {
 
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-52: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('|pear · AR-52> — [factory-e2e] Fix factory issue 52')
     expect(mount.writes.filter((write) =>
       write.path.startsWith('/linear/issues/') &&
       (write.content as { stateId?: string }).stateId === implementing,
@@ -14642,7 +14674,7 @@ describe('FactoryLoop', () => {
 
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-54: factory agents dispatched.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('|pear · AR-54> — [factory-e2e] Fix factory issue 54')
     expect(mount.writes.filter((write) =>
       write.path.startsWith('/linear/issues/') &&
       (write.content as { stateId?: string }).stateId === implementing,
@@ -14697,8 +14729,8 @@ describe('FactoryLoop', () => {
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(2)
     expect(slackRoots.map((write) => (write.content as { text?: string }).text)).toEqual([
-      expect.stringContaining('AR-57: factory agents dispatched.'),
-      expect.stringContaining('AR-59: factory agents dispatched.'),
+      expect.stringContaining('|pear · AR-57> — [factory-e2e] Fix factory issue 57'),
+      expect.stringContaining('|pear · AR-59> — [factory-e2e] Fix factory issue 59'),
     ])
     expect(factory.status()).toMatchObject({
       slackDegraded: false,
@@ -14733,7 +14765,10 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('AR-20: factory triage escalation for [factory-e2e] Fix factory issue 20')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain(
+      '<https://linear.app/agent-relay/issue/AR-20/factory-issue-20|pear · AR-20> — [factory-e2e] Fix factory issue 20',
+    )
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Triage blocked · Reason:')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: Matched repository from Linear label.')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Factory matched AgentWorkforce/pear.')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('For "[factory-e2e] Fix factory issue 20", please reply with:')
@@ -14916,7 +14951,7 @@ describe('FactoryLoop', () => {
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('<@UOWNER> <@ULEAD>')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: <@UISSUEAUTHOR>.')
     expect((slackRoots[0]?.content as { text?: string }).text)
-      .toContain('Reply on the GitHub issue so Factory can resume: https://github.com/AgentWorkforce/pear/issues/56')
+      .toContain('Reply on the linked GitHub issue so Factory can resume.')
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
     expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
@@ -15494,7 +15529,8 @@ describe('FactoryLoop', () => {
       expect.objectContaining({
         content: expect.objectContaining({
           thread_ts: mount.threadTs,
-          text: 'AR-36: ar-36-impl-pear needs input.\nQuestion: Which retry helper should I use?',
+          text: '<https://linear.app/agent-relay/issue/AR-36/factory-issue-36|pear · AR-36> — [factory-e2e] Fix factory issue 36\n' +
+            'ar-36-impl-pear needs input.\nQuestion: Which retry helper should I use?',
         }),
       }),
     ])
@@ -15744,7 +15780,8 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(factory.status().counters.agentQuestionTeamsReleased).toBe(1))
 
     expect(slackReplyWrites(mount).at(-1)?.content.text).toBe(
-      '<@UOWNER> <@ULEAD>\nAR-44: ar-44-impl-pear needs input.\nQuestion: Which owner should approve this?',
+      '<@UOWNER> <@ULEAD> <https://linear.app/issue/AR-44|pear · AR-44> — [factory-e2e] Fix factory issue 44\n' +
+      'ar-44-impl-pear needs input.\nQuestion: Which owner should approve this?',
     )
   })
 
@@ -15962,10 +15999,10 @@ describe('FactoryLoop', () => {
     await factory.runLoop({ maxIterations: 1 })
 
     const clarificationMessages = slackReplyWrites(mount).map((write) => write.content.text)
-    expect(clarificationMessages).toContain(
-      '<@UOWNER>\nAR-47 has been parked for seven days without a reply.\n' +
-      'Question from ar-47-impl-pear: Which timeout policy applies? Reply in this thread to wake the saved agent team, or move the issue out of Agent Implementing to cancel the wake.',
-    )
+    const staleMessage = clarificationMessages.find((message) => message.includes('seven days without a reply'))
+    expect(staleMessage).toContain('<@UOWNER> <https://linear.app/')
+    expect(staleMessage).toContain('|pear · AR-47> — [factory-e2e] Fix factory issue 47')
+    expect(staleMessage).toContain('Question from ar-47-impl-pear: Which timeout policy applies?')
     expect(factory.status().counters.clarificationEscalationsPosted).toBe(1)
     expect((await stateStore.listWaitingClarifications('factory-test'))[0]?.[1].escalatedAtMs).toBe(clock.now())
   })
@@ -16206,7 +16243,11 @@ describe('FactoryLoop', () => {
     })
 
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
-    expect(mount.writes.filter((write) => isSlackRootWritePath(write.path))).toHaveLength(1)
+    const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
+    expect(slackRoots).toHaveLength(1)
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain(
+      '<https://github.com/AgentWorkforce/pear/issues/68|pear#68> — GitHub factory issue 68',
+    )
     mount.files.set(path, { content: githubIssueFile(68, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 68, 9801, {
       body: '### Factory human input request\nAgent: ar-68-impl-pear\nIssue: 68\nQuestion: Keep the issue record authoritative.',
@@ -17261,7 +17302,7 @@ describe('FactoryLoop', () => {
     fleet.emitAgentMessage(question)
     await vi.waitFor(() => {
       expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
-        'AR-40: ar-40-impl-pear needs input.\nQuestion: Is this duplicate-safe?',
+        '<https://linear.app/issue/AR-40|pear · AR-40> — [factory-e2e] Fix factory issue 40\nar-40-impl-pear needs input.\nQuestion: Is this duplicate-safe?',
       ])
       expect(factory.status().counters.clarificationQuestionsDelivered).toBe(1)
     })
