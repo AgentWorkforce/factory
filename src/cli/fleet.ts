@@ -1106,7 +1106,9 @@ async function factoryStatusWithMountHealth(
   registryPath: string,
   heartbeatStaleMs: number,
   versionInfo?: FactoryVersionInfo,
-): Promise<ReturnType<Factory['status']> & {
+): Promise<Omit<ReturnType<Factory['status']>, 'fleetControlPlane'> & {
+  /** Undefined when a live older daemon predates fleet control-plane reporting. */
+  fleetControlPlane?: ReturnType<Factory['status']>['fleetControlPlane']
   version?: string
   installedAt?: string
   latestVersion?: string
@@ -1144,7 +1146,7 @@ async function factoryStatusWithMountHealth(
     ? heartbeat?.readinessReconcile
     : observableStatus.readinessReconcile
   const fleetControlPlane = liveness.ok
-    ? heartbeat?.fleetControlPlane ?? observableStatus.fleetControlPlane
+    ? heartbeat?.fleetControlPlane
     : observableStatus.fleetControlPlane
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {

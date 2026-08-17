@@ -2806,6 +2806,52 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('does not report a fresh local closed circuit for a live older daemon heartbeat', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-legacy-circuit-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({
+          inFlight: [],
+          queued: [],
+          counters: {},
+          fleetControlPlane: {
+            state: 'closed' as const,
+            consecutiveFailures: 0,
+            timeoutMs: 5_000,
+            failureThreshold: 2,
+            resetTimeoutMs: 60_000,
+          },
+        })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).not.toHaveProperty('fleetControlPlane')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('lists registry-backed in-flight issues, agents, and degraded claims in factory status', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-registry-status-'))
     try {
