@@ -54,6 +54,10 @@
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
     },
+    "./cli": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
     "./featuremap": {
       "types": "./dist/featuremap/index.d.ts",
       "import": "./dist/featuremap/index.js"

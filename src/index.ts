@@ -3,8 +3,15 @@ import type { FactoryConfig } from './config/schema'
 export * from './webhook/index.js'
 export * from './state/index.js'
 export * from './cost/index.js'
-export { FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
-export type { FileStateStoreOptions } from './state/file-state-store.js'
+export { DocumentStateStore, FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
+export type { DocumentStateStoreOptions, FileStateStoreOptions } from './state/file-state-store.js'
+export { WatchStateDocumentConflictError } from './state/document-store.js'
+export { parseWatchStateDocument } from './state/watch-state-document.js'
+export type {
+  PersistedWorkspaceState,
+  WatchStateDocument,
+  WatchStateDocumentStore,
+} from './state/document-store.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { DEFAULT_AGENT_HOLD_TIMEOUT_MS, FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export * from './environments/index.js'
