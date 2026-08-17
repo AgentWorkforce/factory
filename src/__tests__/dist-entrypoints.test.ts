@@ -32,6 +32,8 @@ describe('published dist entrypoints', () => {
     expect(main.KubernetesEnvironmentProvider).toBeTypeOf('function')
     expect(hosted.createHostedFactory).toBeTypeOf('function')
     expect(hosted.DurableObjectHostedFactoryStateStore).toBeTypeOf('function')
+    expect(hosted.DurableObjectWatchStateService).toBeTypeOf('function')
+    expect(hosted.SqliteDurableDocumentPersistence).toBeTypeOf('function')
     expect(intake.RelayChannelNotionClaimStore).toBeTypeOf('function')
     expect(intake.runNotionIntake).toBeTypeOf('function')
     expect(environments.KubernetesEnvironmentProvider).toBeTypeOf('function')

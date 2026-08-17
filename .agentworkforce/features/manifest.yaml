@@ -1,13 +1,13 @@
 version: '1.1'
-updated: '2026-08-07'
+updated: '2026-08-17'
 catalog:
   category_count: 25
-  feature_count: 318
+  feature_count: 319
   tier_counts:
     1: 48
     2: 127
     3: 11
-    4: 52
+    4: 53
     5: 65
     6: 15
 
@@ -129,7 +129,7 @@ categories:
         name: Factory Status
         cli: factory status
         api: Factory.status()
-        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, running version identity, and held agents (age, deadline, terminal state awaited) as JSON
+        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, running version identity, the selected durable state backend, and held agents (age, deadline, terminal state awaited) as JSON
         location: src/cli/fleet.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
@@ -700,10 +700,17 @@ categories:
         verify_tier: 4
 
       - id: dispatch-same-host-owner-fencing
-        name: Same-Host Dispatch Owner Fencing
+        name: Dispatch Owner Fencing
         api: StateStore.claimDispatchLifecycle() / renewDispatchLifecycle()
-        description: Fence lifecycle ownership and global batch capacity by lease epoch across processes sharing one FileStateStore; cross-host active/active control planes remain unsupported without shared compare-and-set state
-        location: README.md, src/ports/state.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
+        description: Fence lifecycle ownership and global batch capacity by lease epoch across processes sharing one FileStateStore or across hosts using Durable Object revision compare-and-set
+        location: README.md, src/ports/state.ts, src/state/file-state-store.ts, src/state/cloudflare-state-store.ts, src/orchestrator/factory.ts
+        verify_tier: 4
+
+      - id: dispatch-cloudflare-durable-state
+        name: Cloudflare Durable Dispatch State
+        api: CloudflareStateStore / DurableObjectWatchStateService
+        description: Persist normalized and chunked claim, lease, lifecycle, conversation, babysitter, and discovery records in a SQLite Durable Object, retry revision conflicts, survive complete container-disk loss, and fail closed before dispatch when durable state is unreadable or uninitialized
+        location: docs/cloudflare-durable-state.md, src/state/cloudflare-state-store.ts, src/state/document-store.ts, src/hosted/document-state.ts, src/cli/fleet.ts
         verify_tier: 4
 
       - id: dispatch-remote-publication-recovery
@@ -1457,8 +1464,8 @@ categories:
 
       - id: api-state-stores
         name: State Store API
-        api: InMemoryStateStore / FileStateStore
-        description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records
+        api: InMemoryStateStore / FileStateStore / CloudflareStateStore
+        description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records through memory, atomic file, or revision-fenced Cloudflare Durable Object adapters
         location: src/ports/state.ts, src/state/
         verify_tier: 1
 
@@ -1535,7 +1542,7 @@ categories:
       - id: api-hosted-control-plane
         name: Hosted Factory API
         api: '@agent-relay/factory/hosted'
-        description: Export the worker-safe hosted loop, completion API, lease-fenced state adapters, and host-supplied integration ports without Node filesystem or process dependencies
+        description: Export the worker-safe hosted loop, completion API, lease-fenced state adapters, normalized SQLite Durable Object document service, and host-supplied integration ports without Node filesystem or process dependencies
         location: src/hosted/, package.json
         verify_tier: 1
 
@@ -1603,7 +1610,7 @@ categories:
       - id: hosted-worker-safety
         name: Worker-Safe Hosted Bundle
         api: '@agent-relay/factory/hosted'
-        description: Keep the hosted entrypoint free of Node filesystem, process, child-process, and local-broker imports so it can execute in a Cloud worker
+        description: Keep the hosted loop and SQLite Durable Object document service free of Node filesystem, process, child-process, and local-broker imports so they can execute in a Cloud worker
         location: src/hosted/, src/hosted/worker-safety.test.ts
         verify_tier: 1
 

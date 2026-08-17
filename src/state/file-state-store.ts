@@ -23,24 +23,23 @@ import type {
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
-
-type PersistedWorkspaceState = {
-  githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
-  waitingClarifications: Record<string, WaitingClarification>
-  babysitterSessions: Record<string, BabysitterSessionState>
-  babysitterGenerations: Record<string, BabysitterGenerationRecord>
-  conversationSessions: Record<string, ConversationSessionState>
-  dispatchLifecycles: Record<string, DispatchLifecycle>
-  discoverySweep: DiscoverySweepState
-}
-
-type WatchStateDocument = {
-  version: 3
-  workspaces: Record<string, PersistedWorkspaceState>
-}
+import type {
+  FactoryStateBackend,
+  PersistedWorkspaceState,
+  WatchStateDocument,
+  WatchStateDocumentStore,
+} from './document-store'
+import { emptyDiscoverySweepState, parseWatchStateDocument } from './watch-state-document'
 
 export type FileStateStoreOptions = InMemoryStateStoreOptions & {
   watchStatePath: string
+  /** Injectable for deterministic stale-process lease recovery tests. */
+  isProcessAlive?: (pid: number) => boolean
+}
+
+export type DocumentStateStoreOptions = InMemoryStateStoreOptions & {
+  backend: FactoryStateBackend
+  documentStore: WatchStateDocumentStore
   /** Injectable for deterministic stale-process lease recovery tests. */
   isProcessAlive?: (pid: number) => boolean
 }
@@ -63,17 +62,23 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
  * Mutations reload under an advisory lock so independent processes merge
  * updates instead of publishing divergent cached documents.
  */
-export class FileStateStore extends InMemoryStateStore {
-  readonly #watchStatePath: string
+export class DocumentStateStore extends InMemoryStateStore {
+  readonly backend: FactoryStateBackend
+  readonly #documentStore: WatchStateDocumentStore
   readonly #batchSize: number
   readonly #isProcessAlive: (pid: number) => boolean
   #operation: Promise<void> = Promise.resolve()
 
-  constructor(options: FileStateStoreOptions) {
+  constructor(options: DocumentStateStoreOptions) {
     super(options)
-    this.#watchStatePath = options.watchStatePath
+    this.backend = options.backend
+    this.#documentStore = options.documentStore
     this.#batchSize = options.batchSize
     this.#isProcessAlive = options.isProcessAlive ?? processIsAlive
+  }
+
+  async assertReady(): Promise<void> {
+    await this.#exclusive(async () => this.#documentStore.assertReady())
   }
 
   override async claimDiscoverySweep(
@@ -1040,16 +1045,54 @@ export class FileStateStore extends InMemoryStateStore {
   }
 
   async #loadFromDisk(): Promise<WatchStateDocument> {
+    return await this.#documentStore.read()
+  }
+
+  async #persist(document: WatchStateDocument): Promise<void> {
+    await this.#documentStore.write(document)
+  }
+
+  async #withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    return await this.#documentStore.runMutation(operation)
+  }
+
+  async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#operation.then(operation, operation)
+    this.#operation = result.then(() => undefined, () => undefined)
+    return await result
+  }
+}
+
+/** Node/file-backed state with the exact persistence and locking semantics used before the document seam. */
+export class FileStateStore extends DocumentStateStore {
+  constructor(options: FileStateStoreOptions) {
+    super({
+      backend: 'file',
+      batchSize: options.batchSize,
+      isProcessAlive: options.isProcessAlive,
+      documentStore: new FileWatchStateDocumentStore(options.watchStatePath),
+    })
+  }
+}
+
+class FileWatchStateDocumentStore implements WatchStateDocumentStore {
+  readonly #watchStatePath: string
+
+  constructor(watchStatePath: string) {
+    this.#watchStatePath = watchStatePath
+  }
+
+  async read(): Promise<WatchStateDocument> {
     try {
       const parsed = JSON.parse(await readFile(this.#watchStatePath, 'utf8')) as unknown
-      return parseDocument(parsed)
+      return parseWatchStateDocument(parsed)
     } catch (error) {
       if (!isMissingFileError(error)) throw error
       return { version: 3, workspaces: {} }
     }
   }
 
-  async #persist(document: WatchStateDocument): Promise<void> {
+  async write(document: WatchStateDocument): Promise<void> {
     const temporaryPath = `${this.#watchStatePath}.${process.pid}.${randomUUID()}.tmp`
     try {
       const handle = await open(temporaryPath, 'wx', 0o600)
@@ -1067,7 +1110,7 @@ export class FileStateStore extends InMemoryStateStore {
     }
   }
 
-  async #withMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  async runMutation<T>(operation: () => Promise<T>): Promise<T> {
     await mkdir(dirname(this.#watchStatePath), { recursive: true })
     const release = await lockfile.lock(this.#watchStatePath, {
       realpath: false,
@@ -1088,92 +1131,9 @@ export class FileStateStore extends InMemoryStateStore {
     }
   }
 
-  async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#operation.then(operation, operation)
-    this.#operation = result.then(() => undefined, () => undefined)
-    return await result
+  async assertReady(): Promise<void> {
+    await this.read()
   }
-}
-
-const parseDocument = (value: unknown): WatchStateDocument => {
-  if (!isRecord(value) || !isRecord(value.workspaces)) {
-    throw new Error('Factory GitHub watch state file is invalid')
-  }
-  if (value.version === 3) {
-    const workspaces: Record<string, PersistedWorkspaceState> = {}
-    for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
-      if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
-      const watches = rawWorkspace.githubIssueCommentWatches
-      const clarifications = rawWorkspace.waitingClarifications
-      const babysitters = rawWorkspace.babysitterSessions
-      const generations = rawWorkspace.babysitterGenerations
-      const conversations = rawWorkspace.conversationSessions
-      const lifecycles = rawWorkspace.dispatchLifecycles
-      const discoverySweep = rawWorkspace.discoverySweep
-      if (
-        !isRecord(watches) ||
-        !isRecord(clarifications) ||
-        (babysitters !== undefined && !isRecord(babysitters)) ||
-        (generations !== undefined && !isRecord(generations)) ||
-        (conversations !== undefined && !isRecord(conversations)) ||
-        (lifecycles !== undefined && !isRecord(lifecycles)) ||
-        (discoverySweep !== undefined && !isRecord(discoverySweep))
-      ) {
-        throw new Error('Factory GitHub watch state file is invalid')
-      }
-      workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
-        waitingClarifications: clarifications as Record<string, WaitingClarification>,
-        babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
-        babysitterGenerations: parseBabysitterGenerations(generations ?? {}),
-        conversationSessions: parseConversationSessions(conversations ?? {}),
-        dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
-        discoverySweep: parseDiscoverySweepState(discoverySweep),
-      }
-    }
-    return { version: 3, workspaces }
-  }
-  if (value.version === 2) {
-    const workspaces: Record<string, PersistedWorkspaceState> = {}
-    for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
-      if (!isRecord(rawWorkspace)) throw new Error('Factory GitHub watch state file is invalid')
-      const watches = rawWorkspace.githubIssueCommentWatches
-      const clarifications = rawWorkspace.waitingClarifications
-      const babysitters = rawWorkspace.babysitterSessions
-      if (!isRecord(watches) || !isRecord(clarifications) || (babysitters !== undefined && !isRecord(babysitters))) {
-        throw new Error('Factory GitHub watch state file is invalid')
-      }
-      workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
-        waitingClarifications: clarifications as Record<string, WaitingClarification>,
-        babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
-        babysitterGenerations: {},
-        conversationSessions: {},
-        dispatchLifecycles: {},
-        discoverySweep: emptyDiscoverySweepState(),
-      }
-    }
-    return { version: 3, workspaces }
-  }
-  if (value.version === 1) {
-    const workspaces: Record<string, PersistedWorkspaceState> = {}
-    for (const [workspaceId, watches] of Object.entries(value.workspaces)) {
-      if (!isRecord(watches)) {
-        throw new Error('Factory GitHub watch state file is invalid')
-      }
-      workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
-        waitingClarifications: {},
-        babysitterSessions: {},
-        babysitterGenerations: {},
-        conversationSessions: {},
-        dispatchLifecycles: {},
-        discoverySweep: emptyDiscoverySweepState(),
-      }
-    }
-    return { version: 3, workspaces }
-  }
-  throw new Error('Factory GitHub watch state file is invalid')
 }
 
 const cloneWatch = (watch: GithubIssueCommentWatchState): GithubIssueCommentWatchState =>
@@ -1227,33 +1187,6 @@ const processIsAlive = (pid: number): boolean => {
   }
 }
 
-const emptyDiscoverySweepState = (): DiscoverySweepState => ({
-  consecutiveOverloads: 0,
-  backoffUntilMs: 0,
-  lastEpoch: 0,
-})
-
-const parseDiscoverySweepState = (value: unknown): DiscoverySweepState => {
-  if (value === undefined) return emptyDiscoverySweepState()
-  if (!isRecord(value)) throw new Error('Factory GitHub watch state file is invalid')
-  const checkpoint = value.checkpoint
-  const lease = value.lease
-  const lastEpoch = value.lastEpoch ?? (isRecord(lease) ? lease.epoch : 0)
-  if (
-    !Number.isSafeInteger(value.consecutiveOverloads) || (value.consecutiveOverloads as number) < 0 ||
-    !Number.isSafeInteger(value.backoffUntilMs) ||
-    !Number.isSafeInteger(lastEpoch) || (lastEpoch as number) < 0 ||
-    (lease !== undefined && (!isRecord(lease) || typeof lease.owner !== 'string' ||
-      !Number.isSafeInteger(lease.epoch) || !Number.isSafeInteger(lease.leaseUntilMs))) ||
-    (checkpoint !== undefined && (!isRecord(checkpoint) || !isRecord(checkpoint.trees) ||
-      !Number.isSafeInteger(checkpoint.updatedAtMs) ||
-      (checkpoint.highWatermark !== undefined && typeof checkpoint.highWatermark !== 'string') ||
-      !Object.values(checkpoint.trees).every((paths) =>
-        Array.isArray(paths) && paths.every((path) => typeof path === 'string'))))
-  ) throw new Error('Factory GitHub watch state file is invalid')
-  return structuredClone({ ...value, lastEpoch }) as DiscoverySweepState
-}
-
 const CONVERSATION_HISTORY_LIMIT = 50
 
 const conversationHasMessage = (session: ConversationSessionState, id: string): boolean =>
@@ -1265,162 +1198,6 @@ const conversationHasMessage = (session: ConversationSessionState, id: string): 
 const compareConversationMessages = (left: ConversationMessage, right: ConversationMessage): number =>
   left.receivedAtMs - right.receivedAtMs ||
   (left.providerSequence ?? left.id).localeCompare(right.providerSequence ?? right.id, undefined, { numeric: true })
-
-const parseConversationSessions = (
-  value: Record<string, unknown>,
-): Record<string, ConversationSessionState> => {
-  const sessions: Record<string, ConversationSessionState> = {}
-  for (const [conversationId, candidate] of Object.entries(value)) {
-    if (!isRecord(candidate) || !isRecord(candidate.issue) || !isRecord(candidate.agent) || !isRecord(candidate.context)) {
-      throw new Error('Factory GitHub watch state file is invalid')
-    }
-    const issue = candidate.issue
-    const agent = candidate.agent
-    const delivery = candidate.delivery
-    if (
-      typeof issue.uuid !== 'string' || typeof issue.key !== 'string' || typeof issue.path !== 'string' ||
-      typeof candidate.provider !== 'string' || typeof candidate.externalId !== 'string' ||
-      !Object.values(candidate.context).every((value) => typeof value === 'string') ||
-      typeof agent.name !== 'string' || typeof agent.sessionRef !== 'string' ||
-      !validConversationMessages(candidate.history) || !validConversationMessages(candidate.pending) ||
-      (candidate.processedMessageIds !== undefined && !validConversationMessageIds(candidate.processedMessageIds)) ||
-      (delivery !== undefined && !validConversationDelivery(delivery) && !validLegacyConversationDelivery(delivery))
-    ) {
-      throw new Error('Factory GitHub watch state file is invalid')
-    }
-    const session = structuredClone(candidate) as unknown as ConversationSessionState
-    if (delivery !== undefined && validLegacyConversationDelivery(delivery)) {
-      session.pending = [...structuredClone(delivery.messages), ...session.pending]
-      delete session.delivery
-    }
-    session.processedMessageIds = candidate.processedMessageIds === undefined
-      ? [...new Set([
-          ...session.history,
-          ...session.pending,
-          ...(session.delivery?.messages ?? []),
-        ].map((message) => message.id))]
-      : [...candidate.processedMessageIds as string[]]
-    sessions[conversationId] = session
-  }
-  return sessions
-}
-
-const validConversationMessages = (value: unknown): value is ConversationMessage[] =>
-  Array.isArray(value) && value.every((message) => isRecord(message) &&
-    typeof message.id === 'string' && typeof message.text === 'string' &&
-    typeof message.receivedAtMs === 'number' &&
-    (message.providerSequence === undefined || typeof message.providerSequence === 'string') &&
-    (message.author === undefined || typeof message.author === 'string'))
-
-const validConversationDelivery = (value: unknown): boolean => isRecord(value) &&
-  typeof value.claimId === 'string' && typeof value.owner === 'string' &&
-  typeof value.claimedAtMs === 'number' && typeof value.attempts === 'number' &&
-  validConversationMessages(value.messages) && isRecord(value.agent) &&
-  typeof value.agent.name === 'string' && typeof value.agent.sessionRef === 'string'
-
-const validLegacyConversationDelivery = (value: unknown): value is {
-  owner: string
-  claimedAtMs: number
-  attempts: number
-  messages: ConversationMessage[]
-} => isRecord(value) && value.claimId === undefined && value.agent === undefined &&
-  typeof value.owner === 'string' && typeof value.claimedAtMs === 'number' &&
-  typeof value.attempts === 'number' && validConversationMessages(value.messages)
-
-const validConversationMessageIds = (value: unknown): value is string[] =>
-  Array.isArray(value) && value.every((id) => typeof id === 'string')
-
-const parseBabysitterSessions = (value: Record<string, unknown>): Record<string, BabysitterSessionState> => {
-  const sessions: Record<string, BabysitterSessionState> = {}
-  for (const [key, candidate] of Object.entries(value)) {
-    if (!isRecord(candidate) || !isRecord(candidate.issue)) {
-      throw new Error('Factory GitHub watch state file is invalid')
-    }
-    const issue = candidate.issue
-    if (
-      typeof issue.uuid !== 'string' ||
-      typeof issue.key !== 'string' ||
-      typeof issue.path !== 'string' ||
-      typeof candidate.repo !== 'string' ||
-      !Number.isSafeInteger(candidate.prNumber) ||
-      (candidate.prNumber as number) < 1 ||
-      typeof candidate.agentName !== 'string' ||
-      (candidate.path !== undefined && typeof candidate.path !== 'string') ||
-      typeof candidate.critical !== 'boolean' ||
-      !Array.isArray(candidate.pendingKinds) ||
-      !candidate.pendingKinds.every((kind) => typeof kind === 'string') ||
-      (candidate.pendingDeliveryClaims !== undefined && (
-        !Array.isArray(candidate.pendingDeliveryClaims) ||
-        !candidate.pendingDeliveryClaims.every((claim) =>
-          isRecord(claim) && typeof claim.deliveryId === 'string' && typeof claim.claimToken === 'string'
-        )
-      )) ||
-      (candidate.resourceSubscription !== undefined && (
-        !isRecord(candidate.resourceSubscription) ||
-        typeof candidate.resourceSubscription.subscriptionId !== 'string' ||
-        typeof candidate.resourceSubscription.provider !== 'string' ||
-        typeof candidate.resourceSubscription.resourceRef !== 'string' ||
-        typeof candidate.resourceSubscription.subscriberId !== 'string' ||
-        typeof candidate.resourceSubscription.ownerId !== 'string' ||
-        typeof candidate.resourceSubscription.expiresAt !== 'string' ||
-        (candidate.resourceSubscription.terminal !== undefined && typeof candidate.resourceSubscription.terminal !== 'boolean')
-      ))
-    ) {
-      throw new Error('Factory GitHub watch state file is invalid')
-    }
-    sessions[key] = {
-      issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
-      repo: candidate.repo,
-      prNumber: candidate.prNumber as number,
-      agentName: candidate.agentName,
-      ...(candidate.path === undefined ? {} : { path: candidate.path }),
-      critical: candidate.critical,
-      pendingKinds: [...candidate.pendingKinds] as string[],
-      ...(candidate.resourceSubscription === undefined ? {} : {
-        resourceSubscription: {
-          subscriptionId: candidate.resourceSubscription.subscriptionId as string,
-          provider: candidate.resourceSubscription.provider as string,
-          resourceRef: candidate.resourceSubscription.resourceRef as string,
-          subscriberId: candidate.resourceSubscription.subscriberId as string,
-          ownerId: candidate.resourceSubscription.ownerId as string,
-          expiresAt: candidate.resourceSubscription.expiresAt as string,
-          ...(candidate.resourceSubscription.terminal === undefined ? {} : { terminal: candidate.resourceSubscription.terminal as boolean }),
-        },
-      }),
-      ...(candidate.pendingDeliveryClaims === undefined ? {} : {
-        pendingDeliveryClaims: (candidate.pendingDeliveryClaims as Array<Record<string, unknown>>).map((claim) => ({
-          deliveryId: claim.deliveryId as string,
-          claimToken: claim.claimToken as string,
-        })),
-      }),
-    }
-  }
-  return sessions
-}
-
-const parseBabysitterGenerations = (
-  value: Record<string, unknown>,
-): Record<string, BabysitterGenerationRecord> => {
-  const generations: Record<string, BabysitterGenerationRecord> = {}
-  for (const [key, candidate] of Object.entries(value)) {
-    if (
-      !isRecord(candidate) ||
-      typeof candidate.generationId !== 'string' ||
-      typeof candidate.agentName !== 'string' ||
-      !Number.isSafeInteger(candidate.claimedAtMs) ||
-      !Number.isSafeInteger(candidate.leaseUntilMs) ||
-      (candidate.phase !== 'claimed' && candidate.phase !== 'completed')
-    ) throw new Error('Factory GitHub watch state file is invalid')
-    generations[key] = {
-      generationId: candidate.generationId,
-      agentName: candidate.agentName,
-      claimedAtMs: candidate.claimedAtMs as number,
-      leaseUntilMs: candidate.leaseUntilMs as number,
-      phase: candidate.phase,
-    }
-  }
-  return generations
-}
 
 const cloneLifecycle = (record: DispatchLifecycle): DispatchLifecycle => structuredClone(record)
 

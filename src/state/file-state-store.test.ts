@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -9,6 +9,39 @@ import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
 
 describe('FileStateStore', () => {
+  it('preserves the exact pretty-JSON bytes and private mode of the file backend', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-format-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      await store.claimDiscoverySweep('workspace-1', 'owner-a', 1_000, 5_000)
+      const expected = {
+        version: 3,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            babysitterSessions: {},
+            babysitterGenerations: {},
+            conversationSessions: {},
+            dispatchLifecycles: {},
+            discoverySweep: {
+              consecutiveOverloads: 0,
+              backoffUntilMs: 0,
+              lastEpoch: 1,
+              lease: { owner: 'owner-a', epoch: 1, leaseUntilMs: 6_000 },
+            },
+          },
+        },
+      }
+
+      expect(await readFile(watchStatePath, 'utf8')).toBe(`${JSON.stringify(expected, null, 2)}\n`)
+      expect((await stat(watchStatePath)).mode & 0o777).toBe(0o600)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists discovery checkpoints, overload backoff, and cross-process sweep fencing', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-discovery-state-'))
     try {
