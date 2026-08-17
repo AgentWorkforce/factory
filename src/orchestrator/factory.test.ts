@@ -104,12 +104,13 @@ describe('fleet control-plane admission', () => {
     }
   })
 
-  it('gates a direct dispatch at mutation admission instead of bypassing the probe', async () => {
+  it('gates a direct dispatch before it consumes an attempt or reaches mutation admission', async () => {
     vi.useRealTimers()
     const path = issuePath(992)
     const file = issueFile(992)
     const mount = new FakeMountClient({ [path]: file })
     const fleet = new StalledRosterFleet()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const factory = createFactory(config({
       fleetHealth: {
         rosterTimeoutMs: 100,
@@ -117,19 +118,41 @@ describe('fleet control-plane admission', () => {
         resetTimeoutMs: 60_000,
         requireDedicatedBroker: false,
       },
-    }), { mount, fleet, triage: new StaticTriage(), logger: {} })
+    }), { mount, fleet, stateStore, triage: new StaticTriage(), logger: {} })
     const decision = await factory.triageIssue(parseLinearIssue(path, file))
 
-    await expect(factory.dispatch(decision)).rejects.toMatchObject({
-      cause: {
-        name: 'FleetControlPlaneCircuitOpenError',
-        code: 'FACTORY_FLEET_CONTROL_CIRCUIT_OPEN',
-      },
-    })
+    await expect(factory.dispatch(decision)).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
 
     expect(fleet.rosterCalls).toBe(1)
     expect(fleet.spawns).toEqual([])
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey(decision.issue))).resolves.toBeUndefined()
     expect(factory.status().fleetControlPlane.state).toBe('open')
+  })
+
+  it('logs only the sanitized circuit error when roster admission fails', async () => {
+    class RejectingRosterFleet extends FakeFleetClient {
+      override async roster(): Promise<never> {
+        throw Object.assign(new Error('https://broker.invalid?token=must-not-leak'), { code: 'ECONNREFUSED' })
+      }
+    }
+    const error = vi.fn()
+    const factory = createFactory(config({ fleetHealth: { failureThreshold: 1 } }), {
+      mount: new FakeMountClient(),
+      fleet: new RejectingRosterFleet(),
+      triage: new StaticTriage(),
+      logger: { error },
+    })
+
+    await expect(factory.runOnce()).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
+    expect(error).toHaveBeenCalledWith(
+      '[factory] fleet control plane unavailable; dispatch paused',
+      expect.objectContaining({ error: 'Error (ECONNREFUSED)' }),
+    )
+    expect(JSON.stringify(error.mock.calls)).not.toContain('must-not-leak')
   })
 
   it('rejects a bounded loop when the circuit opens and persists the paused state in its heartbeat', async () => {
@@ -213,10 +236,11 @@ const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 const planning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
 
-type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'dispatch' | 'loop' | 'safety'> & {
+type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'dispatch' | 'loop' | 'safety' | 'fleetHealth'> & {
   dispatch?: Partial<FactoryConfig['dispatch']>
   loop?: Partial<FactoryConfig['loop']>
   safety?: Partial<FactoryConfig['safety']>
+  fleetHealth?: Partial<FactoryConfig['fleetHealth']>
 }
 
 const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => FactoryConfigSchema.parse({

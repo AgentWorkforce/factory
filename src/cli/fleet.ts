@@ -1652,10 +1652,14 @@ export function resolveFactoryBrokerConnectionPath(
     ...env,
     AGENT_RELAY_STATE_DIR: '',
   })
-  const projectStateDir = inheritedConnectionPath
-    ? dirname(inheritedConnectionPath)
-    : join(resolve(startCwd), '.agentworkforce', 'relay')
-  if (sameFilesystemPath(explicitStateDir, projectStateDir)) {
+  // Always reject the checkout-local path, even if broker discovery currently
+  // walks past it and finds an ancestor connection. An interactive relay
+  // started in this checkout can claim the local path later.
+  const sharedStateDirs = [
+    join(resolve(startCwd), '.agentworkforce', 'relay'),
+    ...(inheritedConnectionPath ? [dirname(inheritedConnectionPath)] : []),
+  ]
+  if (sharedStateDirs.some((stateDir) => sameFilesystemPath(explicitStateDir, stateDir))) {
     throw new Error(
       'AGENT_RELAY_STATE_DIR resolves to the project broker; choose a separate state directory for Factory',
     )

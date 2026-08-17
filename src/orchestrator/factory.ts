@@ -2141,24 +2141,28 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #assertFleetControlPlaneAvailable(): Promise<void> {
+    try {
+      await this.#fleet.roster()
+      this.#increment('fleetControlPlaneProbeSuccesses')
+    } catch (error) {
+      const health = this.#fleetControlPlane.status()
+      this.#increment('fleetControlPlaneProbeFailures')
+      if (health.state === 'open') this.#increment('fleetControlPlaneCircuitOpen')
+      this.#logger.error?.('[factory] fleet control plane unavailable; dispatch paused', {
+        state: health.state,
+        consecutiveFailures: health.consecutiveFailures,
+        retryAtMs: health.retryAtMs,
+        error: health.lastError ?? 'unknown control-plane failure',
+      })
+      throw contextualError('Factory dispatch paused because the fleet control plane is unavailable', error)
+    }
+  }
+
   async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
     const sweepStartedAtMs = this.#clock.now()
     if (!(opts.dryRun ?? this.#config.dryRun)) {
-      try {
-        await this.#fleet.roster()
-        this.#increment('fleetControlPlaneProbeSuccesses')
-      } catch (error) {
-        const health = this.#fleetControlPlane.status()
-        this.#increment('fleetControlPlaneProbeFailures')
-        if (health.state === 'open') this.#increment('fleetControlPlaneCircuitOpen')
-        this.#logger.error?.('[factory] fleet control plane unavailable; dispatch paused', {
-          state: health.state,
-          consecutiveFailures: health.consecutiveFailures,
-          retryAtMs: health.retryAtMs,
-          error: describeError(error).errorMessage,
-        })
-        throw contextualError('Factory dispatch paused because the fleet control plane is unavailable', error)
-      }
+      await this.#assertFleetControlPlaneAvailable()
     }
     let claim = await this.#state.claimDiscoverySweep(
       this.#workspaceId,
@@ -3669,6 +3673,12 @@ export class FactoryLoop implements Factory {
       }
     }
     this.#clearDependencyPark(batch, dispatchDecision.issue)
+    // Event-driven and direct dispatches do not necessarily pass through issue
+    // discovery. Admit them before creating previews, claiming a lifecycle, or
+    // consuming a dispatch attempt. The mutation proxy probes again at the
+    // actual spawn/resume boundary so a later control-plane fault still fails
+    // closed.
+    if (!dryRun) await this.#assertFleetControlPlaneAvailable()
     const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
     // ones. Without it, every worker starts in the configured shared checkout

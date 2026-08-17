@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -543,6 +543,40 @@ describe('fleet CLI parsing', () => {
       const projectStateDir = join(root, '.agentworkforce', 'relay')
       expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
         .toThrow(/resolves to the project broker/u)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects the project relay path even when broker discovery finds an ancestor first', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-ancestor-dedicated-broker-'))
+    try {
+      const project = join(root, 'project')
+      const projectStateDir = join(project, '.agentworkforce', 'relay')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(project, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(() => resolveFactoryBrokerConnectionPath(project, {
+        AGENT_RELAY_STATE_DIR: projectStateDir,
+      }, true)).toThrow(/resolves to the project broker/u)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlink that resolves to the shared project relay path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-symlink-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      const stateAlias = join(root, 'relay-alias')
+      await mkdir(projectStateDir, { recursive: true })
+      await symlink(projectStateDir, stateAlias, 'dir')
+
+      expect(() => resolveFactoryBrokerConnectionPath(root, {
+        AGENT_RELAY_STATE_DIR: stateAlias,
+      }, true)).toThrow(/resolves to the project broker/u)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
