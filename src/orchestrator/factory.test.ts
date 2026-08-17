@@ -9342,7 +9342,9 @@ describe('FactoryLoop', () => {
     const fleet = new RemoteLifecycleFleetClient()
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
     const factory = createFactory(config({
-      dispatch: { agentHoldTimeoutMs: 100 },
+      // Leave enough headroom for the durable dispatch writes themselves;
+      // this assertion is about the hold transition, not filesystem speed.
+      dispatch: { agentHoldTimeoutMs: 1_000 },
       loop: {
         heartbeatPath: join(root, 'heartbeat.json'),
         registryPath: join(root, 'registry.json'),
@@ -9378,10 +9380,10 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(fleet.releases).toEqual([
         { name: 'ar-252-impl-pear', reason: 'held-past-deadline' },
         { name: 'ar-252-review', reason: 'held-past-deadline' },
-      ]), { timeout: 2_000 })
+      ]), { timeout: 4_000 })
       await vi.waitFor(async () => expect(
         await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
-      ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 2_000 })
+      ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 4_000 })
       expect(factory.status().heldAgents).toEqual([])
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
         '[factory] released agents held past deadline',
@@ -9391,7 +9393,7 @@ describe('FactoryLoop', () => {
           reason: 'held-past-deadline',
           waitingForTerminalState: 'human-review',
         }),
-      ), { timeout: 2_000 })
+      ), { timeout: 4_000 })
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
@@ -12500,7 +12502,7 @@ describe('FactoryLoop', () => {
         .toMatchObject({ phase: 'abandoned' })
       expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
         .toMatchObject({ phase: 'running' })
-    })
+    }, { timeout: 4_000 })
 
     expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-804-impl-pear')).toHaveLength(2)
     expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-805-impl-pear')
