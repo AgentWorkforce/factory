@@ -14264,6 +14264,10 @@ export class FactoryLoop implements Factory {
       await this.#state.setSlackThread(this.#workspaceId, key, watch.threadId)
       const watchRecord = escalationWatchRecord(watch.decision)
       if (watch.kind === 'terminal-grace') {
+        const retiredAtMs = terminalSlackWatchRetiredAtMs(watch)
+        if (watch.retiredAtMs !== retiredAtMs) {
+          await this.#state.setSlackThreadWatch(this.#workspaceId, key, { ...watch, retiredAtMs })
+        }
         this.#terminalSlackWatchIssues.add(key)
         const conversationId = slackConversationId(watch.threadId)
         await this.#slackConversationTurns.cancel(conversationId)
@@ -14271,7 +14275,7 @@ export class FactoryLoop implements Factory {
         await this.#state.clearConversationSession(this.#workspaceId, conversationId)
         await this.#rearmSlackWatcher(watchRecord, watch.threadId, {
           replayConversationReplies: true,
-          replayAfterMs: watch.retiredAtMs,
+          replayAfterMs: retiredAtMs,
         })
         this.#scheduleSlackTerminalWatchExpiry(watch.issue, watch.expiresAtMs)
         continue
@@ -14478,7 +14482,7 @@ export class FactoryLoop implements Factory {
     const existingWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
       .find(([watchKey]) => watchKey === key)?.[1]
     const retiredAtMs = existingWatch?.kind === 'terminal-grace'
-      ? existingWatch.retiredAtMs
+      ? terminalSlackWatchRetiredAtMs(existingWatch)
       : this.#clock.now()
     const expiresAtMs = existingWatch?.kind === 'terminal-grace'
       ? existingWatch.expiresAtMs
@@ -18067,6 +18071,11 @@ const slackMessageReceivedAtMs = (messageTs: string, fallback: number): number =
   const seconds = Number(messageTs)
   return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds * 1_000) : fallback
 }
+
+const terminalSlackWatchRetiredAtMs = (watch: { retiredAtMs?: number; expiresAtMs: number }): number =>
+  typeof watch.retiredAtMs === 'number' && Number.isFinite(watch.retiredAtMs)
+    ? watch.retiredAtMs
+    : Math.max(0, watch.expiresAtMs - SLACK_TERMINAL_THREAD_GRACE_MS)
 
 const eventIdentity = (event: ChangeEvent): string | undefined => {
   const record = event as unknown as Record<string, unknown>

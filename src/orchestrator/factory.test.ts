@@ -19428,9 +19428,12 @@ describe('FactoryLoop PR babysitter', () => {
       await expectSlackConversationResume(firstFleet, ['This reply was already routed before completion.'])
       firstFleet.emitAgentExit('ar-407-impl-pear', 'issue-done')
       await vi.waitFor(() => expect(first.status().inFlight).toEqual([]))
-      await vi.waitFor(async () => expect(
-        (await state().listSlackThreadWatches('factory-test'))[0]?.[1],
-      ).toMatchObject({ kind: 'terminal-grace', threadId: mount.threadTs }))
+      await vi.waitFor(async () => expect((await state().listSlackThreadWatches('factory-test'))[0]?.[1])
+        .toMatchObject({ kind: 'terminal-grace', threadId: mount.threadTs, retiredAtMs: 10_000 }))
+      const [[watchKey, terminalWatch]] = await state().listSlackThreadWatches('factory-test')
+      if (terminalWatch?.kind !== 'terminal-grace') throw new Error('expected terminal Slack watch')
+      const { retiredAtMs: _legacyMissingWatermark, ...legacyTerminalWatch } = terminalWatch
+      await state().setSlackThreadWatch('factory-test', watchKey, legacyTerminalWatch)
       await first.stop()
 
       emitSlackReply(mount, slackReplyFixturePath(
@@ -19459,6 +19462,8 @@ describe('FactoryLoop PR babysitter', () => {
       expect(slackConversationResumes(restartedFleet)).toEqual([])
       expect(restarted.status().counters.slackAnswersUnroutableVisible).toBe(1)
       expect(restarted.status().counters.slackWatchersRearmed).toBe(1)
+      expect((await state().listSlackThreadWatches('factory-test'))[0]?.[1])
+        .toMatchObject({ kind: 'terminal-grace', retiredAtMs: 10_000 })
       expect(slackReplyWrites(mount).filter((write) =>
         write.content.text?.includes('no longer has an active agent'))).toHaveLength(1)
     } finally {
