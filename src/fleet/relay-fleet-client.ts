@@ -23,6 +23,8 @@ export interface TrackedAgent {
   node?: string
   spawnedAtMs: number
   nodeOfflineSinceMs?: number
+  /** A rejected spawn whose compensating release must be retried. */
+  pendingReleaseReason?: string
 }
 
 export interface RelayClientLike {
@@ -115,6 +117,7 @@ export class RelayFleetClient implements FleetClient {
   #disposed = false
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
+  #pendingReleaseRetry: Promise<void> | undefined
 
   constructor(options: RelayFleetClientOptions = {}) {
     this.#options = options
@@ -187,8 +190,34 @@ export class RelayFleetClient implements FleetClient {
     })
     const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
-    this.#track(result.name, ack)
-    return result
+    let acknowledgedNode: string
+    try {
+      acknowledgedNode = assertNamedRemotePlacement(result, ack.placement?.node)
+    } catch (error) {
+      // A completed placement invocation has already launched the worker. If
+      // Relay cannot prove that it ran on a named remote node, tear that worker
+      // down before refusing the result so a rejected spawn cannot keep acting
+      // outside Factory's lifecycle tracking.
+      try {
+        await this.release(result.name, 'unverified-placement')
+      } catch (releaseError) {
+        // Do not forget a live worker merely because its compensating release
+        // failed. Retain it outside the accepted placement result and let the
+        // reconciliation loop retry the idempotent release until Relay
+        // confirms cleanup (or roster evidence proves the worker exited).
+        this.#track(result.name, {
+          invocationId: ack.invocationId,
+          pendingReleaseReason: 'unverified-placement',
+        })
+        this.#log(
+          `Failed to release ${result.name} after unverified Relay placement: ${errorMessage(releaseError)}`,
+        )
+      }
+      throw error
+    }
+    const trustedResult = { ...result, node: acknowledgedNode }
+    this.#track(trustedResult.name, { invocationId: ack.invocationId, node: acknowledgedNode })
+    return trustedResult
   }
 
   async resume(input: {
@@ -216,17 +245,14 @@ export class RelayFleetClient implements FleetClient {
 
   async release(name: string, reason?: string): Promise<void> {
     const messaging = await this.#ensureMessaging()
-    try {
-      const ack = await messaging.commands.invoke('release', {
-        name,
-        agent: name,
-        ...(reason ? { reason } : {}),
-      })
-      await this.#awaitInvocation(ack.actionName || 'release', ack)
-    } finally {
-      this.#tracked.delete(name)
-      this.#syncExitWatcher()
-    }
+    const ack = await messaging.commands.invoke('release', {
+      name,
+      agent: name,
+      ...(reason ? { reason } : {}),
+    })
+    await this.#awaitInvocation(ack.actionName || 'release', ack)
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
@@ -405,6 +431,25 @@ export class RelayFleetClient implements FleetClient {
 
   async dispose(): Promise<void> {
     if (this.#disposed) return
+
+    // A rejected placement may already have launched a worker. If its first
+    // compensating release failed, disposal must not erase the only ownership
+    // record before giving cleanup one final synchronous retry. Refuse to
+    // dispose while any such release remains unconfirmed; callers then get a
+    // hard failure containing the deterministic worker name instead of a
+    // successful shutdown that silently strands it.
+    if ([...this.#tracked.values()].some((agent) => agent.pendingReleaseReason)) {
+      await this.#retryPendingReleases()
+      const pendingNames = [...this.#tracked]
+        .filter(([, agent]) => agent.pendingReleaseReason)
+        .map(([name]) => name)
+      if (pendingNames.length > 0) {
+        throw new Error(
+          `Refusing to dispose Relay fleet client with unconfirmed worker cleanup: ${pendingNames.join(', ')}`,
+        )
+      }
+    }
+
     this.#disposed = true
     if (this.#watchTimer) {
       clearInterval(this.#watchTimer)
@@ -523,17 +568,27 @@ export class RelayFleetClient implements FleetClient {
     return invocation
   }
 
-  #track(name: string, ack: { invocationId: string; dispatchedNodeId?: string | null; placement?: { node?: string } }): void {
+  #track(name: string, placement: {
+    invocationId: string
+    node?: string
+    pendingReleaseReason?: string
+  }): void {
     this.#tracked.set(name, {
-      invocationId: ack.invocationId,
-      node: ack.placement?.node ?? ack.dispatchedNodeId ?? undefined,
+      invocationId: placement.invocationId,
+      ...(placement.node ? { node: placement.node } : {}),
+      ...(placement.pendingReleaseReason
+        ? { pendingReleaseReason: placement.pendingReleaseReason }
+        : {}),
       spawnedAtMs: this.#now(),
     })
     this.#syncExitWatcher()
   }
 
   #syncExitWatcher(): void {
-    const shouldRun = !this.#disposed && this.#tracked.size > 0 && this.#agentExitListeners.size > 0
+    const hasPendingRelease = [...this.#tracked.values()].some((agent) => agent.pendingReleaseReason)
+    const shouldRun = !this.#disposed && this.#tracked.size > 0 && (
+      this.#agentExitListeners.size > 0 || hasPendingRelease
+    )
     if (shouldRun && !this.#watchTimer) {
       this.#watchTimer = setInterval(() => {
         void this.reconcileTrackedAgents().catch((error) => {
@@ -549,6 +604,12 @@ export class RelayFleetClient implements FleetClient {
 
   async #reconcileTracked(): Promise<void> {
     if (this.#tracked.size === 0) return
+    // Cleanup is more important than roster metadata and does not depend on
+    // it. Retry rejected-placement releases first so a presence/node outage
+    // cannot prevent the compensating action.
+    await this.#retryPendingReleases()
+    if (this.#tracked.size === 0) return
+
     const messaging = await this.#ensureMessaging()
     const [presence, nodes] = await Promise.all([
       messaging.agents.presence(),
@@ -576,6 +637,24 @@ export class RelayFleetClient implements FleetClient {
         }
       } else {
         entry.nodeOfflineSinceMs = undefined
+      }
+    }
+  }
+
+  #retryPendingReleases(): Promise<void> {
+    this.#pendingReleaseRetry ??= this.#runPendingReleaseRetries().finally(() => {
+      this.#pendingReleaseRetry = undefined
+    })
+    return this.#pendingReleaseRetry
+  }
+
+  async #runPendingReleaseRetries(): Promise<void> {
+    for (const [name, entry] of [...this.#tracked]) {
+      if (!entry.pendingReleaseReason) continue
+      try {
+        await this.release(name, entry.pendingReleaseReason)
+      } catch (error) {
+        this.#log(`Pending release retry failed for ${name}: ${errorMessage(error)}`)
       }
     }
   }
@@ -805,6 +884,20 @@ function spawnResultFromInvocation(
     ...(node ? { node } : {}),
     locality: 'remote',
   }
+}
+
+function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): string {
+  // The placement acknowledgement is authoritative. Action output may name
+  // the node executing the spawn handler even when Relay acknowledged `self`,
+  // so accepting the synthesized SpawnResult would let self-placement pass.
+  const node = acknowledgedNode?.trim()
+  if (!node || node === 'self') {
+    throw new Error(
+      `Relay placement did not prove a named remote node for ${result.name}; ` +
+      `refusing to accept the spawn result`,
+    )
+  }
+  return node
 }
 
 function lifecycleSignalFromInvocation(
