@@ -459,6 +459,58 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().size).toBe(0)
   })
 
+  it('shares a pending release retry between reconciliation and disposal', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl' },
+    }])
+    messaging.invocations.set('inv-1', [{
+      invocationId: 'inv-1',
+      actionName: 'release',
+      status: 'failed',
+      error: 'temporary cleanup failure',
+    }])
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    let unblockRelease!: () => void
+    const releaseBlocked = new Promise<void>((resolve) => {
+      unblockRelease = resolve
+    })
+    const invoke = messaging.commands.invoke.bind(messaging.commands)
+    vi.spyOn(messaging.commands, 'invoke').mockImplementation(async (name, input) => {
+      if (name !== 'release') return await invoke(name, input)
+      messaging.invokes.push({ name, input })
+      await releaseBlocked
+      return { invocationId: 'shared-release', actionName: name, status: 'completed' }
+    })
+
+    const reconciliation = fleet.reconcileTrackedAgents()
+    await flush()
+    const disposal = fleet.dispose()
+    await flush()
+
+    expect(messaging.invokes.filter((candidate) => candidate.name === 'release')).toHaveLength(2)
+    unblockRelease()
+    await expect(Promise.all([reconciliation, disposal])).resolves.toEqual([undefined, undefined])
+    expect(messaging.invokes.filter((candidate) => candidate.name === 'release')).toHaveLength(2)
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
   it('retries pending cleanup during disposal without depending on roster health', async () => {
     const messaging = new FakeMessaging()
     messaging.placementAck = {

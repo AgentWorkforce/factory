@@ -117,6 +117,7 @@ export class RelayFleetClient implements FleetClient {
   #disposed = false
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
+  #pendingReleaseRetry: Promise<void> | undefined
 
   constructor(options: RelayFleetClientOptions = {}) {
     this.#options = options
@@ -640,7 +641,14 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
-  async #retryPendingReleases(): Promise<void> {
+  #retryPendingReleases(): Promise<void> {
+    this.#pendingReleaseRetry ??= this.#runPendingReleaseRetries().finally(() => {
+      this.#pendingReleaseRetry = undefined
+    })
+    return this.#pendingReleaseRetry
+  }
+
+  async #runPendingReleaseRetries(): Promise<void> {
     for (const [name, entry] of [...this.#tracked]) {
       if (!entry.pendingReleaseReason) continue
       try {
