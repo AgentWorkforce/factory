@@ -516,6 +516,110 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('persists an unowned Slack turn, fences its visible receipt, and delivers after owner rebind', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-unowned-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const conversationId = 'slack:1780751612.176220'
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.reserveConversationSession('workspace-1', conversationId, {
+        provider: 'slack',
+        issue: { uuid: 'uuid-131', key: 'AR-131', path: '/linear/issues/AR-131__uuid-131.json' },
+        externalId: '1780751612.176220',
+        context: { channelDir: 'C0FACTORY__factory-e2e' },
+        history: [],
+        processedMessageIds: [],
+        acknowledgedMessageIds: [],
+        acknowledgementClaims: {},
+        pending: [],
+      })
+      await first.appendConversationMessage('workspace-1', conversationId, {
+        id: 'message-1', text: 'Keep the complete long instruction.', receivedAtMs: 1_000,
+      })
+      expect(await first.claimConversationTurn(
+        'workspace-1', conversationId, 'turn-owner', 'turn-claim', 1_001, 60_000,
+      )).toBeUndefined()
+
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restarted.claimConversationMessageAcknowledgement(
+        'workspace-1', conversationId, 'message-1', 'ack-a', 1_002, 60_000,
+      )).toBe(true)
+      expect(await first.claimConversationMessageAcknowledgement(
+        'workspace-1', conversationId, 'message-1', 'ack-b', 1_003, 60_000,
+      )).toBe(false)
+      await restarted.releaseConversationMessageAcknowledgement('workspace-1', conversationId, 'message-1', 'ack-a')
+      expect(await first.claimConversationMessageAcknowledgement(
+        'workspace-1', conversationId, 'message-1', 'ack-b', 1_004, 60_000,
+      )).toBe(true)
+      expect(await first.completeConversationMessageAcknowledgement(
+        'workspace-1', conversationId, 'message-1', 'ack-b',
+      )).toBe(true)
+      await restarted.rebindConversationSession('workspace-1', conversationId, {
+        name: 'ar-131-babysit-factory', sessionRef: 'session-babysitter', role: 'babysitter',
+      })
+
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath }).claimConversationTurn(
+        'workspace-1', conversationId, 'turn-owner', 'turn-claim', 1_005, 60_000,
+      )).toMatchObject({
+        agent: { name: 'ar-131-babysit-factory', sessionRef: 'session-babysitter' },
+        acknowledgedMessageIds: ['message-1'],
+        delivery: { messages: [{ id: 'message-1', text: 'Keep the complete long instruction.' }] },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('persists and clears the compact pre-dispatch Slack triage watch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-watch-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const lifecycle = dispatchLifecycle(132)
+      const watch = {
+        kind: 'triage' as const,
+        issue: lifecycle.issue,
+        decision: lifecycle.decision,
+        threadId: '1780751612.176221',
+      }
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.setSlackThreadWatch('workspace-1', 'AR-132:uuid-132', watch)
+
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await restarted.listSlackThreadWatches('workspace-1')).toEqual([
+        ['AR-132:uuid-132', watch],
+      ])
+      await restarted.clearSlackThreadWatch('workspace-1', 'AR-132:uuid-132')
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath })
+        .listSlackThreadWatches('workspace-1')).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('persists the bounded terminal Slack watch used for restart replay', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-terminal-slack-watch-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const lifecycle = dispatchLifecycle(133)
+      const watch = {
+        kind: 'terminal-grace' as const,
+        issue: lifecycle.issue,
+        decision: lifecycle.decision,
+        threadId: '1780751612.176222',
+        expiresAtMs: 86_401_000,
+      }
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      await first.setSlackThreadWatch('workspace-1', 'AR-133:uuid-133', watch)
+
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath })
+        .listSlackThreadWatches('workspace-1')).toEqual([
+        ['AR-133:uuid-133', watch],
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('fences stale claim completion and preserves a conversation owner rebound during resume', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-fencing-'))
     try {

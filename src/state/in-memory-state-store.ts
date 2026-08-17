@@ -12,6 +12,7 @@ import type {
   DispatchAttemptState,
   GithubIssueCommentWatchState,
   RegistryHandoffAgent,
+  SlackThreadWatchState,
   ConversationMessage,
   ConversationSessionState,
   DiscoveryCheckpoint,
@@ -29,6 +30,7 @@ type WorkspaceState = {
   criticalMessages: Map<string, CriticalRecord>
   resumedExitKeys: Set<string>
   slackThreadIds: Map<string, string>
+  slackThreadWatches: Map<string, SlackThreadWatchState>
   conversationSessions: Map<string, ConversationSessionState>
   githubIssueCommentWatches: Map<string, GithubIssueCommentWatchState>
   seenAgentQuestionKeys: Set<string>
@@ -334,6 +336,19 @@ export class InMemoryStateStore implements StateStore {
     this.#workspace(workspaceId).slackThreadIds.clear()
   }
 
+  async setSlackThreadWatch(workspaceId: string, issueKey: string, watch: SlackThreadWatchState): Promise<void> {
+    this.#workspace(workspaceId).slackThreadWatches.set(issueKey, structuredClone(watch))
+  }
+
+  async listSlackThreadWatches(workspaceId: string): Promise<Array<[string, SlackThreadWatchState]>> {
+    return [...this.#workspace(workspaceId).slackThreadWatches]
+      .map(([key, watch]) => [key, structuredClone(watch)])
+  }
+
+  async clearSlackThreadWatch(workspaceId: string, issueKey: string): Promise<void> {
+    this.#workspace(workspaceId).slackThreadWatches.delete(issueKey)
+  }
+
   async reserveConversationSession(
     workspaceId: string,
     conversationId: string,
@@ -372,6 +387,50 @@ export class InMemoryStateStore implements StateStore {
     return cloneConversationSession(session)
   }
 
+  async claimConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session || !conversationHasMessage(session, messageId)) return false
+    if ((session.acknowledgedMessageIds ?? []).includes(messageId)) return false
+    session.acknowledgementClaims ??= {}
+    const current = session.acknowledgementClaims[messageId]
+    if (current && current.claimedAtMs + leaseMs > nowMs) return false
+    session.acknowledgementClaims[messageId] = { claimId, claimedAtMs: nowMs }
+    return true
+  }
+
+  async completeConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (session?.acknowledgementClaims?.[messageId]?.claimId !== claimId) return false
+    session.acknowledgedMessageIds ??= []
+    if (!session.acknowledgedMessageIds.includes(messageId)) session.acknowledgedMessageIds.push(messageId)
+    delete session.acknowledgementClaims[messageId]
+    return true
+  }
+
+  async releaseConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+  ): Promise<void> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (session?.acknowledgementClaims?.[messageId]?.claimId === claimId) {
+      delete session.acknowledgementClaims[messageId]
+    }
+  }
+
   async claimConversationTurn(
     workspaceId: string,
     conversationId: string,
@@ -389,10 +448,11 @@ export class InMemoryStateStore implements StateStore {
       session.pending.unshift(...session.delivery.messages)
     }
     session.pending.sort(compareConversationMessages)
-    if (session.pending.length === 0) {
+    if (!session.agent || session.pending.length === 0) {
       session.delivery = undefined
       return undefined
     }
+    const agent = session.agent
     session.delivery = {
       claimId,
       owner,
@@ -400,8 +460,8 @@ export class InMemoryStateStore implements StateStore {
       attempts: (session.delivery?.attempts ?? 0) + 1,
       messages: session.pending.splice(0),
       agent: {
-        name: session.agent.name,
-        sessionRef: session.agent.sessionRef,
+        name: agent.name,
+        sessionRef: agent.sessionRef,
       },
     }
     return cloneConversationSession(session)
@@ -431,6 +491,7 @@ export class InMemoryStateStore implements StateStore {
     if (!session?.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
     session.history = [...session.history, ...session.delivery.messages].slice(-CONVERSATION_HISTORY_LIMIT)
     if (
+      session.agent &&
       session.agent.name === session.delivery.agent.name &&
       session.agent.sessionRef === session.delivery.agent.sessionRef
     ) {
@@ -456,7 +517,7 @@ export class InMemoryStateStore implements StateStore {
   async rebindConversationSession(
     workspaceId: string,
     conversationId: string,
-    agent: ConversationSessionState['agent'],
+    agent: NonNullable<ConversationSessionState['agent']>,
   ): Promise<boolean> {
     const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
     if (!session) return false
@@ -818,6 +879,7 @@ export class InMemoryStateStore implements StateStore {
         criticalMessages: new Map(),
         resumedExitKeys: new Set(),
         slackThreadIds: new Map(),
+        slackThreadWatches: new Map(),
         conversationSessions: new Map(),
         githubIssueCommentWatches: new Map(),
         seenAgentQuestionKeys: new Set(),

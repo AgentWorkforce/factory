@@ -5,11 +5,13 @@ import type {
   DiscoverySweepState,
   DispatchLifecycle,
   GithubIssueCommentWatchState,
+  SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
 
 export type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
+  slackThreadWatches: Record<string, SlackThreadWatchState>
   waitingClarifications: Record<string, WaitingClarification>
   babysitterSessions: Record<string, BabysitterSessionState>
   babysitterGenerations: Record<string, BabysitterGenerationRecord>

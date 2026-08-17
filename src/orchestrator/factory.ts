@@ -394,8 +394,10 @@ const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
+const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
+const SLACK_TERMINAL_THREAD_GRACE_MS = 24 * 60 * 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
@@ -516,6 +518,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
+  readonly #slackTerminalWatchExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #slackConversationTurns: CoalescedTaskQueue<string>
   readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
@@ -1140,6 +1143,8 @@ export class FactoryLoop implements Factory {
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
       await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
       this.#slackWatchers.clear()
+      for (const timer of this.#slackTerminalWatchExpiryTimers.values()) clearTimeout(timer)
+      this.#slackTerminalWatchExpiryTimers.clear()
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
       this.#githubIssueCommentWatchStates.clear()
@@ -5521,7 +5526,7 @@ export class FactoryLoop implements Factory {
     for (const [name] of record.agents) {
       this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
     }
-    await this.#stopSlackWatcher(record.issue)
+    await this.#retireSlackWatcher(record)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     this.#increment('dispatchLifecycleStaleIssuesAbandoned')
@@ -8482,7 +8487,7 @@ export class FactoryLoop implements Factory {
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
-    await this.#stopSlackWatcher(record.issue)
+    await this.#retireSlackWatcher(record)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     if (next) {
@@ -12765,7 +12770,7 @@ export class FactoryLoop implements Factory {
         batch.complete(record.issue)
       }
       if (!await this.#saveDispatchLifecycle(record, 'releasing', undefined, releaseReason)) return
-      await this.#stopSlackWatcher(record.issue)
+      await this.#retireSlackWatcher(record)
       await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
       await this.#recordDispatchTerminal(record.issue)
       await this.#finishDurableRelease(record, releaseReason)
@@ -13289,6 +13294,14 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(record.issue)
+    const previousWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    if (previousWatch?.kind === 'terminal-grace') {
+      // A reopened work unit needs a fresh dispatch notification and a fresh
+      // conversation. Do not let the old grace-period watcher (or its expiry
+      // timer) capture and later tear down the new dispatch.
+      await this.#stopSlackWatcher(record.issue)
+    }
     const existingThread = await this.#persistedSlackThread(key)
     const watcherStart = this.#slackWatcherStarts.get(key)
     if (existingThread || watcherStart) {
@@ -13390,13 +13403,14 @@ export class FactoryLoop implements Factory {
     if (existing) {
       const sessionRef = owned?.tracked.sessionRef
       const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
+      let rebound = false
       if (
         owned && sessionRef &&
-        (agentName !== existing.agent.name || (
+        (!existing.agent || agentName !== existing.agent.name || (
           options.forceAgentRebind === true && sessionRef !== existing.agent.sessionRef
         ))
       ) {
-        const rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
+        rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
           name: agentName!,
           sessionRef,
           role: owned.tracked.spec.role,
@@ -13412,26 +13426,21 @@ export class FactoryLoop implements Factory {
           this.#workspaceId,
           issueKey(existing.issue),
         )
-        if (!waiting) this.#slackConversationTurns.schedule(conversationId)
+        if (!waiting && (existing.agent || rebound)) this.#slackConversationTurns.schedule(conversationId)
       }
       return
     }
 
     const sessionRef = owned?.tracked.sessionRef
-    if (!owned || !sessionRef) {
-      this.#increment('slackConversationSessionsSkippedMissingSession')
-      return
-    }
-
     const channelDir = await this.#slackChannelDir() ?? this.#config.slack?.channel
     if (!channelDir) return
-    const agentName = owned.tracked.result?.name ?? owned.name
+    const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
     const reserved = await this.#state.reserveConversationSession(this.#workspaceId, conversationId, {
       provider: 'slack',
       issue: { ...record.issue },
       externalId: threadId,
       context: { channelDir },
-      agent: {
+      ...(owned && sessionRef && agentName ? { agent: {
         name: agentName,
         sessionRef,
         role: owned.tracked.spec.role,
@@ -13439,12 +13448,16 @@ export class FactoryLoop implements Factory {
         capability: owned.tracked.spec.capability,
         repo: owned.tracked.spec.repo,
         clonePath: owned.tracked.spec.clonePath,
-      },
+      } } : {}),
       history: [],
       processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      acknowledgementClaims: {},
       pending: [],
     })
-    if (reserved) this.#increment('slackConversationSessionsOwned')
+    if (reserved) {
+      this.#increment(owned && sessionRef ? 'slackConversationSessionsOwned' : 'slackConversationSessionsReservedUnowned')
+    }
   }
 
   // Called right after a babysitter is spawned/reattached for an issue's PR so
@@ -13479,9 +13492,18 @@ export class FactoryLoop implements Factory {
     )
     if (!claimed?.delivery) {
       const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
-      if (current && (current.pending.length > 0 || current.delivery)) {
+      if (current?.agent && (current.pending.length > 0 || current.delivery)) {
         this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
       }
+      return
+    }
+    if (!claimed.agent) {
+      await this.#state.releaseConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        claimId,
+      )
       return
     }
 
@@ -13593,10 +13615,12 @@ export class FactoryLoop implements Factory {
     session: ConversationSessionState,
     result: SpawnResult,
   ): Promise<void> {
+    const sessionAgent = session.agent
+    if (!sessionAgent) return
     const record = (await this.#batch()).getIssue(session.issue)
     if (!record) return
     const entry = [...record.agents.entries()].find(([name, tracked]) =>
-      name === session.agent.name || tracked.result?.name === session.agent.name)
+      name === sessionAgent.name || tracked.result?.name === sessionAgent.name)
     if (!entry) return
     const [previousName, tracked] = entry
     tracked.result = {
@@ -13939,7 +13963,14 @@ export class FactoryLoop implements Factory {
         `Question: ${triageEscalationQuestion(decision, issue)}`,
       ].join('\n'),
     })
-    await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
+    const key = issueKey(decision.issue)
+    await this.#state.setSlackThread(this.#workspaceId, key, root.threadId)
+    await this.#state.setSlackThreadWatch(this.#workspaceId, key, {
+      kind: 'triage',
+      issue: { ...decision.issue },
+      decision: structuredClone(decision),
+      threadId: root.threadId,
+    })
     const replayedResult = await this.#watchSlackThread(escalationWatchRecord(decision), root.threadId)
     this.#recordSlackWritebackSuccess('triage-escalation')
     return replayedResult
@@ -14214,6 +14245,24 @@ export class FactoryLoop implements Factory {
         this.#slackConversationTurns.schedule(conversationId)
       }
     }
+    for (const [key, watch] of await this.#state.listSlackThreadWatches(this.#workspaceId)) {
+      if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) continue
+      if (watch.kind === 'terminal-grace' && watch.expiresAtMs <= this.#clock.now()) {
+        await this.#stopSlackWatcher(watch.issue)
+        continue
+      }
+      await this.#state.setSlackThread(this.#workspaceId, key, watch.threadId)
+      const watchRecord = escalationWatchRecord(watch.decision)
+      if (watch.kind === 'terminal-grace') {
+        const conversationId = slackConversationId(watch.threadId)
+        await this.#slackConversationTurns.cancel(conversationId)
+        await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+        await this.#rearmSlackWatcher(watchRecord, watch.threadId, { replayConversationReplies: true })
+        this.#scheduleSlackTerminalWatchExpiry(watch.issue, watch.expiresAtMs)
+        continue
+      }
+      await this.#rearmSlackWatcher(watchRecord, watch.threadId, { replayConversationReplies: true })
+    }
     await this.#sweepWaitingClarifications()
     for (const [, waiting] of await this.#state.listWaitingClarifications(this.#workspaceId)) {
       if (!waiting.threadId) continue
@@ -14386,6 +14435,9 @@ export class FactoryLoop implements Factory {
 
   async #stopSlackWatcher(issue: IssueRef): Promise<void> {
     const key = issueKey(issue)
+    const expiryTimer = this.#slackTerminalWatchExpiryTimers.get(key)
+    if (expiryTimer) clearTimeout(expiryTimer)
+    this.#slackTerminalWatchExpiryTimers.delete(key)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
     const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
@@ -14396,6 +14448,77 @@ export class FactoryLoop implements Factory {
       await this.#state.clearConversationSession(this.#workspaceId, conversationId)
     }
     await this.#state.clearSlackThread(this.#workspaceId, key)
+    await this.#state.clearSlackThreadWatch(this.#workspaceId, key)
+  }
+
+  async #retireSlackWatcher(record: InFlightIssue): Promise<void> {
+    const key = issueKey(record.issue)
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+    if (!threadId) {
+      await this.#stopSlackWatcher(record.issue)
+      return
+    }
+
+    const existingWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    const expiresAtMs = existingWatch?.kind === 'terminal-grace'
+      ? existingWatch.expiresAtMs
+      : this.#clock.now() + SLACK_TERMINAL_THREAD_GRACE_MS
+    await this.#state.setSlackThreadWatch(this.#workspaceId, key, {
+      kind: 'terminal-grace',
+      issue: { ...record.issue },
+      decision: structuredClone(record.decision),
+      threadId,
+      expiresAtMs,
+    })
+
+    // A terminal thread must never retain a resumable session for an agent that
+    // has already exited. Keep only the exact-thread listener so a late human
+    // reply receives the explicit no-active-agent writeback below.
+    const conversationId = slackConversationId(threadId)
+    await this.#slackConversationTurns.cancel(conversationId)
+    await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+    if (!this.#slackWatchers.has(key) && !this.#stopping) {
+      await this.#rearmSlackWatcher(record, threadId)
+    }
+    this.#scheduleSlackTerminalWatchExpiry(record.issue, expiresAtMs)
+    this.#increment('slackTerminalWatchersRetained')
+  }
+
+  #scheduleSlackTerminalWatchExpiry(
+    issue: IssueRef,
+    expiresAtMs: number,
+    retryDelayMs?: number,
+  ): void {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const existing = this.#slackTerminalWatchExpiryTimers.get(key)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.#slackTerminalWatchExpiryTimers.delete(key)
+      void this.#expireSlackTerminalWatcher(issue, expiresAtMs).catch((error) => {
+        this.#logger.warn?.('[factory] failed to expire terminal Slack reply watcher; retrying', {
+          issue: issue.key,
+          error,
+        })
+        this.#scheduleSlackTerminalWatchExpiry(issue, expiresAtMs, SLACK_REPLY_ROUTE_RETRY_MS)
+      })
+    }, retryDelayMs ?? Math.max(0, expiresAtMs - this.#clock.now()))
+    timer.unref?.()
+    this.#slackTerminalWatchExpiryTimers.set(key, timer)
+  }
+
+  async #expireSlackTerminalWatcher(issue: IssueRef, expiresAtMs: number): Promise<void> {
+    const key = issueKey(issue)
+    const watch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    if (watch?.kind !== 'terminal-grace' || watch.expiresAtMs !== expiresAtMs) return
+    if (watch.expiresAtMs > this.#clock.now()) {
+      this.#scheduleSlackTerminalWatchExpiry(issue, watch.expiresAtMs)
+      return
+    }
+    await this.#stopSlackWatcher(issue)
+    this.#increment('slackTerminalWatchersExpired')
   }
 
   async #readSlackReply(path: string): Promise<SlackThreadReply | undefined> {
@@ -14464,33 +14587,116 @@ export class FactoryLoop implements Factory {
     }
 
     const conversationId = slackConversationId(reply.threadTs)
-    const conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    let conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    let liveRecord: InFlightIssue | undefined
+    if (!conversation) {
+      liveRecord = (await this.#batch()).getIssue(record.issue)
+      if (liveRecord && !liveRecord.dryRun) {
+        await this.#ensureSlackConversationSession(liveRecord, reply.threadTs)
+        conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      }
+    }
     if (conversation && issueKey(conversation.issue) === clarificationKey) {
+      const replyId = `${reply.threadTs}:${reply.messageTs}`
       const queued = await this.#state.appendConversationMessage(this.#workspaceId, conversationId, {
-        id: `${reply.threadTs}:${reply.messageTs}`,
+        id: replyId,
         text,
         receivedAtMs: slackMessageReceivedAtMs(reply.messageTs, this.#clock.now()),
         providerSequence: reply.messageTs,
         author: reply.author,
       })
-      if (!queued) {
-        this.#increment('slackConversationDuplicateRepliesSuppressed')
-        return
+      const durable = queued ?? await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (!durable || !durable.processedMessageIds.includes(replyId)) {
+        throw new Error(`Slack reply ${replyId} was not durably queued`)
       }
-      this.#increment('slackConversationRepliesQueued')
-      this.#slackConversationTurns.schedule(conversationId)
+      if (!(durable.acknowledgedMessageIds ?? []).includes(replyId)) {
+        const acknowledgementClaimId = randomUUID()
+        const acknowledgementClaimed = await this.#state.claimConversationMessageAcknowledgement(
+          this.#workspaceId,
+          conversationId,
+          replyId,
+          acknowledgementClaimId,
+          this.#clock.now(),
+          SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS,
+        )
+        if (acknowledgementClaimed) {
+          try {
+            if (!this.#slack) throw new Error(`Slack reply ${replyId} cannot be acknowledged without writeback`)
+            const owner = durable.agent?.role === 'babysitter'
+              ? 'the PR babysitter'
+              : durable.agent
+                ? 'the issue implementer'
+                : 'an issue agent'
+            const receipt = durable.agent
+              ? `Factory received this reply and durably queued it for ${owner}.`
+              : 'Factory received and durably stored this reply; it will route when an issue agent is resumable.'
+            await this.#slack.reply(reply.threadTs, receipt)
+            if (!await this.#state.completeConversationMessageAcknowledgement(
+              this.#workspaceId,
+              conversationId,
+              replyId,
+              acknowledgementClaimId,
+            )) {
+              throw new Error(`Slack reply ${replyId} receipt could not be recorded`)
+            }
+            this.#increment('slackConversationRepliesAcknowledged')
+          } catch (error) {
+            await this.#state.releaseConversationMessageAcknowledgement(
+              this.#workspaceId,
+              conversationId,
+              replyId,
+              acknowledgementClaimId,
+            )
+            throw error
+          }
+        } else {
+          const acknowledgementState = await this.#state.getConversationSession(
+            this.#workspaceId,
+            conversationId,
+          )
+          if (!(acknowledgementState?.acknowledgedMessageIds ?? []).includes(replyId)) {
+            throw new Error(`Slack reply ${replyId} receipt is claimed by another handler; retrying`)
+          }
+        }
+      }
+      if (queued) {
+        this.#increment('slackConversationRepliesQueued')
+      } else {
+        this.#increment('slackConversationDuplicateRepliesSuppressed')
+      }
+      const pending = durable.pending.some((message) => message.id === replyId) ||
+        Boolean(durable.delivery?.messages.some((message) => message.id === replyId))
+      if (pending && durable.agent) {
+        this.#slackConversationTurns.schedule(conversationId)
+      } else if (pending) {
+        this.#increment('slackConversationRepliesWaitingForOwner')
+      }
       return
     }
 
-    const liveRecord = (await this.#batch()).getIssue(record.issue)
+    liveRecord ??= (await this.#batch()).getIssue(record.issue)
     if (!liveRecord || liveRecord.dryRun) {
       if (isTriageEscalationWatchRecord(record)) {
         return await this.#handleTriageEscalationSlackAnswer(record, text)
       }
       this.#increment('slackAnswersIgnoredNoInFlight')
+      if (this.#slack) {
+        await this.#slack.reply(
+          reply.threadTs,
+          'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+        )
+        this.#increment('slackAnswersUnroutableVisible')
+      }
       return
     }
     this.#increment('slackAnswersIgnoredNoConversationSession')
+    if (this.#slack) {
+      await this.#slack.reply(
+        reply.threadTs,
+        'Factory received this reply but could not create a durable agent route. It will remain replayable; please also continue on the linked issue or pull request.',
+      )
+      this.#increment('slackAnswersUnroutableVisible')
+    }
   }
 
   async #wakeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
@@ -14885,6 +15091,7 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     if (batch.isInFlight(record.issue) || batch.isQueued(record.issue)) {
       this.#increment('slackTriageAnswersIgnoredAlreadyActive')
+      await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
       return
     }
     if (await this.#dispatchBlockReason(record.issue)) {
@@ -14902,6 +15109,10 @@ export class FactoryLoop implements Factory {
       if (hasDispatchableRoute(decision)) {
         this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
         const result = await this.#startOrQueueSlackClarifiedDecision(dispatchAfterSlackClarification(decision, escalationReason))
+        const active = await this.#batch()
+        if (result || active.isInFlight(decision.issue) || active.isQueued(decision.issue)) {
+          await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
+        }
         this.#increment('slackTriageAnswersDispatchedWithRemainingEscalation')
         return result
       }
@@ -14915,6 +15126,10 @@ export class FactoryLoop implements Factory {
 
     this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
     const result = await this.#startOrQueueSlackClarifiedDecision(decision)
+    const active = await this.#batch()
+    if (result || active.isInFlight(decision.issue) || active.isQueued(decision.issue)) {
+      await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
+    }
     this.#increment('slackTriageAnswersDispatched')
     return result
   }
