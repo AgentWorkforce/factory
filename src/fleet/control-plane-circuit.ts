@@ -59,6 +59,9 @@ export class FleetControlPlaneCircuit {
   #lastFailureAtMs?: number
   #retryAtMs?: number
   #lastError?: string
+  // A roster request that predates an open transition is not a valid
+  // half-open recovery probe, even if it resolves after the cooldown.
+  #openGeneration = 0
   #probeInFlight?: Promise<RosterEntry>
 
   constructor(options: FleetControlPlaneCircuitOptions) {
@@ -95,14 +98,24 @@ export class FleetControlPlaneCircuit {
     }
     if (this.#probeInFlight) return this.#probeInFlight
 
+    const openGeneration = this.#openGeneration
     const probe = withTimeout(roster, this.#timeoutMs)
+      .catch((error: unknown) => {
+        this.recordFailure(error)
+        throw error
+      })
       .then((result) => {
+        const settledStatus = this.status()
+        // Mutation failures can open the circuit while this read is pending.
+        // Never let that stale result satisfy waiters or reset circuit state.
+        if (settledStatus.state === 'open' || openGeneration !== this.#openGeneration) {
+          throw new FleetControlPlaneCircuitOpenError(
+            settledStatus.retryAtMs ?? this.#now(),
+            settledStatus.state === 'open' ? 'open' : 'half-open',
+          )
+        }
         this.#recordSuccess()
         return result
-      })
-      .catch((error: unknown) => {
-        this.#recordFailure(error)
-        throw error
       })
       .finally(() => {
         if (this.#probeInFlight === probe) this.#probeInFlight = undefined
@@ -118,7 +131,7 @@ export class FleetControlPlaneCircuit {
     throw new FleetControlPlaneCircuitOpenError(status.retryAtMs ?? this.#now(), status.state)
   }
 
-  #recordFailure(error: unknown): void {
+  recordFailure(error: unknown): void {
     const now = this.#now()
     const wasOpen = this.#retryAtMs !== undefined && now < this.#retryAtMs
     this.#lastFailureAtMs = now
@@ -127,6 +140,7 @@ export class FleetControlPlaneCircuit {
     this.#consecutiveFailures += 1
     if (this.#consecutiveFailures >= this.#failureThreshold) {
       this.#retryAtMs = now + this.#resetTimeoutMs
+      this.#openGeneration += 1
     }
   }
 
@@ -138,10 +152,9 @@ export class FleetControlPlaneCircuit {
 }
 
 /**
- * Gates roster, spawn, and resume through the read-only roster control path.
- * Mutation rejections deliberately do not affect circuit state: a transport
- * error can arrive after the remote side effect committed, so only a fresh,
- * bounded roster probe is allowed to decide subsequent admission.
+ * Gates spawn and resume with a bounded read-only roster admission. Transport
+ * failures from admitted mutations also count toward the circuit without
+ * abandoning or timing the mutation; domain rejections remain uncounted.
  */
 export function guardFleetControlPlane(
   fleet: FleetClient,
@@ -155,9 +168,12 @@ export function guardFleetControlPlane(
     // circuit rejects here without calling either roster or the mutation.
     await circuit.probe(() => fleet.roster())
     circuit.assertMutationAllowed()
-    // Do not catch or classify operation failures here. Their remote outcome
-    // can be ambiguous; the next mutation must run a new roster admission probe.
-    return await operation()
+    try {
+      return await operation()
+    } catch (error) {
+      if (isFleetControlPlaneFailure(error)) circuit.recordFailure(error)
+      throw error
+    }
   }
 
   return new Proxy(fleet, {
@@ -176,6 +192,21 @@ export function guardFleetControlPlane(
       return typeof value === 'function' ? value.bind(target) : value
     },
   }) as FleetClient
+}
+
+export function isFleetControlPlaneFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const candidate = error as Error & { code?: unknown }
+  if (error.name === 'TimeoutError' || error.name === 'AbortError') return true
+  if (typeof candidate.code === 'string' && [
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'EPIPE',
+    'ETIMEDOUT',
+    'UND_ERR_CONNECT_TIMEOUT',
+  ].includes(candidate.code)) return true
+  return /(?:operation\s+timed\s+out|timed\s+out\s+waiting\s+for\b.*\binvocation\b.*\bto\s+complete|operation\s+was\s+aborted|no\s+running\s+broker|broker\s+unavailable|socket\s+hang\s+up)/iu
+    .test(error.message)
 }
 
 /** Redacts arbitrary transport text before circuit state becomes observable. */
