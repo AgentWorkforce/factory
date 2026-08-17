@@ -25,10 +25,10 @@ type RelayChannelClaimStoreOptions = {
 type ClaimRelay = Pick<AgentRelay, 'agents' | 'channels' | 'messages' | 'messaging'>
 
 /**
- * Stores one immutable claim per Notion source key in a workspace-global Relay
- * channel. Channel-name uniqueness is the cross-dispatcher compare-and-set;
- * message idempotency is deliberately not used because it is actor-scoped and
- * expires after a bounded interval.
+ * Stores immutable Notion work-unit authorities and destination delivery
+ * records in workspace-global Relay channels. Channel-name uniqueness is the
+ * cross-dispatcher compare-and-set; message idempotency is deliberately not
+ * used because it is actor-scoped and expires after a bounded interval.
  */
 export class RelayChannelNotionClaimStore implements NotionIntakeClaimStore {
   readonly #workspaceKey: string
@@ -97,6 +97,21 @@ export class RelayChannelNotionClaimStore implements NotionIntakeClaimStore {
     }
     await relay.channels.join(channel)
     return await readExistingClaim(relay, channel, sourceKey)
+  }
+
+  async findBySourcePrefix(sourceKeyPrefix: string): Promise<NotionIntakeClaim[]> {
+    if (this.#disposed) throw new Error('Notion claim store has been disposed')
+    const relay = await this.#relay()
+    const channels = (await relay.channels.list({ includeArchived: true }))
+      .filter((channel) => /^factory-notion-claim-[0-9a-f]{64}$/u.test(channel.name))
+      .sort((left, right) => left.name.localeCompare(right.name))
+    const claims: NotionIntakeClaim[] = []
+    for (const channel of channels) {
+      await relay.channels.join(channel.name)
+      const claim = await discoverClaim(relay, channel.name, sourceKeyPrefix)
+      if (claim) claims.push(claim)
+    }
+    return claims
   }
 
   async dispose(): Promise<void> {
@@ -168,6 +183,17 @@ async function readExistingClaim(
   channel: string,
   expectedSourceKey: string,
 ): Promise<NotionIntakeClaim> {
+  const claim = await readClaim(relay, channel)
+  if (claim.sourceKey !== expectedSourceKey) {
+    throw new Error(`durable Notion claim ${channel} does not match its source key`)
+  }
+  return claim
+}
+
+async function readClaim(
+  relay: ClaimRelay,
+  channel: string,
+): Promise<NotionIntakeClaim> {
   const messages = await listAllMessages(relay, channel)
   const records = messages
     .filter((message) => message.text.startsWith(`${CLAIM_MARKER}\n`))
@@ -178,10 +204,33 @@ async function readExistingClaim(
     )
   }
   const [claim] = records
-  if (claim!.sourceKey !== expectedSourceKey) {
-    throw new Error(`durable Notion claim ${channel} does not match its source key`)
-  }
   return publicClaim(claim!)
+}
+
+async function discoverClaim(
+  relay: ClaimRelay,
+  channel: string,
+  sourceKeyPrefix: string,
+): Promise<NotionIntakeClaim | undefined> {
+  const messages = await listAllMessages(relay, channel)
+  const records = messages
+    .filter((message) => message.text.startsWith(`${CLAIM_MARKER}\n`))
+    .flatMap((message) => {
+      try {
+        const parsed = claimRecordSchema.safeParse(JSON.parse(message.text.slice(CLAIM_MARKER.length + 1)))
+        return parsed.success ? [parsed.data] : []
+      } catch {
+        return []
+      }
+    })
+  const matching = records.filter((record) => record.sourceKey.startsWith(sourceKeyPrefix))
+  if (matching.length === 0) return undefined
+  if (records.length !== 1 || matching.length !== 1) {
+    throw new Error(
+      `durable Notion claim ${channel} has ${records.length} immutable claim records; refusing dispatch`,
+    )
+  }
+  return publicClaim(matching[0]!)
 }
 
 async function listAllMessages(relay: ClaimRelay, channel: string): Promise<RelayMessage[]> {

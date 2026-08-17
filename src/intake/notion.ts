@@ -6,6 +6,8 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import lockfile from 'proper-lockfile'
 import { z } from 'zod'
 
+import { dispatchNotionPageIdentity } from '../dispatch/work-unit-identity'
+
 const INTAKE_LOCK_STALE_MS = 60_000
 
 export const notionRecipeSchema = z.enum(['single', 'workflow', 'team'])
@@ -68,6 +70,7 @@ export type NotionIntakeManifest = z.infer<typeof manifestSchema>
 
 export interface NormalizedNotionTask {
   pageId: string
+  workUnitKey: string
   sourceKey: string
   sourcePath: string
   workerSourcePath: string
@@ -125,6 +128,8 @@ export interface NotionIntakeClaim {
 
 export interface NotionIntakeClaimStore {
   get(sourceKey: string): Promise<NotionIntakeClaim | undefined>
+  /** Enumerate legacy destination claims so they can be bound to the immutable page authority. */
+  findBySourcePrefix(sourceKeyPrefix: string): Promise<NotionIntakeClaim[]>
   claim(input: NotionIntakeClaim): Promise<{
     status: 'claimed' | 'existing'
     claim: NotionIntakeClaim
@@ -280,6 +285,7 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
 
   for (const task of manifest.tasks) {
     const pageId = normalizeNotionPageId(task.page)
+    const workUnitKey = dispatchNotionPageIdentity(pageId)
     const sourcePath = join(manifest.mountRoot, 'pages', pageId, 'content.md')
     const content = await readFile(sourcePath, 'utf8')
     const spec = task.bootstrap
@@ -296,6 +302,7 @@ export async function normalizeNotionManifest(manifest: NotionIntakeManifest): P
       seen.add(sourceKey)
       normalized.push({
         pageId,
+        workUnitKey,
         sourceKey,
         sourcePath,
         workerSourcePath: 'repo' in target || manifest.workerMountTransport.kind === 'relay-channel'
@@ -446,7 +453,8 @@ async function publishRepoTask(
     if (currentDigest !== task.digest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
-    let claim = await observeNotionClaim(task, input)
+    await ensureNotionWorkUnitClaim(task, input)
+    let claim = await observeNotionDeliveryClaim(task, input)
     if (!claim) {
       if (!receipt) {
         return {
@@ -456,7 +464,7 @@ async function publishRepoTask(
           reason: 'lifecycle issue marker has neither a durable shared claim nor a local migration receipt',
         }
       }
-      claim = (await claimNotionTask(task, input)).claim
+      claim = (await claimNotionDelivery(task, input)).claim
     }
     const bodyDelivery = contractDeliveryFromBody(existing.body)
     if (input.manifest.workerMountTransport.kind === 'local') {
@@ -519,8 +527,9 @@ async function publishRepoTask(
   if (missing.length > 0) {
     return { ...base, status: 'blocked', reason: `missing required GitHub labels: ${missing.join(', ')}` }
   }
+  await ensureNotionWorkUnitClaim(task, input)
   const delivery = await prepareContractDelivery(task, input)
-  const claim = await claimNotionTask(task, input)
+  const claim = await claimNotionDelivery(task, input)
   if (claim.status === 'existing') {
     return {
       ...base,
@@ -571,7 +580,8 @@ async function dispatchWorkspaceTask(
     if (receipt.digest !== task.digest) {
       return { ...base, status: 'blocked', agent: receipt.agent, node: receipt.node, reason: 'mounted spec changed after workspace dispatch' }
     }
-    await claimNotionTask(task, input)
+    await ensureNotionWorkUnitClaim(task, input)
+    await claimNotionDelivery(task, input)
     const needsPortableMigration = input.manifest.workerMountTransport.kind !== 'local' && !receipt.delivery
     if (needsPortableMigration) {
       if (!input.workspace?.redispatch) {
@@ -583,7 +593,7 @@ async function dispatchWorkspaceTask(
           reason: 'portable workspace mount migration requires a workspace redispatcher',
         }
       }
-      const migrationClaim = await claimNotionTask(task, input, `${task.sourceKey}:portable-mount`)
+      const migrationClaim = await claimNotionDelivery(task, input, `${task.sourceKey}:portable-mount`)
       if (migrationClaim.status === 'existing') {
         return {
           ...base,
@@ -628,7 +638,8 @@ async function dispatchWorkspaceTask(
 
   const suffix = createHash('sha256').update(task.sourceKey).digest('hex').slice(0, 8)
   const name = `notion-${task.pageId.slice(-8)}-${suffix}`
-  const claim = await claimNotionTask(task, input)
+  await ensureNotionWorkUnitClaim(task, input)
+  const claim = await claimNotionDelivery(task, input)
   if (claim.status === 'existing') {
     if (!input.workspace.find) {
       return {
@@ -647,7 +658,7 @@ async function dispatchWorkspaceTask(
     }
     const migrationSourceKey = `${task.sourceKey}:portable-mount`
     if (input.manifest.workerMountTransport.kind !== 'local' &&
-      await observeNotionClaim(task, input, migrationSourceKey)) {
+      await observeNotionDeliveryClaim(task, input, migrationSourceKey)) {
       return {
         ...base,
         status: 'blocked',
@@ -693,7 +704,49 @@ async function dispatchWorkspaceTask(
   }
 }
 
-async function observeNotionClaim(
+async function ensureNotionWorkUnitClaim(
+  task: NormalizedNotionTask,
+  input: Parameters<typeof runNotionIntake>[0],
+): Promise<NotionIntakeClaim> {
+  if (!input.claims) {
+    throw new Error('dispatch requires a durable Agent Relay Notion claim store')
+  }
+
+  const existing = await input.claims.get(task.workUnitKey)
+  if (existing) {
+    assertNotionClaim(existing, task.workUnitKey, task.digest)
+    return existing
+  }
+
+  const legacyClaims = (await input.claims.findBySourcePrefix(`${task.workUnitKey}:`))
+    .sort((left, right) => left.claimedAt.localeCompare(right.claimedAt) ||
+      left.sourceKey.localeCompare(right.sourceKey))
+  if (legacyClaims.length > 0) {
+    const [authoritative] = legacyClaims
+    const migrated = await input.claims.claim({
+      sourceKey: task.workUnitKey,
+      digest: authoritative!.digest,
+      claimedAt: authoritative!.claimedAt,
+    })
+    assertNotionClaim(migrated.claim, task.workUnitKey, authoritative!.digest)
+    const legacyDigests = new Set(legacyClaims.map((claim) => claim.digest))
+    if (legacyDigests.size > 1) {
+      throw new Error('legacy Notion claims disagree for the provider-native work unit; refusing dispatch')
+    }
+    assertNotionClaim(migrated.claim, task.workUnitKey, task.digest)
+    return migrated.claim
+  }
+
+  const result = await input.claims.claim({
+    sourceKey: task.workUnitKey,
+    digest: task.digest,
+    claimedAt: (input.now?.() ?? new Date()).toISOString(),
+  })
+  assertNotionClaim(result.claim, task.workUnitKey, task.digest)
+  return result.claim
+}
+
+async function observeNotionDeliveryClaim(
   task: NormalizedNotionTask,
   input: Parameters<typeof runNotionIntake>[0],
   sourceKey = task.sourceKey,
@@ -711,7 +764,7 @@ async function observeNotionClaim(
   return claim
 }
 
-async function claimNotionTask(
+async function claimNotionDelivery(
   task: NormalizedNotionTask,
   input: Parameters<typeof runNotionIntake>[0],
   sourceKey = task.sourceKey,
@@ -731,6 +784,15 @@ async function claimNotionTask(
     throw new Error('durable Notion claim digest does not match the mounted spec')
   }
   return result
+}
+
+function assertNotionClaim(claim: NotionIntakeClaim, sourceKey: string, digest: string): void {
+  if (claim.sourceKey !== sourceKey) {
+    throw new Error('durable Notion claim does not match the requested source key')
+  }
+  if (claim.digest !== digest) {
+    throw new Error('durable Notion claim digest does not match the mounted spec')
+  }
 }
 
 function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pageId: string) {

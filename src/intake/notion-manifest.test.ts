@@ -58,6 +58,7 @@ describe('Factory Tasks Notion manifest generator', () => {
         reason: 'Operator authorized the exact repository target.',
         recipe: 'team',
         repo: 'AgentWorkforce/factory',
+        publicSummary: 'Implement the reviewed repository change without exposing the private brief.',
         labels: ['intake', 'shared'],
         routes: ['implementer', 'shared'],
       }),
@@ -90,6 +91,7 @@ describe('Factory Tasks Notion manifest generator', () => {
           targets: [{
             repo: 'AgentWorkforce/factory',
             labels: ['intake', 'shared', 'implementer'],
+            publicSummary: 'Implement the reviewed repository change without exposing the private brief.',
           }],
         }),
       }),
@@ -132,8 +134,126 @@ describe('Factory Tasks Notion manifest generator', () => {
     expect(github.createIssue).toHaveBeenCalledOnce()
     expect(github.createIssue).toHaveBeenCalledWith(expect.objectContaining({
       labels: ['factory-ready', 'agent:team', 'intake', 'shared', 'implementer'],
+      body: expect.stringContaining('Implement the reviewed repository change without exposing the private brief.'),
     }))
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].body).not.toContain(
+      'Implement the reviewed repository change.',
+    )
     expect(workspace.dispatch).toHaveBeenCalledOnce()
+  })
+
+  it('does not create a second issue when a Ready page changes repository', async () => {
+    const body = '# Private brief\n\nInternal implementation details.'
+    const root = await mkdtemp(join(tmpdir(), 'factory-tasks-identity-'))
+    roots.push(root)
+    const pageRoot = join(root, 'mount', 'pages', repoPageId)
+    await mkdir(pageRoot, { recursive: true })
+    await writeFile(join(pageRoot, 'content.md'), body)
+    const claims = memoryClaims()
+    const github = memoryGithub()
+
+    const firstManifest = await generateFactoryTasksManifest({
+      client: fakeNotion([factoryTaskRow({
+        id: repoPageId,
+        title: 'Stable work unit',
+        reason: 'Operator authorized the task.',
+        repo: 'Example/one',
+        publicSummary: 'Apply the reviewed public change.',
+      })], new Map([[repoPageId, body]])),
+      mountRoot: join(root, 'mount'),
+      statePath: join(root, 'first-state.json'),
+    })
+    const first = await runNotionIntake({
+      manifest: firstManifest,
+      dispatch: true,
+      claims,
+      github,
+    })
+
+    const editedManifest = await generateFactoryTasksManifest({
+      client: fakeNotion([factoryTaskRow({
+        id: repoPageId,
+        title: 'Stable work unit',
+        reason: 'Operator authorized the task.',
+        repo: 'Example/two',
+        publicSummary: 'Apply the reviewed public change.',
+      })], new Map([[repoPageId, body]])),
+      mountRoot: join(root, 'mount'),
+      statePath: join(root, 'independent-state.json'),
+    })
+    const edited = await runNotionIntake({
+      manifest: editedManifest,
+      dispatch: true,
+      claims,
+      github,
+    })
+
+    expect(first.results).toEqual([expect.objectContaining({ status: 'dispatched' })])
+    expect(edited).toMatchObject({
+      ok: false,
+      results: [{
+        status: 'blocked',
+        target: { repo: 'Example/two' },
+        reason: 'durable Notion claim digest does not match the mounted spec',
+      }],
+    })
+    expect(github.createIssue).toHaveBeenCalledOnce()
+    expect(claims.stored.has(`notion:${repoPageId}`)).toBe(true)
+    expect(claims.stored.has(`notion:${repoPageId}:repo:example/two`)).toBe(false)
+  })
+
+  it('keeps distinct pages separate while one page fans out to distinct targets', async () => {
+    const bodies = new Map([
+      [repoPageId, 'Private first-page execution contract.'],
+      [workspacePageId, 'Private second-page execution contract.'],
+    ])
+    const root = await mkdtemp(join(tmpdir(), 'factory-tasks-fanout-'))
+    roots.push(root)
+    for (const [pageId, body] of bodies) {
+      const pageRoot = join(root, 'mount', 'pages', pageId)
+      await mkdir(pageRoot, { recursive: true })
+      await writeFile(join(pageRoot, 'content.md'), body)
+    }
+    const manifest = await generateFactoryTasksManifest({
+      client: fakeNotion([
+        factoryTaskRow({
+          id: repoPageId,
+          title: 'Fan out one page',
+          reason: 'Operator authorized both public targets.',
+          repo: 'Example/one',
+          publicSummary: 'Apply the first reviewed public change.',
+        }),
+        factoryTaskRow({
+          id: workspacePageId,
+          title: 'Dispatch a distinct page',
+          reason: 'Operator authorized the distinct public target.',
+          repo: 'Example/two',
+          publicSummary: 'Apply the second reviewed public change.',
+        }),
+      ], bodies),
+      mountRoot: join(root, 'mount'),
+      statePath: join(root, 'state.json'),
+    })
+    manifest.tasks[0]!.bootstrap!.targets.push({
+      repo: 'Example/three',
+      labels: [],
+      publicSummary: 'Apply the additional reviewed public change.',
+    })
+    const claims = memoryClaims()
+    const github = memoryGithub()
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report.ok).toBe(true)
+    expect(report.results).toHaveLength(3)
+    expect(report.results.every((result) => result.status === 'dispatched')).toBe(true)
+    expect(github.createIssue).toHaveBeenCalledTimes(3)
+    expect([...claims.stored.keys()].filter((key) =>
+      key === `notion:${repoPageId}` || key === `notion:${workspacePageId}`,
+    ).sort()).toEqual([
+      `notion:${repoPageId}`,
+      `notion:${workspacePageId}`,
+    ])
   })
 
   it('emits the generated manifest through the Factory CLI without constructing a fleet', async () => {
@@ -213,6 +333,7 @@ describe('Factory Tasks Notion manifest generator', () => {
     })
     expect(secondQuery.start_cursor).toBe('next-page')
     expect(String(fetch.mock.calls[1]![0])).toContain('filter_properties%5B%5D=Task')
+    expect(String(fetch.mock.calls[1]![0])).toContain('filter_properties%5B%5D=Public+Summary')
     expect(fetch.mock.calls.map((call) => call[1]?.method ?? 'GET')).toEqual([
       'GET',
       'POST',
@@ -235,6 +356,44 @@ describe('Factory Tasks Notion manifest generator', () => {
       'must set exactly one of Repo or Project Path',
     )
   })
+
+  it('rejects incomplete markdown and markdown returned for another provider page', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        object: 'page_markdown',
+        id: repoPageId,
+        markdown: 'partial brief',
+        truncated: true,
+        unknown_block_ids: [],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        object: 'page_markdown',
+        id: workspacePageId,
+        markdown: 'wrong page brief',
+        truncated: false,
+        unknown_block_ids: [],
+      }))
+    const client = new NotionApiFactoryTasksClient({ token: 'test-token', fetch })
+
+    await expect(client.retrievePageMarkdown(repoPageId)).rejects.toThrow('complete execution brief')
+    await expect(client.retrievePageMarkdown(repoPageId)).rejects.toThrow('did not match requested page')
+  })
+
+  it('rejects duplicate provider rows before authorizing either copy', async () => {
+    const row = factoryTaskRow({
+      id: repoPageId,
+      title: 'Duplicate provider row',
+      reason: 'The provider identity must be unique.',
+      repo: 'AgentWorkforce/factory',
+      publicSummary: 'Apply the reviewed public change.',
+    })
+    const client = fakeNotion([row, structuredClone(row)], new Map([[repoPageId, 'Private brief']]))
+
+    await expect(generateFactoryTasksManifest({ client })).rejects.toThrow(
+      `Notion returned duplicate Factory Tasks row ${repoPageId}`,
+    )
+    expect(client.retrievePageMarkdown).toHaveBeenCalledOnce()
+  })
 })
 
 function factoryTaskRow(input: {
@@ -244,6 +403,7 @@ function factoryTaskRow(input: {
   reason: string
   recipe?: 'single' | 'workflow' | 'team'
   repo?: string
+  publicSummary?: string
   labels?: string[]
   routes?: string[]
   projectPath?: string
@@ -258,6 +418,7 @@ function factoryTaskRow(input: {
       Reason: richTextProperty('rich_text', input.reason),
       Recipe: selectProperty('select', input.recipe ?? 'single'),
       Repo: richTextProperty('rich_text', input.repo),
+      'Public Summary': richTextProperty('rich_text', input.publicSummary),
       Labels: multiSelectProperty(input.labels ?? []),
       Route: multiSelectProperty(input.routes ?? []),
       'Project Path': richTextProperty('rich_text', input.projectPath),
@@ -295,10 +456,15 @@ function fakeNotion(
   }
 }
 
-function memoryClaims(): NotionIntakeClaimStore {
+function memoryClaims(): NotionIntakeClaimStore & {
+  stored: Map<string, { sourceKey: string; digest: string; claimedAt: string }>
+} {
   const stored = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
   return {
+    stored,
     get: vi.fn(async (sourceKey) => stored.get(sourceKey)),
+    findBySourcePrefix: vi.fn(async (sourceKeyPrefix) => [...stored.values()]
+      .filter((claim) => claim.sourceKey.startsWith(sourceKeyPrefix))),
     claim: vi.fn(async (claim) => {
       const existing = stored.get(claim.sourceKey)
       if (existing) return { status: 'existing' as const, claim: existing }
@@ -311,7 +477,7 @@ function memoryClaims(): NotionIntakeClaimStore {
 function memoryGithub(): GithubIssuePublisher & { createIssue: ReturnType<typeof vi.fn> } {
   const issues = new Map<string, { number: number; url: string; body: string }>()
   return {
-    repositoryVisibility: vi.fn(async () => 'private' as const),
+    repositoryVisibility: vi.fn(async () => 'public' as const),
     missingLabels: vi.fn(async () => []),
     findBySource: vi.fn(async (_repo, sourceKey) => issues.get(sourceKey)),
     createIssue: vi.fn(async ({ body }) => {

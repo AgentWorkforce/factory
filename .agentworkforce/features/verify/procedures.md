@@ -434,9 +434,11 @@ NODE
 ```
 
 Confirm every task matches a current `Ready for Agent` row, `Labels` and
-`Route` are merged only into repository targets, rerunning without database
-changes produces byte-identical JSON, and the row statuses are unchanged. Do
-not run non-dry intake against production rows as part of this verification.
+`Route` are merged only into repository targets, `Public Summary` is mapped
+only as the reviewed public-safe repository description, rerunning without
+database changes produces byte-identical JSON, and the row statuses are
+unchanged. Do not run non-dry intake against production rows as part of this
+verification.
 
 **Automation limit:** the package and fixture subset is deterministic. Commands
 that signal a process or mutate an issue/PR remain live or manual checks.

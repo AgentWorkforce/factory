@@ -757,6 +757,8 @@ describe('fleet CLI runtime', () => {
       const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
       const notionClaims = {
         get: vi.fn(async (sourceKey: string) => durableClaims.get(sourceKey)),
+        findBySourcePrefix: vi.fn(async (sourceKeyPrefix: string) => [...durableClaims.values()]
+          .filter((claim) => claim.sourceKey.startsWith(sourceKeyPrefix))),
         claim: vi.fn(async (claim: { sourceKey: string; digest: string; claimedAt: string }) => {
           const existing = durableClaims.get(claim.sourceKey)
           if (existing) return { status: 'existing' as const, claim: existing }

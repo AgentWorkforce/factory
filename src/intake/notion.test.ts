@@ -23,6 +23,8 @@ const roots: string[] = []
 const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
 const claims: NotionIntakeClaimStore = {
   get: vi.fn(async (sourceKey) => durableClaims.get(sourceKey)),
+  findBySourcePrefix: vi.fn(async (sourceKeyPrefix) => [...durableClaims.values()]
+    .filter((claim) => claim.sourceKey.startsWith(sourceKeyPrefix))),
   claim: vi.fn(async (claim) => {
     const existing = durableClaims.get(claim.sourceKey)
     if (existing) return { status: 'existing' as const, claim: existing }
@@ -34,6 +36,7 @@ const claims: NotionIntakeClaimStore = {
 afterEach(async () => {
   durableClaims.clear()
   vi.mocked(claims.get).mockClear()
+  vi.mocked(claims.findBySourcePrefix).mockClear()
   vi.mocked(claims.claim).mockClear()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
@@ -116,6 +119,7 @@ describe('Notion spec intake', () => {
     expect(tasks).toHaveLength(1)
     expect(tasks[0]).toMatchObject({
       pageId,
+      workUnitKey: `notion:${pageId}`,
       bootstrap: true,
       sourceKey: `notion:${pageId}:repo:agentworkforce/cloud`,
       target: { repo: 'AgentWorkforce/cloud' },
@@ -445,6 +449,7 @@ describe('Notion spec intake', () => {
     const github = fakeGithub({ visibility: 'private' })
     const unavailableClaims: NotionIntakeClaimStore = {
       get: vi.fn(async () => undefined),
+      findBySourcePrefix: vi.fn(async () => []),
       claim: vi.fn(async () => { throw new Error('shared claim write failed') }),
     }
 
@@ -486,6 +491,34 @@ describe('Notion spec intake', () => {
       status: 'blocked',
       reason: expect.stringContaining('durable Notion claim already exists'),
     }))
+  })
+
+  it('migrates a legacy destination claim before refusing an edited destination', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'Example/one', labels: [] }),
+    })
+    roots.push(root)
+    const [original] = await normalizeNotionManifest(manifest)
+    durableClaims.set(original!.sourceKey, {
+      sourceKey: original!.sourceKey,
+      digest: original!.digest,
+      claimedAt: '2026-08-06T20:00:00.000Z',
+    })
+    manifest.tasks[0]!.bootstrap!.targets = [{ repo: 'Example/two', labels: [] }]
+    const github = fakeGithub({ visibility: 'private' })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report).toMatchObject({
+      ok: false,
+      results: [{
+        status: 'blocked',
+        target: { repo: 'Example/two' },
+        reason: 'durable Notion claim digest does not match the mounted spec',
+      }],
+    })
+    expect(durableClaims.get(`notion:${pageId}`)).toMatchObject({ digest: original!.digest })
+    expect(github.createIssue).not.toHaveBeenCalled()
   })
 
   it('serializes overlapping runs and creates one lifecycle issue', async () => {
@@ -630,6 +663,7 @@ describe('Notion spec intake', () => {
     const events: string[] = []
     const unavailableClaims: NotionIntakeClaimStore = {
       get: vi.fn(async () => undefined),
+      findBySourcePrefix: vi.fn(async () => []),
       claim: vi.fn(async () => {
         events.push('claim')
         throw new Error('durable claim unavailable')

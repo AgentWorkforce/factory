@@ -225,7 +225,9 @@ Factory can generate that manifest directly from the **Factory Tasks** Notion
 data source. The generator uses `NOTION_API_KEY` for read-only data-source and
 page-markdown requests, selects only rows whose `Status` is `Ready for Agent`,
 and never updates a row or its status. `Labels` and `Route` values are combined
-for repository issue labels. The output order is stable by page ID, so the same
+for repository issue labels. A repository row can supply a separately reviewed
+`Public Summary`; Factory uses that text for a public lifecycle issue and never
+copies the private page body. The output order is stable by page ID, so the same
 database state produces the same manifest on every run.
 
 ```bash

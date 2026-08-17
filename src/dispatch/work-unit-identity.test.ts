@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { dispatchAgentIdentityKey, dispatchIssueIdentity } from './work-unit-identity'
+import {
+  dispatchAgentIdentityKey,
+  dispatchIssueIdentity,
+  dispatchNotionPageIdentity,
+} from './work-unit-identity'
 
 describe('dispatch work-unit identity', () => {
   it('uses one provider-native identity for GitHub Relayfile aliases', () => {
@@ -61,5 +65,14 @@ describe('dispatch work-unit identity', () => {
   it('throws when the provider identity is empty', () => {
     const issue = { uuid: '   ', key: 'opaque-key', path: '/some/other/mount/opaque-key.json' }
     expect(() => dispatchIssueIdentity(issue)).toThrow(/provider identity is empty/u)
+  })
+
+  it('uses the provider-native Notion page id without a destination alias', () => {
+    expect(dispatchNotionPageIdentity('3B36800C-1C90-801D-B1CF-C8F2E1CFF7CF')).toBe(
+      'notion:3b36800c-1c90-801d-b1cf-c8f2e1cff7cf',
+    )
+    expect(() => dispatchNotionPageIdentity('notion-page:repo:mutable/destination')).toThrow(
+      /canonical page id/u,
+    )
   })
 })

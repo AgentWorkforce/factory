@@ -18,6 +18,7 @@ const FACTORY_TASK_PROPERTIES = [
   'Recipe',
   'Reason',
   'Repo',
+  'Public Summary',
   'Labels',
   'Route',
   'Project Path',
@@ -198,11 +199,12 @@ export async function generateFactoryTasksManifest(
 
     let target: NotionIntakeTarget
     if (repo) {
+      const publicSummary = propertyText(row, 'Public Summary', false)
       const labels = unique([
         ...propertyList(row, 'Labels'),
         ...propertyList(row, 'Route'),
       ])
-      target = { repo, labels }
+      target = { repo, labels, ...(publicSummary ? { publicSummary } : {}) }
     } else {
       const node = propertyText(row, 'Node', false)
       target = { projectPath: projectPath!, ...(node ? { node } : {}) }
