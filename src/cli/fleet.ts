@@ -96,10 +96,13 @@ import {
 } from '../version-info'
 import {
   GhCliIssuePublisher,
+  NotionApiFactoryTasksClient,
   RelayChannelNotionClaimStore,
   RelayChannelNotionContractPublisher,
+  generateFactoryTasksManifest,
   loadNotionIntakeManifest,
   runNotionIntake,
+  type FactoryTasksNotionClient,
   type NotionIntakeClaimStore,
   type NotionContractPublisher,
   type WorkspaceTaskDispatcher,
@@ -154,6 +157,8 @@ export interface FleetCliDeps {
   notionContracts?: NotionContractPublisher
   /** Hermetic workspace-global Notion claim store for tests and alternate runtimes. */
   notionClaims?: NotionIntakeClaimStore
+  /** Hermetic Factory Tasks reader for manifest-generation tests and alternate runtimes. */
+  notionFactoryTasks?: FactoryTasksNotionClient
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
   reapEnvironments?: typeof reapFactoryEnvironmentsOnce
   /** Hermetic package/registry metadata for CLI tests and alternate runtimes. */
@@ -189,6 +194,14 @@ type ParsedCommand =
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
   | { kind: 'factory-init'; repo?: string; workspaceId?: string }
   | { kind: 'notion-intake'; manifestPath: string }
+  | {
+      kind: 'notion-manifest'
+      dataSourceId?: string
+      mountRoot?: string
+      workerMountRoot?: string
+      workerMountTransport?: 'local' | 'relay-channel'
+      statePath?: string
+    }
 
 export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Promise<number> {
   const out = deps.stdout ?? process.stdout
@@ -222,6 +235,24 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
 
     if (command.kind === 'factory-init') {
       await initializeFactory({ repo: command.repo, workspaceId: command.workspaceId, stdout: out, stderr: err })
+      return 0
+    }
+
+    if (command.kind === 'notion-manifest') {
+      const notion = deps.notionFactoryTasks ?? new NotionApiFactoryTasksClient({
+        token: (deps.env ?? process.env).NOTION_API_KEY ?? '',
+      })
+      const manifest = await generateFactoryTasksManifest({
+        client: notion,
+        ...(command.dataSourceId ? { dataSourceId: command.dataSourceId } : {}),
+        ...(command.mountRoot ? { mountRoot: command.mountRoot } : {}),
+        ...(command.workerMountRoot ? { workerMountRoot: command.workerMountRoot } : {}),
+        ...(command.workerMountTransport
+          ? { workerMountTransport: command.workerMountTransport }
+          : {}),
+        ...(command.statePath ? { statePath: command.statePath } : {}),
+      })
+      writeJson(out, manifest)
       return 0
     }
 
@@ -595,6 +626,31 @@ export function parseFleetCommand(args: string[]): ParsedCommand {
 function parseIntakeCommand(args: string[]): ParsedCommand {
   const [source, manifestPath, ...rest] = args
   if (source !== 'notion') throw new Error('factory intake currently requires the notion source')
+  if (manifestPath === 'generate') {
+    const parsed = parseFlags(rest)
+    const allowed = new Set([
+      'data-source',
+      'mount-root',
+      'worker-mount-root',
+      'worker-mount-transport',
+      'state-path',
+    ])
+    const unexpected = Object.keys(parsed).find((key) => !allowed.has(key))
+    if (unexpected) throw new Error(`Unknown Factory Tasks manifest option: --${unexpected}`)
+    const workerMountTransport = parsed['worker-mount-transport']
+    if (workerMountTransport !== undefined &&
+      workerMountTransport !== 'local' && workerMountTransport !== 'relay-channel') {
+      throw new Error('--worker-mount-transport must be local or relay-channel')
+    }
+    return {
+      kind: 'notion-manifest',
+      ...(parsed['data-source'] ? { dataSourceId: parsed['data-source'] } : {}),
+      ...(parsed['mount-root'] ? { mountRoot: parsed['mount-root'] } : {}),
+      ...(parsed['worker-mount-root'] ? { workerMountRoot: parsed['worker-mount-root'] } : {}),
+      ...(workerMountTransport ? { workerMountTransport } : {}),
+      ...(parsed['state-path'] ? { statePath: parsed['state-path'] } : {}),
+    }
+  }
   if (!manifestPath) throw new Error('factory intake notion requires a manifest path')
   if (rest.length > 0) throw new Error(`Unexpected factory intake argument: ${rest[0]}`)
   return { kind: 'notion-intake', manifestPath }
@@ -2559,6 +2615,8 @@ Commands:
   close-probe <PR>      Probe/close a PR for an issue
   featuremap check      Validate .agentworkforce/features/manifest.yaml
   intake notion <file>  Normalize mounted Notion specs into Factory work
+  intake notion generate
+                        Emit a manifest for Ready for Agent Factory Tasks
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:

@@ -418,6 +418,28 @@ fleet fixture is ready. `start`, `kill-loop`, `reap-orphans`, `babysit`, and
 where promised, progress logs stay on stderr, unknown commands/options fail, and
 help/version/feature-map validation do not load config or construct providers.
 
+For Factory Tasks manifest generation, first run the hermetic API-shape and
+round-trip coverage in `src/intake/notion-manifest.test.ts`. The live tier-3
+extension requires a read-only `NOTION_API_KEY` whose connection can access the
+Factory Tasks parent database:
+
+```bash
+factory intake notion generate > "$TMP/notion-intake.json"
+node --input-type=module - "$TMP/notion-intake.json" <<'NODE'
+import { readFileSync } from 'node:fs'
+import { manifestSchema } from './dist/intake/index.js'
+const manifest = manifestSchema.parse(JSON.parse(readFileSync(process.argv[2], 'utf8')))
+if (!manifest.tasks.every((task) => task.bootstrap?.status === 'ready')) process.exit(1)
+NODE
+```
+
+Confirm every task matches a current `Ready for Agent` row, `Labels` and
+`Route` are merged only into repository targets, `Public Summary` is mapped
+only as the reviewed public-safe repository description, rerunning without
+database changes produces byte-identical JSON, and the row statuses are
+unchanged. Do not run non-dry intake against production rows as part of this
+verification.
+
 **Automation limit:** the package and fixture subset is deterministic. Commands
 that signal a process or mutate an issue/PR remain live or manual checks.
 

@@ -348,6 +348,19 @@ describe('fleet CLI parsing', () => {
     expect(() => parseFleetCommand(['intake', 'notion'])).toThrow(
       'requires a manifest path',
     )
+    expect(parseFleetCommand([
+      'intake',
+      'notion',
+      'generate',
+      '--data-source',
+      'collection://a7fb83ad-c667-4003-a1dc-132c6826aac1',
+      '--worker-mount-transport',
+      'relay-channel',
+    ])).toEqual({
+      kind: 'notion-manifest',
+      dataSourceId: 'collection://a7fb83ad-c667-4003-a1dc-132c6826aac1',
+      workerMountTransport: 'relay-channel',
+    })
   })
 
   it('parses global backend, config, and dry-run independently of subcommand position', () => {
@@ -826,6 +839,8 @@ describe('fleet CLI runtime', () => {
       const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
       const notionClaims = {
         get: vi.fn(async (sourceKey: string) => durableClaims.get(sourceKey)),
+        findBySourcePrefix: vi.fn(async (sourceKeyPrefix: string) => [...durableClaims.values()]
+          .filter((claim) => claim.sourceKey.startsWith(sourceKeyPrefix))),
         claim: vi.fn(async (claim: { sourceKey: string; digest: string; claimedAt: string }) => {
           const existing = durableClaims.get(claim.sourceKey)
           if (existing) return { status: 'existing' as const, claim: existing }

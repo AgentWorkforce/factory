@@ -14,6 +14,7 @@ function fakeRelaySurface(options: { failWrites?: boolean } = {}) {
       delete: vi.fn(async () => undefined),
     },
     channels: {
+      list: vi.fn(async () => [...channels.keys()].map((name) => ({ name }))),
       get: vi.fn(async (name: string) => {
         if (!channels.has(name)) throw Object.assign(new Error('missing'), { code: 'channel_not_found' })
         return { name }
@@ -85,6 +86,19 @@ describe('RelayChannelNotionClaimStore', () => {
     await expect(second.get(claim.sourceKey)).resolves.toEqual(claim)
     await expect(second.get('notion:missing')).resolves.toBeUndefined()
     expect(fake.sendCount()).toBe(1)
+  })
+
+  it('discovers legacy destination claims by provider-native page prefix', async () => {
+    const fake = fakeRelaySurface()
+    const store = new RelayChannelNotionClaimStore({ workspaceKey: 'workspace-key', createRelay: fake.createRelay })
+    await store.claim(claim)
+    await store.claim({
+      ...claim,
+      sourceKey: 'notion:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:repo:agentworkforce/cloud',
+    })
+
+    await expect(store.findBySourcePrefix('notion:3b36800c-1c90-801d-b1cf-c8f2e1cff7cf:'))
+      .resolves.toEqual([claim])
   })
 
   it('leaves an incomplete durable channel and rejects when the claim record write fails', async () => {
