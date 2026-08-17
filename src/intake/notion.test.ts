@@ -521,6 +521,94 @@ describe('Notion spec intake', () => {
     expect(github.createIssue).not.toHaveBeenCalled()
   })
 
+  it('refuses disagreeing legacy destination claims without writing a canonical claim', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'Example/current', labels: [] }),
+    })
+    roots.push(root)
+    const [task] = await normalizeNotionManifest(manifest)
+    const workUnitKey = `notion:${pageId}`
+    durableClaims.set(`${workUnitKey}:repo:example/one`, {
+      sourceKey: `${workUnitKey}:repo:example/one`,
+      digest: task!.digest,
+      claimedAt: '2026-08-06T20:00:00.000Z',
+    })
+    durableClaims.set(`${workUnitKey}:repo:example/two`, {
+      sourceKey: `${workUnitKey}:repo:example/two`,
+      digest: 'disagreeing-digest',
+      claimedAt: '2026-08-06T20:01:00.000Z',
+    })
+    const github = fakeGithub({ visibility: 'private' })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: 'legacy Notion claims disagree for the provider-native work unit; refusing dispatch',
+    })
+    expect(durableClaims.has(workUnitKey)).toBe(false)
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('continues refusing disagreeing legacy destination claims on a repeated run', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'Example/current', labels: [] }),
+    })
+    roots.push(root)
+    const [task] = await normalizeNotionManifest(manifest)
+    const workUnitKey = `notion:${pageId}`
+    durableClaims.set(`${workUnitKey}:repo:example/one`, {
+      sourceKey: `${workUnitKey}:repo:example/one`,
+      digest: task!.digest,
+      claimedAt: '2026-08-06T20:00:00.000Z',
+    })
+    durableClaims.set(`${workUnitKey}:repo:example/two`, {
+      sourceKey: `${workUnitKey}:repo:example/two`,
+      digest: 'disagreeing-digest',
+      claimedAt: '2026-08-06T20:01:00.000Z',
+    })
+    const github = fakeGithub({ visibility: 'private' })
+
+    const first = await runNotionIntake({ manifest, dispatch: true, claims, github })
+    const second = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    for (const report of [first, second]) {
+      expect(report.results[0]).toMatchObject({
+        status: 'blocked',
+        reason: 'legacy Notion claims disagree for the provider-native work unit; refusing dispatch',
+      })
+    }
+    expect(durableClaims.has(workUnitKey)).toBe(false)
+    expect(github.createIssue).not.toHaveBeenCalled()
+  })
+
+  it('migrates agreeing legacy destination claims to one canonical claim', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'Example/current', labels: [] }),
+    })
+    roots.push(root)
+    const [task] = await normalizeNotionManifest(manifest)
+    const workUnitKey = `notion:${pageId}`
+    for (const [repo, claimedAt] of [
+      ['one', '2026-08-06T20:00:00.000Z'],
+      ['two', '2026-08-06T20:01:00.000Z'],
+    ] as const) {
+      const sourceKey = `${workUnitKey}:repo:example/${repo}`
+      durableClaims.set(sourceKey, { sourceKey, digest: task!.digest, claimedAt })
+    }
+    const github = fakeGithub({ visibility: 'private' })
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report.results[0]).toMatchObject({ status: 'dispatched' })
+    expect(durableClaims.get(workUnitKey)).toEqual({
+      sourceKey: workUnitKey,
+      digest: task!.digest,
+      claimedAt: '2026-08-06T20:00:00.000Z',
+    })
+    expect(github.createIssue).toHaveBeenCalledTimes(1)
+  })
+
   it('serializes overlapping runs and creates one lifecycle issue', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),

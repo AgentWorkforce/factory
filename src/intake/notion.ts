@@ -722,6 +722,10 @@ async function ensureNotionWorkUnitClaim(
     .sort((left, right) => left.claimedAt.localeCompare(right.claimedAt) ||
       left.sourceKey.localeCompare(right.sourceKey))
   if (legacyClaims.length > 0) {
+    const legacyDigests = new Set(legacyClaims.map((claim) => claim.digest))
+    if (legacyDigests.size > 1) {
+      throw new Error('legacy Notion claims disagree for the provider-native work unit; refusing dispatch')
+    }
     const [authoritative] = legacyClaims
     const migrated = await input.claims.claim({
       sourceKey: task.workUnitKey,
@@ -729,10 +733,6 @@ async function ensureNotionWorkUnitClaim(
       claimedAt: authoritative!.claimedAt,
     })
     assertNotionClaim(migrated.claim, task.workUnitKey, authoritative!.digest)
-    const legacyDigests = new Set(legacyClaims.map((claim) => claim.digest))
-    if (legacyDigests.size > 1) {
-      throw new Error('legacy Notion claims disagree for the provider-native work unit; refusing dispatch')
-    }
     assertNotionClaim(migrated.claim, task.workUnitKey, task.digest)
     return migrated.claim
   }
