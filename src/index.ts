@@ -5,36 +5,13 @@ export * from './state/index.js'
 export * from './cost/index.js'
 export { DocumentStateStore, FileStateStore, githubWatchStatePath } from './state/file-state-store.js'
 export type { DocumentStateStoreOptions, FileStateStoreOptions } from './state/file-state-store.js'
-export {
-  CLOUDFLARE_STATE_BACKEND,
-  FACTORY_STATE_BACKEND_ENV,
-  FACTORY_STATE_URL_ENV,
-  CloudflareStateStore,
-  CloudflareWatchStateDocumentStore,
-} from './state/cloudflare-state-store.js'
-export type {
-  CloudflareStateStoreOptions,
-  CloudflareWatchStateDocumentStoreOptions,
-} from './state/cloudflare-state-store.js'
 export { WatchStateDocumentConflictError } from './state/document-store.js'
+export { parseWatchStateDocument } from './state/watch-state-document.js'
 export type {
-  FactoryStateBackend,
   PersistedWorkspaceState,
   WatchStateDocument,
   WatchStateDocumentStore,
 } from './state/document-store.js'
-export {
-  DurableObjectWatchStateService,
-  SqliteDurableDocumentPersistence,
-} from './hosted/document-state.js'
-export type {
-  DurableDocumentChange,
-  DurableDocumentPersistence,
-  DurableDocumentRecord,
-  DurableDocumentSnapshot,
-  DurableObjectSqlStorage,
-  DurableObjectTransactionalStorage,
-} from './hosted/document-state.js'
 export type { FactoryConfig, FactoryStateRole, PreviewConfig, PreviewServiceConfig } from './config/schema'
 export { DEFAULT_AGENT_HOLD_TIMEOUT_MS, FactoryConfigSchema, FACTORY_STATE_ROLES } from './config/schema'
 export * from './environments/index.js'

@@ -24,7 +24,6 @@ import type {
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
 import type {
-  FactoryStateBackend,
   PersistedWorkspaceState,
   WatchStateDocument,
   WatchStateDocumentStore,
@@ -38,7 +37,8 @@ export type FileStateStoreOptions = InMemoryStateStoreOptions & {
 }
 
 export type DocumentStateStoreOptions = InMemoryStateStoreOptions & {
-  backend: FactoryStateBackend
+  /** Optional host-defined identifier surfaced by embedded CLI status. */
+  backend?: string
   documentStore: WatchStateDocumentStore
   /** Injectable for deterministic stale-process lease recovery tests. */
   isProcessAlive?: (pid: number) => boolean
@@ -63,7 +63,7 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
  * updates instead of publishing divergent cached documents.
  */
 export class DocumentStateStore extends InMemoryStateStore {
-  readonly backend: FactoryStateBackend
+  readonly backend?: string
   readonly #documentStore: WatchStateDocumentStore
   readonly #batchSize: number
   readonly #isProcessAlive: (pid: number) => boolean
@@ -1067,7 +1067,6 @@ export class DocumentStateStore extends InMemoryStateStore {
 export class FileStateStore extends DocumentStateStore {
   constructor(options: FileStateStoreOptions) {
     super({
-      backend: 'file',
       batchSize: options.batchSize,
       isProcessAlive: options.isProcessAlive,
       documentStore: new FileWatchStateDocumentStore(options.watchStatePath),

@@ -18,10 +18,6 @@ import {
 } from './exit-codes'
 import {
   FileStateStore,
-  CloudflareStateStore,
-  CLOUDFLARE_STATE_BACKEND,
-  FACTORY_STATE_BACKEND_ENV,
-  FACTORY_STATE_URL_ENV,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
   closeProbePr,
@@ -86,6 +82,7 @@ import {
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider } from '../ports'
+import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
@@ -106,12 +103,21 @@ import {
   type WorkspaceTaskDispatcher,
 } from '../intake'
 
-interface FleetCliDeps {
+export type CliStateStore = StateStore & {
+  /** Host readiness gate. The CLI invokes it before constructing Factory. */
+  assertReady(): Promise<void>
+  /** Optional host-defined identifier included in status output. */
+  readonly backend?: string
+}
+
+export type CliStateStoreFactory = (config: FactoryConfig) => Promise<CliStateStore> | CliStateStore
+
+export interface FleetCliDeps {
   fleet?: FleetClient
   /** Hermetic credential environment for the relay backend (tests). */
   env?: NodeJS.ProcessEnv
-  /** Hermetic transport for the Cloudflare durable-state backend (tests). */
-  stateFetch?: typeof globalThis.fetch
+  /** Host-supplied durable state adapter; the file implementation remains the default. */
+  stateStoreFactory?: CliStateStoreFactory
   mount?: MountClient
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
@@ -444,15 +450,16 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
-        const stateStore = createCliStateStore(
-          loaded.config,
-          deps.env ?? process.env,
-          deps.stateFetch,
-        )
-        // Dispatch admission is deliberately fail-closed. A remote backend
-        // must prove that its durable document is readable before Factory is
-        // constructed; an empty fallback would make every prior claim vanish.
-        if (stateStore.backend !== 'file') await stateStore.assertReady()
+        const stateStore = deps.stateStoreFactory
+          ? await deps.stateStoreFactory(loaded.config)
+          : new FileStateStore({
+              batchSize: loaded.config.batchSize,
+              watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
+            })
+        // An injected backend is an explicit dispatch-admission dependency.
+        // It must prove readiness before Factory construction; a host adapter
+        // may never turn an unreadable durable store into an empty document.
+        if (deps.stateStoreFactory) await stateStore.assertReady()
         reporter = deps.reporter ?? await buildFactoryCloudReporter({
           config: loaded.config,
           backend: globals.backend,
@@ -495,7 +502,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           deps,
           workspaceId,
           acceptableMountIds,
-          stateStore.backend === 'file' ? undefined : stateStore.backend,
+          stateStore.backend ? { backend: stateStore.backend } : undefined,
         )
       }
     }
@@ -692,7 +699,7 @@ async function runFactoryCommand(
   deps: FleetCliDeps = {},
   workspaceId: string = config.workspaceId ?? '',
   acceptableMountIds?: readonly string[],
-  stateBackend?: 'cloudflare-do',
+  stateStoreStatus?: { backend: string },
 ): Promise<number> {
   const mountFn = resolveLocalMountFn(deps, mount)
   const mountStderr = deps.stderr ?? process.stderr
@@ -817,7 +824,7 @@ async function runFactoryCommand(
         config.loop.registryPath,
         config.loop.heartbeatStaleMs,
         versionInfo,
-        stateBackend,
+        stateStoreStatus,
       ))
       return 0
     }
@@ -858,7 +865,7 @@ async function runFactoryCommand(
           config.loop.registryPath,
           config.loop.heartbeatStaleMs,
           undefined,
-          stateBackend,
+          stateStoreStatus,
         ),
       })
     } finally {
@@ -1150,9 +1157,9 @@ async function factoryStatusWithMountHealth(
   registryPath: string,
   heartbeatStaleMs: number,
   versionInfo?: FactoryVersionInfo,
-  stateBackend?: 'cloudflare-do',
+  stateStoreStatus?: { backend: string },
 ): Promise<ReturnType<Factory['status']> & {
-  stateBackend?: 'cloudflare-do'
+  stateStore?: { backend: string }
   version?: string
   installedAt?: string
   latestVersion?: string
@@ -1202,7 +1209,7 @@ async function factoryStatusWithMountHealth(
   if (!health) return {
     ...observableStatus,
     ...versionInfo,
-    ...(stateBackend ? { stateBackend } : {}),
+    ...(stateStoreStatus ? { stateStore: stateStoreStatus } : {}),
     heldAgents,
     eventListener,
     readinessReconcile,
@@ -1210,7 +1217,7 @@ async function factoryStatusWithMountHealth(
   return {
     ...observableStatus,
     ...versionInfo,
-    ...(stateBackend ? { stateBackend } : {}),
+    ...(stateStoreStatus ? { stateStore: stateStoreStatus } : {}),
     heldAgents,
     eventListener,
     readinessReconcile,
@@ -1482,34 +1489,6 @@ async function loadConfig(path?: string, options: LocalClonePathOptions = {}): P
     }),
     fixtureFiles: record.fixtureFiles ? asRecord(record.fixtureFiles) : undefined,
   }
-}
-
-function createCliStateStore(
-  config: FactoryConfig,
-  env: NodeJS.ProcessEnv,
-  stateFetch?: typeof globalThis.fetch,
-): FileStateStore | CloudflareStateStore {
-  const backend = env[FACTORY_STATE_BACKEND_ENV]?.trim() || 'file'
-  if (backend === 'file') {
-    return new FileStateStore({
-      batchSize: config.batchSize,
-      watchStatePath: githubWatchStatePath(config.loop.registryPath),
-    })
-  }
-  if (backend !== CLOUDFLARE_STATE_BACKEND) {
-    throw new Error(
-      `${FACTORY_STATE_BACKEND_ENV} must be "file" or "${CLOUDFLARE_STATE_BACKEND}", received ${JSON.stringify(backend)}`,
-    )
-  }
-  const url = env[FACTORY_STATE_URL_ENV]?.trim()
-  if (!url) {
-    throw new Error(`${FACTORY_STATE_URL_ENV} is required when ${FACTORY_STATE_BACKEND_ENV}=${CLOUDFLARE_STATE_BACKEND}`)
-  }
-  return new CloudflareStateStore({
-    batchSize: config.batchSize,
-    url,
-    ...(stateFetch ? { fetch: stateFetch } : {}),
-  })
 }
 
 function commandUsesLocalCheckout(command: ParsedCommand): boolean {

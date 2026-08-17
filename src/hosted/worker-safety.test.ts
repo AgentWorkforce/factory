@@ -20,9 +20,8 @@ describe('hosted Factory Worker entrypoints', () => {
       logLevel: 'silent',
     })
 
-    const hosted = result.outputFiles.find(({ path }) => path.endsWith('/hosted.js'))?.text
-    expect(hosted).toContain('HostedFactoryLoop')
-    expect(hosted).toContain('DurableObjectWatchStateService')
+    expect(result.outputFiles.find(({ path }) => path.endsWith('/hosted.js'))?.text)
+      .toContain('HostedFactoryLoop')
     expect(result.outputFiles.find(({ path }) => path.endsWith('/telemetry.js'))?.text)
       .toContain('FactoryCloudEventInputV1Schema')
     expect(Object.keys(result.metafile.inputs)).not.toContain('src/observability/outbox.ts')

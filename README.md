@@ -562,10 +562,8 @@ fence.
 
 ### Hosting the control plane in Cloud
 
-Cloudflare Container deployments must use the fail-closed SQLite Durable
-Object state bridge documented in
-[`docs/cloudflare-durable-state.md`](docs/cloudflare-durable-state.md); container
-disk is not a durable claim store.
+Deployment hosts can inject durable coordination storage through the
+host-neutral [`DocumentStateStore` port](docs/document-state-store.md).
 
 `@agent-relay/factory/hosted` is the worker-safe control-plane entrypoint. It
 contains no Node filesystem/process dependency and runs the complete sweep:

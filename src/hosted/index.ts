@@ -14,18 +14,6 @@ export type {
   HostedFactoryDurableObjectTransaction,
   InMemoryHostedFactoryStateStoreOptions,
 } from './state-store.js'
-export {
-  DurableObjectWatchStateService,
-  SqliteDurableDocumentPersistence,
-} from './document-state.js'
-export type {
-  DurableDocumentChange,
-  DurableDocumentPersistence,
-  DurableDocumentRecord,
-  DurableDocumentSnapshot,
-  DurableObjectSqlStorage,
-  DurableObjectTransactionalStorage,
-} from './document-state.js'
 export type {
   HostedFactory,
   HostedFactoryCompletion,

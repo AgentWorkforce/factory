@@ -23,8 +23,6 @@ export type WatchStateDocument = {
   workspaces: Record<string, PersistedWorkspaceState>
 }
 
-export type FactoryStateBackend = 'file' | 'cloudflare-do'
-
 /**
  * Persistence seam for the document-backed StateStore behavior.
  *
