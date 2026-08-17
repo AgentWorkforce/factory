@@ -325,7 +325,7 @@ export interface TriageDecision {
   issue: IssueRef
   issueResolution?: IssueResolution
   routes: Array<{ repo: string; clonePath?: string; rationale: string }>
-  scope: 'single' | 'workflow' | 'team'
+  scope: 'single' | 'workflow' | 'team' | 'swarm'
   implementers: AgentSpec[]
   workflow?: AgentSpec
   reviewer: AgentSpec

@@ -17,7 +17,7 @@ import type {
 } from '../index'
 import { FactoryConfigSchema, LiveDispatchStateChangedError, stateResolutionFromIds } from '../index'
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
-import { FileStateStore } from '../state/file-state-store'
+import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
@@ -60,6 +60,20 @@ const staleVersionInfo = {
   latestVersion: '0.1.58',
   versionsBehind: 38,
 }
+
+const testDocumentStateStore = (options: {
+  backend?: string
+  assertReady?: () => Promise<void>
+} = {}): DocumentStateStore => new DocumentStateStore({
+  batchSize: 2,
+  ...(options.backend ? { backend: options.backend } : {}),
+  documentStore: {
+    read: async () => ({ version: 3, workspaces: {} }),
+    write: async () => {},
+    runMutation: async (operation) => await operation(),
+    assertReady: options.assertReady ?? (async () => {}),
+  },
+})
 
 const fakeHarnessClient = (): HarnessDriverClientLike => ({
   async spawnPty(input) {
@@ -2626,12 +2640,14 @@ describe('fleet CLI runtime', () => {
         on: vi.fn(),
         dispose: vi.fn(),
       } as unknown as Factory
+      const assertReady = vi.fn(async () => {})
 
       const code = await runFleetCli([
         'status',
         '--config',
         configPath,
       ], {
+        stateStoreFactory: () => testDocumentStateStore({ backend: 'test-durable', assertReady }),
         fleet: new FakeFleetClient(),
         mount: new FakeMountClient(),
         createFactory: () => factory,
@@ -2641,9 +2657,11 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
+      expect(assertReady).toHaveBeenCalledTimes(1)
       expect(JSON.parse(output.text())).toMatchObject({
         ...factoryStatus,
         ...staleVersionInfo,
+        stateStore: { backend: 'test-durable' },
         heldAgents: [{
           name: 'ar-252-impl-factory',
           issue: { key: '252' },
@@ -2655,6 +2673,36 @@ describe('fleet CLI runtime', () => {
           state: 'not-listening',
           reason: 'heartbeat missing',
         },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not eagerly read file state for a status command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-file-state-compat-'))
+    try {
+      const registryPath = join(root, 'registry.json')
+      const configPath = await writeConfig(root, { loop: { registryPath } })
+      await writeFile(join(root, 'github-issue-comment-watches.json'), 'not json')
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        inFlight: [],
+        queued: [],
+        counters: {},
       })
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -3557,6 +3605,34 @@ describe('fleet CLI runtime', () => {
       expect(debugOutput).toContain('[factory] refreshed 1 stale local mount(s)')
     } finally {
       process.chdir(previousCwd)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed before Factory construction when an injected state backend is unreadable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-durable-state-gate-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const createFactorySpy = vi.fn()
+      const assertReady = vi.fn(async () => {
+        throw new Error('injected durable state is unreachable')
+      })
+      const errors = buffer()
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        stateStoreFactory: () => testDocumentStateStore({ assertReady }),
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: createFactorySpy as typeof createFactory,
+        stdout: buffer(),
+        stderr: errors,
+      })
+
+      expect(code).toBe(1)
+      expect(assertReady).toHaveBeenCalledTimes(1)
+      expect(createFactorySpy).not.toHaveBeenCalled()
+      expect(errors.text()).toContain('injected durable state is unreachable')
+    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })

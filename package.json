@@ -54,6 +54,10 @@
       "types": "./dist/node/factory.node.d.ts",
       "import": "./dist/node/factory.node.js"
     },
+    "./cli": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
     "./featuremap": {
       "types": "./dist/featuremap/index.d.ts",
       "import": "./dist/featuremap/index.js"
@@ -85,6 +89,7 @@
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
     "test:e2e:kubernetes": "bash scripts/test-kubernetes-provider-e2e.sh",
+    "benchmark": "tsx benchmark/run.ts",
     "test:e2e:load": "tsx test/e2e/load-harness.e2e.ts",
     "test:e2e:verification": "tsx test/e2e/verification-gate.e2e.ts",
     "test:stack-e2e": "tsx test/e2e/stack-deployer.e2e.ts",

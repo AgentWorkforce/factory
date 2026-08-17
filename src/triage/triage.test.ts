@@ -191,6 +191,13 @@ describe('HeuristicTriage thin and scope detection', () => {
       expectedImplementers: ['ar-123-impl-pear', 'ar-123-impl-scope'],
       expectedWorkflow: undefined,
     },
+    {
+      name: 'agent:swarm produces a lead and one worker sharing a checkout',
+      labels: ['pear', 'agent:swarm'],
+      expectedScope: 'swarm',
+      expectedImplementers: ['ar-123-impl-lead', 'ar-123-impl-worker-1'],
+      expectedWorkflow: undefined,
+    },
   ])('$name', async ({ labels, expectedScope, expectedImplementers, expectedWorkflow }) => {
     const decision = await new HeuristicTriage().triage(issue({
       labels,
@@ -220,6 +227,47 @@ describe('HeuristicTriage thin and scope detection', () => {
     expect(decision.scope).toBe('team')
     expect(decision.implementers.map((implementer) => implementer.name)).toEqual(['ar-123-impl-ui', 'ar-123-impl-main'])
     expect(decision.implementers.every((implementer) => implementer.repo === 'AgentWorkforce/pear')).toBe(true)
+  })
+
+  it('is never inferred heuristically, only from the agent:swarm label', async () => {
+    const decision = await new HeuristicTriage().triage(issue({
+      labels: ['pear', 'agents'],
+      description: richDescription('Update renderer and broker surfaces with tests in src/main/broker.ts.'),
+    }), ctx)
+
+    // Same fixture as the multi-route team test above — proves swarm is opt-in only.
+    expect(decision.scope).toBe('team')
+  })
+
+  it('gives every swarm member the same checkout and a shared relay channel', async () => {
+    const decision = await new HeuristicTriage().triage(issue({
+      labels: ['pear', 'agent:swarm'],
+    }), ctx)
+
+    expect(decision.scope).toBe('swarm')
+    expect(decision.implementers).toHaveLength(2)
+    expect(decision.implementers.every((implementer) => implementer.clonePath === '/work/pear')).toBe(true)
+    expect(decision.implementers.every((implementer) => implementer.channel === 'swarm-ar-123')).toBe(true)
+    expect(decision.implementers[0]?.task).toMatch(/SWARM LEAD/)
+    expect(decision.implementers[0]?.task).toMatch(/#swarm-ar-123/)
+    expect(decision.implementers[1]?.task).toMatch(/SWARM WORKER/)
+  })
+
+  it('caps swarm members at triage.maxImplementers, same as team', async () => {
+    const config = FactoryConfigSchema.parse({
+      workspaceId: 'ws_123',
+      triage: { maxImplementers: 3 },
+      repos: baseConfig.repos,
+      models: { implementer: 'codex-test', reviewer: 'claude-test' },
+    })
+
+    const decision = await new HeuristicTriage().triage(issue({ labels: ['pear', 'agent:swarm'] }), { ...ctx, config })
+
+    expect(decision.implementers.map((implementer) => implementer.name)).toEqual([
+      'ar-123-impl-lead',
+      'ar-123-impl-worker-1',
+      'ar-123-impl-worker-2',
+    ])
   })
 
   it('builds AgentSpec entries from config models and clone paths', async () => {
