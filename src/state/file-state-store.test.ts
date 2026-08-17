@@ -38,6 +38,7 @@ describe('FileStateStore', () => {
         workspaces: {
           'workspace-1': {
             githubIssueCommentWatches: {},
+            slackThreadWatches: {},
             waitingClarifications: {},
             babysitterSessions: {},
             babysitterGenerations: {},

@@ -5,6 +5,7 @@ import { parseWatchStateDocument } from './watch-state-document'
 describe('parseWatchStateDocument', () => {
   it.each([
     ['GitHub watch', 'githubIssueCommentWatches'],
+    ['Slack thread watch', 'slackThreadWatches'],
     ['waiting clarification', 'waitingClarifications'],
     ['dispatch lifecycle', 'dispatchLifecycles'],
   ])('rejects a malformed %s record during readiness parsing', (_label, collection) => {
@@ -77,6 +78,7 @@ const validDocument = (): Record<string, any> => ({
           }],
         },
       },
+      slackThreadWatches: {},
       waitingClarifications: {
         clarification: {
           issue: issue(),
