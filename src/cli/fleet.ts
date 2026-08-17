@@ -452,7 +452,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // Dispatch admission is deliberately fail-closed. A remote backend
         // must prove that its durable document is readable before Factory is
         // constructed; an empty fallback would make every prior claim vanish.
-        await stateStore.assertReady()
+        if (stateStore.backend !== 'file') await stateStore.assertReady()
         reporter = deps.reporter ?? await buildFactoryCloudReporter({
           config: loaded.config,
           backend: globals.backend,

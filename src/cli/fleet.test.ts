@@ -2670,6 +2670,36 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('does not eagerly read file state for a status command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-file-state-compat-'))
+    try {
+      const registryPath = join(root, 'registry.json')
+      const configPath = await writeConfig(root, { loop: { registryPath } })
+      await writeFile(join(root, 'github-issue-comment-watches.json'), 'not json')
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({
+        inFlight: [],
+        queued: [],
+        counters: {},
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces degraded readiness reconciliation from the live daemon heartbeat', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reconcile-status-'))
     try {
