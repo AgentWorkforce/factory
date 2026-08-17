@@ -287,7 +287,7 @@ categories:
       - id: fleet-target-node
         name: Target Fleet Node
         cli: factory fleet spawn <capability> --node <self|node-name>
-        description: Constrain a spawn or resume request to the local node or a named hosted node
+        description: Constrain internal placement to the local node or Relay placement to a named hosted node; Relay treats self as no preference and fails closed unless the result proves a named remote node
         location: src/cli/fleet.ts, src/fleet/relay-fleet-client.ts
         verify_tier: 4
 
@@ -1246,7 +1246,7 @@ categories:
       - id: fleet-relay-backend
         name: Hosted Relay Fleet
         api: RelayFleetClient
-        description: Invoke hosted spawn and release actions, place by capability or node, and expose a unified roster
+        description: Invoke hosted spawn and release actions, place by capability or node, reject results that do not prove a named remote node, and expose a unified roster
         location: src/fleet/relay-fleet-client.ts
         verify_tier: 4
 

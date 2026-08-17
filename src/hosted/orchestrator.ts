@@ -21,6 +21,7 @@ import type {
   HostedFactoryRunReport,
   HostedFactoryWritebackRecord,
 } from './types'
+import { dispatchAgentIdentityKey } from '../dispatch/work-unit-identity'
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60_000
 const DEFAULT_MAX_ISSUES_PER_RUN = 100
@@ -366,6 +367,7 @@ export class HostedFactoryLoop implements HostedFactory {
       lease = await this.#renew(lease)
       const result = await this.#ports.fleet.spawn({
         ...structuredClone(invocation.spec),
+        identityKey: dispatchAgentIdentityKey(record.issue, invocation.spec.role),
         invocationId: invocation.invocationId,
       })
       if (result.invocationId && result.invocationId !== invocation.invocationId) {

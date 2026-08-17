@@ -668,6 +668,38 @@ abandoned so a restart cannot respawn it:
 }
 ```
 
+### Recover names created before dispatch identity proofs
+
+Factory stamps every dispatched agent with a stable broker identity derived from
+the provider-native issue identity and role. For example, the reviewer for
+`AgentWorkforce/factory#244` uses
+`factory:dispatch:v1:github:agentworkforce/factory#244:reviewer`. A retry of that
+work unit can reclaim its deterministic agent name after a crash, while another
+repository's issue 244 cannot.
+
+Agent records created before this behavior have no identity stamp and cannot be
+reclaimed automatically. This includes the burned `ar-244-review-factory` seat
+and any `ar-244-impl-factory` / `ar-244-babysit-factory` siblings created by the
+same pre-fix dispatch. After verifying the named process is no longer live, run
+the broker's guarded, one-time legacy recovery for each affected name. The
+workspace key and Relaycast base URL use their normal environment variables;
+the raw proof is supplied only through the environment and is never placed on
+the command line:
+
+```bash
+BROKER_BIN="$(node --input-type=module -e \
+  "import { getBrokerBinaryPath } from '@agent-relay/harness-driver/broker-path'; const p = getBrokerBinaryPath(); if (!p) process.exit(1); process.stdout.write(p)")"
+
+RELAY_AGENT_IDENTITY_KEY='factory:dispatch:v1:github:agentworkforce/factory#244:reviewer' \
+  "$BROKER_BIN" reclaim-legacy-identity ar-244-review-factory
+```
+
+Use the matching role suffix (`implementer`, `reviewer`, or `babysitter`) for
+each sibling. Recovery refuses a live record, a record that already has an
+identity stamp, or a concurrent competing claim; it does not weaken ordinary
+collision checks. Once stamped, the next Factory retry presents the same proof
+and reclaims normally.
+
 The full schema — every field and default — is validated by Zod at load time, so
 an invalid config fails fast with a field-level error. See
 [`src/config/schema.ts`](src/config/schema.ts) for the authoritative reference,

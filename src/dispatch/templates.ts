@@ -75,6 +75,13 @@ export interface RenderAgentTaskInput {
   branchPrepared?: boolean
   /** Registered relay identity used in durable human-input request comments. */
   agentName?: string
+  /** Set only for scope 'swarm': this implementer collaborates live with named others over a shared relay channel. */
+  swarm?: {
+    role: 'lead' | 'worker'
+    channel: string
+    /** The other swarm members sharing this checkout and channel (excludes this agent). */
+    otherMemberNames: string[]
+  }
   /** Durable Relay action owned by the active Factory process. */
   lifecycleActionName?: string
   /**
@@ -119,21 +126,57 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ] : []),
   ]
 
+  const swarmInstructions = input.swarm ? renderSwarmInstructions(input.swarm) : []
+
+  // Swarm workers share the lead's checkout and branch. The lead alone
+  // commits/pushes the integrated result; workers must not race the lead's
+  // history nor expose an incomplete branch (see renderSwarmInstructions).
+  // Render commit/push/reviewer/lifecycle lines only for roles that own
+  // publication — everyone except a swarm worker.
+  const isSwarmWorker = input.swarm?.role === 'worker'
+  const branchLine = input.branchName && input.branchPrepared
+    ? isSwarmWorker
+      ? `Factory already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; the lead commits and pushes the integrated result.`
+      : `Factory already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; commit and push only this branch.`
+    : input.branchName
+    ? isSwarmWorker
+      ? `Continue on the exact branch \`${input.branchName}\` in this shared checkout. Do not reset it, switch branches, or push it — the lead publishes.`
+      : `Create a branch for this issue before editing. Create or reset the exact branch \`${input.branchName}\` from the repository default branch, then commit and push only this branch.`
+    : 'Create a branch for this issue before editing.'
+  const publicationInstructions = isSwarmWorker
+    ? [
+        // A worker still commits its subtask locally so the lead can integrate
+        // it. It must not push, open a PR, or coordinate with the reviewer —
+        // the lead does that once the integrated branch is ready.
+        'Commit your subtask locally on the shared branch so the lead can integrate it. Do NOT push, do NOT run `gh pr create`, and do NOT DM the reviewer — the lead owns publication and reviewer handoff.',
+        // Split "done" from "blocked": the lead is authoritative for the
+        // completion lifecycle action, but a worker blocked on a human answer
+        // still needs the durable question flow rendered below (github-issue
+        // writeback, or lifecycle `invoke_action { kind: "blocked" }`).
+        'When your subtask is done, post the result on the shared swarm channel and output `/exit` on its own line. Do not call the Factory completion lifecycle action — the lead reports issue completion, not workers.',
+        // The "durable instructions below" only exist when the issue has
+        // github metadata OR a lifecycle action; otherwise questionInstructions
+        // falls back to "report in your final outcome", which is a plain
+        // report, not a durable recording route.
+        ...(sourceGithubIssue || input.lifecycleActionName
+          ? ['If you are blocked and need a human answer instead, follow the durable human-input instructions below (do not exit before recording the request).']
+          : ['If you are blocked, report one concrete question in your final outcome so Factory can route it for an answer.']),
+      ]
+    : [
+        'Commit the implementation and tests.',
+        'Push the branch to origin.',
+        'When implementation is complete, Factory will open the PR targeting the repository default branch through the connected GitHub workspace.',
+        'Do not run `gh pr create` or require local GitHub CLI authentication.',
+        `Factory will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
+        `Send reviewer \`${input.reviewerName}\` a concise branch and commit summary. If that direct delivery fails, do not fall back to a shared channel; Factory completion does not depend on this coordination message.`,
+      ]
   const common = [
     ...header,
+    ...swarmInstructions,
     '',
-    input.branchName && input.branchPrepared
-      ? `Factory already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; commit and push only this branch.`
-      : input.branchName
-      ? `Create a branch for this issue before editing. Create or reset the exact branch \`${input.branchName}\` from the repository default branch, then commit and push only this branch.`
-      : 'Create a branch for this issue before editing.',
-    'Commit the implementation and tests.',
-    'Push the branch to origin.',
-    'When implementation is complete, Factory will open the PR targeting the repository default branch through the connected GitHub workspace.',
-    'Do not run `gh pr create` or require local GitHub CLI authentication.',
-    `Factory will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
-    `Send reviewer \`${input.reviewerName}\` a concise branch and commit summary. If that direct delivery fails, do not fall back to a shared channel; Factory completion does not depend on this coordination message.`,
-    ...lifecycleInstructions(input, 'completed'),
+    branchLine,
+    ...publicationInstructions,
+    ...(isSwarmWorker ? [] : lifecycleInstructions(input, 'completed')),
     'Do NOT auto-merge.',
     mergePolicyLine(input.config.mergePolicy),
   ]
@@ -317,6 +360,24 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
     ...(input.integrationInstructions ? ['', input.integrationInstructions] : []),
     ...(input.testGuidance ? ['', input.testGuidance] : []),
   ].join('\n')
+}
+
+function renderSwarmInstructions(swarm: NonNullable<RenderAgentTaskInput['swarm']>): string[] {
+  const others = swarm.otherMemberNames.length > 0 ? swarm.otherMemberNames.join(', ') : 'the rest of the swarm'
+  if (swarm.role === 'lead') {
+    return [
+      '',
+      `You are the SWARM LEAD. ${others} (workers) are collaborating with you live in this SAME checkout.`,
+      `Coordinate over the shared relay channel #${swarm.channel}: break the work into subtasks, assign them to workers by name, and check their progress before you finish.`,
+      `Integrate everyone's changes into one coherent result before handing off to review. Do not finish until you've confirmed on #${swarm.channel} that every worker is done or blocked.`,
+    ]
+  }
+  return [
+    '',
+    `You are a SWARM WORKER collaborating with a lead (${others}) live in this SAME checkout.`,
+    `Watch the shared relay channel #${swarm.channel} for direction from the lead. Announce what you're starting, ask there if scope is ambiguous, and post when a subtask is done or blocked.`,
+    'Do not open your own pull request or push to origin yourself — the lead integrates everyone\'s work and finishes it.',
+  ]
 }
 
 function lifecycleInstructions(

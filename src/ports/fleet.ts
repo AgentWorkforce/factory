@@ -67,6 +67,8 @@ export type PreviewSweepResult = {
 export interface SpawnInput {
   name: string
   capability: Capability
+  /** Stable proof that this deterministic agent name belongs to the same logical work unit. */
+  identityKey?: string
   node?: 'self' | string
   repo?: string
   clonePath?: string
@@ -144,6 +146,8 @@ export interface FleetClient {
   resume(input: {
     name?: string
     sessionRef: string
+    /** Same work-unit proof used for the original spawn. */
+    identityKey?: string
     node?: 'self' | string
     capability?: Capability
     repo?: string
@@ -221,4 +225,6 @@ export type AgentSpec = {
   existingPullRequestBranch?: boolean
   /** Shared live preview owned by the issue lifecycle, not this agent process. */
   preview?: PreviewReference
+  /** Set only for scope 'swarm': this implementer's position in the live-collaborating team. */
+  swarmRole?: 'lead' | 'worker'
 }

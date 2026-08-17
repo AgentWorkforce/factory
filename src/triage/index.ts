@@ -1,4 +1,4 @@
-export { HeuristicTriage, babysitterSpec, isShapeLabel, scopeFromLabels } from './heuristic'
+export { HeuristicTriage, babysitterSpec, isShapeLabel, scopeFromLabels, swarmChannel, swarmMemberSlugs, swarmTaskFor } from './heuristic'
 export type { HeuristicTriageOptions } from './heuristic'
 export { LlmTriage, buildPrompt } from './llm'
 export type { LlmTriageOptions } from './llm'

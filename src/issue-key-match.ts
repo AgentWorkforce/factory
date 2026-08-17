@@ -1,4 +1,9 @@
-const ISSUE_KEY_PARTS = /^([A-Z]+)-(\d+)$/iu
+/**
+ * Linear-style issue key shape (`TEAM-123`), as opposed to a bare GitHub
+ * issue number. Real team prefixes can include digits after the leading
+ * letter (e.g. `CORE23-456`), so only the first character is anchored.
+ */
+export const ISSUE_KEY_PARTS = /^([A-Z][A-Z0-9]*)-(\d+)$/iu
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 

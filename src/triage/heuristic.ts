@@ -1,7 +1,7 @@
 import type { FactoryConfig } from '../config/schema'
 import type { AgentSpec } from '../ports'
 import type { IssueRef, LinearIssue, RepoMapEntry, TriageContext, TriageDecision, TriageEngine } from '../types'
-import { agentNameForRole, repoSlugFromName } from './agent-names'
+import { agentBaseName, agentNameForRole, repoSlugFromName } from './agent-names'
 
 type RouteSource = RepoMapEntry['source']
 type Route = TriageDecision['routes'][number]
@@ -14,6 +14,14 @@ const SHAPE_LABELS: Record<string, Scope> = {
   'agent:single': 'single',
   'agent:workflow': 'workflow',
   'agent:team': 'team',
+  'agent:swarm': 'swarm',
+}
+
+/** First slug is always the swarm lead; the rest are workers, in spawn order. */
+export function swarmMemberSlugs(maxImplementers: number): string[] {
+  const workerCount = Math.max(maxImplementers - 1, 0)
+  const slugs = ['lead', ...Array.from({ length: workerCount }, (_, index) => `worker-${index + 1}`)]
+  return slugs.slice(0, Math.max(maxImplementers, 0))
 }
 
 const SURFACE_BUCKETS: Array<{ name: string; patterns: RegExp[] }> = [
@@ -252,6 +260,14 @@ function implementationAssignments(
     return route ? [{ route, slug: repoSlugFromName(route.repo) ?? 'scope' }] : []
   }
 
+  if (scope === 'swarm') {
+    // Swarm always shares one checkout (lead + workers collaborate live over a
+    // shared relay channel) — unlike team, extra matched routes are not fanned
+    // out, only the first is used.
+    const route = routes[0]
+    return route ? swarmMemberSlugs(maxImplementers).map((slug) => ({ route, slug })) : []
+  }
+
   if (routes.length >= 2) {
     return routes.slice(0, maxImplementers).map((route, index) => ({
       route,
@@ -286,18 +302,43 @@ function implementerSpec(input: {
 }): AgentSpec {
   const name = agentNameForRole(input.issue, 'impl', {
     repo: input.route.repo,
-    discriminator: input.scope === 'team' ? input.slug : undefined,
+    discriminator: input.scope === 'team' || input.scope === 'swarm' ? input.slug : undefined,
   })
+  const channel = input.scope === 'swarm' ? swarmChannel(input.issue) : undefined
   return {
     name,
     role: 'implementer',
     capability: input.config.agentCapabilities.implementer,
     model: input.config.models.implementer,
-    task: taskFor(input.issue, input.route, 'implementer'),
+    task: channel
+      ? swarmTaskFor(input.issue, input.route, input.slug, channel)
+      : taskFor(input.issue, input.route, 'implementer'),
     repo: input.route.repo,
     clonePath: input.route.clonePath,
+    ...(channel ? { channel, swarmRole: input.slug === 'lead' ? 'lead' as const : 'worker' as const } : {}),
     node: 'self',
   }
+}
+
+/** Shared relay channel every lead/worker for one issue's swarm joins live. */
+export function swarmChannel(issue: LinearIssue): string {
+  return `swarm-${agentBaseName(issue)}`
+}
+
+export function swarmTaskFor(issue: LinearIssue, route: Route, slug: string, channel: string): string {
+  const base = taskFor(issue, route, 'implementer')
+  const roleBriefing = slug === 'lead'
+    ? [
+      `You are the SWARM LEAD for this task. Worker agents are collaborating with you in the same checkout, in real time.`,
+      `Coordinate over the shared relay channel #${channel}: break the work into subtasks, assign them to workers by name, and check their progress before you finish.`,
+      `Integrate everyone's changes into one coherent result before handing off to review. Do not finish until you've confirmed on #${channel} that every worker is done or blocked.`,
+    ]
+    : [
+      `You are a SWARM WORKER (${slug}) for this task, collaborating with a lead and other workers in the same checkout, in real time.`,
+      `Watch the shared relay channel #${channel} for direction from the lead. Announce what you're starting, ask there if scope is ambiguous, and post when a subtask is done or blocked.`,
+      `Do not open your own pull request — the lead integrates and finishes the work.`,
+    ]
+  return [base, ...roleBriefing].join('\n\n')
 }
 
 function workflowSpec(issue: LinearIssue, _config: FactoryConfig, routes: Route[]): AgentSpec {
@@ -379,6 +420,7 @@ function taskFor(issue: LinearIssue, route: Route, role: AgentSpec['role']): str
 
 export function scopeFromLabels(labels: string[]): Scope | undefined {
   const normalized = new Set(labels.map((label) => label.trim().toLowerCase()))
+  if (normalized.has('agent:swarm')) return 'swarm'
   if (normalized.has('agent:team')) return 'team'
   if (normalized.has('agent:workflow')) return 'workflow'
   if (normalized.has('agent:single')) return 'single'

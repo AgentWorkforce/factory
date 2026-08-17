@@ -194,6 +194,7 @@ export class FakeFleetClient implements FleetClient {
   readonly resumes: Array<{
     name?: string
     sessionRef: string
+    identityKey?: string
     node?: 'self' | string
     capability?: Capability
     repo?: string
@@ -236,6 +237,7 @@ export class FakeFleetClient implements FleetClient {
   async resume(input: {
     name?: string
     sessionRef: string
+    identityKey?: string
     node?: 'self' | string
     capability?: Capability
     repo?: string

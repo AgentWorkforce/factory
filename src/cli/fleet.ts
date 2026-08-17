@@ -9,6 +9,14 @@ import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import { initializeFactory } from './init'
 import {
+  FACTORY_EXIT,
+  exitCodeForDispatchResult,
+  exitCodeForError,
+  exitCodeForIterationReport,
+  exitCodeForLoopReports,
+  exitCodeForRelayDispatch,
+} from './exit-codes'
+import {
   FileStateStore,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
@@ -514,7 +522,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       }
     }
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
-    return 1
+    return exitCodeForError(error)
   } finally {
     try {
       try {
@@ -763,15 +771,20 @@ async function runFactoryCommand(
         mountStderr,
         debugMountRefreshes,
       )
-      const handleWarmMountError = (error: unknown): void => {
+      // Returns the code the failure classifies to, so the inline branch below
+      // can surface it directly. The background branch reads the same value
+      // back off the waiter; both must report one code for one failure.
+      const handleWarmMountError = (error: unknown): number => {
         if (error instanceof MountAuthScopeError) {
+          const code = exitCodeForError(error)
           mountStderr.write(`${error.message}\n`)
           mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-          void flushAndResolve(1)
-          return
+          void flushAndResolve(code)
+          return code
         }
         const message = error instanceof Error ? error.message : String(error)
         mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        return FACTORY_EXIT.FAILED
       }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
@@ -790,12 +803,12 @@ async function runFactoryCommand(
             if (!result.mounted) {
               mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
               if (stoppedBySignal) return await waiter.promise
-              return 1
+              return FACTORY_EXIT.FAILED
             }
           } catch (error) {
-            handleWarmMountError(error)
+            const code = handleWarmMountError(error)
             if (stoppedBySignal) return await waiter.promise
-            return 1
+            return code
           }
         } else {
           void warmMount().catch(handleWarmMountError)
@@ -820,8 +833,9 @@ async function runFactoryCommand(
         acceptableMountIds,
         mountStderr,
       )
-      writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
-      return 0
+      const report = await factory.runOnce({ dryRun: globals.dryRun })
+      writeJson(out, report)
+      return exitCodeForIterationReport(report)
     }
     if (command.action === 'status') {
       const versionInfo = await safeFactoryVersionInfo(
@@ -862,8 +876,10 @@ async function runFactoryCommand(
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
+    let loopCode: number = FACTORY_EXIT.OK
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
+      loopCode = exitCodeForLoopReports(reports)
       writeJson(out, {
         reports,
         status: await factoryStatusWithMountHealth(
@@ -878,7 +894,7 @@ async function runFactoryCommand(
       removeSignalHandlers()
       await factory.stop()
     }
-    return 0
+    return loopCode
   }
 
   if (command.kind === 'factory-canary') {
@@ -908,15 +924,16 @@ async function runFactoryCommand(
     try {
       const result = await factory.dispatch(decision, { dryRun: false })
       writeJson(out, result)
-      await factory.waitForDispatchTerminal(result.issue)
-      return 0
+      const terminalPhase = await factory.waitForDispatchTerminal(result.issue)
+      return exitCodeForRelayDispatch(result, terminalPhase)
     } finally {
       await factory.stop()
     }
   }
 
-  writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
-  return 0
+  const dispatched = await factory.dispatch(decision, { dryRun: globals.dryRun })
+  writeJson(out, dispatched)
+  return exitCodeForDispatchResult(dispatched)
 }
 
 async function warmStartPathMounts(

@@ -190,7 +190,7 @@ export class InternalFleetClient implements FleetClient {
       continueFrom: input.sessionRef,
       spawnMode: 'task_exit',
       exitAfterTask: true,
-    })
+    }, input.identityKey)
     const exitSequenceAtSpawnStart = this.#trackAgentStart(input.name)
     this.#tracked.set(input.name, { invocationId: input.invocationId })
     let handle: SpawnedHandleLike
@@ -213,6 +213,7 @@ export class InternalFleetClient implements FleetClient {
   async resume(input: {
     name?: string
     sessionRef: string
+    identityKey?: string
     node?: 'self' | string
     capability?: Capability
     repo?: string
@@ -230,7 +231,7 @@ export class InternalFleetClient implements FleetClient {
       cwd: input.clonePath ?? this.#cwd,
       continueFrom: input.sessionRef,
       task: input.task,
-    })
+    }, input.identityKey)
     const requestedName = input.name ?? input.sessionRef
     const exitSequenceAtSpawnStart = this.#trackAgentStart(requestedName)
     this.#tracked.set(requestedName, {})
@@ -246,13 +247,16 @@ export class InternalFleetClient implements FleetClient {
     return { ...spawnResultFrom(handle), sessionRef: sessionRefFrom(handle) ?? input.sessionRef }
   }
 
-  #withAgentRelayMcpHarness(input: SpawnPtyInput): SpawnPtyInput {
+  #withAgentRelayMcpHarness(input: SpawnPtyInput, identityKey?: string): SpawnPtyInput {
     if (input.harnessConfig || (input.cli !== 'codex' && input.cli !== 'claude')) {
       return input
     }
 
     const command = this.#resolveAgentRelayMcpCommand()
     if (!command) {
+      if (identityKey) {
+        throw new Error(`Cannot spawn ${input.name}: agent-relay MCP is unavailable, so its identity proof cannot be installed`)
+      }
       this.#logger?.warn?.('[factory-sdk] agent-relay MCP command not found; spawning without MCP injection', {
         agent: input.name,
         cli: input.cli,
@@ -262,7 +266,7 @@ export class InternalFleetClient implements FleetClient {
 
     return {
       ...input,
-      harnessConfig: buildRelayMcpHarnessConfig(input, command, this.#workspaceKey),
+      harnessConfig: buildRelayMcpHarnessConfig(input, command, this.#workspaceKey, identityKey),
     }
   }
 
@@ -1133,8 +1137,9 @@ export function buildRelayMcpHarnessConfig(
   input: SpawnPtyInput,
   command: AgentRelayMcpCommand,
   workspaceKey?: string,
+  identityKey?: string,
 ): NonNullable<SpawnPtyInput['harnessConfig']> {
-  const relayEnv = relayMcpEnv(input.name, input.agentToken, workspaceKey)
+  const relayEnv = relayMcpEnv(input.name, input.agentToken, workspaceKey, identityKey)
   return {
     runtime: 'pty',
     command: input.cli,
@@ -1190,11 +1195,17 @@ function stdioMcpServer(command: AgentRelayMcpCommand, relayEnv: Record<string, 
   }
 }
 
-function relayMcpEnv(agentName: string, agentToken?: string, workspaceKey?: string): Record<string, string> {
+function relayMcpEnv(
+  agentName: string,
+  agentToken?: string,
+  workspaceKey?: string,
+  identityKey?: string,
+): Record<string, string> {
   const env: Record<string, string> = {
     RELAY_AGENT_NAME: agentName,
     RELAY_AGENT_TYPE: 'agent',
     RELAY_STRICT_AGENT_NAME: '1',
+    ...(identityKey ? { RELAY_AGENT_IDENTITY_KEY: identityKey } : {}),
   }
   const resolvedWorkspaceKey = resolveRelayWorkspaceKey({ workspaceKey })
   if (resolvedWorkspaceKey) {
