@@ -695,8 +695,11 @@ Factory GitHub write attribution is controlled explicitly with `github.identity`
 ```
 
 - `"app"` publishes pull requests and performs GitHub issue lifecycle writes
-  through the connected workspace GitHub App. If either write capability is
-  unavailable, Factory fails loudly and never falls back to a personal account.
+  through the connected workspace GitHub App. Status transitions provision the
+  target Factory label, add only that label, and remove only the prior Factory
+  label, so labels applied by people are never replaced from a stale mount
+  projection. If any required write capability is unavailable, Factory fails
+  loudly and never falls back to a personal account.
 - `"user"` publishes pull requests and performs issue lifecycle writes with the
   account authenticated by the local `gh` CLI, even when the app path is
   available.

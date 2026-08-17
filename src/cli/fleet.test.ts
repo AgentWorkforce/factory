@@ -3354,7 +3354,7 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: ['factory:in-progress'] },
+        { state: 'closed' },
         { guarded: true },
       )).resolves.toBe(true)
       await expect(predicate(
@@ -3362,6 +3362,30 @@ describe('fleet CLI runtime', () => {
         { body: 'Factory dispatch' },
         { guarded: true },
       )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/labels/factory-11111111-1111-4111-8111-111111111111.json',
+        {
+          name: 'factory:in-progress',
+          color: '1d76db',
+          description: 'Factory agents are working on this issue.',
+        },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
+        { operation: 'add', labels: ['factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
+        { operation: 'remove', label: 'bug' },
+        { guarded: true },
+      )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221/comments/operator.json',
         { body: 'unscoped draft' },

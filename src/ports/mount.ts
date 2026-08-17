@@ -146,6 +146,22 @@ export interface GithubConnectionWrite {
     body: string
     author: 'app'
   }): Promise<void>
+  /** Idempotently provision a repository label through the connected App. */
+  ensureRepositoryLabel?(input: {
+    repo: string
+    name: string
+    color: string
+    description: string
+    author: 'app'
+  }): Promise<void>
+  /** Add or remove exactly one issue label without replacing unrelated labels. */
+  mutateIssueLabel?(input: {
+    repo: string
+    number: number
+    operation: 'add' | 'remove'
+    label: string
+    author: 'app'
+  }): Promise<void>
   /** App-authored partial issue update through the workspace GitHub connection. */
   updateIssue?(input: GithubConnectionIssueUpdateInput): Promise<void>
 }

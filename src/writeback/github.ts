@@ -10,7 +10,7 @@ import { asRecord, wrappedPayload } from './shared'
 
 const execFileAsync = promisify(execFile)
 
-const STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
+export const FACTORY_GITHUB_STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
   'in-progress': {
     name: 'factory:in-progress',
     color: '1d76db',
@@ -65,7 +65,7 @@ export interface GhCliGithubWritebackConfig {
 
 type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
   GithubConnectionWrite,
-  'postIssueComment' | 'updateIssue'
+  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
 >>
 
 /**
@@ -77,9 +77,9 @@ export class AppGithubWriteback implements GithubWriteback {
   readonly #write: AppIssueConnectionWrite
 
   constructor(write: GithubConnectionWrite) {
-    if (!write.postIssueComment || !write.updateIssue) {
+    if (!write.postIssueComment || !write.ensureRepositoryLabel || !write.mutateIssueLabel || !write.updateIssue) {
       throw new Error(
-        'GitHub App lifecycle writeback requires connected issue-comment and issue-update capabilities',
+        'GitHub App lifecycle writeback requires connected comment, label, and issue-update capabilities',
       )
     }
     this.#write = write as AppIssueConnectionWrite
@@ -101,21 +101,35 @@ export class AppGithubWriteback implements GithubWriteback {
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
-    const labels = new Map<string, string>()
-    for (const label of issue.labels) {
-      const trimmed = label.trim()
-      if (trimmed) labels.set(trimmed.toLowerCase(), trimmed)
+    if (status === 'ready') {
+      await this.#write.mutateIssueLabel({
+        repo: ref.repo,
+        number: ref.number,
+        operation: 'remove',
+        label: FACTORY_GITHUB_STATUS_LABELS['in-progress'].name,
+        author: 'app',
+      })
+      return
     }
-    labels.delete(STATUS_LABELS['in-progress'].name.toLowerCase())
-    labels.delete(STATUS_LABELS['human-review'].name.toLowerCase())
-    if (status !== 'ready') {
-      const target = STATUS_LABELS[status].name
-      labels.set(target.toLowerCase(), target)
-    }
-    await this.#write.updateIssue({
+    const target = FACTORY_GITHUB_STATUS_LABELS[status]
+    const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
+    await this.#write.ensureRepositoryLabel({
+      repo: ref.repo,
+      ...target,
+      author: 'app',
+    })
+    await this.#write.mutateIssueLabel({
       repo: ref.repo,
       number: ref.number,
-      labels: [...labels.values()],
+      operation: 'add',
+      label: target.name,
+      author: 'app',
+    })
+    await this.#write.mutateIssueLabel({
+      repo: ref.repo,
+      number: ref.number,
+      operation: 'remove',
+      label: previous.name,
       author: 'app',
     })
   }
@@ -252,8 +266,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
 
   async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
     const labels = await this.#issueLabels(githubIssueRef(issue))
-    if (labels.has(STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
-    if (labels.has(STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
+    if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
+    if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
     return 'ready'
   }
 
@@ -287,7 +301,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
       const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
-      const inProgress = STATUS_LABELS['in-progress']
+      const inProgress = FACTORY_GITHUB_STATUS_LABELS['in-progress']
       if (labels.has(inProgress.name.toLowerCase())) {
         editArgs.push('--remove-label', inProgress.name)
       }
@@ -300,8 +314,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
       }
       return
     }
-    const target = STATUS_LABELS[status]
-    const previous = STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
+    const target = FACTORY_GITHUB_STATUS_LABELS[status]
+    const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
     await this.#run([
       'label',
       'create',

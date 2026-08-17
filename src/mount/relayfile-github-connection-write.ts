@@ -1,7 +1,11 @@
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { promisify } from 'node:util'
 
-import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
+import {
+  factoryGithubIssueCommentDraftName,
+  factoryGithubOperationDraftName,
+} from '../github/writeback-paths'
 import type {
   GithubConnectionIssueUpdateInput,
   GithubConnectionWrite,
@@ -22,6 +26,7 @@ export interface RelayfileGithubConnectionWriteConfig {
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
+  operationIdFactory?: () => string
 }
 
 /**
@@ -34,6 +39,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #git: GitCommandRunner
   readonly #receiptReadAttempts: number
   readonly #receiptReadDelayMs: number
+  readonly #operationIdFactory: () => string
   readonly #writesByPath = new Map<string, Promise<string | undefined>>()
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
@@ -41,6 +47,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     this.#git = config.gitRunner ?? defaultGitRunner
     this.#receiptReadAttempts = positiveInteger(config.receiptReadAttempts) ?? RECEIPT_READ_ATTEMPTS
     this.#receiptReadDelayMs = nonNegativeInteger(config.receiptReadDelayMs) ?? RECEIPT_READ_DELAY_MS
+    this.#operationIdFactory = config.operationIdFactory ?? randomUUID
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
@@ -153,6 +160,47 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     )
   }
 
+  async ensureRepositoryLabel(input: {
+    repo: string
+    name: string
+    color: string
+    description: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertAppAuthor(input.author, 'repository labels')
+    const name = normalizedGithubLabel(input.name)
+    const color = input.color.trim().replace(/^#/u, '')
+    if (!/^[a-f0-9]{6}$/iu.test(color)) {
+      throw new Error(`GitHub label color must be a six-digit hex value: ${input.color}`)
+    }
+    const description = input.description.trim()
+    if (!description) throw new Error('GitHub label description must be a non-empty string')
+    await this.#writeAndConfirm(
+      `${repoRoot}/labels/${this.#nextOperationDraftName()}`,
+      { name, color: color.toLowerCase(), description },
+    )
+  }
+
+  async mutateIssueLabel(input: {
+    repo: string
+    number: number
+    operation: 'add' | 'remove'
+    label: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    assertAppAuthor(input.author, 'issue label mutations')
+    const label = normalizedGithubLabel(input.label)
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}/labels/${this.#nextOperationDraftName()}`,
+      input.operation === 'add'
+        ? { operation: 'add', labels: [label] }
+        : { operation: 'remove', label },
+    )
+  }
+
   async updateIssue(input: GithubConnectionIssueUpdateInput): Promise<void> {
     const repoRoot = githubRepoRoot(input.repo)
     assertPositiveGithubNumber(input.number, 'issue')
@@ -182,6 +230,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       throw new Error(`Unable to resolve ${description} for GitHub PR publication: ${errorMessage(error)}`)
     }
     throw new Error(`Unable to resolve ${description} for GitHub PR publication`)
+  }
+
+  #nextOperationDraftName(): string {
+    return factoryGithubOperationDraftName(this.#operationIdFactory())
   }
 
   async #readPullRequestReceipt(
@@ -272,6 +324,18 @@ const normalizedGithubLabels = (labels: string[]): string[] => {
     throw new Error('GitHub issue labels must be non-empty strings')
   }
   return [...new Set(normalized)]
+}
+
+const normalizedGithubLabel = (label: string): string => {
+  const normalized = normalizedGithubLabels([label])[0]
+  if (!normalized) throw new Error('GitHub label must be a non-empty string')
+  return normalized
+}
+
+const assertAppAuthor = (author: string, operation: string): void => {
+  if (author !== 'app') {
+    throw new Error(`Relayfile GitHub ${operation} require author "app": ${author}`)
+  }
 }
 
 const githubDraftName = (headRef: string, headSha?: string): string => {

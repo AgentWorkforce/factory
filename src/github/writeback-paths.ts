@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 
 const FACTORY_ISSUE_COMMENT_DRAFT_PREFIX = 'factory-'
 const FACTORY_ISSUE_COMMENT_DIGEST_LENGTH = 24
+const FACTORY_GITHUB_OPERATION_DRAFT = /^factory-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/iu
 
 /** Stable filename contract shared by the App writer and the mount guard. */
 export const factoryGithubIssueCommentDraftName = (body: string): string => {
@@ -17,3 +18,15 @@ export const isFactoryGithubIssueCommentDraftName = (value: string): boolean => 
   const digest = value.slice(FACTORY_ISSUE_COMMENT_DRAFT_PREFIX.length, -'.json'.length)
   return digest.length === FACTORY_ISSUE_COMMENT_DIGEST_LENGTH && /^[a-f0-9]+$/u.test(digest)
 }
+
+/** Unique operation drafts force every lifecycle transition through writeback. */
+export const factoryGithubOperationDraftName = (operationId: string): string => {
+  const name = `factory-${operationId}.json`
+  if (!isFactoryGithubOperationDraftName(name)) {
+    throw new Error(`GitHub operation id must be a UUID: ${operationId}`)
+  }
+  return name
+}
+
+export const isFactoryGithubOperationDraftName = (value: string): boolean =>
+  FACTORY_GITHUB_OPERATION_DRAFT.test(value)

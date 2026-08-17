@@ -835,11 +835,15 @@ describe('AppGithubWriteback', () => {
       author: 'app',
     }))
     const postIssueComment = vi.fn(async () => undefined)
+    const ensureRepositoryLabel = vi.fn(async () => undefined)
+    const mutateIssueLabel = vi.fn(async () => undefined)
     const updateIssue = vi.fn(async () => undefined)
     const connection: GithubConnectionWrite = {
       publishPullRequest,
       closePullRequest: async () => undefined,
       postIssueComment,
+      ensureRepositoryLabel,
+      mutateIssueLabel,
       updateIssue,
     }
     const app = new AppGithubWriteback(connection)
@@ -853,6 +857,7 @@ describe('AppGithubWriteback', () => {
     })).resolves.toMatchObject({ number: 322, author: 'app' })
     await app.postComment(appIssue, 'Factory dispatch for 221')
     await app.setStatus(appIssue, 'human-review')
+    await app.setStatus(appIssue, 'ready')
     await app.closeIssue(appIssue, 'Factory observed the linked PR merge.')
 
     expect(postIssueComment).toHaveBeenNthCalledWith(1, {
@@ -861,19 +866,26 @@ describe('AppGithubWriteback', () => {
       body: 'Factory dispatch for 221',
       author: 'app',
     })
-    expect(updateIssue).toHaveBeenNthCalledWith(1, {
+    expect(ensureRepositoryLabel).toHaveBeenCalledWith({
       repo: 'AgentWorkforce/factory',
-      number: 221,
-      labels: ['factory', 'bug', 'factory:human-review'],
+      name: 'factory:human-review',
+      color: 'fbca04',
+      description: 'Factory work is ready for human review.',
       author: 'app',
     })
+    expect(mutateIssueLabel.mock.calls).toEqual([
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'add', label: 'factory:human-review', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
+    ])
     expect(postIssueComment).toHaveBeenNthCalledWith(2, {
       repo: 'AgentWorkforce/factory',
       number: 221,
       body: 'Factory observed the linked PR merge.',
       author: 'app',
     })
-    expect(updateIssue).toHaveBeenNthCalledWith(2, {
+    expect(updateIssue).toHaveBeenCalledTimes(1)
+    expect(updateIssue).toHaveBeenCalledWith({
       repo: 'AgentWorkforce/factory',
       number: 221,
       state: 'closed',
@@ -889,7 +901,7 @@ describe('AppGithubWriteback', () => {
     expect(() => new AppGithubWriteback({
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
-    })).toThrow('requires connected issue-comment and issue-update capabilities')
+    })).toThrow('requires connected comment, label, and issue-update capabilities')
   })
 })
 

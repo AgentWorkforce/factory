@@ -178,6 +178,7 @@ export type {
 } from './triage'
 export {
   AppGithubWriteback,
+  FACTORY_GITHUB_STATUS_LABELS,
   GhCliGithubWriteback,
   FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,

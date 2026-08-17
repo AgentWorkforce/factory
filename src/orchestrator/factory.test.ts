@@ -2371,11 +2371,15 @@ describe('FactoryLoop', () => {
         author: 'app',
       }))
       const postIssueComment = vi.fn(async () => undefined)
+      const ensureRepositoryLabel = vi.fn(async () => undefined)
+      const mutateIssueLabel = vi.fn(async () => undefined)
       const updateIssue = vi.fn(async () => undefined)
       const githubWrite: GithubConnectionWrite = {
         publishPullRequest,
         closePullRequest: async () => undefined,
         postIssueComment,
+        ensureRepositoryLabel,
+        mutateIssueLabel,
         updateIssue,
       }
       const mount = new FakeMountClient({
@@ -2397,12 +2401,18 @@ describe('FactoryLoop', () => {
 
       await factory.runOnce()
 
-      expect(updateIssue).toHaveBeenCalledWith({
+      expect(ensureRepositoryLabel).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/pear',
-        number,
-        labels: ['factory', 'bug', 'factory:in-progress'],
+        name: 'factory:in-progress',
+        color: '1d76db',
+        description: 'Factory agents are working on this issue.',
         author: 'app',
       })
+      expect(mutateIssueLabel.mock.calls).toEqual([
+        [{ repo: 'AgentWorkforce/pear', number, operation: 'add', label: 'factory:in-progress', author: 'app' }],
+        [{ repo: 'AgentWorkforce/pear', number, operation: 'remove', label: 'factory:human-review', author: 'app' }],
+      ])
+      expect(updateIssue).not.toHaveBeenCalled()
       expect(postIssueComment).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
@@ -12289,6 +12299,8 @@ describe('FactoryLoop', () => {
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     })
 

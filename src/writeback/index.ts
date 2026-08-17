@@ -18,6 +18,7 @@ export type {
 } from './slack'
 export {
   AppGithubWriteback,
+  FACTORY_GITHUB_STATUS_LABELS,
   GhCliGithubWriteback,
   MountGithubRead,
 } from './github'
