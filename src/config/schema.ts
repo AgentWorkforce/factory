@@ -57,6 +57,17 @@ const dispatchSchema = z.object({
     .default(DEFAULT_AGENT_HOLD_TIMEOUT_MS),
 }).default({})
 
+const fleetHealthSchema = z.object({
+  // Roster is read-only, so Factory can safely bound it locally. Mutating
+  // spawn/resume calls are never abandoned behind a local timeout.
+  rosterTimeoutMs: z.number().int().min(100).max(60_000).default(5_000),
+  failureThreshold: z.number().int().min(1).max(10).default(2),
+  resetTimeoutMs: z.number().int().min(1_000).max(15 * 60_000).default(60_000),
+  // Production launchers can require an explicit, non-project broker state
+  // directory so Factory never silently shares an interactive broker.
+  requireDedicatedBroker: z.boolean().default(false),
+}).default({})
+
 const loopSchema = z.object({
   maxIterations: z.number().int().min(1).max(5).default(3),
   maxConsecutiveFailures: z.number().int().min(1).max(5).default(3),
@@ -301,10 +312,11 @@ const WorkspaceConfigObjectSchema = z.object({
   subscription: subscriptionSchema,
   liveSubscription: liveSubscriptionSchema,
   dispatch: dispatchSchema,
+  fleetHealth: fleetHealthSchema,
   loop: loopSchema,
   triage: triageSchema,
   repos: workspaceReposSchema,
-  batchSize: z.number().int().min(1).max(5).default(5),
+  batchSize: z.number().int().min(1).max(5).default(1),
   models: modelsSchema,
   agentCapabilities: agentCapabilitiesSchema,
   slack: slackSchema,

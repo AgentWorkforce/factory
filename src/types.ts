@@ -12,6 +12,7 @@ import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispat
 import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
 import type { TicketDispatchDelivery } from './delivery/ticket-dispatch'
+import type { FleetControlPlaneStatus } from './fleet/control-plane-circuit'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -278,6 +279,8 @@ export interface FactoryStatus {
     capacityBlocked: boolean
   }>
   counters: Record<string, number>
+  /** Broker/fleet mutation gate. An open circuit blocks new workers until a successful half-open roster probe. */
+  fleetControlPlane: FleetControlPlaneStatus
   slackDegraded?: boolean
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */

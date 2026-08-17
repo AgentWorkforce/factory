@@ -21,7 +21,7 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
-import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -510,6 +510,25 @@ describe('fleet CLI parsing', () => {
 
       expect(resolveBrokerConnectionPath(nested, { AGENT_RELAY_STATE_DIR: stateDir }))
         .toBe(join(stateDir, 'connection.json'))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('requires a separate explicit relay state directory when dedicated broker isolation is enabled', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      const dedicatedStateDir = join(root, '.agentworkforce', 'factory-relay')
+      await mkdir(projectStateDir, { recursive: true })
+      await writeFile(join(projectStateDir, 'connection.json'), JSON.stringify({ port: 3890 }))
+
+      expect(() => resolveFactoryBrokerConnectionPath(root, {}, true))
+        .toThrow(/requires AGENT_RELAY_STATE_DIR/u)
+      expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
+        .toThrow(/resolves to the project broker/u)
+      expect(resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: dedicatedStateDir }, true))
+        .toBe(join(dedicatedStateDir, 'connection.json'))
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -28,11 +28,17 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.byProject).toEqual({})
     expect(parsed.repos.keywordRules).toEqual([])
     expect(parsed.repos.clonePaths).toEqual({})
-    expect(parsed.batchSize).toBe(5)
+    expect(parsed.batchSize).toBe(1)
     expect(parsed.dispatch).toEqual({
       errorCooldownMs: 60_000,
       maxAttempts: 2,
       agentHoldTimeoutMs: 4 * 60 * 60_000,
+    })
+    expect(parsed.fleetHealth).toEqual({
+      rosterTimeoutMs: 5_000,
+      failureThreshold: 2,
+      resetTimeoutMs: 60_000,
+      requireDedicatedBroker: false,
     })
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
     // Agent CLI per role defaults to today's behavior: codex implements, claude

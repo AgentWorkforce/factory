@@ -458,6 +458,7 @@ export type {
   TriageDecision,
   TriageEngine,
 } from './types'
+export type { FleetControlPlaneState, FleetControlPlaneStatus } from './fleet/control-plane-circuit'
 export {
   LOAD_EVIDENCE_CONTRACT,
   LoadMeasurementsSchema,

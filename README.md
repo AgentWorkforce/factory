@@ -149,6 +149,25 @@ names and the provider-claim state (`pending`, `verified`, or `degraded`). This
 view is read from Factory's local in-flight registry, so it remains available
 when GitHub lifecycle writeback is the degraded subsystem.
 
+It also reports `fleetControlPlane`. Factory bounds its read-only roster probe,
+pauses a live dispatch immediately when that probe fails, and opens a circuit
+after repeated failures. While the circuit is open, new spawn and resume calls
+fail fast. After `fleetHealth.resetTimeoutMs`, one half-open roster probe may
+close the circuit. Configure `fleetHealth.rosterTimeoutMs`,
+`fleetHealth.failureThreshold`, and `fleetHealth.resetTimeoutMs` when the fleet
+has intentionally higher control-plane latency. Mutating calls are never
+abandoned behind a local timeout because an accepted-but-late spawn would be
+ambiguous.
+
+For production, set `fleetHealth.requireDedicatedBroker` to `true` and point
+`AGENT_RELAY_STATE_DIR` at a state directory that is distinct from the
+project's `.agentworkforce/relay`. Factory then refuses startup if it would
+silently reuse the interactive project broker.
+
+Factory now defaults `batchSize` to `1`. Operators may explicitly raise it to
+at most `5` after isolating Factory workers from an interactive broker and
+measuring control-plane latency under the intended recipe mix.
+
 For a live daemon, `factory status` also includes `readinessReconcile`. Its
 state advances from `retrying` to `degraded` after three consecutive periodic
 discovery failures and returns to `healthy` after a successful checkpoint.

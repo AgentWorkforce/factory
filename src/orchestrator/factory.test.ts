@@ -47,6 +47,36 @@ import {
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim, DiscoverySweepRenewal, DispatchLifecycle } from '../ports/state'
 
+describe('fleet control-plane admission', () => {
+  it('fails closed before discovery or spawn when the roster probe stalls', async () => {
+    class StalledRosterFleet extends FakeFleetClient {
+      override async roster(): Promise<never> {
+        return new Promise(() => undefined)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(991)]: issueFile(991) })
+    const fleet = new StalledRosterFleet()
+    const factory = createFactory(config({
+      fleetHealth: {
+        rosterTimeoutMs: 100,
+        failureThreshold: 1,
+        resetTimeoutMs: 1_000,
+      },
+    }), { mount, fleet, triage: new StaticTriage(), logger: {} })
+
+    await expect(factory.runOnce()).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
+    expect(fleet.spawns).toEqual([])
+    expect(mount.reads).toEqual([])
+    expect(factory.status().fleetControlPlane).toMatchObject({
+      state: 'open',
+      consecutiveFailures: 1,
+    })
+  })
+})
+
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
 const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'

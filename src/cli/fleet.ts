@@ -1520,7 +1520,13 @@ async function buildFleet(
 
   const cwd = process.cwd()
   const env = deps.env ?? process.env
-  const connectionPath = resolveBrokerConnectionPath(cwd, env)
+  const connectionPath = globals.backend === 'internal'
+    ? resolveFactoryBrokerConnectionPath(
+        cwd,
+        env,
+        loaded?.config.fleetHealth.requireDedicatedBroker ?? false,
+      )
+    : resolveBrokerConnectionPath(cwd, env)
 
   // An injected createFleet owns fleet construction entirely (tests), so skip the
   // real broker bootstrap.
@@ -1613,6 +1619,32 @@ export function resolveBrokerConnectionPath(
     }
     current = parent
   }
+}
+
+export function resolveFactoryBrokerConnectionPath(
+  startCwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+  requireDedicatedBroker = false,
+): string | undefined {
+  const connectionPath = resolveBrokerConnectionPath(startCwd, env)
+  if (!requireDedicatedBroker) return connectionPath
+
+  const explicitStateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+  if (!explicitStateDir) {
+    throw new Error(
+      'fleetHealth.requireDedicatedBroker requires AGENT_RELAY_STATE_DIR to name Factory\'s isolated relay state directory',
+    )
+  }
+  const inheritedConnectionPath = resolveBrokerConnectionPath(startCwd, {
+    ...env,
+    AGENT_RELAY_STATE_DIR: '',
+  })
+  if (connectionPath === inheritedConnectionPath) {
+    throw new Error(
+      'AGENT_RELAY_STATE_DIR resolves to the project broker; choose a separate state directory for Factory',
+    )
+  }
+  return connectionPath
 }
 
 async function prepareFactoryIntegrations(
