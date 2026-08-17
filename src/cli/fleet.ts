@@ -1,6 +1,6 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import readline from 'node:readline/promises'
 import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
@@ -1639,12 +1639,36 @@ export function resolveFactoryBrokerConnectionPath(
     ...env,
     AGENT_RELAY_STATE_DIR: '',
   })
-  if (connectionPath === inheritedConnectionPath) {
+  const projectStateDir = inheritedConnectionPath
+    ? dirname(inheritedConnectionPath)
+    : join(resolve(startCwd), '.agentworkforce', 'relay')
+  if (sameFilesystemPath(explicitStateDir, projectStateDir)) {
     throw new Error(
       'AGENT_RELAY_STATE_DIR resolves to the project broker; choose a separate state directory for Factory',
     )
   }
   return connectionPath
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  return canonicalPath(left) === canonicalPath(right)
+}
+
+function canonicalPath(path: string): string {
+  const absolute = resolve(path)
+  const missingSegments: string[] = []
+  let existingAncestor = absolute
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor)
+    if (parent === existingAncestor) return absolute
+    missingSegments.unshift(basename(existingAncestor))
+    existingAncestor = parent
+  }
+  try {
+    return resolve(realpathSync.native(existingAncestor), ...missingSegments)
+  } catch {
+    return absolute
+  }
 }
 
 async function prepareFactoryIntegrations(

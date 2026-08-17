@@ -527,8 +527,22 @@ describe('fleet CLI parsing', () => {
         .toThrow(/requires AGENT_RELAY_STATE_DIR/u)
       expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
         .toThrow(/resolves to the project broker/u)
+      expect(() => resolveFactoryBrokerConnectionPath(root, {
+        AGENT_RELAY_STATE_DIR: join(projectStateDir, '..', 'relay'),
+      }, true)).toThrow(/resolves to the project broker/u)
       expect(resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: dedicatedStateDir }, true))
         .toBe(join(dedicatedStateDir, 'connection.json'))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects the shared project relay path before its connection file exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-empty-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
+        .toThrow(/resolves to the project broker/u)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
