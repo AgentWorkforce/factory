@@ -606,6 +606,7 @@ describe('FileStateStore', () => {
         issue: lifecycle.issue,
         decision: lifecycle.decision,
         threadId: '1780751612.176222',
+        retiredAtMs: 1_000,
         expiresAtMs: 86_401_000,
       }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })

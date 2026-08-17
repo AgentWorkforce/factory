@@ -19402,16 +19402,30 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new ConfirmRecordingSlackMountClient({ [issuePath(407)]: issue })
     const factoryConfig = config({ slack: slackConfig() })
     const state = () => new FileStateStore({ batchSize: 10, watchStatePath })
+    const clock = new ManualClock()
+    clock.advance(10_000)
     const firstFleet = new FakeFleetClient()
+    firstFleet.setSessionRef('ar-407-impl-pear', 'session-ar-407-impl-pear')
     const first = createFactory(factoryConfig, {
       mount,
       fleet: firstFleet,
       triage: new StaticTriage(),
       stateStore: state(),
+      clock,
     })
     let restarted: ReturnType<typeof createFactory> | undefined
     try {
       await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(407), issue)))
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e', mount.threadTs, 'human-before-terminal',
+      ), 'slack-human-before-terminal', {
+        ts: '9.000',
+        text: 'This reply was already routed before completion.',
+        user: 'U407',
+        user_name: 'human',
+        user_is_bot: false,
+      })
+      await expectSlackConversationResume(firstFleet, ['This reply was already routed before completion.'])
       firstFleet.emitAgentExit('ar-407-impl-pear', 'issue-done')
       await vi.waitFor(() => expect(first.status().inFlight).toEqual([]))
       await vi.waitFor(async () => expect(
@@ -19422,6 +19436,7 @@ describe('FactoryLoop PR babysitter', () => {
       emitSlackReply(mount, slackReplyFixturePath(
         'C0FACTORY__factory-e2e', mount.threadTs, 'human-after-terminal-restart',
       ), 'slack-human-after-terminal-restart', {
+        ts: '11.000',
         text: 'There is still unaddressed review feedback.',
         user: 'U407',
         user_name: 'human',
@@ -19434,6 +19449,7 @@ describe('FactoryLoop PR babysitter', () => {
         fleet: restartedFleet,
         triage: new StaticTriage(),
         stateStore: state(),
+        clock,
       })
       await restarted.start({ mode: 'dispatch-owner' })
 
@@ -19443,10 +19459,58 @@ describe('FactoryLoop PR babysitter', () => {
       expect(slackConversationResumes(restartedFleet)).toEqual([])
       expect(restarted.status().counters.slackAnswersUnroutableVisible).toBe(1)
       expect(restarted.status().counters.slackWatchersRearmed).toBe(1)
+      expect(slackReplyWrites(mount).filter((write) =>
+        write.content.text?.includes('no longer has an active agent'))).toHaveLength(1)
     } finally {
       await first.stop()
       await restarted?.stop()
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('surfaces an acknowledged reply if the work unit terminates during coalescing', async () => {
+    const issue = issueFile(408)
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(408)]: issue })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-408-impl-pear', 'session-ar-408-impl-pear')
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const factory = createFactory(config({
+      slack: { ...slackConfig(), conversationCoalesceMs: 60_000 },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(408), issue)))
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e', mount.threadTs, 'human-during-coalesce',
+      ), 'slack-human-during-coalesce', {
+        text: 'Please do not lose this acknowledged instruction.',
+        user: 'U408',
+        user_name: 'human',
+        user_is_bot: false,
+      })
+      await vi.waitFor(async () => expect(
+        (await stateStore.getConversationSession('factory-test', `slack:${mount.threadTs}`))?.pending,
+      ).toEqual([expect.objectContaining({ text: 'Please do not lose this acknowledged instruction.' })]))
+      await vi.waitFor(() => expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
+        slackImplementerReceipt,
+      ))
+
+      fleet.emitAgentExit('ar-408-impl-pear', 'issue-done')
+
+      await vi.waitFor(() => expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
+        'Factory could not deliver 1 queued reply because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+      ))
+      await expect(stateStore.getConversationSession(
+        'factory-test', `slack:${mount.threadTs}`,
+      )).resolves.toBeUndefined()
+      expect(slackConversationResumes(fleet)).toEqual([])
+      expect(factory.status().counters.slackConversationRepliesSurfacedTerminal).toBe(1)
+    } finally {
+      await factory.stop()
     }
   })
 

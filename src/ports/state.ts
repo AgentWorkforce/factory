@@ -163,6 +163,8 @@ export type SlackThreadWatchState = {
   issue: IssueRef
   decision: TriageDecision
   threadId: string
+  /** Provider-message cutoff preventing historical replies from replaying as terminal. */
+  retiredAtMs: number
   expiresAtMs: number
 }
 

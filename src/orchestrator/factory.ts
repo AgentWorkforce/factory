@@ -519,6 +519,8 @@ export class FactoryLoop implements Factory {
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
   readonly #slackTerminalWatchExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #terminalSlackWatchIssues = new Set<string>()
+  readonly #slackReplyRoutes = new Map<string, Promise<DispatchResult | undefined>>()
   readonly #slackConversationTurns: CoalescedTaskQueue<string>
   readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
@@ -1145,6 +1147,7 @@ export class FactoryLoop implements Factory {
       this.#slackWatchers.clear()
       for (const timer of this.#slackTerminalWatchExpiryTimers.values()) clearTimeout(timer)
       this.#slackTerminalWatchExpiryTimers.clear()
+      this.#terminalSlackWatchIssues.clear()
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
       this.#githubIssueCommentWatchStates.clear()
@@ -13979,7 +13982,7 @@ export class FactoryLoop implements Factory {
   async #watchSlackThread(
     record: InFlightIssue,
     threadId: string,
-    options: { replayConversationReplies?: boolean } = {},
+    options: { replayConversationReplies?: boolean; replayAfterMs?: number } = {},
   ): Promise<DispatchResult | undefined> {
     if (!this.#config.slack) {
       return
@@ -14045,6 +14048,13 @@ export class FactoryLoop implements Factory {
 
         const reply = await this.#readSlackReply(path)
         if (!reply || !reply.isThreadReply || reply.threadTs !== threadId || reply.channelDir !== channelDir) {
+          return
+        }
+        if (
+          allowPreExisting &&
+          options.replayAfterMs !== undefined &&
+          slackMessageReceivedAtMs(reply.messageTs, Number.MAX_SAFE_INTEGER) < options.replayAfterMs
+        ) {
           return
         }
 
@@ -14180,7 +14190,7 @@ export class FactoryLoop implements Factory {
   async #rearmSlackWatcher(
     record: InFlightIssue,
     threadId: string,
-    options: { replayConversationReplies?: boolean } = {},
+    options: { replayConversationReplies?: boolean; replayAfterMs?: number } = {},
   ): Promise<void> {
     const key = issueKey(record.issue)
     if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) {
@@ -14254,10 +14264,15 @@ export class FactoryLoop implements Factory {
       await this.#state.setSlackThread(this.#workspaceId, key, watch.threadId)
       const watchRecord = escalationWatchRecord(watch.decision)
       if (watch.kind === 'terminal-grace') {
+        this.#terminalSlackWatchIssues.add(key)
         const conversationId = slackConversationId(watch.threadId)
         await this.#slackConversationTurns.cancel(conversationId)
+        await this.#surfaceUndeliveredSlackConversation(watch.threadId)
         await this.#state.clearConversationSession(this.#workspaceId, conversationId)
-        await this.#rearmSlackWatcher(watchRecord, watch.threadId, { replayConversationReplies: true })
+        await this.#rearmSlackWatcher(watchRecord, watch.threadId, {
+          replayConversationReplies: true,
+          replayAfterMs: watch.retiredAtMs,
+        })
         this.#scheduleSlackTerminalWatchExpiry(watch.issue, watch.expiresAtMs)
         continue
       }
@@ -14435,6 +14450,7 @@ export class FactoryLoop implements Factory {
 
   async #stopSlackWatcher(issue: IssueRef): Promise<void> {
     const key = issueKey(issue)
+    this.#terminalSlackWatchIssues.delete(key)
     const expiryTimer = this.#slackTerminalWatchExpiryTimers.get(key)
     if (expiryTimer) clearTimeout(expiryTimer)
     this.#slackTerminalWatchExpiryTimers.delete(key)
@@ -14461,28 +14477,53 @@ export class FactoryLoop implements Factory {
 
     const existingWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
       .find(([watchKey]) => watchKey === key)?.[1]
+    const retiredAtMs = existingWatch?.kind === 'terminal-grace'
+      ? existingWatch.retiredAtMs
+      : this.#clock.now()
     const expiresAtMs = existingWatch?.kind === 'terminal-grace'
       ? existingWatch.expiresAtMs
-      : this.#clock.now() + SLACK_TERMINAL_THREAD_GRACE_MS
+      : retiredAtMs + SLACK_TERMINAL_THREAD_GRACE_MS
     await this.#state.setSlackThreadWatch(this.#workspaceId, key, {
       kind: 'terminal-grace',
       issue: { ...record.issue },
       decision: structuredClone(record.decision),
       threadId,
+      retiredAtMs,
       expiresAtMs,
     })
 
     // A terminal thread must never retain a resumable session for an agent that
     // has already exited. Keep only the exact-thread listener so a late human
     // reply receives the explicit no-active-agent writeback below.
+    this.#terminalSlackWatchIssues.add(key)
+    await this.#slackReplyRoutes.get(key)?.catch(() => undefined)
     const conversationId = slackConversationId(threadId)
     await this.#slackConversationTurns.cancel(conversationId)
+    await this.#surfaceUndeliveredSlackConversation(threadId)
     await this.#state.clearConversationSession(this.#workspaceId, conversationId)
     if (!this.#slackWatchers.has(key) && !this.#stopping) {
       await this.#rearmSlackWatcher(record, threadId)
     }
     this.#scheduleSlackTerminalWatchExpiry(record.issue, expiresAtMs)
     this.#increment('slackTerminalWatchersRetained')
+  }
+
+  async #surfaceUndeliveredSlackConversation(threadId: string): Promise<void> {
+    const session = await this.#state.getConversationSession(
+      this.#workspaceId,
+      slackConversationId(threadId),
+    )
+    const pendingCount = session
+      ? session.pending.length + (session.delivery?.messages.length ?? 0)
+      : 0
+    if (pendingCount === 0) return
+    if (!this.#slack) throw new Error(`Slack thread ${threadId} cannot surface undelivered replies without writeback`)
+    const noun = pendingCount === 1 ? 'reply' : 'replies'
+    await this.#slack.reply(
+      threadId,
+      `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+    )
+    this.#increment('slackConversationRepliesSurfacedTerminal')
   }
 
   #scheduleSlackTerminalWatchExpiry(
@@ -14586,6 +14627,39 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    return await this.#routeSlackConversationAnswer(record, reply, text, clarificationKey)
+  }
+
+  async #routeSlackConversationAnswer(
+    record: InFlightIssue,
+    reply: SlackThreadReply,
+    text: string,
+    clarificationKey: string,
+  ): Promise<DispatchResult | undefined> {
+    const preceding = this.#slackReplyRoutes.get(clarificationKey)
+    const route = (async () => {
+      await preceding?.catch(() => undefined)
+      return await this.#routeSlackConversationAnswerUnlocked(record, reply, text, clarificationKey)
+    })()
+    this.#slackReplyRoutes.set(clarificationKey, route)
+    try {
+      return await route
+    } finally {
+      if (this.#slackReplyRoutes.get(clarificationKey) === route) this.#slackReplyRoutes.delete(clarificationKey)
+    }
+  }
+
+  async #routeSlackConversationAnswerUnlocked(
+    record: InFlightIssue,
+    reply: SlackThreadReply,
+    text: string,
+    clarificationKey: string,
+  ): Promise<DispatchResult | undefined> {
+    if (this.#terminalSlackWatchIssues.has(clarificationKey)) {
+      await this.#writeUnroutableSlackReply(reply.threadTs)
+      return
+    }
+
     const conversationId = slackConversationId(reply.threadTs)
     let conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
     let liveRecord: InFlightIssue | undefined
@@ -14679,14 +14753,7 @@ export class FactoryLoop implements Factory {
       if (isTriageEscalationWatchRecord(record)) {
         return await this.#handleTriageEscalationSlackAnswer(record, text)
       }
-      this.#increment('slackAnswersIgnoredNoInFlight')
-      if (this.#slack) {
-        await this.#slack.reply(
-          reply.threadTs,
-          'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
-        )
-        this.#increment('slackAnswersUnroutableVisible')
-      }
+      await this.#writeUnroutableSlackReply(reply.threadTs)
       return
     }
     this.#increment('slackAnswersIgnoredNoConversationSession')
@@ -14697,6 +14764,16 @@ export class FactoryLoop implements Factory {
       )
       this.#increment('slackAnswersUnroutableVisible')
     }
+  }
+
+  async #writeUnroutableSlackReply(threadId: string): Promise<void> {
+    this.#increment('slackAnswersIgnoredNoInFlight')
+    if (!this.#slack) return
+    await this.#slack.reply(
+      threadId,
+      'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+    )
+    this.#increment('slackAnswersUnroutableVisible')
   }
 
   async #wakeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
