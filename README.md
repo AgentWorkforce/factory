@@ -580,12 +580,20 @@ as local processes.
 
 The supported topology for the **CLI control plane** is one Factory host per
 workspace, with any number of relay execution nodes. Multiple Factory processes
-on that host are fenced through the shared `FileStateStore` lock/lease.
+that open the same state file do not mutate it concurrently: `FileStateStore`
+holds a cross-process filesystem lock around the complete read/modify/write,
+so a second process waits, reloads after it acquires the lock, and then publishes
+through fsync plus atomic rename. The in-process operation queue alone is not
+the cross-process fence.
 Active/active CLI control planes on different hosts remain intentionally
 unsupported: separate local state files cannot provide a truthful cross-host
 fence.
 
 ### Hosting the control plane in Cloud
+
+Embedded CLI hosts can inject durable coordination storage through the
+host-neutral [`WatchStateDocumentStore` port](docs/document-state-store.md)
+via `stateStoreFactory`.
 
 `@agent-relay/factory/hosted` is the worker-safe control-plane entrypoint. It
 contains no Node filesystem/process dependency and runs the complete sweep:

@@ -4,7 +4,7 @@ catalog:
   category_count: 25
   feature_count: 319
   tier_counts:
-    1: 48
+    1: 49
     2: 127
     3: 12
     4: 52
@@ -137,7 +137,7 @@ categories:
         name: Factory Status
         cli: factory status
         api: Factory.status()
-        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, running version identity, and held agents (age, deadline, terminal state awaited) as JSON
+        description: Print in-flight issues, queued issues, counters, Slack degradation state, in-flight dispatch claims, running version identity, optional host-defined state-store identity, and held agents (age, deadline, terminal state awaited) as JSON
         location: src/cli/fleet.ts, src/orchestrator/factory.ts
         verify_tier: 2
 
@@ -713,6 +713,13 @@ categories:
         description: Fence lifecycle ownership and global batch capacity by lease epoch across processes sharing one FileStateStore; cross-host active/active control planes remain unsupported without shared compare-and-set state
         location: README.md, src/ports/state.ts, src/state/file-state-store.ts, src/orchestrator/factory.ts
         verify_tier: 4
+
+      - id: dispatch-document-state-store-port
+        name: Pluggable Document State Persistence
+        api: '@agent-relay/factory/cli / DocumentStateStore / WatchStateDocumentStore / CliStateStoreFactory'
+        description: Inject a serialized whole-document persistence port without reimplementing StateStore behavior, preserve the atomic file adapter as the default, and require an injected CLI adapter to pass its readiness gate before Factory construction
+        location: docs/document-state-store.md, package.json, src/state/document-store.ts, src/state/file-state-store.ts, src/cli/index.ts, src/cli/fleet.ts
+        verify_tier: 1
 
       - id: dispatch-remote-publication-recovery
         name: Remote PR Publication and Release Recovery
@@ -1465,8 +1472,8 @@ categories:
 
       - id: api-state-stores
         name: State Store API
-        api: InMemoryStateStore / FileStateStore
-        description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records
+        api: InMemoryStateStore / DocumentStateStore / FileStateStore
+        description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records through memory, an injectable document port, or the atomic file adapter
         location: src/ports/state.ts, src/state/
         verify_tier: 1
 

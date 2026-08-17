@@ -190,6 +190,7 @@ describe('Factory feature manifest contract', () => {
       './testing': '@agent-relay/factory/testing',
       './writeback': 'LinearWriteback / GithubWriteback / SlackWriteback',
       './node': 'createFactoryNodeDefinition()',
+      './cli': '@agent-relay/factory/cli',
       './featuremap': '@agent-relay/factory/featuremap',
       './intake': '@agent-relay/factory/intake',
       './feature-guardian': '@agent-relay/factory/feature-guardian',
