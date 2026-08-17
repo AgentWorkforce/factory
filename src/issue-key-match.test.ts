@@ -18,6 +18,18 @@ describe('issue key matching', () => {
     expect(containsIssueKey('core23-456-1-is-positive', 'CORE23-456')).toBe(false)
   })
 
+  it('keeps a digit-embedded prefix distinct from a pure-alpha key with the same characters', () => {
+    // `CORE23-1` and `CORE-231` are the same characters split at a different
+    // hyphen, so widening the prefix must not let either claim the other's
+    // branch — nor let a longer issue number (`CORE23-12`) absorb `CORE23-1`.
+    expect(containsIssueKey('core23-1-is-positive', 'CORE23-1')).toBe(true)
+    expect(containsIssueKey('core-231-is-positive', 'CORE23-1')).toBe(false)
+    expect(containsIssueKey('core23-12-is-positive', 'CORE23-1')).toBe(false)
+    expect(containsIssueKey('core23-1-is-positive', 'CORE-231')).toBe(false)
+    expect(factoryBranchBelongsToIssue('factory/core23-1-agentworkforce-factory', 'CORE23-1')).toBe(true)
+    expect(factoryBranchBelongsToIssue('factory/core-231-agentworkforce-factory', 'CORE23-1')).toBe(false)
+  })
+
   it('requires explicit body issue references instead of loose mentions', () => {
     expect(containsExplicitIssueReference('Linear: AR-229', 'AR-229')).toBe(true)
     expect(containsExplicitIssueReference('Closes AR-229', 'AR-229')).toBe(true)
