@@ -6,6 +6,7 @@ import { checkMountStaleness } from './relayfile-binary'
 import {
   classifyMountAuthError,
   MountAuthScopeError,
+  mountAuthDegradedWarning,
   mountAuthRemediation,
   readMountAuthErrorFromState,
 } from './mount-auth-error'
@@ -77,7 +78,11 @@ export async function ensureLocalMount(
     // The mount is reconciling. If it still reports a scope shortfall (e.g. a
     // root bootstrap that 403s while scoped subtrees sync), surface it once —
     // but never tear down a working mount over it.
-    if (authError) process.stderr.write(`${mountAuthRemediation(authError)}\n`)
+    //
+    // This warns rather than refusing, so it must NOT use the refusal text: the
+    // remediation promises Factory will not spawn against a read-denied mirror,
+    // and this branch goes on to spawn. Same diagnosis, opposite verdict.
+    if (authError) process.stderr.write(`${mountAuthDegradedWarning(authError)}\n`)
     return
   }
 

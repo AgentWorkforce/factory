@@ -9,6 +9,14 @@ import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import { initializeFactory } from './init'
 import {
+  FACTORY_EXIT,
+  exitCodeForDispatchResult,
+  exitCodeForError,
+  exitCodeForIterationReport,
+  exitCodeForLoopReports,
+  exitCodeForRelayDispatch,
+} from './exit-codes'
+import {
   FileStateStore,
   RelayfileCloudMountClient,
   checkFactoryLoopLiveness,
@@ -74,6 +82,7 @@ import {
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider } from '../ports'
+import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
@@ -94,10 +103,21 @@ import {
   type WorkspaceTaskDispatcher,
 } from '../intake'
 
-interface FleetCliDeps {
+export type CliStateStore = StateStore & {
+  /** Host readiness gate. The CLI invokes it before constructing Factory. */
+  assertReady(): Promise<void>
+  /** Optional host-defined identifier included in status output. */
+  readonly backend?: string
+}
+
+export type CliStateStoreFactory = (config: FactoryConfig) => Promise<CliStateStore> | CliStateStore
+
+export interface FleetCliDeps {
   fleet?: FleetClient
   /** Hermetic credential environment for the relay backend (tests). */
   env?: NodeJS.ProcessEnv
+  /** Host-supplied durable state adapter; the file implementation remains the default. */
+  stateStoreFactory?: CliStateStoreFactory
   mount?: MountClient
   createFactory?: typeof createFactory
   createFleet?: typeof createFleet
@@ -430,10 +450,16 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         // A GitHub-only workspace has no /linear/states catalog and uses labels
         // for lifecycle state, so it must not depend on that provider at startup.
         const stateResolution = await resolveStatesForIssueSource(mount, loaded.config, deps.resolveStates)
-        const stateStore = new FileStateStore({
-          batchSize: loaded.config.batchSize,
-          watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
-        })
+        const stateStore = deps.stateStoreFactory
+          ? await deps.stateStoreFactory(loaded.config)
+          : new FileStateStore({
+              batchSize: loaded.config.batchSize,
+              watchStatePath: githubWatchStatePath(loaded.config.loop.registryPath),
+            })
+        // An injected backend is an explicit dispatch-admission dependency.
+        // It must prove readiness before Factory construction; a host adapter
+        // may never turn an unreadable durable store into an empty document.
+        if (deps.stateStoreFactory) await stateStore.assertReady()
         reporter = deps.reporter ?? await buildFactoryCloudReporter({
           config: loaded.config,
           backend: globals.backend,
@@ -465,7 +491,19 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
         })
-        return await runFactoryCommand(command, factory, mount, fleet, loaded.config, globals, out, deps, workspaceId, acceptableMountIds)
+        return await runFactoryCommand(
+          command,
+          factory,
+          mount,
+          fleet,
+          loaded.config,
+          globals,
+          out,
+          deps,
+          workspaceId,
+          acceptableMountIds,
+          stateStore.backend ? { backend: stateStore.backend } : undefined,
+        )
       }
     }
     return 1
@@ -483,7 +521,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       }
     }
     err.write(`${error instanceof Error ? error.message : String(error)}\n`)
-    return 1
+    return exitCodeForError(error)
   } finally {
     try {
       try {
@@ -661,6 +699,7 @@ async function runFactoryCommand(
   deps: FleetCliDeps = {},
   workspaceId: string = config.workspaceId ?? '',
   acceptableMountIds?: readonly string[],
+  stateStoreStatus?: { backend: string },
 ): Promise<number> {
   const mountFn = resolveLocalMountFn(deps, mount)
   const mountStderr = deps.stderr ?? process.stderr
@@ -707,15 +746,20 @@ async function runFactoryCommand(
         mountStderr,
         debugMountRefreshes,
       )
-      const handleWarmMountError = (error: unknown): void => {
+      // Returns the code the failure classifies to, so the inline branch below
+      // can surface it directly. The background branch reads the same value
+      // back off the waiter; both must report one code for one failure.
+      const handleWarmMountError = (error: unknown): number => {
         if (error instanceof MountAuthScopeError) {
+          const code = exitCodeForError(error)
           mountStderr.write(`${error.message}\n`)
           mountStderr.write('[factory] aborting startup: local mount cannot obtain its filesystem scopes.\n')
-          void flushAndResolve(1)
-          return
+          void flushAndResolve(code)
+          return code
         }
         const message = error instanceof Error ? error.message : String(error)
         mountStderr.write(`[factory] warning: background relayfile mount warmup failed: ${message}\n`)
+        return FACTORY_EXIT.FAILED
       }
       const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
         exit: (code) => {
@@ -734,12 +778,12 @@ async function runFactoryCommand(
             if (!result.mounted) {
               mountStderr.write('[factory] aborting startup: Relayfile workspace mirror could not be resolved.\n')
               if (stoppedBySignal) return await waiter.promise
-              return 1
+              return FACTORY_EXIT.FAILED
             }
           } catch (error) {
-            handleWarmMountError(error)
+            const code = handleWarmMountError(error)
             if (stoppedBySignal) return await waiter.promise
-            return 1
+            return code
           }
         } else {
           void warmMount().catch(handleWarmMountError)
@@ -764,8 +808,9 @@ async function runFactoryCommand(
         acceptableMountIds,
         mountStderr,
       )
-      writeJson(out, await factory.runOnce({ dryRun: globals.dryRun }))
-      return 0
+      const report = await factory.runOnce({ dryRun: globals.dryRun })
+      writeJson(out, report)
+      return exitCodeForIterationReport(report)
     }
     if (command.action === 'status') {
       const versionInfo = await safeFactoryVersionInfo(
@@ -779,6 +824,7 @@ async function runFactoryCommand(
         config.loop.registryPath,
         config.loop.heartbeatStaleMs,
         versionInfo,
+        stateStoreStatus,
       ))
       return 0
     }
@@ -806,8 +852,10 @@ async function runFactoryCommand(
     const removeSignalHandlers = installFactoryStopSignalHandlers(factory, {
       processLike: deps.stopSignalProcessLike,
     })
+    let loopCode: number = FACTORY_EXIT.OK
     try {
       const reports = await factory.runLoop({ dryRun: globals.dryRun })
+      loopCode = exitCodeForLoopReports(reports)
       writeJson(out, {
         reports,
         status: await factoryStatusWithMountHealth(
@@ -816,13 +864,15 @@ async function runFactoryCommand(
           config.loop.heartbeatPath,
           config.loop.registryPath,
           config.loop.heartbeatStaleMs,
+          undefined,
+          stateStoreStatus,
         ),
       })
     } finally {
       removeSignalHandlers()
       await factory.stop()
     }
-    return 0
+    return loopCode
   }
 
   if (command.kind === 'factory-canary') {
@@ -852,15 +902,16 @@ async function runFactoryCommand(
     try {
       const result = await factory.dispatch(decision, { dryRun: false })
       writeJson(out, result)
-      await factory.waitForDispatchTerminal(result.issue)
-      return 0
+      const terminalPhase = await factory.waitForDispatchTerminal(result.issue)
+      return exitCodeForRelayDispatch(result, terminalPhase)
     } finally {
       await factory.stop()
     }
   }
 
-  writeJson(out, await factory.dispatch(decision, { dryRun: globals.dryRun }))
-  return 0
+  const dispatched = await factory.dispatch(decision, { dryRun: globals.dryRun })
+  writeJson(out, dispatched)
+  return exitCodeForDispatchResult(dispatched)
 }
 
 async function warmStartPathMounts(
@@ -1106,9 +1157,11 @@ async function factoryStatusWithMountHealth(
   registryPath: string,
   heartbeatStaleMs: number,
   versionInfo?: FactoryVersionInfo,
+  stateStoreStatus?: { backend: string },
 ): Promise<Omit<ReturnType<Factory['status']>, 'fleetControlPlane'> & {
   /** Undefined when a live older daemon predates fleet control-plane reporting. */
   fleetControlPlane?: ReturnType<Factory['status']>['fleetControlPlane']
+  stateStore?: { backend: string }
   version?: string
   installedAt?: string
   latestVersion?: string
@@ -1158,19 +1211,19 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) {
-    return {
-      ...observableStatus,
-      ...versionInfo,
-      heldAgents,
-      eventListener,
-      readinessReconcile,
-      fleetControlPlane,
-    }
+  if (!health) return {
+    ...observableStatus,
+    ...versionInfo,
+    ...(stateStoreStatus ? { stateStore: stateStoreStatus } : {}),
+    heldAgents,
+    eventListener,
+    readinessReconcile,
+    fleetControlPlane,
   }
   return {
     ...observableStatus,
     ...versionInfo,
+    ...(stateStoreStatus ? { stateStore: stateStoreStatus } : {}),
     heldAgents,
     eventListener,
     readinessReconcile,

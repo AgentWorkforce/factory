@@ -1,0 +1,13 @@
+{
+  "id": "example-single-file-fix",
+  "title": "TEMPLATE (single-file control group) — fix a null-check bug in one file",
+  "issueBody": "TEMPLATE — replace this whole file with a real task authored against benchmark-fixtures repo `<n>` before running the corpus for real.\n\nThe intent of a single-file task: a change small and self-contained enough that splitting it across multiple agents (team/swarm) should offer little or no coordination benefit. These are the control group — if team/swarm don't at least match single here, dispatch overhead is hurting, not helping.\n\nExample shape: `formatUserName(user)` in `src/format.ts` throws when `user.middleName` is undefined. Fix it to treat a missing middle name as absent (no double space), and add a regression test.",
+  "targetRepo": "AgentWorkforce/factory-benchmark-fixtures",
+  "baseRef": "main",
+  "difficulty": "single-file",
+  "verify": {
+    "command": "npm test -- format.test.ts",
+    "timeoutMs": 300000
+  },
+  "source": "authored"
+}

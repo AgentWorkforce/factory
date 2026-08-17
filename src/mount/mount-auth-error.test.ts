@@ -6,9 +6,13 @@ import { describe, expect, it } from 'vitest'
 import {
   classifyMountAuthError,
   MountAuthScopeError,
+  mountAuthDegradedWarning,
   mountAuthRemediation,
   readMountAuthErrorFromState,
 } from './mount-auth-error'
+
+/** The sentence that promises no agents will run. Only a refusal may say it. */
+const REFUSAL_PROMISE = 'Factory will not spawn agents against a read-denied mirror'
 
 async function withTempStateFile(
   lastError: unknown,
@@ -106,6 +110,35 @@ describe('mountAuthRemediation', () => {
   it('is still actionable without a scope', () => {
     const msg = mountAuthRemediation()
     expect(msg).toContain('Re-authenticate')
+  })
+
+  it('promises that no agents will run', () => {
+    expect(mountAuthRemediation({ missingScope: 'fs:read', detail: 'x' })).toContain(REFUSAL_PROMISE)
+  })
+})
+
+describe('mountAuthDegradedWarning', () => {
+  const details = { missingScope: 'fs:read', detail: 'http 403' } as const
+
+  // The pair that matters: the refusal and the warning must be tellable apart
+  // from the terminal alone. They were once the same string, so a path that
+  // proceeded printed a promise that no agents would run — and then ran them.
+  it('never makes the refusal promise, because this caller proceeds', () => {
+    expect(mountAuthDegradedWarning(details)).not.toContain(REFUSAL_PROMISE)
+    expect(mountAuthDegradedWarning()).not.toContain(REFUSAL_PROMISE)
+  })
+
+  it('says Factory is continuing, and is distinguishable from the refusal', () => {
+    const warning = mountAuthDegradedWarning(details)
+    expect(warning).toContain('continuing')
+    expect(warning).not.toBe(mountAuthRemediation(details))
+  })
+
+  // Same defect, same fix: only the verdict may differ.
+  it('carries the same diagnosis and remediation as the refusal', () => {
+    const warning = mountAuthDegradedWarning(details)
+    expect(warning).toContain('missing fs:read')
+    expect(warning).toContain('Re-authenticate')
   })
 })
 

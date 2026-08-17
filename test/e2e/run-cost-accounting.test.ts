@@ -145,7 +145,7 @@ describe('run cost accounting e2e', () => {
       // Completion follows immediately: the accounting seam must drain both
       // async usage callbacks before it freezes the terminal summary.
       harness.emitExit('ar-185-impl-factory')
-      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBe('complete')
 
       await vi.waitFor(() => expect(reporter.events.filter((event) => event.type === 'cost.model.unpriced'))
         .toHaveLength(1))
@@ -247,7 +247,7 @@ describe('run cost accounting e2e', () => {
 
       harness.emitUsage('ar-185-impl-factory', 'openai/gpt-5.4', 100, 20)
       harness.emitExit('ar-185-impl-factory')
-      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+      await expect(factory.waitForDispatchTerminal(decision.issue)).resolves.toBe('complete')
 
       expect(ledger.getRunRecords(running.runId)).toContainEqual({
         runId: running.runId,
@@ -304,7 +304,7 @@ describe('run cost accounting e2e', () => {
       await restarted.factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
 
       first.harness.emitExit('ar-185-impl-factory')
-      await expect(restarted.factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+      await expect(restarted.factory.waitForDispatchTerminal(decision.issue)).resolves.toBe('complete')
 
       const [[, completed]] = await first.stateStore.listDispatchLifecycles(workspaceId)
       expect(completed.cost?.byRole.find((entry) => entry.role === 'implementer')).toMatchObject({
@@ -405,7 +405,7 @@ describe('run cost accounting e2e', () => {
       }
 
       scenario.harness.emitExit('ar-185-impl-factory')
-      await expect(scenario.factory.waitForDispatchTerminal(decision.issue)).resolves.toBeUndefined()
+      await expect(scenario.factory.waitForDispatchTerminal(decision.issue)).resolves.toBe('complete')
       await vi.waitFor(() => expect(scenario.factory.status().counters.costUsageDroppedAfterTerminal).toBe(1))
       expect(scenario.reporter.events).toContainEqual(expect.objectContaining({
         type: 'factory.anomaly',
@@ -512,7 +512,10 @@ const costScenario = (workspaceId: string, overrides: CostScenarioOverrides = {}
     fleet: new InternalFleetClient({
       client: harness,
       cwd: '/work/factory',
-      resolveAgentRelayMcpCommand: () => undefined,
+      resolveAgentRelayMcpCommand: () => ({
+        command: process.execPath,
+        args: ['/work/factory/node_modules/agent-relay/dist/cli/index.js', 'mcp'],
+      }),
     }),
     stateStore,
     costLedger: ledger,

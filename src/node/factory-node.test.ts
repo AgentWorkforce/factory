@@ -117,6 +117,7 @@ describe('factory node definition', () => {
 
     await expect(invokeNodeHandler(definition, 'spawn:codex', {
       name: 'ar-13-impl',
+      identity_key: 'factory:dispatch:v1:github:agentworkforce/factory#13:implementer',
       repo: 'AgentWorkforce/factory',
       task: 'implement p13',
       model: 'gpt-5',
@@ -153,6 +154,9 @@ describe('factory node definition', () => {
           runtime: 'pty',
           command: 'codex',
           cwd: '/work/factory',
+          env: expect.objectContaining({
+            RELAY_AGENT_IDENTITY_KEY: 'factory:dispatch:v1:github:agentworkforce/factory#13:implementer',
+          }),
           metadata: {
             factoryRelayMcp: true,
             relayMcpCommand: '/usr/local/bin/node',
@@ -163,6 +167,9 @@ describe('factory node definition', () => {
     })
     expect(spawns[0]?.agent.harness_config?.runtime).toBe('pty')
     if (spawns[0]?.agent.harness_config?.runtime !== 'pty') throw new Error('expected pty harness config')
+    expect(spawns[0].agent.harness_config.env?.RELAY_AGENT_IDENTITY_KEY).toBe(
+      'factory:dispatch:v1:github:agentworkforce/factory#13:implementer',
+    )
     expect(spawns[0].agent.harness_config.args.join('\n')).toContain('mcp_servers.agent-relay.command="/usr/local/bin/node"')
   })
 

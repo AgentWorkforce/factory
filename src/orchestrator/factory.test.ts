@@ -28,7 +28,7 @@ import {
 } from '../index'
 import { changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
-import { FakeFleetClient, FakeMountClient } from '../testing'
+import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
@@ -2244,6 +2244,31 @@ describe('github API fallback eligibility candidate gathering', () => {
   })
 })
 
+describe('waitForDispatchTerminal', () => {
+  it('returns immediately when the dispatch never created a lifecycle row', async () => {
+    // A dependency park, a triage escalation, and a label refusal all return
+    // before the lifecycle claim, so no row exists and none can ever become
+    // terminal. Polling for one would never stop, and a caller deriving an exit
+    // code would never produce one at all.
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const phase = await withDeadline(
+        factory.waitForDispatchTerminal({ key: 'AR-404', uuid: 'uuid-404', path: '/linear/issues/AR-404.json' }),
+        3_000,
+        'waitForDispatchTerminal never returned',
+      )
+
+      expect(phase).toBeUndefined()
+    } finally {
+      await factory.stop()
+    }
+  })
+})
+
 describe('FactoryLoop', () => {
   it('sweeps preview orphans on daemon startup using durable active issue owners', async () => {
     const mount = new FakeMountClient()
@@ -3234,6 +3259,7 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(fleet.resumes).toContainEqual({
         name: 'ar-26-review-hoopsheet',
         sessionRef: 'session-review-hoopsheet-26',
+        identityKey: 'factory:dispatch:v1:github:agentworkforce/hoopsheet#26:reviewer',
         node: 'self',
         capability: 'spawn:claude',
         repo: 'AgentWorkforce/hoopsheet',
@@ -6605,6 +6631,12 @@ describe('FactoryLoop', () => {
       await attached.start({ mode: 'dispatch-owner' })
       await expect(attached.dispatch(decision)).resolves.toEqual(result)
       const terminal = attached.waitForDispatchTerminal(decision.issue)
+      // A SECOND waiter on the same row. Only the poller that observes the
+      // terminal row learns the phase first-hand; every other waiter has to be
+      // handed it through the resolution. A waiter that re-read the shared row
+      // after release could find it cleared, or find the next dispatch for the
+      // same issue, and report the wrong run.
+      const secondWaiter = attached.waitForDispatchTerminal(decision.issue)
 
       mount.files.set(issuePath(number), { content: issueFile(number, implementing) })
       firstFleet.emitAgentMessage({
@@ -6662,7 +6694,9 @@ describe('FactoryLoop', () => {
       if (crashAfterPark) expect(firstFleet.resumes).toEqual([])
       else expect(attachedFleet.resumes).toEqual([])
       completingFleet.emitAgentExit(`ar-${number}-review`, 'completed')
-      await terminal
+      // Both waiters report the phase the row settled in, not `undefined` and
+      // not each other's opposite.
+      expect(await Promise.all([terminal, secondWaiter])).toEqual(['complete', 'complete'])
       expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
         .toMatchObject({ phase: 'complete' })
       expect(attachedFleet.spawns).toEqual([])
@@ -10458,6 +10492,10 @@ describe('FactoryLoop', () => {
       ['ar-124-impl-factory', 'AgentWorkforce/factory', '/work/factory'],
       ['ar-124-review-factory', 'AgentWorkforce/factory', '/work/factory'],
     ])
+    expect(fleet.spawns.map((spawn) => spawn.identityKey)).toEqual([
+      'factory:dispatch:v1:github:agentworkforce/factory#124:implementer',
+      'factory:dispatch:v1:github:agentworkforce/factory#124:reviewer',
+    ])
     expect(factory.status().counters.triageEscalations).toBeUndefined()
   })
 
@@ -11506,6 +11544,115 @@ describe('FactoryLoop', () => {
     expect(comments[0]).not.toContain('Too many repo labels')
   })
 
+  // Companion to the single/workflow guard tests: an explicit swarm-scope issue
+  // shares one checkout across a lead + worker (unlike team, which fans out one
+  // implementer per repo label) and puts every member on the same relay channel
+  // so they can coordinate live, even when extra repo labels are present.
+  it('dispatches explicit swarm labels as a lead and worker sharing one checkout and channel', async () => {
+    const routedIssue = realIssueFile(729, ready, {
+      labels: [{ name: 'pear' }, { name: 'cloud' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(729)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          cloud: 'AgentWorkforce/cloud',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/cloud': '/work/cloud',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(729), routedIssue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual([
+      'ar-729-impl-lead',
+      'ar-729-impl-worker-1',
+      'ar-729-review',
+    ])
+    expect(fleet.spawns.map((spawn) => [spawn.name, spawn.cwd, spawn.channel])).toEqual([
+      ['ar-729-impl-lead', '/work/pear', 'swarm-ar-729'],
+      ['ar-729-impl-worker-1', '/work/pear', 'swarm-ar-729'],
+      ['ar-729-review', '/work/pear', undefined],
+    ])
+    const [lead, worker] = fleet.spawns
+    expect(lead?.task).toMatch(/SWARM LEAD/)
+    expect(lead?.task).toContain('#swarm-ar-729')
+    expect(worker?.task).toMatch(/SWARM WORKER/)
+  })
+
+  // Swarm workers register as implementers on the SAME shared checkout and
+  // lifecycle branch as the lead. Without a worker-specific gate, whichever
+  // worker finished first would publish (or wave through) the partial shared
+  // branch and mark every swarm member "done" via the shared-branch PR probe,
+  // releasing the still-working lead. A worker exit must therefore be a
+  // non-event for publication and completion.
+  it('suppresses a swarm worker exit so it never publishes or completes the shared checkout', async () => {
+    const routedIssue = realIssueFile(732, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(732)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(732), routedIssue)))
+
+    fleet.emitAgentExit('ar-732-impl-worker-1', 'issue-done')
+    await flush()
+    await flush()
+
+    expect(factory.status().counters.swarmWorkerExitsSuppressed).toBe(1)
+    expect(factory.status().counters.done ?? 0).toBe(0)
+    expect(fleet.releases).toEqual([])
+    // Lead is still in flight — its exit is the authoritative publication /
+    // completion signal, and we must not have raced it via the worker.
+    expect(factory.status().inFlight.map((issue) => issue.key)).toContain('AR-732')
+  })
+
+  it('does not suppress a swarm lead exit — the lead drives the normal completion path', async () => {
+    const routedIssue = realIssueFile(733, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(733)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(733), routedIssue)))
+
+    fleet.emitAgentExit('ar-733-impl-lead', 'issue-done')
+    await flush()
+    await flush()
+
+    // The lead exit is NEVER treated as a worker suppression event.
+    expect(factory.status().counters.swarmWorkerExitsSuppressed ?? 0).toBe(0)
+  })
+
   it('fails dispatch loudly when no labels are present and no default repo is configured', async () => {
     const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
@@ -11852,6 +11999,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-6-review',
       sessionRef: 'session-review-6',
+      identityKey: 'factory:dispatch:v1:linear:uuid-6:reviewer',
       node: 'self',
       capability: 'spawn:claude',
       repo: 'AgentWorkforce/pear',
@@ -12938,6 +13086,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-256-impl-pear',
       sessionRef: 'session-impl-256',
+      identityKey: 'factory:dispatch:v1:linear:uuid-256:implementer',
       node: 'self',
       capability: 'spawn:codex',
       repo: 'AgentWorkforce/pear',
@@ -12972,6 +13121,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-255-impl-pear',
       sessionRef: 'session-impl-255',
+      identityKey: 'factory:dispatch:v1:linear:uuid-255:implementer',
       node: 'self',
       capability: 'spawn:codex',
       repo: 'AgentWorkforce/pear',
@@ -12998,6 +13148,7 @@ describe('FactoryLoop', () => {
     expect(fleet.resumes).toEqual([{
       name: 'ar-10-review',
       sessionRef: 'session-review-10',
+      identityKey: 'factory:dispatch:v1:linear:uuid-10:reviewer',
       node: 'self',
       capability: 'spawn:claude',
       repo: 'AgentWorkforce/pear',

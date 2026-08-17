@@ -283,6 +283,48 @@ describe('ensureLocalMount', () => {
     })
   })
 
+  // The must-fire / must-not-fire pair for the two verdicts. Both arms start
+  // from the SAME scope-403; only mount freshness differs, and that is what
+  // decides whether Factory refuses or proceeds. Asserting one arm alone proves
+  // nothing — a single shared string satisfied the old "surfaces it" assertion
+  // on both, which is exactly how the two verdicts became indistinguishable.
+  const printed = (stderr: ReturnType<typeof vi.spyOn>): string =>
+    stderr.mock.calls.map(([chunk]) => String(chunk)).join('')
+
+  it('warns without the refusal promise when it proceeds against a fresh scope-403 mount', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountStateWithError(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date().toISOString(),
+        pid: process.pid,
+      }, SCOPE_403)
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+      // Proceeds: resolving here is what lets startup continue and exit 0.
+      await expect(ensureLocalMount('rw_test', dir, { startMount: vi.fn(async () => {}) }))
+        .resolves.toBeUndefined()
+
+      const text = printed(stderr)
+      expect(text).toContain('continuing')
+      // The load-bearing half: it must NOT claim to be refusing.
+      expect(text).not.toContain('Factory will not spawn agents against a read-denied mirror')
+    })
+  })
+
+  it('raises the refusal promise when a stale scope-403 mount aborts startup', async () => {
+    await withTempDir(async (dir) => {
+      await writeMountStateWithError(dir, {
+        workspaceId: 'rw_test',
+        lastReconcileAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        pid: process.pid,
+      }, SCOPE_403)
+
+      // Refuses: the thrown error is what the CLI maps to a non-zero code.
+      await expect(ensureLocalMount('rw_test', dir, { startMount: vi.fn(async () => {}) }))
+        .rejects.toThrow(/Factory will not spawn agents against a read-denied mirror/u)
+    })
+  })
+
   it('escalates a first-ever bootstrap that 403s into a terminal MountAuthScopeError', async () => {
     await withTempDir(async (dir) => {
       // No state file at start; the bootstrap "succeeds" but writes a stale

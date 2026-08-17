@@ -1,4 +1,4 @@
-import type { Capability, SendInput, SpawnResult } from './fleet'
+import type { AgentSpec, Capability, SendInput, SpawnResult } from './fleet'
 import type { AgentWorktree } from './worktree'
 import type {
   DependencyAdmission,
@@ -118,6 +118,13 @@ export type ConversationSessionState = {
   agent: {
     name: string
     sessionRef: string
+    /**
+     * Bound at claim/rebind time so identity-proof resume never depends on a
+     * live lookup by the (possibly since-renamed) agent name. Absent on
+     * sessions persisted before this field existed; resume falls back to a
+     * live lookup for those.
+     */
+    role?: AgentSpec['role']
     node?: string
     capability?: Capability
     repo?: string
@@ -205,6 +212,13 @@ export type DispatchLifecyclePhase =
   | 'releasing'
   | 'complete'
   | 'abandoned'
+
+/**
+ * The phases a dispatch lifecycle can end in. Callers that wait for a terminal
+ * outcome — the CLI derives an exit code from one — must not be handed an
+ * intermediate phase they could mistake for a result.
+ */
+export type TerminalDispatchLifecyclePhase = Extract<DispatchLifecyclePhase, 'complete' | 'abandoned'>
 
 export type DispatchLifecycleLease = {
   owner: string

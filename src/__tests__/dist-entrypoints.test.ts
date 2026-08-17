@@ -6,9 +6,12 @@ import { describe, expect, it } from 'vitest'
 // them. Without that step these imports throw ERR_MODULE_NOT_FOUND. Requires a
 // prior `npm run build` (CI builds before testing).
 describe('published dist entrypoints', () => {
+  // Under full-suite worker contention, dynamically importing all eight dist
+  // bundles can exceed vitest's 5000ms default, independent of correctness.
   it('are importable by Node ESM consumers', async () => {
     const featuremap = await import('../../dist/featuremap/index.js')
     const featureGuardian = await import('../../dist/feature-guardian/index.js')
+    const cli = await import('../../dist/cli/index.js')
     const main = await import('../../dist/index.js')
     const hosted = await import('../../dist/hosted/index.js')
     const intake = await import('../../dist/intake/index.js')
@@ -21,6 +24,7 @@ describe('published dist entrypoints', () => {
     expect(featuremap.validateFeatureManifestFile).toBeTypeOf('function')
     expect(featureGuardian.defineFeatureGuardianAgent).toBeTypeOf('function')
     expect(featureGuardian.runGuardianConversationTurn).toBeTypeOf('function')
+    expect(cli.runFleetCli).toBeTypeOf('function')
     expect(main.FactoryConfigSchema).toBeDefined()
     expect(main.createFactory).toBeTypeOf('function')
     expect(main.createFleet).toBeTypeOf('function')
@@ -39,5 +43,5 @@ describe('published dist entrypoints', () => {
     expect(environments.VerificationStackDeployer).toBeTypeOf('function')
     expect(testing.FakeFleetClient).toBeTypeOf('function')
     expect(writeback.MountLinearWriteback).toBeTypeOf('function')
-  })
+  }, 20_000)
 })

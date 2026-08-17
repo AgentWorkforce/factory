@@ -1,0 +1,13 @@
+{
+  "id": "example-multi-service-feature",
+  "title": "TEMPLATE (multi-service — where team/swarm should differentiate) — add a feature spanning API, worker, and frontend",
+  "issueBody": "TEMPLATE — replace this whole file with a real task authored against benchmark-fixtures repo `<n>` before running the corpus for real.\n\nThe intent of a multi-service task: acceptance criteria that genuinely span independently-touchable surfaces (an API route, a background worker, a frontend component), so isolated parallel work (team) or live-coordinated work (swarm) has real room to beat a single agent serializing through all three.\n\nExample shape: add a `/export` API endpoint that enqueues a background job, a worker that processes the queued job and writes a result file, and a frontend button that triggers the export and polls for the result. Acceptance: an end-to-end test exercises all three surfaces together.",
+  "targetRepo": "AgentWorkforce/factory-benchmark-fixtures",
+  "baseRef": "main",
+  "difficulty": "multi-service",
+  "verify": {
+    "command": "npm test -- export-flow.e2e.test.ts",
+    "timeoutMs": 600000
+  },
+  "source": "authored"
+}
