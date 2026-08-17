@@ -1,9 +1,14 @@
 import { isDeepStrictEqual } from 'node:util'
 
 import { A2aAgentCardSchema, type A2aAgentCard } from '@relaycast/a2a'
-import * as personaKitSpec from '@agentworkforce/persona-kit/spec'
-
-import type { PersonaIntent, PersonaSpec } from '@agentworkforce/persona-kit/spec'
+import {
+  deriveAgentCard,
+  isIntent,
+  parsePersonaSpec,
+  type DeriveAgentCardOptions,
+  type PersonaIntent,
+  type PersonaSpec,
+} from '@agentworkforce/persona-kit/spec'
 
 export interface FactoryPersonaCardInput {
   /** Raw persona.json data or an already parsed PersonaSpec. */
@@ -34,24 +39,9 @@ export interface RelaycastAgentCardPublisherOptions {
   timeoutMs?: number
 }
 
-type DeriveAgentCardOptions = {
-  baseUrl: string
-  version: string
-  documentationUrl?: string
-  inputModes?: string[]
-  outputModes?: string[]
-}
-type DeriveAgentCard = (persona: PersonaSpec, options: DeriveAgentCardOptions) => A2aAgentCard
-const A2A_TRANSPORT_CAPABILITIES = new Set(['streaming', 'pushNotifications'])
-
 /**
- * Derive and schema-validate the card attached to a Factory-hosted persona.
- *
- * workforce#296 owns the canonical mapper. persona-kit 4.1.34 predates that
- * export, so this release keeps a compatibility mapper behind the same call
- * boundary. As soon as a persona-kit containing deriveAgentCard is installed,
- * it is selected automatically and every result is still parsed by the shared
- * @relaycast/a2a schema.
+ * Derive the card with persona-kit's canonical mapper, then validate it against
+ * the shared Relaycast schema before attaching it to a Factory-hosted persona.
  */
 export function deriveFactoryPersonaCard(input: FactoryPersonaCardInput): A2aAgentCard {
   const persona = parsePersona(input.persona)
@@ -62,10 +52,7 @@ export function deriveFactoryPersonaCard(input: FactoryPersonaCardInput): A2aAge
     ...(input.inputModes ? { inputModes: input.inputModes } : {}),
     ...(input.outputModes ? { outputModes: input.outputModes } : {}),
   }
-  const upstream = (personaKitSpec as typeof personaKitSpec & { deriveAgentCard?: DeriveAgentCard }).deriveAgentCard
-  return A2aAgentCardSchema.parse(
-    upstream ? upstream(persona, options) : deriveAgentCardCompatibility(persona, options),
-  )
+  return A2aAgentCardSchema.parse(deriveAgentCard(persona, options))
 }
 
 /** Publish an inline canonical card through Relaycast's A2A registration seam. */
@@ -168,86 +155,10 @@ export class RelaycastAgentCardPublisher implements AgentCardPublisher {
 function parsePersona(value: unknown): PersonaSpec {
   const record = asRecord(value)
   const intent = readString(record, 'intent')
-  if (!intent || !personaKitSpec.isIntent(intent)) {
+  if (!intent || !isIntent(intent)) {
     throw new Error('Factory-hosted persona must declare a valid persona-kit intent')
   }
-  return personaKitSpec.parsePersonaSpec(value, intent as PersonaIntent)
-}
-
-function deriveAgentCardCompatibility(persona: PersonaSpec, options: DeriveAgentCardOptions): A2aAgentCard {
-  const integrationTags = Object.keys(persona.integrations ?? {})
-  const skills = persona.skills.map((skill) => ({
-    id: skill.id,
-    name: humanize(skill.id),
-    description: skill.description,
-    tags: unique([skill.source, ...integrationTags]),
-  }))
-  for (const [name, value] of Object.entries(persona.capabilities ?? {})) {
-    if (!capabilityEnabled(value)) continue
-    if (A2A_TRANSPORT_CAPABILITIES.has(name)) continue
-    const canonicalName = name === 'pullRequest' ? 'review' : name
-    const existing = skills.find((skill) => skill.id === canonicalName)
-    if (existing) {
-      existing.tags = unique([...(existing.tags ?? []), ...integrationTags])
-      continue
-    }
-    skills.push({
-      id: canonicalName,
-      name: humanize(canonicalName),
-      description: `Persona capability: ${humanize(canonicalName)}`,
-      tags: unique(integrationTags),
-    })
-  }
-
-  if (skills.length === 0) {
-    skills.push({
-      id: persona.intent,
-      name: humanize(persona.intent),
-      description: persona.description,
-      tags: unique(integrationTags),
-    })
-  }
-
-  const relayName = typeof persona.relay === 'object' && persona.relay !== null
-    ? persona.relay.agentName
-    : undefined
-  return {
-    name: relayName ?? persona.id,
-    description: persona.description,
-    url: options.baseUrl,
-    version: options.version,
-    skills,
-    capabilities: {
-      streaming: capabilityEnabled(persona.capabilities?.streaming),
-      pushNotifications: capabilityEnabled(persona.capabilities?.pushNotifications),
-    },
-    default_input_modes: options.inputModes ?? ['text/plain', 'application/json'],
-    default_output_modes: options.outputModes ?? ['text/plain', 'application/json'],
-    provider: {
-      organization: 'AgentWorkforce',
-      persona_id: persona.id,
-      intent: persona.intent,
-      tags: [...(persona.tags ?? [])],
-    },
-    ...(options.documentationUrl ? { documentation_url: options.documentationUrl } : {}),
-  }
-}
-
-function capabilityEnabled(value: unknown): boolean {
-  if (value === true) return true
-  if (value === false || value === undefined || value === null) return false
-  return typeof value === 'object' && !Array.isArray(value) && (value as { enabled?: unknown }).enabled !== false
-}
-
-function humanize(value: string): string {
-  return value
-    .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
-    .replace(/[-_:]+/gu, ' ')
-    .replace(/\b\w/gu, (letter) => letter.toUpperCase())
-}
-
-function unique(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+  return parsePersonaSpec(value, intent as PersonaIntent)
 }
 
 async function readJson(response: Response): Promise<unknown> {
