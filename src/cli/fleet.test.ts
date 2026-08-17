@@ -3325,10 +3325,13 @@ describe('fleet CLI runtime', () => {
       const configPath = await writeConfig(root, { issueSource: 'github' })
       const outOfScopeIssue = githubIssueFile('pear', 222)
       outOfScopeIssue.payload.labels = [{ name: 'bug' }]
+      const closedIssue = githubIssueFile('pear', 223)
+      closedIssue.payload.state = 'closed'
       const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
       const mount = mountWithIntegrationConnections({
         '/github/repos/AgentWorkforce/pear/issues/by-id/221.json': githubIssueFile('pear', 221),
         '/github/repos/AgentWorkforce/pear/issues/by-id/222.json': outOfScopeIssue,
+        '/github/repos/AgentWorkforce/pear/issues/by-id/223.json': closedIssue,
       }, integrations)
       let predicate: (
         path: string,
@@ -3392,7 +3395,17 @@ describe('fleet CLI runtime', () => {
         { guarded: true },
       )).resolves.toBe(false)
       await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345.json',
+        { body: 'wrong-length digest' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/222.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/223.json',
         { state: 'closed' },
         { guarded: true },
       )).resolves.toBe(false)

@@ -102,13 +102,15 @@ export class AppGithubWriteback implements GithubWriteback {
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
-      await this.#write.mutateIssueLabel({
-        repo: ref.repo,
-        number: ref.number,
-        operation: 'remove',
-        label: FACTORY_GITHUB_STATUS_LABELS['in-progress'].name,
-        author: 'app',
-      })
+      for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
+        await this.#write.mutateIssueLabel({
+          repo: ref.repo,
+          number: ref.number,
+          operation: 'remove',
+          label: label.name,
+          author: 'app',
+        })
+      }
       return
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]

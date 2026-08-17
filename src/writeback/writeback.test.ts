@@ -877,6 +877,7 @@ describe('AppGithubWriteback', () => {
       [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'add', label: 'factory:human-review', author: 'app' }],
       [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
       [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:human-review', author: 'app' }],
     ])
     expect(postIssueComment).toHaveBeenNthCalledWith(2, {
       repo: 'AgentWorkforce/factory',

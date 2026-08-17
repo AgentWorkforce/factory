@@ -12292,9 +12292,12 @@ describe('FactoryLoop', () => {
       }
     }
     const number = 221
+    const closedNumber = 222
     const issuePath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const closedIssuePath = githubIssuePath('AgentWorkforce', 'pear', closedNumber)
     const mount = new PredicateMount({
       [issuePath]: githubIssueFile(number, { labels: ['factory'] }),
+      [closedIssuePath]: githubIssueFile(closedNumber, { labels: ['factory'], state: 'closed' }),
     }, {
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
@@ -12319,6 +12322,11 @@ describe('FactoryLoop', () => {
       { state: 'closed' },
       { guarded: true },
     )).resolves.toBe(true)
+    await expect(mount.predicate!(
+      `/github/repos/AgentWorkforce/pear/issues/${closedNumber}.json`,
+      { state: 'closed' },
+      { guarded: true },
+    )).resolves.toBe(false)
   })
 
   it.each([

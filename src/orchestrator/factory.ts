@@ -17517,7 +17517,7 @@ export const isAllowedFactoryGithubDraft = async (
   for (const candidate of candidates) {
     try {
       const issue = parseGithubFactoryIssue(candidate, (await mount.readFile(candidate)).content)
-      return isInFactoryScope(issue, config.safety)
+      return issue.state?.name === 'open' && isInFactoryScope(issue, config.safety)
     } catch {
       // Try the next canonical/alias shape. Any total miss fails closed.
     }
