@@ -403,7 +403,23 @@ const validAgentSpec = (value: unknown): value is AgentSpec => isRecord(value) &
   (value.inputs === undefined || isRecord(value.inputs)) &&
   (value.ownedPullRequest === undefined || validOwnedPullRequest(value.ownedPullRequest)) &&
   (value.pendingPullRequestWake === undefined || validPendingPullRequestWake(value.pendingPullRequestWake)) &&
-  (value.preview === undefined || isRecord(value.preview))
+  (value.preview === undefined || validPreviewReference(value.preview))
+
+const validPreviewReference = (value: unknown): boolean => isRecord(value) &&
+  typeof value.id === 'string' && value.provider === 'tailscale-serve' &&
+  typeof value.namespace === 'string' && typeof value.owner === 'string' &&
+  typeof value.service === 'string' && typeof value.repo === 'string' &&
+  typeof value.url === 'string' && validOptionalPort(value.configuredTargetPort) &&
+  validPort(value.targetPort) && validPort(value.httpsPort) &&
+  value.access === 'tailnet' && value.lifetime === 'issue' &&
+  typeof value.createdAt === 'string' && typeof value.startCommand === 'string' &&
+  (value.process === undefined || validPreviewProcessReference(value.process)) &&
+  validOptionalString(value.node)
+
+const validPreviewProcessReference = (value: unknown): boolean => isRecord(value) &&
+  Number.isSafeInteger(value.pid) && (value.pid as number) > 0 &&
+  typeof value.startTime === 'string' && typeof value.cmdline === 'string' &&
+  typeof value.cwd === 'string' && typeof value.marker === 'string'
 
 const validOwnedPullRequest = (value: unknown): boolean => isRecord(value) &&
   typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
@@ -426,9 +442,35 @@ const validRoute = (value: unknown): boolean => isRecord(value) &&
   typeof value.repo === 'string' && typeof value.rationale === 'string' && validOptionalString(value.clonePath)
 
 const validDispatchResult = (value: unknown): boolean => isRecord(value) && validIssueRef(value.issue) &&
+  (value.issueResolution === undefined || validIssueResolution(value.issueResolution)) &&
   Array.isArray(value.agents) && value.agents.every((agent) => isRecord(agent) &&
-    typeof agent.name === 'string' && typeof agent.role === 'string') &&
-  typeof value.dryRun === 'boolean'
+    typeof agent.name === 'string' && validAgentRole(agent.role)) &&
+  validOptionalStringArray(value.comments) && validOptionalString(value.stateId) &&
+  (value.previews === undefined || (Array.isArray(value.previews) && value.previews.every(validPreviewReference))) &&
+  typeof value.dryRun === 'boolean' && (value.hold === undefined || validDispatchHold(value.hold))
+
+const validDispatchHold = (value: unknown): boolean => isRecord(value) &&
+  (value.kind === 'capacity' || value.kind === 'dependency' || value.kind === 'dependency-cycle') &&
+  validOptionalStringArray(value.blockers) && validOptionalStringArray(value.cycle)
+
+const validIssueResolution = (value: unknown): boolean => isRecord(value) &&
+  (value.source === 'relayfile-projection' || value.source === 'github-api-fallback') &&
+  validOptionalString(value.repo) && typeof value.detail === 'string' &&
+  isRecord(value.projection) &&
+  (value.projection.outcome === 'matched' || value.projection.outcome === 'no-match') &&
+  validOptionalBoolean(value.projection.localMountDegraded) &&
+  validOptionalString(value.projection.localMountDegradedReason) &&
+  (value.projection.eventListener === undefined || validEventListenerStatus(value.projection.eventListener)) &&
+  (value.projection.githubConnection === undefined || validGithubConnection(value.projection.githubConnection))
+
+const validEventListenerStatus = (value: unknown): boolean => isRecord(value) &&
+  (value.state === 'starting' || value.state === 'subscribed' || value.state === 'polling' ||
+    value.state === 'not-listening' || value.state === 'unknown') &&
+  validOptionalString(value.reason)
+
+const validGithubConnection = (value: unknown): boolean => isRecord(value) &&
+  typeof value.ready === 'boolean' && validOptionalString(value.state) &&
+  validOptionalString(value.initialSyncState)
 
 const validDispatchClaimStatus = (value: unknown): boolean => isRecord(value) &&
   (value.state === 'pending' || value.state === 'verified' || value.state === 'degraded') &&
@@ -452,7 +494,21 @@ const validAgentUsage = (value: unknown): boolean => isRecord(value) && typeof v
 
 const validRunCostTotal = (value: unknown): boolean => isRecord(value) && typeof value.runId === 'string' &&
   validNullableNumber(value.inputTokens) && validNullableNumber(value.outputTokens) &&
-  validNullableNumber(value.usd) && Array.isArray(value.byRole)
+  validNullableNumber(value.usd) && Array.isArray(value.byRole) && value.byRole.every(validCostRoleBreakdown)
+
+const validCostRoleBreakdown = (value: unknown): boolean => isRecord(value) &&
+  validCostLedgerRole(value.role) && validNullableNumber(value.inputTokens) &&
+  validNullableNumber(value.outputTokens) && validNullableNumber(value.usd) &&
+  Array.isArray(value.byModel) && value.byModel.every(validCostModelBreakdown)
+
+const validCostModelBreakdown = (value: unknown): boolean => isRecord(value) &&
+  typeof value.model === 'string' && validNullableNumber(value.inputTokens) &&
+  validNullableNumber(value.outputTokens) && validNullableNumber(value.usd)
+
+const validAgentRole = (value: unknown): boolean => value === 'implementer' || value === 'reviewer' ||
+  value === 'babysitter' || value === 'workflow'
+
+const validCostLedgerRole = (value: unknown): boolean => validAgentRole(value) || value === 'triage'
 
 const validIssueRef = (value: unknown): boolean => isRecord(value) &&
   typeof value.uuid === 'string' && typeof value.key === 'string' && typeof value.path === 'string'
@@ -464,6 +520,9 @@ const validOptionalString = (value: unknown): boolean => value === undefined || 
 const validOptionalBoolean = (value: unknown): boolean => value === undefined || typeof value === 'boolean'
 const validOptionalStringArray = (value: unknown): boolean => value === undefined ||
   (Array.isArray(value) && value.every((entry) => typeof entry === 'string'))
+const validPort = (value: unknown): boolean => Number.isSafeInteger(value) &&
+  (value as number) > 0 && (value as number) <= 65_535
+const validOptionalPort = (value: unknown): boolean => value === undefined || validPort(value)
 
 const invalidDocument = (): Error => new Error('Factory GitHub watch state file is invalid')
 

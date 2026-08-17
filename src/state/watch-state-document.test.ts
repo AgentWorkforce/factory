@@ -17,6 +17,49 @@ describe('parseWatchStateDocument', () => {
   it('accepts the persisted v3 record shapes used by the document-backed store', () => {
     expect(parseWatchStateDocument(validDocument())).toEqual(validDocument())
   })
+
+  it.each([
+    ['preview reference', (document: Record<string, any>) => {
+      document.workspaces.workspace.waitingClarifications.clarification.decision.implementers[0].preview = {
+        provider: 'tailscale-serve',
+      }
+    }],
+    ['dispatch result role', (document: Record<string, any>) => {
+      document.workspaces.workspace.dispatchLifecycles.lifecycle.result = {
+        issue: issue(),
+        agents: [{ name: 'triage', role: 'triage' }],
+        dryRun: false,
+      }
+    }],
+    ['dispatch result optional field', (document: Record<string, any>) => {
+      document.workspaces.workspace.dispatchLifecycles.lifecycle.result = {
+        issue: issue(),
+        agents: [],
+        comments: [123],
+        dryRun: false,
+      }
+    }],
+    ['nested run cost', (document: Record<string, any>) => {
+      document.workspaces.workspace.dispatchLifecycles.lifecycle.cost = {
+        runId: 'run-268',
+        inputTokens: 1,
+        outputTokens: 2,
+        usd: null,
+        byRole: [{
+          role: 'implementer',
+          inputTokens: 1,
+          outputTokens: 2,
+          usd: null,
+          byModel: [{ model: 123, inputTokens: 1, outputTokens: 2, usd: null }],
+        }],
+      }
+    }],
+  ])('rejects a malformed %s during readiness parsing', (_label, mutate) => {
+    const document = validDocument()
+    mutate(document)
+
+    expect(() => parseWatchStateDocument(document)).toThrow('Factory GitHub watch state file is invalid')
+  })
 })
 
 const validDocument = (): Record<string, any> => ({
