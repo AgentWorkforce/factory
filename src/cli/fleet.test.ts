@@ -21,6 +21,7 @@ import { FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -3360,11 +3361,17 @@ describe('fleet CLI runtime', () => {
         { state: 'closed' },
         { guarded: true },
       )).resolves.toBe(true)
+      const commentBody = 'Factory dispatch'
       await expect(predicate(
-        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345abcdef012345.json',
-        { body: 'Factory dispatch' },
+        `/github/repos/AgentWorkforce/pear/issues/221/comments/${factoryGithubIssueCommentDraftName(commentBody)}`,
+        { body: commentBody },
         { guarded: true },
       )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345abcdef012345.json',
+        { body: commentBody },
+        { guarded: true },
+      )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/labels/factory-11111111-1111-4111-8111-111111111111.json',
         {

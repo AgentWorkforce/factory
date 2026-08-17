@@ -7,6 +7,7 @@ import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constant
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import {
+  factoryGithubIssueCommentDraftName,
   isFactoryGithubIssueCommentDraftName,
   isFactoryGithubOperationDraftName,
 } from '../github/writeback-paths'
@@ -17502,6 +17503,11 @@ export const isAllowedFactoryGithubDraft = async (
   const target = factoryGithubIssueWriteTarget(path)
   if (!target) return false
   if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content)) return false
+  if (target.kind === 'comment') {
+    const body = asRecord(content)?.body
+    const draftName = path.slice(path.lastIndexOf('/') + 1)
+    if (typeof body !== 'string' || draftName !== factoryGithubIssueCommentDraftName(body)) return false
+  }
   const repoPath = `/github/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`
   if (!isConfiguredGithubRepoPath(`${repoPath}/`, config)) return false
 
