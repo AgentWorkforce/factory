@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import type { MountClient } from '../ports'
+import type { GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
@@ -63,13 +63,79 @@ export interface GhCliGithubWritebackConfig {
   gitRunner?: GhRunner
 }
 
+type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
+  GithubConnectionWrite,
+  'postIssueComment' | 'updateIssue'
+>>
+
 /**
- * GitHub issue lifecycle writeback using authenticated `gh` primitives.
- * TODO(issue-52): migrate issue labels/comments to the mounted GitHub
- * connection after the PR publication path has proven stable.
- *
- * Labels are created idempotently before use so a newly-onboarded repository
- * does not need factory status labels to be provisioned by hand.
+ * Orchestrator-facing GitHub lifecycle adapter for the connected App writer.
+ * Provider-authoritative reads remain intentionally absent until the mount
+ * exposes an app-actor read contract; GithubWriteback models those as optional.
+ */
+export class AppGithubWriteback implements GithubWriteback {
+  readonly #write: AppIssueConnectionWrite
+
+  constructor(write: GithubConnectionWrite) {
+    if (!write.postIssueComment || !write.updateIssue) {
+      throw new Error(
+        'GitHub App lifecycle writeback requires connected issue-comment and issue-update capabilities',
+      )
+    }
+    this.#write = write as AppIssueConnectionWrite
+  }
+
+  async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
+    return await this.#write.publishPullRequest(input)
+  }
+
+  async postComment(issue: LinearIssue, body: string): Promise<void> {
+    const ref = githubIssueRef(issue)
+    await this.#write.postIssueComment({
+      repo: ref.repo,
+      number: ref.number,
+      body,
+      author: 'app',
+    })
+  }
+
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
+    const ref = githubIssueRef(issue)
+    const labels = new Map<string, string>()
+    for (const label of issue.labels) {
+      const trimmed = label.trim()
+      if (trimmed) labels.set(trimmed.toLowerCase(), trimmed)
+    }
+    labels.delete(STATUS_LABELS['in-progress'].name.toLowerCase())
+    labels.delete(STATUS_LABELS['human-review'].name.toLowerCase())
+    if (status !== 'ready') {
+      const target = STATUS_LABELS[status].name
+      labels.set(target.toLowerCase(), target)
+    }
+    await this.#write.updateIssue({
+      repo: ref.repo,
+      number: ref.number,
+      labels: [...labels.values()],
+      author: 'app',
+    })
+  }
+
+  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+    const ref = githubIssueRef(issue)
+    await this.postComment(issue, body)
+    await this.#write.updateIssue({
+      repo: ref.repo,
+      number: ref.number,
+      state: 'closed',
+      author: 'app',
+    })
+  }
+}
+
+/**
+ * Compatibility GitHub issue lifecycle writeback using authenticated `gh`
+ * primitives. Labels are created idempotently before use so a newly-onboarded
+ * repository does not need Factory status labels provisioned by hand.
  */
 export class GhCliGithubWriteback implements GithubWriteback {
   readonly #run: GhRunner

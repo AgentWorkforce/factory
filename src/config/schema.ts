@@ -231,10 +231,10 @@ const previewSchema = z.object({
 }).optional()
 
 const githubSchema = z.object({
-  // Controls the credential identity used when Factory creates pull requests.
-  // `auto` preserves the compatibility behavior: prefer the connected
-  // workspace GitHub App, then use the operator's local `gh` authentication
-  // when the app write path is unavailable.
+  // Controls the credential identity used for GitHub writes. Exact `app`
+  // selects the connected App for both PR publication and issue lifecycle
+  // writes. `auto` preserves compatibility: PRs prefer the App, while issue
+  // lifecycle writes retain the operator's local `gh` authentication.
   identity: z.enum(['app', 'user', 'auto']).default('auto'),
 }).default({})
 

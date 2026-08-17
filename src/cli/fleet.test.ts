@@ -3280,6 +3280,26 @@ describe('fleet CLI runtime', () => {
             { ref: 'refs/heads/factory/77', sha: 'abc123' },
             { guarded: true },
           )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/issues/221.json`,
+            { labels: ['factory', 'factory:in-progress'] },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/issues/221/comments/factory-abcdef012345abcdef012345.json`,
+            { body: 'Factory dispatch' },
+            { guarded: true },
+          )).toBe(true)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/issues/221/comments/operator.json`,
+            { body: 'unscoped draft' },
+            { guarded: true },
+          )).toBe(false)
+          expect(await opts?.isAllowedDraft?.(
+            `/github/repos/${input.repo}/issues/221/comments/factory-abcdef012345.json`,
+            { body: 'wrong digest length' },
+            { guarded: true },
+          )).toBe(false)
           closes.push(input)
         },
       }

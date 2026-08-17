@@ -139,6 +139,21 @@ export interface FactoryIntegrationConnections {
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
+  /** App-authored issue comment through the workspace GitHub connection. */
+  postIssueComment?(input: {
+    repo: string
+    number: number
+    body: string
+    author: 'app'
+  }): Promise<void>
+  /** App-authored partial issue update through the workspace GitHub connection. */
+  updateIssue?(input: {
+    repo: string
+    number: number
+    labels?: string[]
+    state?: 'open' | 'closed'
+    author: 'app'
+  }): Promise<void>
 }
 
 export interface MountClient {

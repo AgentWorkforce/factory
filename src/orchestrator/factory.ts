@@ -95,7 +95,7 @@ import type {
   TriageDecision,
   TriageEngine,
 } from '../types'
-import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
+import { AppGithubWriteback, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import {
@@ -716,7 +716,7 @@ export class FactoryLoop implements Factory {
       safety: config.safety,
     })
     this.#githubWritebackProvided = Boolean(ports.githubWriteback)
-    this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
+    this.#githubWriteback = ports.githubWriteback ?? defaultGithubWriteback(config, ports.mount)
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
@@ -15155,6 +15155,18 @@ export class FactoryLoop implements Factory {
   #isSyntheticProbeIssue(issue: LinearIssue): boolean {
     return hasTitlePrefix(issue.title, FACTORY_E2E_MARKER)
   }
+}
+
+const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
+  if (config.github.identity !== 'app') {
+    return new GhCliGithubWriteback()
+  }
+  if (!mount.githubWrite) {
+    throw new Error(
+      'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
+    )
+  }
+  return new AppGithubWriteback(mount.githubWrite)
 }
 
 export function parseLinearIssue(path: string, content: unknown): LinearIssue {

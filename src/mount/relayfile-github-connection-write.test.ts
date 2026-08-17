@@ -174,6 +174,64 @@ describe('RelayfileGithubConnectionWrite', () => {
     }])
   })
 
+  it('posts deterministic app-authored issue comments and updates through confirmed drafts', async () => {
+    const mount = new FakeMountClient()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory dispatch for 221',
+      author: 'app',
+    })
+    await write.updateIssue({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'bug', 'factory:in-progress', 'bug'],
+      author: 'app',
+    })
+
+    expect(mount.writes).toEqual([
+      {
+        path: expect.stringMatching(
+          /^\/github\/repos\/AgentWorkforce\/factory\/issues\/221\/comments\/factory-[a-f0-9]{24}\.json$/u,
+        ),
+        content: { body: 'Factory dispatch for 221' },
+      },
+      {
+        path: '/github/repos/AgentWorkforce/factory/issues/221.json',
+        content: {
+          labels: ['factory', 'bug', 'factory:in-progress'],
+        },
+      },
+    ])
+
+    await write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory dispatch for 221',
+      author: 'app',
+    })
+    expect(mount.writes[2]?.path).toBe(mount.writes[0]?.path)
+  })
+
+  it('does not report an app issue comment when provider confirmation remains pending', async () => {
+    class PendingCommentMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked' | 'pending'> {
+        return path.includes('/comments/') ? 'pending' : 'acked'
+      }
+    }
+    const mount = new PendingCommentMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Unconfirmed comment',
+      author: 'app',
+    })).rejects.toThrow(/GitHub writeback did not complete .*: pending/u)
+  })
+
   it('fails closed when the provider does not acknowledge a write', async () => {
     const mount = new FakeMountClient()
     const refPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
@@ -2353,6 +2353,125 @@ describe('FactoryLoop', () => {
     expect(githubWriteback.closes).toEqual([])
     expect(mergeGate.checks).toEqual([])
     expect(mergeGate.merges).toEqual([])
+  })
+
+  it('uses the app writer for both a GitHub issue comment and PR when identity is explicitly app and no gh token is configured', async () => {
+    vi.stubEnv('GH_TOKEN', '')
+    vi.stubEnv('GITHUB_TOKEN', '')
+    vi.stubEnv('GH_ENTERPRISE_TOKEN', '')
+    vi.stubEnv('GH_CONFIG_DIR', '/nonexistent/factory-no-gh-auth')
+    try {
+      const number = 221
+      const path = githubIssuePath('AgentWorkforce', 'pear', number)
+      const publishPullRequest: GithubConnectionWrite['publishPullRequest'] = vi.fn(async (input) => ({
+        repo: input.repo,
+        number: 322,
+        url: `https://github.com/${input.repo}/pull/322`,
+        headRef: input.headRef ?? input.expectedHeadRef!,
+        author: 'app',
+      }))
+      const postIssueComment = vi.fn(async () => undefined)
+      const updateIssue = vi.fn(async () => undefined)
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest,
+        closePullRequest: async () => undefined,
+        postIssueComment,
+        updateIssue,
+      }
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'bug'] }),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        github: { identity: 'app' },
+        mergePolicy: 'never',
+        terminalState: 'human-review',
+      }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+      })
+
+      await factory.runOnce()
+
+      expect(updateIssue).toHaveBeenCalledWith({
+        repo: 'AgentWorkforce/pear',
+        number,
+        labels: ['factory', 'bug', 'factory:in-progress'],
+        author: 'app',
+      })
+      expect(postIssueComment).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        number,
+        author: 'app',
+        body: expect.stringContaining('Factory dispatch for 221'),
+      }))
+
+      fleet.emitAgentExit('ar-221-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(publishPullRequest).toHaveBeenCalledTimes(1))
+      expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('keeps the default gh lifecycle path in auto mode even when an app connection is available', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-default-gh-writeback-'))
+    const ghLogPath = join(root, 'gh.log')
+    const ghPath = join(root, 'gh')
+    await writeFile(ghPath, [
+      '#!/bin/sh',
+      'printf \'%s\\n\' "$*" >> "$FACTORY_TEST_GH_LOG"',
+      'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then',
+      '  count=$(grep -c \'^issue view \' "$FACTORY_TEST_GH_LOG")',
+      '  if [ "$count" -gt 1 ]; then',
+      '    printf \'%s\\n\' \'{"labels":[{"name":"factory:in-progress"}]}\'',
+      '  else',
+      '    printf \'%s\\n\' \'{"labels":[]}\'',
+      '  fi',
+      'fi',
+      'if [ "$1" = "api" ]; then',
+      '  cat "$FACTORY_TEST_GH_LOG"',
+      'fi',
+    ].join('\n'))
+    await chmod(ghPath, 0o755)
+    vi.stubEnv('PATH', `${root}:${process.env.PATH ?? ''}`)
+    vi.stubEnv('FACTORY_TEST_GH_LOG', ghLogPath)
+    try {
+      const number = 220
+      const path = githubIssuePath('AgentWorkforce', 'pear', number)
+      const appPostIssueComment = vi.fn(async () => undefined)
+      const appUpdateIssue = vi.fn(async () => undefined)
+      const mount = new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory'] }),
+      }, {
+        publishPullRequest: async () => { throw new Error('unexpected publish') },
+        closePullRequest: async () => undefined,
+        postIssueComment: appPostIssueComment,
+        updateIssue: appUpdateIssue,
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const factory = createFactory(config({ github: { identity: 'auto' } }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+      })
+
+      await factory.runOnce()
+
+      const ghCalls = await readFile(ghLogPath, 'utf8')
+      expect(ghCalls).toContain('label create factory:in-progress')
+      expect(ghCalls).toContain('issue edit 220')
+      expect(ghCalls).toContain('issue comment 220')
+      expect(appPostIssueComment).not.toHaveBeenCalled()
+      expect(appUpdateIssue).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('retries a failed GitHub dispatch claim, dead-letters it loudly, and preserves registry visibility', async () => {
@@ -12135,29 +12254,18 @@ describe('FactoryLoop', () => {
     })
   })
 
-  it('surfaces a clear error when a cloud mount lacks the GitHub write path', async () => {
+  it('refuses exact App identity when the cloud mount lacks its lifecycle write path', () => {
     const mount = new FakeMountClient({ [issuePath(53)]: issueFile(53) })
     Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
     const fleet = new FakeFleetClient()
-    const errors: Error[] = []
-    const factory = createFactory(config({ github: { identity: 'app' } }), {
+    expect(() => createFactory(config({ github: { identity: 'app' } }), {
       mount,
       fleet,
       triage: new StaticTriage(),
-    })
-    factory.on('error', (payload) => {
-      if (payload.error instanceof Error) errors.push(payload.error)
-    })
-
-    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(53), issueFile(53))))
-    fleet.emitAgentExit('ar-53-impl-pear', 'issue-done')
-    await vi.waitFor(() => expect(errors).toHaveLength(1))
-
-    expect(errors[0]?.message).toBe(
-      'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
+    })).toThrow(
+      'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
     )
-    expect(factory.status().counters.githubPullRequestPublishFailures).toBe(1)
-    expect(fleet.releases).toEqual([])
+    expect(fleet.spawns).toEqual([])
   })
 
   it.each([

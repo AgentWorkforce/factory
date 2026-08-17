@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 
 import type {
@@ -23,7 +24,7 @@ export interface RelayfileGithubConnectionWriteConfig {
 }
 
 /**
- * GitHub PR mutations backed by the workspace's file-native Relayfile
+ * GitHub mutations backed by the workspace's file-native Relayfile
  * connection. The adapter is server-side; Factory only depends on the stable
  * write paths and payload contracts exposed through MountClient.
  */
@@ -127,6 +128,58 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     )
   }
 
+  async postIssueComment(input: {
+    repo: string
+    number: number
+    body: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    const body = input.body.trim()
+    if (!body) {
+      throw new Error('GitHub issue comment body must be a non-empty string')
+    }
+    if (input.author !== 'app') {
+      throw new Error(`Relayfile GitHub issue comments require author "app": ${input.author}`)
+    }
+    const digest = createHash('sha256').update(body).digest('hex').slice(0, 24)
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}/comments/factory-${digest}.json`,
+      // `author` selects this connection method, but is not a writable field
+      // in Relayfile's GitHub issue-comment schema. The connected App
+      // credential is applied server-side.
+      { body },
+    )
+  }
+
+  async updateIssue(input: {
+    repo: string
+    number: number
+    labels?: string[]
+    state?: 'open' | 'closed'
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    if (input.author !== 'app') {
+      throw new Error(`Relayfile GitHub issue updates require author "app": ${input.author}`)
+    }
+    const labels = input.labels === undefined ? undefined : normalizedGithubLabels(input.labels)
+    if (labels === undefined && input.state === undefined) {
+      throw new Error('GitHub issue update requires labels and/or state')
+    }
+    // As with comments, the App identity is enforced by the method contract;
+    // the provider's issue schema accepts only its mutable REST fields.
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}.json`,
+      {
+        ...(labels === undefined ? {} : { labels }),
+        ...(input.state === undefined ? {} : { state: input.state }),
+      },
+    )
+  }
+
   async #gitValue(args: string[], description: string): Promise<string> {
     try {
       const value = (await this.#git(args)).stdout.trim()
@@ -206,6 +259,25 @@ const githubRepoParts = (value: string): { owner: string; repo: string } => {
     throw new Error(`GitHub repo must be owner/repo: ${value}`)
   }
   return { owner: match[1], repo: match[2] }
+}
+
+const githubRepoRoot = (value: string): string => {
+  const { owner, repo } = githubRepoParts(value)
+  return `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+}
+
+const assertPositiveGithubNumber = (value: number, resource: string): void => {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`GitHub ${resource} number must be a positive integer: ${value}`)
+  }
+}
+
+const normalizedGithubLabels = (labels: string[]): string[] => {
+  const normalized = labels.map((label) => label.trim())
+  if (normalized.some((label) => !label)) {
+    throw new Error('GitHub issue labels must be non-empty strings')
+  }
+  return [...new Set(normalized)]
 }
 
 const githubDraftName = (headRef: string, headSha?: string): string => {

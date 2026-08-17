@@ -175,6 +175,7 @@ export type {
   LlmTriageOptions,
 } from './triage'
 export {
+  AppGithubWriteback,
   GhCliGithubWriteback,
   FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,

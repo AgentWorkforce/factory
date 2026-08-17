@@ -1894,7 +1894,7 @@ async function isAllowedFactoryDraft(
 }
 
 const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json|issues\/(?:[1-9]\d*\.json|[1-9]\d*\/comments\/factory-[a-f0-9]{24}\.json))$/iu.test(path)
 
 const isAllowedFactoryGithubDraft = (
   path: string,
