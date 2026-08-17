@@ -10,6 +10,8 @@ export {
   createFactory,
   FactoryLoop,
   isDispatchableIssue,
+  isAllowedFactoryGithubDraft,
+  isAllowedFactoryGithubArtifactDraft,
   isLiveDispatchStateChangedError,
   isRealLinearIssue,
   LiveDispatchStateChangedError,

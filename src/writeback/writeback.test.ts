@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
-import type { MountClient } from '../ports'
+import { AppGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import type { GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
@@ -803,6 +803,109 @@ describe('MountGithubRead', () => {
   })
 })
 
+describe('AppGithubWriteback', () => {
+  const appIssue: LinearIssue = {
+    ...issue,
+    uuid: 'github-221',
+    key: '221',
+    title: 'GitHub-native app writeback',
+    stateId: '',
+    labels: ['factory', 'bug', 'factory:in-progress'],
+    path: '/github/repos/AgentWorkforce/factory/issues/by-id/221.json',
+    raw: {
+      payload: {
+        source: {
+          provider: 'github',
+          id: 'github-221',
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          number: 221,
+          url: 'https://github.com/AgentWorkforce/factory/issues/221',
+        },
+      },
+    },
+  }
+
+  it('delegates PRs and lifecycle writes to the app connection without exposing read methods', async () => {
+    const publishPullRequest: GithubConnectionWrite['publishPullRequest'] = vi.fn(async (input) => ({
+      repo: input.repo,
+      number: 322,
+      url: 'https://github.com/AgentWorkforce/factory/pull/322',
+      headRef: input.headRef ?? input.expectedHeadRef!,
+      author: 'app',
+    }))
+    const postIssueComment = vi.fn(async () => undefined)
+    const ensureRepositoryLabel = vi.fn(async () => undefined)
+    const mutateIssueLabel = vi.fn(async () => undefined)
+    const updateIssue = vi.fn(async () => undefined)
+    const connection: GithubConnectionWrite = {
+      publishPullRequest,
+      closePullRequest: async () => undefined,
+      postIssueComment,
+      ensureRepositoryLabel,
+      mutateIssueLabel,
+      updateIssue,
+    }
+    const app = new AppGithubWriteback(connection)
+
+    await expect(app.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/221-agentworkforce-factory',
+      baseRef: 'main',
+      title: '221: app writeback',
+      body: 'Fixes #221',
+    })).resolves.toMatchObject({ number: 322, author: 'app' })
+    await app.postComment(appIssue, 'Factory dispatch for 221')
+    await app.setStatus(appIssue, 'human-review')
+    await app.setStatus(appIssue, 'ready')
+    await app.closeIssue(appIssue, 'Factory observed the linked PR merge.')
+
+    expect(postIssueComment).toHaveBeenNthCalledWith(1, {
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory dispatch for 221',
+      author: 'app',
+    })
+    expect(ensureRepositoryLabel).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      name: 'factory:human-review',
+      color: 'fbca04',
+      description: 'Factory work is ready for human review.',
+      author: 'app',
+    })
+    expect(mutateIssueLabel.mock.calls).toEqual([
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'add', label: 'factory:human-review', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
+      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:human-review', author: 'app' }],
+    ])
+    expect(postIssueComment).toHaveBeenNthCalledWith(2, {
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory observed the linked PR merge.',
+      author: 'app',
+    })
+    expect(updateIssue).toHaveBeenCalledTimes(1)
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      state: 'closed',
+      author: 'app',
+    })
+    const writeback: GithubWriteback = app
+    expect(writeback.getIssueAuthor).toBeUndefined()
+    expect(writeback.getIssueStatus).toBeUndefined()
+    expect(writeback.hasCommentMarker).toBeUndefined()
+  })
+
+  it('refuses selection when the connected writer lacks issue lifecycle capabilities', () => {
+    expect(() => new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('unexpected publish') },
+      closePullRequest: async () => undefined,
+    })).toThrow('requires connected comment, label, and issue-update capabilities')
+  })
+})
+
 describe('GhCliGithubWriteback', () => {
   const githubIssue: LinearIssue = {
     ...issue,
@@ -984,7 +1087,9 @@ describe('GhCliGithubWriteback', () => {
           }
         }
         if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
-          labels.delete(args[args.indexOf('--remove-label') + 1]!)
+          args.forEach((arg, index) => {
+            if (arg === '--remove-label') labels.delete(args[index + 1]!)
+          })
         }
         return { stdout: '' }
       },
@@ -994,7 +1099,17 @@ describe('GhCliGithubWriteback', () => {
 
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
-      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
+      [
+        'issue',
+        'edit',
+        '48',
+        '--repo',
+        'AgentWorkforce/factory',
+        '--remove-label',
+        'factory:in-progress',
+        '--remove-label',
+        'factory:human-review',
+      ],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
     ])
   })

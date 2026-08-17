@@ -31,6 +31,8 @@ import {
   explicitLinkedIssueKey,
   githubIssuePathParts,
   githubWatchStatePath,
+  isAllowedFactoryGithubDraft,
+  isAllowedFactoryGithubArtifactDraft,
   isInFactoryScope,
   parseGithubFactoryIssue,
   parseLinearIssue,
@@ -305,7 +307,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         const workspaceId = (await (deps.resolveWorkspace ?? resolveFactoryWorkspace)()).workspaceId
         mount = deps.mount ?? await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
           workspaceId,
-          isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubDraft(path, opts),
+          isAllowedDraft: (path, _content, opts) => isAllowedFactoryGithubArtifactDraft(path, opts),
         })
         await prepareFactoryIntegrations(command, mount, undefined, globals, deps, workspaceId, err)
         githubWrite = mount.githubWrite
@@ -1997,20 +1999,10 @@ async function isAllowedFactoryDraft(
     return true
   }
 
-  if (isAllowedFactoryGithubDraft(path, opts)) {
-    return true
-  }
+  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config)) return true
 
   return false
 }
-
-const isFactoryGithubWritebackPath = (path: string): boolean =>
-  /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
-
-const isAllowedFactoryGithubDraft = (
-  path: string,
-  opts: { guarded?: boolean } | undefined,
-): boolean => opts?.guarded === true && isFactoryGithubWritebackPath(path)
 
 const scopeIssueFromDraftContent = (content: unknown) => ({
   title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',

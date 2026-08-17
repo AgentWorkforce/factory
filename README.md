@@ -73,8 +73,9 @@ After init, add the `factory` label to an open issue and run a dry run below.
 1. **Connect GitHub to your relay workspace** with push access for the target
    repositories. Factory uses that workspace connection to publish branches and
    open pull requests by default. A local `gh` installation and `gh auth login`
-   are required only when `github.identity` selects the user path (or for the
-   existing GitHub issue lifecycle writeback described below). If a required
+   are required when `github.identity` is `"user"`, or when the default
+   `"auto"` mode uses the compatibility GitHub issue lifecycle path. Exact
+   `"app"` mode needs no local GitHub credential. If a required
    connection is missing, an interactive Factory command offers to open the
    Relayfile connection flow and waits for it to finish. Linear-backed operations
    require both Linear and GitHub; GitHub-native operations require GitHub.
@@ -719,7 +720,7 @@ an invalid config fails fast with a field-level error. See
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
 
-Factory PR authorship is controlled explicitly with `github.identity`:
+Factory GitHub write attribution is controlled explicitly with `github.identity`:
 
 ```jsonc
 {
@@ -729,19 +730,27 @@ Factory PR authorship is controlled explicitly with `github.identity`:
 }
 ```
 
-- `"app"` always publishes through the connected workspace GitHub App. If that
-  write path is unavailable, Factory fails loudly and never falls back to a
-  personal account.
-- `"user"` always publishes with the account authenticated by the local `gh`
-  CLI, even when the app path is available.
-- `"auto"` is the default and preserves compatibility: prefer the app path,
-  then fall back to the local `gh` user when the app writer is unavailable.
+- `"app"` publishes pull requests and performs GitHub issue lifecycle writes
+  through the connected workspace GitHub App. Status transitions provision the
+  target Factory label, add only that label, and remove only the prior Factory
+  label, so labels applied by people are never replaced from a stale mount
+  projection. If any required write capability is unavailable, Factory fails
+  loudly and never falls back to a personal account.
+- `"user"` publishes pull requests and performs issue lifecycle writes with the
+  account authenticated by the local `gh` CLI, even when the app path is
+  available.
+- `"auto"` is the default and preserves compatibility: pull requests prefer the
+  App path and fall back to the local `gh` user, while issue comments, status
+  labels, and issue closure retain the local `gh` path.
 
 Each successful publication log includes `identity` (`app` or `user`) and the
-confirmed `author`. This setting currently controls PR creation only. GitHub
-issue comments and lifecycle status labels still use the existing local `gh`
-writeback; extending the identity policy to those operations requires a
-connected-app issue writeback surface.
+confirmed `author`. App writes are not reported complete until the connected
+mount acknowledges the provider mutation. Provider-authoritative issue reads
+remain optional on the writeback interface; when unavailable, their existing
+call sites keep their conservative fallback behavior.
+
+This identity setting does not change Notion intake's separate GitHub issue
+publisher, which still requires local `gh` authentication when enabled.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,

@@ -139,7 +139,44 @@ export interface FactoryIntegrationConnections {
 export interface GithubConnectionWrite {
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
+  /** App-authored issue comment through the workspace GitHub connection. */
+  postIssueComment?(input: {
+    repo: string
+    number: number
+    body: string
+    author: 'app'
+  }): Promise<void>
+  /** Idempotently provision a repository label through the connected App. */
+  ensureRepositoryLabel?(input: {
+    repo: string
+    name: string
+    color: string
+    description: string
+    author: 'app'
+  }): Promise<void>
+  /** Add or remove exactly one issue label without replacing unrelated labels. */
+  mutateIssueLabel?(input: {
+    repo: string
+    number: number
+    operation: 'add' | 'remove'
+    label: string
+    author: 'app'
+  }): Promise<void>
+  /** App-authored partial issue update through the workspace GitHub connection. */
+  updateIssue?(input: GithubConnectionIssueUpdateInput): Promise<void>
 }
+
+type GithubConnectionIssueUpdateTarget = {
+  repo: string
+  number: number
+  author: 'app'
+}
+
+/** At least one mutable issue field must be present. */
+export type GithubConnectionIssueUpdateInput = GithubConnectionIssueUpdateTarget & (
+  | { labels: string[]; state?: 'open' | 'closed' }
+  | { labels?: never; state: 'open' | 'closed' }
+)
 
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'

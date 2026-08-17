@@ -21,6 +21,7 @@ import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -3500,6 +3501,112 @@ describe('fleet CLI runtime', () => {
     expect(integrations.getStatus).toHaveBeenCalledWith('github')
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 42 }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
+  })
+
+  it('scope-checks GitHub lifecycle drafts in the ordinary CLI cloud mount', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-github-draft-scope-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const outOfScopeIssue = githubIssueFile('pear', 222)
+      outOfScopeIssue.payload.labels = [{ name: 'bug' }]
+      const closedIssue = githubIssueFile('pear', 223)
+      closedIssue.payload.state = 'closed'
+      const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
+      const mount = mountWithIntegrationConnections({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/221.json': githubIssueFile('pear', 221),
+        '/github/repos/AgentWorkforce/pear/issues/by-id/222.json': outOfScopeIssue,
+        '/github/repos/AgentWorkforce/pear/issues/by-id/223.json': closedIssue,
+      }, integrations)
+      let predicate: (
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean },
+      ) => boolean | Promise<boolean> = () => false
+      const cloudMountFromConfig = vi.fn(async (opts) => {
+        predicate = opts?.isAllowedDraft ?? predicate
+        return mount
+      })
+      const factory = {
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        cloudMountFromConfig,
+        fleet: new FakeFleetClient(),
+        createFactory: () => factory,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(true)
+      const commentBody = 'Factory dispatch'
+      await expect(predicate(
+        `/github/repos/AgentWorkforce/pear/issues/221/comments/${factoryGithubIssueCommentDraftName(commentBody)}`,
+        { body: commentBody },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345abcdef012345.json',
+        { body: commentBody },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/labels/factory-11111111-1111-4111-8111-111111111111.json',
+        {
+          name: 'factory:in-progress',
+          color: '1d76db',
+          description: 'Factory agents are working on this issue.',
+        },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
+        { operation: 'add', labels: ['factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
+        { operation: 'remove', label: 'bug' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/operator.json',
+        { body: 'unscoped draft' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345.json',
+        { body: 'wrong-length digest' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/222.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/223.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/OtherOrg/other/issues/221.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('runs factory loop through the bounded runner and emits a heartbeat-backed status', async () => {
