@@ -438,7 +438,7 @@ export class RelayFleetClient implements FleetClient {
     // hard failure containing the deterministic worker name instead of a
     // successful shutdown that silently strands it.
     if ([...this.#tracked.values()].some((agent) => agent.pendingReleaseReason)) {
-      await this.reconcileTrackedAgents()
+      await this.#retryPendingReleases()
       const pendingNames = [...this.#tracked]
         .filter(([, agent]) => agent.pendingReleaseReason)
         .map(([name]) => name)
@@ -603,6 +603,12 @@ export class RelayFleetClient implements FleetClient {
 
   async #reconcileTracked(): Promise<void> {
     if (this.#tracked.size === 0) return
+    // Cleanup is more important than roster metadata and does not depend on
+    // it. Retry rejected-placement releases first so a presence/node outage
+    // cannot prevent the compensating action.
+    await this.#retryPendingReleases()
+    if (this.#tracked.size === 0) return
+
     const messaging = await this.#ensureMessaging()
     const [presence, nodes] = await Promise.all([
       messaging.agents.presence(),
@@ -615,14 +621,6 @@ export class RelayFleetClient implements FleetClient {
     const nowMs = this.#now()
 
     for (const [name, entry] of [...this.#tracked]) {
-      if (entry.pendingReleaseReason) {
-        try {
-          await this.release(name, entry.pendingReleaseReason)
-          continue
-        } catch (error) {
-          this.#log(`Pending release retry failed for ${name}: ${errorMessage(error)}`)
-        }
-      }
       if (!onlineAgentNames.has(name)) {
         // A just-spawned agent may not have registered with the engine yet;
         // absence only counts as an exit once the grace window has passed.
@@ -638,6 +636,17 @@ export class RelayFleetClient implements FleetClient {
         }
       } else {
         entry.nodeOfflineSinceMs = undefined
+      }
+    }
+  }
+
+  async #retryPendingReleases(): Promise<void> {
+    for (const [name, entry] of [...this.#tracked]) {
+      if (!entry.pendingReleaseReason) continue
+      try {
+        await this.release(name, entry.pendingReleaseReason)
+      } catch (error) {
+        this.#log(`Pending release retry failed for ${name}: ${errorMessage(error)}`)
       }
     }
   }

@@ -459,6 +459,48 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().size).toBe(0)
   })
 
+  it('retries pending cleanup during disposal without depending on roster health', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl' },
+    }])
+    messaging.invocations.set('inv-1', [{
+      invocationId: 'inv-1',
+      actionName: 'release',
+      status: 'failed',
+      error: 'temporary cleanup failure',
+    }])
+    const presence = vi.spyOn(messaging.agents, 'presence')
+      .mockRejectedValue(new Error('roster unavailable'))
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    messaging.invocations.set('inv-2', [{
+      invocationId: 'inv-2',
+      actionName: 'release',
+      status: 'completed',
+      output: {},
+    }])
+    await expect(fleet.dispose()).resolves.toBeUndefined()
+
+    expect(presence).not.toHaveBeenCalled()
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toHaveLength(2)
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
   it('refuses disposal without erasing an unconfirmed rejected-placement release', async () => {
     const messaging = new FakeMessaging()
     messaging.placementAck = {
