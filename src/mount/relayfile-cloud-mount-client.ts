@@ -397,7 +397,10 @@ export class RelayfileCloudMountClient implements MountClient {
           timeoutMs: config.cloudAccessTokenTimeoutMs ?? DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS,
         })
       : undefined
-    const directTokenProvider = config.cloudAccessTokenProvider ?? hostedTokenProvider
+    const unvalidatedDirectTokenProvider = config.cloudAccessTokenProvider ?? hostedTokenProvider
+    const directTokenProvider = unvalidatedDirectTokenProvider
+      ? createValidatedHostedAccessTokenProvider(unvalidatedDirectTokenProvider)
+      : undefined
     let initialSession: CloudSession | undefined
     let tokenProvider: () => Promise<string>
     if (directTokenProvider) {
@@ -1001,6 +1004,16 @@ const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, token
     cloudApiUrl,
     accessToken: tokenProvider,
   }) as unknown as RelayfileSetupLike
+
+const createValidatedHostedAccessTokenProvider = (
+  provider: () => Promise<string>,
+): (() => Promise<string>) => async () => {
+  const accessToken = (await provider()).trim()
+  if (!accessToken.startsWith('relay_pa_')) {
+    throw new Error('hosted Cloud access-token provider returned an invalid token class')
+  }
+  return accessToken
+}
 
 const createHostedCloudAccessTokenProvider = (options: {
   url: string

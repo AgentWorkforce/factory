@@ -1038,13 +1038,61 @@ describe('RelayfileCloudMountClient', () => {
     expect(cloudSessionProvider).not.toHaveBeenCalled()
     expect(relayfileSetupFactory).toHaveBeenCalledWith({
       cloudApiUrl: 'https://cloud.example',
-      tokenProvider: cloudAccessTokenProvider,
+      tokenProvider: expect.any(Function),
     })
     expect(setup.joinWorkspace).toHaveBeenCalledWith('rw_test', {
       agentName: 'agent-relay-factory',
       scopes: [...FACTORY_RELAYFILE_SCOPES],
     })
     await expect(capturedTokenProvider?.()).resolves.toBe('relay_pa_hosted_access')
+  })
+
+  it('rejects a non-path token from an injected hosted provider before workspace join', async () => {
+    const joinWorkspace = vi.fn()
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => ({
+      joinWorkspace: async () => {
+        await tokenProvider()
+        return await joinWorkspace()
+      },
+    })
+
+    await expect(RelayfileCloudMountClient.fromConfig({
+      cloudApiUrl: 'https://cloud.example',
+      cloudAccessTokenProvider: async () => 'relay_ws_overbroad',
+      relayfileSetupFactory,
+    })).rejects.toThrow('invalid token class')
+    expect(joinWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('uses an explicit hosted endpoint without resolving local Cloud workspace state', async () => {
+    const fake = new FakeRelayFileClient()
+    const cloudSessionProvider = vi.fn(async () => {
+      throw new Error('local Cloud login must not be consulted')
+    })
+    const joinWorkspace = vi.fn(async () => ({
+      client: () => fake,
+      getToken: async () => 'delegated-relayfile-token',
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }))
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => ({
+      joinWorkspace: async (workspaceId, options) => {
+        await tokenProvider()
+        return await joinWorkspace(workspaceId, options)
+      },
+    })
+
+    await RelayfileCloudMountClient.fromConfig({
+      cloudAccessTokenUrl: 'http://factory-auth.do/v1/access',
+      cloudApiUrl: 'https://cloud.example',
+      cloudSessionProvider,
+      cloudAccessTokenFetch: vi.fn(async () => Response.json({ accessToken: 'relay_pa_hosted_access' })) as unknown as typeof fetch,
+      relayfileSetupFactory,
+    })
+
+    expect(cloudSessionProvider).not.toHaveBeenCalled()
+    expect(joinWorkspace).toHaveBeenCalledWith('rw_7ccfea89', expect.objectContaining({
+      agentName: 'agent-relay-factory',
+    }))
   })
 
   it('fails loudly when a hosted token provider has no Cloud API URL', async () => {
