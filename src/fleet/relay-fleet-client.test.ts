@@ -324,6 +324,47 @@ describe('RelayFleetClient', () => {
     })).rejects.toThrow('Relay placement did not prove a named remote node')
 
     expect(fleet.trackedAgents().size).toBe(0)
+    expect(messaging.invokes).toContainEqual({
+      name: 'release',
+      input: {
+        name: 'ar-1-impl',
+        agent: 'ar-1-impl',
+        reason: 'unverified-placement',
+      },
+    })
+  })
+
+  it('rejects the acknowledgement node even when action output synthesizes a named node', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl', node: 'mac-mini' },
+    }])
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+      task: 'do work',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    expect(messaging.invokes).toContainEqual({
+      name: 'release',
+      input: expect.objectContaining({
+        name: 'ar-1-impl',
+        reason: 'unverified-placement',
+      }),
+    })
+    expect(fleet.trackedAgents().size).toBe(0)
   })
 
   it('surfaces a self-placement refusal as a non-zero CLI result', async () => {

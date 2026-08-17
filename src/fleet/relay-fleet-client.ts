@@ -187,7 +187,22 @@ export class RelayFleetClient implements FleetClient {
     })
     const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
-    assertNamedRemotePlacement(result)
+    try {
+      assertNamedRemotePlacement(result, ack.placement?.node)
+    } catch (error) {
+      // A completed placement invocation has already launched the worker. If
+      // Relay cannot prove that it ran on a named remote node, tear that worker
+      // down before refusing the result so a rejected spawn cannot keep acting
+      // outside Factory's lifecycle tracking.
+      try {
+        await this.release(result.name, 'unverified-placement')
+      } catch (releaseError) {
+        this.#log(
+          `Failed to release ${result.name} after unverified Relay placement: ${errorMessage(releaseError)}`,
+        )
+      }
+      throw error
+    }
     this.#track(result.name, ack)
     return result
   }
@@ -808,8 +823,11 @@ function spawnResultFromInvocation(
   }
 }
 
-function assertNamedRemotePlacement(result: SpawnResult): void {
-  const node = result.node?.trim()
+function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): void {
+  // The placement acknowledgement is authoritative. Action output may name
+  // the node executing the spawn handler even when Relay acknowledged `self`,
+  // so accepting the synthesized SpawnResult would let self-placement pass.
+  const node = acknowledgedNode?.trim()
   if (!node || node === 'self') {
     throw new Error(
       `Relay placement did not prove a named remote node for ${result.name}; ` +
