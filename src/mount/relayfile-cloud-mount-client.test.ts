@@ -16,6 +16,7 @@ import {
   FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
   relayfileWorkspaceTokenProvider,
+  resolveFactoryWorkspace,
   type CloudSessionProvider,
   type RelayfileSetupFactory,
   type RelayfileCloudMountClientConfig,
@@ -1110,6 +1111,17 @@ describe('RelayfileCloudMountClient', () => {
       },
     })).rejects.toThrow(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must be an absolute URL`)
     expect(cloudSessionProvider).not.toHaveBeenCalled()
+  })
+
+  it('does not resolve a local Cloud workspace when hosted credentials are configured', async () => {
+    const activeWorkspaceResolver = vi.fn(async () => {
+      throw new Error('local Cloud workspace resolution must not run')
+    })
+
+    await expect(resolveFactoryWorkspace(activeWorkspaceResolver, {
+      [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: 'http://factory-auth.do/v1/access',
+    })).resolves.toEqual({ workspaceId: 'rw_7ccfea89' })
+    expect(activeWorkspaceResolver).not.toHaveBeenCalled()
   })
 
   it('cancels a failed hosted credential response body without reading it', async () => {

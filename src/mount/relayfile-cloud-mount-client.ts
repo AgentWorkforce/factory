@@ -110,7 +110,16 @@ export interface ResolvedFactoryWorkspace {
  */
 export async function resolveFactoryWorkspace(
   resolver: ActiveWorkspaceResolver = resolveActiveWorkspace,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<ResolvedFactoryWorkspace> {
+  // Hosted Factory receives a workspace-bound relay_pa credential from its
+  // private endpoint. Never consult the laptop-oriented Cloud session path in
+  // that mode; doing so can invoke AGENT_RELAY_BIN before fromConfig() gets the
+  // chance to use the hosted provider. fromConfig() remains responsible for
+  // validating the configured endpoint URL and failing closed when malformed.
+  if (Object.prototype.hasOwnProperty.call(env, FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV)) {
+    return { workspaceId: DEFAULT_WORKSPACE_ID }
+  }
   try {
     const descriptor = await resolver({ interactive: false })
     if (descriptor.relayfileWorkspaceId) {
