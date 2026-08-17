@@ -7,6 +7,11 @@ export interface OrchestrateDeps {
   appendResult: (result: BenchmarkResult) => Promise<void>
   log: (message: string) => void
   now: () => string
+  /**
+   * Monotonic clock in milliseconds. Injected so tests can drive it
+   * deterministically; defaults to `performance.now()` at call sites.
+   */
+  monotonicMs?: () => number
 }
 
 /**
@@ -27,6 +32,8 @@ export async function runMatrix(cells: MatrixCell[], deps: OrchestrateDeps): Pro
 }
 
 async function runCell(cell: MatrixCell, deps: OrchestrateDeps): Promise<BenchmarkResult> {
+  const monotonic = deps.monotonicMs ?? (() => performance.now())
+  const startedAtMs = monotonic()
   try {
     const outcome = await deps.runner.dispatch(cell.task, cell.mode)
     const verdict = await deps.runner.verify(cell.task, outcome)
@@ -38,6 +45,7 @@ async function runCell(cell: MatrixCell, deps: OrchestrateDeps): Promise<Benchma
       passed: verdict.passed,
       notes: verdict.notes,
       timestamp: deps.now(),
+      durationMs: Math.max(0, Math.round(monotonic() - startedAtMs)),
     }
   } catch (error) {
     // A dispatch/verify failure is itself a real, reportable data point (the
@@ -50,6 +58,7 @@ async function runCell(cell: MatrixCell, deps: OrchestrateDeps): Promise<Benchma
       passed: false,
       notes: `runner error: ${error instanceof Error ? error.message : String(error)}`,
       timestamp: deps.now(),
+      durationMs: Math.max(0, Math.round(monotonic() - startedAtMs)),
     }
   }
 }

@@ -46,9 +46,13 @@ describe('runMatrix', () => {
     ], opts)
 
     expect(results).toEqual([
-      { taskId: 'a', mode: 'single', repeat: 0, runId: 'a-single', passed: true, notes: undefined, timestamp: 'fixed-timestamp' },
-      { taskId: 'a', mode: 'team', repeat: 0, runId: 'a-team', passed: true, notes: undefined, timestamp: 'fixed-timestamp' },
+      expect.objectContaining({ taskId: 'a', mode: 'single', repeat: 0, runId: 'a-single', passed: true, notes: undefined, timestamp: 'fixed-timestamp' }),
+      expect.objectContaining({ taskId: 'a', mode: 'team', repeat: 0, runId: 'a-team', passed: true, notes: undefined, timestamp: 'fixed-timestamp' }),
     ])
+    // Every result now carries a non-negative wall-clock — the report can no
+    // longer print `n/a` for it. (Cost stays undefined until Factory exposes
+    // per-dispatch spend to the runner.)
+    for (const result of results) expect(result.durationMs).toBeGreaterThanOrEqual(0)
     expect(appended).toEqual(results)
     expect(runner.dispatch).toHaveBeenCalledTimes(2)
   })
@@ -70,6 +74,26 @@ describe('runMatrix', () => {
     expect(results[0]).toMatchObject({ mode: 'single', passed: false, notes: expect.stringContaining('fleet spawn failed') })
     expect(results[1]).toMatchObject({ mode: 'team', passed: true })
     expect(runner.dispatch).toHaveBeenCalledTimes(2) // second cell still ran after the first threw
+  })
+
+  it('records durationMs on every cell — including failures — using the injected monotonic clock', async () => {
+    let clock = 1_000
+    const runner: DispatchRunner = {
+      dispatch: vi.fn()
+        .mockImplementationOnce(async () => { clock += 42_000; return { runId: 'ok', prBranch: 'factory/x' } })
+        .mockImplementationOnce(async () => { clock += 17_000; throw new Error('boom') }),
+      verify: vi.fn(async () => ({ passed: true })),
+    }
+    const { opts, appended } = deps(runner)
+
+    await runMatrix([
+      { task: task('a'), mode: 'single', repeat: 0 },
+      { task: task('a'), mode: 'team', repeat: 0 },
+    ], { ...opts, monotonicMs: () => clock })
+
+    expect(appended[0]?.durationMs).toBe(42_000)
+    expect(appended[1]?.durationMs).toBe(17_000) // the failure path timed the failed cell just like a success
+    expect(appended[1]?.notes).toContain('runner error')
   })
 
   it('processes cells strictly sequentially, never overlapping two dispatches', async () => {

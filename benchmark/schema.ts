@@ -48,6 +48,18 @@ export interface BenchmarkResult {
   notes?: string
   /** ISO timestamp the result was recorded. */
   timestamp: string
+  /**
+   * Wall-clock the cell took, dispatch → verify inclusive. Optional so
+   * historical results.jsonl lines that pre-date this field still load; new
+   * rows always include it.
+   */
+  durationMs?: number
+  /**
+   * USD spend attributed to this cell. Optional and left unset until Factory
+   * surfaces per-dispatch cost — the report treats undefined as "no cost
+   * sample" (renders `n/a`) rather than as 0.
+   */
+  costUsd?: number
 }
 
 export const BenchmarkResultSchema = z.object({
@@ -58,6 +70,8 @@ export const BenchmarkResultSchema = z.object({
   passed: z.boolean(),
   notes: z.string().optional(),
   timestamp: z.string().min(1),
+  durationMs: z.number().nonnegative().optional(),
+  costUsd: z.number().nonnegative().optional(),
 })
 
 /**

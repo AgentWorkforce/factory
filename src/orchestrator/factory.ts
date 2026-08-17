@@ -7407,6 +7407,17 @@ export class FactoryLoop implements Factory {
       }
     }
 
+    // Swarm workers share the lead's checkout and lifecycle branch. If a worker
+    // exit reached the publication/completion paths below, whichever worker
+    // finished first would publish whatever partial state was on the shared
+    // branch and mark every swarm member "done" via the shared-branch PR probe,
+    // releasing the still-working lead. The lead alone is authoritative for
+    // publication and completion in a swarm.
+    if (exiting?.spec.swarmRole === 'worker') {
+      this.#increment('swarmWorkerExitsSuppressed')
+      return
+    }
+
     if (isCompletionReason(reason)) {
       if (exiting?.spec.role === 'implementer' && await this.#issueHasCompletionPr(record, {
         openOnly: this.#config.babysitter.enabled,

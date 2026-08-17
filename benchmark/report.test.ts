@@ -50,6 +50,30 @@ describe('buildReportRows', () => {
     expect(rows[0]?.meanWallClockMs).toBeUndefined()
   })
 
+  // New shape: durationMs and costUsd are recorded directly on the result by
+  // orchestrate.runMatrix, so the report never needs an out-of-band samples
+  // file to fill in the headline wall-clock column.
+  it('reads durationMs and costUsd off the result row directly', () => {
+    const rows = buildReportRows([task], [
+      { taskId: 'rename-error-type', mode: 'single', repeat: 0, runId: 'r1', passed: true, timestamp: 't', durationMs: 60_000, costUsd: 1 },
+      { taskId: 'rename-error-type', mode: 'single', repeat: 1, runId: 'r2', passed: true, timestamp: 't', durationMs: 180_000, costUsd: 3 },
+    ])
+
+    expect(rows[0]?.meanWallClockMs).toBe(120_000)
+    expect(rows[0]?.meanCostUsd).toBe(2)
+  })
+
+  it('averages only the rows that carry duration/cost, treating missing values as absent rather than 0', () => {
+    const rows = buildReportRows([task], [
+      { taskId: 'rename-error-type', mode: 'single', repeat: 0, runId: 'r1', passed: true, timestamp: 't', durationMs: 120_000 },
+      { taskId: 'rename-error-type', mode: 'single', repeat: 1, runId: 'r2', passed: false, timestamp: 't' }, // no durationMs
+    ])
+
+    // Only the sampled row counts toward the mean — no silent 0 bringing it down.
+    expect(rows[0]?.meanWallClockMs).toBe(120_000)
+    expect(rows[0]?.meanCostUsd).toBeUndefined()
+  })
+
   it('drops results for tasks no longer in the corpus instead of throwing', () => {
     const rows = buildReportRows([task], [
       { taskId: 'deleted-task', mode: 'single', repeat: 0, runId: 'r1', passed: true, timestamp: 't' },

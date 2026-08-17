@@ -29,6 +29,14 @@ export interface CliDispatchRunnerOptions {
  * intentionally not unit-tested (same category as
  * scripts/verify-tailscale-preview-e2e.mjs): correctness here is proven by
  * running it for real, not by mocking child_process.
+ *
+ * Two categories of dispatch call are refused up front instead of quietly
+ * producing wrong numbers — see the guards in `dispatch()` below. Both are
+ * limitations of Factory's dispatch, not this runner: fixing them belongs in
+ * Factory (multi-implementer-per-repo team scope, per-issue base override),
+ * and the benchmark should report `n/a` for the affected cells until those
+ * land rather than mislabel single-agent runs as `team` or measure the wrong
+ * SWE-bench base commit.
  */
 export function createCliDispatchRunner(options: CliDispatchRunnerOptions): DispatchRunner {
   const log = options.log ?? (() => {})
@@ -37,6 +45,36 @@ export function createCliDispatchRunner(options: CliDispatchRunnerOptions): Disp
 
   return {
     async dispatch(task, mode) {
+      // Factory's `team` scope fans out ONE implementer per configured repo
+      // route. A single-repository benchmark task produces exactly one route,
+      // so `team` and `single` become the same one-implementer dispatch and
+      // the benchmark's team-vs-single comparison would be a null test
+      // wearing the wrong label. Refuse the cell so the report shows the gap
+      // instead of manufacturing data.
+      if (mode === 'team' && !task.targetRepo.includes(',')) {
+        throw new Error(
+          `Cannot dispatch team mode for single-repository task ${task.id} (targetRepo=${task.targetRepo}): ` +
+          `Factory's team scope requires multiple repository routes and would spawn one implementer here — ` +
+          `the same cardinality as single. This cell is unsupported until BenchmarkTask carries multiple ` +
+          `repositories (or Factory's team scope splits one repository across implementers).`,
+        )
+      }
+      // Factory always cuts the lifecycle branch from the repository's
+      // default branch and opens the PR against it (see
+      // Factory#publishImplementerPullRequest / #githubDefaultBranch). A
+      // task carrying a specific baseRef — most obviously a SWE-bench
+      // instance's `base_commit` — would silently be measured against the
+      // wrong revision. Until Factory honors a per-issue base override,
+      // refuse instead of scoring against `main`.
+      if (task.baseRef && task.baseRef !== 'main') {
+        throw new Error(
+          `Cannot dispatch task ${task.id} with baseRef=${task.baseRef}: ` +
+          `Factory cuts the lifecycle branch and PR base from the repository's default branch and does not ` +
+          `honor a per-issue baseRef. Scoring this task from a different base would silently measure the ` +
+          `wrong revision.`,
+        )
+      }
+
       const label = `agent:${mode}`
       const { stdout: createOut } = await exec('gh', [
         'issue', 'create',
@@ -53,7 +91,14 @@ export function createCliDispatchRunner(options: CliDispatchRunnerOptions): Disp
       }
       log(`created ${task.targetRepo}#${issueNumber} (${label})`)
 
-      await exec('node', ['bin/factory.mjs', 'dispatch', issueNumber, '--config', options.factoryConfigPath])
+      // Repo-qualify the dispatch argument (owner/repo#N — the same shape
+      // githubIssueIdentity / githubLifecycleIdentity already use). A bare
+      // number is either rejected as ambiguous when the config maps
+      // multiple repositories, or is silently resolved through
+      // repos.default to a different repository — the same defect class
+      // as factory#276 (unqualified merge-advance closed cross-repo
+      // issues; fixed by repo-qualifying with githubIssuePathParts).
+      await exec('node', ['bin/factory.mjs', 'dispatch', `${task.targetRepo}#${issueNumber}`, '--config', options.factoryConfigPath])
       log(`dispatched ${task.targetRepo}#${issueNumber}`)
 
       const prBranch = await pollForPrBranch(task.targetRepo, issueNumber, dispatchTimeoutMs, pollIntervalMs, log)

@@ -11405,6 +11405,70 @@ describe('FactoryLoop', () => {
     expect(worker?.task).toMatch(/SWARM WORKER/)
   })
 
+  // Swarm workers register as implementers on the SAME shared checkout and
+  // lifecycle branch as the lead. Without a worker-specific gate, whichever
+  // worker finished first would publish (or wave through) the partial shared
+  // branch and mark every swarm member "done" via the shared-branch PR probe,
+  // releasing the still-working lead. A worker exit must therefore be a
+  // non-event for publication and completion.
+  it('suppresses a swarm worker exit so it never publishes or completes the shared checkout', async () => {
+    const routedIssue = realIssueFile(732, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(732)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(732), routedIssue)))
+
+    fleet.emitAgentExit('ar-732-impl-worker-1', 'issue-done')
+    await flush()
+    await flush()
+
+    expect(factory.status().counters.swarmWorkerExitsSuppressed).toBe(1)
+    expect(factory.status().counters.done ?? 0).toBe(0)
+    expect(fleet.releases).toEqual([])
+    // Lead is still in flight — its exit is the authoritative publication /
+    // completion signal, and we must not have raced it via the worker.
+    expect(factory.status().inFlight.map((issue) => issue.key)).toContain('AR-732')
+  })
+
+  it('does not suppress a swarm lead exit — the lead drives the normal completion path', async () => {
+    const routedIssue = realIssueFile(733, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:swarm' }],
+    })
+    const mount = new FakeMountClient({ [issuePath(733)]: routedIssue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      triage: { maxImplementers: 2 },
+      repos: {
+        byLabel: { pear: 'AgentWorkforce/pear' },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+        default: 'AgentWorkforce/pear',
+      },
+    }), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(733), routedIssue)))
+
+    fleet.emitAgentExit('ar-733-impl-lead', 'issue-done')
+    await flush()
+    await flush()
+
+    // The lead exit is NEVER treated as a worker suppression event.
+    expect(factory.status().counters.swarmWorkerExitsSuppressed ?? 0).toBe(0)
+  })
+
   it('fails dispatch loudly when no labels are present and no default repo is configured', async () => {
     const unlabeledIssue = realIssueFile(722, ready, { labels: [] })
     const mount = new FakeMountClient({ [issuePath(722)]: unlabeledIssue })
