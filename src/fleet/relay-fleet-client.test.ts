@@ -372,6 +372,53 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().size).toBe(0)
   })
 
+  it('retains and retries cleanup when release of an unverified placement fails', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl', node: 'untrusted-output-node' },
+    }])
+    messaging.invocations.set('inv-1', [{
+      invocationId: 'inv-1',
+      actionName: 'release',
+      status: 'failed',
+      error: 'temporary cleanup failure',
+    }])
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({
+      invocationId: 'self-placement',
+      pendingReleaseReason: 'unverified-placement',
+    })
+    expect(fleet.trackedAgents().get('ar-1-impl')).not.toHaveProperty('node')
+
+    messaging.invocations.set('inv-2', [{
+      invocationId: 'inv-2',
+      actionName: 'release',
+      status: 'completed',
+      output: {},
+    }])
+    await fleet.reconcileTrackedAgents()
+
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toHaveLength(2)
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
   it('returns and tracks the normalized acknowledgement node instead of action output', async () => {
     const messaging = new FakeMessaging()
     messaging.placementAck = {

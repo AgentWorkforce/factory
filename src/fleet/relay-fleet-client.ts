@@ -23,6 +23,8 @@ export interface TrackedAgent {
   node?: string
   spawnedAtMs: number
   nodeOfflineSinceMs?: number
+  /** A rejected spawn whose compensating release must be retried. */
+  pendingReleaseReason?: string
 }
 
 export interface RelayClientLike {
@@ -198,6 +200,14 @@ export class RelayFleetClient implements FleetClient {
       try {
         await this.release(result.name, 'unverified-placement')
       } catch (releaseError) {
+        // Do not forget a live worker merely because its compensating release
+        // failed. Retain it outside the accepted placement result and let the
+        // reconciliation loop retry the idempotent release until Relay
+        // confirms cleanup (or roster evidence proves the worker exited).
+        this.#track(result.name, {
+          invocationId: ack.invocationId,
+          pendingReleaseReason: 'unverified-placement',
+        })
         this.#log(
           `Failed to release ${result.name} after unverified Relay placement: ${errorMessage(releaseError)}`,
         )
@@ -234,17 +244,14 @@ export class RelayFleetClient implements FleetClient {
 
   async release(name: string, reason?: string): Promise<void> {
     const messaging = await this.#ensureMessaging()
-    try {
-      const ack = await messaging.commands.invoke('release', {
-        name,
-        agent: name,
-        ...(reason ? { reason } : {}),
-      })
-      await this.#awaitInvocation(ack.actionName || 'release', ack)
-    } finally {
-      this.#tracked.delete(name)
-      this.#syncExitWatcher()
-    }
+    const ack = await messaging.commands.invoke('release', {
+      name,
+      agent: name,
+      ...(reason ? { reason } : {}),
+    })
+    await this.#awaitInvocation(ack.actionName || 'release', ack)
+    this.#tracked.delete(name)
+    this.#syncExitWatcher()
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
@@ -541,17 +548,27 @@ export class RelayFleetClient implements FleetClient {
     return invocation
   }
 
-  #track(name: string, placement: { invocationId: string; node: string }): void {
+  #track(name: string, placement: {
+    invocationId: string
+    node?: string
+    pendingReleaseReason?: string
+  }): void {
     this.#tracked.set(name, {
       invocationId: placement.invocationId,
-      node: placement.node,
+      ...(placement.node ? { node: placement.node } : {}),
+      ...(placement.pendingReleaseReason
+        ? { pendingReleaseReason: placement.pendingReleaseReason }
+        : {}),
       spawnedAtMs: this.#now(),
     })
     this.#syncExitWatcher()
   }
 
   #syncExitWatcher(): void {
-    const shouldRun = !this.#disposed && this.#tracked.size > 0 && this.#agentExitListeners.size > 0
+    const hasPendingRelease = [...this.#tracked.values()].some((agent) => agent.pendingReleaseReason)
+    const shouldRun = !this.#disposed && this.#tracked.size > 0 && (
+      this.#agentExitListeners.size > 0 || hasPendingRelease
+    )
     if (shouldRun && !this.#watchTimer) {
       this.#watchTimer = setInterval(() => {
         void this.reconcileTrackedAgents().catch((error) => {
@@ -579,6 +596,14 @@ export class RelayFleetClient implements FleetClient {
     const nowMs = this.#now()
 
     for (const [name, entry] of [...this.#tracked]) {
+      if (entry.pendingReleaseReason) {
+        try {
+          await this.release(name, entry.pendingReleaseReason)
+          continue
+        } catch (error) {
+          this.#log(`Pending release retry failed for ${name}: ${errorMessage(error)}`)
+        }
+      }
       if (!onlineAgentNames.has(name)) {
         // A just-spawned agent may not have registered with the engine yet;
         // absence only counts as an exit once the grace window has passed.
