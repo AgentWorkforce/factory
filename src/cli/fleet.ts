@@ -1,6 +1,6 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import readline from 'node:readline/promises'
 import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
@@ -1160,7 +1160,9 @@ async function factoryStatusWithMountHealth(
   heartbeatStaleMs: number,
   versionInfo?: FactoryVersionInfo,
   stateStoreStatus?: { backend: string },
-): Promise<ReturnType<Factory['status']> & {
+): Promise<Omit<ReturnType<Factory['status']>, 'fleetControlPlane'> & {
+  /** Undefined when a live older daemon predates fleet control-plane reporting. */
+  fleetControlPlane?: ReturnType<Factory['status']>['fleetControlPlane']
   stateStore?: { backend: string }
   version?: string
   installedAt?: string
@@ -1198,6 +1200,9 @@ async function factoryStatusWithMountHealth(
   const readinessReconcile = liveness.ok
     ? heartbeat?.readinessReconcile
     : observableStatus.readinessReconcile
+  const fleetControlPlane = liveness.ok
+    ? heartbeat?.fleetControlPlane
+    : observableStatus.fleetControlPlane
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
       state: 'unknown' as const,
@@ -1215,6 +1220,7 @@ async function factoryStatusWithMountHealth(
     heldAgents,
     eventListener,
     readinessReconcile,
+    fleetControlPlane,
   }
   return {
     ...observableStatus,
@@ -1223,6 +1229,7 @@ async function factoryStatusWithMountHealth(
     heldAgents,
     eventListener,
     readinessReconcile,
+    fleetControlPlane,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),
@@ -1583,7 +1590,13 @@ async function buildFleet(
 
   const cwd = process.cwd()
   const env = deps.env ?? process.env
-  const connectionPath = resolveBrokerConnectionPath(cwd, env)
+  const connectionPath = globals.backend === 'internal'
+    ? resolveFactoryBrokerConnectionPath(
+        cwd,
+        env,
+        loaded?.config.fleetHealth.requireDedicatedBroker ?? false,
+      )
+    : resolveBrokerConnectionPath(cwd, env)
 
   // An injected createFleet owns fleet construction entirely (tests), so skip the
   // real broker bootstrap.
@@ -1675,6 +1688,60 @@ export function resolveBrokerConnectionPath(
       return undefined
     }
     current = parent
+  }
+}
+
+export function resolveFactoryBrokerConnectionPath(
+  startCwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+  requireDedicatedBroker = false,
+): string | undefined {
+  const connectionPath = resolveBrokerConnectionPath(startCwd, env)
+  if (!requireDedicatedBroker) return connectionPath
+
+  const explicitStateDir = env.AGENT_RELAY_STATE_DIR?.trim()
+  if (!explicitStateDir) {
+    throw new Error(
+      'fleetHealth.requireDedicatedBroker requires AGENT_RELAY_STATE_DIR to name Factory\'s isolated relay state directory',
+    )
+  }
+  const inheritedConnectionPath = resolveBrokerConnectionPath(startCwd, {
+    ...env,
+    AGENT_RELAY_STATE_DIR: '',
+  })
+  // Always reject the checkout-local path, even if broker discovery currently
+  // walks past it and finds an ancestor connection. An interactive relay
+  // started in this checkout can claim the local path later.
+  const sharedStateDirs = [
+    join(resolve(startCwd), '.agentworkforce', 'relay'),
+    ...(inheritedConnectionPath ? [dirname(inheritedConnectionPath)] : []),
+  ]
+  if (sharedStateDirs.some((stateDir) => sameFilesystemPath(explicitStateDir, stateDir))) {
+    throw new Error(
+      'AGENT_RELAY_STATE_DIR resolves to the project broker; choose a separate state directory for Factory',
+    )
+  }
+  return connectionPath
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  return canonicalPath(left) === canonicalPath(right)
+}
+
+function canonicalPath(path: string): string {
+  const absolute = resolve(path)
+  const missingSegments: string[] = []
+  let existingAncestor = absolute
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor)
+    if (parent === existingAncestor) return absolute
+    missingSegments.unshift(basename(existingAncestor))
+    existingAncestor = parent
+  }
+  try {
+    return resolve(realpathSync.native(existingAncestor), ...missingSegments)
+  } catch {
+    return absolute
   }
 }
 

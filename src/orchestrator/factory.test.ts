@@ -46,6 +46,189 @@ import {
 } from '../subscriptions'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim, DiscoverySweepRenewal, DispatchLifecycle } from '../ports/state'
+import {
+  DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+  DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+} from '../fleet/control-plane-circuit'
+
+describe('fleet control-plane admission', () => {
+  class StalledRosterFleet extends FakeFleetClient {
+    rosterCalls = 0
+
+    override async roster(): Promise<never> {
+      this.rosterCalls += 1
+      return new Promise(() => undefined)
+    }
+  }
+
+  it('fails closed at the default boundary before discovery and opens after two stalls', async () => {
+    vi.useFakeTimers()
+    try {
+      const mount = new FakeMountClient({ [issuePath(991)]: issueFile(991) })
+      const fleet = new StalledRosterFleet()
+      const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage(), logger: {} })
+
+      const first = factory.runOnce()
+      const firstFailure = expect(first).rejects.toThrow(
+        'Factory dispatch paused because the fleet control plane is unavailable',
+      )
+      await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
+      await firstFailure
+      expect(factory.status().fleetControlPlane).toMatchObject({
+        state: 'closed',
+        consecutiveFailures: 1,
+        failureThreshold: DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+      })
+
+      const second = factory.runOnce()
+      const secondFailure = expect(second).rejects.toThrow(
+        'Factory dispatch paused because the fleet control plane is unavailable',
+      )
+      await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
+      await secondFailure
+
+      expect(fleet.rosterCalls).toBe(2)
+      expect(fleet.spawns).toEqual([])
+      expect(mount.reads).toEqual([])
+      expect(factory.status().fleetControlPlane).toMatchObject({
+        state: 'open',
+        consecutiveFailures: DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(
+        'Factory dispatch paused because the fleet control plane is unavailable',
+      )
+      expect(fleet.rosterCalls).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('gates a direct dispatch before it consumes an attempt or reaches mutation admission', async () => {
+    vi.useRealTimers()
+    const path = issuePath(992)
+    const file = issueFile(992)
+    const mount = new FakeMountClient({ [path]: file })
+    const fleet = new StalledRosterFleet()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({
+      fleetHealth: {
+        rosterTimeoutMs: 100,
+        failureThreshold: 1,
+        resetTimeoutMs: 60_000,
+        requireDedicatedBroker: false,
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage(), logger: {} })
+    const decision = await factory.triageIssue(parseLinearIssue(path, file))
+
+    await expect(factory.dispatch(decision)).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
+
+    expect(fleet.rosterCalls).toBe(1)
+    expect(fleet.spawns).toEqual([])
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey(decision.issue))).resolves.toBeUndefined()
+    expect(factory.status().fleetControlPlane.state).toBe('open')
+  })
+
+  it('logs only the sanitized circuit error when roster admission fails', async () => {
+    class RejectingRosterFleet extends FakeFleetClient {
+      override async roster(): Promise<never> {
+        throw Object.assign(new Error('https://broker.invalid?token=must-not-leak'), { code: 'ECONNREFUSED' })
+      }
+    }
+    const error = vi.fn()
+    const factory = createFactory(config({ fleetHealth: { failureThreshold: 1 } }), {
+      mount: new FakeMountClient(),
+      fleet: new RejectingRosterFleet(),
+      triage: new StaticTriage(),
+      logger: { error },
+    })
+
+    await expect(factory.runOnce()).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
+    expect(error).toHaveBeenCalledWith(
+      '[factory] fleet control plane unavailable; dispatch paused',
+      expect.objectContaining({ error: 'Error (ECONNREFUSED)' }),
+    )
+    expect(JSON.stringify(error.mock.calls)).not.toContain('must-not-leak')
+  })
+
+  it('rejects a bounded loop when the circuit opens and persists the paused state in its heartbeat', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-fleet-circuit-loop-'))
+    vi.useRealTimers()
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const registryPath = join(root, 'registry.json')
+      const fleet = new StalledRosterFleet()
+      const factory = createFactory(config({
+        fleetHealth: {
+          rosterTimeoutMs: 100,
+          failureThreshold: 2,
+          resetTimeoutMs: 60_000,
+          requireDedicatedBroker: false,
+        },
+        loop: {
+          maxIterations: 3,
+          maxConsecutiveFailures: 3,
+          heartbeatPath,
+          registryPath,
+        },
+      }), {
+        mount: new FakeMountClient(),
+        fleet,
+        triage: new StaticTriage(),
+        logger: {},
+      })
+
+      await expect(factory.runLoop()).rejects.toMatchObject({
+        code: 'FACTORY_FLEET_CONTROL_CIRCUIT_OPEN',
+      })
+
+      expect(fleet.rosterCalls).toBe(2)
+      expect(await readFactoryLoopHeartbeat(heartbeatPath)).toMatchObject({
+        status: 'stopping',
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 2,
+          retryAtMs: expect.any(Number),
+        },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('supports a deliberately tighter configured bound', async () => {
+    vi.useRealTimers()
+    class StalledRosterFleet extends FakeFleetClient {
+      override async roster(): Promise<never> {
+        return new Promise(() => undefined)
+      }
+    }
+
+    const mount = new FakeMountClient({ [issuePath(991)]: issueFile(991) })
+    const fleet = new StalledRosterFleet()
+    const factory = createFactory(config({
+      fleetHealth: {
+        rosterTimeoutMs: 100,
+        failureThreshold: 1,
+        resetTimeoutMs: 1_000,
+      },
+    }), { mount, fleet, triage: new StaticTriage(), logger: {} })
+
+    await expect(factory.runOnce()).rejects.toThrow(
+      'Factory dispatch paused because the fleet control plane is unavailable',
+    )
+    expect(fleet.spawns).toEqual([])
+    expect(mount.reads).toEqual([])
+    expect(factory.status().fleetControlPlane).toMatchObject({
+      state: 'open',
+      consecutiveFailures: 1,
+    })
+  })
+})
 
 const ready = 'b9bec744-b60c-4745-8022-d90d6ab59ae3'
 const implementing = '39b9881d-1196-4c95-8b80-a20f0c7263f7'
@@ -53,10 +236,11 @@ const humanReview = '24462e2d-9946-4dd1-a798-931cdd678498'
 const done = '83ea5383-bfe9-425a-86ef-517b8190f09a'
 const planning = '3de351f2-90e6-4731-aa6b-4a55b77f481e'
 
-type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'dispatch' | 'loop' | 'safety'> & {
+type FactoryConfigOverrides = Omit<Partial<FactoryConfig>, 'dispatch' | 'loop' | 'safety' | 'fleetHealth'> & {
   dispatch?: Partial<FactoryConfig['dispatch']>
   loop?: Partial<FactoryConfig['loop']>
   safety?: Partial<FactoryConfig['safety']>
+  fleetHealth?: Partial<FactoryConfig['fleetHealth']>
 }
 
 const config = (overrides: FactoryConfigOverrides = {}): FactoryConfig => FactoryConfigSchema.parse({

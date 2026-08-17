@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -23,7 +23,7 @@ import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, Lo
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
-import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, runFleetCli } from './fleet'
+import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -526,6 +526,73 @@ describe('fleet CLI parsing', () => {
 
       expect(resolveBrokerConnectionPath(nested, { AGENT_RELAY_STATE_DIR: stateDir }))
         .toBe(join(stateDir, 'connection.json'))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('requires a separate explicit relay state directory when dedicated broker isolation is enabled', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      const dedicatedStateDir = join(root, '.agentworkforce', 'factory-relay')
+      await mkdir(projectStateDir, { recursive: true })
+      await writeFile(join(projectStateDir, 'connection.json'), JSON.stringify({ port: 3890 }))
+
+      expect(() => resolveFactoryBrokerConnectionPath(root, {}, true))
+        .toThrow(/requires AGENT_RELAY_STATE_DIR/u)
+      expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
+        .toThrow(/resolves to the project broker/u)
+      expect(() => resolveFactoryBrokerConnectionPath(root, {
+        AGENT_RELAY_STATE_DIR: join(projectStateDir, '..', 'relay'),
+      }, true)).toThrow(/resolves to the project broker/u)
+      expect(resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: dedicatedStateDir }, true))
+        .toBe(join(dedicatedStateDir, 'connection.json'))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects the shared project relay path before its connection file exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-empty-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      expect(() => resolveFactoryBrokerConnectionPath(root, { AGENT_RELAY_STATE_DIR: projectStateDir }, true))
+        .toThrow(/resolves to the project broker/u)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects the project relay path even when broker discovery finds an ancestor first', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-ancestor-dedicated-broker-'))
+    try {
+      const project = join(root, 'project')
+      const projectStateDir = join(project, '.agentworkforce', 'relay')
+      const ancestorConnectionPath = join(root, '.agentworkforce', 'relay', 'connection.json')
+      await mkdir(dirname(ancestorConnectionPath), { recursive: true })
+      await mkdir(project, { recursive: true })
+      await writeFile(ancestorConnectionPath, JSON.stringify({ port: 3890 }))
+
+      expect(() => resolveFactoryBrokerConnectionPath(project, {
+        AGENT_RELAY_STATE_DIR: projectStateDir,
+      }, true)).toThrow(/resolves to the project broker/u)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlink that resolves to the shared project relay path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-symlink-dedicated-broker-'))
+    try {
+      const projectStateDir = join(root, '.agentworkforce', 'relay')
+      const stateAlias = join(root, 'relay-alias')
+      await mkdir(projectStateDir, { recursive: true })
+      await symlink(projectStateDir, stateAlias, 'dir')
+
+      expect(() => resolveFactoryBrokerConnectionPath(root, {
+        AGENT_RELAY_STATE_DIR: stateAlias,
+      }, true)).toThrow(/resolves to the project broker/u)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2709,7 +2776,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('surfaces degraded readiness reconciliation from the live daemon heartbeat', async () => {
+  it('surfaces degraded readiness and an open fleet circuit from the live daemon heartbeat', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reconcile-status-'))
     try {
       const heartbeatPath = join(root, 'heartbeat.json')
@@ -2730,6 +2797,16 @@ describe('fleet CLI runtime', () => {
           lastFailureAtMs: now - 1_000,
           lastError: 'discovery sweep lease expired',
         },
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 2,
+          timeoutMs: 5_000,
+          failureThreshold: 2,
+          resetTimeoutMs: 60_000,
+          lastFailureAtMs: now - 500,
+          retryAtMs: now + 59_500,
+          lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
+        },
       }))
       const output = buffer()
       const factory = {
@@ -2741,6 +2818,13 @@ describe('fleet CLI runtime', () => {
             state: 'not-running' as const,
             consecutiveFailures: 0,
             failureThreshold: 3,
+          },
+          fleetControlPlane: {
+            state: 'closed' as const,
+            consecutiveFailures: 0,
+            timeoutMs: 5_000,
+            failureThreshold: 2,
+            resetTimeoutMs: 60_000,
           },
         })),
       } as unknown as Factory
@@ -2761,7 +2845,58 @@ describe('fleet CLI runtime', () => {
           failureThreshold: 3,
           lastError: 'discovery sweep lease expired',
         },
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 2,
+          lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
+        },
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not report a fresh local closed circuit for a live older daemon heartbeat', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-legacy-circuit-status-'))
+    try {
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const configPath = await writeConfig(root, { loop: { heartbeatPath, heartbeatStaleMs: 10_000 } })
+      const now = Date.now()
+      await writeFile(heartbeatPath, JSON.stringify({
+        pid: process.pid,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        eventListener: { state: 'subscribed' },
+      }))
+      const output = buffer()
+      const factory = {
+        status: vi.fn(() => ({
+          inFlight: [],
+          queued: [],
+          counters: {},
+          fleetControlPlane: {
+            state: 'closed' as const,
+            consecutiveFailures: 0,
+            timeoutMs: 5_000,
+            failureThreshold: 2,
+            resetTimeoutMs: 60_000,
+          },
+        })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).not.toHaveProperty('fleetControlPlane')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

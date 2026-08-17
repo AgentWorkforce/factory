@@ -128,6 +128,11 @@ import {
 } from '../observability/events'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
+import {
+  FleetControlPlaneCircuit,
+  FleetControlPlaneCircuitOpenError,
+  guardFleetControlPlane,
+} from '../fleet/control-plane-circuit'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -483,6 +488,7 @@ export class FactoryLoop implements Factory {
   readonly #mount: MountClient
   readonly #states: FactoryStateResolution
   readonly #fleet: FleetClient
+  readonly #fleetControlPlane: FleetControlPlaneCircuit
   readonly #ticketDispatchDelivery: TicketDispatchDelivery
   readonly #triage: TriageEngine
   readonly #linear: LinearWriteback
@@ -712,7 +718,6 @@ export class FactoryLoop implements Factory {
     // synced records (state.name but no state.id) without the states catalog.
     this.#states = ports.stateResolution ?? stateResolutionFromIds(config.stateIds, config.linear.states)
     installFactoryDraftPredicate(this.#mount, config)
-    this.#fleet = ports.fleet
     this.#ticketDispatchDelivery = ports.ticketDispatchDelivery ?? createTicketDispatchDelivery({
       mountRoot: config.localMountRoot,
     })
@@ -743,6 +748,13 @@ export class FactoryLoop implements Factory {
     this.#probePrResolver = ports.probePrResolver ?? ((issue) => this.#resolveIssuePr(issue))
     this.#logger = normalizeLogger(ports.logger ?? console)
     this.#clock = ports.clock ?? realClock
+    this.#fleetControlPlane = new FleetControlPlaneCircuit({
+      timeoutMs: config.fleetHealth.rosterTimeoutMs,
+      failureThreshold: config.fleetHealth.failureThreshold,
+      resetTimeoutMs: config.fleetHealth.resetTimeoutMs,
+      now: () => this.#clock.now(),
+    })
+    this.#fleet = guardFleetControlPlane(ports.fleet, this.#fleetControlPlane)
     this.#processIdentityReader = ports.processIdentityReader ?? readProcessIdentity
     this.#processFinder = ports.processFinder ?? ((agentName, opts) => findAgentProcessByName(agentName, {
       readProcessIdentity: this.#processIdentityReader,
@@ -2161,8 +2173,29 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  async #assertFleetControlPlaneAvailable(): Promise<void> {
+    try {
+      await this.#fleet.roster()
+      this.#increment('fleetControlPlaneProbeSuccesses')
+    } catch (error) {
+      const health = this.#fleetControlPlane.status()
+      this.#increment('fleetControlPlaneProbeFailures')
+      if (health.state === 'open') this.#increment('fleetControlPlaneCircuitOpen')
+      this.#logger.error?.('[factory] fleet control plane unavailable; dispatch paused', {
+        state: health.state,
+        consecutiveFailures: health.consecutiveFailures,
+        retryAtMs: health.retryAtMs,
+        error: health.lastError ?? 'unknown control-plane failure',
+      })
+      throw contextualError('Factory dispatch paused because the fleet control plane is unavailable', error)
+    }
+  }
+
   async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
     const sweepStartedAtMs = this.#clock.now()
+    if (!(opts.dryRun ?? this.#config.dryRun)) {
+      await this.#assertFleetControlPlaneAvailable()
+    }
     let claim = await this.#state.claimDiscoverySweep(
       this.#workspaceId,
       this.#discoverySweepOwner,
@@ -3499,6 +3532,19 @@ export class FactoryLoop implements Factory {
           reports.push(failedIterationReport(error, opts.dryRun ?? this.#config.dryRun))
           await this.#reapDispatchFailureHandoffsNow(heartbeatPath, registryPath)
           await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration + 1, maxIterations)
+          const fleetControlPlane = this.#fleetControlPlane.status()
+          if (fleetControlPlane.state !== 'closed') {
+            this.#increment('loopCircuitBreaks')
+            this.#logger.error?.('[factory] stopping loop because dispatch is paused by the fleet control-plane circuit', {
+              state: fleetControlPlane.state,
+              consecutiveFailures: fleetControlPlane.consecutiveFailures,
+              retryAtMs: fleetControlPlane.retryAtMs,
+            })
+            throw new FleetControlPlaneCircuitOpenError(
+              fleetControlPlane.retryAtMs ?? this.#clock.now(),
+              fleetControlPlane.state,
+            )
+          }
           if (consecutiveFailures >= maxConsecutiveFailures) {
             this.#increment('loopCircuitBreaks')
             this.#logger.error?.('[factory] stopping loop after consecutive iteration failures', {
@@ -3659,6 +3705,12 @@ export class FactoryLoop implements Factory {
       }
     }
     this.#clearDependencyPark(batch, dispatchDecision.issue)
+    // Event-driven and direct dispatches do not necessarily pass through issue
+    // discovery. Admit them before creating previews, claiming a lifecycle, or
+    // consuming a dispatch attempt. The mutation proxy probes again at the
+    // actual spawn/resume boundary so a later control-plane fault still fails
+    // closed.
+    if (!dryRun) await this.#assertFleetControlPlaneAvailable()
     const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
     // ones. Without it, every worker starts in the configured shared checkout
@@ -3975,6 +4027,7 @@ export class FactoryLoop implements Factory {
         capacityBlocked: parked.capacityBlocked,
       })) ?? [],
       counters: { ...this.#counters },
+      fleetControlPlane: this.#fleetControlPlane.status(),
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
@@ -6714,6 +6767,7 @@ export class FactoryLoop implements Factory {
       registryPath,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
+      fleetControlPlane: this.#fleetControlPlane.status(),
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
