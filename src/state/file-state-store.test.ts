@@ -9,6 +9,24 @@ import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
 
 describe('FileStateStore', () => {
+  it('forwards the configured agent-question dedupe limit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-question-limit-'))
+    try {
+      const store = new FileStateStore({
+        batchSize: 2,
+        agentQuestionDedupeLimit: 1,
+        watchStatePath: join(root, 'state.json'),
+      })
+      await store.markAgentQuestion('workspace-1', 'first')
+      await store.markAgentQuestion('workspace-1', 'second')
+
+      expect(await store.seenAgentQuestion('workspace-1', 'first')).toBe(false)
+      expect(await store.seenAgentQuestion('workspace-1', 'second')).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('preserves the exact pretty-JSON bytes and private mode of the file backend', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-format-'))
     try {

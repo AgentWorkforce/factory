@@ -1,4 +1,5 @@
 import type {
+  DispatchLifecycleAgent,
   BabysitterGenerationRecord,
   BabysitterSessionState,
   ConversationMessage,
@@ -8,6 +9,9 @@ import type {
   GithubIssueCommentWatchState,
   WaitingClarification,
 } from '../ports/state'
+import type { AgentSpec, SpawnResult } from '../ports/fleet'
+import type { TrackedAgent } from '../orchestrator/batch-tracker'
+import type { TriageDecision } from '../types'
 import type { PersistedWorkspaceState, WatchStateDocument } from './document-store'
 
 export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
@@ -35,12 +39,12 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
         (discoverySweep !== undefined && !isRecord(discoverySweep))
       ) throw invalidDocument()
       workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
-        waitingClarifications: clarifications as Record<string, WaitingClarification>,
+        githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
+        waitingClarifications: parseWaitingClarifications(clarifications),
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
         babysitterGenerations: parseBabysitterGenerations(generations ?? {}),
         conversationSessions: parseConversationSessions(conversations ?? {}),
-        dispatchLifecycles: (lifecycles ?? {}) as Record<string, DispatchLifecycle>,
+        dispatchLifecycles: parseDispatchLifecycles(lifecycles ?? {}),
         discoverySweep: parseDiscoverySweepState(discoverySweep),
       }
     }
@@ -57,8 +61,8 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
         throw invalidDocument()
       }
       workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
-        waitingClarifications: clarifications as Record<string, WaitingClarification>,
+        githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
+        waitingClarifications: parseWaitingClarifications(clarifications),
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
         babysitterGenerations: {},
         conversationSessions: {},
@@ -73,7 +77,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
     for (const [workspaceId, watches] of Object.entries(value.workspaces)) {
       if (!isRecord(watches)) throw invalidDocument()
       workspaces[workspaceId] = {
-        githubIssueCommentWatches: watches as Record<string, GithubIssueCommentWatchState>,
+        githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
         waitingClarifications: {},
         babysitterSessions: {},
         babysitterGenerations: {},
@@ -263,6 +267,203 @@ const parseBabysitterGenerations = (
   }
   return generations
 }
+
+const parseGithubIssueCommentWatches = (
+  value: Record<string, unknown>,
+): Record<string, GithubIssueCommentWatchState> => {
+  const watches: Record<string, GithubIssueCommentWatchState> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (
+      !isRecord(candidate) || !validIssueRef(candidate.issue) || !isRecord(candidate.source) ||
+      typeof candidate.source.owner !== 'string' || typeof candidate.source.repo !== 'string' ||
+      !Number.isSafeInteger(candidate.source.number) || (candidate.source.number as number) < 1 ||
+      typeof candidate.source.url !== 'string' || !Array.isArray(candidate.pending) ||
+      !candidate.pending.every(validGithubWatchPending) ||
+      !validOptionalBoolean(candidate.detectAgentQuestions) ||
+      !validOptionalString(candidate.sinceCommentId) || !validOptionalString(candidate.lastSeenCommentId) ||
+      !validOptionalStringArray(candidate.processedCommentIds)
+    ) throw invalidDocument()
+    watches[key] = structuredClone(candidate) as unknown as GithubIssueCommentWatchState
+  }
+  return watches
+}
+
+const validGithubWatchPending = (value: unknown): boolean => isRecord(value) &&
+  typeof value.correlationId === 'string' &&
+  (value.kind === 'triage' || value.kind === 'agent-question') &&
+  typeof value.authorizedAuthor === 'string' &&
+  (value.decision === undefined || validTriageDecision(value.decision)) &&
+  validOptionalString(value.claimedByCommentId) && validOptionalString(value.replyAfterCommentId)
+
+const parseWaitingClarifications = (
+  value: Record<string, unknown>,
+): Record<string, WaitingClarification> => {
+  const clarifications: Record<string, WaitingClarification> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (
+      !isRecord(candidate) || !validIssueRef(candidate.issue) || !validTriageDecision(candidate.decision) ||
+      typeof candidate.dryRun !== 'boolean' || typeof candidate.askerName !== 'string' ||
+      typeof candidate.question !== 'string' || !validNumber(candidate.askedAtMs) ||
+      !Array.isArray(candidate.agents) || !candidate.agents.every(validWaitingClarificationAgent) ||
+      !validOptionalString(candidate.threadId) ||
+      (candidate.questionSource !== undefined && candidate.questionSource !== 'github' && candidate.questionSource !== 'slack') ||
+      !validOptionalNumber(candidate.questionPostedAtMs) || !validOptionalNumber(candidate.parkedAtMs) ||
+      !validOptionalNumber(candidate.escalatedAtMs) || !validOptionalStringArray(candidate.releasedAgents) ||
+      (candidate.questionDelivery !== undefined && !validOwnerClaim(candidate.questionDelivery)) ||
+      (candidate.escalation !== undefined && !validOwnerClaim(candidate.escalation)) ||
+      (candidate.reply !== undefined && !validClarificationReply(candidate.reply)) ||
+      (candidate.wake !== undefined && !validClarificationWake(candidate.wake))
+    ) throw invalidDocument()
+    clarifications[key] = structuredClone(candidate) as unknown as WaitingClarification
+  }
+  return clarifications
+}
+
+const validWaitingClarificationAgent = (value: unknown): boolean => isRecord(value) &&
+  typeof value.name === 'string' && validTrackedAgent(value.tracked)
+
+const validOwnerClaim = (value: unknown): boolean => isRecord(value) &&
+  typeof value.owner === 'string' && validNumber(value.claimedAtMs) && validNumber(value.attempts)
+
+const validClarificationReply = (value: unknown): boolean => isRecord(value) &&
+  typeof value.id === 'string' && typeof value.text === 'string' && validNumber(value.receivedAtMs) &&
+  (value.source === undefined || value.source === 'slack' || value.source === 'github') &&
+  validOptionalString(value.author)
+
+const validClarificationWake = (value: unknown): boolean => validOwnerClaim(value) && isRecord(value) &&
+  Array.isArray(value.injectedAgents) && value.injectedAgents.every((agent) => typeof agent === 'string')
+
+const parseDispatchLifecycles = (value: Record<string, unknown>): Record<string, DispatchLifecycle> => {
+  const lifecycles: Record<string, DispatchLifecycle> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (!validDispatchLifecycle(candidate)) throw invalidDocument()
+    lifecycles[key] = structuredClone(candidate)
+  }
+  return lifecycles
+}
+
+const DISPATCH_LIFECYCLE_PHASES = new Set([
+  'queued',
+  'dispatching',
+  'retryable',
+  'abandoning',
+  'running',
+  'parking',
+  'waiting-for-human',
+  'publishing',
+  'published',
+  'writeback-applied',
+  'releasing',
+  'complete',
+  'abandoned',
+])
+
+const validDispatchLifecycle = (value: unknown): value is DispatchLifecycle => isRecord(value) &&
+  typeof value.runId === 'string' && validIssueRef(value.issue) && validTriageDecision(value.decision) &&
+  typeof value.dryRun === 'boolean' && typeof value.phase === 'string' &&
+  DISPATCH_LIFECYCLE_PHASES.has(value.phase) &&
+  Array.isArray(value.agents) && value.agents.every(validDispatchLifecycleAgent) &&
+  Array.isArray(value.invocationIds) && value.invocationIds.every((id) => typeof id === 'string') &&
+  validNumber(value.updatedAtMs) && validOptionalNumber(value.heldSinceAtMs) &&
+  validOptionalString(value.releaseReason) &&
+  (value.lease === undefined || validLifecycleLease(value.lease)) &&
+  (value.result === undefined || validDispatchResult(value.result)) &&
+  (value.dispatchClaim === undefined || validDispatchClaimStatus(value.dispatchClaim)) &&
+  (value.pullRequest === undefined || validPullRequest(value.pullRequest)) &&
+  (value.pullRequests === undefined || (Array.isArray(value.pullRequests) && value.pullRequests.every(validPullRequest))) &&
+  (value.ticketDispatchNotification === undefined || validTicketDispatchNotification(value.ticketDispatchNotification)) &&
+  (value.cost === undefined || validRunCostTotal(value.cost))
+
+const validDispatchLifecycleAgent = (value: unknown): value is DispatchLifecycleAgent => isRecord(value) &&
+  typeof value.name === 'string' && validTrackedAgent(value.tracked) &&
+  validOptionalNumber(value.releasedAtMs) &&
+  (value.costUsage === undefined || (Array.isArray(value.costUsage) && value.costUsage.every(validAgentUsage)))
+
+const validTrackedAgent = (value: unknown): value is TrackedAgent => isRecord(value) &&
+  validAgentSpec(value.spec) && (value.result === undefined || validSpawnResult(value.result)) &&
+  validOptionalString(value.sessionRef) && validOptionalString(value.unreachableWakeResumedSessionRef) &&
+  validOptionalNumber(value.releasedAtMs)
+
+const validSpawnResult = (value: unknown): value is SpawnResult => isRecord(value) &&
+  typeof value.name === 'string' && validOptionalString(value.sessionRef) && validOptionalNumber(value.pid) &&
+  (value.pids === undefined || (Array.isArray(value.pids) && value.pids.every(validNumber))) &&
+  validOptionalString(value.node) &&
+  (value.locality === undefined || value.locality === 'local' || value.locality === 'remote')
+
+const validAgentSpec = (value: unknown): value is AgentSpec => isRecord(value) &&
+  typeof value.name === 'string' &&
+  (value.role === 'implementer' || value.role === 'reviewer' || value.role === 'babysitter' || value.role === 'workflow') &&
+  (value.capability === 'spawn:codex' || value.capability === 'spawn:claude' || value.capability === 'workflow:run') &&
+  typeof value.task === 'string' && typeof value.repo === 'string' &&
+  validOptionalString(value.principal) && validOptionalString(value.owner) && validOptionalString(value.model) &&
+  validOptionalString(value.workflow) && validOptionalString(value.baseClonePath) &&
+  validOptionalString(value.clonePath) && validOptionalString(value.channel) && validOptionalString(value.node) &&
+  validOptionalString(value.sessionRef) && validOptionalString(value.invocationId) &&
+  validOptionalString(value.branch) && validOptionalBoolean(value.existingPullRequestBranch) &&
+  (value.inputs === undefined || isRecord(value.inputs)) &&
+  (value.ownedPullRequest === undefined || validOwnedPullRequest(value.ownedPullRequest)) &&
+  (value.pendingPullRequestWake === undefined || validPendingPullRequestWake(value.pendingPullRequestWake)) &&
+  (value.preview === undefined || isRecord(value.preview))
+
+const validOwnedPullRequest = (value: unknown): boolean => isRecord(value) &&
+  typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
+  validOptionalString(value.path)
+
+const validPendingPullRequestWake = (value: unknown): boolean => isRecord(value) &&
+  typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
+  Array.isArray(value.kinds) && value.kinds.every((kind) => typeof kind === 'string')
+
+const validTriageDecision = (value: unknown): value is TriageDecision => isRecord(value) &&
+  validIssueRef(value.issue) && Array.isArray(value.routes) && value.routes.every(validRoute) &&
+  (value.scope === 'single' || value.scope === 'workflow' || value.scope === 'team') &&
+  Array.isArray(value.implementers) && value.implementers.every(validAgentSpec) &&
+  (value.workflow === undefined || validAgentSpec(value.workflow)) && validAgentSpec(value.reviewer) &&
+  typeof value.thin === 'boolean' && (value.confidence === 'high' || value.confidence === 'low') &&
+  typeof value.rationale === 'string' &&
+  (value.issueResolution === undefined || isRecord(value.issueResolution))
+
+const validRoute = (value: unknown): boolean => isRecord(value) &&
+  typeof value.repo === 'string' && typeof value.rationale === 'string' && validOptionalString(value.clonePath)
+
+const validDispatchResult = (value: unknown): boolean => isRecord(value) && validIssueRef(value.issue) &&
+  Array.isArray(value.agents) && value.agents.every((agent) => isRecord(agent) &&
+    typeof agent.name === 'string' && typeof agent.role === 'string') &&
+  typeof value.dryRun === 'boolean'
+
+const validDispatchClaimStatus = (value: unknown): boolean => isRecord(value) &&
+  (value.state === 'pending' || value.state === 'verified' || value.state === 'degraded') &&
+  validNumber(value.updatedAtMs) && validOptionalString(value.write) && validOptionalString(value.error) &&
+  validOptionalNumber(value.attempts) && validOptionalNumber(value.maxAttempts) &&
+  validOptionalBoolean(value.deadLettered)
+
+const validPullRequest = (value: unknown): boolean => isRecord(value) &&
+  typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
+  typeof value.url === 'string' && typeof value.headRef === 'string' &&
+  validOptionalString(value.headSha) && validOptionalString(value.author)
+
+const validTicketDispatchNotification = (value: unknown): boolean => isRecord(value) &&
+  typeof value.workUnitId === 'string' && validNumber(value.claimedAtMs)
+
+const validLifecycleLease = (value: unknown): boolean => isRecord(value) &&
+  typeof value.owner === 'string' && Number.isSafeInteger(value.epoch) && validNumber(value.leaseUntilMs)
+
+const validAgentUsage = (value: unknown): boolean => isRecord(value) && typeof value.model === 'string' &&
+  validNullableNumber(value.inputTokens) && validNullableNumber(value.outputTokens)
+
+const validRunCostTotal = (value: unknown): boolean => isRecord(value) && typeof value.runId === 'string' &&
+  validNullableNumber(value.inputTokens) && validNullableNumber(value.outputTokens) &&
+  validNullableNumber(value.usd) && Array.isArray(value.byRole)
+
+const validIssueRef = (value: unknown): boolean => isRecord(value) &&
+  typeof value.uuid === 'string' && typeof value.key === 'string' && typeof value.path === 'string'
+
+const validNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
+const validNullableNumber = (value: unknown): boolean => value === null || validNumber(value)
+const validOptionalNumber = (value: unknown): boolean => value === undefined || validNumber(value)
+const validOptionalString = (value: unknown): boolean => value === undefined || typeof value === 'string'
+const validOptionalBoolean = (value: unknown): boolean => value === undefined || typeof value === 'boolean'
+const validOptionalStringArray = (value: unknown): boolean => value === undefined ||
+  (Array.isArray(value) && value.every((entry) => typeof entry === 'string'))
 
 const invalidDocument = (): Error => new Error('Factory GitHub watch state file is invalid')
 

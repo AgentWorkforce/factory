@@ -1068,6 +1068,7 @@ export class FileStateStore extends DocumentStateStore {
   constructor(options: FileStateStoreOptions) {
     super({
       batchSize: options.batchSize,
+      agentQuestionDedupeLimit: options.agentQuestionDedupeLimit,
       isProcessAlive: options.isProcessAlive,
       documentStore: new FileWatchStateDocumentStore(options.watchStatePath),
     })
