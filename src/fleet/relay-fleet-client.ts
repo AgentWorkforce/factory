@@ -194,6 +194,7 @@ export class RelayFleetClient implements FleetClient {
   async resume(input: {
     name?: string
     sessionRef: string
+    identityKey?: string
     node?: 'self' | string
     capability?: Capability
     repo?: string
@@ -204,6 +205,7 @@ export class RelayFleetClient implements FleetClient {
     return await this.spawn({
       name,
       capability: input.capability ?? 'spawn:codex',
+      identityKey: input.identityKey,
       node: input.node,
       repo: input.repo,
       clonePath: input.clonePath,
@@ -764,6 +766,7 @@ function spawnActionInput(input: SpawnInput): Record<string, unknown> {
   return definedRecord({
     name: input.name,
     agent: input.name,
+    identity_key: input.identityKey,
     clone_path: input.clonePath,
     clonePath: input.clonePath,
     session_ref: input.sessionRef,

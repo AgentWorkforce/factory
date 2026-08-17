@@ -178,6 +178,7 @@ describe('RelayFleetClient', () => {
     await expect(fleet.spawn({
       name: 'ar-1-impl',
       capability: 'spawn:claude',
+      identityKey: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
       node: 'self',
       repo: 'AgentWorkforce/factory',
       clonePath: '/checkout',
@@ -196,6 +197,7 @@ describe('RelayFleetClient', () => {
     expect(placement.input).toEqual({
       name: 'ar-1-impl',
       agent: 'ar-1-impl',
+      identity_key: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
       clone_path: '/checkout',
       clonePath: '/checkout',
       invocationId: 'factory-inv-1',

@@ -1,4 +1,4 @@
-import type { Capability, SendInput, SpawnResult } from './fleet'
+import type { AgentSpec, Capability, SendInput, SpawnResult } from './fleet'
 import type { AgentWorktree } from './worktree'
 import type {
   DependencyAdmission,
@@ -118,6 +118,13 @@ export type ConversationSessionState = {
   agent: {
     name: string
     sessionRef: string
+    /**
+     * Bound at claim/rebind time so identity-proof resume never depends on a
+     * live lookup by the (possibly since-renamed) agent name. Absent on
+     * sessions persisted before this field existed; resume falls back to a
+     * live lookup for those.
+     */
+    role?: AgentSpec['role']
     node?: string
     capability?: Capability
     repo?: string

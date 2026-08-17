@@ -512,7 +512,10 @@ const costScenario = (workspaceId: string, overrides: CostScenarioOverrides = {}
     fleet: new InternalFleetClient({
       client: harness,
       cwd: '/work/factory',
-      resolveAgentRelayMcpCommand: () => undefined,
+      resolveAgentRelayMcpCommand: () => ({
+        command: process.execPath,
+        args: ['/work/factory/node_modules/agent-relay/dist/cli/index.js', 'mcp'],
+      }),
     }),
     stateStore,
     costLedger: ledger,

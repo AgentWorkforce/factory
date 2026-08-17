@@ -193,6 +193,10 @@ describe('HostedFactoryLoop', () => {
     expect(fleet).toBeInstanceOf(Fleet)
     const calls = (fleet as Fleet).calls
     expect(calls.map((call) => call.name)).toEqual(['ar-2778-impl', 'ar-2778-review'])
+    expect(calls.map((call) => call.identityKey)).toEqual([
+      'factory:dispatch:v1:linear:issue-2778:implementer',
+      'factory:dispatch:v1:linear:issue-2778:reviewer',
+    ])
     expect(calls.every((call) => call.invocationId.startsWith('factory:'))).toBe(true)
     expect(new Set(calls.map((call) => call.invocationId))).toHaveLength(2)
 

@@ -130,6 +130,7 @@ describe('InternalFleetClient', () => {
       fleet.spawn({
         name: 'ar-1-impl',
         capability: 'spawn:codex',
+        identityKey: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
         node: 'self',
         task: 'do work',
         model: 'gpt-5',
@@ -159,6 +160,7 @@ describe('InternalFleetClient', () => {
             RELAY_AGENT_NAME: 'ar-1-impl',
             RELAY_AGENT_TYPE: 'agent',
             RELAY_STRICT_AGENT_NAME: '1',
+            RELAY_AGENT_IDENTITY_KEY: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
           }),
           metadata: expect.objectContaining({
             factoryRelayMcp: true,
@@ -180,6 +182,9 @@ describe('InternalFleetClient', () => {
       'do work',
     ]))
     expect(config.args.join('\n')).toContain('"RELAY_AGENT_NAME" = "ar-1-impl"')
+    expect(config.args.join('\n')).toContain(
+      '"RELAY_AGENT_IDENTITY_KEY" = "factory:dispatch:v1:github:agentworkforce/factory#1:implementer"',
+    )
   })
 
   it('injects agent-relay MCP config for Claude factory spawns', async () => {
@@ -278,6 +283,19 @@ describe('InternalFleetClient', () => {
       '[factory-sdk] agent-relay MCP command not found; spawning without MCP injection',
       { agent: 'ar-1-impl', cli: 'codex' },
     )
+  })
+
+  it('fails closed when an identity proof cannot be installed', async () => {
+    const fleet = new InternalFleetClient({
+      client: new FakeHarnessDriverClient(),
+      resolveAgentRelayMcpCommand: () => undefined,
+    })
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      identityKey: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
+    })).rejects.toThrow(/identity proof cannot be installed/)
   })
 
   it('resolves the default agent-relay CLI mcp command from node_modules', async () => {
@@ -740,6 +758,7 @@ describe('InternalFleetClient', () => {
     await expect(fleet.resume({
       name: 'ar-1-impl',
       sessionRef: 'session-original',
+      identityKey: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
       node: 'self',
       clonePath: '/isolated/ar-1',
       task: 'Continue with the durable human answer.',
@@ -754,6 +773,11 @@ describe('InternalFleetClient', () => {
       cwd: '/isolated/ar-1',
       continueFrom: 'session-original',
       task: 'Continue with the durable human answer.',
+      harnessConfig: expect.objectContaining({
+        env: expect.objectContaining({
+          RELAY_AGENT_IDENTITY_KEY: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
+        }),
+      }),
     })
   })
 
