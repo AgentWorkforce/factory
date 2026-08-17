@@ -2,6 +2,11 @@ import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
 import { z } from 'zod'
+import {
+  DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+  DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
+  DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+} from '../fleet/control-plane-circuit'
 
 import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
 
@@ -60,9 +65,9 @@ const dispatchSchema = z.object({
 const fleetHealthSchema = z.object({
   // Roster is read-only, so Factory can safely bound it locally. Mutating
   // spawn/resume calls are never abandoned behind a local timeout.
-  rosterTimeoutMs: z.number().int().min(100).max(60_000).default(5_000),
-  failureThreshold: z.number().int().min(1).max(10).default(2),
-  resetTimeoutMs: z.number().int().min(1_000).max(15 * 60_000).default(60_000),
+  rosterTimeoutMs: z.number().int().min(100).max(60_000).default(DEFAULT_FLEET_ROSTER_TIMEOUT_MS),
+  failureThreshold: z.number().int().min(1).max(10).default(DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD),
+  resetTimeoutMs: z.number().int().min(1_000).max(15 * 60_000).default(DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS),
   // Production launchers can require an explicit, non-project broker state
   // directory so Factory never silently shares an interactive broker.
   requireDedicatedBroker: z.boolean().default(false),

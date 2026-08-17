@@ -159,6 +159,15 @@ has intentionally higher control-plane latency. Mutating calls are never
 abandoned behind a local timeout because an accepted-but-late spawn would be
 ambiguous.
 
+A paused `run-once` or `loop` exits non-zero and logs `dispatch paused by the
+circuit`; `factory status` reads the daemon heartbeat and reports the circuit's
+`state`, `lastError`, and `retryAtMs`. If the broker is healthy but slower than
+the configured bound, raise `fleetHealth.rosterTimeoutMs` (maximum 60 seconds)
+to match measured control-plane latency. If the control path is unavailable,
+repair the isolated broker and wait until `retryAtMs`; the next successful
+half-open roster probe closes the circuit automatically. Do not treat an open
+circuit as an empty queue or successful no-work iteration.
+
 For production, set `fleetHealth.requireDedicatedBroker` to `true` and point
 `AGENT_RELAY_STATE_DIR` at a state directory that is distinct from the
 project's `.agentworkforce/relay`. Factory then refuses startup if it would

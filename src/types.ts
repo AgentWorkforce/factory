@@ -129,6 +129,8 @@ export interface FactoryLoopHeartbeat {
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
   readinessReconcile?: FactoryReadinessReconcileStatus
+  /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
+  fleetControlPlane?: FleetControlPlaneStatus
 }
 
 export interface FactoryReadinessReconcileStatus {

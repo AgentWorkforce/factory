@@ -1143,6 +1143,9 @@ async function factoryStatusWithMountHealth(
   const readinessReconcile = liveness.ok
     ? heartbeat?.readinessReconcile
     : observableStatus.readinessReconcile
+  const fleetControlPlane = liveness.ok
+    ? heartbeat?.fleetControlPlane ?? observableStatus.fleetControlPlane
+    : observableStatus.fleetControlPlane
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
       state: 'unknown' as const,
@@ -1153,13 +1156,23 @@ async function factoryStatusWithMountHealth(
       reason: liveness.reason,
     }
   const health = mount.getLocalMountHealth?.()
-  if (!health) return { ...observableStatus, ...versionInfo, heldAgents, eventListener, readinessReconcile }
+  if (!health) {
+    return {
+      ...observableStatus,
+      ...versionInfo,
+      heldAgents,
+      eventListener,
+      readinessReconcile,
+      fleetControlPlane,
+    }
+  }
   return {
     ...observableStatus,
     ...versionInfo,
     heldAgents,
     eventListener,
     readinessReconcile,
+    fleetControlPlane,
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),

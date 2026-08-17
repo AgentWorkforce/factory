@@ -121,7 +121,11 @@ import {
 } from '../observability/events'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
-import { FleetControlPlaneCircuit, guardFleetControlPlane } from '../fleet/control-plane-circuit'
+import {
+  FleetControlPlaneCircuit,
+  FleetControlPlaneCircuitOpenError,
+  guardFleetControlPlane,
+} from '../fleet/control-plane-circuit'
 
 type FactoryEvent = 'issue-queued' | 'dispatched' | 'issue-done' | 'writeback-verified' | 'error'
 type Listener = (payload: FactoryEventPayload) => void
@@ -3492,6 +3496,19 @@ export class FactoryLoop implements Factory {
           reports.push(failedIterationReport(error, opts.dryRun ?? this.#config.dryRun))
           await this.#reapDispatchFailureHandoffsNow(heartbeatPath, registryPath)
           await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'running', iteration + 1, maxIterations)
+          const fleetControlPlane = this.#fleetControlPlane.status()
+          if (fleetControlPlane.state !== 'closed') {
+            this.#increment('loopCircuitBreaks')
+            this.#logger.error?.('[factory] stopping loop because dispatch is paused by the fleet control-plane circuit', {
+              state: fleetControlPlane.state,
+              consecutiveFailures: fleetControlPlane.consecutiveFailures,
+              retryAtMs: fleetControlPlane.retryAtMs,
+            })
+            throw new FleetControlPlaneCircuitOpenError(
+              fleetControlPlane.retryAtMs ?? this.#clock.now(),
+              fleetControlPlane.state,
+            )
+          }
           if (consecutiveFailures >= maxConsecutiveFailures) {
             this.#increment('loopCircuitBreaks')
             this.#logger.error?.('[factory] stopping loop after consecutive iteration failures', {
@@ -6704,6 +6721,7 @@ export class FactoryLoop implements Factory {
       registryPath,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
+      fleetControlPlane: this.#fleetControlPlane.status(),
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')

@@ -1,5 +1,9 @@
 import type { FleetClient, RosterEntry, SpawnInput, SpawnResult } from '../ports/fleet'
 
+export const DEFAULT_FLEET_ROSTER_TIMEOUT_MS = 5_000
+export const DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD = 2
+export const DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS = 60_000
+
 export type FleetControlPlaneState = 'closed' | 'open' | 'half-open'
 
 export interface FleetControlPlaneStatus {
@@ -135,13 +139,14 @@ export function guardFleetControlPlane(
   circuit: FleetControlPlaneCircuit,
 ): FleetClient {
   const guardedMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // A fresh Factory instance starts with a closed circuit, so checking state
+    // alone would let direct `factory dispatch` calls bypass admission. Probe
+    // the same roster path before every spawn/resume. Concurrent mutations
+    // coalesce onto one in-flight probe, and an open circuit rejects here
+    // without calling either roster or the mutation.
+    await circuit.probe(() => fleet.roster())
     circuit.assertMutationAllowed()
-    try {
-      return await operation()
-    } catch (error) {
-      if (isFleetControlPlaneFailure(error)) circuit.recordFailure(error)
-      throw error
-    }
+    return await operation()
   }
 
   return new Proxy(fleet, {

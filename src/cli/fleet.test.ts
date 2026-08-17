@@ -2692,7 +2692,7 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('surfaces degraded readiness reconciliation from the live daemon heartbeat', async () => {
+  it('surfaces degraded readiness and an open fleet circuit from the live daemon heartbeat', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-reconcile-status-'))
     try {
       const heartbeatPath = join(root, 'heartbeat.json')
@@ -2713,6 +2713,16 @@ describe('fleet CLI runtime', () => {
           lastFailureAtMs: now - 1_000,
           lastError: 'discovery sweep lease expired',
         },
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 2,
+          timeoutMs: 5_000,
+          failureThreshold: 2,
+          resetTimeoutMs: 60_000,
+          lastFailureAtMs: now - 500,
+          retryAtMs: now + 59_500,
+          lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
+        },
       }))
       const output = buffer()
       const factory = {
@@ -2724,6 +2734,13 @@ describe('fleet CLI runtime', () => {
             state: 'not-running' as const,
             consecutiveFailures: 0,
             failureThreshold: 3,
+          },
+          fleetControlPlane: {
+            state: 'closed' as const,
+            consecutiveFailures: 0,
+            timeoutMs: 5_000,
+            failureThreshold: 2,
+            resetTimeoutMs: 60_000,
           },
         })),
       } as unknown as Factory
@@ -2743,6 +2760,11 @@ describe('fleet CLI runtime', () => {
           consecutiveFailures: 3,
           failureThreshold: 3,
           lastError: 'discovery sweep lease expired',
+        },
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 2,
+          lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
         },
       })
     } finally {
