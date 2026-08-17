@@ -6,6 +6,11 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import {
+  factoryGithubIssueCommentDraftName,
+  isFactoryGithubIssueCommentDraftName,
+  isFactoryGithubOperationDraftName,
+} from '../github/writeback-paths'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
@@ -95,7 +100,7 @@ import type {
   TriageDecision,
   TriageEngine,
 } from '../types'
-import { GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
+import { AppGithubWriteback, FACTORY_GITHUB_STATUS_LABELS, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import {
@@ -716,7 +721,7 @@ export class FactoryLoop implements Factory {
       safety: config.safety,
     })
     this.#githubWritebackProvided = Boolean(ports.githubWriteback)
-    this.#githubWriteback = ports.githubWriteback ?? new GhCliGithubWriteback()
+    this.#githubWriteback = ports.githubWriteback ?? defaultGithubWriteback(config, ports.mount)
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
     this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
@@ -15177,6 +15182,18 @@ export class FactoryLoop implements Factory {
   }
 }
 
+const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
+  if (config.github.identity !== 'app') {
+    return new GhCliGithubWriteback()
+  }
+  if (!mount.githubWrite) {
+    throw new Error(
+      'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
+    )
+  }
+  return new AppGithubWriteback(mount.githubWrite)
+}
+
 export function parseLinearIssue(path: string, content: unknown): LinearIssue {
   const parsed = parseJsonContent(content)
   const payload = wrappedPayload(parsed)
@@ -17429,15 +17446,138 @@ const isAllowedFactoryDraft = async (
     return true
   }
 
-  if (isFactoryGithubWritebackPath(path)) {
-    return true
-  }
+  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config)) return true
 
   return false
 }
 
-const isFactoryGithubWritebackPath = (path: string): boolean =>
+const isFactoryGithubAuthoredArtifactPath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+
+export const isAllowedFactoryGithubArtifactDraft = (
+  path: string,
+  opts: { guarded?: boolean } | undefined,
+): boolean => opts?.guarded === true && isFactoryGithubAuthoredArtifactPath(path)
+
+const factoryGithubIssueWriteTarget = (
+  path: string,
+): { owner: string; repo: string; number: number; kind: 'issue-update' | 'comment' | 'label-operation' } | undefined => {
+  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/([1-9]\d*)(?:\.json|\/(comments|labels)\/([^/]+))$/iu.exec(path)
+  if (!match?.[1] || !match[2] || !match[3]) return undefined
+  const child = match[4]
+  const filename = match[5]
+  if (child === 'comments' && (!filename || !isFactoryGithubIssueCommentDraftName(filename))) return undefined
+  if (child === 'labels' && (!filename || !isFactoryGithubOperationDraftName(filename))) return undefined
+  try {
+    return {
+      owner: decodeURIComponent(match[1]),
+      repo: decodeURIComponent(match[2]),
+      number: Number(match[3]),
+      kind: child === 'comments' ? 'comment' : child === 'labels' ? 'label-operation' : 'issue-update',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+const factoryGithubRepositoryLabelWriteTarget = (
+  path: string,
+): { owner: string; repo: string } | undefined => {
+  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/labels\/([^/]+)$/iu.exec(path)
+  if (!match?.[1] || !match[2] || !match[3] || !isFactoryGithubOperationDraftName(match[3])) return undefined
+  try {
+    return { owner: decodeURIComponent(match[1]), repo: decodeURIComponent(match[2]) }
+  } catch {
+    return undefined
+  }
+}
+
+const githubLifecycleLabel = (name: unknown) =>
+  Object.values(FACTORY_GITHUB_STATUS_LABELS).find((label) => label.name === name)
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+const isAllowedFactoryGithubIssueWriteContent = (
+  kind: 'issue-update' | 'comment' | 'label-operation',
+  content: unknown,
+): boolean => {
+  const value = asRecord(content)
+  if (!value) return false
+  if (kind === 'issue-update') {
+    return hasExactKeys(value, ['state']) && value.state === 'closed'
+  }
+  if (kind === 'comment') {
+    return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
+  }
+  if (value.operation === 'add') {
+    return hasExactKeys(value, ['labels', 'operation']) &&
+      Array.isArray(value.labels) && value.labels.length === 1 && Boolean(githubLifecycleLabel(value.labels[0]))
+  }
+  return value.operation === 'remove' && hasExactKeys(value, ['label', 'operation']) && Boolean(githubLifecycleLabel(value.label))
+}
+
+const isAllowedFactoryGithubRepositoryLabelContent = (content: unknown): boolean => {
+  const value = asRecord(content)
+  if (!value || !hasExactKeys(value, ['color', 'description', 'name'])) return false
+  const expected = githubLifecycleLabel(value.name)
+  return Boolean(expected && expected.color === value.color && expected.description === value.description)
+}
+
+/**
+ * Last-resort mount guard for Factory-authored GitHub drafts. PR/ref paths are
+ * intrinsically Factory-owned. Issue mutations additionally require a current
+ * in-scope issue projection in one of Relayfile's supported repository layouts.
+ */
+export const isAllowedFactoryGithubDraft = async (
+  path: string,
+  content: unknown,
+  opts: { guarded?: boolean } | undefined,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<boolean> => {
+  if (!opts?.guarded) return false
+  if (isAllowedFactoryGithubArtifactDraft(path, opts)) return true
+
+  const repositoryLabelTarget = factoryGithubRepositoryLabelWriteTarget(path)
+  if (repositoryLabelTarget) {
+    const repoPath = `/github/repos/${encodeURIComponent(repositoryLabelTarget.owner)}/${encodeURIComponent(repositoryLabelTarget.repo)}/`
+    return isConfiguredGithubRepoPath(repoPath, config) && isAllowedFactoryGithubRepositoryLabelContent(content)
+  }
+
+  const target = factoryGithubIssueWriteTarget(path)
+  if (!target) return false
+  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content)) return false
+  if (target.kind === 'comment') {
+    const body = asRecord(content)?.body
+    const draftName = path.slice(path.lastIndexOf('/') + 1)
+    if (typeof body !== 'string' || draftName !== factoryGithubIssueCommentDraftName(body)) return false
+  }
+  const repoPath = `/github/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`
+  if (!isConfiguredGithubRepoPath(`${repoPath}/`, config)) return false
+
+  const compactRepo = `${encodeURIComponent(target.owner)}__${encodeURIComponent(target.repo)}`
+  const candidates = [
+    `${repoPath}/issues/by-id/${target.number}.json`,
+    `/github/repos/${compactRepo}/issues/by-id/${target.number}.json`,
+    `${repoPath}/issues/${target.number}/meta.json`,
+    `/github/repos/${compactRepo}/issues/${target.number}/meta.json`,
+    `${repoPath}/issues/${target.number}.json`,
+    `/github/repos/${compactRepo}/issues/${target.number}.json`,
+  ]
+  for (const candidate of candidates) {
+    try {
+      const issue = parseGithubFactoryIssue(candidate, (await mount.readFile(candidate)).content)
+      return issue.state?.name === 'open' && isInFactoryScope(issue, config.safety)
+    } catch {
+      // Try the next canonical/alias shape. Any total miss fails closed.
+    }
+  }
+  return false
+}
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,

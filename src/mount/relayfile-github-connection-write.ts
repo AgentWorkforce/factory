@@ -1,7 +1,13 @@
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { promisify } from 'node:util'
 
+import {
+  factoryGithubIssueCommentDraftName,
+  factoryGithubOperationDraftName,
+} from '../github/writeback-paths'
 import type {
+  GithubConnectionIssueUpdateInput,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
@@ -20,10 +26,11 @@ export interface RelayfileGithubConnectionWriteConfig {
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
+  operationIdFactory?: () => string
 }
 
 /**
- * GitHub PR mutations backed by the workspace's file-native Relayfile
+ * GitHub mutations backed by the workspace's file-native Relayfile
  * connection. The adapter is server-side; Factory only depends on the stable
  * write paths and payload contracts exposed through MountClient.
  */
@@ -32,6 +39,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #git: GitCommandRunner
   readonly #receiptReadAttempts: number
   readonly #receiptReadDelayMs: number
+  readonly #operationIdFactory: () => string
   readonly #writesByPath = new Map<string, Promise<string | undefined>>()
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
@@ -39,6 +47,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     this.#git = config.gitRunner ?? defaultGitRunner
     this.#receiptReadAttempts = positiveInteger(config.receiptReadAttempts) ?? RECEIPT_READ_ATTEMPTS
     this.#receiptReadDelayMs = nonNegativeInteger(config.receiptReadDelayMs) ?? RECEIPT_READ_DELAY_MS
+    this.#operationIdFactory = config.operationIdFactory ?? randomUUID
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
@@ -127,6 +136,92 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     )
   }
 
+  async postIssueComment(input: {
+    repo: string
+    number: number
+    body: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    const body = input.body.trim()
+    if (!body) {
+      throw new Error('GitHub issue comment body must be a non-empty string')
+    }
+    if (input.author !== 'app') {
+      throw new Error(`Relayfile GitHub issue comments require author "app": ${input.author}`)
+    }
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}/comments/${factoryGithubIssueCommentDraftName(body)}`,
+      // `author` selects this connection method, but is not a writable field
+      // in Relayfile's GitHub issue-comment schema. The connected App
+      // credential is applied server-side.
+      { body },
+    )
+  }
+
+  async ensureRepositoryLabel(input: {
+    repo: string
+    name: string
+    color: string
+    description: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertAppAuthor(input.author, 'repository labels')
+    const name = normalizedGithubLabel(input.name)
+    const color = input.color.trim().replace(/^#/u, '')
+    if (!/^[a-f0-9]{6}$/iu.test(color)) {
+      throw new Error(`GitHub label color must be a six-digit hex value: ${input.color}`)
+    }
+    const description = input.description.trim()
+    if (!description) throw new Error('GitHub label description must be a non-empty string')
+    await this.#writeAndConfirm(
+      `${repoRoot}/labels/${this.#nextOperationDraftName()}`,
+      { name, color: color.toLowerCase(), description },
+    )
+  }
+
+  async mutateIssueLabel(input: {
+    repo: string
+    number: number
+    operation: 'add' | 'remove'
+    label: string
+    author: 'app'
+  }): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    assertAppAuthor(input.author, 'issue label mutations')
+    const label = normalizedGithubLabel(input.label)
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}/labels/${this.#nextOperationDraftName()}`,
+      input.operation === 'add'
+        ? { operation: 'add', labels: [label] }
+        : { operation: 'remove', label },
+    )
+  }
+
+  async updateIssue(input: GithubConnectionIssueUpdateInput): Promise<void> {
+    const repoRoot = githubRepoRoot(input.repo)
+    assertPositiveGithubNumber(input.number, 'issue')
+    if (input.author !== 'app') {
+      throw new Error(`Relayfile GitHub issue updates require author "app": ${input.author}`)
+    }
+    const labels = input.labels === undefined ? undefined : normalizedGithubLabels(input.labels)
+    if (labels === undefined && input.state === undefined) {
+      throw new Error('GitHub issue update requires labels and/or state')
+    }
+    // As with comments, the App identity is enforced by the method contract;
+    // the provider's issue schema accepts only its mutable REST fields.
+    await this.#writeAndConfirm(
+      `${repoRoot}/issues/${input.number}.json`,
+      {
+        ...(labels === undefined ? {} : { labels }),
+        ...(input.state === undefined ? {} : { state: input.state }),
+      },
+    )
+  }
+
   async #gitValue(args: string[], description: string): Promise<string> {
     try {
       const value = (await this.#git(args)).stdout.trim()
@@ -135,6 +230,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       throw new Error(`Unable to resolve ${description} for GitHub PR publication: ${errorMessage(error)}`)
     }
     throw new Error(`Unable to resolve ${description} for GitHub PR publication`)
+  }
+
+  #nextOperationDraftName(): string {
+    return factoryGithubOperationDraftName(this.#operationIdFactory())
   }
 
   async #readPullRequestReceipt(
@@ -206,6 +305,37 @@ const githubRepoParts = (value: string): { owner: string; repo: string } => {
     throw new Error(`GitHub repo must be owner/repo: ${value}`)
   }
   return { owner: match[1], repo: match[2] }
+}
+
+const githubRepoRoot = (value: string): string => {
+  const { owner, repo } = githubRepoParts(value)
+  return `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+}
+
+const assertPositiveGithubNumber = (value: number, resource: string): void => {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`GitHub ${resource} number must be a positive integer: ${value}`)
+  }
+}
+
+const normalizedGithubLabels = (labels: string[]): string[] => {
+  const normalized = labels.map((label) => label.trim())
+  if (normalized.some((label) => !label)) {
+    throw new Error('GitHub issue labels must be non-empty strings')
+  }
+  return [...new Set(normalized)]
+}
+
+const normalizedGithubLabel = (label: string): string => {
+  const normalized = normalizedGithubLabels([label])[0]
+  if (!normalized) throw new Error('GitHub label must be a non-empty string')
+  return normalized
+}
+
+const assertAppAuthor = (author: string, operation: string): void => {
+  if (author !== 'app') {
+    throw new Error(`Relayfile GitHub ${operation} require author "app": ${author}`)
+  }
 }
 
 const githubDraftName = (headRef: string, headSha?: string): string => {

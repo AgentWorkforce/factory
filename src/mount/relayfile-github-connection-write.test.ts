@@ -174,6 +174,139 @@ describe('RelayfileGithubConnectionWrite', () => {
     }])
   })
 
+  it('posts deterministic app-authored issue comments and updates through confirmed drafts', async () => {
+    const mount = new FakeMountClient()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory dispatch for 221',
+      author: 'app',
+    })
+    await write.updateIssue({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'bug', 'factory:in-progress', 'bug'],
+      author: 'app',
+    })
+
+    expect(mount.writes).toEqual([
+      {
+        path: expect.stringMatching(
+          /^\/github\/repos\/AgentWorkforce\/factory\/issues\/221\/comments\/factory-[a-f0-9]{24}\.json$/u,
+        ),
+        content: { body: 'Factory dispatch for 221' },
+      },
+      {
+        path: '/github/repos/AgentWorkforce/factory/issues/221.json',
+        content: {
+          labels: ['factory', 'bug', 'factory:in-progress'],
+        },
+      },
+    ])
+
+    await write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Factory dispatch for 221',
+      author: 'app',
+    })
+    expect(mount.writes[2]?.path).toBe(mount.writes[0]?.path)
+  })
+
+  it('provisions and mutates lifecycle labels through unique confirmed operation drafts', async () => {
+    const mount = new FakeMountClient()
+    const operationIds = [
+      '11111111-1111-4111-8111-111111111111',
+      '22222222-2222-4222-8222-222222222222',
+      '33333333-3333-4333-8333-333333333333',
+    ]
+    const write = new RelayfileGithubConnectionWrite({
+      mount,
+      operationIdFactory: () => operationIds.shift()!,
+    })
+
+    await write.ensureRepositoryLabel({
+      repo: 'AgentWorkforce/factory',
+      name: 'factory:in-progress',
+      color: '#1D76DB',
+      description: 'Factory agents are working on this issue.',
+      author: 'app',
+    })
+    await write.mutateIssueLabel({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      operation: 'add',
+      label: 'factory:in-progress',
+      author: 'app',
+    })
+    await write.mutateIssueLabel({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      operation: 'remove',
+      label: 'factory:human-review',
+      author: 'app',
+    })
+
+    expect(mount.writes).toEqual([
+      {
+        path: '/github/repos/AgentWorkforce/factory/labels/factory-11111111-1111-4111-8111-111111111111.json',
+        content: {
+          name: 'factory:in-progress',
+          color: '1d76db',
+          description: 'Factory agents are working on this issue.',
+        },
+      },
+      {
+        path: '/github/repos/AgentWorkforce/factory/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
+        content: { operation: 'add', labels: ['factory:in-progress'] },
+      },
+      {
+        path: '/github/repos/AgentWorkforce/factory/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
+        content: { operation: 'remove', label: 'factory:human-review' },
+      },
+    ])
+  })
+
+  it('does not report an app issue comment when provider confirmation remains pending', async () => {
+    class PendingCommentMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked' | 'pending'> {
+        return path.includes('/comments/') ? 'pending' : 'acked'
+      }
+    }
+    const mount = new PendingCommentMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.postIssueComment({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      body: 'Unconfirmed comment',
+      author: 'app',
+    })).rejects.toThrow(/GitHub writeback did not complete .*: pending/u)
+  })
+
+  it('does not report a lifecycle-label operation when provider confirmation remains pending', async () => {
+    class PendingLabelMount extends FakeMountClient {
+      override async confirmWrite(path: string): Promise<'acked' | 'pending'> {
+        return path.includes('/labels/') ? 'pending' : 'acked'
+      }
+    }
+    const mount = new PendingLabelMount()
+    const write = new RelayfileGithubConnectionWrite({
+      mount,
+      operationIdFactory: () => '11111111-1111-4111-8111-111111111111',
+    })
+
+    await expect(write.mutateIssueLabel({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      operation: 'add',
+      label: 'factory:in-progress',
+      author: 'app',
+    })).rejects.toThrow(/GitHub writeback did not complete .*: pending/u)
+  })
+
   it('fails closed when the provider does not acknowledge a write', async () => {
     const mount = new FakeMountClient()
     const refPath = '/github/repos/AgentWorkforce/factory/refs/factory.json'

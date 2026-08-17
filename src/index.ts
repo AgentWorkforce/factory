@@ -145,6 +145,8 @@ export {
   findDependencyCycle,
   issueKey,
   isDispatchableIssue,
+  isAllowedFactoryGithubDraft,
+  isAllowedFactoryGithubArtifactDraft,
   isLiveDispatchStateChangedError,
   isRealLinearIssue,
   githubIssuePathParts,
@@ -182,6 +184,8 @@ export type {
   LlmTriageOptions,
 } from './triage'
 export {
+  AppGithubWriteback,
+  FACTORY_GITHUB_STATUS_LABELS,
   GhCliGithubWriteback,
   FACTORY_MOUNT_HEALTH_PATH,
   linearCommentName,
