@@ -9,7 +9,6 @@ import {
   FleetControlPlaneCircuit,
   FleetControlPlaneCircuitOpenError,
   guardFleetControlPlane,
-  isFleetControlPlaneFailure,
 } from './control-plane-circuit'
 
 const roster: RosterEntry = { agents: [], nodes: [] }
@@ -165,8 +164,8 @@ describe('FleetControlPlaneCircuit', () => {
     const fleet = new FakeFleetClient()
     const rosterProbe = vi.spyOn(fleet, 'roster')
     const guarded = guardFleetControlPlane(fleet, circuit)
-    circuit.recordFailure(new Error('broker unavailable'))
-    circuit.recordFailure(new Error('broker unavailable'))
+    await expect(circuit.probe(async () => { throw new Error('broker unavailable') })).rejects.toThrow()
+    await expect(circuit.probe(async () => { throw new Error('broker unavailable') })).rejects.toThrow()
 
     await expect(guarded.spawn({
       name: 'blocked-worker',
@@ -181,13 +180,27 @@ describe('FleetControlPlaneCircuit', () => {
     expect(fleet.resumes).toEqual([])
   })
 
-  it('recognizes timeout and transport failures without classifying domain errors', () => {
-    expect(isFleetControlPlaneFailure(Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' }))).toBe(true)
-    expect(isFleetControlPlaneFailure(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(true)
-    expect(isFleetControlPlaneFailure(new Error('agent already exists'))).toBe(false)
-
+  it('sanitizes probe failures before exposing them through circuit status', async () => {
     const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000 })
-    circuit.recordFailure(Object.assign(new Error('https://broker.invalid?token=must-not-leak'), { code: 'ECONNREFUSED' }))
+    await expect(circuit.probe(async () => {
+      throw Object.assign(new Error('https://broker.invalid?token=must-not-leak'), { code: 'ECONNREFUSED' })
+    })).rejects.toThrow()
     expect(circuit.status().lastError).toBe('Error (ECONNREFUSED)')
+  })
+
+  it('does not treat ambiguous mutation transport failures as roster probe failures', async () => {
+    const fleet = new FakeFleetClient()
+    const mutationError = Object.assign(
+      new Error('Timed out waiting for spawn invocation inv-1 to complete'),
+      { code: 'ETIMEDOUT' },
+    )
+    vi.spyOn(fleet, 'spawn').mockRejectedValue(mutationError)
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 2, resetTimeoutMs: 1_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit)
+
+    await expect(guarded.spawn({ name: 'worker-1', capability: 'spawn:codex' })).rejects.toBe(mutationError)
+    await expect(guarded.spawn({ name: 'worker-2', capability: 'spawn:codex' })).rejects.toBe(mutationError)
+
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
   })
 })

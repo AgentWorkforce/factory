@@ -68,6 +68,7 @@ export class FleetControlPlaneCircuit {
     this.#now = options.now ?? Date.now
   }
 
+  /** Returns the current admission state without performing broker I/O. */
   status(): FleetControlPlaneStatus {
     const state: FleetControlPlaneState = this.#consecutiveFailures < this.#failureThreshold
       ? 'closed'
@@ -86,12 +87,13 @@ export class FleetControlPlaneCircuit {
     }
   }
 
+  /** Runs or joins one bounded roster request, recording only its outcome. */
   async probe(roster: () => Promise<RosterEntry>): Promise<RosterEntry> {
-    if (this.#probeInFlight) return this.#probeInFlight
     const status = this.status()
     if (status.state === 'open') {
       throw new FleetControlPlaneCircuitOpenError(status.retryAtMs!)
     }
+    if (this.#probeInFlight) return this.#probeInFlight
 
     const probe = withTimeout(roster, this.#timeoutMs)
       .then((result) => {
@@ -99,7 +101,7 @@ export class FleetControlPlaneCircuit {
         return result
       })
       .catch((error: unknown) => {
-        this.recordFailure(error)
+        this.#recordFailure(error)
         throw error
       })
       .finally(() => {
@@ -109,13 +111,14 @@ export class FleetControlPlaneCircuit {
     return probe
   }
 
+  /** Rejects mutations until an open or half-open circuit has recovered. */
   assertMutationAllowed(): void {
     const status = this.status()
     if (status.state === 'closed') return
     throw new FleetControlPlaneCircuitOpenError(status.retryAtMs ?? this.#now(), status.state)
   }
 
-  recordFailure(error: unknown): void {
+  #recordFailure(error: unknown): void {
     const now = this.#now()
     const wasOpen = this.#retryAtMs !== undefined && now < this.#retryAtMs
     this.#lastFailureAtMs = now
@@ -134,6 +137,12 @@ export class FleetControlPlaneCircuit {
   }
 }
 
+/**
+ * Gates roster, spawn, and resume through the read-only roster control path.
+ * Mutation rejections deliberately do not affect circuit state: a transport
+ * error can arrive after the remote side effect committed, so only a fresh,
+ * bounded roster probe is allowed to decide subsequent admission.
+ */
 export function guardFleetControlPlane(
   fleet: FleetClient,
   circuit: FleetControlPlaneCircuit,
@@ -146,6 +155,8 @@ export function guardFleetControlPlane(
     // circuit rejects here without calling either roster or the mutation.
     await circuit.probe(() => fleet.roster())
     circuit.assertMutationAllowed()
+    // Do not catch or classify operation failures here. Their remote outcome
+    // can be ambiguous; the next mutation must run a new roster admission probe.
     return await operation()
   }
 
@@ -167,21 +178,7 @@ export function guardFleetControlPlane(
   }) as FleetClient
 }
 
-export function isFleetControlPlaneFailure(error: unknown): boolean {
-  if (!(error instanceof Error)) return false
-  const candidate = error as Error & { code?: unknown }
-  if (error.name === 'TimeoutError' || error.name === 'AbortError') return true
-  if (typeof candidate.code === 'string' && [
-    'ECONNREFUSED',
-    'ECONNRESET',
-    'EPIPE',
-    'ETIMEDOUT',
-    'UND_ERR_CONNECT_TIMEOUT',
-  ].includes(candidate.code)) return true
-  return /(?:operation\s+timed\s+out|operation\s+was\s+aborted|no\s+running\s+broker|broker\s+unavailable|socket\s+hang\s+up)/iu
-    .test(error.message)
-}
-
+/** Redacts arbitrary transport text before circuit state becomes observable. */
 function describeControlPlaneError(error: unknown): string {
   if (!(error instanceof Error)) return 'unknown control-plane failure'
   const code = (error as Error & { code?: unknown }).code
@@ -191,6 +188,7 @@ function describeControlPlaneError(error: unknown): string {
   return `${error.name || 'Error'}${safeCode}`
 }
 
+/** Applies the local roster deadline without imposing a timeout on mutations. */
 function withTimeout<T>(operation: () => Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false
