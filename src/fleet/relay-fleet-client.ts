@@ -430,6 +430,25 @@ export class RelayFleetClient implements FleetClient {
 
   async dispose(): Promise<void> {
     if (this.#disposed) return
+
+    // A rejected placement may already have launched a worker. If its first
+    // compensating release failed, disposal must not erase the only ownership
+    // record before giving cleanup one final synchronous retry. Refuse to
+    // dispose while any such release remains unconfirmed; callers then get a
+    // hard failure containing the deterministic worker name instead of a
+    // successful shutdown that silently strands it.
+    if ([...this.#tracked.values()].some((agent) => agent.pendingReleaseReason)) {
+      await this.reconcileTrackedAgents()
+      const pendingNames = [...this.#tracked]
+        .filter(([, agent]) => agent.pendingReleaseReason)
+        .map(([name]) => name)
+      if (pendingNames.length > 0) {
+        throw new Error(
+          `Refusing to dispose Relay fleet client with unconfirmed worker cleanup: ${pendingNames.join(', ')}`,
+        )
+      }
+    }
+
     this.#disposed = true
     if (this.#watchTimer) {
       clearInterval(this.#watchTimer)

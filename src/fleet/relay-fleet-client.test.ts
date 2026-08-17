@@ -419,6 +419,88 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().size).toBe(0)
   })
 
+  it('drains a pending rejected-placement release before disposal', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl' },
+    }])
+    messaging.invocations.set('inv-1', [{
+      invocationId: 'inv-1',
+      actionName: 'release',
+      status: 'failed',
+      error: 'temporary cleanup failure',
+    }])
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    messaging.invocations.set('inv-2', [{
+      invocationId: 'inv-2',
+      actionName: 'release',
+      status: 'completed',
+      output: {},
+    }])
+    await expect(fleet.dispose()).resolves.toBeUndefined()
+
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toHaveLength(2)
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
+  it('refuses disposal without erasing an unconfirmed rejected-placement release', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'self-placement',
+      status: 'pending',
+      placement: { node: 'self' },
+    }
+    messaging.invocations.set('self-placement', [{
+      invocationId: 'self-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl' },
+    }])
+    messaging.invocations.set('inv-1', [{
+      invocationId: 'inv-1',
+      actionName: 'release',
+      status: 'failed',
+      error: 'cleanup unavailable',
+    }])
+    messaging.invocations.set('inv-2', [{
+      invocationId: 'inv-2',
+      actionName: 'release',
+      status: 'failed',
+      error: 'cleanup still unavailable',
+    }])
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    await expect(fleet.dispose()).rejects.toThrow(
+      'Refusing to dispose Relay fleet client with unconfirmed worker cleanup: ar-1-impl',
+    )
+    expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({
+      pendingReleaseReason: 'unverified-placement',
+    })
+  })
+
   it('returns and tracks the normalized acknowledgement node instead of action output', async () => {
     const messaging = new FakeMessaging()
     messaging.placementAck = {
