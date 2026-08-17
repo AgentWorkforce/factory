@@ -149,7 +149,12 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         // it. It must not push, open a PR, or coordinate with the reviewer —
         // the lead does that once the integrated branch is ready.
         'Commit your subtask locally on the shared branch so the lead can integrate it. Do NOT push, do NOT run `gh pr create`, and do NOT DM the reviewer — the lead owns publication and reviewer handoff.',
-        'When your subtask is done or blocked, post on the shared swarm channel and output `/exit` on its own line. Do not call any Factory lifecycle action — the lead reports issue completion, not workers.',
+        // Split "done" from "blocked": the lead is authoritative for the
+        // completion lifecycle action, but a worker blocked on a human answer
+        // still needs the durable question flow rendered below (github-issue
+        // writeback, or lifecycle `invoke_action { kind: "blocked" }`).
+        'When your subtask is done, post the result on the shared swarm channel and output `/exit` on its own line. Do not call the Factory completion lifecycle action — the lead reports issue completion, not workers.',
+        'If you are blocked and need a human answer instead, follow the durable human-input instructions below (do not exit before recording the request).',
       ]
     : [
         'Commit the implementation and tests.',
