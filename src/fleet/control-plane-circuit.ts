@@ -140,10 +140,10 @@ export function guardFleetControlPlane(
 ): FleetClient {
   const guardedMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
     // A fresh Factory instance starts with a closed circuit, so checking state
-    // alone would let direct `factory dispatch` calls bypass admission. Probe
-    // the same roster path before every spawn/resume. Concurrent mutations
-    // coalesce onto one in-flight probe, and an open circuit rejects here
-    // without calling either roster or the mutation.
+    // alone would let resume/cold-start paths that did not run discovery bypass
+    // admission. Probe the same roster path before every spawn/resume.
+    // Concurrent mutations coalesce onto one in-flight probe, and an open
+    // circuit rejects here without calling either roster or the mutation.
     await circuit.probe(() => fleet.roster())
     circuit.assertMutationAllowed()
     return await operation()
