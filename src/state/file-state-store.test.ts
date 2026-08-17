@@ -475,6 +475,7 @@ describe('FileStateStore', () => {
         },
         history: [],
         processedMessageIds: [],
+        acknowledgedMessageIds: [],
         pending: [],
       }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
@@ -566,6 +567,60 @@ describe('FileStateStore', () => {
         acknowledgedMessageIds: ['message-1'],
         delivery: { messages: [{ id: 'message-1', text: 'Keep the complete long instruction.' }] },
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('durably requeues an expired delivery when its conversation has no owner', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-expired-unowned-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const conversationId = 'slack:1780751612.176223'
+      const message = { id: 'message-expired', text: 'Keep me pending.', receivedAtMs: 1_000 }
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 3,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            slackThreadWatches: {},
+            waitingClarifications: {},
+            babysitterSessions: {},
+            babysitterGenerations: {},
+            conversationSessions: {
+              [conversationId]: {
+                provider: 'slack',
+                issue: { uuid: 'uuid-134', key: 'AR-134', path: '/linear/issues/AR-134__uuid-134.json' },
+                externalId: '1780751612.176223',
+                context: { channelDir: 'C0FACTORY__factory-e2e' },
+                history: [],
+                processedMessageIds: [message.id],
+                pending: [],
+                delivery: {
+                  claimId: 'expired-claim',
+                  owner: 'stopped-owner',
+                  claimedAtMs: 1_000,
+                  attempts: 1,
+                  messages: [message],
+                  agent: { name: 'ar-134-impl-factory', sessionRef: 'expired-session' },
+                },
+              },
+            },
+            dispatchLifecycles: {},
+            discoverySweep: { consecutiveOverloads: 0, backoffUntilMs: 0, lastEpoch: 0 },
+          },
+        },
+      }))
+
+      const requeued = await new FileStateStore({ batchSize: 2, watchStatePath }).claimConversationTurn(
+        'workspace-1', conversationId, 'replacement-owner', 'replacement-claim', 62_000, 60_000,
+      )
+      expect(requeued).toMatchObject({ pending: [message] })
+      expect(requeued?.delivery).toBeUndefined()
+      const restored = await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getConversationSession('workspace-1', conversationId)
+      expect(restored).toMatchObject({ pending: [message] })
+      expect(restored?.delivery).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }

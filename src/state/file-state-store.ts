@@ -1025,8 +1025,9 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (session.delivery) session.pending.unshift(...session.delivery.messages)
       session.pending.sort(compareConversationMessages)
       if (!session.agent || session.pending.length === 0) {
+        const hadDelivery = session.delivery !== undefined
         session.delivery = undefined
-        return false
+        return hadDelivery
       }
       const agent = session.agent
       session.delivery = {

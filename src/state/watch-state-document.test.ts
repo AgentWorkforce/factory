@@ -19,6 +19,23 @@ describe('parseWatchStateDocument', () => {
     expect(parseWatchStateDocument(validDocument())).toEqual(validDocument())
   })
 
+  it('migrates legacy conversation history as already acknowledged without acknowledging pending work', () => {
+    const document = validDocument()
+    document.workspaces.workspace.conversationSessions.legacy = {
+      provider: 'slack',
+      issue: issue(),
+      externalId: '1780751612.176224',
+      context: { channelDir: 'factory' },
+      agent: { name: 'implementer', sessionRef: 'session-implementer' },
+      history: [{ id: 'delivered', text: 'Already delivered.', receivedAtMs: 1_000 }],
+      processedMessageIds: ['delivered', 'pending'],
+      pending: [{ id: 'pending', text: 'Still pending.', receivedAtMs: 1_001 }],
+    }
+
+    expect(parseWatchStateDocument(document).workspaces.workspace?.conversationSessions.legacy)
+      .toMatchObject({ acknowledgedMessageIds: ['delivered'] })
+  })
+
   it.each([
     ['preview reference', (document: Record<string, any>) => {
       document.workspaces.workspace.waitingClarifications.clarification.decision.implementers[0].preview = {

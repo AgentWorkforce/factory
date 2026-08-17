@@ -158,9 +158,9 @@ const parseConversationSessions = (
           ...(session.delivery?.messages ?? []),
         ].map((message) => message.id))]
       : [...candidate.processedMessageIds as string[]]
-    if (candidate.acknowledgedMessageIds !== undefined) {
-      session.acknowledgedMessageIds = [...candidate.acknowledgedMessageIds as string[]]
-    }
+    session.acknowledgedMessageIds = candidate.acknowledgedMessageIds === undefined
+      ? session.history.map((message) => message.id)
+      : [...candidate.acknowledgedMessageIds as string[]]
     if (candidate.acknowledgementClaims !== undefined) {
       session.acknowledgementClaims = structuredClone(candidate.acknowledgementClaims) as ConversationSessionState['acknowledgementClaims']
     }
