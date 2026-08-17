@@ -154,7 +154,13 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         // still needs the durable question flow rendered below (github-issue
         // writeback, or lifecycle `invoke_action { kind: "blocked" }`).
         'When your subtask is done, post the result on the shared swarm channel and output `/exit` on its own line. Do not call the Factory completion lifecycle action — the lead reports issue completion, not workers.',
-        'If you are blocked and need a human answer instead, follow the durable human-input instructions below (do not exit before recording the request).',
+        // The "durable instructions below" only exist when the issue has
+        // github metadata OR a lifecycle action; otherwise questionInstructions
+        // falls back to "report in your final outcome", which is a plain
+        // report, not a durable recording route.
+        ...(sourceGithubIssue || input.lifecycleActionName
+          ? ['If you are blocked and need a human answer instead, follow the durable human-input instructions below (do not exit before recording the request).']
+          : ['If you are blocked, report one concrete question in your final outcome so Factory can route it for an answer.']),
       ]
     : [
         'Commit the implementation and tests.',
