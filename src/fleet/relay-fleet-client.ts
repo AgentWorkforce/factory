@@ -187,8 +187,9 @@ export class RelayFleetClient implements FleetClient {
     })
     const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
+    let acknowledgedNode: string
     try {
-      assertNamedRemotePlacement(result, ack.placement?.node)
+      acknowledgedNode = assertNamedRemotePlacement(result, ack.placement?.node)
     } catch (error) {
       // A completed placement invocation has already launched the worker. If
       // Relay cannot prove that it ran on a named remote node, tear that worker
@@ -203,8 +204,9 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
-    this.#track(result.name, ack)
-    return result
+    const trustedResult = { ...result, node: acknowledgedNode }
+    this.#track(trustedResult.name, { invocationId: ack.invocationId, node: acknowledgedNode })
+    return trustedResult
   }
 
   async resume(input: {
@@ -539,10 +541,10 @@ export class RelayFleetClient implements FleetClient {
     return invocation
   }
 
-  #track(name: string, ack: { invocationId: string; dispatchedNodeId?: string | null; placement?: { node?: string } }): void {
+  #track(name: string, placement: { invocationId: string; node: string }): void {
     this.#tracked.set(name, {
-      invocationId: ack.invocationId,
-      node: ack.placement?.node ?? ack.dispatchedNodeId ?? undefined,
+      invocationId: placement.invocationId,
+      node: placement.node,
       spawnedAtMs: this.#now(),
     })
     this.#syncExitWatcher()
@@ -823,7 +825,7 @@ function spawnResultFromInvocation(
   }
 }
 
-function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): void {
+function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): string {
   // The placement acknowledgement is authoritative. Action output may name
   // the node executing the spawn handler even when Relay acknowledged `self`,
   // so accepting the synthesized SpawnResult would let self-placement pass.
@@ -834,6 +836,7 @@ function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: strin
       `refusing to accept the spawn result`,
     )
   }
+  return node
 }
 
 function lifecycleSignalFromInvocation(

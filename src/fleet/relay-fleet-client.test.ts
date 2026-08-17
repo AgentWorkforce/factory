@@ -102,15 +102,18 @@ class FakeMessaging {
     spawn: async (input: RelaySpawnPlacementInput) => {
       this.placements.push(input)
       const invocationId = this.placementAck.invocationId ?? `inv-${++this.nextInvocationId}`
+      const acknowledgedNode = Object.prototype.hasOwnProperty.call(this.placementAck, 'placement')
+        ? this.placementAck.placement?.node
+        : 'node-a'
       return {
         invocationId,
         actionName: 'spawn',
         status: this.placementAck.status ?? (this.invocations.has(invocationId) ? 'pending' : 'completed'),
         dispatchedNodeId: this.placementAck.dispatchedNodeId,
-        node: { name: this.placementAck.placement?.node ?? 'node-a' } as RelayNode,
+        node: { name: acknowledgedNode } as RelayNode,
         placement: {
           capability: input.capability,
-          node: this.placementAck.placement?.node ?? 'node-a',
+          node: acknowledgedNode,
           attempts: 1,
           queued: false,
         },
@@ -210,6 +213,7 @@ describe('RelayFleetClient', () => {
       exit_after_task: true,
     })
     expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({ invocationId: 'inv-1', node: 'mac-mini' })
+    expect(messaging.invokes).not.toContainEqual(expect.objectContaining({ name: 'release' }))
   })
 
   it('passes explicit node targets through to placement', async () => {
@@ -308,11 +312,12 @@ describe('RelayFleetClient', () => {
   })
 
   it.each([
-    ['self', 'self'],
-    ['a missing node', ''],
-  ])('fails closed when placement resolves to %s', async (_label, node) => {
+    ['self', { node: 'self' }],
+    ['an empty node', { node: '' }],
+    ['an absent node', {}],
+  ])('fails closed when placement resolves to %s', async (_label, placement) => {
     const messaging = new FakeMessaging()
-    messaging.placementAck = { placement: { node } }
+    messaging.placementAck = { placement }
     const fleet = createClient(messaging)
 
     await expect(fleet.spawn({
@@ -365,6 +370,32 @@ describe('RelayFleetClient', () => {
       }),
     })
     expect(fleet.trackedAgents().size).toBe(0)
+  })
+
+  it('returns and tracks the normalized acknowledgement node instead of action output', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = {
+      invocationId: 'remote-placement',
+      status: 'pending',
+      placement: { node: ' mac-mini ' },
+    }
+    messaging.invocations.set('remote-placement', [{
+      invocationId: 'remote-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl', node: 'wrong-node' },
+    }])
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+    })).resolves.toMatchObject({ node: 'mac-mini' })
+
+    expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({ node: 'mac-mini' })
+    expect(messaging.invokes).not.toContainEqual(expect.objectContaining({ name: 'release' }))
   })
 
   it('surfaces a self-placement refusal as a non-zero CLI result', async () => {
