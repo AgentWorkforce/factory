@@ -378,26 +378,31 @@ export class RelayfileCloudMountClient implements MountClient {
     const workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
     const runtimeEnv = config.cloudSessionEnv ?? process.env
     const hostedAccessTokenUrl = config.cloudAccessTokenUrl
-      ?? runtimeEnv[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]?.trim()
-    const hostedTokenProvider = !config.cloudAccessTokenProvider && hostedAccessTokenUrl
+      ?? runtimeEnv[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]
+    const hasHostedAccessTokenConfig = config.cloudAccessTokenUrl !== undefined
+      || Object.prototype.hasOwnProperty.call(runtimeEnv, FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV)
+    const hostedTokenProvider = !config.cloudAccessTokenProvider && hasHostedAccessTokenConfig
       ? createHostedCloudAccessTokenProvider({
-          url: hostedAccessTokenUrl,
+          url: hostedAccessTokenUrl?.trim() ?? '',
           fetchImpl: config.cloudAccessTokenFetch ?? fetch,
           timeoutMs: config.cloudAccessTokenTimeoutMs ?? DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS,
         })
       : undefined
     const directTokenProvider = config.cloudAccessTokenProvider ?? hostedTokenProvider
-    const sharedSession = directTokenProvider ? undefined : createSharedCloudSessionResolver(config)
-    const initialSession = sharedSession ? await sharedSession.resolve() : undefined
+    let initialSession: CloudSession | undefined
+    let tokenProvider: () => Promise<string>
+    if (directTokenProvider) {
+      tokenProvider = directTokenProvider
+    } else {
+      const sharedSession = createSharedCloudSessionResolver(config)
+      initialSession = await sharedSession.resolve()
+      tokenProvider = sharedSession.getAccessToken
+    }
     const cloudApiUrl = config.cloudApiUrl
       ?? initialSession?.auth.apiUrl
       ?? (hostedTokenProvider ? (runtimeEnv.CLOUD_API_URL?.trim() || defaultApiUrl()) : undefined)
     if (!cloudApiUrl) {
       throw new Error('Relayfile hosted access requires cloudApiUrl with cloudAccessTokenProvider')
-    }
-    const tokenProvider = directTokenProvider ?? sharedSession?.getAccessToken
-    if (!tokenProvider) {
-      throw new Error('Relayfile hosted access token provider is unavailable')
     }
     const setup = (config.relayfileSetupFactory ?? createDefaultRelayfileSetup)({
       cloudApiUrl,
@@ -1017,6 +1022,11 @@ const createHostedCloudAccessTokenProvider = (options: {
         signal: controller.signal,
       })
       if (!response.ok) {
+        try {
+          await response.body?.cancel()
+        } catch {
+          // Preserve the HTTP failure if undici has already closed the body.
+        }
         throw new Error(`hosted Cloud access-token provider returned HTTP ${String(response.status)}`)
       }
       const payload = await response.json() as unknown

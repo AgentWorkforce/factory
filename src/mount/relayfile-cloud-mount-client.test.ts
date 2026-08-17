@@ -1096,6 +1096,45 @@ describe('RelayfileCloudMountClient', () => {
     }))
   })
 
+  it('fails closed when the hosted credential endpoint variable is defined but blank', async () => {
+    const cloudSessionProvider = vi.fn(async () => {
+      throw new Error('local Cloud login must not be consulted')
+    })
+
+    await expect(RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider,
+      cloudSessionEnv: {
+        [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: '   ',
+        CLOUD_API_URL: 'https://cloud.example',
+      },
+    })).rejects.toThrow(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must be an absolute URL`)
+    expect(cloudSessionProvider).not.toHaveBeenCalled()
+  })
+
+  it('cancels a failed hosted credential response body without reading it', async () => {
+    const response = new Response('sensitive failure details', { status: 503 })
+    const cancel = vi.spyOn(response.body!, 'cancel')
+    const fetchImpl = vi.fn(async () => response)
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => ({
+      joinWorkspace: async () => {
+        await tokenProvider()
+        throw new Error('unreachable')
+      },
+    })
+
+    await expect(RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionEnv: {
+        [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: 'http://factory-auth.do/v1/access',
+        CLOUD_API_URL: 'https://cloud.example',
+      },
+      cloudAccessTokenFetch: fetchImpl as unknown as typeof fetch,
+      relayfileSetupFactory,
+    })).rejects.toThrow('returned HTTP 503')
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
   it('fails hosted startup when the private endpoint does not return a RelayAuth path token', async () => {
     const fetchImpl = vi.fn(async () => Response.json({ accessToken: 'relay_ws_overbroad' }))
     const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => ({
