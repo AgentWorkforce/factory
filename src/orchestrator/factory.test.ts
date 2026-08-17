@@ -28,7 +28,7 @@ import {
 } from '../index'
 import { changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
-import { FakeFleetClient, FakeMountClient } from '../testing'
+import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
@@ -2057,6 +2057,31 @@ describe('github API fallback eligibility candidate gathering', () => {
     ]
     const candidates = githubApiFallbackCandidatesFromDispatchLifecycles(lifecycles)
     expect(candidates).toEqual([{ issue: other, decision: { ...fallbackDecision, issue: other } }])
+  })
+})
+
+describe('waitForDispatchTerminal', () => {
+  it('returns immediately when the dispatch never created a lifecycle row', async () => {
+    // A dependency park, a triage escalation, and a label refusal all return
+    // before the lifecycle claim, so no row exists and none can ever become
+    // terminal. Polling for one would never stop, and a caller deriving an exit
+    // code would never produce one at all.
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const phase = await withDeadline(
+        factory.waitForDispatchTerminal({ key: 'AR-404', uuid: 'uuid-404', path: '/linear/issues/AR-404.json' }),
+        3_000,
+        'waitForDispatchTerminal never returned',
+      )
+
+      expect(phase).toBeUndefined()
+    } finally {
+      await factory.stop()
+    }
   })
 })
 
@@ -6421,6 +6446,12 @@ describe('FactoryLoop', () => {
       await attached.start({ mode: 'dispatch-owner' })
       await expect(attached.dispatch(decision)).resolves.toEqual(result)
       const terminal = attached.waitForDispatchTerminal(decision.issue)
+      // A SECOND waiter on the same row. Only the poller that observes the
+      // terminal row learns the phase first-hand; every other waiter has to be
+      // handed it through the resolution. A waiter that re-read the shared row
+      // after release could find it cleared, or find the next dispatch for the
+      // same issue, and report the wrong run.
+      const secondWaiter = attached.waitForDispatchTerminal(decision.issue)
 
       mount.files.set(issuePath(number), { content: issueFile(number, implementing) })
       firstFleet.emitAgentMessage({
@@ -6478,7 +6509,9 @@ describe('FactoryLoop', () => {
       if (crashAfterPark) expect(firstFleet.resumes).toEqual([])
       else expect(attachedFleet.resumes).toEqual([])
       completingFleet.emitAgentExit(`ar-${number}-review`, 'completed')
-      await terminal
+      // Both waiters report the phase the row settled in, not `undefined` and
+      // not each other's opposite.
+      expect(await Promise.all([terminal, secondWaiter])).toEqual(['complete', 'complete'])
       expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
         .toMatchObject({ phase: 'complete' })
       expect(attachedFleet.spawns).toEqual([])

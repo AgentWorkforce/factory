@@ -86,17 +86,50 @@ export function readMountAuthErrorFromState(stateFilePath: string): MountAuthErr
 }
 
 /**
- * Build the single, actionable remediation message shown when the mount cannot
- * obtain its filesystem scopes. Kept in one place so preflight, the supervisor,
- * and startup all speak with one voice.
+ * The diagnosis and the fix, shared by every mount scope-shortfall message.
+ *
+ * Deliberately states no verdict: it does not say whether the caller is
+ * refusing or proceeding. Callers append that, so the two verdicts cannot
+ * drift apart on the half that is genuinely identical.
  */
-export function mountAuthRemediation(details?: MountAuthErrorDetails): string {
+function mountAuthDiagnosis(details?: MountAuthErrorDetails): string {
   const scope = details?.missingScope ? ` (missing ${details.missingScope})` : ''
   return (
-    `[factory] Agent Relay Cloud session lacks the filesystem scope the mount needs${scope}. ` +
+    `Agent Relay Cloud session lacks the filesystem scope the mount needs${scope}. ` +
     'Re-authenticate with a session that can mint relayfile fs:read/fs:write for this workspace ' +
     '(an organization owner/admin session); a plain `agent-relay cloud login` grants only ' +
-    'follow-user/cli:auth and cannot mint fs scopes. Factory will not spawn agents against a ' +
-    'read-denied mirror.'
+    'follow-user/cli:auth and cannot mint fs scopes.'
+  )
+}
+
+/**
+ * The message for a caller that is REFUSING: it raises this and aborts.
+ *
+ * Use only where the scope shortfall is terminal and the command actually
+ * stops. It promises that no agents will run, so a path that emits it and then
+ * carries on is lying to the operator — see `mountAuthDegradedWarning` for the
+ * proceeding case.
+ */
+export function mountAuthRemediation(details?: MountAuthErrorDetails): string {
+  return (
+    `[factory] ${mountAuthDiagnosis(details)} ` +
+    'Factory will not spawn agents against a read-denied mirror.'
+  )
+}
+
+/**
+ * The message for a caller that is PROCEEDING against a mount which reports a
+ * scope shortfall but is otherwise current and readable.
+ *
+ * Same diagnosis, opposite verdict. This exists because both cases once shared
+ * `mountAuthRemediation`, so the terminal output for "I am refusing" and
+ * "I am continuing" was byte-identical and an operator could not tell which
+ * had happened.
+ */
+export function mountAuthDegradedWarning(details?: MountAuthErrorDetails): string {
+  return (
+    `[factory] warning: ${mountAuthDiagnosis(details)} ` +
+    'The mount is still reconciling and readable, so Factory is continuing against it. ' +
+    'Fix the scope if reads or writeback look wrong.'
   )
 }

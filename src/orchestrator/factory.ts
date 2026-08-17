@@ -44,6 +44,7 @@ import type {
   RegistryHandoffAgent,
   ConversationSessionState,
   StateStore,
+  TerminalDispatchLifecyclePhase,
   WaitingClarification,
 } from '../ports/state'
 import type { Clock, Logger } from '../ports/system'
@@ -556,7 +557,7 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleOwner = `${process.pid}:${randomUUID()}`
   readonly #discoverySweepOwner = `${process.pid}:${randomUUID()}`
   readonly #dispatchLifecycleEpochs = new Map<string, number>()
-  readonly #dispatchTerminalWaiters = new Map<string, Set<() => void>>()
+  readonly #dispatchTerminalWaiters = new Map<string, Set<DispatchTerminalWaiter>>()
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #abandonedDispatchReasons = new Map<string, string>()
@@ -844,10 +845,30 @@ export class FactoryLoop implements Factory {
     return batch
   }
 
-  async waitForDispatchTerminal(issue: IssueRef): Promise<void> {
+  /**
+   * Resolves once this issue's durable dispatch row reaches a terminal phase,
+   * and reports which one. A caller that turns the run into an exit code needs
+   * the phase: a dispatch that hit capacity returns an empty hold result and
+   * schedules a durable retry, so the pre-wait result says nothing about how
+   * the run actually ended.
+   *
+   * `undefined` means no terminal phase was observed — there was no lifecycle
+   * row to wait on, or the wait ended because Factory is stopping.
+   */
+  async waitForDispatchTerminal(issue: IssueRef): Promise<TerminalDispatchLifecyclePhase | undefined> {
     const key = issueKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    if (lifecycle && isTerminalDispatchLifecycle(lifecycle)) return
+    // No durable row means this dispatch never claimed a lifecycle: a
+    // dependency park, a triage escalation, and a label refusal all return
+    // before the claim. Nothing can ever become terminal, so polling would
+    // never stop and the caller would never produce an exit code at all.
+    if (!lifecycle) return undefined
+    if (isTerminalDispatchLifecycle(lifecycle)) return lifecycle.phase
+    // Capture the phase at the moment this waiter observes it. The waiters are
+    // shared across callers of one row and carry no payload, so a re-read after
+    // the fact can race lifecycle cleanup or a reopened dispatch for the same
+    // issue and report a different run — or none.
+    let observedPhase: TerminalDispatchLifecyclePhase | undefined
     await new Promise<void>((resolve) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -856,9 +877,10 @@ export class FactoryLoop implements Factory {
         waiters = new Set()
         this.#dispatchTerminalWaiters.set(key, waiters)
       }
-      const finish = (): void => {
+      const finish: DispatchTerminalWaiter = (phase): void => {
         if (settled) return
         settled = true
+        observedPhase = phase
         if (timer) clearTimeout(timer)
         const current = this.#dispatchTerminalWaiters.get(key)
         current?.delete(finish)
@@ -879,7 +901,7 @@ export class FactoryLoop implements Factory {
         try {
           const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
           if (latest && isTerminalDispatchLifecycle(latest)) {
-            this.#resolveDispatchTerminalWaiters(issue)
+            this.#resolveDispatchTerminalWaiters(issue, latest.phase)
             return
           }
           if (latest?.phase === 'waiting-for-human' && this.#startMode === 'dispatch-owner') {
@@ -907,6 +929,10 @@ export class FactoryLoop implements Factory {
       }
       void poll()
     })
+    // `observedPhase` is whatever resolved THIS waiter. It stays undefined only
+    // when the wait ended without a terminal resolution at all — Factory is
+    // stopping — which is exactly what `undefined` reports.
+    return observedPhase
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {
@@ -3073,7 +3099,7 @@ export class FactoryLoop implements Factory {
       await this.#state.clearBabysitterSession(this.#workspaceId, issueKey(lifecycle.issue))
       this.#dispatchLifecycleEpochs.delete(key)
       this.#abandonedDispatchReasons.delete(key)
-      this.#resolveDispatchTerminalWaiters(lifecycle.issue)
+      this.#resolveDispatchTerminalWaiters(lifecycle.issue, 'abandoned')
       await this.#writeInFlightRegistry().catch((error: unknown) => {
         this.#logger.warn?.('[factory] failed to rewrite registry after orphaned claim release', {
           issue: issue.key,
@@ -4998,9 +5024,13 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  #resolveDispatchTerminalWaiters(issue: IssueRef): void {
+  // Every caller of this knows the phase the row settled in, and each waiter
+  // must be handed it directly. A waiter that instead re-read the shared row
+  // after release could see it cleared, or see the next dispatch for the same
+  // issue, and classify the wrong run.
+  #resolveDispatchTerminalWaiters(issue: IssueRef, phase: TerminalDispatchLifecyclePhase): void {
     const key = issueKey(issue)
-    for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve()
+    for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve(phase)
     this.#dispatchTerminalWaiters.delete(key)
   }
 
@@ -5084,7 +5114,7 @@ export class FactoryLoop implements Factory {
     let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return
     if (isTerminalDispatchLifecycle(lifecycle)) {
-      this.#resolveDispatchTerminalWaiters(lifecycle.issue)
+      this.#resolveDispatchTerminalWaiters(lifecycle.issue, lifecycle.phase)
       return
     }
     if (lifecycle.phase === 'waiting-for-human') return
@@ -5494,7 +5524,7 @@ export class FactoryLoop implements Factory {
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     this.#increment('dispatchLifecycleStaleIssuesAbandoned')
-    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#resolveDispatchTerminalWaiters(record.issue, 'abandoned')
     this.#logger.info?.('[factory] abandoned durable dispatch whose live issue is no longer ready', {
       issue: record.issue.key,
       reason,
@@ -5565,7 +5595,7 @@ export class FactoryLoop implements Factory {
     this.#increment(releaseReason === 'issue-human-review' ? 'humanReview' : 'done')
     this.#emit('issue-done', { issue: record.issue })
     await this.#writeInFlightRegistry()
-    this.#resolveDispatchTerminalWaiters(record.issue)
+    this.#resolveDispatchTerminalWaiters(record.issue, 'complete')
     return true
   }
 
@@ -17876,10 +17906,18 @@ const durableBabysitterTrackedAgent = (
   result: { name: session.agentName },
 })
 
-const isTerminalDispatchLifecycle = (lifecycle: DispatchLifecycle): boolean =>
+// Type guards, not plain predicates: callers that report the terminal phase
+// outward must be able to narrow it, so an intermediate phase cannot leak into
+// a terminal-phase contract.
+/** Resolves one `waitForDispatchTerminal` caller with the phase the row settled in. */
+type DispatchTerminalWaiter = (phase?: TerminalDispatchLifecyclePhase) => void
+
+const isTerminalDispatchLifecycle = (
+  lifecycle: DispatchLifecycle,
+): lifecycle is DispatchLifecycle & { phase: TerminalDispatchLifecyclePhase } =>
   lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
 
-const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): boolean =>
+const isTerminalDispatchPhase = (phase: DispatchLifecyclePhase): phase is TerminalDispatchLifecyclePhase =>
   phase === 'complete' || phase === 'abandoned'
 
 const heldAgentsForRecord = (
@@ -18032,7 +18070,14 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
   return `${reasons.join(' and ')}${decision.rationale ? `: ${decision.rationale}` : ''}`
 }
 
-class LiveDispatchStateChangedError extends Error {
+/**
+ * The dispatch claim race: another writer changed the issue's live state
+ * between this process reading it and writing back, so the dispatch was
+ * abandoned. Exported so callers outside this module — notably the CLI, which
+ * turns it into a distinct exit code — can recognize it by type rather than by
+ * matching on `error.name`, and so tests can construct a genuine instance.
+ */
+export class LiveDispatchStateChangedError extends Error {
   readonly issueKey: string
 
   constructor(issueKey: string) {
@@ -18040,6 +18085,11 @@ class LiveDispatchStateChangedError extends Error {
     this.name = 'LiveDispatchStateChangedError'
     this.issueKey = issueKey
   }
+}
+
+/** Whether a thrown value is a {@link LiveDispatchStateChangedError}. */
+export function isLiveDispatchStateChangedError(error: unknown): error is LiveDispatchStateChangedError {
+  return error instanceof LiveDispatchStateChangedError
 }
 
 const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
