@@ -303,16 +303,17 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
       const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
-      const inProgress = FACTORY_GITHUB_STATUS_LABELS['in-progress']
-      if (labels.has(inProgress.name.toLowerCase())) {
-        editArgs.push('--remove-label', inProgress.name)
+      for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
+        if (labels.has(label.name.toLowerCase())) {
+          editArgs.push('--remove-label', label.name)
+        }
       }
       if (editArgs.length > 5) {
         await this.#run(editArgs)
       }
       const confirmed = await this.#issueLabels(ref)
-      if (confirmed.has(inProgress.name.toLowerCase())) {
-        throw new Error(`GitHub writeback did not confirm removal of ${inProgress.name} on ${ref.repo}#${ref.number}`)
+      if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
+        throw new Error(`GitHub writeback did not confirm removal of Factory status labels on ${ref.repo}#${ref.number}`)
       }
       return
     }

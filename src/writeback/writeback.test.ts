@@ -1087,7 +1087,9 @@ describe('GhCliGithubWriteback', () => {
           }
         }
         if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
-          labels.delete(args[args.indexOf('--remove-label') + 1]!)
+          args.forEach((arg, index) => {
+            if (arg === '--remove-label') labels.delete(args[index + 1]!)
+          })
         }
         return { stdout: '' }
       },
@@ -1097,7 +1099,17 @@ describe('GhCliGithubWriteback', () => {
 
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
-      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--remove-label', 'factory:in-progress'],
+      [
+        'issue',
+        'edit',
+        '48',
+        '--repo',
+        'AgentWorkforce/factory',
+        '--remove-label',
+        'factory:in-progress',
+        '--remove-label',
+        'factory:human-review',
+      ],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
     ])
   })
