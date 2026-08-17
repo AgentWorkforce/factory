@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
   FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
   relayfileWorkspaceTokenProvider,
@@ -1003,6 +1004,116 @@ describe('RelayfileCloudMountClient', () => {
     expect(factoryReadScopeCovers('/slack/users/U123/messages/1781267200_000000/meta.json')).toBe(true)
     expect(capturedTokenProvider).toBeDefined()
     await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_shared')
+  })
+
+  it('uses an injected hosted token provider without consulting local Cloud login or AGENT_RELAY_BIN', async () => {
+    const fake = new FakeRelayFileClient()
+    const handle = {
+      client: vi.fn(() => fake),
+      getToken: vi.fn(async () => 'delegated-relayfile-token'),
+      info: { relayfileUrl: 'https://relayfile.example' },
+    }
+    const setup = { joinWorkspace: vi.fn(async () => handle) }
+    const cloudSessionProvider = vi.fn(async () => {
+      throw new Error('local Cloud login must not be consulted')
+    })
+    const cloudAccessTokenProvider = vi.fn(async () => 'relay_pa_hosted_access')
+    let capturedTokenProvider: (() => Promise<string>) | undefined
+    const relayfileSetupFactory: RelayfileSetupFactory = vi.fn(({ tokenProvider }) => {
+      capturedTokenProvider = tokenProvider
+      return setup
+    })
+
+    const mount = await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudApiUrl: 'https://cloud.example',
+      cloudAccessTokenProvider,
+      cloudSessionProvider,
+      cloudSessionEnv: { AGENT_RELAY_BIN: '/definitely/not/a/node-cli' },
+      relayfileSetupFactory,
+    })
+
+    expect(mount.workspaceId).toBe('rw_test')
+    expect(cloudSessionProvider).not.toHaveBeenCalled()
+    expect(relayfileSetupFactory).toHaveBeenCalledWith({
+      cloudApiUrl: 'https://cloud.example',
+      tokenProvider: cloudAccessTokenProvider,
+    })
+    expect(setup.joinWorkspace).toHaveBeenCalledWith('rw_test', {
+      agentName: 'agent-relay-factory',
+      scopes: [...FACTORY_RELAYFILE_SCOPES],
+    })
+    await expect(capturedTokenProvider?.()).resolves.toBe('relay_pa_hosted_access')
+  })
+
+  it('fails loudly when a hosted token provider has no Cloud API URL', async () => {
+    await expect(RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudAccessTokenProvider: async () => 'relay_pa_hosted_access',
+    })).rejects.toThrow('cloudApiUrl')
+  })
+
+  it('loads the hosted CLI credential through the private endpoint without local login or AGENT_RELAY_BIN', async () => {
+    const fake = new FakeRelayFileClient()
+    const cloudSessionProvider = vi.fn(async () => {
+      throw new Error('local Cloud login must not be consulted')
+    })
+    const fetchImpl = vi.fn(async () => Response.json({ accessToken: 'relay_pa_rotated_access' }))
+    let capturedTokenProvider: (() => Promise<string>) | undefined
+    const relayfileSetupFactory: RelayfileSetupFactory = vi.fn(({ tokenProvider }) => {
+      capturedTokenProvider = tokenProvider
+      return {
+        joinWorkspace: vi.fn(async () => ({
+          client: () => fake,
+          getToken: async () => 'delegated-relayfile-token',
+          info: { relayfileUrl: 'https://relayfile.example' },
+        })),
+      }
+    })
+
+    await RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionProvider,
+      cloudSessionEnv: {
+        [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: 'http://factory-auth.do/v1/access',
+        CLOUD_API_URL: 'https://cloud.example',
+        AGENT_RELAY_BIN: '/definitely/not/a/node-cli',
+      },
+      cloudAccessTokenFetch: fetchImpl as unknown as typeof fetch,
+      relayfileSetupFactory,
+    })
+
+    expect(cloudSessionProvider).not.toHaveBeenCalled()
+    expect(relayfileSetupFactory).toHaveBeenCalledWith({
+      cloudApiUrl: 'https://cloud.example',
+      tokenProvider: expect.any(Function),
+    })
+    await expect(capturedTokenProvider?.()).resolves.toBe('relay_pa_rotated_access')
+    expect(fetchImpl).toHaveBeenCalledWith(new URL('http://factory-auth.do/v1/access'), expect.objectContaining({
+      method: 'GET',
+      redirect: 'error',
+      headers: expect.objectContaining({ 'cache-control': 'no-store' }),
+    }))
+  })
+
+  it('fails hosted startup when the private endpoint does not return a RelayAuth path token', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ accessToken: 'relay_ws_overbroad' }))
+    const relayfileSetupFactory: RelayfileSetupFactory = ({ tokenProvider }) => ({
+      joinWorkspace: async () => {
+        await tokenProvider()
+        throw new Error('unreachable')
+      },
+    })
+
+    await expect(RelayfileCloudMountClient.fromConfig({
+      workspaceId: 'rw_test',
+      cloudSessionEnv: {
+        [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: 'http://factory-auth.do/v1/access',
+        CLOUD_API_URL: 'https://cloud.example',
+      },
+      cloudAccessTokenFetch: fetchImpl as unknown as typeof fetch,
+      relayfileSetupFactory,
+    })).rejects.toThrow('invalid token class')
   })
 
   it('uses the shared cloud session provider for refreshed relayfile workspace token mints', async () => {

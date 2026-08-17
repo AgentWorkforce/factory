@@ -1,5 +1,6 @@
 import {
   CloudAuthError,
+  defaultApiUrl,
   ensureCloudSession,
   resolveActiveWorkspace,
   type ActiveWorkspaceDescriptor,
@@ -60,6 +61,8 @@ const DEFAULT_WORKSPACE_ID = 'rw_7ccfea89'
 const DEFAULT_AGENT_NAME = 'agent-relay-factory'
 const DEFAULT_LOCAL_MOUNT_HEALTH_INTERVAL_MS = 30_000
 const DEFAULT_LOCAL_MOUNT_MAX_CONCURRENCY = 4
+const DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS = 10_000
+export const FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV = 'FACTORY_CLOUD_ACCESS_TOKEN_URL'
 export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:read:/linear/issues/**',
   'relayfile:fs:read:/linear/states/**',
@@ -190,6 +193,18 @@ export interface RelayfileCloudMountClientConfig {
   backend?: 'relayfile-cloud'
   workspaceId?: string
   cloudApiUrl?: string
+  /**
+   * Non-interactive host credential used only for the Cloud workspace join.
+   * Hosted runtimes inject a rotating, fixed RelayAuth path-token provider;
+   * when present, Factory never reads the local Cloud login or shells out.
+   */
+  cloudAccessTokenProvider?: () => Promise<string>
+  /** Private host endpoint that returns the current fixed RelayAuth access token. */
+  cloudAccessTokenUrl?: string
+  /** Internal fetch override for hosted credential-provider tests. */
+  cloudAccessTokenFetch?: typeof fetch
+  /** Internal hosted credential request timeout override. */
+  cloudAccessTokenTimeoutMs?: number
   cloudSessionProvider?: CloudSessionProvider
   cloudSessionRefreshTimeoutMs?: number
   cloudSessionEnv?: NodeJS.ProcessEnv
@@ -361,11 +376,32 @@ export class RelayfileCloudMountClient implements MountClient {
     if (config.client) return new RelayfileCloudMountClient(config)
 
     const workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
-    const sharedSession = createSharedCloudSessionResolver(config)
-    const initialSession = await sharedSession.resolve()
+    const runtimeEnv = config.cloudSessionEnv ?? process.env
+    const hostedAccessTokenUrl = config.cloudAccessTokenUrl
+      ?? runtimeEnv[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]?.trim()
+    const hostedTokenProvider = !config.cloudAccessTokenProvider && hostedAccessTokenUrl
+      ? createHostedCloudAccessTokenProvider({
+          url: hostedAccessTokenUrl,
+          fetchImpl: config.cloudAccessTokenFetch ?? fetch,
+          timeoutMs: config.cloudAccessTokenTimeoutMs ?? DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS,
+        })
+      : undefined
+    const directTokenProvider = config.cloudAccessTokenProvider ?? hostedTokenProvider
+    const sharedSession = directTokenProvider ? undefined : createSharedCloudSessionResolver(config)
+    const initialSession = sharedSession ? await sharedSession.resolve() : undefined
+    const cloudApiUrl = config.cloudApiUrl
+      ?? initialSession?.auth.apiUrl
+      ?? (hostedTokenProvider ? (runtimeEnv.CLOUD_API_URL?.trim() || defaultApiUrl()) : undefined)
+    if (!cloudApiUrl) {
+      throw new Error('Relayfile hosted access requires cloudApiUrl with cloudAccessTokenProvider')
+    }
+    const tokenProvider = directTokenProvider ?? sharedSession?.getAccessToken
+    if (!tokenProvider) {
+      throw new Error('Relayfile hosted access token provider is unavailable')
+    }
     const setup = (config.relayfileSetupFactory ?? createDefaultRelayfileSetup)({
-      cloudApiUrl: initialSession.auth.apiUrl,
-      tokenProvider: sharedSession.getAccessToken,
+      cloudApiUrl,
+      tokenProvider,
     })
     const handle = await setup.joinWorkspace(workspaceId, {
       agentName: config.agentName ?? DEFAULT_AGENT_NAME,
@@ -951,6 +987,57 @@ const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, token
     cloudApiUrl,
     accessToken: tokenProvider,
   }) as unknown as RelayfileSetupLike
+
+const createHostedCloudAccessTokenProvider = (options: {
+  url: string
+  fetchImpl: typeof fetch
+  timeoutMs: number
+}): (() => Promise<string>) => {
+  let url: URL
+  try {
+    url = new URL(options.url)
+  } catch {
+    throw new Error(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must be an absolute URL`)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must use http or https`)
+  }
+  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+    throw new Error('hosted Cloud access-token timeout must be positive')
+  }
+
+  return async (): Promise<string> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+    try {
+      const response = await options.fetchImpl(url, {
+        method: 'GET',
+        headers: { accept: 'application/json', 'cache-control': 'no-store' },
+        redirect: 'error',
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        throw new Error(`hosted Cloud access-token provider returned HTTP ${String(response.status)}`)
+      }
+      const payload = await response.json() as unknown
+      const accessToken = payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+        && typeof (payload as { accessToken?: unknown }).accessToken === 'string'
+        ? (payload as { accessToken: string }).accessToken.trim()
+        : ''
+      if (!accessToken.startsWith('relay_pa_')) {
+        throw new Error('hosted Cloud access-token provider returned an invalid token class')
+      }
+      return accessToken
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`hosted Cloud access-token provider timed out after ${String(options.timeoutMs)}ms`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
 
 const createSharedCloudSessionResolver = (config: RelayfileCloudMountClientConfig): {
   resolve: () => Promise<CloudSession>
