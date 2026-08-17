@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 
+import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import type {
+  GithubConnectionIssueUpdateInput,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
@@ -143,9 +144,8 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     if (input.author !== 'app') {
       throw new Error(`Relayfile GitHub issue comments require author "app": ${input.author}`)
     }
-    const digest = createHash('sha256').update(body).digest('hex').slice(0, 24)
     await this.#writeAndConfirm(
-      `${repoRoot}/issues/${input.number}/comments/factory-${digest}.json`,
+      `${repoRoot}/issues/${input.number}/comments/${factoryGithubIssueCommentDraftName(body)}`,
       // `author` selects this connection method, but is not a writable field
       // in Relayfile's GitHub issue-comment schema. The connected App
       // credential is applied server-side.
@@ -153,13 +153,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     )
   }
 
-  async updateIssue(input: {
-    repo: string
-    number: number
-    labels?: string[]
-    state?: 'open' | 'closed'
-    author: 'app'
-  }): Promise<void> {
+  async updateIssue(input: GithubConnectionIssueUpdateInput): Promise<void> {
     const repoRoot = githubRepoRoot(input.repo)
     assertPositiveGithubNumber(input.number, 'issue')
     if (input.author !== 'app') {

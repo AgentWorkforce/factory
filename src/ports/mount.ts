@@ -147,14 +147,20 @@ export interface GithubConnectionWrite {
     author: 'app'
   }): Promise<void>
   /** App-authored partial issue update through the workspace GitHub connection. */
-  updateIssue?(input: {
-    repo: string
-    number: number
-    labels?: string[]
-    state?: 'open' | 'closed'
-    author: 'app'
-  }): Promise<void>
+  updateIssue?(input: GithubConnectionIssueUpdateInput): Promise<void>
 }
+
+type GithubConnectionIssueUpdateTarget = {
+  repo: string
+  number: number
+  author: 'app'
+}
+
+/** At least one mutable issue field must be present. */
+export type GithubConnectionIssueUpdateInput = GithubConnectionIssueUpdateTarget & (
+  | { labels: string[]; state?: 'open' | 'closed' }
+  | { labels?: never; state: 'open' | 'closed' }
+)
 
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'

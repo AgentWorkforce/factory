@@ -3280,26 +3280,6 @@ describe('fleet CLI runtime', () => {
             { ref: 'refs/heads/factory/77', sha: 'abc123' },
             { guarded: true },
           )).toBe(false)
-          expect(await opts?.isAllowedDraft?.(
-            `/github/repos/${input.repo}/issues/221.json`,
-            { labels: ['factory', 'factory:in-progress'] },
-            { guarded: true },
-          )).toBe(true)
-          expect(await opts?.isAllowedDraft?.(
-            `/github/repos/${input.repo}/issues/221/comments/factory-abcdef012345abcdef012345.json`,
-            { body: 'Factory dispatch' },
-            { guarded: true },
-          )).toBe(true)
-          expect(await opts?.isAllowedDraft?.(
-            `/github/repos/${input.repo}/issues/221/comments/operator.json`,
-            { body: 'unscoped draft' },
-            { guarded: true },
-          )).toBe(false)
-          expect(await opts?.isAllowedDraft?.(
-            `/github/repos/${input.repo}/issues/221/comments/factory-abcdef012345.json`,
-            { body: 'wrong digest length' },
-            { guarded: true },
-          )).toBe(false)
           closes.push(input)
         },
       }
@@ -3337,6 +3317,69 @@ describe('fleet CLI runtime', () => {
     expect(integrations.getStatus).toHaveBeenCalledWith('github')
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 42 }])
     expect(JSON.parse(output.text())).toEqual({ repo: 'AgentWorkforce/pear', prNumber: 42, state: 'CLOSED' })
+  })
+
+  it('scope-checks GitHub lifecycle drafts in the ordinary CLI cloud mount', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-github-draft-scope-'))
+    try {
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const outOfScopeIssue = githubIssueFile('pear', 222)
+      outOfScopeIssue.payload.labels = [{ name: 'bug' }]
+      const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
+      const mount = mountWithIntegrationConnections({
+        '/github/repos/AgentWorkforce/pear/issues/by-id/221.json': githubIssueFile('pear', 221),
+        '/github/repos/AgentWorkforce/pear/issues/by-id/222.json': outOfScopeIssue,
+      }, integrations)
+      let predicate: (
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean },
+      ) => boolean | Promise<boolean> = () => false
+      const cloudMountFromConfig = vi.fn(async (opts) => {
+        predicate = opts?.isAllowedDraft ?? predicate
+        return mount
+      })
+      const factory = {
+        status: vi.fn(() => ({ inFlight: [], queued: [], counters: {} })),
+      } as unknown as Factory
+
+      const code = await runFleetCli(['status', '--config', configPath], {
+        cloudMountFromConfig,
+        fleet: new FakeFleetClient(),
+        createFactory: () => factory,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-abcdef012345abcdef012345.json',
+        { body: 'Factory dispatch' },
+        { guarded: true },
+      )).resolves.toBe(true)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221/comments/operator.json',
+        { body: 'unscoped draft' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/222.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/OtherOrg/other/issues/221.json',
+        { state: 'closed' },
+        { guarded: true },
+      )).resolves.toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('runs factory loop through the bounded runner and emits a heartbeat-backed status', async () => {

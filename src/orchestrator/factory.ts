@@ -6,6 +6,7 @@ import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { isFactoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
   AgentMessage,
@@ -17393,15 +17394,75 @@ const isAllowedFactoryDraft = async (
     return true
   }
 
-  if (isFactoryGithubWritebackPath(path)) {
-    return true
-  }
+  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config)) return true
 
   return false
 }
 
-const isFactoryGithubWritebackPath = (path: string): boolean =>
+const isFactoryGithubAuthoredArtifactPath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
+
+export const isAllowedFactoryGithubArtifactDraft = (
+  path: string,
+  opts: { guarded?: boolean } | undefined,
+): boolean => opts?.guarded === true && isFactoryGithubAuthoredArtifactPath(path)
+
+const factoryGithubIssueWriteTarget = (
+  path: string,
+): { owner: string; repo: string; number: number } | undefined => {
+  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/([1-9]\d*)(?:\.json|\/comments\/([^/]+))$/iu.exec(path)
+  if (!match?.[1] || !match[2] || !match[3]) return undefined
+  if (match[4] && !isFactoryGithubIssueCommentDraftName(match[4])) return undefined
+  try {
+    return {
+      owner: decodeURIComponent(match[1]),
+      repo: decodeURIComponent(match[2]),
+      number: Number(match[3]),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Last-resort mount guard for Factory-authored GitHub drafts. PR/ref paths are
+ * intrinsically Factory-owned. Issue mutations additionally require a current
+ * in-scope issue projection in one of Relayfile's supported repository layouts.
+ */
+export const isAllowedFactoryGithubDraft = async (
+  path: string,
+  _content: unknown,
+  opts: { guarded?: boolean } | undefined,
+  mount: MountClient,
+  config: FactoryConfig,
+): Promise<boolean> => {
+  if (!opts?.guarded) return false
+  if (isAllowedFactoryGithubArtifactDraft(path, opts)) return true
+
+  const target = factoryGithubIssueWriteTarget(path)
+  if (!target) return false
+  const repoPath = `/github/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`
+  if (!isConfiguredGithubRepoPath(`${repoPath}/`, config)) return false
+
+  const compactRepo = `${encodeURIComponent(target.owner)}__${encodeURIComponent(target.repo)}`
+  const candidates = [
+    `${repoPath}/issues/by-id/${target.number}.json`,
+    `/github/repos/${compactRepo}/issues/by-id/${target.number}.json`,
+    `${repoPath}/issues/${target.number}/meta.json`,
+    `/github/repos/${compactRepo}/issues/${target.number}/meta.json`,
+    `${repoPath}/issues/${target.number}.json`,
+    `/github/repos/${compactRepo}/issues/${target.number}.json`,
+  ]
+  for (const candidate of candidates) {
+    try {
+      const issue = parseGithubFactoryIssue(candidate, (await mount.readFile(candidate)).content)
+      return isInFactoryScope(issue, config.safety)
+    } catch {
+      // Try the next canonical/alias shape. Any total miss fails closed.
+    }
+  }
+  return false
+}
 
 const isIssuePathInFactoryScope = async (
   mount: MountClient,

@@ -138,6 +138,8 @@ export {
   findDependencyCycle,
   issueKey,
   isDispatchableIssue,
+  isAllowedFactoryGithubDraft,
+  isAllowedFactoryGithubArtifactDraft,
   isLiveDispatchStateChangedError,
   isRealLinearIssue,
   githubIssuePathParts,

@@ -12268,6 +12268,47 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toEqual([])
   })
 
+  it('installs the scoped GitHub issue draft predicate for direct library mounts', async () => {
+    type DraftPredicate = (
+      path: string,
+      content: unknown,
+      opts?: { guarded?: boolean },
+    ) => boolean | Promise<boolean>
+    class PredicateMount extends FakeMountClient {
+      predicate?: DraftPredicate
+
+      override setDefaultAllowedDraftPredicate(predicate: DraftPredicate): void {
+        this.predicate ??= predicate
+      }
+    }
+    const number = 221
+    const issuePath = githubIssuePath('AgentWorkforce', 'pear', number)
+    const mount = new PredicateMount({
+      [issuePath]: githubIssueFile(number, { labels: ['factory'] }),
+    }, {
+      publishPullRequest: async () => { throw new Error('unexpected publish') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue: async () => undefined,
+    })
+
+    createFactory(config({
+      issueSource: 'github',
+      github: { identity: 'app' },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })
+
+    expect(mount.predicate).toBeTypeOf('function')
+    await expect(mount.predicate!(
+      `/github/repos/AgentWorkforce/pear/issues/${number}.json`,
+      { state: 'closed' },
+      { guarded: true },
+    )).resolves.toBe(true)
+  })
+
   it.each([
     ['without a reason', undefined],
     ['with an abnormal reason', 'worker_exited'],
