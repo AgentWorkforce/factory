@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
+import { runFleetCli } from '../cli/fleet'
 
 import type {
   RelayActionInvocation,
@@ -304,6 +305,50 @@ describe('RelayFleetClient', () => {
       node: 'mac-mini',
       input: { operation: 'remove', preview: reference },
     })
+  })
+
+  it.each([
+    ['self', 'self'],
+    ['a missing node', ''],
+  ])('fails closed when placement resolves to %s', async (_label, node) => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { placement: { node } }
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+      task: 'do work',
+    })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+    expect(fleet.trackedAgents().size).toBe(0)
+  })
+
+  it('surfaces a self-placement refusal as a non-zero CLI result', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { placement: { node: 'self' } }
+    const fleet = createClient(messaging)
+    const stderr: string[] = []
+
+    const code = await runFleetCli([
+      'fleet',
+      'spawn',
+      'spawn:codex',
+      '--name',
+      'ar-1-impl',
+    ], {
+      fleet,
+      stdout: { write: () => true } as never,
+      stderr: { write: (chunk: string | Uint8Array) => {
+        stderr.push(String(chunk))
+        return true
+      } } as never,
+    })
+
+    expect(code).toBe(1)
+    expect(stderr.join('')).toContain('Relay placement did not prove a named remote node')
   })
 
   it('sweeps previews on every live preview-capable node', async () => {

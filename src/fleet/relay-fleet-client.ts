@@ -187,6 +187,7 @@ export class RelayFleetClient implements FleetClient {
     })
     const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
+    assertNamedRemotePlacement(result)
     this.#track(result.name, ack)
     return result
   }
@@ -804,6 +805,16 @@ function spawnResultFromInvocation(
     ...(pids ? { pids } : {}),
     ...(node ? { node } : {}),
     locality: 'remote',
+  }
+}
+
+function assertNamedRemotePlacement(result: SpawnResult): void {
+  const node = result.node?.trim()
+  if (!node || node === 'self') {
+    throw new Error(
+      `Relay placement did not prove a named remote node for ${result.name}; ` +
+      `refusing to accept the spawn result`,
+    )
   }
 }
 
