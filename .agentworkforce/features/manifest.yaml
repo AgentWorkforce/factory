@@ -868,7 +868,7 @@ categories:
         name: Completed-Session Replay Pointer
         api: trajectoryPointerFromBody()
         description: Stamp Factory-opened PRs with the ruled three-key trajectory marker from Relay's existing opaque session_ref while leaving replay availability and the workspace retention boundary to the authenticated live resolver
-        location: src/trajectory.ts, src/orchestrator/factory.ts
+        location: src/trajectory.ts, src/orchestrator/factory.ts, src/index.ts
         verify_tier: 6
 
       - id: pr-babysitter-opt-in

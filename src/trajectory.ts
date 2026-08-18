@@ -27,6 +27,7 @@ export function canonicalTrajectorySessionRef(value: string | undefined): string
   return normalized
 }
 
+/** Render the ruled three-key HTML marker without claiming replay availability. */
 export function renderTrajectoryPointer(pointer: TrajectoryPointer): string {
   if (!POINTER_TOKEN.test(pointer.workUnitId)) {
     throw new Error(`Trajectory work unit id must be a comment-safe token: ${pointer.workUnitId}`)
@@ -52,6 +53,7 @@ export function trajectoryPointerFromBody(body: string): Required<TrajectoryPoin
   return pointers.size === 1 ? [...pointers.values()][0] : undefined
 }
 
+/** Return only the session UUID from the one unambiguous resolver input pointer. */
 export function trajectorySessionRefFromBody(body: string): string | undefined {
   return trajectoryPointerFromBody(body)?.sessionRef
 }
