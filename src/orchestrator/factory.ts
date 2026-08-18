@@ -7851,7 +7851,6 @@ export class FactoryLoop implements Factory {
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const trajectorySessionRef = canonicalTrajectorySessionRef(implementer.sessionRef)
-      ?? canonicalTrajectorySessionRef(process.env.RELAY_ATTEST_SESSION_ID)
     const expectedHeadRef = implementer.spec.branch
     if (!expectedHeadRef) {
       throw new Error(`Refusing to publish ${record.issue.key}: implementer has no Factory-derived branch`)
@@ -7928,7 +7927,7 @@ export class FactoryLoop implements Factory {
       baseRef,
       title: `${issue.key}: ${issue.title}`,
       body: githubPullRequestBody(issue, implementer.spec.preview, trajectorySessionRef),
-      ...(trajectorySessionRef ? { sessionRef: trajectorySessionRef } : {}),
+      ...(implementer.sessionRef ? { sessionRef: implementer.sessionRef } : {}),
     })
     const published = result.author
       ? result

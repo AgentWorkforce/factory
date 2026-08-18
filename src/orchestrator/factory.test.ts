@@ -13213,6 +13213,8 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
     }, githubWrite)
     const fleet = new FakeFleetClient()
+    const attestationSessionRef = 'session-impl-92'
+    fleet.setSessionRef('ar-92-impl-pear', attestationSessionRef)
     const factory = createFactory(config(), {
       mount,
       fleet,
@@ -13225,7 +13227,7 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-92-impl-pear', 'crash')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
-    expect(publishInputs[0]).not.toHaveProperty('sessionRef')
+    expect(publishInputs[0]?.sessionRef).toBe(attestationSessionRef)
     expect(publishInputs[0]?.body).toContain(
       '<!-- trajectory: work_unit_id=factory:uuid-92 work_unit_surface=factory session_ref=missing -->',
     )
