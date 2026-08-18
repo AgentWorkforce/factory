@@ -87,6 +87,11 @@ import type { FactoryIntegrationProvider } from '../ports'
 import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
+import {
+  createHostedCloudAccessTokenProvider,
+  FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
+  resolveHostedCloudApiUrl,
+} from '../mount/relayfile-cloud-mount-client'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import {
   isMeaningfullyBehind,
@@ -149,6 +154,10 @@ export interface FleetCliDeps {
   localClonePathOptions?: LocalClonePathOptions
   reporter?: FactoryEventReporter
   cloudSessionProvider?: (options?: Parameters<typeof ensureCloudSession>[0]) => Promise<CloudSession>
+  /** Hermetic private hosted-token endpoint transport for CLI integration tests. */
+  cloudAccessTokenFetch?: typeof fetch
+  /** Hermetic Cloud telemetry transport for CLI integration tests. */
+  cloudReporterFetch?: typeof fetch
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
@@ -1582,10 +1591,20 @@ async function buildFactoryCloudReporter(input: {
   deps: FleetCliDeps
 }): Promise<FactoryEventReporter | undefined> {
   if (!input.config.reporting.enabled) return undefined
-  if (hasInjectedFactoryRuntime(input.deps) && !input.deps.cloudSessionProvider) return undefined
+  const runtimeEnv = input.deps.env ?? process.env
+  const hasHostedAccessTokenConfig = Object.prototype.hasOwnProperty.call(
+    runtimeEnv,
+    FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
+  )
+  if (
+    hasInjectedFactoryRuntime(input.deps)
+    && !input.deps.cloudSessionProvider
+    && !hasHostedAccessTokenConfig
+  ) return undefined
 
   try {
-    const activeWorkspace = await (input.deps.resolveWorkspace ?? resolveFactoryWorkspace)()
+    const activeWorkspace = await (input.deps.resolveWorkspace
+      ?? (() => resolveFactoryWorkspace(undefined, runtimeEnv)))()
     const activeWorkspaceIds = new Set([
       activeWorkspace.workspaceId,
       activeWorkspace.cloudWorkspaceId,
@@ -1594,15 +1613,28 @@ async function buildFactoryCloudReporter(input: {
       input.logger.warn?.('[factory] Cloud progress reporting skipped because the active account workspace differs from Factory config')
       return undefined
     }
-    const session = await (input.deps.cloudSessionProvider ?? ensureCloudSession)({ interactive: false })
     const outboxPath = input.config.reporting.outboxPath
       ?? join(dirname(input.config.loop.registryPath), 'factory-cloud-events.json')
     const instanceId = await loadOrCreateFactoryInstanceId(`${outboxPath}.instance-id`)
     const instanceName = resolveFactoryInstanceName(input.config)
-    const cloudFetch: typeof fetch = async (_request, init) =>
-      session.client.fetch('/api/v1/factory/events', init)
+    let apiUrl: string
+    let getAccessToken: () => Promise<string>
+    let cloudFetch: typeof fetch | undefined
+    if (hasHostedAccessTokenConfig) {
+      apiUrl = resolveHostedCloudApiUrl(runtimeEnv)
+      getAccessToken = createHostedCloudAccessTokenProvider({
+        url: runtimeEnv[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]?.trim() ?? '',
+        fetchImpl: input.deps.cloudAccessTokenFetch ?? fetch,
+      })
+      cloudFetch = input.deps.cloudReporterFetch
+    } else {
+      const session = await (input.deps.cloudSessionProvider ?? ensureCloudSession)({ interactive: false })
+      apiUrl = session.auth.apiUrl
+      getAccessToken = async () => session.client.snapshot().accessToken
+      cloudFetch = async (_request, init) => session.client.fetch('/api/v1/factory/events', init)
+    }
     return new FactoryCloudReporter({
-      apiUrl: session.auth.apiUrl,
+      apiUrl,
       instance: {
         id: instanceId,
         bootId: randomUUID(),
@@ -1615,8 +1647,8 @@ async function buildFactoryCloudReporter(input: {
         },
       },
       outbox: new FileFactoryCloudEventOutbox({ path: outboxPath }),
-      getAccessToken: async () => session.client.snapshot().accessToken,
-      fetch: cloudFetch,
+      getAccessToken,
+      ...(cloudFetch ? { fetch: cloudFetch } : {}),
       logger: input.logger,
       batchSize: input.config.reporting.batchSize,
       requestTimeoutMs: input.config.reporting.requestTimeoutMs,

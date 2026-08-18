@@ -15,7 +15,12 @@ import type {
   FactoryPorts,
   createFactory,
 } from '../index'
-import { FactoryConfigSchema, LiveDispatchStateChangedError, stateResolutionFromIds } from '../index'
+import {
+  FactoryConfigSchema,
+  FileFactoryCloudEventOutbox,
+  LiveDispatchStateChangedError,
+  stateResolutionFromIds,
+} from '../index'
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
@@ -1520,6 +1525,157 @@ describe('fleet CLI runtime', () => {
         }),
       })
       expect(close).toHaveBeenCalledWith({ deadlineMs: 2_000 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the hosted rotating path token for Cloud reporting without local login', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-hosted-reporting-'))
+    try {
+      const outboxPath = join(root, 'factory-cloud-events.json')
+      const configPath = await writeConfig(root, {
+        workspaceId: 'rw_7ccfea89',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+        },
+        reporting: {
+          enabled: true,
+          instanceName: 'factory-khaliq-cloud',
+          outboxPath,
+          batchSize: 100,
+          requestTimeoutMs: 1_000,
+        },
+      })
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(async () => {}),
+      } as unknown as Factory
+      let capturedReporter: FactoryEventReporter | undefined
+      const createFactorySpy = vi.fn((_config, ports: FactoryPorts) => {
+        capturedReporter = ports.reporter
+        return factory
+      }) as typeof createFactory
+      const cloudSessionProvider = vi.fn(async () => {
+        throw new Error('local Cloud login must not be consulted')
+      })
+      const cloudAccessTokenFetch = vi.fn(async () =>
+        Response.json({ accessToken: 'relay_pa_test' }))
+      const batches: Array<Record<string, unknown>> = []
+      const cloudReporterFetch = vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        expect(String(request)).toBe('https://cloud.example/api/v1/factory/events')
+        expect(new Headers(init?.headers).get('authorization')).toBe(
+          'Bearer relay_pa_test',
+        )
+        const batch = JSON.parse(String(init?.body)) as Record<string, unknown>
+        batches.push(batch)
+        const accepted = Array.isArray(batch.events) ? batch.events.length : 0
+        return Response.json({ accepted, duplicates: 0 }, { status: 201 })
+      })
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        env: {
+          FACTORY_CLOUD_ACCESS_TOKEN_URL: 'http://factory-auth.do/factory-primary/v1/access',
+          CLOUD_API_URL: 'https://cloud.example',
+        },
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: createFactorySpy,
+        cloudSessionProvider,
+        cloudAccessTokenFetch: cloudAccessTokenFetch as unknown as typeof fetch,
+        cloudReporterFetch: cloudReporterFetch as unknown as typeof fetch,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(capturedReporter).toBeDefined()
+      expect(factory.runOnce).toHaveBeenCalledOnce()
+      expect(cloudSessionProvider).not.toHaveBeenCalled()
+      expect(cloudAccessTokenFetch).toHaveBeenCalledWith(
+        new URL('http://factory-auth.do/factory-primary/v1/access'),
+        expect.objectContaining({ method: 'GET', redirect: 'error' }),
+      )
+      expect(cloudReporterFetch).toHaveBeenCalled()
+      const events = batches.flatMap((batch) => (
+        Array.isArray(batch.events) ? batch.events as Array<{ type?: string }> : []
+      ))
+      expect(events.map((event) => event.type)).toEqual(expect.arrayContaining([
+        'instance.started',
+        'instance.stopping',
+        'instance.stopped',
+      ]))
+      expect(batches[0]?.instance).toMatchObject({
+        metadata: expect.objectContaining({ name: 'factory-khaliq-cloud' }),
+      })
+      await expect(new FileFactoryCloudEventOutbox({ path: outboxPath }).stats())
+        .resolves.toMatchObject({ pending: 0 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps dispatch successful and the event pending when hosted telemetry returns 503', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-hosted-reporting-fail-open-'))
+    try {
+      const outboxPath = join(root, 'factory-cloud-events.json')
+      const configPath = await writeConfig(root, {
+        workspaceId: 'rw_7ccfea89',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+        },
+        reporting: {
+          enabled: true,
+          instanceName: 'factory-khaliq-cloud',
+          outboxPath,
+          batchSize: 100,
+          requestTimeoutMs: 100,
+        },
+      })
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(async () => {}),
+      } as unknown as Factory
+      const cloudAccessTokenFetch = vi.fn(async () =>
+        Response.json({ accessToken: 'relay_pa_test' }))
+      const cloudReporterFetch = vi.fn(async () =>
+        new Response('unavailable', { status: 503 }))
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        env: {
+          FACTORY_CLOUD_ACCESS_TOKEN_URL: 'http://factory-auth.do/factory-primary/v1/access',
+          CLOUD_API_URL: 'https://cloud.example',
+        },
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        cloudAccessTokenFetch: cloudAccessTokenFetch as unknown as typeof fetch,
+        cloudReporterFetch: cloudReporterFetch as unknown as typeof fetch,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(factory.runOnce).toHaveBeenCalledOnce()
+      expect(cloudReporterFetch).toHaveBeenCalled()
+      const stats = await new FileFactoryCloudEventOutbox({ path: outboxPath }).stats()
+      expect(stats.pending).toBeGreaterThan(0)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

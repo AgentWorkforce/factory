@@ -83,6 +83,10 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:write:/factory/observability/**',
 ] as const
 
+export const resolveHostedCloudApiUrl = (
+  env: NodeJS.ProcessEnv = process.env,
+): string => env.CLOUD_API_URL?.trim() || defaultApiUrl()
+
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
 
 export type ActiveWorkspaceResolver = (
@@ -412,7 +416,7 @@ export class RelayfileCloudMountClient implements MountClient {
     }
     const cloudApiUrl = config.cloudApiUrl
       ?? initialSession?.auth.apiUrl
-      ?? (hostedTokenProvider ? (runtimeEnv.CLOUD_API_URL?.trim() || defaultApiUrl()) : undefined)
+      ?? (hostedTokenProvider ? resolveHostedCloudApiUrl(runtimeEnv) : undefined)
     if (!cloudApiUrl) {
       throw new Error('Relayfile hosted access requires cloudApiUrl with cloudAccessTokenProvider')
     }
@@ -1015,11 +1019,12 @@ const createValidatedHostedAccessTokenProvider = (
   return accessToken
 }
 
-const createHostedCloudAccessTokenProvider = (options: {
+export const createHostedCloudAccessTokenProvider = (options: {
   url: string
   fetchImpl: typeof fetch
-  timeoutMs: number
+  timeoutMs?: number
 }): (() => Promise<string>) => {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS
   let url: URL
   try {
     url = new URL(options.url)
@@ -1029,13 +1034,13 @@ const createHostedCloudAccessTokenProvider = (options: {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must use http or https`)
   }
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error('hosted Cloud access-token timeout must be positive')
   }
 
   return async (): Promise<string> => {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const response = await options.fetchImpl(url, {
         method: 'GET',
@@ -1062,7 +1067,7 @@ const createHostedCloudAccessTokenProvider = (options: {
       return accessToken
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`hosted Cloud access-token provider timed out after ${String(options.timeoutMs)}ms`)
+        throw new Error(`hosted Cloud access-token provider timed out after ${String(timeoutMs)}ms`)
       }
       throw error
     } finally {
