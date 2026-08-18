@@ -129,6 +129,12 @@ import {
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
+  canonicalTrajectorySessionRef,
+  renderTrajectoryPointer,
+  stripTrajectoryPointers,
+  type TrajectoryWorkUnitSurface,
+} from '../trajectory'
+import {
   FleetControlPlaneCircuit,
   FleetControlPlaneCircuitOpenError,
   guardFleetControlPlane,
@@ -7844,6 +7850,8 @@ export class FactoryLoop implements Factory {
     opts: { reconcileExisting?: boolean } = {},
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
+    const trajectorySessionRef = canonicalTrajectorySessionRef(implementer.sessionRef)
+      ?? canonicalTrajectorySessionRef(process.env.RELAY_ATTEST_SESSION_ID)
     const expectedHeadRef = implementer.spec.branch
     if (!expectedHeadRef) {
       throw new Error(`Refusing to publish ${record.issue.key}: implementer has no Factory-derived branch`)
@@ -7919,8 +7927,8 @@ export class FactoryLoop implements Factory {
       expectedHeadRef,
       baseRef,
       title: `${issue.key}: ${issue.title}`,
-      body: githubPullRequestBody(issue, implementer.spec.preview),
-      ...(implementer.sessionRef ? { sessionRef: implementer.sessionRef } : {}),
+      body: githubPullRequestBody(issue, implementer.spec.preview, trajectorySessionRef),
+      ...(trajectorySessionRef ? { sessionRef: trajectorySessionRef } : {}),
     })
     const published = result.author
       ? result
@@ -17924,8 +17932,12 @@ const normalizeGithubRepo = (repo: string, defaultOwner?: string): string => {
   return `${owner}/${repo}`
 }
 
-const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): string => [
-  issue.description,
+const githubPullRequestBody = (
+  issue: LinearIssue,
+  preview: PreviewReference | undefined,
+  sessionRef: string | undefined,
+): string => [
+  stripTrajectoryPointers(issue.description),
   '',
   isGithubIssue(issue) && /^\d+$/u.test(issue.key)
     ? `Fixes #${issue.key}`
@@ -17935,7 +17947,28 @@ const githubPullRequestBody = (issue: LinearIssue, preview?: PreviewReference): 
     `Live preview: ${preview.url}`,
     'Access: Tailscale tailnet membership and the tailnet grants/ACLs are required; this URL is not public.',
   ] : []),
+  '',
+  renderTrajectoryPointer({
+    ...trajectoryWorkUnitForIssue(issue),
+    sessionRef,
+  }),
 ].join('\n').trim()
+
+const trajectoryWorkUnitForIssue = (
+  issue: LinearIssue,
+): { workUnitId: string; workUnitSurface: TrajectoryWorkUnitSurface } => {
+  const github = githubIssueSourceRef(issue)
+  if (github) {
+    return {
+      workUnitId: `${github.owner}/${github.repo}#${github.number}`,
+      workUnitSurface: 'github',
+    }
+  }
+  if (isRealLinearIssue(issue)) {
+    return { workUnitId: issue.key, workUnitSurface: 'linear' }
+  }
+  return { workUnitId: `factory:${issue.uuid}`, workUnitSurface: 'factory' }
+}
 
 // The broker rejects re-registering a name it never released on exit
 // (relay#1116-family) with a 500 "agent '<name>' already exists". Detect it from

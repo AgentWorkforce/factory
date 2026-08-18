@@ -12377,6 +12377,8 @@ describe('FactoryLoop', () => {
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
     }, githubWrite)
     const fleet = new OrderedPreviewFleetClient()
+    const sessionRef = '0198b179-c6c2-7e63-9177-4ef52f56c192'
+    fleet.setSessionRef('ar-52-impl-pear', sessionRef)
     const factory = createFactory(config({
       preview: {
         provider: 'tailscale-serve',
@@ -12432,7 +12434,13 @@ describe('FactoryLoop', () => {
       baseRef: 'main',
       title: 'AR-52: [factory-e2e] Fix factory issue 52',
       body: expect.stringContaining('Live preview: https://factory-node.tailnet.ts.net:10052/'),
+      sessionRef,
     }])
+    expect(publishInputs[0]?.body).toContain(
+      `<!-- trajectory: work_unit_id=AR-52 work_unit_surface=linear session_ref=${sessionRef} -->`,
+    )
+    expect(publishInputs[0]?.body).not.toContain('relay session replay')
+    expect(publishInputs[0]?.body).not.toMatch(/retained-since|never-prune|replay available/iu)
     await vi.waitFor(() => expect(fleet.previewRemovals).toHaveLength(1))
     await vi.waitFor(() => expect(fleet.releases).toHaveLength(2))
     expect(fleet.terminalEvents.indexOf(`state:${done}`)).toBeLessThan(
@@ -13217,6 +13225,11 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-92-impl-pear', 'crash')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
+    expect(publishInputs[0]).not.toHaveProperty('sessionRef')
+    expect(publishInputs[0]?.body).toContain(
+      '<!-- trajectory: work_unit_id=factory:uuid-92 work_unit_surface=factory session_ref=missing -->',
+    )
+    expect(publishInputs[0]?.body).not.toContain('relay session replay')
     expect(factory.status().counters.implementerPrsPublishedOnExit).toBe(1)
     expect(fleet.resumes).toEqual([]) // published instead of respawning
     // Published PR -> completed -> both agents released, issue no longer in flight.
@@ -15937,6 +15950,9 @@ describe('FactoryLoop', () => {
       baseRef: 'main',
       title: '58: GitHub factory issue 58',
     })
+    expect(publishInputs[0]?.body).toContain(
+      '<!-- trajectory: work_unit_id=AgentWorkforce/pear#58 work_unit_surface=github session_ref=missing -->',
+    )
     expect(factory.status().counters.githubPullRequestsPublished).toBe(1)
   })
 
