@@ -1,15 +1,15 @@
 version: '1.1'
-updated: '2026-08-17'
+updated: '2026-08-18'
 catalog:
   category_count: 25
-  feature_count: 320
+  feature_count: 321
   tier_counts:
     1: 49
     2: 127
     3: 12
     4: 52
     5: 65
-    6: 15
+    6: 16
 
 # Every user-facing feature in @agent-relay/factory, categorized and scored.
 #
@@ -863,6 +863,13 @@ categories:
         description: Keep an issue in flight while its matching pull request remains a draft
         location: src/orchestrator/factory.ts
         verify_tier: 5
+
+      - id: pr-session-replay-pointer
+        name: Completed-Session Replay Pointer
+        api: trajectoryPointerFromBody()
+        description: Stamp Factory-opened PRs with the ruled three-key trajectory marker from Relay's existing opaque session_ref while leaving replay availability and the workspace retention boundary to the authenticated live resolver
+        location: src/trajectory.ts, src/orchestrator/factory.ts, src/index.ts
+        verify_tier: 6
 
       - id: pr-babysitter-opt-in
         name: Event-Driven PR Babysitter

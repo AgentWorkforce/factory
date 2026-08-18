@@ -43,6 +43,18 @@ export type {
   TemplateIssue,
   TemplateRoute,
 } from './dispatch/templates'
+export {
+  canonicalTrajectorySessionRef,
+  MISSING_TRAJECTORY_SESSION_REF,
+  renderTrajectoryPointer,
+  stripTrajectoryPointers,
+  trajectoryPointerFromBody,
+  trajectorySessionRefFromBody,
+} from './trajectory'
+export type {
+  TrajectoryPointer,
+  TrajectoryWorkUnitSurface,
+} from './trajectory'
 export * from './featuremap/index'
 export * from './feature-guardian/index.js'
 export {
