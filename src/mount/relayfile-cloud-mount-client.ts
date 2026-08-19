@@ -1070,7 +1070,10 @@ export const createHostedCloudAccessTokenProvider = (options: {
     let cancelled = false
     const abortForCaller = (): void => {
       cancelled = true
-      controller.abort()
+      // Forward the caller's reason so the request signal records *why* it was
+      // cancelled: a reporter shutting down and a lapsed flush deadline are
+      // different stops, and only the caller can tell them apart.
+      controller.abort(callerSignal?.reason)
     }
     callerSignal?.addEventListener('abort', abortForCaller, { once: true })
     const timer = setTimeout(() => controller.abort(), timeoutMs)

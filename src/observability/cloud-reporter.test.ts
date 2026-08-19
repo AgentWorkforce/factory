@@ -283,6 +283,61 @@ describe('FactoryCloudReporter', () => {
     expect(signals[0]?.aborted).toBe(true)
   })
 
+  it('records shutdown, not the lapsed deadline, as the reason a token request was cancelled', async () => {
+    const signals: AbortSignal[] = []
+    const reporter = await createReporter({
+      getAccessToken: async (options) => {
+        if (options?.signal) signals.push(options.signal)
+        // The hosted credential endpoint never answers.
+        await new Promise<never>(() => {})
+        return 'cloud-token'
+      },
+      fetch: vi.fn(),
+    })
+
+    await reporter.report(progress('event-shutdown-reason'))
+    await reporter.close({ deadlineMs: 20 })
+
+    // `aborted` alone cannot guard the shutdown binding: this controller is
+    // also aborted when the flush deadline lapses, so a request unbound from
+    // shutdown still ends up aborted. Only the reason tells the two apart.
+    await vi.waitFor(() => { expect(signals[0]?.aborted).toBe(true) })
+    expect((signals[0]?.reason as Error | undefined)?.name).toBe('FactoryCloudShutdownError')
+  })
+
+  it('cancels a response body that stalls after headers when close() gives up at its deadline', async () => {
+    const requestSignals: Array<AbortSignal | undefined> = []
+    const bodyStops: string[] = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      fetch: vi.fn(async (_url, init) => {
+        requestSignals.push(init?.signal ?? undefined)
+        // Cloud answers with headers and then never sends the body. A real
+        // fetch tears the body down when the request signal aborts.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener('abort', () => {
+              bodyStops.push('aborted')
+              controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            }, { once: true })
+          },
+          cancel() { bodyStops.push('cancelled') },
+        })
+        return new Response(body, { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }),
+    })
+
+    await reporter.report(progress('event-stalled-body'))
+    await vi.waitFor(() => { expect(requestSignals).toHaveLength(1) })
+
+    await reporter.close({ deadlineMs: 20 })
+
+    // Headers arriving is not delivery: the body read runs on the same socket,
+    // so shutdown has to cancel it too or the process outlives close().
+    expect(bodyStops.length).toBeGreaterThan(0)
+    expect(requestSignals[0]?.aborted).toBe(true)
+  })
+
   it('preserves a Cloud deployment base path when resolving the endpoint', async () => {
     const requests: string[] = []
     const reporter = await createReporter({

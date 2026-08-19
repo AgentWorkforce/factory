@@ -1679,8 +1679,14 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(0)
       expect(tokenSignals.length).toBeGreaterThan(0)
       // Shutdown must leave no referenced credential request behind, or the
-      // process outlives the reporter's close() deadline.
-      expect(tokenSignals.map((signal) => signal?.aborted)).toEqual(tokenSignals.map(() => true))
+      // process outlives the reporter's close() deadline. `aborted` alone does
+      // not prove that: the reporter also aborts this same controller when the
+      // flush deadline lapses, so an unbound request still reports aborted and
+      // the assertion could not fail for the reason it guards. Assert the abort
+      // *reason* instead — only the shutdown path produces it.
+      expect(tokenSignals.map((signal) => (signal?.reason as Error | undefined)?.name)).toEqual(
+        tokenSignals.map(() => 'FactoryCloudShutdownError'),
+      )
     } finally {
       // The cancelled flush unwinds its outbox writes just after the CLI
       // returns; retry rmdir rather than race it.

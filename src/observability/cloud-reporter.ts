@@ -53,6 +53,16 @@ export interface FactoryCloudReporterOptions {
   sleep?: (ms: number) => Promise<void>
 }
 
+/**
+ * Cancellation that outlives the round trip. `release()` detaches the
+ * shutdown/timeout wiring and aborts, which also tears down a body that was
+ * never read.
+ */
+type CloudRequestLifetime = {
+  signal: AbortSignal
+  release: () => void
+}
+
 type DeliveryResult = {
   delivered: boolean
   attempts: number
@@ -182,7 +192,7 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       // A deadline only stops us *awaiting* the flush; the requests it started
       // keep running. Cancel them here so nothing — a hung credential endpoint
       // in particular — survives shutdown and holds the event loop open.
-      this.#shutdown.abort(new FactoryCloudDeadlineError())
+      this.#shutdown.abort(new FactoryCloudShutdownError())
     }
   }
 
@@ -244,11 +254,14 @@ export class FactoryCloudReporter implements FactoryEventReporter {
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
       if (this.#now() >= deadlineAt) return { delivered: false, attempts: attempt - 1, stoppedReason: 'deadline' }
       let response: Response
+      let request: CloudRequestLifetime | undefined
       try {
         const token = await this.#requestAccessToken(attempt, deadlineAt)
         if (!token.trim()) throw new Error('Cloud access token is empty')
-        response = await this.#fetchWithTimeout(batch, token, deadlineAt)
+        request = this.#beginRequest(deadlineAt)
+        response = await this.#sendBatch(batch, token, request)
       } catch (error) {
+        request?.release()
         if (isDeadlineExceeded(error)) {
           return { delivered: false, attempts: attempt, stoppedReason: 'deadline' }
         }
@@ -266,43 +279,51 @@ export class FactoryCloudReporter implements FactoryEventReporter {
         continue
       }
 
-      if (response.status === 201) {
-        const payload = ingestResponseSchema.safeParse(
-          await this.#withinDeadline(readJson(response), deadlineAt),
-        )
-        if (payload.success && payload.data.accepted + payload.data.duplicates === batch.events.length) {
-          return { delivered: true, attempts: attempt }
+      // Response headers are not the response. The body arrives on the same
+      // connection, so the request's cancellation stays armed until the body is
+      // read or discarded; released early, a Cloud reply that stalls mid-body
+      // survives close() and holds the event loop open. Released here rather
+      // than in a whole-attempt finally so a retry never sleeps with the
+      // connection still open.
+      try {
+        if (response.status === 201) {
+          const payload = ingestResponseSchema.safeParse(await this.#readBody(response, deadlineAt))
+          if (payload.success && payload.data.accepted + payload.data.duplicates === batch.events.length) {
+            return { delivered: true, attempts: attempt }
+          }
+          this.#logger?.warn?.('[factory] cloud progress response was incomplete', { status: response.status })
+          return { delivered: false, attempts: attempt, stoppedReason: 'rejected', retryDelayMs: this.#retryMaxMs }
         }
-        this.#logger?.warn?.('[factory] cloud progress response was incomplete', { status: response.status })
-        return { delivered: false, attempts: attempt, stoppedReason: 'rejected', retryDelayMs: this.#retryMaxMs }
-      }
 
-      // A Cloud CLI token can expire between provider resolution and the
-      // request. Retry once through the provider's forced-refresh path without
-      // delaying the durable queue.
-      if (response.status === 401 && attempt < this.#maxAttempts) {
-        continue
-      }
-
-      if (response.status === 401) {
-        return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
-      }
-
-      if (!isRetryableStatus(response.status)) {
-        this.#logger?.warn?.('[factory] cloud progress batch rejected', { status: response.status })
-        return {
-          delivered: false,
-          attempts: attempt,
-          stoppedReason: 'rejected',
-          retryDelayMs: this.#retryMaxMs,
-          discard: isPermanentPayloadRejectionStatus(response.status),
-          status: response.status,
+        // A Cloud CLI token can expire between provider resolution and the
+        // request. Retry once through the provider's forced-refresh path without
+        // delaying the durable queue.
+        if (response.status === 401 && attempt < this.#maxAttempts) {
+          continue
         }
-      }
 
-      retryDelayMs = retryAfterMs(response, this.#now()) ?? this.#nextRetryDelay(attempt)
-      if (attempt >= this.#maxAttempts) {
-        return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+        if (response.status === 401) {
+          return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+        }
+
+        if (!isRetryableStatus(response.status)) {
+          this.#logger?.warn?.('[factory] cloud progress batch rejected', { status: response.status })
+          return {
+            delivered: false,
+            attempts: attempt,
+            stoppedReason: 'rejected',
+            retryDelayMs: this.#retryMaxMs,
+            discard: isPermanentPayloadRejectionStatus(response.status),
+            status: response.status,
+          }
+        }
+
+        retryDelayMs = retryAfterMs(response, this.#now()) ?? this.#nextRetryDelay(attempt)
+        if (attempt >= this.#maxAttempts) {
+          return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+        }
+      } finally {
+        request?.release()
       }
       if (!await this.#waitForRetry(retryDelayMs, deadlineAt)) {
         return { delivered: false, attempts: attempt, stoppedReason: 'deadline' }
@@ -317,9 +338,9 @@ export class FactoryCloudReporter implements FactoryEventReporter {
    * aborted both when the deadline lapses and when `close()` gives up.
    */
   async #requestAccessToken(attempt: number, deadlineAt: number): Promise<string> {
-    if (this.#shutdown.signal.aborted) throw new FactoryCloudDeadlineError()
+    if (this.#shutdown.signal.aborted) throw new FactoryCloudShutdownError()
     const controller = new AbortController()
-    const abortForShutdown = (): void => { controller.abort(new FactoryCloudDeadlineError()) }
+    const abortForShutdown = (): void => { controller.abort(new FactoryCloudShutdownError()) }
     this.#shutdown.signal.addEventListener('abort', abortForShutdown, { once: true })
     try {
       return await this.#withinDeadline(
@@ -333,22 +354,44 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       controller.abort(error)
       // A provider that rejected because shutdown cancelled it is a deadline
       // stop, not a transient failure worth another attempt.
-      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudDeadlineError()
+      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudShutdownError()
       throw error
     } finally {
       this.#shutdown.signal.removeEventListener('abort', abortForShutdown)
     }
   }
 
-  async #fetchWithTimeout(batch: FactoryCloudEventBatchV1, token: string, deadlineAt: number): Promise<Response> {
-    if (this.#shutdown.signal.aborted) throw new FactoryCloudDeadlineError()
+  /**
+   * Open a cancellation scope for one round trip: request timeout, remaining
+   * deadline, and reporter shutdown all abort it. The caller releases it once
+   * the response body is consumed or abandoned.
+   */
+  #beginRequest(deadlineAt: number): CloudRequestLifetime {
+    if (this.#shutdown.signal.aborted) throw new FactoryCloudShutdownError()
     const controller = new AbortController()
     const remainingMs = Math.max(1, deadlineAt - this.#now())
     const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     timer.unref?.()
-    const abortForShutdown = (): void => { controller.abort(new FactoryCloudDeadlineError()) }
+    const abortForShutdown = (): void => { controller.abort(new FactoryCloudShutdownError()) }
     this.#shutdown.signal.addEventListener('abort', abortForShutdown, { once: true })
+    return {
+      signal: controller.signal,
+      release: () => {
+        clearTimeout(timer)
+        this.#shutdown.signal.removeEventListener('abort', abortForShutdown)
+        // Aborting on release discards any body left unread: an unconsumed body
+        // holds its connection open exactly like a hung request would.
+        controller.abort()
+      },
+    }
+  }
+
+  async #sendBatch(
+    batch: FactoryCloudEventBatchV1,
+    token: string,
+    request: CloudRequestLifetime,
+  ): Promise<Response> {
     try {
       return await this.#fetch(this.#endpoint, {
         method: 'POST',
@@ -357,14 +400,25 @@ export class FactoryCloudReporter implements FactoryEventReporter {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(batch),
-        signal: controller.signal,
+        signal: request.signal,
       })
     } catch (error) {
-      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudDeadlineError()
+      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudShutdownError()
       throw error
-    } finally {
-      clearTimeout(timer)
-      this.#shutdown.signal.removeEventListener('abort', abortForShutdown)
+    }
+  }
+
+  /**
+   * Read the acknowledgement body. A body that is malformed is a rejection; a
+   * body cut short by shutdown or the deadline is a stop, not a rejection.
+   */
+  async #readBody(response: Response, deadlineAt: number): Promise<unknown> {
+    try {
+      return await this.#withinDeadline(response.json(), deadlineAt)
+    } catch (error) {
+      if (isDeadlineExceeded(error)) throw error
+      if (this.#shutdown.signal.aborted) throw new FactoryCloudShutdownError()
+      return undefined
     }
   }
 
@@ -442,6 +496,19 @@ class FactoryCloudDeadlineError extends Error {
   }
 }
 
+/**
+ * A stop caused by `close()` rather than by a lapsed flush deadline. It is a
+ * deadline stop for control-flow purposes, and a distinguishable abort reason
+ * for anyone — a token provider, a test — asking *why* a request was cancelled.
+ */
+class FactoryCloudShutdownError extends FactoryCloudDeadlineError {
+  constructor() {
+    super()
+    this.name = 'FactoryCloudShutdownError'
+    this.message = 'Factory Cloud reporting stopped at shutdown'
+  }
+}
+
 const isDeadlineExceeded = (error: unknown): error is FactoryCloudDeadlineError =>
   error instanceof FactoryCloudDeadlineError
 
@@ -466,14 +533,6 @@ function retryAfterMs(response: Response, nowMs: number): number | undefined {
   if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000)
   const dateMs = Date.parse(value)
   return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : undefined
-}
-
-async function readJson(response: Response): Promise<unknown> {
-  try {
-    return await response.json()
-  } catch {
-    return undefined
-  }
 }
 
 function positiveInteger(value: number, name: string): number {
