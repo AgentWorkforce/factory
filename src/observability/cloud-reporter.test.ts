@@ -234,6 +234,55 @@ describe('FactoryCloudReporter', () => {
     expect(JSON.stringify(warnings)).not.toContain('private server rejection detail')
   })
 
+  it('cancels an in-flight access-token request when close() gives up at its deadline', async () => {
+    const signals: Array<AbortSignal | undefined> = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      getAccessToken: async (options) => {
+        signals.push(options?.signal)
+        // The hosted credential endpoint never answers.
+        await new Promise<void>((resolve) => {
+          options?.signal?.addEventListener('abort', () => { resolve() }, { once: true })
+        })
+        throw new Error('token request cancelled')
+      },
+      fetch: vi.fn(async () => response(201, { accepted: 1, duplicates: 0 })),
+    })
+
+    await reporter.report(progress('event-shutdown'))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+
+    await expect(reporter.close({ deadlineMs: 20 })).resolves.toMatchObject({
+      stoppedReason: 'deadline',
+    })
+
+    // close() must not merely stop awaiting the automatic flush: the token
+    // request it left behind has to be cancelled, or it keeps the process alive.
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
+  it('cancels an in-flight event request when close() gives up at its deadline', async () => {
+    const signals: Array<AbortSignal | undefined> = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      fetch: vi.fn(async (_url, init) => {
+        signals.push(init?.signal ?? undefined)
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }, { once: true })
+        })
+      }),
+    })
+
+    await reporter.report(progress('event-shutdown-post'))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+
+    await reporter.close({ deadlineMs: 20 })
+
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
   it('preserves a Cloud deployment base path when resolving the endpoint', async () => {
     const requests: string[] = []
     const reporter = await createReporter({

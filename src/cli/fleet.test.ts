@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { CloudSession } from '@agent-relay/cloud'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1616,6 +1617,143 @@ describe('fleet CLI runtime', () => {
       expect(batches[0]?.instance).toMatchObject({
         metadata: expect.objectContaining({ name: 'factory-khaliq-cloud' }),
       })
+      await expect(new FileFactoryCloudEventOutbox({ path: outboxPath }).stats())
+        .resolves.toMatchObject({ pending: 0 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('cancels a hanging hosted credential request when the CLI shuts down', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-hosted-token-shutdown-'))
+    try {
+      const outboxPath = join(root, 'factory-cloud-events.json')
+      const configPath = await writeConfig(root, {
+        workspaceId: 'rw_7ccfea89',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+        },
+        reporting: {
+          enabled: true,
+          outboxPath,
+          batchSize: 100,
+          requestTimeoutMs: 100,
+        },
+      })
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(async () => {}),
+      } as unknown as Factory
+      const tokenSignals: Array<AbortSignal | undefined> = []
+      // The private credential endpoint accepts the connection and never answers.
+      const cloudAccessTokenFetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        tokenSignals.push(init?.signal ?? undefined)
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }, { once: true })
+        })
+      })
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        env: {
+          FACTORY_CLOUD_ACCESS_TOKEN_URL: 'http://factory-auth.do/factory-primary/v1/access',
+          CLOUD_API_URL: 'https://cloud.example',
+        },
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        cloudAccessTokenFetch: cloudAccessTokenFetch as unknown as typeof fetch,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(tokenSignals.length).toBeGreaterThan(0)
+      // Shutdown must leave no referenced credential request behind, or the
+      // process outlives the reporter's close() deadline.
+      expect(tokenSignals.map((signal) => signal?.aborted)).toEqual(tokenSignals.map(() => true))
+    } finally {
+      // The cancelled flush unwinds its outbox writes just after the CLI
+      // returns; retry rmdir rather than race it.
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 })
+    }
+  })
+
+  it('falls back to the local Cloud session when the hosted credential URL is blank', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-hosted-blank-url-'))
+    try {
+      const outboxPath = join(root, 'factory-cloud-events.json')
+      const configPath = await writeConfig(root, {
+        workspaceId: 'rw_7ccfea89',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+        },
+        reporting: {
+          enabled: true,
+          outboxPath,
+          batchSize: 100,
+          requestTimeoutMs: 1_000,
+        },
+      })
+      const factory = {
+        start: vi.fn(),
+        stop: vi.fn(),
+        runLoop: vi.fn(async () => []),
+        runOnce: vi.fn(async () => ({ pulled: [], triaged: [], dispatched: [], skipped: [], dryRun: true })),
+        status: vi.fn(),
+        triageIssue: vi.fn(),
+        dispatch: vi.fn(),
+        on: vi.fn(),
+        dispose: vi.fn(async () => {}),
+      } as unknown as Factory
+      const sessionBatches: Array<Record<string, unknown>> = []
+      const cloudSessionProvider = vi.fn(async () => ({
+        auth: { apiUrl: 'https://cloud.example' },
+        client: {
+          snapshot: () => ({ accessToken: 'relay_pa_session' }),
+          fetch: async (_path: string, init?: RequestInit) => {
+            const batch = JSON.parse(String(init?.body)) as Record<string, unknown>
+            sessionBatches.push(batch)
+            const accepted = Array.isArray(batch.events) ? batch.events.length : 0
+            return Response.json({ accepted, duplicates: 0 }, { status: 201 })
+          },
+        },
+      }) as unknown as CloudSession)
+      const cloudAccessTokenFetch = vi.fn(async () => {
+        throw new Error('hosted credential endpoint must not be consulted')
+      })
+
+      const code = await runFleetCli(['run-once', '--dry-run', '--config', configPath], {
+        env: {
+          FACTORY_CLOUD_ACCESS_TOKEN_URL: '   ',
+          CLOUD_API_URL: 'https://cloud.example',
+        },
+        fleet: new FakeFleetClient(),
+        mount: new FakeMountClient(),
+        createFactory: () => factory,
+        resolveWorkspace: async () => ({ workspaceId: 'rw_7ccfea89' }),
+        cloudSessionProvider,
+        cloudAccessTokenFetch: cloudAccessTokenFetch as unknown as typeof fetch,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      // A blank URL is not hosted configuration: the local-session path owns
+      // telemetry instead of `new URL('')` throwing the reporter away.
+      expect(cloudSessionProvider).toHaveBeenCalledOnce()
+      expect(cloudAccessTokenFetch).not.toHaveBeenCalled()
+      expect(sessionBatches.length).toBeGreaterThan(0)
       await expect(new FileFactoryCloudEventOutbox({ path: outboxPath }).stats())
         .resolves.toMatchObject({ pending: 0 })
     } finally {

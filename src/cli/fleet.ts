@@ -53,6 +53,7 @@ import {
   resolveFactoryWorkspace,
   type Capability,
   type Factory,
+  type FactoryCloudAccessTokenProvider,
   type FactoryEventReporter,
   type FactoryInFlightDispatchStatus,
   type FactoryInFlightRegistry,
@@ -89,7 +90,7 @@ import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
 import {
   createHostedCloudAccessTokenProvider,
-  FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
+  hostedCloudAccessTokenUrl,
   resolveHostedCloudApiUrl,
 } from '../mount/relayfile-cloud-mount-client'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
@@ -1592,14 +1593,14 @@ async function buildFactoryCloudReporter(input: {
 }): Promise<FactoryEventReporter | undefined> {
   if (!input.config.reporting.enabled) return undefined
   const runtimeEnv = input.deps.env ?? process.env
-  const hasHostedAccessTokenConfig = Object.prototype.hasOwnProperty.call(
-    runtimeEnv,
-    FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
-  )
+  // Hosted mode is a usable endpoint, not a defined-but-blank variable: an
+  // empty value must fall through to the local-session path instead of
+  // reaching createHostedCloudAccessTokenProvider, which throws on `new URL('')`.
+  const hostedAccessTokenUrl = hostedCloudAccessTokenUrl(runtimeEnv)
   if (
     hasInjectedFactoryRuntime(input.deps)
     && !input.deps.cloudSessionProvider
-    && !hasHostedAccessTokenConfig
+    && !hostedAccessTokenUrl
   ) return undefined
 
   try {
@@ -1618,12 +1619,12 @@ async function buildFactoryCloudReporter(input: {
     const instanceId = await loadOrCreateFactoryInstanceId(`${outboxPath}.instance-id`)
     const instanceName = resolveFactoryInstanceName(input.config)
     let apiUrl: string
-    let getAccessToken: () => Promise<string>
+    let getAccessToken: FactoryCloudAccessTokenProvider
     let cloudFetch: typeof fetch | undefined
-    if (hasHostedAccessTokenConfig) {
+    if (hostedAccessTokenUrl) {
       apiUrl = resolveHostedCloudApiUrl(runtimeEnv)
       getAccessToken = createHostedCloudAccessTokenProvider({
-        url: runtimeEnv[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]?.trim() ?? '',
+        url: hostedAccessTokenUrl,
         fetchImpl: input.deps.cloudAccessTokenFetch ?? fetch,
       })
       cloudFetch = input.deps.cloudReporterFetch

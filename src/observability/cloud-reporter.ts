@@ -27,7 +27,7 @@ const ingestResponseSchema = z.object({
 }).passthrough()
 
 export type FactoryCloudAccessTokenProvider = (
-  options?: { forceRefresh?: boolean },
+  options?: { forceRefresh?: boolean, signal?: AbortSignal },
 ) => string | Promise<string>
 
 export interface FactoryCloudReporterOptions {
@@ -84,6 +84,7 @@ export class FactoryCloudReporter implements FactoryEventReporter {
   readonly #now: () => number
   readonly #random: () => number
   readonly #sleep: (ms: number) => Promise<void>
+  readonly #shutdown = new AbortController()
   #flushInFlight?: Promise<FactoryEventReportResult>
   #retryTimer?: ReturnType<typeof setTimeout>
   #closed = false
@@ -110,7 +111,12 @@ export class FactoryCloudReporter implements FactoryEventReporter {
     this.#autoFlush = options.autoFlush ?? true
     this.#now = options.now ?? Date.now
     this.#random = options.random ?? Math.random
-    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+    // An unreferenced retry timer cannot hold the process open once the CLI
+    // has stopped awaiting the reporter.
+    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    }))
   }
 
   async report(rawEvent: FactoryCloudEventInputV1): Promise<void> {
@@ -170,7 +176,14 @@ export class FactoryCloudReporter implements FactoryEventReporter {
     this.#closed = true
     if (this.#retryTimer) clearTimeout(this.#retryTimer)
     this.#retryTimer = undefined
-    return await this.flush(options)
+    try {
+      return await this.flush(options)
+    } finally {
+      // A deadline only stops us *awaiting* the flush; the requests it started
+      // keep running. Cancel them here so nothing — a hung credential endpoint
+      // in particular — survives shutdown and holds the event loop open.
+      this.#shutdown.abort(new FactoryCloudDeadlineError())
+    }
   }
 
   async #flush(deadlineAt: number): Promise<FactoryEventReportResult> {
@@ -232,10 +245,7 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       if (this.#now() >= deadlineAt) return { delivered: false, attempts: attempt - 1, stoppedReason: 'deadline' }
       let response: Response
       try {
-        const token = await this.#withinDeadline(
-          Promise.resolve().then(async () => await this.#getAccessToken({ forceRefresh: attempt > 1 })),
-          deadlineAt,
-        )
+        const token = await this.#requestAccessToken(attempt, deadlineAt)
         if (!token.trim()) throw new Error('Cloud access token is empty')
         response = await this.#fetchWithTimeout(batch, token, deadlineAt)
       } catch (error) {
@@ -301,12 +311,44 @@ export class FactoryCloudReporter implements FactoryEventReporter {
     return { delivered: false, attempts: this.#maxAttempts, stoppedReason: 'retry-exhausted', retryDelayMs }
   }
 
+  /**
+   * Resolve a credential without letting the provider outlive this flush.
+   * `#withinDeadline` alone only stops awaiting it, so the controller is
+   * aborted both when the deadline lapses and when `close()` gives up.
+   */
+  async #requestAccessToken(attempt: number, deadlineAt: number): Promise<string> {
+    if (this.#shutdown.signal.aborted) throw new FactoryCloudDeadlineError()
+    const controller = new AbortController()
+    const abortForShutdown = (): void => { controller.abort(new FactoryCloudDeadlineError()) }
+    this.#shutdown.signal.addEventListener('abort', abortForShutdown, { once: true })
+    try {
+      return await this.#withinDeadline(
+        Promise.resolve().then(async () => await this.#getAccessToken({
+          forceRefresh: attempt > 1,
+          signal: controller.signal,
+        })),
+        deadlineAt,
+      )
+    } catch (error) {
+      controller.abort(error)
+      // A provider that rejected because shutdown cancelled it is a deadline
+      // stop, not a transient failure worth another attempt.
+      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudDeadlineError()
+      throw error
+    } finally {
+      this.#shutdown.signal.removeEventListener('abort', abortForShutdown)
+    }
+  }
+
   async #fetchWithTimeout(batch: FactoryCloudEventBatchV1, token: string, deadlineAt: number): Promise<Response> {
+    if (this.#shutdown.signal.aborted) throw new FactoryCloudDeadlineError()
     const controller = new AbortController()
     const remainingMs = Math.max(1, deadlineAt - this.#now())
     const timeoutMs = Math.min(this.#requestTimeoutMs, remainingMs)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     timer.unref?.()
+    const abortForShutdown = (): void => { controller.abort(new FactoryCloudDeadlineError()) }
+    this.#shutdown.signal.addEventListener('abort', abortForShutdown, { once: true })
     try {
       return await this.#fetch(this.#endpoint, {
         method: 'POST',
@@ -317,8 +359,12 @@ export class FactoryCloudReporter implements FactoryEventReporter {
         body: JSON.stringify(batch),
         signal: controller.signal,
       })
+    } catch (error) {
+      if (this.#shutdown.signal.aborted && !isDeadlineExceeded(error)) throw new FactoryCloudDeadlineError()
+      throw error
     } finally {
       clearTimeout(timer)
+      this.#shutdown.signal.removeEventListener('abort', abortForShutdown)
     }
   }
 

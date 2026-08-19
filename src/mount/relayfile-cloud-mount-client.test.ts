@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  createHostedCloudAccessTokenProvider,
   FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV,
   FACTORY_RELAYFILE_SCOPES,
   RelayfileCloudMountClient,
@@ -1170,6 +1171,55 @@ describe('RelayfileCloudMountClient', () => {
       [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: 'http://factory-auth.do/v1/access',
     })).resolves.toEqual({ workspaceId: 'rw_7ccfea89' })
     expect(activeWorkspaceResolver).not.toHaveBeenCalled()
+  })
+
+  it('cancels the hosted credential request when the caller aborts', async () => {
+    let requestSignal: AbortSignal | undefined
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      requestSignal = init?.signal ?? undefined
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+        }, { once: true })
+      })
+    })
+    const provider = createHostedCloudAccessTokenProvider({
+      url: 'http://factory-auth.do/v1/access',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 60_000,
+    })
+
+    const controller = new AbortController()
+    const pending = provider({ signal: controller.signal })
+    await vi.waitFor(() => { expect(fetchImpl).toHaveBeenCalledOnce() })
+    controller.abort()
+
+    await expect(pending).rejects.toThrow('hosted Cloud access-token request was cancelled')
+    expect(requestSignal?.aborted).toBe(true)
+  })
+
+  it('refuses a hosted credential request whose caller signal is already aborted', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ accessToken: 'relay_pa_never' }))
+    const provider = createHostedCloudAccessTokenProvider({
+      url: 'http://factory-auth.do/v1/access',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })
+
+    await expect(provider({ signal: AbortSignal.abort() }))
+      .rejects.toThrow('hosted Cloud access-token request was cancelled')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('resolves a local Cloud workspace when the hosted credential variable is blank', async () => {
+    const activeWorkspaceResolver = vi.fn(async () => ({
+      relayfileWorkspaceId: 'rw_local',
+      cloudWorkspaceId: 'ws-uuid',
+    }))
+
+    await expect(resolveFactoryWorkspace(activeWorkspaceResolver, {
+      [FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]: '   ',
+    })).resolves.toEqual({ workspaceId: 'rw_local', cloudWorkspaceId: 'ws-uuid' })
+    expect(activeWorkspaceResolver).toHaveBeenCalledOnce()
   })
 
   it('cancels a failed hosted credential response body without reading it', async () => {
