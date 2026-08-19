@@ -397,7 +397,13 @@ const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
 const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
+// One pass drains the whole chain (#slackReplyRoutes holds only the newest
+// route per key and every route awaits its predecessor). The extra passes only
+// exist so the drain can prove quiescence rather than assume it.
+const SLACK_REPLY_ROUTE_DRAIN_PASSES = 8
 const SLACK_TERMINAL_THREAD_GRACE_MS = 24 * 60 * 60_000
+const SLACK_TERMINAL_RECEIPT_RETRY_MS = 1_000
+const SLACK_TERMINAL_RECEIPT_RETRY_MAX_MS = 5 * 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
@@ -519,8 +525,10 @@ export class FactoryLoop implements Factory {
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
   readonly #slackTerminalWatchExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #slackTerminalReceiptRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #terminalSlackWatchIssues = new Set<string>()
   readonly #slackReplyRoutes = new Map<string, Promise<DispatchResult | undefined>>()
+  readonly #slackReplyRouteDrains = new Set<string>()
   readonly #slackConversationTurns: CoalescedTaskQueue<string>
   readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
@@ -1147,7 +1155,10 @@ export class FactoryLoop implements Factory {
       this.#slackWatchers.clear()
       for (const timer of this.#slackTerminalWatchExpiryTimers.values()) clearTimeout(timer)
       this.#slackTerminalWatchExpiryTimers.clear()
+      for (const timer of this.#slackTerminalReceiptRetryTimers.values()) clearTimeout(timer)
+      this.#slackTerminalReceiptRetryTimers.clear()
       this.#terminalSlackWatchIssues.clear()
+      this.#slackReplyRouteDrains.clear()
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
       this.#githubIssueCommentWatchStates.clear()
@@ -14296,6 +14307,7 @@ export class FactoryLoop implements Factory {
             { issue: watch.issue.key, error },
           )
           this.#increment('slackTerminalWatchReceiptsDeferred')
+          this.#scheduleSlackTerminalReceiptRetry(watch.issue, watch.threadId, watch.expiresAtMs)
         }
         await this.#rearmSlackWatcher(watchRecord, watch.threadId, {
           replayConversationReplies: true,
@@ -14479,23 +14491,48 @@ export class FactoryLoop implements Factory {
   // The terminal fence is the only thing that makes an in-flight reply route
   // answer "no active agent" instead of binding the retired thread to whatever
   // dispatch owns this key. Routes are chained per work unit, so awaiting the
-  // newest one drains every reply queued behind it. A route that *rejects* is
-  // not drained: the watcher replays it after SLACK_REPLY_ROUTE_RETRY_MS, and
-  // that replay would land on the next dispatch. Fail closed and let the caller
-  // keep the fence up rather than leak a stale human reply onto fresh work.
+  // newest one drains every reply queued behind it.
   async #drainSlackReplyRoutes(key: string): Promise<boolean> {
-    const route = this.#slackReplyRoutes.get(key)
-    if (!route) return true
+    // Snapshotting #slackReplyRoutes is not enough on its own. A reply handler
+    // that is still inside its mount read when the drain starts registers its
+    // route *after* the snapshot, so it would run once the fence is gone and
+    // bind the retired thread to the next dispatch — the same escape one level
+    // in. Bar registration for this key first (the bar and the registration are
+    // both synchronous, so nothing can slip between them), then drain whatever
+    // is already chained, then prove the set is empty before reporting success.
+    const nested = this.#slackReplyRouteDrains.has(key)
+    this.#slackReplyRouteDrains.add(key)
     try {
-      await route
-      return true
-    } catch (error) {
+      for (let pass = 0; pass < SLACK_REPLY_ROUTE_DRAIN_PASSES; pass += 1) {
+        const route = this.#slackReplyRoutes.get(key)
+        if (!route) return true
+        try {
+          await route
+        } catch (error) {
+          // A route that *rejects* is not drained: the watcher replays it after
+          // SLACK_REPLY_ROUTE_RETRY_MS, and that replay would land on the next
+          // dispatch. Fail closed and let the caller keep the fence up rather
+          // than leak a stale human reply onto fresh work.
+          this.#logger.warn?.(
+            '[factory] in-flight Slack reply route did not drain; keeping terminal Slack fence',
+            { issue: key, error },
+          )
+          this.#increment('slackReplyRouteDrainsFailed')
+          return false
+        }
+        // The owner clears its own entry when it settles; retiring it here too
+        // keeps the loop monotonic if that finally has not run yet.
+        if (this.#slackReplyRoutes.get(key) === route) this.#slackReplyRoutes.delete(key)
+      }
+      // Not provably quiescent. Fail closed for the same reason as a rejection.
       this.#logger.warn?.(
-        '[factory] in-flight Slack reply route did not drain; keeping terminal Slack fence',
-        { issue: key, error },
+        '[factory] Slack reply routes did not quiesce; keeping terminal Slack fence',
+        { issue: key },
       )
       this.#increment('slackReplyRouteDrainsFailed')
       return false
+    } finally {
+      if (!nested) this.#slackReplyRouteDrains.delete(key)
     }
   }
 
@@ -14510,6 +14547,9 @@ export class FactoryLoop implements Factory {
     const expiryTimer = this.#slackTerminalWatchExpiryTimers.get(key)
     if (expiryTimer) clearTimeout(expiryTimer)
     this.#slackTerminalWatchExpiryTimers.delete(key)
+    const receiptRetryTimer = this.#slackTerminalReceiptRetryTimers.get(key)
+    if (receiptRetryTimer) clearTimeout(receiptRetryTimer)
+    this.#slackTerminalReceiptRetryTimers.delete(key)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
     const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
@@ -14583,6 +14623,61 @@ export class FactoryLoop implements Factory {
     this.#increment('slackConversationRepliesSurfacedTerminal')
   }
 
+  // A terminal receipt that could not be written leaves the queued replies
+  // pending with the human who wrote them told nothing. That is retryable
+  // maintenance this daemon owns, not work to leave for the next restart: the
+  // grace watch is the only window in which the receipt can still land on the
+  // retired thread, so keep reattempting inside it and give up when it closes.
+  #scheduleSlackTerminalReceiptRetry(
+    issue: IssueRef,
+    threadId: string,
+    expiresAtMs: number,
+    attempt = 0,
+  ): void {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const existing = this.#slackTerminalReceiptRetryTimers.get(key)
+    if (existing) clearTimeout(existing)
+    this.#slackTerminalReceiptRetryTimers.delete(key)
+    const remainingMs = expiresAtMs - this.#clock.now()
+    if (remainingMs <= 0) {
+      this.#increment('slackTerminalWatchReceiptsAbandoned')
+      return
+    }
+    const backoffMs = Math.min(
+      SLACK_TERMINAL_RECEIPT_RETRY_MAX_MS,
+      SLACK_TERMINAL_RECEIPT_RETRY_MS * 2 ** Math.min(attempt, 16),
+    )
+    const timer = setTimeout(() => {
+      this.#slackTerminalReceiptRetryTimers.delete(key)
+      void this.#retrySlackTerminalReceipt(issue, threadId, attempt)
+    }, Math.max(0, Math.min(backoffMs, remainingMs)))
+    timer.unref?.()
+    this.#slackTerminalReceiptRetryTimers.set(key, timer)
+  }
+
+  async #retrySlackTerminalReceipt(issue: IssueRef, threadId: string, attempt: number): Promise<void> {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const watch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    // The grace watch is gone (expired, or the work unit reopened): the thread
+    // this receipt would settle no longer exists, so there is nothing to say.
+    if (watch?.kind !== 'terminal-grace' || watch.threadId !== threadId) return
+    try {
+      await this.#surfaceUndeliveredSlackConversation(threadId)
+      await this.#state.clearConversationSession(this.#workspaceId, slackConversationId(threadId))
+      this.#increment('slackTerminalWatchReceiptsRecovered')
+    } catch (error) {
+      this.#logger.warn?.('[factory] terminal Slack receipt retry failed; rescheduling', {
+        issue: issue.key,
+        error,
+      })
+      this.#increment('slackTerminalWatchReceiptRetryFailures')
+      this.#scheduleSlackTerminalReceiptRetry(issue, threadId, watch.expiresAtMs, attempt + 1)
+    }
+  }
+
   #scheduleSlackTerminalWatchExpiry(
     issue: IssueRef,
     expiresAtMs: number,
@@ -14615,7 +14710,15 @@ export class FactoryLoop implements Factory {
       this.#scheduleSlackTerminalWatchExpiry(issue, watch.expiresAtMs)
       return
     }
-    await this.#stopSlackWatcher(issue)
+    // #stopSlackWatcher fails closed when an in-flight reply route will not
+    // drain, leaving the watch and its terminal fence in place. Counting that as
+    // an expiration retires the watch in the metrics while the real one lives
+    // on unwatched by any expiry timer, so reschedule and count only on success.
+    if (!await this.#stopSlackWatcher(issue)) {
+      this.#increment('slackTerminalWatchExpiriesDeferred')
+      this.#scheduleSlackTerminalWatchExpiry(issue, expiresAtMs, SLACK_REPLY_ROUTE_RETRY_MS)
+      return
+    }
     this.#increment('slackTerminalWatchersExpired')
   }
 
@@ -14693,6 +14796,14 @@ export class FactoryLoop implements Factory {
     text: string,
     clarificationKey: string,
   ): Promise<DispatchResult | undefined> {
+    if (this.#slackReplyRouteDrains.has(clarificationKey)) {
+      // The terminal fence for this work unit is being drained right now.
+      // Registering here would put this route past the drain's snapshot and run
+      // it once the fence is gone. Answer it the way the fence would have.
+      this.#increment('slackReplyRoutesFencedDuringDrain')
+      await this.#writeUnroutableSlackReply(reply.threadTs)
+      return
+    }
     const preceding = this.#slackReplyRoutes.get(clarificationKey)
     const route = (async () => {
       await preceding?.catch(() => undefined)
