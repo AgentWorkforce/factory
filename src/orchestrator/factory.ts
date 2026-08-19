@@ -13303,7 +13303,17 @@ export class FactoryLoop implements Factory {
       // A reopened work unit needs a fresh dispatch notification and a fresh
       // conversation. Do not let the old grace-period watcher (or its expiry
       // timer) capture and later tear down the new dispatch.
-      await this.#stopSlackWatcher(record.issue)
+      if (!await this.#stopSlackWatcher(record.issue)) {
+        // Fail closed. An undrained reply route still holds the retired thread
+        // and would bind it to this dispatch, delivering a stale human reply to
+        // fresh work. Leave the fence up; the next reconcile retries the drain.
+        this.#logger.warn?.(
+          '[factory] deferring Slack dispatch thread for reopened work unit; in-flight reply route not drained',
+          { issue: record.issue.key },
+        )
+        this.#increment('slackDispatchThreadsDeferredUndrainedReply')
+        return
+      }
     }
     const existingThread = await this.#persistedSlackThread(key)
     const watcherStart = this.#slackWatcherStarts.get(key)
@@ -14271,8 +14281,22 @@ export class FactoryLoop implements Factory {
         this.#terminalSlackWatchIssues.add(key)
         const conversationId = slackConversationId(watch.threadId)
         await this.#slackConversationTurns.cancel(conversationId)
-        await this.#surfaceUndeliveredSlackConversation(watch.threadId)
-        await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+        try {
+          await this.#surfaceUndeliveredSlackConversation(watch.threadId)
+          await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+        } catch (error) {
+          // The undelivered-reply receipt needs Slack writeback, which may be
+          // unavailable at startup. That is retryable state maintenance for this
+          // one thread, not a reason to abandon rehydration: aborting here would
+          // leave every remaining thread watched by nobody. Keep the queued
+          // replies (clearing them now would drop replies nobody was told about)
+          // and carry on re-arming.
+          this.#logger.warn?.(
+            '[factory] failed to settle undelivered Slack replies for terminal watch; will retry',
+            { issue: watch.issue.key, error },
+          )
+          this.#increment('slackTerminalWatchReceiptsDeferred')
+        }
         await this.#rearmSlackWatcher(watchRecord, watch.threadId, {
           replayConversationReplies: true,
           replayAfterMs: retiredAtMs,
@@ -14452,8 +14476,36 @@ export class FactoryLoop implements Factory {
     this.#clarificationSweepDueAtMs = dueAtMs
   }
 
-  async #stopSlackWatcher(issue: IssueRef): Promise<void> {
+  // The terminal fence is the only thing that makes an in-flight reply route
+  // answer "no active agent" instead of binding the retired thread to whatever
+  // dispatch owns this key. Routes are chained per work unit, so awaiting the
+  // newest one drains every reply queued behind it. A route that *rejects* is
+  // not drained: the watcher replays it after SLACK_REPLY_ROUTE_RETRY_MS, and
+  // that replay would land on the next dispatch. Fail closed and let the caller
+  // keep the fence up rather than leak a stale human reply onto fresh work.
+  async #drainSlackReplyRoutes(key: string): Promise<boolean> {
+    const route = this.#slackReplyRoutes.get(key)
+    if (!route) return true
+    try {
+      await route
+      return true
+    } catch (error) {
+      this.#logger.warn?.(
+        '[factory] in-flight Slack reply route did not drain; keeping terminal Slack fence',
+        { issue: key, error },
+      )
+      this.#increment('slackReplyRouteDrainsFailed')
+      return false
+    }
+  }
+
+  async #stopSlackWatcher(issue: IssueRef): Promise<boolean> {
     const key = issueKey(issue)
+    // Drain before clearing the fence. Clearing it first lets a reply that is
+    // already mid-route — or one queued behind it — fall through the fence check
+    // in #routeSlackConversationAnswerUnlocked and rebind the retired thread to
+    // the next dispatch of this work unit.
+    if (!await this.#drainSlackReplyRoutes(key)) return false
     this.#terminalSlackWatchIssues.delete(key)
     const expiryTimer = this.#slackTerminalWatchExpiryTimers.get(key)
     if (expiryTimer) clearTimeout(expiryTimer)
@@ -14469,6 +14521,7 @@ export class FactoryLoop implements Factory {
     }
     await this.#state.clearSlackThread(this.#workspaceId, key)
     await this.#state.clearSlackThreadWatch(this.#workspaceId, key)
+    return true
   }
 
   async #retireSlackWatcher(record: InFlightIssue): Promise<void> {
