@@ -406,12 +406,25 @@ export interface StateStore {
     owner: string,
     epoch: number,
     checkpoint?: DiscoveryCheckpoint,
-    /**
-     * Residual overload state for a sweep that committed its work while
-     * relayfile was shedding some of it (#297). Omitted for a clean sweep,
-     * which clears the ratchet and the backoff as it always has.
-     */
-    overload?: { consecutiveOverloads: number; backoffUntilMs: number },
+  ): Promise<boolean>
+  /**
+   * Commit a sweep that ran while Relayfile was shedding some of it, carrying
+   * a decayed ratchet and a backoff forward instead of clearing both (#297).
+   *
+   * Optional, and a separate method rather than an extra argument on
+   * `completeDiscoverySweep`, for the same reason as
+   * `renewDiscoverySweepWithDetails`: a legacy or custom store keeps working,
+   * and its inability to carry this state is *detectable* by the caller. An
+   * optional argument would have been silently dropped by any store compiled
+   * against the old signature, losing the backoff and letting the next sweep
+   * retry immediately — the exact failure this change exists to prevent.
+   */
+  completeDiscoverySweepWithOverload?(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint: DiscoveryCheckpoint | undefined,
+    overload: { consecutiveOverloads: number; backoffUntilMs: number },
   ): Promise<boolean>
   deferDiscoverySweep(
     workspaceId: string,

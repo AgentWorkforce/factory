@@ -154,6 +154,29 @@ export class DocumentStateStore extends InMemoryStateStore {
     owner: string,
     epoch: number,
     checkpoint?: DiscoveryCheckpoint,
+  ): Promise<boolean> {
+    return await this.#completeDiscoverySweep(workspaceId, owner, epoch, checkpoint)
+  }
+
+  /**
+   * A sweep that committed while Relayfile was shedding it keeps a decayed
+   * ratchet and a backoff instead of clearing both outright (#297).
+   */
+  override async completeDiscoverySweepWithOverload(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint: DiscoveryCheckpoint | undefined,
+    overload: { consecutiveOverloads: number; backoffUntilMs: number },
+  ): Promise<boolean> {
+    return await this.#completeDiscoverySweep(workspaceId, owner, epoch, checkpoint, overload)
+  }
+
+  async #completeDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    epoch: number,
+    checkpoint?: DiscoveryCheckpoint,
     overload?: { consecutiveOverloads: number; backoffUntilMs: number },
   ): Promise<boolean> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
@@ -165,8 +188,6 @@ export class DocumentStateStore extends InMemoryStateStore {
       // now empty") — keep the last good checkpoint so the next sweep can
       // still diff from it instead of falling back to a full walk.
       if (checkpoint) state.checkpoint = cloneDiscoveryCheckpoint(checkpoint)
-      // A sweep that committed while relayfile was shedding it keeps a decayed
-      // ratchet and a backoff instead of clearing both outright (#297).
       state.consecutiveOverloads = overload?.consecutiveOverloads ?? 0
       state.backoffUntilMs = overload?.backoffUntilMs ?? 0
       delete state.lease
