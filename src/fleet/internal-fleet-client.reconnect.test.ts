@@ -7,7 +7,7 @@ import { AddressInfo } from 'node:net'
 
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
 
-import { InternalFleetClient } from './internal-fleet-client'
+import { InternalFleetClient, type HarnessDriverClientLike } from './internal-fleet-client'
 
 // A stand-in for the relay broker's HTTP surface. Only the endpoints the fleet
 // client actually reaches are implemented: `/api/spawned` (listAgents, which is
@@ -67,6 +67,19 @@ class FakeBroker {
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
+}
+
+// `brokerPid` is a getter on the real client and is only populated by spawn().
+// Overlay it so a connect()ed client can stand in for a spawned one, keeping
+// every method bound to the real instance so its private state still works.
+function asSpawnedClient(client: HarnessDriverClient, brokerPid: number): HarnessDriverClientLike {
+  return new Proxy(client, {
+    get(target, property) {
+      if (property === 'brokerPid') return brokerPid
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as unknown as HarnessDriverClientLike
 }
 
 describe('InternalFleetClient broker rebind recovery', () => {
@@ -185,6 +198,59 @@ describe('InternalFleetClient broker rebind recovery', () => {
     // The broker answered — it is reachable, the connection file is unchanged,
     // and a 500 is not a reason to go looking for a different broker.
     expect(connectCalls).toBe(1)
+  })
+
+  it('does not abandon a broker it spawned while that broker is still alive', async () => {
+    const connectionPath = connectionFile()
+    const spawned = await startBroker({ apiKey: 'key-spawned', agents: ['worker-a'] })
+    writeConnection(connectionPath, spawned)
+
+    let connectCalls = 0
+    const fleet = new InternalFleetClient({
+      connectionPath,
+      ownsBroker: true,
+      // Stands in for the broker child this client spawned. It reports alive.
+      client: asSpawnedClient(HarnessDriverClient.connect({ connectionPath }), process.pid),
+      isProcessAlive: () => true,
+      connect: (options) => {
+        connectCalls += 1
+        return HarnessDriverClient.connect(options)
+      },
+    })
+    cleanup.push(() => fleet.dispose())
+    await fleet.roster()
+
+    // Something else's broker takes over the connection file while ours is
+    // still running and merely unreachable for this call.
+    await spawned.stop()
+    const other = await startBroker({ apiKey: 'key-other', agents: ['worker-b'] })
+    writeConnection(connectionPath, other)
+
+    await expect(fleet.roster()).rejects.toThrow(/fetch failed/)
+    // Switching would orphan the broker we are responsible for shutting down.
+    expect(connectCalls).toBe(0)
+    expect(other.requests).toHaveLength(0)
+  })
+
+  it('adopts the rebound broker once the broker it spawned is gone', async () => {
+    const connectionPath = connectionFile()
+    const spawned = await startBroker({ apiKey: 'key-spawned', agents: ['worker-a'] })
+    writeConnection(connectionPath, spawned)
+
+    const fleet = new InternalFleetClient({
+      connectionPath,
+      ownsBroker: true,
+      client: asSpawnedClient(HarnessDriverClient.connect({ connectionPath }), process.pid),
+      isProcessAlive: () => false,
+    })
+    cleanup.push(() => fleet.dispose())
+    await fleet.roster()
+
+    await spawned.stop()
+    const replacement = await startBroker({ apiKey: 'key-replacement', agents: ['worker-b'] })
+    writeConnection(connectionPath, replacement)
+
+    await expect(fleet.roster()).resolves.toMatchObject({ agents: [{ name: 'worker-b' }] })
   })
 
   it('re-points a non-idempotent send at the rebound broker without replaying it', async () => {

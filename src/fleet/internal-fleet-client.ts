@@ -524,6 +524,18 @@ export class InternalFleetClient implements FleetClient {
     const current = this.#readConnectionFile()
     if (!current || current.fingerprint === this.#connectedBroker) return false
 
+    // We own a broker only when we spawned it, and dispose() is responsible for
+    // shutting it down. If that process is still alive, the file naming someone
+    // else is not a cue to abandon it — switching would orphan it. Only move on
+    // once the broker we started is actually gone.
+    const ownedBrokerPid = this.#client.brokerPid
+    if (this.#ownsBroker
+      && typeof ownedBrokerPid === 'number'
+      && ownedBrokerPid > 0
+      && this.#isProcessAlive(ownedBrokerPid)) {
+      return false
+    }
+
     let next: HarnessDriverClientLike
     try {
       next = this.#connect({ cwd: this.#cwd, connectionPath: this.#connectionPath })
