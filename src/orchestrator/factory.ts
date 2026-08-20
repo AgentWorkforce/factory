@@ -2669,9 +2669,14 @@ export class FactoryLoop implements Factory {
    *   anyway.
    * - The factory is stopping. Teardown is in progress and dispatching more
    *   agents now leaks them past the shutdown deadline.
-   * - The fleet control-plane circuit is open. Dispatch is globally paused —
-   *   this is the same condition `#assertFleetControlPlaneAvailable` refuses
-   *   to *start* a pass on, so it must also stop one already in flight.
+   * - The fleet control-plane circuit is no longer closed. Dispatch is
+   *   globally paused — this is the same condition
+   *   `#assertFleetControlPlaneAvailable` refuses to *start* a pass on, so it
+   *   must also stop one already in flight. This is read as circuit *state*,
+   *   not as an error type, because the failure that trips the threshold is
+   *   rethrown by `FleetControlPlaneCircuit.probe` as the original transport
+   *   error: a type check alone would skip the very item whose roster request
+   *   opened the circuit and let the pass finish reporting healthy.
    *
    * Deliberately NOT here: JavaScript builtin error types. Classifying
    * "programmer faults" such as `TypeError` as fatal is the obvious next rule
@@ -2689,6 +2694,7 @@ export class FactoryLoop implements Factory {
     if (this.#discoverySweepLeaseLost || this.#discoveryOverloadError !== undefined || this.#stopping) {
       return true
     }
+    if (this.#fleetControlPlane.status().state !== 'closed') return true
     return isPassFatalDispatchError(error)
   }
 

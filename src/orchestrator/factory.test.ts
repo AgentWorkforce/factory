@@ -4576,6 +4576,51 @@ describe('FactoryLoop', () => {
       expect(fleet.spawns).toEqual([])
     })
 
+    // Must-not-fire control. The failure that trips the circuit threshold is
+    // rethrown by `probe()` as the original transport error, not as a
+    // FleetControlPlaneCircuitOpenError, so classifying by error type alone
+    // would skip the very item that paused dispatch and finish the pass green.
+    it('still aborts the pass when a per-item roster failure opens the circuit', async () => {
+      class BreakableRosterFleetClient extends LocalLifecycleFleetClient {
+        failRoster = false
+
+        override async roster() {
+          if (this.failRoster) {
+            throw Object.assign(new Error('broker unreachable'), { code: 'ECONNREFUSED' })
+          }
+          return await super.roster()
+        }
+      }
+
+      // Deliberately a single ready issue: with more work behind it the pass
+      // would abort one item later on the now-open circuit, which would hide
+      // the gap this test exists for.
+      const mount = new FakeMountClient({
+        [blockedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+      })
+      const fleet = new BreakableRosterFleetClient()
+      // The pass-wide admission probe succeeds; the broker goes away just
+      // before this work unit's own admission probe, so the failure that trips
+      // the threshold surfaces as the raw transport error.
+      const factory = createFactory(config({
+        issueSource: 'github',
+        batchSize: 4,
+        fleetHealth: { rosterTimeoutMs: 1_000, failureThreshold: 1, resetTimeoutMs: 60_000 },
+      }), {
+        mount,
+        fleet,
+        triage: new FailingTriage((issue) => {
+          if (issue.key === '59') fleet.failRoster = true
+          return undefined
+        }),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(/fleet control plane is unavailable/)
+      expect(factory.status().fleetControlPlane.state).not.toBe('closed')
+      expect(fleet.spawns).toEqual([])
+    })
+
     // Must-not-fire control. A pass-wide fault that arrives disguised as a
     // string of per-item faults must still surface as a failed pass rather
     // than a green report full of skips.
