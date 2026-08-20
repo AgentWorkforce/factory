@@ -49,6 +49,7 @@ import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim
 import {
   DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+  FleetControlPlaneCircuitOpenError,
 } from '../fleet/control-plane-circuit'
 
 describe('fleet control-plane admission', () => {
@@ -4300,7 +4301,13 @@ describe('FactoryLoop', () => {
         probePrGhRunner: async () => ({ stdout: '[]' }),
       })
 
-      await expect(factory.runOnce()).rejects.toThrow('transient triage failure')
+      // #292: the transient failure costs issue 58 this pass and nothing more —
+      // it is recorded as a skip instead of aborting the sweep. The exemption
+      // this test is about is still consumed, so the next pass recovers it.
+      await expect(factory.runOnce()).resolves.toMatchObject({
+        dispatched: [],
+        skipped: [{ issue: { key: '58' }, reason: 'dispatch failed: transient triage failure' }],
+      })
       await expect(factory.runOnce()).resolves.toMatchObject({
         dispatched: [{ issue: { key: '58' } }],
       })
@@ -4447,6 +4454,148 @@ describe('FactoryLoop', () => {
     })
     },
   )
+
+  // #292: one work unit must not decide the fate of the others. Each case
+  // below is a per-item failure on issue 59 followed by an untouched, ready
+  // issue 60 that must still be dispatched in the SAME pass.
+  describe('per-item dispatch failures do not abort the readiness pass (#292)', () => {
+    const blockedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
+
+    const twoReadyIssues = () => new FakeMountClient({
+      [blockedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+      [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+    })
+
+    // Reproduces the production wedge: the surface issue is open and
+    // gate-eligible while its durable dispatch-lifecycle record is terminal,
+    // so `#claimDispatchLifecycle` cannot acquire and refuses the dispatch.
+    class TerminalLifecycleStateStore extends InMemoryStateStore {
+      constructor(readonly terminalIssueKey: string) {
+        super({ batchSize: 4 })
+      }
+
+      override async claimDispatchLifecycle(
+        workspaceId: string,
+        key: string,
+        seed: DispatchLifecycle,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ) {
+        if (seed.issue.key === this.terminalIssueKey) {
+          return {
+            key,
+            acquired: false as const,
+            created: false,
+            lifecycle: { ...seed, phase: 'complete' as const },
+          }
+        }
+        return await super.claimDispatchLifecycle(workspaceId, key, seed, owner, nowMs, leaseMs)
+      }
+    }
+
+    // Per-item failures raised from triage stand in for every non-lifecycle
+    // fault that is about one unit (#291's `fetch failed` roster lookup is the
+    // production example) without coupling the test to a dispatch internal.
+    class FailingTriage extends StaticTriage {
+      constructor(readonly failFor: (issue: LinearIssue) => Error | undefined) {
+        super()
+      }
+
+      override async triage(issue: LinearIssue): Promise<TriageDecision> {
+        const failure = this.failFor(issue)
+        if (failure) throw failure
+        return await super.triage(issue)
+      }
+    }
+
+    it('skips a work unit whose dispatch lifecycle is already terminal and dispatches the rest of the pass', async () => {
+      const mount = twoReadyIssues()
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        stateStore: new TerminalLifecycleStateStore('59'),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.skipped).toContainEqual({
+        issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
+        reason: 'dispatch lifecycle already terminal',
+      })
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        'ar-60-impl-pear',
+        'ar-60-review-pear',
+      ])
+    })
+
+    it('skips a work unit whose per-item failure is unclassified and dispatches the rest of the pass', async () => {
+      const mount = twoReadyIssues()
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        // Node reports a network failure as `TypeError: fetch failed`, which is
+        // exactly the shape that wedged the second instance (#291).
+        triage: new FailingTriage((issue) => issue.key === '59'
+          ? new TypeError('fetch failed')
+          : undefined),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.skipped).toContainEqual({
+        issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
+        reason: 'dispatch failed: fetch failed',
+      })
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
+    })
+
+    // Must-not-fire control. Without this the fix could degrade into swallowing
+    // every failure and the suite would not notice.
+    it('still aborts the pass when the fleet control plane is globally unavailable', async () => {
+      const mount = twoReadyIssues()
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        triage: new FailingTriage((issue) => issue.key === '59'
+          ? new FleetControlPlaneCircuitOpenError(0)
+          : undefined),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(/circuit/)
+      expect(fleet.spawns).toEqual([])
+    })
+
+    // Must-not-fire control. A pass-wide fault that arrives disguised as a
+    // string of per-item faults must still surface as a failed pass rather
+    // than a green report full of skips.
+    it('still aborts the pass once unclassified per-item failures repeat', async () => {
+      const paths = [71, 72, 73, 74, 75, 76].map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new FakeMountClient(Object.fromEntries(
+        paths.map((path, index) => [path, githubIssueFile(71 + index, { labels: ['factory', 'pear'] })]),
+      ))
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new FailingTriage(() => new Error('state store is unreachable')),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(/consecutive unclassified dispatch failures/)
+      expect(fleet.spawns).toEqual([])
+    })
+  })
 
   it('adopts a same-repo legacy PR and wakes its babysitter when REST metadata later becomes conflicting', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-open-pr-'))

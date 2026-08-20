@@ -505,6 +505,26 @@ class DispatchLifecycleOwnedElsewhereError extends Error {
   }
 }
 
+/**
+ * The durable dispatch-lifecycle claim was refused for one work unit: its
+ * record is already terminal, or another publisher currently holds the lease.
+ * Both are facts about that single unit — the rest of the pass is unaffected —
+ * so the readiness loop skips it and keeps going (#292).
+ *
+ * Typed rather than left as a plain `Error` so the loop can classify it by
+ * construction instead of by matching on `Refusing to dispatch ...` text.
+ */
+class DispatchLifecycleClaimRefusedError extends Error {
+  constructor(
+    readonly issueKey: string,
+    readonly refusal: 'terminal' | 'owned-elsewhere',
+    message: string,
+  ) {
+    super(message)
+    this.name = 'DispatchLifecycleClaimRefusedError'
+  }
+}
+
 const realClock: Clock = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -743,6 +763,11 @@ export class FactoryLoop implements Factory {
   #discoverySweepRenewTimer?: ReturnType<typeof setInterval>
   #discoverySweepRenewalInFlight?: Promise<void>
   #discoverySweepLeaseLost = false
+  // Registry/heartbeat paths the in-flight runLoop iteration would use. A
+  // per-item dispatch failure now skips instead of aborting the pass (#292),
+  // so the loop's catch no longer runs the failure-handoff reaper for it; the
+  // pass reaps inline and must write to the same paths runLoop would.
+  #loopReapPaths?: { heartbeatPath: string; registryPath: string }
   #discoveryOverloadError?: unknown
   #resolvedIssueSource?: IssueSource
   #integrationInstructions?: string
@@ -2423,6 +2448,8 @@ export class FactoryLoop implements Factory {
           reason: entry.reason,
         })
       }
+      // Backstop for the skip-by-default catch below: see #292.
+      let consecutiveUnclassifiedFailures = 0
       let lastReadyReadProgressAtMs = this.#clock.now()
       let readyIssueReads = 0
 
@@ -2531,17 +2558,10 @@ export class FactoryLoop implements Factory {
 
           const decision = await this.triageIssue(issue)
           triaged.push(decision)
-          let result: DispatchResult
-          try {
-            result = await this.dispatch(decision, { dryRun })
-          } catch (error) {
-            if (!(error instanceof LiveDispatchStateChangedError)) throw error
-            recordSkip({ issue: decision.issue, reason: 'live state changed during dispatch' })
-            this.#logger.info?.('[factory] skipped issue whose live state changed during dispatch', {
-              issue: decision.issue.key,
-            })
-            continue
-          }
+          const result = await this.dispatch(decision, { dryRun })
+          // A completed dispatch — even one that parks or escalates the issue —
+          // proves the pipeline still works, so the fuse below starts over.
+          consecutiveUnclassifiedFailures = 0
           if (result.agents.length === 0 && !dryRun) {
             const reason = result.hold?.kind === 'dependency-cycle'
               ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
@@ -2552,6 +2572,45 @@ export class FactoryLoop implements Factory {
           } else {
             dispatched.push(result)
           }
+        } catch (error) {
+          // #292: issues in a pass are independent work units, so a failure
+          // that is about ONE unit costs that unit and nothing else. Only the
+          // conditions named in `#isPassFatalFailure` — the ones where
+          // continuing the pass is meaningless — abort the whole sweep.
+          if (this.#isPassFatalFailure(error)) throw error
+          if (!isClassifiedPerItemDispatchFailure(error)) {
+            consecutiveUnclassifiedFailures += 1
+            // A pass-wide fault can arrive disguised as a run of per-item
+            // faults. Skipping every unit would then hand back a green report
+            // that dispatched nothing, which is the same silent wedge #292 is
+            // about, wearing the opposite costume. Fail the pass loudly so
+            // `readinessReconcile.lastError` carries the cause.
+            if (consecutiveUnclassifiedFailures >= UNCLASSIFIED_DISPATCH_FAILURE_LIMIT) {
+              throw contextualError(
+                `Aborting readiness pass after ${consecutiveUnclassifiedFailures} consecutive unclassified dispatch failures`,
+                error,
+              )
+            }
+            this.#increment('dispatchItemFailuresSkipped')
+            this.#logger.warn?.('[factory] skipped a work unit whose dispatch failed; continuing the pass', {
+              issue: issueRef(issue).key,
+              consecutiveUnclassifiedFailures,
+              error: describeError(error).errorMessage,
+            })
+            this.#error(error, issueRef(issue))
+            // The failure may have left half-spawned agents behind. runLoop's
+            // catch used to reap them because this error aborted the pass;
+            // now that the pass survives, the reap has to happen here or the
+            // agents leak until the next failed iteration.
+            await this.#reapDispatchFailureHandoffsNow()
+          } else {
+            this.#logger.info?.('[factory] skipped a work unit that cannot be dispatched right now', {
+              issue: issueRef(issue).key,
+              error: describeError(error).errorMessage,
+            })
+          }
+          recordSkip({ issue: issueRef(issue), reason: perItemDispatchSkipReason(error) })
+          continue
         } finally {
           if (recoveredIdentity) this.#reconciledGithubInProgress.delete(recoveredIdentity)
         }
@@ -2582,6 +2641,55 @@ export class FactoryLoop implements Factory {
         })
       }
     }
+  }
+
+  /**
+   * Whether a failure raised while processing ONE work unit must abort the
+   * whole readiness pass instead of skipping that unit.
+   *
+   * The default is the opposite, and that inversion is the fix for #292.
+   * Issues in a pass are independent work units: a failure that is *about one
+   * unit* — its dispatch-lifecycle record, its live state, a provider fault on
+   * its own writeback — costs that unit and nothing else. Before this, every
+   * error except `LiveDispatchStateChangedError` escaped the `for` loop, so a
+   * single issue whose lifecycle record had gone terminal stopped all dispatch
+   * indefinitely, every pass.
+   *
+   * A condition belongs here only when continuing the pass is meaningless or
+   * actively harmful — when the failure is about the *pass*, not the item:
+   *
+   * - The discovery sweep lease is gone. Another process now owns this
+   *   workspace's sweep, so every remaining read throws the same way and each
+   *   one would be recorded as an ordinary per-issue skip. The run report
+   *   would then claim a clean pass over work this process no longer has the
+   *   right to touch.
+   * - Relayfile signalled overload for this sweep. The backend is shedding
+   *   load; grinding through the remaining units makes it worse, and
+   *   `#runOnceWithDiscoveryFence` is going to rethrow this at the fence
+   *   anyway.
+   * - The factory is stopping. Teardown is in progress and dispatching more
+   *   agents now leaks them past the shutdown deadline.
+   * - The fleet control-plane circuit is open. Dispatch is globally paused —
+   *   this is the same condition `#assertFleetControlPlaneAvailable` refuses
+   *   to *start* a pass on, so it must also stop one already in flight.
+   *
+   * Deliberately NOT here: JavaScript builtin error types. Classifying
+   * "programmer faults" such as `TypeError` as fatal is the obvious next rule
+   * and it is a trap — Node reports a failed `fetch` as `TypeError: fetch
+   * failed`, which is precisely the transient per-item roster lookup that
+   * wedged the second instance (#291). A rule keyed on builtin types would
+   * have preserved that outage verbatim.
+   *
+   * Everything else — a refused lifecycle claim, a terminal lifecycle record,
+   * a transient network fault on one issue — is per-item: record a skip and
+   * keep going. The consecutive-failure fuse in `#performRunOnce` is the
+   * backstop for a pass-wide fault that does not announce itself as one.
+   */
+  #isPassFatalFailure(error: unknown): boolean {
+    if (this.#discoverySweepLeaseLost || this.#discoveryOverloadError !== undefined || this.#stopping) {
+      return true
+    }
+    return isPassFatalDispatchError(error)
   }
 
   #startDiscoverySweepRenewal(epoch: number): void {
@@ -3555,6 +3663,7 @@ export class FactoryLoop implements Factory {
     )))
     const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
     const registryPath = opts.registryPath ?? this.#config.loop.registryPath
+    this.#loopReapPaths = { heartbeatPath, registryPath }
     const reports: IterationReport[] = []
     let consecutiveFailures = 0
     let completed = false
@@ -3611,6 +3720,7 @@ export class FactoryLoop implements Factory {
       completed = true
       return reports
     } finally {
+      this.#loopReapPaths = undefined
       if (!completed) {
         await this.#writeLoopHeartbeat(heartbeatPath, registryPath, 'stopping', reports.length, maxIterations)
       }
@@ -4679,10 +4789,15 @@ export class FactoryLoop implements Factory {
       DISPATCH_LIFECYCLE_LEASE_MS,
     )
     if (!claim.acquired || !claim.lease) {
-      const reason = isTerminalDispatchLifecycle(claim.lifecycle)
+      const terminal = isTerminalDispatchLifecycle(claim.lifecycle)
+      const reason = terminal
         ? 'dispatch lifecycle is already terminal'
         : `dispatch lifecycle is owned by ${claim.lifecycle.lease?.owner ?? 'another publisher'}`
-      throw new Error(`Refusing to dispatch ${decision.issue.key}: ${reason}`)
+      throw new DispatchLifecycleClaimRefusedError(
+        decision.issue.key,
+        terminal ? 'terminal' : 'owned-elsewhere',
+        `Refusing to dispatch ${decision.issue.key}: ${reason}`,
+      )
     }
     this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
     this.#hydrateCostLedger(claim.lifecycle)
@@ -6836,7 +6951,10 @@ export class FactoryLoop implements Factory {
     })
   }
 
-  async #reapDispatchFailureHandoffsNow(heartbeatPath: string, registryPath: string): Promise<void> {
+  async #reapDispatchFailureHandoffsNow(
+    heartbeatPath = this.#loopReapPaths?.heartbeatPath ?? this.#config.loop.heartbeatPath,
+    registryPath = this.#loopReapPaths?.registryPath ?? this.#config.loop.registryPath,
+  ): Promise<void> {
     const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
     if (handoffs.length === 0) {
       return
@@ -19047,6 +19165,55 @@ export class LiveDispatchStateChangedError extends Error {
 /** Whether a thrown value is a {@link LiveDispatchStateChangedError}. */
 export function isLiveDispatchStateChangedError(error: unknown): error is LiveDispatchStateChangedError {
   return error instanceof LiveDispatchStateChangedError
+}
+
+/**
+ * Error types that abort a readiness pass rather than skipping one work unit.
+ * Kept deliberately short; the reasoning for what is in and out of this set
+ * lives on `FactoryLoop#isPassFatalFailure`.
+ */
+const PASS_FATAL_DISPATCH_ERRORS: ReadonlyArray<abstract new (...args: never[]) => Error> = [
+  FleetControlPlaneCircuitOpenError,
+]
+
+/** How deep to follow `cause` when classifying a wrapped failure. */
+const PASS_FATAL_CAUSE_DEPTH = 4
+
+/**
+ * How many consecutive *unclassified* per-item failures end the pass. Named
+ * per-item conditions (a lifecycle claim refusal, a live-state race) never
+ * count toward it: those legitimately affect many units at once and are
+ * exactly the benign case #292 asks the loop to survive.
+ */
+const UNCLASSIFIED_DISPATCH_FAILURE_LIMIT = 5
+
+/**
+ * Failures the loop recognizes as belonging to one work unit. They are always
+ * skippable and are exempt from the consecutive-failure fuse.
+ */
+const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
+  error instanceof LiveDispatchStateChangedError ||
+  error instanceof DispatchLifecycleClaimRefusedError
+
+const isPassFatalDispatchError = (error: unknown, depth = 0): boolean => {
+  if (depth > PASS_FATAL_CAUSE_DEPTH || !(error instanceof Error)) return false
+  if (isClassifiedPerItemDispatchFailure(error)) return false
+  if (PASS_FATAL_DISPATCH_ERRORS.some((type) => error instanceof type)) return true
+  // `contextualError` and the fleet control-plane guard both re-throw wrapped,
+  // so classification has to follow the cause chain rather than trust the
+  // outermost type.
+  return isPassFatalDispatchError((error as { cause?: unknown }).cause, depth + 1)
+}
+
+/** The run-report reason recorded for a work unit the pass could not dispatch. */
+const perItemDispatchSkipReason = (error: unknown): string => {
+  if (error instanceof LiveDispatchStateChangedError) return 'live state changed during dispatch'
+  if (error instanceof DispatchLifecycleClaimRefusedError) {
+    return error.refusal === 'terminal'
+      ? 'dispatch lifecycle already terminal'
+      : 'dispatch lifecycle owned by another publisher'
+  }
+  return `dispatch failed: ${describeError(error).errorMessage}`
 }
 
 const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
