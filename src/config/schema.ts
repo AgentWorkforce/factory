@@ -40,6 +40,26 @@ const subscriptionSchema = z.object({
   assignees: z.array(z.string()).default([]),
 }).default({})
 
+/**
+ * Deadline for one readiness reconcile sweep (#296).
+ *
+ * This is a wedge backstop, not a latency target. An unbounded sweep stops the
+ * reconcile loop permanently and silently, because the timer re-arms only when
+ * the sweep settles — so the deadline exists to guarantee that it settles.
+ *
+ * DO NOT lower this to a small multiple of `reconcileIntervalMs`. Container
+ * disk is ephemeral, so the Relayfile mirror rehydrates on every boot, and #36
+ * measured a real cold-mirror reconcile at 3,665,173 ms (61 minutes) in
+ * production. A deadline under realistic worst-case hydration converts a slow
+ * boot into a crash loop, which is worse than the hang it would be preventing.
+ * 90 minutes leaves roughly 47% headroom over that measurement.
+ *
+ * A stall is *reported* far sooner than it is killed — see
+ * `READINESS_RECONCILE_STALL_INTERVALS` — so operators do not wait 90 minutes
+ * to learn that a pass is stuck.
+ */
+export const DEFAULT_READINESS_RECONCILE_TIMEOUT_MS = 90 * 60_000
+
 const liveSubscriptionSchema = z.object({
   transport: z.enum(['subscribe-and-poll', 'subscribe', 'poll']).default('subscribe-and-poll'),
   pollIntervalMs: z.number().int().min(50).default(5_000),
@@ -47,6 +67,19 @@ const liveSubscriptionSchema = z.object({
   replaySkewMarginMs: z.number().int().min(0).default(60_000),
   /** Independent source-of-truth sweep; live event watermarks remain a latency optimization. */
   reconcileIntervalMs: z.number().int().min(50).default(60_000),
+  /** Bounds one sweep so a hung dependency call cannot stop the loop forever. */
+  reconcileTimeoutMs: z.number().int().min(50).max(6 * 60 * 60_000)
+    .default(DEFAULT_READINESS_RECONCILE_TIMEOUT_MS),
+}).superRefine((value, ctx) => {
+  // A deadline below the interval kills every pass that takes longer than one
+  // tick, which is most of them on a cold mirror.
+  if (value.reconcileTimeoutMs < value.reconcileIntervalMs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['reconcileTimeoutMs'],
+      message: `reconcileTimeoutMs (${value.reconcileTimeoutMs}) must be at least reconcileIntervalMs (${value.reconcileIntervalMs})`,
+    })
+  }
 }).default({})
 
 export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000

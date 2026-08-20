@@ -65,7 +65,8 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "intervalMs": 60000,
     "lastStartedAtMs": 1787224595805,   // 11:16:35.805Z
     "lastCompletedAtMs": 1787224535802, // 11:15:35.802Z — 60s EARLIER
-    "inFlightMs": 4560000,          // now − lastStarted: this pass has run 76 minutes
+    "inFlightSinceMs": 1787224595805,   // when the oldest sweep still running began
+    "inFlightMs": 4560000,          // this pass has run 76 minutes
     "missedPasses": 76,
     "lastErrorClass": "TimeoutError"
   },
@@ -78,16 +79,26 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
 
 - **`consecutiveFailures` / `lastErrorClass`** — the failing case. During the outage this read 7 then
   8 while `/healthz` said `ok: true` and published nothing but the string `degraded`.
-- **`lastStartedAtMs` vs `lastCompletedAtMs`** — the *silent* case. A sweep that hangs takes neither
-  the success nor the failure path, so no state is written and every settled field keeps reading
-  green. `lastStarted > lastCompleted` is the only evidence that a pass is in flight, and `inFlightMs`
-  says for how long.
+- **`inFlightSinceMs`, or `lastStartedAtMs` vs `lastCompletedAtMs`** — the *silent* case. A sweep that
+  hangs takes neither the success nor the failure path, so no state is written and every settled field
+  keeps reading green. `inFlightSinceMs` is the daemon saying outright when the oldest sweep still
+  running began; `inFlightMs` is its age. Where it is absent — a heartbeat written by a build before
+  #296 — fall back to `lastStarted > lastCompleted`, which infers the same thing from timestamp order.
+  Prefer the published field: once a sweep has passed its deadline (below) the wait records a failure
+  while the sweep underneath it keeps running, and order alone then reports nothing in flight.
 - **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
   as hard as a failing sweep. `closed` is the healthy value.
 - **`state: "stalled"`** — derived, not written: an in-flight pass older than ten sweep intervals.
   A cold container legitimately spends minutes in its first pass (#36 measured 61 minutes while the
   Relayfile mirror hydrated), so check `lastCompletedAtMs`: absent means "first pass since boot,
   still hydrating"; present and hours old means "was fine, then wedged".
+- **How long a stall can last** — a sweep is bounded at `liveSubscription.reconcileTimeoutMs`,
+  90 minutes by default (#296). On expiry the *wait* fails, so `consecutiveFailures` starts rising
+  and the loop schedules the next pass; the sweep itself is not cancelled, because it holds a durable
+  discovery lease, so `inFlightSinceMs` keeps ageing until it really finishes. A `stalled` state that
+  never turns into a rising `consecutiveFailures` therefore means the process is not running the loop
+  at all, which is a restart, not a wait. The deadline sits above #36's 61-minute measurement on
+  purpose: setting it below realistic cold-mirror hydration would turn a slow boot into a crash loop.
 
 ### Why `ok` stays `true` while `status` goes amber
 
