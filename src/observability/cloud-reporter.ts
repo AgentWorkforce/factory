@@ -253,8 +253,12 @@ export class FactoryCloudReporter implements FactoryEventReporter {
     let retryDelayMs = this.#retryBaseMs
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
       if (this.#now() >= deadlineAt) return { delivered: false, attempts: attempt - 1, stoppedReason: 'deadline' }
-      let response: Response
+      let response: Response | undefined
       let request: CloudRequestLifetime | undefined
+      // The attempt failed in a way that says nothing about the batch: the
+      // request never completed, or its acknowledgement was cut short. Both
+      // back off and try again rather than parking the batch.
+      let transient = false
       try {
         const token = await this.#requestAccessToken(attempt, deadlineAt)
         if (!token.trim()) throw new Error('Cloud access token is empty')
@@ -269,14 +273,7 @@ export class FactoryCloudReporter implements FactoryEventReporter {
           attempt,
           errorClass: errorClass(error),
         })
-        if (attempt >= this.#maxAttempts) {
-          return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
-        }
-        if (!await this.#waitForRetry(retryDelayMs, deadlineAt)) {
-          return { delivered: false, attempts: attempt, stoppedReason: 'deadline' }
-        }
-        retryDelayMs = this.#nextRetryDelay(attempt)
-        continue
+        transient = true
       }
 
       // Response headers are not the response. The body arrives on the same
@@ -285,49 +282,69 @@ export class FactoryCloudReporter implements FactoryEventReporter {
       // survives close() and holds the event loop open. Released here rather
       // than in a whole-attempt finally so a retry never sleeps with the
       // connection still open.
-      try {
-        if (response.status === 201) {
-          const payload = ingestResponseSchema.safeParse(await this.#readBody(response, deadlineAt))
-          if (payload.success && payload.data.accepted + payload.data.duplicates === batch.events.length) {
-            return { delivered: true, attempts: attempt }
+      if (request && response) {
+        try {
+          if (response.status === 201) {
+            const payload = ingestResponseSchema.safeParse(await this.#readBody(response, request, deadlineAt))
+            if (payload.success && payload.data.accepted + payload.data.duplicates === batch.events.length) {
+              return { delivered: true, attempts: attempt }
+            }
+            this.#logger?.warn?.('[factory] cloud progress response was incomplete', { status: response.status })
+            return { delivered: false, attempts: attempt, stoppedReason: 'rejected', retryDelayMs: this.#retryMaxMs }
           }
-          this.#logger?.warn?.('[factory] cloud progress response was incomplete', { status: response.status })
-          return { delivered: false, attempts: attempt, stoppedReason: 'rejected', retryDelayMs: this.#retryMaxMs }
-        }
 
-        // A Cloud CLI token can expire between provider resolution and the
-        // request. Retry once through the provider's forced-refresh path without
-        // delaying the durable queue.
-        if (response.status === 401 && attempt < this.#maxAttempts) {
+          // A Cloud CLI token can expire between provider resolution and the
+          // request. Retry once through the provider's forced-refresh path without
+          // delaying the durable queue.
+          if (response.status === 401 && attempt < this.#maxAttempts) {
+            continue
+          }
+
+          if (response.status === 401) {
+            return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+          }
+
+          if (!isRetryableStatus(response.status)) {
+            this.#logger?.warn?.('[factory] cloud progress batch rejected', { status: response.status })
+            return {
+              delivered: false,
+              attempts: attempt,
+              stoppedReason: 'rejected',
+              retryDelayMs: this.#retryMaxMs,
+              discard: isPermanentPayloadRejectionStatus(response.status),
+              status: response.status,
+            }
+          }
+
+          retryDelayMs = retryAfterMs(response, this.#now()) ?? this.#nextRetryDelay(attempt)
+          if (attempt >= this.#maxAttempts) {
+            return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
+          }
+        } catch (error) {
+          // The acknowledgement never finished arriving. Cloud did not reject
+          // anything, so treating it like a malformed body would park a healthy
+          // batch for retryMaxMs; ingestion is idempotent, so re-send instead.
+          if (!(error instanceof FactoryCloudRequestTimeoutError)) throw error
+          this.#logger?.warn?.('[factory] cloud progress acknowledgement timed out', { attempt })
+          transient = true
+        } finally {
+          request.release()
+        }
+        if (!transient) {
+          if (!await this.#waitForRetry(retryDelayMs, deadlineAt)) {
+            return { delivered: false, attempts: attempt, stoppedReason: 'deadline' }
+          }
           continue
         }
+      }
 
-        if (response.status === 401) {
-          return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
-        }
-
-        if (!isRetryableStatus(response.status)) {
-          this.#logger?.warn?.('[factory] cloud progress batch rejected', { status: response.status })
-          return {
-            delivered: false,
-            attempts: attempt,
-            stoppedReason: 'rejected',
-            retryDelayMs: this.#retryMaxMs,
-            discard: isPermanentPayloadRejectionStatus(response.status),
-            status: response.status,
-          }
-        }
-
-        retryDelayMs = retryAfterMs(response, this.#now()) ?? this.#nextRetryDelay(attempt)
-        if (attempt >= this.#maxAttempts) {
-          return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
-        }
-      } finally {
-        request?.release()
+      if (attempt >= this.#maxAttempts) {
+        return { delivered: false, attempts: attempt, stoppedReason: 'retry-exhausted', retryDelayMs }
       }
       if (!await this.#waitForRetry(retryDelayMs, deadlineAt)) {
         return { delivered: false, attempts: attempt, stoppedReason: 'deadline' }
       }
+      retryDelayMs = this.#nextRetryDelay(attempt)
     }
     return { delivered: false, attempts: this.#maxAttempts, stoppedReason: 'retry-exhausted', retryDelayMs }
   }
@@ -410,14 +427,16 @@ export class FactoryCloudReporter implements FactoryEventReporter {
 
   /**
    * Read the acknowledgement body. A body that is malformed is a rejection; a
-   * body cut short by shutdown or the deadline is a stop, not a rejection.
+   * body cut short by shutdown, the deadline, or the request timeout is a stop
+   * or a transient failure, not a rejection.
    */
-  async #readBody(response: Response, deadlineAt: number): Promise<unknown> {
+  async #readBody(response: Response, request: CloudRequestLifetime, deadlineAt: number): Promise<unknown> {
     try {
       return await this.#withinDeadline(response.json(), deadlineAt)
     } catch (error) {
       if (isDeadlineExceeded(error)) throw error
       if (this.#shutdown.signal.aborted) throw new FactoryCloudShutdownError()
+      if (request.signal.aborted) throw new FactoryCloudRequestTimeoutError()
       return undefined
     }
   }
@@ -506,6 +525,18 @@ class FactoryCloudShutdownError extends FactoryCloudDeadlineError {
     super()
     this.name = 'FactoryCloudShutdownError'
     this.message = 'Factory Cloud reporting stopped at shutdown'
+  }
+}
+
+/**
+ * The per-request timeout fired before the round trip finished. Deliberately
+ * not a deadline error: the flush may still have time, and the batch's fate is
+ * simply unknown, so it retries like any other transient failure.
+ */
+class FactoryCloudRequestTimeoutError extends Error {
+  constructor() {
+    super('Factory Cloud request timed out')
+    this.name = 'FactoryCloudRequestTimeoutError'
   }
 }
 

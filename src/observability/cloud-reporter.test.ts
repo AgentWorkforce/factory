@@ -167,6 +167,45 @@ describe('FactoryCloudReporter', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
+  it('retries a 201 whose acknowledgement body is cut short by the request timeout', async () => {
+    let calls = 0
+    const waits: number[] = []
+    const fetch = vi.fn(async (_url, init) => {
+      calls += 1
+      if (calls > 1) return response(201, { accepted: 1, duplicates: 0 })
+      // Cloud answers 201 and then stalls mid-body. A real fetch tears the body
+      // down when the request timeout aborts the signal.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => {
+            controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }, { once: true })
+        },
+      })
+      return new Response(body, { status: 201, headers: { 'Content-Type': 'application/json' } })
+    })
+    const reporter = await createReporter({
+      fetch,
+      requestTimeoutMs: 10,
+      maxAttempts: 2,
+      retryBaseMs: 5,
+      sleep: async (ms) => { waits.push(ms) },
+    })
+    await reporter.report(progress('event-body-timeout'))
+
+    // A timed-out acknowledgement is not a rejection: nothing said the batch was
+    // bad, so it belongs on the transient retry path rather than parked for
+    // retryMaxMs. Ingestion is idempotent, so a re-send is safe.
+    expect(await reporter.flush()).toMatchObject({
+      delivered: 1,
+      pending: 0,
+      attempts: 2,
+      stoppedReason: 'empty',
+    })
+    expect(waits).toEqual([5])
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
   it('bounds close even when an earlier unbounded flush is already running', async () => {
     let resolveTokenRequested!: () => void
     const tokenRequested = new Promise<void>((resolve) => {
