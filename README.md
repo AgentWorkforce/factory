@@ -140,6 +140,7 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
 | `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
+| `factory diagnose --deployed <url>` | Ask a **deployed** instance why it is or is not dispatching. Reads the unauthenticated `/healthz` diagnostics block — readiness failure count, error class, in-flight sweep age — with no credential; `--token` (or `FACTORY_EVIDENCE_TOKEN`) also reads the gated `/evidence` message. Exits non-zero when the instance is not dispatching. See [deployed diagnostics](docs/deployed-diagnostics.md). |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
 | `factory reap-orphans [--include-held]` | Report stale factory processes and held agents. By default held agents are visible but retained; `--include-held` releases held agents whose configured deadline has elapsed. Kubernetes cleanup is reported as not applicable when no environment provider is configured. |
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
@@ -182,6 +183,14 @@ For a live daemon, `factory status` also includes `readinessReconcile`. Its
 state advances from `retrying` to `degraded` after three consecutive periodic
 discovery failures and returns to `healthy` after a successful checkpoint.
 The same record includes the last error, attempt duration, and failure count.
+
+Those counters only move when a sweep *settles*, so a sweep that hangs would
+leave every field reading `healthy` forever. `readinessReconcile` therefore
+also carries `intervalMs` and `inFlightMs`, and reports `stalled` when a pass
+has been in flight for more than ten sweep intervals. The redacted subset of
+this record is published on the deployed instance's `/healthz` and is what
+`factory diagnose --deployed` reads — see
+[deployed diagnostics](docs/deployed-diagnostics.md).
 
 Dispatch lifecycle writes are claim-critical. Factory applies the
 `factory:in-progress` label/state before the dispatch comment, confirms the

@@ -126,6 +126,12 @@ import {
   type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
+import { telemetryErrorClass } from '../observability/error-class'
+import {
+  derivedReadinessReconcileState,
+  publicHealthFromHeartbeat,
+  readinessReconcileInFlightMs,
+} from './public-health'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -713,6 +719,7 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastCompletedAtMs?: number
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
+  #readinessReconcileLastErrorClass?: string
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -1433,9 +1440,26 @@ export class FactoryLoop implements Factory {
       this.#logger.info?.('[factory] running startup ready-issue backfill before draining buffered events', {
         highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
       })
+      // Review follow-up on #300 (P1, cubic). The startup backfill is a
+      // discovery pass like any other, and it is the one most likely to hang:
+      // #36 measured 61 minutes here while the Relayfile mirror hydrated on a
+      // cold container. Stamping it means a wedged FIRST pass is visible as
+      // in-flight, instead of leaving the timestamps empty and the derived
+      // state reading `healthy` forever.
+      //
+      // Only the timestamps. `consecutiveFailures` and `lastError` belong to
+      // the reconcile loop's own failure accounting, which owns the degraded
+      // threshold and the #297 reason allowlist; a startup failure is already
+      // counted by `liveStartupBackfillErrors` and reported through `#error`.
+      const backfillStartedAtMs = this.#clock.now()
+      this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
         await this.runOnce()
+        this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
+        this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       } catch (error) {
+        this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
+        this.#readinessReconcileLastFailureAtMs = this.#clock.now()
         // A startup backfill failure must not abort the daemon: log it and fall
         // back to the live event stream (plus any buffered events) instead of
         // leaving the factory down.
@@ -1599,6 +1623,7 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       this.#readinessReconcileLastError = undefined
+      this.#readinessReconcileLastErrorClass = undefined
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
@@ -1625,6 +1650,9 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
       this.#readinessReconcileLastError = errorMessage
+      // The class, unlike the message, is publishable: #295 puts it on the
+      // unauthenticated health surface through the same allowlist.
+      this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
       this.#increment('readinessReconcileErrors')
       this.#logger.warn?.('[factory] periodic readiness reconciliation failed; retry remains scheduled', {
         error: errorMessage,
@@ -4581,17 +4609,54 @@ export class FactoryLoop implements Factory {
 
   #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
     const consecutiveFailures = this.#readinessReconcileConsecutiveFailures
-    const state = this.#startMode !== 'live'
+    const settled: FactoryReadinessReconcileStatus['state'] = this.#startMode !== 'live'
       ? 'not-running'
       : consecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD
         ? 'degraded'
         : consecutiveFailures > 0
           ? 'retrying'
           : 'healthy'
+    // The counters above only move when a pass *settles*. A pass that hangs
+    // takes neither path, so `settled` would keep reporting the last finished
+    // pass — `healthy` — for as long as the process is stuck (#295). The
+    // in-flight age is the only field that can express that, so derive the
+    // state from it rather than trusting the last write.
+    const timestamps = {
+      intervalMs: this.#readinessReconcileIntervalMs,
+      ...(this.#readinessReconcileLastStartedAtMs !== undefined
+        ? { lastStartedAtMs: this.#readinessReconcileLastStartedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastCompletedAtMs !== undefined
+        ? { lastCompletedAtMs: this.#readinessReconcileLastCompletedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastFailureAtMs !== undefined
+        ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
+        : {}),
+    }
+    const nowMs = this.#clock.now()
+    // Defence in depth (#300 review, CodeRabbit). These derivations are new
+    // code from another module on a path that `status()` and every heartbeat
+    // write depend on. A throw here would take out the liveness signal the
+    // crash reaper reads — the diagnostic causing the outage it exists to
+    // explain — so a failure costs the derived fields and nothing else.
+    let inFlightMs: number | undefined
+    let derived: FactoryReadinessReconcileStatus['state'] | 'unknown' = settled
+    try {
+      inFlightMs = readinessReconcileInFlightMs(timestamps, nowMs)
+      derived = derivedReadinessReconcileState({ ...timestamps, state: settled }, nowMs)
+    } catch (error) {
+      this.#logger.warn?.('[factory] readiness health derivation failed; reporting the settled state', {
+        error: describeError(error).errorMessage,
+      })
+      inFlightMs = undefined
+      derived = settled
+    }
     return {
-      state,
+      state: derived === 'unknown' ? settled : derived,
       consecutiveFailures,
       failureThreshold: READINESS_RECONCILE_FAILURE_THRESHOLD,
+      intervalMs: this.#readinessReconcileIntervalMs,
+      ...(inFlightMs !== undefined ? { inFlightMs } : {}),
       ...(this.#readinessReconcileLastDurationMs !== undefined
         ? { lastDurationMs: this.#readinessReconcileLastDurationMs }
         : {}),
@@ -4605,6 +4670,9 @@ export class FactoryLoop implements Factory {
         ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
+      ...(this.#readinessReconcileLastErrorClass
+        ? { lastErrorClass: this.#readinessReconcileLastErrorClass }
+        : {}),
     }
   }
 
@@ -7292,6 +7360,28 @@ export class FactoryLoop implements Factory {
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
+    }
+    // The deployed container serves `/healthz` straight out of this file and
+    // has no redaction logic of its own, so publish the already-safe view here
+    // rather than leaving that boundary to whoever reads the file (#295).
+    // Derived against this daemon's clock: every duration in it is a
+    // difference between timestamps this process wrote.
+    //
+    // Guarded (#300 review, CodeRabbit): this heartbeat is what the crash
+    // reaper and `/healthz` read to decide the daemon is alive, and several
+    // callers of this method sit outside any try/catch. A projection failure
+    // must cost the diagnostics block, never the heartbeat — the omitted block
+    // is itself legible, since `factory diagnose` reports a missing one rather
+    // than a false green.
+    try {
+      heartbeat.health = publicHealthFromHeartbeat(heartbeat, {
+        nowMs: updatedAtMs,
+        staleMs: this.#config.loop.heartbeatStaleMs,
+      })
+    } catch (error) {
+      this.#logger.warn?.('[factory] public health projection failed; heartbeat written without it', {
+        error: describeError(error).errorMessage,
+      })
     }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
@@ -19308,11 +19398,6 @@ const telemetryCategory = (value: string | undefined): string | undefined => {
   if (!value) return undefined
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:/-]+/gu, '-')
   return normalized.slice(0, 120) || undefined
-}
-
-const telemetryErrorClass = (error: unknown): string => {
-  const name = error instanceof Error ? error.name : ''
-  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 const isTimeoutError = (error: unknown): boolean =>

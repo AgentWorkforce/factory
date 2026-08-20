@@ -1,3 +1,4 @@
+export * from './error-class.js'
 export * from './cloud-reporter.js'
 export * from './events.js'
 export * from './instance-identity.js'

@@ -8,6 +8,7 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
 import { initializeFactory } from './init'
+import { diagnoseDeployedFactory, renderDeployedDiagnosis } from './diagnose'
 import {
   FACTORY_EXIT,
   exitCodeForDispatchResult,
@@ -159,6 +160,8 @@ export interface FleetCliDeps {
   cloudAccessTokenFetch?: typeof fetch
   /** Hermetic Cloud telemetry transport for CLI integration tests. */
   cloudReporterFetch?: typeof fetch
+  /** Hermetic deployed-instance transport for `diagnose --deployed` tests. */
+  diagnoseFetch?: typeof fetch
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
@@ -203,6 +206,7 @@ type ParsedCommand =
   | { kind: 'factory-close-probe'; prNumber: number; repo: string; issue: string }
   | { kind: 'featuremap-check'; manifestPath?: string; baseRef?: string }
   | { kind: 'factory-init'; repo?: string; workspaceId?: string }
+  | { kind: 'factory-diagnose'; url: string; token?: string; json: boolean; timeoutMs?: number }
   | { kind: 'notion-intake'; manifestPath: string }
   | {
       kind: 'notion-manifest'
@@ -232,7 +236,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       return 0
     }
     const { globals, args } = parseGlobalOptions(argv)
-    const command = parseFleetCommand(args)
+    const command = parseFleetCommand(args, deps.env ?? process.env)
 
     if (command.kind === 'featuremap-check') {
       const report = await (deps.featureMapCheck ?? checkFeatureMap)({
@@ -241,6 +245,26 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       })
       writeJson(out, report)
       return 0
+    }
+
+    if (command.kind === 'factory-diagnose') {
+      // Deliberately ahead of every config/mount/fleet setup below: the whole
+      // point of #295 is that this runs from anywhere — a laptop, a lane, a
+      // runbook — against an instance this checkout knows nothing about.
+      const diagnosis = await diagnoseDeployedFactory({
+        url: command.url,
+        ...(command.token ? { token: command.token } : {}),
+        ...(command.timeoutMs !== undefined ? { timeoutMs: command.timeoutMs } : {}),
+        ...(deps.diagnoseFetch ? { fetch: deps.diagnoseFetch } : {}),
+      })
+      if (command.json) {
+        writeJson(out, diagnosis)
+      } else {
+        out.write(renderDeployedDiagnosis(diagnosis))
+      }
+      // Same contract as `factory canary`: a lane that only reads $? must be
+      // able to tell "production is dispatching" from "it is not".
+      return diagnosis.dispatching ? FACTORY_EXIT.OK : FACTORY_EXIT.FAILED
     }
 
     if (command.kind === 'factory-init') {
@@ -608,14 +632,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   }
 }
 
-export function parseFleetCommand(args: string[]): ParsedCommand {
+export function parseFleetCommand(args: string[], env: NodeJS.ProcessEnv = process.env): ParsedCommand {
   const [verb, ...rest] = args
   if (!verb) {
     throw new Error(usage())
   }
 
   if (isFactoryAction(verb)) {
-    return parseFactoryCommand(args)
+    return parseFactoryCommand(args, env)
   }
 
   if (verb === 'fleet') {
@@ -1436,7 +1460,7 @@ function resolveLocalMountFn(
   }
 }
 
-function parseFactoryCommand(args: string[]): ParsedCommand {
+function parseFactoryCommand(args: string[], env: NodeJS.ProcessEnv = process.env): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
   if (action === 'init') {
     const values = [issueOrPr, ...flags].filter((value): value is string => Boolean(value))
@@ -1453,6 +1477,12 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
       repo = value
     }
     return { kind: 'factory-init', repo, workspaceId }
+  }
+  if (action === 'diagnose') {
+    return parseFactoryDiagnoseFlags(
+      [issueOrPr, ...flags].filter((value): value is string => Boolean(value)),
+      env,
+    )
   }
   if (action === 'start') {
     return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
@@ -1533,6 +1563,65 @@ function evaluateFactoryCanary(
     status: 'unknown',
     reason: 'issue pulled but neither dispatched, triaged, nor skipped',
   }
+}
+
+function parseFactoryDiagnoseFlags(flags: string[], env: NodeJS.ProcessEnv): ParsedCommand {
+  let url: string | undefined
+  // The injected environment, not the process one: an embedder or a hermetic
+  // test that supplies `deps.env` must not silently skip the authenticated
+  // read (#300 review, P2, cubic).
+  let token = env.FACTORY_EVIDENCE_TOKEN?.trim() || undefined
+  let json = false
+  let timeoutMs: number | undefined
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index]
+    if (flag === '--deployed' || flag === '--url') {
+      url = requireValue(flags, ++index, flag)
+      continue
+    }
+    if (flag === '--token') {
+      token = requireValue(flags, ++index, '--token')
+      continue
+    }
+    if (flag === '--timeout-ms') {
+      const value = Number(requireValue(flags, ++index, '--timeout-ms'))
+      if (!Number.isInteger(value) || value <= 0) throw new Error('--timeout-ms requires a positive integer')
+      timeoutMs = value
+      continue
+    }
+    if (flag === '--json') {
+      json = true
+      continue
+    }
+    // A bare URL is the same request spelled shorter.
+    if (!flag.startsWith('-') && !url) {
+      url = flag
+      continue
+    }
+    // Never echo the value: `factory diagnose <url> <token>` is a plausible
+    // slip, and this message reaches stderr and from there CI logs (#300
+    // review, CodeRabbit). The position is enough to find it.
+    if (!flag.startsWith('-')) {
+      throw new Error(
+        `factory diagnose accepts one url; argument ${index + 1} is a second positional value. ` +
+        'Pass a token with --token, not as a bare argument.',
+      )
+    }
+    throw new Error(`Unknown factory diagnose option at argument ${index + 1}`)
+  }
+  if (!url) {
+    throw new Error('factory diagnose requires --deployed <url> (the deployed instance base URL)')
+  }
+  if (!/^https?:\/\//u.test(url)) {
+    // Not echoed, for the same reason as the positional case above: the value
+    // in the url slot is exactly where a mistyped `--token` argument lands
+    // (#300 review, cubic).
+    throw new Error(
+      'factory diagnose --deployed requires an http(s) url; the value given does not start with ' +
+      'http:// or https://. If that value is a token, pass it with --token.',
+    )
+  }
+  return { kind: 'factory-diagnose', url, json, ...(token ? { token } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}) }
 }
 
 function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live' } {
@@ -2556,6 +2645,7 @@ function isCapability(value: string | undefined): value is Capability {
 
 function isFactoryAction(value: string): boolean {
   return value === 'init' ||
+    value === 'diagnose' ||
     value === 'start' ||
     value === 'run-once' ||
     value === 'loop' ||
@@ -2638,6 +2728,9 @@ Commands:
   status                Print current factory status as JSON
   loop                  Run the bounded loop configured in factory.config.json
   loop-status           Print heartbeat/liveness status for the loop
+  diagnose --deployed <url>
+                        Ask a DEPLOYED instance why it is or is not dispatching
+                        (--token/FACTORY_EVIDENCE_TOKEN also reads /evidence)
   kill-loop             Send SIGTERM to the heartbeat pid
   reap-orphans [--include-held]
                         Report stale processes and held agents; opt in to release held agents past deadline
