@@ -510,10 +510,15 @@ export class InternalFleetClient implements FleetClient {
       if (!reconnected || options?.retry !== true) {
         throw attributeBrokerError(error, attemptedBaseUrl)
       }
+      // Snapshot the retry's client too: yet another caller can reconnect while
+      // this retry is in flight, and attributing the failure to whatever
+      // `#client` happens to be by then would name a broker that never saw the
+      // request — the exact mis-diagnosis this attribution exists to prevent.
+      const retryClient = this.#client
       try {
-        return await call(this.#client)
+        return await call(retryClient)
       } catch (retryError) {
-        throw attributeBrokerError(retryError, this.#client.baseUrl)
+        throw attributeBrokerError(retryError, retryClient.baseUrl)
       }
     }
   }

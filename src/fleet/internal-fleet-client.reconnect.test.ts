@@ -369,6 +369,48 @@ describe('InternalFleetClient broker rebind recovery', () => {
     await loserRejects
   })
 
+  it('attributes a failed retry to the broker that received it, not a later one', async () => {
+    const connectionPath = connectionFile()
+    writeRawConnection(connectionPath, 'http://127.0.0.1:1', 'key-1')
+    const first = new ControllableClient('http://127.0.0.1:1', [])
+    const second = new ControllableClient('http://127.0.0.1:2', [])
+    const third = new ControllableClient('http://127.0.0.1:3', [])
+    const replacements = [second, third]
+
+    const fleet = new InternalFleetClient({
+      connectionPath,
+      client: first,
+      connect: () => replacements.shift()!,
+    })
+
+    // A fails on `first`, reconnects to `second`, and its retry is now in
+    // flight against `second`.
+    const retried = fleet.roster()
+    const retriedRejects = expect(retried).rejects.toThrow(/broker at http:\/\/127\.0\.0\.1:2/)
+    await flush()
+    writeRawConnection(connectionPath, 'http://127.0.0.1:2', 'key-2')
+    first.pending[0]!.reject(transportFailure())
+    await flush()
+    expect(second.pending).toHaveLength(1)
+
+    // While that retry is still open, a second caller rebinds again, so
+    // `#client` moves on to `third` underneath it.
+    const mover = fleet.roster()
+    const moverRejects = expect(mover).rejects.toThrow(/fetch failed/)
+    await flush()
+    writeRawConnection(connectionPath, 'http://127.0.0.1:3', 'key-3')
+    second.pending[1]!.reject(transportFailure())
+    await flush()
+    expect(third.pending).toHaveLength(1)
+
+    // Only now does the retry fail. It was answered by `second`, so naming
+    // `third` would point a future diagnosis at a broker that never saw it.
+    second.pending[0]!.reject(transportFailure())
+    await retriedRejects
+    third.pending[0]!.reject(transportFailure())
+    await moverRejects
+  })
+
   it('re-points a non-idempotent send at the rebound broker without replaying it', async () => {
     const connectionPath = connectionFile()
     const first = await startBroker({ apiKey: 'key-first', agents: ['worker'] })
