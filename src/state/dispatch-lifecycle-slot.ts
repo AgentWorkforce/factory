@@ -20,16 +20,32 @@ export const dispatchPhaseOccupiesSlot = (phase: DispatchLifecyclePhase | undefi
   phase !== 'complete' &&
   phase !== 'abandoned'
 
-export const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
-  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
+/**
+ * Spec-shaped so the orchestrator's in-flight records can ask the same
+ * question the stores ask of a durable row. A handed-off lifecycle stops
+ * counting against `batchSize`, so anything that reports occupancy — or bounds
+ * an occupant — has to agree with admission, or it reports slots that are not
+ * blocking anything (#303 review, codex).
+ */
+export const dispatchHandedOffToBabysitters = (
+  implementers: ReadonlyArray<{ repo: string }>,
+  agentSpecs: ReadonlyArray<{ role?: string; ownedPullRequest?: { repo: string } }>,
+): boolean => {
+  const implementerRepos = [...new Set(implementers.map((spec) => spec.repo))]
   if (implementerRepos.length === 0) return false
-  const babysitterRepos = lifecycle.agents
-    .filter((agent) => agent.tracked.spec.role === 'babysitter')
-    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
+  const babysitterRepos = agentSpecs
+    .filter((spec) => spec.role === 'babysitter')
+    .map((spec) => spec.ownedPullRequest?.repo)
     .filter((repo): repo is string => Boolean(repo))
   return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
     githubRepositoriesMatch(repo, ownedRepo)))
 }
+
+export const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean =>
+  dispatchHandedOffToBabysitters(
+    lifecycle.decision.implementers,
+    lifecycle.agents.map((agent) => agent.tracked.spec),
+  )
 
 export const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
   dispatchPhaseOccupiesSlot(lifecycle.phase) && !dispatchLifecycleHandedOffToBabysitters(lifecycle)

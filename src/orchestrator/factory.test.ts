@@ -10947,6 +10947,87 @@ describe('FactoryLoop', () => {
     }, 30_000)
   }
 
+  // #303 review (CodeRabbit): the sweep re-reads the durable row before tearing
+  // anything down, so it must also *classify* from it. Reading the stale
+  // in-memory record instead relabels a team that did run as never-placed —
+  // which excludes its agents from the release and leaks live workers.
+  it('classifies a release from the durable row when the in-flight record lags a placement (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-durable-classification-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(310)]: issueFile(310) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decision = await seed.triageIssue(parseLinearIssue(issuePath(310), issueFile(310)))
+    await seed.stop()
+
+    const plannedSpec = decision.implementers[0]!
+    const key = issueKey(decision.issue)
+    const wedged: DispatchLifecycle = {
+      runId: 'lagging-run',
+      issue: { ...decision.issue },
+      decision,
+      dryRun: false,
+      phase: 'dispatching',
+      agents: [{ name: plannedSpec.name, tracked: { spec: { ...plannedSpec } } }],
+      invocationIds: [],
+      updatedAtMs: 0,
+    }
+    // Claimed on the real clock so the never-placed deadline is still ahead
+    // while the durable row is patched below; the lease is already expired.
+    await state().claimDispatchLifecycle('factory-test', key, wedged, 'dead-owner', Date.now(), 1)
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 5_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      // AR-310 is unreadable here, so the resume driver keeps failing and
+      // `BatchTracker#restore` keeps handing back the same stale record.
+      mount: new FakeMountClient({}),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+
+      // Another owner placed the agent and stamped the hold. Only the durable
+      // row knows; this process still holds the never-placed record.
+      const document = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, { dispatchLifecycles: Record<string, DispatchLifecycle> }>
+      }
+      const durable = document.workspaces['factory-test']!.dispatchLifecycles[key]!
+      durable.heldSinceAtMs = 0
+      durable.agents[0]!.tracked.result = {
+        name: plannedSpec.name,
+        sessionRef: 'session-310',
+        node: 'sf-mini',
+        locality: 'remote',
+      }
+      await writeFile(watchStatePath, JSON.stringify(document))
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 15_000 })
+      expect(fleet.releases).toContainEqual({ name: plannedSpec.name, reason: 'held-past-deadline' })
+      // The release reason and the release itself are the discriminators: read
+      // from the stale record this row is classified never-placed, which both
+      // relabels it and filters its agent out of the release entirely.
+      // `heldPastDeadlineReleases` is deliberately not asserted — the sweep
+      // only increments it when the abandon completes on that same pass, and
+      // this one does real agent teardown, so a slower pass finishes through
+      // `#scheduleAbandonedDispatchRetry` with the same durable outcome.
+      expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
   // sight would convert a wedge into a dispatch race.
@@ -21724,6 +21805,13 @@ describe('FactoryLoop PR babysitter', () => {
         reason: 'superseded-pr-receipt',
       }))
       expect(factory.status().counters.supersededBabysittersReleased).toBe(1)
+      // #303 review (codex): admission stops counting a lifecycle once every
+      // implementer repo is babysat, so the reported occupancy has to stop
+      // counting it too. Reporting it would name a slot that is not blocking
+      // anything — and with batchSize 1, `active: 1` here is a claim the
+      // store's own predicate contradicts.
+      expect(factory.status().dispatchCapacity).toMatchObject({ batchSize: 1, active: 0, waiting: 0 })
+      expect(factory.status().dispatchCapacity?.occupants).toBeUndefined()
     } finally {
       await factory.stop()
     }

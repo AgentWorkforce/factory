@@ -229,8 +229,15 @@ export interface FactoryPublicReadinessReconcileHealth {
 export interface FactoryDispatchSlotOccupant {
   issue: string
   phase?: DispatchLifecyclePhase
-  /** Placements recorded on the lifecycle, including planned-but-unspawned. */
+  /** Entries recorded on the lifecycle, including planned-but-unspawned. */
   agents: number
+  /**
+   * Entries that actually reached a spawn result.
+   *
+   * `agents` counts specs: `BatchTracker#recordPlanned` writes one before the
+   * spawn returns. Zero here with a slot held is the wedge signature.
+   */
+  placedAgents: number
   /** Since the first successful placement, when there has been one. */
   heldForMs?: number
   /** Since the row took the batch slot, whether or not it ever placed an agent. */

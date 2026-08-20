@@ -304,8 +304,16 @@ function dispatchCapacityHealth(
   const waiting = counter(status.waiting)
   const longestWaitMs = finiteNumber(status.longestWaitMs)
   const warnMs = positiveNumber(status.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS
+  // `agents` counts specs, and `recordPlanned` writes one before the spawn
+  // returns — so a dispatch that died mid-spawn reports `agents: 1` with no
+  // placement, and counting specs would drop the wedge signature for exactly
+  // the case #303 exists for. `heldForMs` is stamped only by a successful
+  // placement, and `placedAgents` says so outright; prefer the explicit count
+  // and fall back for a producer that does not send it.
   const agentlessOccupants = (status.occupants ?? [])
-    .filter((occupant) => counter(occupant.agents) === 0).length
+    .filter((occupant) => (occupant.placedAgents !== undefined
+      ? counter(occupant.placedAgents) === 0
+      : finiteNumber(occupant.heldForMs) === undefined)).length
   return {
     state: deriveDispatchCapacityState(waiting, longestWaitMs, warnMs),
     batchSize: counter(status.batchSize),

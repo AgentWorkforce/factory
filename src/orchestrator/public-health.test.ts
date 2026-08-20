@@ -40,7 +40,16 @@ describe('dispatch capacity health (#303)', () => {
       waiting: 3,
       waitWarnMs: 30 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
-      occupants: [{ issue: 'AR-303', phase: 'dispatching', agents: 0, slotHeldForMs: 13 * 60 * 60_000 }],
+      // `recordPlanned` wrote a spec and the spawn never returned, so the row
+      // reports an agent and no placement — the shape the projection must not
+      // mistake for a healthy occupant (#303 review).
+      occupants: [{
+        issue: 'AR-303',
+        phase: 'dispatching',
+        agents: 1,
+        placedAgents: 0,
+        slotHeldForMs: 13 * 60 * 60_000,
+      }],
       waitingIssues: ['AR-304', 'AR-305', 'AR-306'],
       ...overrides,
     },
@@ -63,6 +72,20 @@ describe('dispatch capacity health (#303)', () => {
     // Liveness must not move: recycling the container would destroy the
     // evidence of the wedge and carry the durable lock into the replacement.
     expect(health.ok).toBe(true)
+  })
+
+  it('falls back to the placement stamp for a producer without placedAgents', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        occupants: [
+          { issue: 'AR-303', phase: 'dispatching', agents: 1 } as never,
+          { issue: 'AR-307', phase: 'running', agents: 2, heldForMs: 90_000 } as never,
+        ],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.agentlessOccupants).toBe(1)
   })
 
   it('keeps issue keys behind the authenticated surface', () => {

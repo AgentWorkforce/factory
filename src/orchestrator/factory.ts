@@ -56,7 +56,7 @@ import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
-import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
+import { dispatchHandedOffToBabysitters, dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
 import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
@@ -5260,6 +5260,22 @@ export class FactoryLoop implements Factory {
    * the spec before the spawn returns, so a process that died mid-spawn leaves
    * an agent entry with no result and still no placement.
    */
+  /**
+   * Does this in-flight record hold a `batchSize` slot right now?
+   *
+   * The same predicate the state stores apply to the durable row, asked of the
+   * in-memory one. Phase alone is not it: once every implementer repo has been
+   * handed to a babysitter, admission stops counting the lifecycle, so
+   * reporting it as an occupant would name slots that are not blocking
+   * anything (#303 review, codex).
+   */
+  #recordOccupiesSlot(record: InFlightIssue): boolean {
+    return dispatchPhaseOccupiesSlot(record.lifecyclePhase) && !dispatchHandedOffToBabysitters(
+      record.decision.implementers,
+      [...record.agents.values()].map((tracked) => tracked.spec),
+    )
+  }
+
   #holdDeadline(record: InFlightIssue): {
     kind: 'agents' | 'agentless'
     sinceAtMs: number
@@ -5278,7 +5294,7 @@ export class FactoryLoop implements Factory {
     }
     // Only a row that is actually holding a slot is worth reaping; a `queued`
     // or `waiting-for-human` row costs nothing and may wait indefinitely.
-    if (record.slotHeldSinceAtMs === undefined || !dispatchPhaseOccupiesSlot(record.lifecyclePhase)) {
+    if (record.slotHeldSinceAtMs === undefined || !this.#recordOccupiesSlot(record)) {
       return undefined
     }
     const timeoutMs = this.#config.dispatch.agentlessHoldTimeoutMs
@@ -5337,6 +5353,12 @@ export class FactoryLoop implements Factory {
       const deadline = this.#holdDeadline(record)
       if (!deadline || nowMs < deadline.dueAtMs) continue
 
+      // The durable row wins the classification when there is one. The
+      // in-memory record can lag a placement made in another process, and
+      // reading the stale one would relabel a team that did run as
+      // never-placed — which also excludes its agents from the release below,
+      // leaking live workers (#303 review, CodeRabbit).
+      let effective = deadline
       const key = issueKey(record.issue)
       if (this.#abandonedDispatchReasons.has(key)) continue
       if (this.#usesDurableDispatchLifecycle()) {
@@ -5356,15 +5378,16 @@ export class FactoryLoop implements Factory {
         // moving (#303 must-not-fire).
         const durable = this.#holdDeadline(inFlightRecordFromLifecycle(lifecycle))
         if (!durable || this.#clock.now() < durable.dueAtMs) continue
+        effective = durable
         if (!await this.#assertDispatchLifecycleOwner(record)) continue
       }
 
-      const agentless = deadline.kind === 'agentless'
-      const heldForMs = Math.max(0, this.#clock.now() - deadline.sinceAtMs)
+      const agentless = effective.kind === 'agentless'
+      const heldForMs = Math.max(0, this.#clock.now() - effective.sinceAtMs)
       const details = {
         issue: record.issue.key,
         heldForMs,
-        holdTimeoutMs: deadline.timeoutMs,
+        holdTimeoutMs: effective.timeoutMs,
         waitingForTerminalState: this.#config.terminalState,
         reason: agentless ? AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON : HELD_PAST_DEADLINE_RELEASE_REASON,
         agents: [...record.agents.keys()].sort(),
@@ -5828,10 +5851,9 @@ export class FactoryLoop implements Factory {
     record.lifecyclePhase = phase
     // Mirror what the store stamps, so the reaper's never-placed clock is
     // readable from the in-memory record between durable reads (#303). The
-    // store owns the authoritative value and re-applies the babysitter-handoff
-    // half of the predicate; here `agents.size === 0` for every record this
-    // anchor is ever consulted for, and a handed-off row has babysitters.
-    if (dispatchPhaseOccupiesSlot(phase)) record.slotHeldSinceAtMs ??= this.#clock.now()
+    // store still owns the authoritative value; this uses the same predicate so
+    // the two cannot disagree.
+    if (this.#recordOccupiesSlot(record)) record.slotHeldSinceAtMs ??= this.#clock.now()
     else record.slotHeldSinceAtMs = undefined
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
@@ -5948,11 +5970,14 @@ export class FactoryLoop implements Factory {
   /** Issue keys currently holding a `batchSize` slot, for operator surfaces. */
   #dispatchSlotOccupants(): FactoryDispatchSlotOccupant[] {
     return (this.#batchView?.inFlight ?? [])
-      .filter((record) => !record.dryRun && dispatchPhaseOccupiesSlot(record.lifecyclePhase))
+      .filter((record) => !record.dryRun && this.#recordOccupiesSlot(record))
       .map((record) => ({
         issue: record.issue.key,
         ...(record.lifecyclePhase ? { phase: record.lifecyclePhase } : {}),
         agents: record.agents.size,
+        // Specs, not workers: `recordPlanned` writes an entry before the spawn
+        // returns, so `agents > 0` is not proof of a placement (#303 review).
+        placedAgents: [...record.agents.values()].filter((tracked) => tracked.result !== undefined).length,
         ...(record.heldSinceAtMs !== undefined
           ? { heldForMs: Math.max(0, this.#clock.now() - record.heldSinceAtMs) }
           : {}),
