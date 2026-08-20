@@ -507,5 +507,29 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(text).toContain('predates')
     expect(text.match(/^ +phase +:/gmu)?.length ?? 0).toBe(1)
   })
+  // Review follow-up on #300 (P3, cubic). Introduced by my own refactor: with
+  // only one legacy state string present, the other rendered as the literal
+  // "undefined" in the verdict.
+  it('says unknown, never undefined, for a legacy state string that is missing', async () => {
+    const out = buffer()
+    await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            heartbeat: { status: 'running', eventListener: 'subscribed' },
+          },
+        },
+      }),
+    })
+
+    const report = JSON.parse(out.text()) as { verdict: string }
+    expect(report.verdict).not.toContain('undefined')
+    expect(report.verdict).toContain('readinessReconcile=unknown')
+  })
 })
 

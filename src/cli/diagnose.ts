@@ -207,7 +207,7 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       dispatching: false,
       verdict:
         'cannot tell: this instance predates the /healthz diagnostics block (#295), so it publishes ' +
-        `state strings only — readinessReconcile=${legacy.readinessReconcile}, ` +
+        `state strings only — readinessReconcile=${legacy.readinessReconcile ?? 'unknown'}, ` +
         `eventListener=${legacy.eventListener ?? 'unknown'}. ` +
         'Upgrade the deployed Factory, or pass --token to read /evidence.',
     }
