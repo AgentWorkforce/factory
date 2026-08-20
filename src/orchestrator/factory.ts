@@ -448,6 +448,38 @@ const DISCOVERY_SWEEP_RENEW_MS = 30_000
 const READINESS_RECONCILE_FAILURE_THRESHOLD = 3
 const DISCOVERY_CHANGE_EVENT_LIMIT = 1_000
 const DISCOVERY_OVERLOAD_BACKOFF_MAX_MS = 5 * 60_000
+/** First rung of the ladder when the 429 advertises no `Retry-After`. */
+const DISCOVERY_OVERLOAD_BACKOFF_BASE_MS = 5_000
+/**
+ * Floor for the advertised delay. `Retry-After: 0` would otherwise pin the
+ * whole ladder at zero (`0 * 2 ** n` is still zero) and turn respecting the
+ * dependency into hammering it.
+ */
+const DISCOVERY_OVERLOAD_BACKOFF_MIN_MS = 1_000
+/**
+ * Ceiling for the ladder once the dependency has told us how long to wait.
+ *
+ * relayfile sheds an overloaded workspace DO with a 429 in milliseconds
+ * carrying `Retry-After: 5`, and #297 is what happened when the ladder ignored
+ * that and climbed to `DISCOVERY_OVERLOAD_BACKOFF_MAX_MS` anyway: the
+ * dependency asked for five seconds, Factory slept for five minutes, probed
+ * for recovery once per cap-length window, and presented a transient upstream
+ * blip as a sustained outage. The ratchet still escalates — it is just bounded
+ * by roughly what was actually asked for, and never *below* it, so this is a
+ * ceiling and not a licence to retry sooner than the dependency allows.
+ */
+const DISCOVERY_OVERLOAD_ADVERTISED_BACKOFF_MAX_MS = 30_000
+/**
+ * How many relayfile operations one sweep may have shed before the sweep is
+ * abandoned rather than continued.
+ *
+ * Per-item overload skips that item and keeps going (#297, the same principle
+ * as #292), but skipping must not degenerate into grinding a shedding
+ * dependency through an entire backlog one 429 at a time. Past this many, the
+ * dependency is not serving this sweep at all: abort, back off, and let the
+ * ratchet do its job.
+ */
+const DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT = 5
 const GITHUB_FACTORY_LABEL = 'factory'
 const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
 const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
@@ -768,7 +800,34 @@ export class FactoryLoop implements Factory {
   // so the loop's catch no longer runs the failure-handoff reaper for it; the
   // pass reaps inline and must write to the same paths runLoop would.
   #loopReapPaths?: { heartbeatPath: string; registryPath: string }
+  /**
+   * The first 429 relayfile raised during this sweep, kept for its
+   * `Retry-After` and reason when the sweep decides how long to back off.
+   *
+   * Before #297 this doubled as a sweep-wide kill switch: any 429 from any
+   * relayfile call latched here and `#runOnceWithDiscoveryFence` then threw it
+   * away along with everything the sweep had already accomplished. It is now
+   * only evidence, never a verdict — see `#discoverySweepOverloads` for the
+   * fuse that still ends a sweep the dependency is genuinely refusing to serve.
+   */
   #discoveryOverloadError?: unknown
+  /** Relayfile operations this sweep has been shed on. */
+  #discoverySweepOverloads = 0
+  /**
+   * The longest `Retry-After` any operation in this sweep advertised.
+   *
+   * `#discoveryOverloadError` latches the FIRST 429, so deriving the backoff
+   * from it alone would let the durable window expire before a later, longer
+   * advertised delay permits — breaking the very guarantee #297 is about. The
+   * backoff takes the maximum instead.
+   */
+  #discoverySweepRetryAfterSeconds?: number
+  /**
+   * Whether relayfile served at least one ready work unit end to end during
+   * this sweep — its issue read, or a dispatch built on it. This is what
+   * decays the durable overload ratchet; see `#discoveryOverloadOutcome`.
+   */
+  #discoverySweepProgress = false
   #resolvedIssueSource?: IssueSource
   #integrationInstructions?: string
   #integrationInstructionsRefresh?: Promise<string | undefined>
@@ -1547,7 +1606,21 @@ export class FactoryLoop implements Factory {
         skipped: report.skipped.length,
       })
     } catch (error) {
-      const errorMessage = describeError(error).errorMessage
+      // #297: all four relayfile overload reason codes share one message, and
+      // `lastError` is what an operator reads from /evidence. Without the
+      // reason, "workspace durable object is busy" cannot be told apart from
+      // three other conditions with three different remedies.
+      //
+      // Allowlisted, because this is a persisted operator-facing surface and
+      // not just a log line: `lastError` is returned from `status()` and
+      // written into the loop heartbeat file, so an unbounded
+      // dependency-controlled string would land on disk.
+      const overload = relayfileOverload(error)
+      const errorMessage = overload
+        ? `${describeError(error).errorMessage} ` +
+          `[relayfile ${overload.status} ${relayfileOverloadReasonLabel(overload.reason)}` +
+          `${overload.retryAfterSeconds === undefined ? '' : `; retry-after=${overload.retryAfterSeconds}s`}]`
+        : describeError(error).errorMessage
       this.#readinessReconcileConsecutiveFailures += 1
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
@@ -2328,12 +2401,29 @@ export class FactoryLoop implements Factory {
     this.#discoverySweepStartedAtMs = sweepStartedAtMs
     this.#discoverySweepLeaseLost = false
     this.#discoveryOverloadError = undefined
+    this.#discoverySweepOverloads = 0
+    this.#discoverySweepRetryAfterSeconds = undefined
+    this.#discoverySweepProgress = false
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
     let leaseReleased = false
     try {
       this.#discoverySession = await this.#prepareDiscoverySession(claim)
+      // #297: a 429 raised anywhere in the sweep used to latch and be rethrown
+      // here, discarding a completed pass — every issue read, every dispatch —
+      // because of one transient shed operation. The work this sweep did is
+      // now kept instead, and the ratchet below records that the dependency is
+      // shedding but still serving.
       const report = await this.#performRunOnce(opts)
-      if (this.#discoveryOverloadError) throw this.#discoveryOverloadError
+      // The exception, and the reason skipping shed units cannot make a sweep
+      // unconditionally green: a sweep that was shed AND got no work unit
+      // through accomplished nothing. There is no progress to preserve, and
+      // committing it would report a clean sweep over a dependency that served
+      // none of it — leaving `readinessReconcile` healthy while Factory
+      // dispatches nothing, which is the #292 wedge wearing the other costume.
+      // Fail it so the ratchet escalates and readiness reflects reality.
+      if (this.#discoveryOverloadError !== undefined && !this.#discoverySweepProgress) {
+        throw this.#discoveryOverloadError
+      }
       const checkpoint = await this.#finalizeDiscoveryCheckpoint()
       // Do not clear the durable lease while a renewal can still be waiting on
       // the same state-file lock. A late renewal that observes the completed
@@ -2343,12 +2433,8 @@ export class FactoryLoop implements Factory {
       if (this.#discoverySweepLeaseLost) {
         throw new Error('discovery sweep lease was lost before checkpoint commit')
       }
-      const completed = await this.#state.completeDiscoverySweep(
-        this.#workspaceId,
-        this.#discoverySweepOwner,
-        claim.lease.epoch,
-        checkpoint,
-      )
+      const residual = this.#discoveryOverloadOutcome(claim.state.consecutiveOverloads, 'committed')
+      const completed = await this.#commitDiscoverySweep(claim.lease.epoch, checkpoint, residual)
       leaseReleased = completed
       if (!completed) throw new Error('discovery sweep lease was lost before completion')
       this.#logger.info?.('[factory] discovery sweep checkpoint committed', {
@@ -2362,24 +2448,24 @@ export class FactoryLoop implements Factory {
       await this.#stopDiscoverySweepRenewal()
       const overload = relayfileOverload(error)
       if (overload) {
-        const consecutiveOverloads = claim.state.consecutiveOverloads + 1
-        const delayMs = discoveryOverloadBackoffMs(overload.retryAfterSeconds, consecutiveOverloads)
-        const backoffUntilMs = this.#clock.now() + delayMs
+        const outcome = this.#discoveryOverloadOutcome(claim.state.consecutiveOverloads, 'aborted', error)!
         leaseReleased = await this.#state.deferDiscoverySweep(
           this.#workspaceId,
           this.#discoverySweepOwner,
           claim.lease.epoch,
-          backoffUntilMs,
-          consecutiveOverloads,
+          outcome.backoffUntilMs,
+          outcome.consecutiveOverloads,
         )
-        this.#increment('discoveryOverloadBackoffs')
         this.#logger.warn?.('[factory] Relayfile discovery overloaded; backing off before another sweep', {
           status: overload.status,
           reason: overload.reason,
-          retryAfterSeconds: overload.retryAfterSeconds,
-          delayMs,
-          backoffUntilMs,
-          consecutiveOverloads,
+          retryAfterSeconds: outcome.retryAfterSeconds,
+          delayMs: outcome.delayMs,
+          backoffUntilMs: outcome.backoffUntilMs,
+          consecutiveOverloads: outcome.consecutiveOverloads,
+          previousOverloads: claim.state.consecutiveOverloads,
+          sweepOverloads: this.#discoverySweepOverloads,
+          sweepProgress: this.#discoverySweepProgress,
         })
         // backoffUntilMs is already durable via deferDiscoverySweep, and the
         // next runOnce() honors it at the pre-claim wait above — sleeping
@@ -2394,6 +2480,9 @@ export class FactoryLoop implements Factory {
       this.#discoverySweepEpoch = undefined
       this.#discoverySweepStartedAtMs = undefined
       this.#discoveryOverloadError = undefined
+      this.#discoverySweepOverloads = 0
+      this.#discoverySweepRetryAfterSeconds = undefined
+      this.#discoverySweepProgress = false
       // This sweep is over either way (committed, deferred, or lease lost) —
       // a stale `true` here would otherwise make every #listRelayfileTree
       // call outside a fresh claim (Slack lookups, PR confirmation, the
@@ -2407,6 +2496,119 @@ export class FactoryLoop implements Factory {
           claim.lease.epoch,
         )
       }
+    }
+  }
+
+  /**
+   * Commit the sweep, carrying any residual overload backoff into the store.
+   *
+   * `completeDiscoverySweepWithOverload` is optional on the port so a store
+   * written before #297 keeps working. When one of those is injected and this
+   * sweep HAS a residual, the backoff cannot be persisted and the next sweep
+   * would retry immediately — so this says so, loudly and with a counter,
+   * rather than degrading in silence. The sweep itself still commits: losing
+   * the backoff is worse than pre-#297 behaviour only if nobody notices.
+   */
+  async #commitDiscoverySweep(
+    epoch: number,
+    checkpoint: DiscoveryCheckpoint | undefined,
+    residual?: { consecutiveOverloads: number; backoffUntilMs: number; delayMs: number },
+  ): Promise<boolean> {
+    if (residual && this.#state.completeDiscoverySweepWithOverload) {
+      return await this.#state.completeDiscoverySweepWithOverload(
+        this.#workspaceId,
+        this.#discoverySweepOwner,
+        epoch,
+        checkpoint,
+        { consecutiveOverloads: residual.consecutiveOverloads, backoffUntilMs: residual.backoffUntilMs },
+      )
+    }
+    if (residual) {
+      this.#increment('discoveryOverloadResidualUnsupported')
+      this.#logger.warn?.('[factory] state store cannot persist the Relayfile overload backoff; it will be lost', {
+        store: this.#state.constructor?.name,
+        consecutiveOverloads: residual.consecutiveOverloads,
+        backoffUntilMs: residual.backoffUntilMs,
+        delayMs: residual.delayMs,
+      })
+    }
+    return await this.#state.completeDiscoverySweep(
+      this.#workspaceId,
+      this.#discoverySweepOwner,
+      epoch,
+      checkpoint,
+    )
+  }
+
+  /**
+   * How the durable overload ratchet should read after this sweep, or
+   * `undefined` if relayfile never shed anything and the ordinary reset
+   * applies.
+   *
+   * #297, deliverable 3. `consecutiveOverloads` used to clear only on a
+   * *fully* clean sweep, so under sustained mild load the ratchet essentially
+   * never cleared: it climbed to the cap on the first bad sweep and stayed
+   * there, probing for recovery once per cap-length window, long after the
+   * dependency had recovered. Requiring perfection to clear a ratchet means
+   * the ratchet does not clear.
+   *
+   * The signal that replaces "was this sweep perfect" is "did relayfile serve
+   * any of this sweep's work units", because that is what the ratchet is
+   * actually for. A shedding DO rejects ALL background traffic —
+   * `oldest_inflight_age` does this regardless of how few requests are in
+   * flight — so a sweep against a genuinely overloaded workspace gets not one
+   * unit through and still escalates, all the way to the cap. A sweep that did
+   * get units through proves the dependency is serving us, so it decays by one
+   * rung. Decay, not reset: getting work done while being shed is not evidence
+   * that the overload is over, only that it is survivable.
+   */
+  #discoveryOverloadOutcome(
+    previousOverloads: number,
+    sweepOutcome: 'committed' | 'aborted',
+    error?: unknown,
+  ): {
+    consecutiveOverloads: number
+    backoffUntilMs: number
+    delayMs: number
+    retryAfterSeconds?: number
+  } | undefined {
+    const overload = relayfileOverload(error) ?? relayfileOverload(this.#discoveryOverloadError)
+    if (!overload) return undefined
+    // The longest delay anything in this sweep asked for, not just the one the
+    // latched or terminating error carried — see `#discoverySweepRetryAfterSeconds`.
+    const advertised = [this.#discoverySweepRetryAfterSeconds, overload.retryAfterSeconds]
+      .filter((value): value is number => value !== undefined)
+    const retryAfterSeconds = advertised.length > 0 ? Math.max(...advertised) : undefined
+    // Deliberately NOT "the sweep reached its end". A sweep in which relayfile
+    // shed EVERY unit still runs the loop to the end, and it got nothing done;
+    // treating that as progress would decay the ratchet in exactly the case it
+    // exists for. (`#runOnceWithDiscoveryFence` turns that sweep into an
+    // aborted one before it can commit, so the escalate branch here is reached
+    // only through `sweepOutcome === 'aborted'` — but the rule is a property of
+    // progress, not of which caller asked, and is written that way.)
+    const consecutiveOverloads = this.#discoverySweepProgress
+      ? Math.max(0, previousOverloads - 1)
+      : previousOverloads + 1
+    const delayMs = discoveryOverloadBackoffMs(retryAfterSeconds, consecutiveOverloads)
+    const backoffUntilMs = this.#clock.now() + delayMs
+    this.#increment('discoveryOverloadBackoffs')
+    if (sweepOutcome === 'committed') {
+      this.#logger.warn?.('[factory] discovery sweep committed despite Relayfile overload', {
+        status: overload.status,
+        reason: overload.reason,
+        retryAfterSeconds,
+        sweepOverloads: this.#discoverySweepOverloads,
+        previousOverloads,
+        consecutiveOverloads,
+        delayMs,
+        backoffUntilMs,
+      })
+    }
+    return {
+      consecutiveOverloads,
+      backoffUntilMs,
+      delayMs,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
     }
   }
 
@@ -2457,8 +2659,44 @@ export class FactoryLoop implements Factory {
 
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
-        const issue = await this.#readIssue(path)
+        let issue: LinearIssue | undefined
+        let shed = false
+        try {
+          issue = await this.#readIssue(path)
+        } catch (error) {
+          // #297: `#readIssue` rethrows relayfile overload and swallows every
+          // other read fault, so this catch only ever sees the backend
+          // shedding THIS issue's read. That is a fact about one work unit:
+          // a sweep that pulled 40 issues and was shed on the 39th must keep
+          // the other 39, exactly as #292 argued for dispatch failures. The
+          // fuse is what still ends a sweep the backend is refusing.
+          const overload = relayfileOverload(error)
+          // Defensive: anything `#readIssue` did not swallow and is not a 429
+          // is not ours to reclassify, and must surface as itself.
+          if (!overload) throw error
+          const fuse = this.#discoveryOverloadFuseError()
+          if (fuse) throw fuse
+          shed = true
+          this.#increment('discoveryOverloadItemsSkipped')
+          this.#logger.warn?.('[factory] relayfile shed a ready-issue read; skipping it and continuing the sweep', {
+            path,
+            status: overload.status,
+            reason: overload.reason,
+            retryAfterSeconds: overload.retryAfterSeconds,
+            sweepOverloads: this.#discoverySweepOverloads,
+          })
+          recordSkip({ issue: issueRefFromPath(path), reason: perItemDispatchSkipReason(error) })
+        }
         readyIssueReads += 1
+        // Relayfile served this work unit's read: the dependency is shedding
+        // but not refusing, which is what decays the ratchet (#297).
+        //
+        // `issue` is required, not just `!shed`: `#readIssue` returns
+        // `undefined` for a body it could not read at all, and the known
+        // phantom condition — the tree listing issue paths whose bodies are
+        // absent — makes every read return `undefined`. Crediting those would
+        // decay the ratchet on a sweep that served nothing.
+        if (!shed && issue) this.#discoverySweepProgress = true
         lastReadyReadProgressAtMs = this.#logTimedProgress(
           this.#config.issueSource === 'github'
             ? '[factory] GitHub ready issue read progress'
@@ -2467,10 +2705,12 @@ export class FactoryLoop implements Factory {
           lastReadyReadProgressAtMs,
           { read: readyIssueReads, total: paths.length, path },
         )
-        if (issue && issueSource === 'linear') {
-          await this.#recordCanonicalIssueState(issue)
+        if (!shed) {
+          if (issue && issueSource === 'linear') {
+            await this.#recordCanonicalIssueState(issue)
+          }
+          issueEntries.push({ path, issue })
         }
-        issueEntries.push({ path, issue })
         await this.#refreshLiveHeartbeatIfDue()
       }
       if (issueSource === 'github') {
@@ -2564,6 +2804,9 @@ export class FactoryLoop implements Factory {
           // A completed dispatch — even one that parks or escalates the issue —
           // proves the pipeline still works, so the fuse below starts over.
           unclassifiedFailuresSinceDispatch = 0
+          // ...and proves relayfile is still serving this sweep, which is what
+          // decays the durable overload ratchet (#297).
+          this.#discoverySweepProgress = true
           if (result.agents.length === 0 && !dryRun) {
             const reason = result.hold?.kind === 'dependency-cycle'
               ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
@@ -2575,12 +2818,46 @@ export class FactoryLoop implements Factory {
             dispatched.push(result)
           }
         } catch (error) {
+          // The failure may have left half-spawned agents behind, persisted as
+          // failure handoffs on the way out of `#dispatchUnlocked`. runLoop's
+          // catch used to reap them because every such error aborted the pass;
+          // now that most of them are skipped, the reap has to happen here.
+          //
+          // BEFORE the fatality check, not after (#298 review, round two): the
+          // 429 that trips the overload fuse aborts this pass, and a direct
+          // `runOnce()` — the `factory run-once` CLI, `#reconcileReadyIssues` —
+          // has no runLoop catch behind it, so the unit that trips the fuse
+          // would leak the agents it had already spawned. Reaping first covers
+          // the abort and the skip with one call; it is idempotent, so the
+          // runLoop catch finding nothing left to do is free.
+          if (mayHaveSpawnedBeforeFailing(error)) {
+            await this.#reapDispatchFailureHandoffsNow()
+          }
           // #292: issues in a pass are independent work units, so a failure
           // that is about ONE unit costs that unit and nothing else. Only the
           // conditions named in `#isPassFatalFailure` — the ones where
           // continuing the pass is meaningless — abort the whole sweep.
-          if (this.#isPassFatalFailure(error, dryRun)) throw error
-          if (!isClassifiedPerItemDispatchFailure(error)) {
+          if (this.#isPassFatalFailure(error, dryRun)) {
+            // The overload fuse may have been tripped by a 429 that a caller
+            // swallowed, leaving an unrelated error in hand. The fence keys
+            // the durable backoff off `relayfileOverload(error)`, so hand it
+            // the 429 rather than whatever surfaced last.
+            throw this.#discoveryOverloadFuseError() ?? error
+          }
+          const overload = relayfileOverload(error)
+          if (overload) {
+            // #297: shedding is a state of the dependency, not a fault of this
+            // work unit, so it stays out of `counters.errors` and gets its own
+            // counter — the same split #293 made for undispatchable units.
+            this.#increment('discoveryOverloadItemsSkipped')
+            this.#logger.warn?.('[factory] relayfile shed this work unit; skipping it and continuing the sweep', {
+              issue: issueRef(issue).key,
+              status: overload.status,
+              reason: overload.reason,
+              retryAfterSeconds: overload.retryAfterSeconds,
+              sweepOverloads: this.#discoverySweepOverloads,
+            })
+          } else if (!isClassifiedPerItemDispatchFailure(error)) {
             unclassifiedFailuresSinceDispatch += 1
             // A pass-wide fault can arrive disguised as a run of per-item
             // faults. Skipping every unit would then hand back a green report
@@ -2602,11 +2879,6 @@ export class FactoryLoop implements Factory {
               error: describeError(error).errorMessage,
             })
             this.#error(error, issueRef(issue))
-            // The failure may have left half-spawned agents behind. runLoop's
-            // catch used to reap them because this error aborted the pass;
-            // now that the pass survives, the reap has to happen here or the
-            // agents leak until the next failed iteration.
-            await this.#reapDispatchFailureHandoffsNow()
           } else {
             // Not an error — the unit simply cannot be dispatched right now —
             // so this stays out of `counters.errors` and gets its own counter
@@ -2653,6 +2925,21 @@ export class FactoryLoop implements Factory {
   }
 
   /**
+   * The 429 that ended this sweep, when relayfile has shed
+   * `DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT` operations and skipping the next work
+   * unit would just be grinding a shedding dependency. Undefined below that.
+   *
+   * Returns the *latched* 429 rather than whatever error is in hand, because
+   * `#runOnceWithDiscoveryFence` keys the durable backoff off
+   * `relayfileOverload(error)` and a caller may have swallowed the 429 that
+   * tripped the fuse.
+   */
+  #discoveryOverloadFuseError(): unknown {
+    if (this.#discoverySweepOverloads < DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT) return undefined
+    return this.#discoveryOverloadError
+  }
+
+  /**
    * Whether a failure raised while processing ONE work unit must abort the
    * whole readiness pass instead of skipping that unit.
    *
@@ -2672,10 +2959,11 @@ export class FactoryLoop implements Factory {
    *   one would be recorded as an ordinary per-issue skip. The run report
    *   would then claim a clean pass over work this process no longer has the
    *   right to touch.
-   * - Relayfile signalled overload for this sweep. The backend is shedding
-   *   load; grinding through the remaining units makes it worse, and
-   *   `#runOnceWithDiscoveryFence` is going to rethrow this at the fence
-   *   anyway.
+   * - Relayfile has shed `DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT` operations in
+   *   this sweep. A single shed operation is per-item and skippable (#297),
+   *   but past this the backend is not serving this sweep at all: grinding
+   *   through the remaining units makes it worse, and the fence needs the 429
+   *   to set the durable backoff.
    * - The factory is stopping. Teardown is in progress and dispatching more
    *   agents now leaks them past the shutdown deadline.
    * - The fleet control-plane circuit is no longer closed, **on a live pass**.
@@ -2704,7 +2992,15 @@ export class FactoryLoop implements Factory {
   #isPassFatalFailure(error: unknown, dryRun: boolean): boolean {
     // Sweep-scoped: these are about this process's right or ability to run the
     // pass at all, so they hold for a dry run exactly as for a live one.
-    if (this.#discoverySweepLeaseLost || this.#discoveryOverloadError !== undefined || this.#stopping) {
+    if (this.#discoverySweepLeaseLost || this.#stopping) {
+      return true
+    }
+    // #297: relayfile overload used to sit alongside those two, and it did not
+    // belong there. A 429 on ONE work unit is a fact about that unit's read or
+    // write, not about this process's right to run the pass — and because the
+    // flag latched for the whole sweep, the first transient shed also made
+    // every later unit fatal. Only sustained shedding is now pass-fatal.
+    if (this.#discoverySweepOverloads >= DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT) {
       return true
     }
     // Fleet-scoped, and therefore live-only. See the doc comment above.
@@ -3651,14 +3947,43 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
-      if (relayfileOverload(error) && this.#discoverySweepEpoch !== undefined) {
+      const overload = relayfileOverload(error)
+      if (overload && this.#discoverySweepEpoch !== undefined) {
         this.#discoveryOverloadError ??= error
+        this.#discoverySweepOverloads += 1
+        if (overload.retryAfterSeconds !== undefined) {
+          this.#discoverySweepRetryAfterSeconds = Math.max(
+            this.#discoverySweepRetryAfterSeconds ?? 0,
+            overload.retryAfterSeconds,
+          )
+        }
+        this.#increment('discoveryOverloadOperations')
+        // #297: relayfile's four overload reason codes — inflight_limit,
+        // oldest_inflight_age, router_inflight_limit, durable_object_overloaded
+        // — all share ONE message string, and they mean four different things:
+        // a DO-local admission cap, one stuck op poisoning every background
+        // caller, a Worker-global isolate cap, and the Cloudflare runtime
+        // shedding the object outright. `relayfileOverload()` has always parsed
+        // the reason; nothing on this path ever printed it, and during the
+        // 2026-08-20 outage that ambiguity was the single biggest obstacle to
+        // diagnosis. Unconditional, unlike the failure warn below: a 429 is
+        // always worth one line.
+        this.#increment(`discoveryOverloadReason:${relayfileOverloadReasonLabel(overload.reason)}`)
+        this.#logger.warn?.('[factory] relayfile shed a discovery operation', {
+          ...metadata,
+          status: overload.status,
+          reason: overload.reason,
+          retryAfterSeconds: overload.retryAfterSeconds,
+          sweepOverloads: this.#discoverySweepOverloads,
+          elapsedMs: this.#elapsedSince(startedAtMs),
+        })
       }
       if (opts.logFailure || waitWarnings > 0) {
         this.#increment('relayfileOperationFailures')
         this.#logger.warn?.('[factory] relayfile operation failed', {
           ...metadata,
           elapsedMs: this.#elapsedSince(startedAtMs),
+          ...(overload ? { status: overload.status, reason: overload.reason } : {}),
           error: describeError(error).errorMessage,
         })
       }
@@ -6990,12 +7315,18 @@ export class FactoryLoop implements Factory {
     heartbeatPath = this.#loopReapPaths?.heartbeatPath ?? this.#config.loop.heartbeatPath,
     registryPath = this.#loopReapPaths?.registryPath ?? this.#config.loop.registryPath,
   ): Promise<void> {
-    const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
-    if (handoffs.length === 0) {
-      return
-    }
-
     try {
+      // Inside the try, not before it (#298 review). Every caller reaps while
+      // already handling a failure and then propagates that failure: the
+      // per-item catch rethrows the dispatch error, runLoop's catch is mid
+      // teardown. A throw from here would REPLACE the error in flight — and a
+      // replaced 429 is no longer recognised as overload at the discovery
+      // fence, silently dropping the advertised backoff. Reaping is
+      // best-effort by construction; the caller's error always wins.
+      const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
+      if (handoffs.length === 0) {
+        return
+      }
       const protectedPids = await this.#protectedPids()
       let registryChanged = false
       const readyToClear = new Set<string>()
@@ -16376,6 +16707,16 @@ const githubIssueAuthor = (issue: LinearIssue): string | undefined => {
   return source ? undefined : githubAuthorLogin(payload)?.trim() || undefined
 }
 
+/**
+ * An `IssueRef` for a path whose issue body could not be read at all — the
+ * shape a relayfile-shed ready-issue read leaves behind (#297). The key is
+ * what an operator needs to correlate the skip; the uuid falls back to it.
+ */
+const issueRefFromPath = (path: string): IssueRef => {
+  const key = keyFromPath(path)
+  return { uuid: uuidFromPath(path) ?? key, key, path }
+}
+
 const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
 
 // Preserve the historical Linear state namespace while keeping GitHub-native
@@ -18665,16 +19006,60 @@ const relayfileOverload = (error: unknown): RelayfileOverload | undefined => {
   return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
 }
 
+/**
+ * relayfile's overload reason codes, allowlisted.
+ *
+ * `IterationReport.skipped[].reason` is serialized to stdout by `factory
+ * run-once`, so it stays a fixed classification plus a known code — the same
+ * public-surface rule #293 applied to error class names — rather than
+ * whatever string the dependency happened to send.
+ */
+const RELAYFILE_OVERLOAD_REASONS = new Set([
+  // Admission gate inside the workspace durable object.
+  'inflight_limit',
+  'oldest_inflight_age',
+  'write_admission_limit',
+  // Worker-side backpressure, per isolate rather than per workspace.
+  'router_inflight_limit',
+  // The Cloudflare runtime shed the object; relayfile only relabels it.
+  'durable_object_overloaded',
+  // relayfileOverload()'s fallback when the body carried no reason at all.
+  'rate_limited',
+])
+
+/**
+ * Both the run-report reason and the per-reason counter key are built from
+ * this, so an unknown code from the dependency can neither leak into stdout
+ * nor open an unbounded counter namespace.
+ */
+const relayfileOverloadReasonLabel = (reason: string): string =>
+  RELAYFILE_OVERLOAD_REASONS.has(reason) ? reason : 'unrecognized'
+
+/**
+ * How long to wait before the next discovery sweep after relayfile shed this
+ * one.
+ *
+ * The advertised `Retry-After` is authoritative in BOTH directions (#297):
+ * it is the first rung, so we never retry sooner than the dependency allows,
+ * and it bounds the ceiling, so we never sleep for minutes because of a
+ * request to wait seconds. Without an advertised delay there is nothing to
+ * respect and the original five-minute ladder governs unchanged.
+ */
 const discoveryOverloadBackoffMs = (
   retryAfterSeconds: number | undefined,
   consecutiveOverloads: number,
 ): number => {
-  const retryAfterMs = Math.max(0, Math.ceil((retryAfterSeconds ?? 0) * 1_000))
-  const exponentialMs = Math.min(
-    DISCOVERY_OVERLOAD_BACKOFF_MAX_MS,
-    5_000 * (2 ** Math.min(10, Math.max(0, consecutiveOverloads - 1))),
-  )
-  return Math.max(retryAfterMs, exponentialMs)
+  const advertisedMs = retryAfterSeconds === undefined
+    ? undefined
+    : Math.max(DISCOVERY_OVERLOAD_BACKOFF_MIN_MS, Math.ceil(retryAfterSeconds * 1_000))
+  const baseMs = advertisedMs ?? DISCOVERY_OVERLOAD_BACKOFF_BASE_MS
+  // A dependency that asks for longer than the advertised ceiling still gets
+  // what it asked for; the ceiling only stops the ladder from overshooting it.
+  const ceilingMs = advertisedMs === undefined
+    ? DISCOVERY_OVERLOAD_BACKOFF_MAX_MS
+    : Math.max(advertisedMs, DISCOVERY_OVERLOAD_ADVERTISED_BACKOFF_MAX_MS)
+  const steps = Math.min(10, Math.max(0, consecutiveOverloads - 1))
+  return Math.min(ceilingMs, baseMs * (2 ** steps))
 }
 
 const eventSequenceNumber = (eventId: string): number | undefined => {
@@ -19237,7 +19622,28 @@ const UNCLASSIFIED_DISPATCH_FAILURE_LIMIT = 5
  */
 const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
   error instanceof LiveDispatchStateChangedError ||
-  error instanceof DispatchLifecycleClaimRefusedError
+  error instanceof DispatchLifecycleClaimRefusedError ||
+  // Relayfile shedding one operation is a state of the dependency, not an
+  // unexplained fault, and it has its own fuse — see #297 and
+  // DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT.
+  relayfileOverload(error) !== undefined
+
+/**
+ * Whether a per-item failure could have left half-spawned agents behind.
+ *
+ * The two lifecycle refusals are decided before `#dispatchUnlocked` spawns
+ * anything, so there is nothing to reap for them. Everything else can fail
+ * *after* a spawn — including relayfile shedding a post-spawn read — having
+ * persisted the agents as failure handoffs on the way out.
+ *
+ * Deliberately a denylist rather than an allowlist: a new failure mode that
+ * nobody classified should default to "reap it", because the cost of a
+ * needless reap is one no-op pass over an empty handoff list, while the cost
+ * of a missed one is leaked agents and duplicate workers on the next retry.
+ */
+const mayHaveSpawnedBeforeFailing = (error: unknown): boolean =>
+  !(error instanceof LiveDispatchStateChangedError) &&
+  !(error instanceof DispatchLifecycleClaimRefusedError)
 
 /**
  * The run-report reason recorded for a work unit the pass could not dispatch.
@@ -19249,6 +19655,8 @@ const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
  * `describeControlPlaneError` makes for circuit state.
  */
 const perItemDispatchSkipReason = (error: unknown): string => {
+  const overload = relayfileOverload(error)
+  if (overload) return `relayfile overloaded (${relayfileOverloadReasonLabel(overload.reason)})`
   if (error instanceof LiveDispatchStateChangedError) return 'live state changed during dispatch'
   if (error instanceof DispatchLifecycleClaimRefusedError) {
     return error.refusal === 'terminal'

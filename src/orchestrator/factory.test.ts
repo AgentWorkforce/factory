@@ -45,7 +45,7 @@ import {
   type ResourceSubscriptionsClient,
 } from '../subscriptions'
 import { InternalFleetClient, type HarnessDriverClientLike } from '../fleet/internal-fleet-client'
-import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim, DiscoverySweepRenewal, DispatchLifecycle } from '../ports/state'
+import type { ConversationMessage, ConversationSessionState, DiscoverySweepClaim, DiscoverySweepRenewal, DispatchLifecycle, StateStore } from '../ports/state'
 import {
   DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
@@ -4094,6 +4094,759 @@ describe('FactoryLoop', () => {
       message: '[factory] discovery sweep waiting for Relayfile overload backoff',
       details: expect.objectContaining({ delayMs: 7_000 }),
     }))
+  })
+
+  // #297: relayfile answers an overloaded workspace DO with a 429 in
+  // milliseconds carrying `Retry-After: 5`. Factory answered by sleeping up to
+  // 300 SECONDS, latching on the first 429 raised anywhere in the sweep, and
+  // discarding everything the sweep had already accomplished. Root-caused
+  // during the 2026-08-20 cloud outage.
+  describe('Relayfile discovery overload (#297)', () => {
+    // All four relayfile reason codes share this one message string, which is
+    // why the reason has to be logged separately — during the incident that
+    // ambiguity was the single biggest obstacle to diagnosis.
+    const OVERLOAD_MESSAGE = 'workspace durable object is busy; retry after the advertised delay'
+
+    const overloadError = (
+      opts: { retryAfterSeconds?: number; reason?: string } = {},
+    ): Error =>
+      Object.assign(new Error(OVERLOAD_MESSAGE), {
+        status: 429,
+        details: {
+          reason: opts.reason ?? 'oldest_inflight_age',
+          ...(opts.retryAfterSeconds === undefined
+            ? {}
+            : { retryAfterSeconds: opts.retryAfterSeconds }),
+        },
+      })
+
+    type Warning = { message: string; details?: unknown }
+
+    const backoffs = (warnings: Warning[]) =>
+      warnings
+        .filter((entry) =>
+          entry.message === '[factory] Relayfile discovery overloaded; backing off before another sweep')
+        .map((entry) => entry.details as { delayMs: number; consecutiveOverloads: number })
+
+    /**
+     * The durable ratchet after each overloaded sweep, whichever way the sweep
+     * ended. A sweep that skipped every shed unit and ran to the end still
+     * moves the ratchet — it just does so from the commit path rather than the
+     * deferral path.
+     */
+    const ratchet = (warnings: Warning[]) =>
+      warnings
+        .filter((entry) =>
+          entry.message === '[factory] Relayfile discovery overloaded; backing off before another sweep' ||
+          entry.message === '[factory] discovery sweep committed despite Relayfile overload')
+        .map((entry) => entry.details as {
+          delayMs: number
+          consecutiveOverloads: number
+          previousOverloads: number
+          reason: string
+        })
+
+    /**
+     * `oldest_inflight_age` rejects ALL background traffic regardless of how
+     * few requests are in flight — one stuck op poisons everyone — so a sweep
+     * against a shedding object gets nothing done at all. This is the shape the
+     * ratchet exists for, and it must keep escalating.
+     */
+    class ShedEveryTreeReadMount extends FakeMountClient {
+      constructor(readonly makeOverload: () => Error) {
+        super()
+      }
+
+      override async listTree(): Promise<string[]> {
+        throw this.makeOverload()
+      }
+    }
+
+    const shedFactory = (mount: FakeMountClient, clock: ManualClock, warnings: Warning[]) =>
+      createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 2 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+    const drainLadder = async (mount: FakeMountClient, rungs: number) => {
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const factory = shedFactory(mount, clock, warnings)
+      for (let rung = 0; rung < rungs; rung += 1) {
+        await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      }
+      return { factory, warnings, delays: backoffs(warnings) }
+    }
+
+    // MUST FIRE. The dependency asked for 5 seconds and Factory slept for up to
+    // 300 — a self-imposed outage, and the reason /healthz still read degraded
+    // seven minutes after the upstream fix went live.
+    it('caps the ladder near the advertised Retry-After instead of climbing to five minutes', async () => {
+      const mount = new ShedEveryTreeReadMount(() => overloadError({ retryAfterSeconds: 5 }))
+
+      const { delays } = await drainLadder(mount, 7)
+
+      // Never below the advertised delay, never wildly above it, and still
+      // rising: the ratchet is intact, it is just bounded by what the
+      // dependency actually asked for.
+      expect(delays.map((entry) => entry.delayMs)).toEqual([
+        5_000,
+        10_000,
+        20_000,
+        30_000,
+        30_000,
+        30_000,
+        30_000,
+      ])
+      // MUST NOT FIRE: repeated genuine overload still escalates the durable
+      // ratchet. Capping the sleep must not make the counter meaningless.
+      expect(delays.map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    })
+
+    // MUST NOT FIRE. With no advertised delay there is nothing to respect, so
+    // the original five-minute ceiling still governs. Without this the fix
+    // could quietly become "hammer the dependency every five seconds forever".
+    it('still climbs the five-minute ladder when the 429 advertises no Retry-After', async () => {
+      const mount = new ShedEveryTreeReadMount(() => overloadError())
+
+      const { delays } = await drainLadder(mount, 8)
+
+      expect(delays.map((entry) => entry.delayMs)).toEqual([
+        5_000,
+        10_000,
+        20_000,
+        40_000,
+        80_000,
+        160_000,
+        300_000,
+        300_000,
+      ])
+      expect(delays.map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    })
+
+    const shedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
+
+    /** Sheds the read of specific issue files, leaving the rest of the sweep intact. */
+    class ShedSomeIssueReadsMount extends FakeMountClient {
+      shedPaths = new Set<string>()
+
+      constructor(files: Record<string, unknown>, readonly makeOverload: () => Error) {
+        super(files)
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (this.shedPaths.has(path)) throw this.makeOverload()
+        return await super.readFile(path)
+      }
+    }
+
+    const twoReadyIssues = () =>
+      new ShedSomeIssueReadsMount(
+        {
+          [shedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+          [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+        },
+        () => overloadError({ retryAfterSeconds: 5, reason: 'inflight_limit' }),
+      )
+
+    // MUST FIRE. Same principle as #292/#293: one work unit must not decide the
+    // fate of the others. A sweep that pulled 40 issues and hit one 429 on the
+    // 39th must not throw away the other 39.
+    it('skips the work unit relayfile shed and dispatches the rest of the sweep', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        // The issue body was never readable, so the ref is reconstructed from
+        // the path — the key is what an operator needs to correlate it.
+        issue: expect.objectContaining({ key: '59' }),
+        // Sanitized the way #293 sanitized per-item skip reasons: a fixed
+        // classification plus an allowlisted relayfile reason code.
+        reason: 'relayfile overloaded (inflight_limit)',
+      }))
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        'ar-60-impl-pear',
+        'ar-60-review-pear',
+      ])
+      expect(factory.status().counters.discoveryOverloadItemsSkipped).toBe(1)
+    })
+
+    // MUST FIRE. Deliverable 4: four distinct reason codes share one message
+    // string, and only the reason separates a DO-local limiter from a runtime
+    // shed from a Worker-global one.
+    it('logs the 429 reason code, not just its message', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      await factory.runOnce()
+
+      expect(warnings).toContainEqual(expect.objectContaining({
+        message: '[factory] relayfile shed a discovery operation',
+        details: expect.objectContaining({
+          operation: 'readFile',
+          status: 429,
+          reason: 'inflight_limit',
+          retryAfterSeconds: 5,
+        }),
+      }))
+      expect(factory.status().counters['discoveryOverloadReason:inflight_limit']).toBe(1)
+    })
+
+    // MUST FIRE. Deliverable 3: requiring a perfect sweep to clear the ratchet
+    // means the ratchet rarely clears under sustained mild load, so recovery
+    // stays pinned at the cap long after the dependency recovered.
+    it('decays the ratchet when a sweep makes progress despite an overload', async () => {
+      const mount = twoReadyIssues()
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Every work unit is shed, so three sweeps in a row get nothing through.
+      // Skipping a shed unit is no longer fatal, but a sweep that served NO
+      // unit accomplished nothing, so it still fails and still ratchets.
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      for (let rung = 0; rung < 3; rung += 1) {
+        await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      }
+      expect(ratchet(warnings).map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3])
+
+      // The dependency partially recovers: issue 60 now reads and dispatches,
+      // issue 59 is still shed. That is progress, so the ratchet must come
+      // down rather than stay pinned or climb.
+      mount.shedPaths.delete(freshPath)
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(warnings).toContainEqual(expect.objectContaining({
+        message: '[factory] discovery sweep committed despite Relayfile overload',
+        details: expect.objectContaining({
+          previousOverloads: 3,
+          consecutiveOverloads: 2,
+          reason: 'inflight_limit',
+          // The decayed rung, still bounded by the advertised ceiling rather
+          // than by DISCOVERY_OVERLOAD_BACKOFF_MAX_MS.
+          delayMs: 10_000,
+        }),
+      }))
+    })
+
+    // MUST NOT FIRE. Partial-progress decay must not make the ratchet
+    // meaningless: a sweep that gets nothing done still escalates, and the
+    // durable counter it escalates from is the one the decayed sweep left.
+    it('still escalates from the decayed counter when the next sweep gets nothing done', async () => {
+      const mount = twoReadyIssues()
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(ratchet(warnings).map((entry) => entry.consecutiveOverloads)).toEqual([1, 2])
+
+      // One sweep gets work done and decays the counter to 1...
+      mount.shedPaths.delete(freshPath)
+      expect((await factory.runOnce()).dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(ratchet(warnings).at(-1)?.consecutiveOverloads).toBe(1)
+
+      // ...and the next sweep, which gets nothing through, climbs again from
+      // there rather than restarting at zero.
+      mount.shedPaths.add(freshPath)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(ratchet(warnings).at(-1)).toMatchObject({
+        previousOverloads: 1,
+        consecutiveOverloads: 2,
+      })
+    })
+
+    // MUST NOT FIRE. Skipping shed work units must never hand back a green
+    // sweep over a dependency that served none of it: `readinessReconcile` is
+    // the signal operators and monitors read, and a sweep that dispatched
+    // nothing because every unit was shed is an outage, not a clean pass.
+    it('still fails a sweep in which relayfile shed every work unit', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Two shed units is below DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT, so the fuse
+      // is not what saves this — "no unit got through" is.
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(fleet.spawns).toEqual([])
+      expect(backoffs(warnings)).toEqual([
+        expect.objectContaining({ delayMs: 5_000, consecutiveOverloads: 1 }),
+      ])
+    })
+
+    // MUST NOT FIRE. Skipping shed work units must not degenerate into grinding
+    // a shedding dependency through a whole backlog one 429 at a time. Once the
+    // sweep has been shed repeatedly, the pass aborts and backs off.
+    it('still aborts the sweep once relayfile sheds it repeatedly', async () => {
+      const numbers = [71, 72, 73, 74, 75, 76, 77]
+      const paths = numbers.map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new ShedSomeIssueReadsMount(
+        Object.fromEntries(paths.map((path, index) => [
+          path,
+          githubIssueFile(numbers[index]!, { labels: ['factory', 'pear'] }),
+        ])),
+        () => overloadError({ retryAfterSeconds: 5, reason: 'durable_object_overloaded' }),
+      )
+      for (const path of paths) mount.shedPaths.add(path)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 5 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+
+      expect(fleet.spawns).toEqual([])
+      expect(backoffs(warnings)).toEqual([
+        expect.objectContaining({ delayMs: 5_000, consecutiveOverloads: 1 }),
+      ])
+    })
+
+    // Review follow-up on #298 (P2). `#discoveryOverloadError` latches the
+    // FIRST 429 of the sweep, so deriving the delay from it alone can let the
+    // durable backoff expire before a LATER, longer Retry-After permits —
+    // contradicting the guarantee this PR is built on.
+    it('backs off by the longest Retry-After the sweep saw, not the first', async () => {
+      class ShedWithPerPathDelayMount extends FakeMountClient {
+        constructor(files: Record<string, unknown>, readonly delaysByPath: Map<string, number>) {
+          super(files)
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          const retryAfterSeconds = this.delaysByPath.get(path)
+          if (retryAfterSeconds !== undefined) throw overloadError({ retryAfterSeconds })
+          return await super.readFile(path)
+        }
+      }
+
+      // Issue 59 is read first and asks for one second; issue 60 then asks for
+      // thirty. Honouring only the first would re-sweep 29 seconds early.
+      const mount = new ShedWithPerPathDelayMount(
+        {
+          [shedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+          [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+        },
+        new Map([[shedPath, 1], [freshPath, 30]]),
+      )
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+
+      expect(backoffs(warnings)).toEqual([
+        expect.objectContaining({ delayMs: 30_000, retryAfterSeconds: 30 }),
+      ])
+    })
+
+    // Review follow-up on #298 (P1). A 429 raised after `#dispatchUnlocked`
+    // has spawned leaves half-started agents behind, persisted as failure
+    // handoffs. runLoop's catch used to reap them because the error aborted
+    // the pass; now that an overloaded unit is merely skipped, the reap has to
+    // happen inside the pass or those agents leak and a later retry doubles
+    // them up.
+    it('reaps the agents a shed dispatch left behind instead of leaking them', async () => {
+      const mount = new FakeMountClient({ [issuePath(72)]: issueFile(72) })
+      const fleet = new CapturedPidFleetClient([
+        { name: 'ar-72-impl-pear', sessionRef: 'session-ar-72-impl-pear', pid: 7_201 },
+        { name: 'ar-72-review', sessionRef: 'session-ar-72-review', pid: 7_203 },
+      ])
+      // Sheds only after the team is spawned, which is the window the leak
+      // lives in: the agents exist, the dispatch does not complete.
+      const linear: LinearWriteback = {
+        async postComment() {},
+        async setState() {
+          throw overloadError({ retryAfterSeconds: 5, reason: 'oldest_inflight_age' })
+        },
+        async createIssue() {
+          throw new Error('not used')
+        },
+        async verify() {
+          return true
+        },
+      }
+      const factory = createFactory(config({}), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        linear,
+        readChildPids: async () => [],
+        kill: () => {
+          throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+        },
+        terminationGraceMs: 0,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-72' }),
+        reason: 'relayfile overloaded (oldest_inflight_age)',
+      }))
+      // The dispatch got far enough to spawn and to persist the handoffs...
+      expect(factory.status().counters.dispatchFailureReaperHandoffs).toBe(1)
+      // ...so the pass must have released them before returning.
+      expect(fleet.releases.map((release) => release.name).sort()).toEqual([
+        'ar-72-impl-pear',
+        'ar-72-review',
+      ])
+      expect(fleet.releases.every((release) => release.reason === 'dispatch failed')).toBe(true)
+    })
+
+    // Review follow-up on #298 (P2, found by cubic and coderabbit). Every other
+    // surface in this PR routes the reason through the allowlist;
+    // `readinessReconcile.lastError` did not — and it is returned from
+    // `status()` AND written to the loop heartbeat file on disk, so a raw
+    // dependency-controlled string reaches an operator-facing artifact.
+    it('allowlists the 429 reason before it reaches readinessReconcile.lastError', async () => {
+      const hostileReason = 'not_a_reason\n<script>alert(1)</script>'
+
+      class OverloadedClaimStateStore extends InMemoryStateStore {
+        override async claimDiscoverySweep(): Promise<DiscoverySweepClaim> {
+          throw Object.assign(new Error(OVERLOAD_MESSAGE), {
+            status: 429,
+            details: { reason: hostileReason, retryAfterSeconds: 5 },
+          })
+        }
+      }
+
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const root = await mkdtemp(join(tmpdir(), 'factory-overload-reason-allowlist-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { heartbeatPath, registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: new OverloadedClaimStateStore({ batchSize: 2 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      try {
+        await vi.waitFor(() => {
+          const lastError = factory.status().readinessReconcile?.lastError
+          expect(lastError).toBeDefined()
+          // The operator still learns it was a 429 and how long to wait...
+          expect(lastError).toContain('[relayfile 429 unrecognized; retry-after=5s]')
+          // ...without the dependency choosing what lands in status().
+          expect(lastError).not.toContain('<script>')
+          expect(lastError).not.toContain('not_a_reason')
+        }, { timeout: 3_000 })
+
+        // The heartbeat file is the persisted copy, and the reason it matters.
+        await vi.waitFor(async () => {
+          const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+          const lastError = (heartbeat as { readinessReconcile?: { lastError?: string } })
+            ?.readinessReconcile?.lastError
+          expect(lastError).toContain('[relayfile 429 unrecognized')
+          expect(lastError).not.toContain('<script>')
+        }, { timeout: 3_000 })
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // Review follow-up on #298 (P2, cubic). A read that produced no issue
+    // served no work unit, so it must not credit the decay. cubic reached this
+    // through a "concurrent 429" that cannot actually occur — `#readIssue`
+    // rethrows overloads rather than swallowing them into `undefined` — but
+    // the conclusion holds by a route that IS reachable in production: the
+    // known phantom condition, where the tree lists issue paths whose bodies
+    // are absent, makes every read return `undefined`.
+    it('does not credit a phantom read as progress that decays the ratchet', async () => {
+      class PhantomAndShedMount extends FakeMountClient {
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === shedPath) throw overloadError({ retryAfterSeconds: 5, reason: 'inflight_limit' })
+          // Listed in the tree, body absent — a phantom, not a served unit.
+          if (path === freshPath) throw new Error(`File not found: ${path}`)
+          return await super.readFile(path)
+        }
+      }
+
+      const mount = new PhantomAndShedMount({
+        [shedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+        [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+      })
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Nothing was served, so the sweep must fail and the ratchet must climb
+      // — not commit with a decayed ratchet on the strength of two reads that
+      // produced nothing.
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(ratchet(warnings).map((entry) => entry.consecutiveOverloads)).toEqual([1])
+    })
+
+    // Review follow-up on #298 (P2, cubic). A StateStore injected from outside
+    // that predates the residual-overload completion path must not lose the
+    // backoff without saying so — silent is the bad part.
+    it('says so loudly when the state store cannot persist the overload residual', async () => {
+      /** A store from before `completeDiscoverySweepWithOverload` existed. */
+      const legacyStore = (store: InMemoryStateStore): StateStore =>
+        new Proxy(store, {
+          get: (target, property) => {
+            if (property === 'completeDiscoverySweepWithOverload') return undefined
+            const value = Reflect.get(target, property)
+            // Bind to the real store: these methods touch private fields, so
+            // `this` must never be the proxy.
+            return typeof value === 'function' ? value.bind(target) : value
+          },
+        }) as unknown as StateStore
+
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore: legacyStore(new InMemoryStateStore({ batchSize: 4 })),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Issue 60 still dispatches, so the sweep commits with a residual it
+      // cannot store.
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(warnings).toContainEqual(expect.objectContaining({
+        message: '[factory] state store cannot persist the Relayfile overload backoff; it will be lost',
+        details: expect.objectContaining({
+          consecutiveOverloads: 0,
+          delayMs: 5_000,
+        }),
+      }))
+      expect(factory.status().counters.discoveryOverloadResidualUnsupported).toBe(1)
+    })
+
+    // Review follow-up on #298 (P1, cubic, second round). The reap added for
+    // the first P1 sits AFTER the fatal-failure check, so the 429 that trips
+    // the per-sweep fuse throws straight past it. A direct `runOnce()` — the
+    // `factory run-once` CLI, and `#reconcileReadyIssues` — has no runLoop
+    // catch behind it, so that work unit's spawned agents leak.
+    const FUSE_ISSUE_NUMBERS = [71, 72, 73, 74, 75]
+
+    /**
+     * Sheds one read per issue, and only after that issue has already spawned
+     * — the spawn loop reads the issue again between agents, which is the
+     * post-spawn window the leak lives in. Five issues means five shed
+     * operations, so the fifth trips DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT.
+     */
+    class ShedPostSpawnReadMount extends FakeMountClient {
+      readonly #shed = new Set<string>()
+
+      constructor(files: Record<string, unknown>, readonly spawnedFor: (issueKey: string) => number) {
+        super(files)
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        // Keyed on THIS issue's own agents. A global spawn count would instead
+        // make every issue after the first shed before it had spawned
+        // anything, tripping the fuse on a unit with nothing to leak — which
+        // is exactly how the first version of this harness silently passed
+        // against the unfixed code.
+        const issueKey = /AR-(\d+)/u.exec(path)?.[1]
+        if (issueKey && !this.#shed.has(path) && this.spawnedFor(issueKey) > 0) {
+          this.#shed.add(path)
+          throw overloadError({ retryAfterSeconds: 5, reason: 'oldest_inflight_age' })
+        }
+        return await super.readFile(path)
+      }
+    }
+
+    const fuseTrippingFactory = (overrides: { stateStore?: StateStore; warnings?: Warning[] } = {}) => {
+      const fleet = new CapturedPidFleetClient(FUSE_ISSUE_NUMBERS.flatMap((number, index) => [
+        { name: `ar-${number}-impl-pear`, sessionRef: `session-ar-${number}-impl`, pid: 7_100 + index * 2 },
+        { name: `ar-${number}-review`, sessionRef: `session-ar-${number}-review`, pid: 7_101 + index * 2 },
+      ]))
+      const mount = new ShedPostSpawnReadMount(
+        Object.fromEntries(FUSE_ISSUE_NUMBERS.map((number) => [issuePath(number), issueFile(number)])),
+        (issueKey) => fleet.spawns.filter((spawn) => spawn.name.startsWith(`ar-${issueKey}-`)).length,
+      )
+      const factory = createFactory(config({ batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        ...(overrides.stateStore ? { stateStore: overrides.stateStore } : {}),
+        ...(overrides.warnings
+          ? { logger: { warn: (message, details) => overrides.warnings!.push({ message, details }) } }
+          : {}),
+        readChildPids: async () => [],
+        kill: () => {
+          throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+        },
+        terminationGraceMs: 0,
+      })
+      return { factory, fleet }
+    }
+
+    it('reaps the agents of the shed dispatch that trips the fuse', async () => {
+      const { factory, fleet } = fuseTrippingFactory()
+
+      // Five shed operations trip DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT, so the
+      // fifth unit aborts the pass instead of being skipped.
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+
+      // The first four were skipped and reaped by the existing path. The fifth
+      // is the one that throws — its agents must be released too, or a retry
+      // spawns duplicates on top of them.
+      const released = new Set(fleet.releases.map((release) => release.name))
+      const spawned = fleet.spawns.map((spawn) => spawn.name)
+      expect(spawned.length).toBeGreaterThan(0)
+      for (const name of spawned) {
+        expect(released).toContain(name)
+      }
+    })
+
+    // Review follow-up on #298 (P2, cubic, second round). Reaping before the
+    // fatality check put a state-store read on the path of EVERY per-item
+    // failure. `listFailureHandoffs` sits outside `#reapDispatchFailureHandoffsNow`'s
+    // own try, so its failure replaces the dispatch error — and a replaced 429
+    // is no longer recognised as overload at the fence, which silently drops
+    // the advertised backoff the whole PR exists to honour.
+    it('keeps the 429 when the handoff store fails during the reap', async () => {
+      /**
+       * Fails only the reap's read, not the registry write's.
+       *
+       * `#writeInFlightRegistry` calls the same method from inside dispatch's
+       * own failure handling, and breaking that replaces the 429 *before* the
+       * reap ever runs — which masks the defect under test rather than
+       * exercising it. Keying on the caller is precise where a call count
+       * would be brittle.
+       */
+      class UnreadableHandoffStateStore extends InMemoryStateStore {
+        override async listFailureHandoffs(): ReturnType<InMemoryStateStore['listFailureHandoffs']> {
+          if (new Error().stack?.includes('reapDispatchFailureHandoffsNow')) {
+            throw new Error('handoff store unavailable')
+          }
+          return await super.listFailureHandoffs()
+        }
+      }
+
+      // One issue, so this isolates the reap: the unit is skipped rather than
+      // fatal, and the only thing that can change the recorded error is the
+      // reap running between the failure and the classification.
+      const fleet = new CapturedPidFleetClient([
+        { name: 'ar-71-impl-pear', sessionRef: 'session-ar-71-impl', pid: 7_100 },
+        { name: 'ar-71-review', sessionRef: 'session-ar-71-review', pid: 7_101 },
+      ])
+      const mount = new ShedPostSpawnReadMount(
+        { [issuePath(71)]: issueFile(71) },
+        (issueKey) => fleet.spawns.filter((spawn) => spawn.name.startsWith(`ar-${issueKey}-`)).length,
+      )
+      const factory = createFactory(config({ batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        stateStore: new UnreadableHandoffStateStore({ batchSize: 5 }),
+        readChildPids: async () => [],
+        kill: () => {
+          throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+        },
+        terminationGraceMs: 0,
+      })
+
+      const report = await factory.runOnce()
+
+      // The 429 must survive the failed reap. If it does not, the unit is
+      // misclassified as an ordinary failure — and at the fence a replaced 429
+      // is no longer overload at all, so the advertised backoff is dropped.
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-71' }),
+        reason: 'relayfile overloaded (oldest_inflight_age)',
+      }))
+    })
   })
 
   it('filters GitHub startup discovery through the Relayfile issue index', async () => {
