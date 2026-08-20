@@ -492,11 +492,19 @@ export class InternalFleetClient implements FleetClient {
     call: (client: HarnessDriverClientLike) => Promise<T>,
     options?: { retry?: boolean },
   ): Promise<T> {
-    const attemptedBaseUrl = this.#client.baseUrl
+    const attemptedClient = this.#client
+    const attemptedBaseUrl = attemptedClient.baseUrl
     try {
-      return await call(this.#client)
+      return await call(attemptedClient)
     } catch (error) {
-      if (!this.#reconnectIfBrokerChanged(error, operation) || options?.retry !== true) {
+      // Only one of several in-flight calls wins the reconnect. The rest fail
+      // on the client it just retired and would find the file already matching
+      // the new broker — so also treat "the client I used has since been
+      // replaced" as a reconnect, or concurrent rosters keep surfacing stale
+      // errors from a broker that no longer exists.
+      const reconnected = this.#reconnectIfBrokerChanged(error, operation)
+        || this.#client !== attemptedClient
+      if (!reconnected || options?.retry !== true) {
         throw attributeBrokerError(error, attemptedBaseUrl)
       }
       try {

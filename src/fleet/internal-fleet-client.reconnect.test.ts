@@ -134,6 +134,31 @@ describe('InternalFleetClient broker rebind recovery', () => {
     expect(second.requests).toEqual([{ path: '/api/spawned', apiKey: 'key-second' }])
   })
 
+  it('recovers every concurrent read, including the ones that lost the reconnect race', async () => {
+    const connectionPath = connectionFile()
+    const first = await startBroker({ apiKey: 'key-first', agents: ['worker-a'] })
+    writeConnection(connectionPath, first)
+
+    const fleet = new InternalFleetClient({ connectionPath })
+    cleanup.push(() => fleet.dispose())
+    await fleet.roster()
+
+    await first.stop()
+    const second = await startBroker({ apiKey: 'key-second', agents: ['worker-b'] })
+    writeConnection(connectionPath, second)
+
+    // Factory takes rosters concurrently (orchestrator/factory.ts:3296, :8740).
+    // Only one of these can win the reconnect; the others fail on the client it
+    // retired, and must ride the replacement rather than surfacing a stale
+    // error from a broker that no longer exists.
+    const rosters = await Promise.all([fleet.roster(), fleet.roster(), fleet.roster()])
+    for (const roster of rosters) {
+      expect(roster.agents).toEqual([{ name: 'worker-b' }])
+    }
+    // Exactly one reconnect, not one per in-flight call.
+    expect(second.requests).toHaveLength(3)
+  })
+
   it('surfaces an error, and never reconnects, when the broker is simply down', async () => {
     const connectionPath = connectionFile()
     const broker = await startBroker({ apiKey: 'key-only', agents: ['worker-a'] })
