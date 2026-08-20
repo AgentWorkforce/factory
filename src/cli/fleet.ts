@@ -1598,7 +1598,16 @@ function parseFactoryDiagnoseFlags(flags: string[], env: NodeJS.ProcessEnv): Par
       url = flag
       continue
     }
-    throw new Error(`Unknown factory diagnose option: ${flag}`)
+    // Never echo the value: `factory diagnose <url> <token>` is a plausible
+    // slip, and this message reaches stderr and from there CI logs (#300
+    // review, CodeRabbit). The position is enough to find it.
+    if (!flag.startsWith('-')) {
+      throw new Error(
+        `factory diagnose accepts one url; argument ${index + 1} is a second positional value. ` +
+        'Pass a token with --token, not as a bare argument.',
+      )
+    }
+    throw new Error(`Unknown factory diagnose option at argument ${index + 1}`)
   }
   if (!url) {
     throw new Error('factory diagnose requires --deployed <url> (the deployed instance base URL)')

@@ -3,6 +3,10 @@ import { describe, expect, it } from 'vitest'
 import { runFleetCli } from './fleet'
 
 const BASE = 'https://factory.example.com'
+// An ambient FACTORY_EVIDENCE_TOKEN on a developer machine or CI runner would
+// otherwise make these commands request /evidence as well, which the stubs do
+// not route (#300 review, CodeRabbit).
+const HERMETIC_ENV = {} as NodeJS.ProcessEnv
 const NOW_MS = 1_787_224_000_000
 
 const buffer = () => {
@@ -70,6 +74,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: err,
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({ healthz: { status: 200, body: healthy } }, seen),
     })
 
@@ -85,6 +90,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -127,6 +133,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -173,6 +180,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -201,6 +209,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -224,6 +233,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'op-token', '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: { status: 200, body: healthy },
         evidence: {
@@ -253,6 +263,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'stale-token', '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: { status: 200, body: healthy },
         evidence: { status: 401, body: { error: 'unauthorized' } },
@@ -271,6 +282,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: err,
+      env: HERMETIC_ENV,
       diagnoseFetch: (async () => {
         throw Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { name: 'TypeError' })
       }) as typeof fetch,
@@ -309,6 +321,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 503,
@@ -341,6 +354,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -373,6 +387,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -408,6 +423,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -448,6 +464,7 @@ describe('factory diagnose --deployed (#295)', () => {
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 503,
@@ -472,6 +489,7 @@ describe('factory diagnose --deployed (#295)', () => {
     await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -491,6 +509,7 @@ describe('factory diagnose --deployed (#295)', () => {
     await runFleetCli(['diagnose', '--deployed', BASE], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -515,6 +534,7 @@ describe('factory diagnose --deployed (#295)', () => {
     await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
       stdout: out,
       stderr: buffer(),
+      env: HERMETIC_ENV,
       diagnoseFetch: stubFetch({
         healthz: {
           status: 200,
@@ -530,6 +550,125 @@ describe('factory diagnose --deployed (#295)', () => {
     const report = JSON.parse(out.text()) as { verdict: string }
     expect(report.verdict).not.toContain('undefined')
     expect(report.verdict).toContain('readinessReconcile=unknown')
+  })
+  // Review follow-up on #300 (Major, CodeRabbit). `live` was false for any
+  // non-200, so a fronting proxy answering 404/502 produced a confident
+  // statement about a Factory that was never asked.
+  it('does not claim a Factory diagnosis from a proxy answer', async () => {
+    for (const status of [404, 401, 502]) {
+      const out = buffer()
+      const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+        stdout: out,
+        stderr: buffer(),
+        env: HERMETIC_ENV,
+        diagnoseFetch: stubFetch({ healthz: { status, body: { error: 'nope' } } }),
+      })
+
+      expect(code).not.toBe(0)
+      const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
+      expect(report.dispatching).toBe(false)
+      expect(report.verdict).toContain(`HTTP ${status}`)
+      expect(report.verdict).toMatch(/cannot tell/iu)
+      // The claims this response cannot support.
+      expect(report.verdict).not.toContain('reports itself not live')
+      expect(report.verdict).not.toContain('Factory process is gone')
+    }
+  })
+
+  it('still treats a 503 carrying the instance own verdict as the instance speaking', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: { status: 503, body: { ok: false, phase: 'running', factoryProcess: 'running' } },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { verdict: string }
+    expect(report.verdict).toContain('reports itself not live')
+  })
+
+  // Review follow-up on #300 (Minor, CodeRabbit). `unknown` means the block did
+  // not say, which is not the same statement as "a subsystem is degraded".
+  it('reports an unreadable status as cannot tell rather than as degradation', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              schemaVersion: 1,
+              ok: true,
+              status: 'sideways',
+              stale: false,
+              loopStatus: 'running',
+              degradedSubsystems: [],
+              readinessReconcile: { state: 'healthy', consecutiveFailures: 0, failureThreshold: 3 },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { verdict: string }
+    expect(report.verdict).toMatch(/cannot tell/iu)
+    expect(report.verdict).not.toContain('a subsystem is degraded')
+  })
+
+  // Review follow-up on #300 (Minor, CodeRabbit). A 404 means the deployment
+  // has no /evidence route and a 5xx means it failed; neither is a reason to
+  // send someone rotating a credential that works.
+  it('blames the token only when the token is what was refused', async () => {
+    const cases = [
+      { status: 401, expect: /token/iu },
+      { status: 403, expect: /token/iu },
+      { status: 404, expect: /no \/evidence route|not exposed/iu },
+      { status: 502, expect: /failed|error/iu },
+    ]
+    for (const testCase of cases) {
+      const out = buffer()
+      await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'op-token', '--json'], {
+        stdout: out,
+        stderr: buffer(),
+        env: HERMETIC_ENV,
+        diagnoseFetch: stubFetch({
+          healthz: { status: 200, body: healthy },
+          evidence: { status: testCase.status, body: {} },
+        }),
+      })
+
+      const report = JSON.parse(out.text()) as { evidence?: { reason?: string } }
+      expect(report.evidence?.reason).toMatch(testCase.expect)
+      if (testCase.status === 404 || testCase.status === 502) {
+        expect(report.evidence?.reason).not.toContain('token was not accepted')
+      }
+    }
+  })
+
+  // Review follow-up on #300 (Security, CodeRabbit). `factory diagnose <url>
+  // my-evidence-token` puts a credential in argv; echoing it into the error
+  // puts it on stderr and from there into CI logs.
+  it('never echoes an unrecognized argument value into the error', async () => {
+    const err = buffer()
+    const code = await runFleetCli(['diagnose', BASE, 's3cr3t-evidence-token'], {
+      stdout: buffer(),
+      stderr: err,
+      env: HERMETIC_ENV,
+    })
+
+    expect(code).not.toBe(0)
+    expect(err.text()).not.toContain('s3cr3t-evidence-token')
+    expect(err.text()).toMatch(/argument 2|second argument|position/iu)
   })
 })
 

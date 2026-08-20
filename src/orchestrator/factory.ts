@@ -4634,8 +4634,23 @@ export class FactoryLoop implements Factory {
         : {}),
     }
     const nowMs = this.#clock.now()
-    const inFlightMs = readinessReconcileInFlightMs(timestamps, nowMs)
-    const derived = derivedReadinessReconcileState({ ...timestamps, state: settled }, nowMs)
+    // Defence in depth (#300 review, CodeRabbit). These derivations are new
+    // code from another module on a path that `status()` and every heartbeat
+    // write depend on. A throw here would take out the liveness signal the
+    // crash reaper reads — the diagnostic causing the outage it exists to
+    // explain — so a failure costs the derived fields and nothing else.
+    let inFlightMs: number | undefined
+    let derived: FactoryReadinessReconcileStatus['state'] | 'unknown' = settled
+    try {
+      inFlightMs = readinessReconcileInFlightMs(timestamps, nowMs)
+      derived = derivedReadinessReconcileState({ ...timestamps, state: settled }, nowMs)
+    } catch (error) {
+      this.#logger.warn?.('[factory] readiness health derivation failed; reporting the settled state', {
+        error: describeError(error).errorMessage,
+      })
+      inFlightMs = undefined
+      derived = settled
+    }
     return {
       state: derived === 'unknown' ? settled : derived,
       consecutiveFailures,
@@ -7351,10 +7366,23 @@ export class FactoryLoop implements Factory {
     // rather than leaving that boundary to whoever reads the file (#295).
     // Derived against this daemon's clock: every duration in it is a
     // difference between timestamps this process wrote.
-    heartbeat.health = publicHealthFromHeartbeat(heartbeat, {
-      nowMs: updatedAtMs,
-      staleMs: this.#config.loop.heartbeatStaleMs,
-    })
+    //
+    // Guarded (#300 review, CodeRabbit): this heartbeat is what the crash
+    // reaper and `/healthz` read to decide the daemon is alive, and several
+    // callers of this method sit outside any try/catch. A projection failure
+    // must cost the diagnostics block, never the heartbeat — the omitted block
+    // is itself legible, since `factory diagnose` reports a missing one rather
+    // than a false green.
+    try {
+      heartbeat.health = publicHealthFromHeartbeat(heartbeat, {
+        nowMs: updatedAtMs,
+        staleMs: this.#config.loop.heartbeatStaleMs,
+      })
+    } catch (error) {
+      this.#logger.warn?.('[factory] public health projection failed; heartbeat written without it', {
+        error: describeError(error).errorMessage,
+      })
+    }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
     await this.#writeInFlightRegistry(registryPath, path)

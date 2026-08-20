@@ -6,7 +6,7 @@
 
 ## The command
 
-```
+```sh
 factory diagnose --deployed https://<factory-host>
 ```
 
@@ -14,7 +14,7 @@ No credential required. It reads the unauthenticated `/healthz` and answers one 
 instance dispatching, and if not, why* — with a non-zero exit when the answer is no, so a lane brief
 or a cron entry can act on `$?` alone.
 
-```
+```sh
 factory diagnose --deployed <url>              # human-readable
 factory diagnose --deployed <url> --json       # the same diagnosis as JSON
 factory diagnose --deployed <url> --token <t>  # also read the gated /evidence
@@ -112,8 +112,13 @@ that cannot restart the box.
 and URLs with credentials in the query string. It stays on the authenticated `/evidence` surface. The
 public block carries only its **class**, through the same allowlist that guards
 `IterationReport.skipped[].reason` (`src/observability/error-class.ts`): a pattern-checked class name,
-falling back to `Error`. Every other public field is a closed enum or a coerced number, built by
-construction rather than by spreading the record — see `src/orchestrator/public-health.ts`.
+falling back to `Error`.
+
+Every other field is constructed explicitly and validated for what it is — states against closed
+enums, counters and timestamps coerced with range and sign checks, `degradedSubsystems` filtered to
+a fixed set of names, and the one assembled string (`reason`) built from those same names, then
+control-stripped and length-bounded. Nothing is spread, so a field added upstream cannot reach the
+public surface by default. See `src/orchestrator/public-health.ts`.
 
 Regression coverage: `src/orchestrator/public-health.test.ts` and the `#295` block in
 `src/orchestrator/factory.test.ts` feed a `lastError` containing a path, a URL and a token and assert

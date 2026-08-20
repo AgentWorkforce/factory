@@ -48,8 +48,15 @@ export interface DeployedFactoryDiagnosis {
    * and the container keeps serving that file, the block stays green forever.
    * The container recomputes liveness from `updatedAtMs` on every request, so
    * its verdict is the fresh one and it wins (#300 review, P1).
+   *
+   * `false` only when the INSTANCE answered no — a 503 health body, or
+   * `ok: false`. A 404, 401 or 502 from a proxy in front of it is not the
+   * instance speaking at all, and leaves this `undefined` (#300 review,
+   * CodeRabbit).
    */
   live?: boolean
+  /** The endpoint answered, but not with anything this command can read. */
+  unreadable?: boolean
   /** Allowlisted class of a transport failure; the message is not reported. */
   errorClass?: string
   dispatching: boolean
@@ -183,6 +190,15 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
         'serves describes the last write, not the present.',
     }
   }
+  if (diagnosis.unreadable) {
+    return {
+      dispatching: false,
+      verdict:
+        `cannot tell: the endpoint answered HTTP ${diagnosis.httpStatus ?? '?'} and carried no Factory ` +
+        'health. Something other than the instance may be answering this URL — a gateway, an auth ' +
+        'proxy, or a load balancer. Check the URL, then pass --token to read /evidence.',
+    }
+  }
   if (diagnosis.workerOnly) {
     return {
       dispatching: false,
@@ -247,6 +263,14 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       verdict: 'not dispatching: the daemon is not listening for Relayfile events.',
     }
   }
+  if (health.status === 'unknown') {
+    return {
+      dispatching: false,
+      verdict:
+        'cannot tell: the health block did not report a status this version understands. ' +
+        'Pass --token to read /evidence.',
+    }
+  }
   if (health.status !== 'ok') {
     return { dispatching: false, verdict: `not dispatching: ${health.reason ?? 'a subsystem is degraded'}` }
   }
@@ -303,11 +327,20 @@ export async function diagnoseDeployedFactory(
     // accept a top-level copy too, so a proxy that hoists it still works.
     const published = normalizePublicHealth(body.health ?? asRecord(body.heartbeat).health)
     const workerOnly = body.eventDrivenSleep === true || body.container === 'not-probed'
+    // A container answering its own health says `ok`; the 503 path is the
+    // service-level negative. Anything else that answers on this URL — a
+    // gateway 404, an auth proxy 401, a load balancer 502 — never asked the
+    // container, and cannot support a statement about Factory.
+    const instanceAnswered = typeof body.ok === 'boolean' ||
+      health.status === 200 ||
+      health.status === 503
     base = {
       url,
       reachable: true,
       httpStatus: health.status,
-      live: health.status === 200 && body.ok !== false,
+      ...(instanceAnswered
+        ? { live: health.status === 200 && body.ok !== false }
+        : { unreadable: true }),
       ...(asText(body.phase) ? { phase: asText(body.phase) } : {}),
       ...(workerOnly ? { workerOnly: true } : {}),
       ...(published ? { health: published } : { legacy: legacyHealth(body) }),
@@ -340,11 +373,16 @@ async function readEvidence(
   try {
     const evidence = await getJson(fetchImpl, endpoint(url, '/evidence'), { token, timeoutMs })
     if (evidence.status !== 200) {
-      return {
-        fetched: false,
-        httpStatus: evidence.status,
-        reason: `/evidence answered HTTP ${evidence.status}; the token was not accepted`,
-      }
+      // Only 401/403 are statements about the credential. A 404 means this
+      // deployment exposes no /evidence route and a 5xx means the endpoint
+      // failed — sending someone to rotate a working token for either is the
+      // wrong-problem failure again (#300 review, CodeRabbit).
+      const reason = evidence.status === 401 || evidence.status === 403
+        ? `/evidence answered HTTP ${evidence.status}; the token was not accepted`
+        : evidence.status === 404
+          ? `/evidence answered HTTP 404; this deployment exposes no /evidence route (the token is not the problem)`
+          : `/evidence request failed with HTTP ${evidence.status}; the endpoint errored (the token is not the problem)`
+      return { fetched: false, httpStatus: evidence.status, reason }
     }
     const body = asRecord(evidence.body)
     const readiness = asRecord(body.readinessReconcile)
@@ -405,6 +443,8 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       lines.push(`    lastFailureAt      : ${formatInstant(readiness.lastFailureAtMs)}`)
     }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)
+  } else if (diagnosis.unreadable) {
+    lines.push('  health block         : none — this response carried no Factory health')
   } else if (diagnosis.workerOnly) {
     // Not an old instance — an unprobed one. Saying "predates #295" here would
     // send an operator to upgrade a Factory that is fine.

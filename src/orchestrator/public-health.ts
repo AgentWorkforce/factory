@@ -118,6 +118,23 @@ const optionalNumber = <K extends string>(key: K, value: unknown): Partial<Recor
   return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
 }
 
+/**
+ * A duration that cannot be negative, dropped rather than republished.
+ *
+ * The writer never emits these; a remote process on another version might
+ * (#300 review, CodeRabbit). Dropping the field keeps the promise this
+ * module's doc comment makes to its callers about the shape they get.
+ */
+const optionalDuration = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
+  const parsed = finiteNumber(value)
+  return parsed === undefined || parsed < 0 ? {} : { [key]: parsed } as Partial<Record<K, number>>
+}
+
+const optionalPositive = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
+  const parsed = positiveNumber(value)
+  return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
+}
+
 /** Control characters stripped, length bounded: this text can reach a terminal. */
 const boundedText = (value: string): string =>
   // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
@@ -361,7 +378,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     status,
     stale: record.stale === true,
     ...optionalTimestamp('updatedAtMs', record.updatedAtMs),
-    ...optionalNumber('ageMs', record.ageMs),
+    ...optionalDuration('ageMs', record.ageMs),
     loopStatus: enumValue(record.loopStatus, ['running', 'idle', 'stopping'] as const),
     degradedSubsystems: [...degradedSubsystems],
     ...(typeof record.reason === 'string'
@@ -373,13 +390,13 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             state: enumValue(readiness.state, READINESS_RECONCILE_STATES),
             consecutiveFailures: counter(readiness.consecutiveFailures),
             failureThreshold: counter(readiness.failureThreshold),
-            ...optionalNumber('intervalMs', readiness.intervalMs),
-            ...optionalNumber('lastDurationMs', readiness.lastDurationMs),
+            ...optionalPositive('intervalMs', readiness.intervalMs),
+            ...optionalDuration('lastDurationMs', readiness.lastDurationMs),
             ...optionalTimestamp('lastStartedAtMs', readiness.lastStartedAtMs),
             ...optionalTimestamp('lastCompletedAtMs', readiness.lastCompletedAtMs),
             ...optionalTimestamp('lastFailureAtMs', readiness.lastFailureAtMs),
-            ...optionalNumber('inFlightMs', readiness.inFlightMs),
-            ...optionalNumber('missedPasses', readiness.missedPasses),
+            ...optionalDuration('inFlightMs', readiness.inFlightMs),
+            ...optionalDuration('missedPasses', readiness.missedPasses),
             ...(readiness.lastErrorClass !== undefined
               ? { lastErrorClass: telemetryErrorClassName(readiness.lastErrorClass) }
               : {}),

@@ -380,5 +380,35 @@ describe('publicHealthFromHeartbeat (#295)', () => {
     expect(Number.isFinite(health.readinessReconcile?.missedPasses ?? 0)).toBe(true)
     expect(health.readinessReconcile?.intervalMs).toBeUndefined()
   })
+  // Review follow-up on #300 (Minor, CodeRabbit). The writer refuses to publish
+  // a non-positive cadence; a reader that accepts one from a remote process
+  // undoes that guarantee for everyone downstream of it.
+  it('re-applies the writer cadence and sign invariants when reading a remote record', () => {
+    const health = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'degraded',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: ['readinessReconcile'],
+      readinessReconcile: {
+        state: 'stalled',
+        consecutiveFailures: 3,
+        failureThreshold: 3,
+        intervalMs: 0,
+        inFlightMs: -5_000,
+        missedPasses: -12,
+        lastDurationMs: -1,
+      },
+    })
+
+    expect(health?.readinessReconcile?.intervalMs).toBeUndefined()
+    expect(health?.readinessReconcile?.inFlightMs).toBeUndefined()
+    expect(health?.readinessReconcile?.missedPasses).toBeUndefined()
+    expect(health?.readinessReconcile?.lastDurationMs).toBeUndefined()
+    // The states and counters still come through: dropping a bad duration must
+    // not cost the operator the signal.
+    expect(health?.readinessReconcile).toMatchObject({ state: 'stalled', consecutiveFailures: 3 })
+  })
 })
 
