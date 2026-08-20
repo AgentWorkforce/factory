@@ -462,5 +462,50 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(text).toMatch(/still starting|booting/iu)
     expect(text).not.toContain('the Factory process is gone')
   })
+  // Found while running the built CLI against a short-sleep stub: the report
+  // said "instance predates #295" about an instance whose age it cannot know,
+  // and printed `phase` twice. Sending an operator to "upgrade the deployed
+  // Factory" when the real answer is "the Worker never asked the container" is
+  // the wrong-problem failure this command exists to prevent.
+  it('does not blame the instance version when the Worker simply did not probe it', async () => {
+    const out = buffer()
+    await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: { ok: true, phase: 'worker-ready', container: 'not-probed', eventDrivenSleep: true },
+        },
+      }),
+    })
+
+    const text = out.text()
+    expect(text).not.toContain('predates')
+    expect(text).toMatch(/short-sleep/iu)
+    expect(text.match(/^ +phase +:/gmu)?.length ?? 0).toBe(1)
+  })
+
+  it('prints the phase once when the instance predates the block', async () => {
+    const out = buffer()
+    await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            heartbeat: { status: 'running', readinessReconcile: 'degraded', eventListener: 'subscribed' },
+          },
+        },
+      }),
+    })
+
+    const text = out.text()
+    expect(text).toContain('predates')
+    expect(text.match(/^ +phase +:/gmu)?.length ?? 0).toBe(1)
+  })
 })
 

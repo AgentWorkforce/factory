@@ -195,11 +195,19 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
   const health = diagnosis.health
   if (!health) {
     const legacy = diagnosis.legacy ?? {}
+    if (!legacy.readinessReconcile && !legacy.eventListener) {
+      return {
+        dispatching: false,
+        verdict:
+          'cannot tell: this response carried no Factory health at all — no diagnostics block and ' +
+          'no subsystem state strings. Pass --token to read /evidence.',
+      }
+    }
     return {
       dispatching: false,
       verdict:
         'cannot tell: this instance predates the /healthz diagnostics block (#295), so it publishes ' +
-        `state strings only — readinessReconcile=${legacy.readinessReconcile ?? 'unknown'}, ` +
+        `state strings only — readinessReconcile=${legacy.readinessReconcile}, ` +
         `eventListener=${legacy.eventListener ?? 'unknown'}. ` +
         'Upgrade the deployed Factory, or pass --token to read /evidence.',
     }
@@ -397,11 +405,19 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       lines.push(`    lastFailureAt      : ${formatInstant(readiness.lastFailureAtMs)}`)
     }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)
-  } else if (diagnosis.legacy) {
+  } else if (diagnosis.workerOnly) {
+    // Not an old instance — an unprobed one. Saying "predates #295" here would
+    // send an operator to upgrade a Factory that is fine.
+    lines.push('  health block         : not requested — the Worker answered without probing the container')
+    lines.push('  mode                 : event-driven short-sleep')
+  } else if (diagnosis.legacy?.readinessReconcile || diagnosis.legacy?.eventListener) {
     lines.push('  health block         : absent — state strings only (instance predates #295)')
-    lines.push(`  phase                : ${diagnosis.legacy.phase ?? 'unknown'}`)
     lines.push(`  readinessReconcile   : ${diagnosis.legacy.readinessReconcile ?? 'unknown'}`)
     lines.push(`  eventListener        : ${diagnosis.legacy.eventListener ?? 'unknown'}`)
+  } else {
+    // No block and no state strings: the response carried no Factory health at
+    // all. That is a statement about this response, not about the instance.
+    lines.push('  health block         : absent, and no subsystem state strings in the response')
   }
 
   const evidence = diagnosis.evidence
