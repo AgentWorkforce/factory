@@ -167,6 +167,45 @@ describe('FactoryCloudReporter', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
+  it('retries a 201 whose acknowledgement body is cut short by the request timeout', async () => {
+    let calls = 0
+    const waits: number[] = []
+    const fetch = vi.fn(async (_url, init) => {
+      calls += 1
+      if (calls > 1) return response(201, { accepted: 1, duplicates: 0 })
+      // Cloud answers 201 and then stalls mid-body. A real fetch tears the body
+      // down when the request timeout aborts the signal.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => {
+            controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }, { once: true })
+        },
+      })
+      return new Response(body, { status: 201, headers: { 'Content-Type': 'application/json' } })
+    })
+    const reporter = await createReporter({
+      fetch,
+      requestTimeoutMs: 10,
+      maxAttempts: 2,
+      retryBaseMs: 5,
+      sleep: async (ms) => { waits.push(ms) },
+    })
+    await reporter.report(progress('event-body-timeout'))
+
+    // A timed-out acknowledgement is not a rejection: nothing said the batch was
+    // bad, so it belongs on the transient retry path rather than parked for
+    // retryMaxMs. Ingestion is idempotent, so a re-send is safe.
+    expect(await reporter.flush()).toMatchObject({
+      delivered: 1,
+      pending: 0,
+      attempts: 2,
+      stoppedReason: 'empty',
+    })
+    expect(waits).toEqual([5])
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
   it('bounds close even when an earlier unbounded flush is already running', async () => {
     let resolveTokenRequested!: () => void
     const tokenRequested = new Promise<void>((resolve) => {
@@ -232,6 +271,120 @@ describe('FactoryCloudReporter', () => {
       { status: 422, droppedEvents: 1 },
     ])
     expect(JSON.stringify(warnings)).not.toContain('private server rejection detail')
+  })
+
+  it('cancels an in-flight access-token request when close() gives up at its deadline', async () => {
+    const signals: Array<AbortSignal | undefined> = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      getAccessToken: async (options) => {
+        signals.push(options?.signal)
+        // The hosted credential endpoint never answers.
+        await new Promise<void>((resolve) => {
+          options?.signal?.addEventListener('abort', () => { resolve() }, { once: true })
+        })
+        throw new Error('token request cancelled')
+      },
+      fetch: vi.fn(async () => response(201, { accepted: 1, duplicates: 0 })),
+    })
+
+    await reporter.report(progress('event-shutdown'))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+
+    await expect(reporter.close({ deadlineMs: 20 })).resolves.toMatchObject({
+      stoppedReason: 'deadline',
+    })
+
+    // close() must not merely stop awaiting the automatic flush: the token
+    // request it left behind has to be cancelled, or it keeps the process alive.
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
+  it('cancels an in-flight event request when close() gives up at its deadline', async () => {
+    const signals: Array<AbortSignal | undefined> = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      fetch: vi.fn(async (_url, init) => {
+        signals.push(init?.signal ?? undefined)
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }, { once: true })
+        })
+      }),
+    })
+
+    await reporter.report(progress('event-shutdown-post'))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+
+    await reporter.close({ deadlineMs: 20 })
+
+    expect(signals[0]?.aborted).toBe(true)
+  })
+
+  it('records shutdown, not the lapsed deadline, as the reason a token request was cancelled', async () => {
+    const signals: AbortSignal[] = []
+    let resolveTokenRequested!: () => void
+    const tokenRequested = new Promise<void>((resolve) => {
+      resolveTokenRequested = resolve
+    })
+    const reporter = await createReporter({
+      getAccessToken: async (options) => {
+        if (options?.signal) signals.push(options.signal)
+        resolveTokenRequested()
+        // The hosted credential endpoint never answers.
+        return await new Promise<string>(() => {})
+      },
+      fetch: vi.fn(),
+    })
+
+    await reporter.report(progress('event-shutdown-reason'))
+    // The credential request has to be in flight under an *unbounded* flush.
+    // Give it a deadline of its own and the two cancellations race: whichever
+    // fires first freezes the reason, so the assertion below would be flaky.
+    void reporter.flush()
+    await tokenRequested
+
+    await reporter.close({ deadlineMs: 20 })
+
+    // `aborted` alone cannot guard the shutdown binding: this controller is
+    // also aborted when the flush deadline lapses, so a request unbound from
+    // shutdown still ends up aborted. Only the reason tells the two apart.
+    expect(signals[0]?.aborted).toBe(true)
+    expect((signals[0]?.reason as Error | undefined)?.name).toBe('FactoryCloudShutdownError')
+  })
+
+  it('cancels a response body that stalls after headers when close() gives up at its deadline', async () => {
+    const requestSignals: Array<AbortSignal | undefined> = []
+    const bodyStops: string[] = []
+    const reporter = await createReporter({
+      autoFlush: true,
+      fetch: vi.fn(async (_url, init) => {
+        requestSignals.push(init?.signal ?? undefined)
+        // Cloud answers with headers and then never sends the body. A real
+        // fetch tears the body down when the request signal aborts.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener('abort', () => {
+              bodyStops.push('aborted')
+              controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            }, { once: true })
+          },
+          cancel() { bodyStops.push('cancelled') },
+        })
+        return new Response(body, { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }),
+    })
+
+    await reporter.report(progress('event-stalled-body'))
+    await vi.waitFor(() => { expect(requestSignals).toHaveLength(1) })
+
+    await reporter.close({ deadlineMs: 20 })
+
+    // Headers arriving is not delivery: the body read runs on the same socket,
+    // so shutdown has to cancel it too or the process outlives close().
+    expect(bodyStops.length).toBeGreaterThan(0)
+    expect(requestSignals[0]?.aborted).toBe(true)
   })
 
   it('preserves a Cloud deployment base path when resolving the endpoint', async () => {

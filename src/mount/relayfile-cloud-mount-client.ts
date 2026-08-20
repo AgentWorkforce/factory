@@ -83,6 +83,20 @@ export const FACTORY_RELAYFILE_SCOPES = [
   'relayfile:fs:write:/factory/observability/**',
 ] as const
 
+/**
+ * Hosted mode is defined by a usable endpoint, not by the variable merely
+ * existing. A blank or whitespace-only value is not hosted configuration — it
+ * must fall through to the local-session path rather than steer callers into a
+ * branch that throws on `new URL('')`.
+ */
+export const hostedCloudAccessTokenUrl = (
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined => env[FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV]?.trim() || undefined
+
+export const resolveHostedCloudApiUrl = (
+  env: NodeJS.ProcessEnv = process.env,
+): string => env.CLOUD_API_URL?.trim() || defaultApiUrl()
+
 export type CloudSessionProvider = (options?: CloudSessionOptions) => Promise<CloudSession>
 
 export type ActiveWorkspaceResolver = (
@@ -117,7 +131,7 @@ export async function resolveFactoryWorkspace(
   // that mode; doing so can invoke AGENT_RELAY_BIN before fromConfig() gets the
   // chance to use the hosted provider. fromConfig() remains responsible for
   // validating the configured endpoint URL and failing closed when malformed.
-  if (Object.prototype.hasOwnProperty.call(env, FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV)) {
+  if (hostedCloudAccessTokenUrl(env)) {
     return { workspaceId: DEFAULT_WORKSPACE_ID }
   }
   try {
@@ -207,7 +221,7 @@ export interface RelayfileCloudMountClientConfig {
    * Hosted runtimes inject a rotating, fixed RelayAuth path-token provider;
    * when present, Factory never reads the local Cloud login or shells out.
    */
-  cloudAccessTokenProvider?: () => Promise<string>
+  cloudAccessTokenProvider?: HostedCloudAccessTokenProvider
   /** Private host endpoint that returns the current fixed RelayAuth access token. */
   cloudAccessTokenUrl?: string
   /** Internal fetch override for hosted credential-provider tests. */
@@ -412,7 +426,7 @@ export class RelayfileCloudMountClient implements MountClient {
     }
     const cloudApiUrl = config.cloudApiUrl
       ?? initialSession?.auth.apiUrl
-      ?? (hostedTokenProvider ? (runtimeEnv.CLOUD_API_URL?.trim() || defaultApiUrl()) : undefined)
+      ?? (hostedTokenProvider ? resolveHostedCloudApiUrl(runtimeEnv) : undefined)
     if (!cloudApiUrl) {
       throw new Error('Relayfile hosted access requires cloudApiUrl with cloudAccessTokenProvider')
     }
@@ -1005,21 +1019,37 @@ const createDefaultRelayfileSetup: RelayfileSetupFactory = ({ cloudApiUrl, token
     accessToken: tokenProvider,
   }) as unknown as RelayfileSetupLike
 
+/**
+ * Options a caller may pass per token request. `signal` binds the request's
+ * lifetime to the caller's: a reporter that has hit its shutdown deadline
+ * cancels the credential fetch instead of leaving it holding the event loop.
+ */
+export interface HostedCloudAccessTokenRequestOptions {
+  signal?: AbortSignal
+}
+
+export type HostedCloudAccessTokenProvider = (
+  options?: HostedCloudAccessTokenRequestOptions,
+) => Promise<string>
+
 const createValidatedHostedAccessTokenProvider = (
-  provider: () => Promise<string>,
-): (() => Promise<string>) => async () => {
-  const accessToken = (await provider()).trim()
+  provider: HostedCloudAccessTokenProvider,
+): HostedCloudAccessTokenProvider => async (requestOptions) => {
+  const accessToken = (await provider(requestOptions)).trim()
   if (!accessToken.startsWith('relay_pa_')) {
     throw new Error('hosted Cloud access-token provider returned an invalid token class')
   }
   return accessToken
 }
 
-const createHostedCloudAccessTokenProvider = (options: {
+const HOSTED_ACCESS_TOKEN_CANCELLED = 'hosted Cloud access-token request was cancelled'
+
+export const createHostedCloudAccessTokenProvider = (options: {
   url: string
   fetchImpl: typeof fetch
-  timeoutMs: number
-}): (() => Promise<string>) => {
+  timeoutMs?: number
+}): HostedCloudAccessTokenProvider => {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_HOSTED_ACCESS_TOKEN_TIMEOUT_MS
   let url: URL
   try {
     url = new URL(options.url)
@@ -1029,13 +1059,28 @@ const createHostedCloudAccessTokenProvider = (options: {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`${FACTORY_CLOUD_ACCESS_TOKEN_URL_ENV} must use http or https`)
   }
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error('hosted Cloud access-token timeout must be positive')
   }
 
-  return async (): Promise<string> => {
+  return async (requestOptions?: HostedCloudAccessTokenRequestOptions): Promise<string> => {
+    const callerSignal = requestOptions?.signal
+    if (callerSignal?.aborted) throw new Error(HOSTED_ACCESS_TOKEN_CANCELLED)
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+    let cancelled = false
+    const abortForCaller = (): void => {
+      cancelled = true
+      // Forward the caller's reason so the request signal records *why* it was
+      // cancelled: a reporter shutting down and a lapsed flush deadline are
+      // different stops, and only the caller can tell them apart.
+      controller.abort(callerSignal?.reason)
+    }
+    callerSignal?.addEventListener('abort', abortForCaller, { once: true })
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    // An unreferenced timer cannot outlive the caller. Combined with the
+    // caller signal above, a hung credential endpoint can no longer keep the
+    // process alive past a reporter's shutdown deadline.
+    timer.unref?.()
     try {
       const response = await options.fetchImpl(url, {
         method: 'GET',
@@ -1061,12 +1106,14 @@ const createHostedCloudAccessTokenProvider = (options: {
       }
       return accessToken
     } catch (error) {
+      if (cancelled) throw new Error(HOSTED_ACCESS_TOKEN_CANCELLED)
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`hosted Cloud access-token provider timed out after ${String(options.timeoutMs)}ms`)
+        throw new Error(`hosted Cloud access-token provider timed out after ${String(timeoutMs)}ms`)
       }
       throw error
     } finally {
       clearTimeout(timer)
+      callerSignal?.removeEventListener('abort', abortForCaller)
     }
   }
 }
