@@ -4096,6 +4096,378 @@ describe('FactoryLoop', () => {
     }))
   })
 
+  // #297: relayfile answers an overloaded workspace DO with a 429 in
+  // milliseconds carrying `Retry-After: 5`. Factory answered by sleeping up to
+  // 300 SECONDS, latching on the first 429 raised anywhere in the sweep, and
+  // discarding everything the sweep had already accomplished. Root-caused
+  // during the 2026-08-20 cloud outage.
+  describe('Relayfile discovery overload (#297)', () => {
+    // All four relayfile reason codes share this one message string, which is
+    // why the reason has to be logged separately — during the incident that
+    // ambiguity was the single biggest obstacle to diagnosis.
+    const OVERLOAD_MESSAGE = 'workspace durable object is busy; retry after the advertised delay'
+
+    const overloadError = (
+      opts: { retryAfterSeconds?: number; reason?: string } = {},
+    ): Error =>
+      Object.assign(new Error(OVERLOAD_MESSAGE), {
+        status: 429,
+        details: {
+          reason: opts.reason ?? 'oldest_inflight_age',
+          ...(opts.retryAfterSeconds === undefined
+            ? {}
+            : { retryAfterSeconds: opts.retryAfterSeconds }),
+        },
+      })
+
+    type Warning = { message: string; details?: unknown }
+
+    const backoffs = (warnings: Warning[]) =>
+      warnings
+        .filter((entry) =>
+          entry.message === '[factory] Relayfile discovery overloaded; backing off before another sweep')
+        .map((entry) => entry.details as { delayMs: number; consecutiveOverloads: number })
+
+    /**
+     * The durable ratchet after each overloaded sweep, whichever way the sweep
+     * ended. A sweep that skipped every shed unit and ran to the end still
+     * moves the ratchet — it just does so from the commit path rather than the
+     * deferral path.
+     */
+    const ratchet = (warnings: Warning[]) =>
+      warnings
+        .filter((entry) =>
+          entry.message === '[factory] Relayfile discovery overloaded; backing off before another sweep' ||
+          entry.message === '[factory] discovery sweep committed despite Relayfile overload')
+        .map((entry) => entry.details as {
+          delayMs: number
+          consecutiveOverloads: number
+          previousOverloads: number
+          reason: string
+        })
+
+    /**
+     * `oldest_inflight_age` rejects ALL background traffic regardless of how
+     * few requests are in flight — one stuck op poisons everyone — so a sweep
+     * against a shedding object gets nothing done at all. This is the shape the
+     * ratchet exists for, and it must keep escalating.
+     */
+    class ShedEveryTreeReadMount extends FakeMountClient {
+      constructor(readonly makeOverload: () => Error) {
+        super()
+      }
+
+      override async listTree(): Promise<string[]> {
+        throw this.makeOverload()
+      }
+    }
+
+    const shedFactory = (mount: FakeMountClient, clock: ManualClock, warnings: Warning[]) =>
+      createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 2 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+    const drainLadder = async (mount: FakeMountClient, rungs: number) => {
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const factory = shedFactory(mount, clock, warnings)
+      for (let rung = 0; rung < rungs; rung += 1) {
+        await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      }
+      return { factory, warnings, delays: backoffs(warnings) }
+    }
+
+    // MUST FIRE. The dependency asked for 5 seconds and Factory slept for up to
+    // 300 — a self-imposed outage, and the reason /healthz still read degraded
+    // seven minutes after the upstream fix went live.
+    it('caps the ladder near the advertised Retry-After instead of climbing to five minutes', async () => {
+      const mount = new ShedEveryTreeReadMount(() => overloadError({ retryAfterSeconds: 5 }))
+
+      const { delays } = await drainLadder(mount, 7)
+
+      // Never below the advertised delay, never wildly above it, and still
+      // rising: the ratchet is intact, it is just bounded by what the
+      // dependency actually asked for.
+      expect(delays.map((entry) => entry.delayMs)).toEqual([
+        5_000,
+        10_000,
+        20_000,
+        30_000,
+        30_000,
+        30_000,
+        30_000,
+      ])
+      // MUST NOT FIRE: repeated genuine overload still escalates the durable
+      // ratchet. Capping the sleep must not make the counter meaningless.
+      expect(delays.map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    })
+
+    // MUST NOT FIRE. With no advertised delay there is nothing to respect, so
+    // the original five-minute ceiling still governs. Without this the fix
+    // could quietly become "hammer the dependency every five seconds forever".
+    it('still climbs the five-minute ladder when the 429 advertises no Retry-After', async () => {
+      const mount = new ShedEveryTreeReadMount(() => overloadError())
+
+      const { delays } = await drainLadder(mount, 8)
+
+      expect(delays.map((entry) => entry.delayMs)).toEqual([
+        5_000,
+        10_000,
+        20_000,
+        40_000,
+        80_000,
+        160_000,
+        300_000,
+        300_000,
+      ])
+      expect(delays.map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    })
+
+    const shedPath = githubIssuePath('AgentWorkforce', 'pear', 59)
+    const freshPath = githubIssuePath('AgentWorkforce', 'pear', 60)
+
+    /** Sheds the read of specific issue files, leaving the rest of the sweep intact. */
+    class ShedSomeIssueReadsMount extends FakeMountClient {
+      shedPaths = new Set<string>()
+
+      constructor(files: Record<string, unknown>, readonly makeOverload: () => Error) {
+        super(files)
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (this.shedPaths.has(path)) throw this.makeOverload()
+        return await super.readFile(path)
+      }
+    }
+
+    const twoReadyIssues = () =>
+      new ShedSomeIssueReadsMount(
+        {
+          [shedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+          [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+        },
+        () => overloadError({ retryAfterSeconds: 5, reason: 'inflight_limit' }),
+      )
+
+    // MUST FIRE. Same principle as #292/#293: one work unit must not decide the
+    // fate of the others. A sweep that pulled 40 issues and hit one 429 on the
+    // 39th must not throw away the other 39.
+    it('skips the work unit relayfile shed and dispatches the rest of the sweep', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        // The issue body was never readable, so the ref is reconstructed from
+        // the path — the key is what an operator needs to correlate it.
+        issue: expect.objectContaining({ key: '59' }),
+        // Sanitized the way #293 sanitized per-item skip reasons: a fixed
+        // classification plus an allowlisted relayfile reason code.
+        reason: 'relayfile overloaded (inflight_limit)',
+      }))
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+        'ar-60-impl-pear',
+        'ar-60-review-pear',
+      ])
+      expect(factory.status().counters.discoveryOverloadItemsSkipped).toBe(1)
+    })
+
+    // MUST FIRE. Deliverable 4: four distinct reason codes share one message
+    // string, and only the reason separates a DO-local limiter from a runtime
+    // shed from a Worker-global one.
+    it('logs the 429 reason code, not just its message', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      await factory.runOnce()
+
+      expect(warnings).toContainEqual(expect.objectContaining({
+        message: '[factory] relayfile shed a discovery operation',
+        details: expect.objectContaining({
+          operation: 'readFile',
+          status: 429,
+          reason: 'inflight_limit',
+          retryAfterSeconds: 5,
+        }),
+      }))
+      expect(factory.status().counters['discoveryOverloadReason:inflight_limit']).toBe(1)
+    })
+
+    // MUST FIRE. Deliverable 3: requiring a perfect sweep to clear the ratchet
+    // means the ratchet rarely clears under sustained mild load, so recovery
+    // stays pinned at the cap long after the dependency recovered.
+    it('decays the ratchet when a sweep makes progress despite an overload', async () => {
+      const mount = twoReadyIssues()
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Every work unit is shed, so three sweeps in a row get nothing through.
+      // Skipping a shed unit is no longer fatal, but a sweep that served NO
+      // unit accomplished nothing, so it still fails and still ratchets.
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      for (let rung = 0; rung < 3; rung += 1) {
+        await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      }
+      expect(ratchet(warnings).map((entry) => entry.consecutiveOverloads)).toEqual([1, 2, 3])
+
+      // The dependency partially recovers: issue 60 now reads and dispatches,
+      // issue 59 is still shed. That is progress, so the ratchet must come
+      // down rather than stay pinned or climb.
+      mount.shedPaths.delete(freshPath)
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(warnings).toContainEqual(expect.objectContaining({
+        message: '[factory] discovery sweep committed despite Relayfile overload',
+        details: expect.objectContaining({
+          previousOverloads: 3,
+          consecutiveOverloads: 2,
+          reason: 'inflight_limit',
+          // The decayed rung, still bounded by the advertised ceiling rather
+          // than by DISCOVERY_OVERLOAD_BACKOFF_MAX_MS.
+          delayMs: 10_000,
+        }),
+      }))
+    })
+
+    // MUST NOT FIRE. Partial-progress decay must not make the ratchet
+    // meaningless: a sweep that gets nothing done still escalates, and the
+    // durable counter it escalates from is the one the decayed sweep left.
+    it('still escalates from the decayed counter when the next sweep gets nothing done', async () => {
+      const mount = twoReadyIssues()
+      const clock = new ManualClock()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(ratchet(warnings).map((entry) => entry.consecutiveOverloads)).toEqual([1, 2])
+
+      // One sweep gets work done and decays the counter to 1...
+      mount.shedPaths.delete(freshPath)
+      expect((await factory.runOnce()).dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(ratchet(warnings).at(-1)?.consecutiveOverloads).toBe(1)
+
+      // ...and the next sweep, which gets nothing through, climbs again from
+      // there rather than restarting at zero.
+      mount.shedPaths.add(freshPath)
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(ratchet(warnings).at(-1)).toMatchObject({
+        previousOverloads: 1,
+        consecutiveOverloads: 2,
+      })
+    })
+
+    // MUST NOT FIRE. Skipping shed work units must never hand back a green
+    // sweep over a dependency that served none of it: `readinessReconcile` is
+    // the signal operators and monitors read, and a sweep that dispatched
+    // nothing because every unit was shed is an outage, not a clean pass.
+    it('still fails a sweep in which relayfile shed every work unit', async () => {
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      mount.shedPaths.add(freshPath)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      // Two shed units is below DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT, so the fuse
+      // is not what saves this — "no unit got through" is.
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+      expect(fleet.spawns).toEqual([])
+      expect(backoffs(warnings)).toEqual([
+        expect.objectContaining({ delayMs: 5_000, consecutiveOverloads: 1 }),
+      ])
+    })
+
+    // MUST NOT FIRE. Skipping shed work units must not degenerate into grinding
+    // a shedding dependency through a whole backlog one 429 at a time. Once the
+    // sweep has been shed repeatedly, the pass aborts and backs off.
+    it('still aborts the sweep once relayfile sheds it repeatedly', async () => {
+      const numbers = [71, 72, 73, 74, 75, 76, 77]
+      const paths = numbers.map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new ShedSomeIssueReadsMount(
+        Object.fromEntries(paths.map((path, index) => [
+          path,
+          githubIssueFile(numbers[index]!, { labels: ['factory', 'pear'] }),
+        ])),
+        () => overloadError({ retryAfterSeconds: 5, reason: 'durable_object_overloaded' }),
+      )
+      for (const path of paths) mount.shedPaths.add(path)
+      const fleet = new LocalLifecycleFleetClient()
+      const warnings: Warning[] = []
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 5 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock: new ManualClock(),
+        logger: { warn: (message, details) => warnings.push({ message, details }) },
+      })
+
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+
+      expect(fleet.spawns).toEqual([])
+      expect(backoffs(warnings)).toEqual([
+        expect.objectContaining({ delayMs: 5_000, consecutiveOverloads: 1 }),
+      ])
+    })
+  })
+
   it('filters GitHub startup discovery through the Relayfile issue index', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-github-index-discovery-'))
     const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 70)

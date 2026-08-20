@@ -154,6 +154,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     owner: string,
     epoch: number,
     checkpoint?: DiscoveryCheckpoint,
+    overload?: { consecutiveOverloads: number; backoffUntilMs: number },
   ): Promise<boolean> {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
@@ -164,8 +165,10 @@ export class DocumentStateStore extends InMemoryStateStore {
       // now empty") — keep the last good checkpoint so the next sweep can
       // still diff from it instead of falling back to a full walk.
       if (checkpoint) state.checkpoint = cloneDiscoveryCheckpoint(checkpoint)
-      state.consecutiveOverloads = 0
-      state.backoffUntilMs = 0
+      // A sweep that committed while relayfile was shedding it keeps a decayed
+      // ratchet and a backoff instead of clearing both outright (#297).
+      state.consecutiveOverloads = overload?.consecutiveOverloads ?? 0
+      state.backoffUntilMs = overload?.backoffUntilMs ?? 0
       delete state.lease
       await this.#persist(document)
       return true
