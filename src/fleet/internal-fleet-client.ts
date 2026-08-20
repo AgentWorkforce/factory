@@ -502,8 +502,11 @@ export class InternalFleetClient implements FleetClient {
       // the new broker — so also treat "the client I used has since been
       // replaced" as a reconnect, or concurrent rosters keep surfacing stale
       // errors from a broker that no longer exists.
+      // The `#disposed` guard mirrors the one in #reconnectIfBrokerChanged:
+      // once dispose() has begun we stop touching the broker, so a call that
+      // fails on a client some earlier reconnect retired is not retried.
       const reconnected = this.#reconnectIfBrokerChanged(error, operation)
-        || this.#client !== attemptedClient
+        || (!this.#disposed && this.#client !== attemptedClient)
       if (!reconnected || options?.retry !== true) {
         throw attributeBrokerError(error, attemptedBaseUrl)
       }

@@ -65,6 +65,49 @@ class FakeBroker {
   }
 }
 
+// A client whose calls stay pending until the test settles them, so the window
+// between one call reconnecting and another failing on the client it retired
+// can be driven deterministically.
+class ControllableClient implements HarnessDriverClientLike {
+  readonly pending: Array<{ resolve: () => void; reject: (error: unknown) => void }> = []
+  disconnectCalls = 0
+
+  constructor(readonly baseUrl: string, private readonly agents: string[]) {}
+
+  listAgents(): Promise<Array<{ name: string; cli?: string; pid?: number }>> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ resolve: () => resolve(this.agents.map((name) => ({ name }))), reject })
+    })
+  }
+
+  async spawnPty(): Promise<{ name: string; session_ref: string }> {
+    throw new Error('not used')
+  }
+
+  async release(name: string): Promise<{ name: string }> {
+    return { name }
+  }
+
+  async sendMessage(): Promise<{ event_id: string }> {
+    return { event_id: 'event' }
+  }
+
+  async sendInput(): Promise<void> {}
+
+  disconnect(): void {
+    this.disconnectCalls += 1
+  }
+}
+
+const flush = async (): Promise<void> => {
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve))
+}
+
+const transportFailure = (): Error =>
+  Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }),
+  })
+
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
@@ -95,6 +138,10 @@ describe('InternalFleetClient broker rebind recovery', () => {
     const dir = mkdtempSync(join(tmpdir(), 'factory-connection-'))
     cleanup.push(() => rmSync(dir, { recursive: true, force: true }))
     return join(dir, 'connection.json')
+  }
+
+  function writeRawConnection(path: string, url: string, apiKey: string): void {
+    writeFileSync(path, JSON.stringify({ url, api_key: apiKey, pid: process.pid }))
   }
 
   function writeConnection(path: string, broker: FakeBroker): void {
@@ -276,6 +323,50 @@ describe('InternalFleetClient broker rebind recovery', () => {
     writeConnection(connectionPath, replacement)
 
     await expect(fleet.roster()).resolves.toMatchObject({ agents: [{ name: 'worker-b' }] })
+  })
+
+  it('does not retry a superseded call once dispose() has begun', async () => {
+    const connectionPath = connectionFile()
+    writeRawConnection(connectionPath, 'http://127.0.0.1:1', 'key-first')
+    const retired = new ControllableClient('http://127.0.0.1:1', ['worker-a'])
+    const replacement = new ControllableClient('http://127.0.0.1:2', ['worker-b'])
+
+    const fleet = new InternalFleetClient({
+      connectionPath,
+      client: retired,
+      connect: () => replacement,
+    })
+
+    // Two rosters in flight against the same client, the way factory.ts:3296
+    // issues them.
+    const loser = fleet.roster()
+    // Attach the expectation now: the rejection lands well before the assertion
+    // point below, and an unhandled rejection in between would be reported as a
+    // suite error.
+    const loserRejects = expect(loser).rejects.toThrow(/fetch failed/)
+    const winner = fleet.roster()
+    await flush()
+    expect(retired.pending).toHaveLength(2)
+
+    // The broker rebinds. The second call fails first and wins the reconnect.
+    writeRawConnection(connectionPath, 'http://127.0.0.1:2', 'key-second')
+    retired.pending[1]!.reject(transportFailure())
+    await flush()
+    expect(replacement.pending).toHaveLength(1)
+    replacement.pending[0]!.resolve()
+    await expect(winner).resolves.toMatchObject({ agents: [{ name: 'worker-b' }] })
+
+    // Factory shuts down, and only then does the first call fail on the client
+    // the reconnect retired.
+    await fleet.dispose()
+    retired.pending[0]!.reject(transportFailure())
+    await flush()
+
+    // dispose() means stop touching the broker. The retry must not be issued —
+    // and because the replacement's calls never settle here, issuing it would
+    // also leave the caller hanging instead of failing.
+    expect(replacement.pending).toHaveLength(1)
+    await loserRejects
   })
 
   it('re-points a non-idempotent send at the rebound broker without replaying it', async () => {
