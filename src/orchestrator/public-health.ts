@@ -1,8 +1,11 @@
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
+import { DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
 import type {
+  FactoryDispatchCapacityStatus,
   FactoryEventListenerStatus,
   FactoryLoopHeartbeat,
+  FactoryPublicDispatchCapacityHealth,
   FactoryPublicEventListenerHealth,
   FactoryPublicFleetControlPlaneHealth,
   FactoryPublicHealth,
@@ -71,7 +74,17 @@ const FLEET_CONTROL_PLANE_STATES: readonly FleetControlPlaneStatus['state'][] = 
 ]
 
 /** Subsystems whose degradation stops issues from being dispatched. */
-const DISPATCH_GATING_SUBSYSTEMS = ['readinessReconcile', 'eventListener', 'fleetControlPlane'] as const
+const DISPATCH_GATING_SUBSYSTEMS = [
+  'readinessReconcile',
+  'eventListener',
+  'fleetControlPlane',
+  // #303. A full batch stops dispatch exactly as hard as a failing sweep, and
+  // is the only one of the four that fails without anything throwing: nothing
+  // increments a failure counter, nothing writes `lastError`, and the wait
+  // logged once and went quiet. It belongs on this list because "why is
+  // nothing being dispatched" is the question the list exists to answer.
+  'dispatchCapacity',
+] as const
 
 const finiteNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -148,6 +161,41 @@ const boundedText = (value: string): string =>
   // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
   // C1 range as escape introducers.
   value.replace(/[\u0000-\u001F\u007F-\u009F]+/gu, ' ').trim().slice(0, 300)
+
+const DISPATCH_CAPACITY_STATES: readonly FactoryPublicDispatchCapacityHealth['state'][] = [
+  'healthy',
+  'waiting',
+  'stalled',
+]
+
+/**
+ * Capacity state from the numbers that produced it.
+ *
+ * Used by the writer, and as the fallback when a record arrives carrying an
+ * unrecognised state string. Falling back to `healthy` there would hide the
+ * exact condition this block exists to report, and unlike the readiness
+ * derivations this one needs no clock — `longestWaitMs` is a duration the
+ * writer already measured.
+ */
+const deriveDispatchCapacityState = (
+  waiting: number,
+  longestWaitMs: number | undefined,
+  warnMs: number,
+): FactoryPublicDispatchCapacityHealth['state'] => waiting === 0
+  ? 'healthy'
+  : longestWaitMs !== undefined && longestWaitMs > warnMs
+    ? 'stalled'
+    : 'waiting'
+
+const dispatchCapacityState = (
+  value: unknown,
+  waiting: number,
+  longestWaitMs: number | undefined,
+  warnMs: number,
+): FactoryPublicDispatchCapacityHealth['state'] =>
+  typeof value === 'string' && (DISPATCH_CAPACITY_STATES as readonly string[]).includes(value)
+    ? value as FactoryPublicDispatchCapacityHealth['state']
+    : deriveDispatchCapacityState(waiting, longestWaitMs, warnMs)
 
 const enumValue = <T extends string>(value: unknown, allowed: readonly T[]): T | 'unknown' =>
   typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : 'unknown'
@@ -242,6 +290,33 @@ function readinessReconcileHealth(
   }
 }
 
+/**
+ * Batch occupancy, redacted (#303).
+ *
+ * Issue keys stay behind the authenticated surface — they carry customer
+ * project and repository names — so the public record carries counts and
+ * durations only. `agentlessOccupants` is the wedge signature: a slot held by
+ * a lifecycle that never placed an agent cannot make progress on its own.
+ */
+function dispatchCapacityHealth(
+  status: FactoryDispatchCapacityStatus,
+): FactoryPublicDispatchCapacityHealth {
+  const waiting = counter(status.waiting)
+  const longestWaitMs = finiteNumber(status.longestWaitMs)
+  const warnMs = positiveNumber(status.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS
+  const agentlessOccupants = (status.occupants ?? [])
+    .filter((occupant) => counter(occupant.agents) === 0).length
+  return {
+    state: deriveDispatchCapacityState(waiting, longestWaitMs, warnMs),
+    batchSize: counter(status.batchSize),
+    active: counter(status.active),
+    waiting,
+    waitWarnMs: warnMs,
+    ...optionalDuration('longestWaitMs', longestWaitMs),
+    ...(agentlessOccupants > 0 ? { agentlessOccupants } : {}),
+  }
+}
+
 function fleetControlPlaneHealth(
   status: FleetControlPlaneStatus,
 ): FactoryPublicFleetControlPlaneHealth {
@@ -292,6 +367,9 @@ export function publicHealthFromHeartbeat(
   const fleetControlPlane = heartbeat.fleetControlPlane
     ? fleetControlPlaneHealth(heartbeat.fleetControlPlane)
     : undefined
+  const dispatchCapacity = heartbeat.dispatchCapacity
+    ? dispatchCapacityHealth(heartbeat.dispatchCapacity)
+    : undefined
   const eventListener: FactoryPublicEventListenerHealth | undefined = heartbeat.eventListener
     // Only the state. `reason` is assembled free text and stays behind the
     // authenticated surface.
@@ -312,6 +390,13 @@ export function publicHealthFromHeartbeat(
       // An open circuit fails every spawn fast; half-open is one probe away
       // from either. Both mean dispatch is not admitting work normally.
       return fleetControlPlane !== undefined && fleetControlPlane.state !== 'closed'
+    }
+    if (name === 'dispatchCapacity') {
+      // `waiting` alone is ordinary backpressure and stays green: a batch is
+      // supposed to fill up. Only a wait past the configured threshold — which
+      // a deployment running multi-hour issues should raise rather than
+      // silence — is a degradation.
+      return dispatchCapacity !== undefined && dispatchCapacity.state === 'stalled'
     }
     // Review follow-up on #300 (P2, codex): `starting` is what a live daemon
     // reports before `#startLiveSubscription` installs the subscription. No
@@ -359,6 +444,7 @@ export function publicHealthFromHeartbeat(
     ...(readinessReconcile ? { readinessReconcile } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
+    ...(dispatchCapacity ? { dispatchCapacity } : {}),
   }
 }
 
@@ -383,6 +469,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const readiness = plainRecord(record.readinessReconcile)
   const listener = plainRecord(record.eventListener)
   const fleet = plainRecord(record.fleetControlPlane)
+  const capacity = plainRecord(record.dispatchCapacity)
   const degradedSubsystems = Array.isArray(record.degradedSubsystems)
     ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => (record.degradedSubsystems as unknown[]).includes(name))
     : []
@@ -427,6 +514,24 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             failureThreshold: counter(fleet.failureThreshold),
             ...optionalTimestamp('lastFailureAtMs', fleet.lastFailureAtMs),
             ...optionalTimestamp('retryAtMs', fleet.retryAtMs),
+          },
+        }
+      : {}),
+    ...(capacity
+      ? {
+          dispatchCapacity: {
+            state: dispatchCapacityState(
+              capacity.state,
+              counter(capacity.waiting),
+              optionalDuration('longestWaitMs', capacity.longestWaitMs).longestWaitMs,
+              positiveNumber(capacity.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS,
+            ),
+            batchSize: counter(capacity.batchSize),
+            active: counter(capacity.active),
+            waiting: counter(capacity.waiting),
+            waitWarnMs: positiveNumber(capacity.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS,
+            ...optionalDuration('longestWaitMs', capacity.longestWaitMs),
+            ...optionalCount('agentlessOccupants', capacity.agentlessOccupants),
           },
         }
       : {}),

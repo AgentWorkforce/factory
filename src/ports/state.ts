@@ -305,6 +305,15 @@ export type DispatchLifecycle = {
   lease?: DispatchLifecycleLease
   /** First successful agent placement for this active team generation. */
   heldSinceAtMs?: number
+  /**
+   * When this row started occupying a `dispatch.batchSize` slot (#303).
+   *
+   * `heldSinceAtMs` only exists once a placement succeeds, and `updatedAtMs`
+   * is bumped by every lease renewal, so neither can bound a lifecycle that
+   * took the slot and never got an agent. This is that bound; it is cleared
+   * whenever the row stops occupying a slot.
+   */
+  slotHeldSinceAtMs?: number
   updatedAtMs: number
 }
 

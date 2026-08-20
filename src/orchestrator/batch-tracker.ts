@@ -27,6 +27,13 @@ export interface InFlightIssue {
   dispatchClaim?: FactoryDispatchClaimStatus
   /** Wall-clock anchor set when the first agent placement succeeds. */
   heldSinceAtMs?: number
+  /**
+   * Wall-clock anchor set when this record took a `batchSize` slot (#303).
+   *
+   * The only deadline a lifecycle that never placed an agent has: it holds a
+   * slot, `heldSinceAtMs` is never stamped, and nothing else will move it.
+   */
+  slotHeldSinceAtMs?: number
   /** Latest durable phase, used only for operator-facing held-agent status. */
   lifecyclePhase?: DispatchLifecyclePhase
 }
@@ -315,6 +322,7 @@ export class BatchTracker {
       invocationIds: new Set(record.invocationIds),
       result: record.result ? structuredClone(record.result) : undefined,
       heldSinceAtMs: record.heldSinceAtMs,
+      slotHeldSinceAtMs: record.slotHeldSinceAtMs,
       lifecyclePhase: record.lifecyclePhase,
     }
     this.#inFlight.set(key, restored)

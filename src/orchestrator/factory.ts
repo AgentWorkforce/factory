@@ -56,6 +56,7 @@ import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
+import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
 import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
@@ -86,6 +87,8 @@ import type {
   FactoryLoopRunOptions,
   FactoryLoopHeartbeat,
   FactoryLoopLiveness,
+  FactoryDispatchCapacityStatus,
+  FactoryDispatchSlotOccupant,
   FactoryReadinessReconcileStatus,
   FactoryDispatchClaimStatus,
   FactoryInFlightDispatchStatus,
@@ -408,9 +411,28 @@ const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
+/**
+ * Ceiling on the durable capacity-wait re-arm (#303).
+ *
+ * The retry was a flat 1 Hz with no bound at all. When the batch was wedged,
+ * every queued issue re-read the shared state document once a second forever —
+ * production measured 1477 state GETs in 111 s — and the timers could not even
+ * keep up, so they coalesced into a continuous spin against the serialized
+ * store. Waiting for capacity is legitimate and must not be abandoned (a real
+ * multi-hour run holds the slot honestly), so what is bounded is the *rate*.
+ */
+const DISPATCH_LIFECYCLE_RETRY_MAX_MS = 30_000
+/** Rate limit for the capacity-wait warning once the backoff has capped. */
+const DISPATCH_LIFECYCLE_CAPACITY_WAIT_LOG_MS = 60_000
 const DISPATCH_WRITEBACK_MAX_ATTEMPTS = 3
 const DISPATCH_WRITEBACK_RETRY_MS = 250
 const HELD_PAST_DEADLINE_RELEASE_REASON = 'held-past-deadline'
+/**
+ * Release reason for a lifecycle that took a batch slot and never placed an
+ * agent (#303). Deliberately distinct from `held-past-deadline`: that one
+ * means a team ran and never finished, this one means no team ever existed.
+ */
+const AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON = 'agentless-slot-past-deadline'
 const HELD_DEADLINE_OVERDUE_RETRY_MS = 1_000
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
@@ -688,7 +710,22 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #dispatchLifecycleDrives = new Set<Promise<void>>()
   readonly #abandonedDispatchReasons = new Map<string, string>()
-  readonly #dispatchLifecycleCapacityWaitLogged = new Set<string>()
+  /**
+   * Live batch-capacity waits, keyed by issue (#303).
+   *
+   * Replaces a `Set` of "already logged" keys. That set made the wait a
+   * one-shot log and nothing else: after the first line, an outage in which
+   * every issue was stuck behind a wedged slot was indistinguishable from an
+   * idle Factory on every operator surface. The wait now carries its own start
+   * instant and attempt count, which is what both the escalating warning and
+   * `status().dispatchCapacity` are derived from.
+   */
+  readonly #dispatchLifecycleCapacityWaits = new Map<string, {
+    sinceAtMs: number
+    attempts: number
+    lastLoggedAtMs?: number
+    lastLoggedRetryMs?: number
+  }>()
   readonly #dispatchLifecycleOwnershipWaitLogged = new Set<string>()
   readonly #dispatchClaimStatuses = new Map<string, FactoryDispatchClaimStatus>()
   readonly #localReleaseCheckpoints = new Map<string, Set<string>>()
@@ -1274,6 +1311,7 @@ export class FactoryLoop implements Factory {
     for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
     this.#dispatchLifecycleRetryTimers.clear()
     this.#abandonedDispatchReasons.clear()
+    this.#dispatchLifecycleCapacityWaits.clear()
     this.#dispatchLifecycleOwnershipWaitLogged.clear()
     if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
     this.#completionSweepTimer = undefined
@@ -4700,6 +4738,7 @@ export class FactoryLoop implements Factory {
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
+      dispatchCapacity: this.#dispatchCapacityStatus(),
       heldAgents: batch?.inFlight.flatMap((record) => heldAgentsForRecord(
         record,
         nowMs,
@@ -5145,7 +5184,7 @@ export class FactoryLoop implements Factory {
         const timer = this.#dispatchLifecycleRetryTimers.get(key)
         if (timer) clearTimeout(timer)
         this.#dispatchLifecycleRetryTimers.delete(key)
-        this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+        this.#dispatchLifecycleCapacityWaits.delete(key)
         clearedKeys.add(key)
         this.#increment('dispatchLifecycleGithubAliasesCollapsed')
       }
@@ -5204,9 +5243,58 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleRenewTimer.unref?.()
   }
 
+  /**
+   * The wall-clock deadline that can free this record's batch slot, if any.
+   *
+   * Two clocks, never both. `heldSinceAtMs` is stamped by the first successful
+   * placement and bounds a team that ran and never reached a terminal state.
+   * A record that has no `heldSinceAtMs` never had a placement at all, and
+   * before #303 that made it permanently unreapable: `#scheduleHeldAgentDeadline`
+   * armed no timer and `#sweepHeldAgentDeadlines` skipped it, so a row that
+   * reached `dispatching` and lost its process held the only batch slot
+   * forever. Such a row is definitionally stuck — nothing but a placement can
+   * move it, and no placement is coming — so it gets the much shorter
+   * `agentlessHoldTimeoutMs` anchored on when it took the slot.
+   *
+   * The anchor is deliberately not `agents.size === 0`: `recordPlanned` writes
+   * the spec before the spawn returns, so a process that died mid-spawn leaves
+   * an agent entry with no result and still no placement.
+   */
+  #holdDeadline(record: InFlightIssue): {
+    kind: 'agents' | 'agentless'
+    sinceAtMs: number
+    timeoutMs: number
+    dueAtMs: number
+  } | undefined {
+    if (record.dryRun) return undefined
+    if (record.heldSinceAtMs !== undefined) {
+      const timeoutMs = this.#config.dispatch.agentHoldTimeoutMs
+      return {
+        kind: 'agents',
+        sinceAtMs: record.heldSinceAtMs,
+        timeoutMs,
+        dueAtMs: record.heldSinceAtMs + timeoutMs,
+      }
+    }
+    // Only a row that is actually holding a slot is worth reaping; a `queued`
+    // or `waiting-for-human` row costs nothing and may wait indefinitely.
+    if (record.slotHeldSinceAtMs === undefined || !dispatchPhaseOccupiesSlot(record.lifecyclePhase)) {
+      return undefined
+    }
+    const timeoutMs = this.#config.dispatch.agentlessHoldTimeoutMs
+    return {
+      kind: 'agentless',
+      sinceAtMs: record.slotHeldSinceAtMs,
+      timeoutMs,
+      dueAtMs: record.slotHeldSinceAtMs + timeoutMs,
+    }
+  }
+
   #scheduleHeldAgentDeadline(record: InFlightIssue): void {
-    if (this.#stopping || record.dryRun || record.heldSinceAtMs === undefined || record.agents.size === 0) return
-    const dueAtMs = record.heldSinceAtMs + this.#config.dispatch.agentHoldTimeoutMs
+    if (this.#stopping) return
+    const deadline = this.#holdDeadline(record)
+    if (!deadline) return
+    const dueAtMs = deadline.dueAtMs
     if (
       this.#heldAgentDeadlineTimer &&
       this.#heldAgentDeadlineDueAtMs !== undefined &&
@@ -5245,15 +5333,9 @@ export class FactoryLoop implements Factory {
 
   async #sweepHeldAgentDeadlines(): Promise<void> {
     const nowMs = this.#clock.now()
-    const timeoutMs = this.#config.dispatch.agentHoldTimeoutMs
     for (const record of [...(await this.#batch()).inFlight]) {
-      const heldSinceAtMs = record.heldSinceAtMs
-      if (
-        record.dryRun ||
-        heldSinceAtMs === undefined ||
-        record.agents.size === 0 ||
-        nowMs - heldSinceAtMs < timeoutMs
-      ) continue
+      const deadline = this.#holdDeadline(record)
+      if (!deadline || nowMs < deadline.dueAtMs) continue
 
       const key = issueKey(record.issue)
       if (this.#abandonedDispatchReasons.has(key)) continue
@@ -5266,26 +5348,46 @@ export class FactoryLoop implements Factory {
           await this.#finishDurableRelease(record, lifecycle.releaseReason)
           continue
         }
+        // Re-derive against the durable row before tearing anything down. The
+        // in-memory record can be a beat behind a placement that just
+        // succeeded in this process or a takeover in another, and the
+        // never-placed deadline exists precisely to catch rows nothing is
+        // moving — it must not be what ends a dispatch that just started
+        // moving (#303 must-not-fire).
+        const durable = this.#holdDeadline(inFlightRecordFromLifecycle(lifecycle))
+        if (!durable || this.#clock.now() < durable.dueAtMs) continue
         if (!await this.#assertDispatchLifecycleOwner(record)) continue
       }
 
-      const heldForMs = Math.max(0, this.#clock.now() - heldSinceAtMs)
+      const agentless = deadline.kind === 'agentless'
+      const heldForMs = Math.max(0, this.#clock.now() - deadline.sinceAtMs)
       const details = {
         issue: record.issue.key,
         heldForMs,
-        holdTimeoutMs: timeoutMs,
+        holdTimeoutMs: deadline.timeoutMs,
         waitingForTerminalState: this.#config.terminalState,
-        reason: HELD_PAST_DEADLINE_RELEASE_REASON,
+        reason: agentless ? AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON : HELD_PAST_DEADLINE_RELEASE_REASON,
         agents: [...record.agents.keys()].sort(),
+        ...(agentless ? { phase: record.lifecyclePhase } : {}),
       }
-      this.#logger.warn?.('[factory] releasing agents held past deadline', details)
-      await this.#abandonStuckDispatch(record, HELD_PAST_DEADLINE_RELEASE_REASON)
+      this.#logger.warn?.(
+        agentless
+          ? '[factory] releasing a dispatch lifecycle that never placed an agent'
+          : '[factory] releasing agents held past deadline',
+        details,
+      )
+      await this.#abandonStuckDispatch(record, details.reason)
       const lifecycle = this.#usesDurableDispatchLifecycle()
         ? await this.#state.getDispatchLifecycle(this.#workspaceId, key)
         : undefined
       if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) {
-        this.#increment('heldPastDeadlineReleases')
-        this.#logger.warn?.('[factory] released agents held past deadline', details)
+        this.#increment(agentless ? 'agentlessSlotPastDeadlineReleases' : 'heldPastDeadlineReleases')
+        this.#logger.warn?.(
+          agentless
+            ? '[factory] released a dispatch lifecycle that never placed an agent'
+            : '[factory] released agents held past deadline',
+          details,
+        )
       }
     }
   }
@@ -5724,6 +5826,13 @@ export class FactoryLoop implements Factory {
     telemetry: { cancellationReason?: FactoryCloudCancellationReasonV1 } = {},
   ): Promise<boolean> {
     record.lifecyclePhase = phase
+    // Mirror what the store stamps, so the reaper's never-placed clock is
+    // readable from the in-memory record between durable reads (#303). The
+    // store owns the authoritative value and re-applies the babysitter-handoff
+    // half of the predicate; here `agents.size === 0` for every record this
+    // anchor is ever consulted for, and a handed-off row has babysitters.
+    if (dispatchPhaseOccupiesSlot(phase)) record.slotHeldSinceAtMs ??= this.#clock.now()
+    else record.slotHeldSinceAtMs = undefined
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
     const key = issueKey(record.issue)
@@ -5820,29 +5929,122 @@ export class FactoryLoop implements Factory {
     this.#dispatchTerminalWaiters.delete(key)
   }
 
-  #scheduleDispatchLifecycleRetry(record: InFlightIssue): void {
+  /**
+   * Re-arm delay for a capacity wait: 1 s doubling to a 30 s ceiling (#303).
+   *
+   * Only the capacity path backs off. An ownership wait is already bounded by
+   * `DISPATCH_LIFECYCLE_LEASE_MS`, and every other failure is a real error
+   * whose fast retry is the recovery. A capacity wait has no bound at all —
+   * it ends when some other lifecycle terminates, which may be hours away or,
+   * before this fix, never.
+   */
+  #capacityRetryDelayMs(attempts: number): number {
+    return Math.min(
+      DISPATCH_LIFECYCLE_RETRY_MS * 2 ** Math.max(0, attempts - 1),
+      DISPATCH_LIFECYCLE_RETRY_MAX_MS,
+    )
+  }
+
+  /** Issue keys currently holding a `batchSize` slot, for operator surfaces. */
+  #dispatchSlotOccupants(): FactoryDispatchSlotOccupant[] {
+    return (this.#batchView?.inFlight ?? [])
+      .filter((record) => !record.dryRun && dispatchPhaseOccupiesSlot(record.lifecyclePhase))
+      .map((record) => ({
+        issue: record.issue.key,
+        ...(record.lifecyclePhase ? { phase: record.lifecyclePhase } : {}),
+        agents: record.agents.size,
+        ...(record.heldSinceAtMs !== undefined
+          ? { heldForMs: Math.max(0, this.#clock.now() - record.heldSinceAtMs) }
+          : {}),
+        ...(record.slotHeldSinceAtMs !== undefined
+          ? { slotHeldForMs: Math.max(0, this.#clock.now() - record.slotHeldSinceAtMs) }
+          : {}),
+      }))
+      .sort((left, right) => left.issue.localeCompare(right.issue))
+  }
+
+  /**
+   * Batch occupancy as an operator-readable fact (#303).
+   *
+   * Before this, a full batch was visible only as the *absence* of dispatch:
+   * `readinessReconcile` stayed green, `consecutiveFailures` stayed 0, and the
+   * one capacity log had fired hours earlier. Publishing occupancy is what
+   * turns "nothing is being dispatched" into a question an operator can answer
+   * without reading the state document.
+   */
+  #dispatchCapacityStatus(): FactoryDispatchCapacityStatus {
+    const nowMs = this.#clock.now()
+    const occupants = this.#dispatchSlotOccupants()
+    const waits = [...this.#dispatchLifecycleCapacityWaits.entries()]
+    const longestWaitMs = waits.length === 0
+      ? undefined
+      : Math.max(...waits.map(([, wait]) => Math.max(0, nowMs - wait.sinceAtMs)))
+    return {
+      batchSize: this.#config.batchSize,
+      active: occupants.length,
+      waiting: waits.length,
+      waitWarnMs: this.#config.dispatch.capacityWaitWarnMs,
+      ...(longestWaitMs !== undefined ? { longestWaitMs } : {}),
+      ...(occupants.length > 0 ? { occupants } : {}),
+      ...(waits.length > 0
+        ? {
+            waitingIssues: waits
+              .sort(([, left], [, right]) => left.sinceAtMs - right.sinceAtMs)
+              .map(([key]) => key),
+          }
+        : {}),
+    }
+  }
+
+  #recordDispatchCapacityWait(record: InFlightIssue, key: string): number {
+    const nowMs = this.#clock.now()
+    let wait = this.#dispatchLifecycleCapacityWaits.get(key)
+    if (!wait) {
+      wait = { sinceAtMs: nowMs, attempts: 0 }
+      this.#dispatchLifecycleCapacityWaits.set(key, wait)
+      this.#increment('dispatchLifecycleCapacityWaits')
+    }
+    wait.attempts += 1
+    const retryMs = this.#capacityRetryDelayMs(wait.attempts)
+    const waitedMs = Math.max(0, nowMs - wait.sinceAtMs)
+    // Escalate on every backoff step, then once a minute after the delay
+    // caps. The old behaviour logged once per key and went silent forever,
+    // which is what made a 14-hour dispatch outage look like an idle Factory.
+    const stepChanged = wait.lastLoggedRetryMs !== retryMs
+    const overdue = wait.lastLoggedAtMs === undefined ||
+      nowMs - wait.lastLoggedAtMs >= DISPATCH_LIFECYCLE_CAPACITY_WAIT_LOG_MS
+    if (stepChanged || overdue) {
+      wait.lastLoggedAtMs = nowMs
+      wait.lastLoggedRetryMs = retryMs
+      this.#logger.warn?.('[factory] durable dispatch is queued for batch capacity; retries remain active', {
+        issue: record.issue.key,
+        retryMs,
+        attempts: wait.attempts,
+        waitedMs,
+        batchSize: this.#config.batchSize,
+        occupiedBy: this.#dispatchSlotOccupants().map((occupant) => occupant.issue),
+      })
+    }
+    return retryMs
+  }
+
+  #scheduleDispatchLifecycleRetry(record: InFlightIssue, delayMs = DISPATCH_LIFECYCLE_RETRY_MS): void {
     const key = issueKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
       const drive = this.#driveDispatchLifecycle(key)
         .then(() => {
-          this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+          this.#dispatchLifecycleCapacityWaits.delete(key)
           this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
         })
         .catch((error) => {
+          let nextDelayMs = DISPATCH_LIFECYCLE_RETRY_MS
           if (error instanceof DispatchLifecycleCapacityError) {
             this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
-            if (!this.#dispatchLifecycleCapacityWaitLogged.has(key)) {
-              this.#dispatchLifecycleCapacityWaitLogged.add(key)
-              this.#increment('dispatchLifecycleCapacityWaits')
-              this.#logger.warn?.('[factory] durable dispatch is queued for batch capacity; retries remain active', {
-                issue: record.issue.key,
-                retryMs: DISPATCH_LIFECYCLE_RETRY_MS,
-              })
-            }
+            nextDelayMs = this.#recordDispatchCapacityWait(record, key)
           } else if (error instanceof DispatchLifecycleOwnedElsewhereError) {
-            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#dispatchLifecycleCapacityWaits.delete(key)
             if (!this.#dispatchLifecycleOwnershipWaitLogged.has(key)) {
               this.#dispatchLifecycleOwnershipWaitLogged.add(key)
               this.#increment('dispatchLifecycleOwnershipWaits')
@@ -5855,18 +6057,18 @@ export class FactoryLoop implements Factory {
               })
             }
           } else {
-            this.#dispatchLifecycleCapacityWaitLogged.delete(key)
+            this.#dispatchLifecycleCapacityWaits.delete(key)
             this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
               issue: record.issue.key,
               error: describeError(error).errorMessage,
             })
           }
-          this.#scheduleDispatchLifecycleRetry(record)
+          this.#scheduleDispatchLifecycleRetry(record, nextDelayMs)
         })
         .finally(() => this.#dispatchLifecycleDrives.delete(drive))
       this.#dispatchLifecycleDrives.add(drive)
-    }, DISPATCH_LIFECYCLE_RETRY_MS)
+    }, delayMs)
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
 
@@ -7494,6 +7696,7 @@ export class FactoryLoop implements Factory {
       registryPath,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
+      dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
     }
     // The deployed container serves `/healthz` straight out of this file and
@@ -7943,10 +8146,13 @@ export class FactoryLoop implements Factory {
   async #teardownFailedDispatchWorktrees(
     handoffs: RegistryHandoffAgent[],
     releaseReason = 'dispatch failed',
+    opts: { skipNeverPlacedAgents?: boolean } = {},
   ): Promise<boolean> {
     if (!this.#worktrees || !handoffs.some((handoff) => handoff.worktree)) return false
     const failed = await this.#releaseAndTerminateAgents(
-      handoffs.map((handoff) => [handoff.name, handoff.tracked]),
+      handoffs
+        .filter((handoff) => !opts.skipNeverPlacedAgents || handoff.tracked.result !== undefined)
+        .map((handoff) => [handoff.name, handoff.tracked]),
       releaseReason,
       'completion',
     )
@@ -9244,7 +9450,14 @@ export class FactoryLoop implements Factory {
       this.#scheduleAbandonedDispatchRetry(record, reason)
       return
     }
-    const agents = [...record.agents]
+    // A never-placed record carries specs, not workers: `recordPlanned` writes
+    // the spec before the spawn returns, so a dispatch that died mid-spawn
+    // leaves a name the broker never issued. Releasing one fails, which fails
+    // the whole cleanup and re-arms the abandon retry forever — turning the
+    // #303 reap into a second, quieter wedge. Their worktrees are still torn
+    // down below.
+    const neverPlaced = reason === AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON
+    const agents = [...record.agents].filter(([, tracked]) => !neverPlaced || tracked.result !== undefined)
     for (const [agentName, tracked] of agents) {
       if (!heldPastDeadline && tracked.spec.role === 'implementer') continue
       this.#fleet.markAgentTerminal?.(
@@ -9266,7 +9479,11 @@ export class FactoryLoop implements Factory {
         const failed = await this.#releaseAndTerminateAgents(nonWorktreeAgents, agentReleaseReason, 'completion')
         cleanupComplete = failed.length === 0
       }
-      cleanupComplete = await this.#teardownFailedDispatchWorktrees(worktreeHandoffs, agentReleaseReason) && cleanupComplete
+      cleanupComplete = await this.#teardownFailedDispatchWorktrees(
+        worktreeHandoffs,
+        agentReleaseReason,
+        { skipNeverPlacedAgents: neverPlaced },
+      ) && cleanupComplete
     } else if (agents.length > 0) {
       const failed = await this.#releaseAndTerminateAgents(agents, agentReleaseReason, 'completion')
       cleanupComplete = failed.length === 0
@@ -19739,6 +19956,7 @@ const lifecycleFromInFlightRecord = (
   ...(releaseReason ? { releaseReason } : {}),
   ...(cost ? { cost: structuredClone(cost) } : {}),
   ...(record.heldSinceAtMs !== undefined ? { heldSinceAtMs: record.heldSinceAtMs } : {}),
+  ...(record.slotHeldSinceAtMs !== undefined ? { slotHeldSinceAtMs: record.slotHeldSinceAtMs } : {}),
   updatedAtMs,
 })
 
@@ -19757,10 +19975,14 @@ const inFlightRecordFromLifecycle = (lifecycle: DispatchLifecycle): InFlightIssu
   result: lifecycle.result ? structuredClone(lifecycle.result) : undefined,
   ...(lifecycle.dispatchClaim ? { dispatchClaim: { ...lifecycle.dispatchClaim } } : {}),
   heldSinceAtMs: lifecycle.heldSinceAtMs ?? (
-    lifecycle.agents.some((agent) => agent.releasedAtMs === undefined)
+    // A live placement the durable row predates the `heldSinceAtMs` field for.
+    // `tracked.result` is what distinguishes a placement from a spec that
+    // `recordPlanned` wrote and no spawn ever answered (#303).
+    lifecycle.agents.some((agent) => agent.releasedAtMs === undefined && agent.tracked.result !== undefined)
       ? lifecycle.updatedAtMs
       : undefined
   ),
+  slotHeldSinceAtMs: lifecycle.slotHeldSinceAtMs,
   lifecyclePhase: lifecycle.phase,
 })
 

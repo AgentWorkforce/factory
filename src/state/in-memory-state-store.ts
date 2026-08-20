@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
 import { BatchTracker } from '../orchestrator/batch-tracker'
-import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BatchSnapshot,
   BabysitterGenerationRecord,
@@ -24,6 +23,7 @@ import type {
   ClarificationReply,
 } from '../ports/state'
 import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
+import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
 
 type WorkspaceState = {
   batch: BatchTracker
@@ -225,6 +225,9 @@ export class InMemoryStateStore implements StateStore {
       : (lifecycle.lease?.epoch ?? 0) + 1
     lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
     lifecycle.updatedAtMs = nowMs
+    // See FileStateStore#claimDispatchLifecycle: claim starts the #303
+    // never-placed clock for rows that predate the field.
+    stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
     return {
       key,
       acquired: true,
@@ -268,6 +271,7 @@ export class InMemoryStateStore implements StateStore {
     ) return false
     lifecycle.phase = 'dispatching'
     lifecycle.updatedAtMs = nowMs
+    stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
     return true
   }
 
@@ -292,6 +296,7 @@ export class InMemoryStateStore implements StateStore {
     const next = cloneDispatchLifecycle(lifecycle)
     next.lease = { ...current.lease }
     next.updatedAtMs = nowMs
+    stampDispatchLifecycleSlot(next, current, nowMs)
     this.#workspace(workspaceId).dispatchLifecycles.set(key, next)
     return true
   }
@@ -1029,25 +1034,6 @@ const compareConversationMessages = (left: ConversationMessage, right: Conversat
 
 const activeDispatchLifecycleCount = (lifecycles: Map<string, DispatchLifecycle>, exceptKey?: string): number =>
   [...lifecycles].filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
-
-const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
-  lifecycle.phase !== 'queued' &&
-  lifecycle.phase !== 'waiting-for-human' &&
-  lifecycle.phase !== 'releasing' &&
-  lifecycle.phase !== 'complete' &&
-  lifecycle.phase !== 'abandoned' &&
-  !dispatchLifecycleHandedOffToBabysitters(lifecycle)
-
-const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
-  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
-  if (implementerRepos.length === 0) return false
-  const babysitterRepos = lifecycle.agents
-    .filter((agent) => agent.tracked.spec.role === 'babysitter')
-    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
-    .filter((repo): repo is string => Boolean(repo))
-  return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
-    githubRepositoriesMatch(repo, ownedRepo)))
-}
 
 const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>
   structuredClone(record)

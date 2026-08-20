@@ -84,6 +84,21 @@ const liveSubscriptionSchema = z.object({
 
 export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
 
+/**
+ * How long a lifecycle may occupy a batch slot without ever placing an agent.
+ *
+ * Much shorter than `agentHoldTimeoutMs` because the two bound different
+ * things: that one bounds a team that is plausibly working, this one bounds a
+ * row that definitionally is not — nothing but a placement can move it, and no
+ * placement ever happened. It still has to clear the whole promote-to-spawn
+ * window (clone, worktree prep, fleet spawn, roster adoption) with room to
+ * spare, or the reaper races a dispatch that was about to succeed (#303).
+ */
+export const DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS = 30 * 60_000
+
+/** Capacity wait past which a full batch stops reading as ordinary backpressure. */
+export const DEFAULT_CAPACITY_WAIT_WARN_MS = 30 * 60_000
+
 const dispatchSchema = z.object({
   errorCooldownMs: z.number().int().min(0).default(60_000),
   maxAttempts: z.number().int().min(1).max(5).default(2),
@@ -93,6 +108,21 @@ const dispatchSchema = z.object({
   // agent placement until terminal cleanup.
   agentHoldTimeoutMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000)
     .default(DEFAULT_AGENT_HOLD_TIMEOUT_MS),
+  // A slot-occupying lifecycle with no successful placement has no other
+  // deadline: `agentHoldTimeoutMs` is anchored on a placement that never
+  // happened, so before #303 nothing could ever reap it.
+  agentlessHoldTimeoutMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000)
+    .default(DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS),
+  /**
+   * Wall-clock capacity wait past which dispatch is reported degraded (#303).
+   *
+   * A full batch is normal; a batch that has been full for hours is how a
+   * total dispatch outage looked from every operator surface. Deployments that
+   * legitimately run multi-hour issues against a small `batchSize` should
+   * raise this rather than lower `batchSize`'s usefulness.
+   */
+  capacityWaitWarnMs: z.number().int().min(1_000).max(7 * 24 * 60 * 60_000)
+    .default(DEFAULT_CAPACITY_WAIT_WARN_MS),
 }).default({})
 
 const fleetHealthSchema = z.object({

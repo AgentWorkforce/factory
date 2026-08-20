@@ -174,6 +174,60 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(report.verdict).toContain('stalled')
   })
 
+  // #303: a wedged batch was the one dispatch-gating condition every surface
+  // reported as healthy. `factory diagnose` has to name it, or the operator is
+  // back to reading the state document.
+  it('names a wedged batch when everything else reads healthy', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              schemaVersion: 1,
+              ok: true,
+              status: 'degraded',
+              stale: false,
+              loopStatus: 'running',
+              degradedSubsystems: ['dispatchCapacity'],
+              readinessReconcile: {
+                state: 'healthy',
+                consecutiveFailures: 0,
+                failureThreshold: 3,
+                intervalMs: 60_000,
+                lastStartedAtMs: NOW_MS - 30_000,
+                lastCompletedAtMs: NOW_MS - 29_000,
+              },
+              eventListener: { state: 'subscribed' },
+              dispatchCapacity: {
+                state: 'stalled',
+                batchSize: 1,
+                active: 1,
+                waiting: 7,
+                waitWarnMs: 1_800_000,
+                longestWaitMs: 46_800_000,
+                agentlessOccupants: 1,
+              },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
+    expect(report.dispatching).toBe(false)
+    expect(report.verdict).toContain('batch slot')
+    expect(report.verdict).toContain('never placed an agent')
+    expect(report.verdict).toContain('7 issue(s) waiting')
+  })
+
   // The deployed container serves the block inside its heartbeat projection.
   it('reads the health block where the container actually serves it', async () => {
     const out = buffer()
