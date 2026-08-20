@@ -167,6 +167,35 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(report.verdict).toContain('stalled')
   })
 
+  // The deployed container serves the block inside its heartbeat projection.
+  it('reads the health block where the container actually serves it', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            heartbeat: {
+              status: 'running',
+              readinessReconcile: 'healthy',
+              eventListener: 'subscribed',
+              health: healthy.health,
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    const report = JSON.parse(out.text()) as { dispatching: boolean; health?: { status?: string } }
+    expect(report.dispatching).toBe(true)
+    expect(report.health?.status).toBe('ok')
+  })
+
   it('says what is missing when the instance predates the diagnostics block', async () => {
     const out = buffer()
     const code = await runFleetCli(['diagnose', '--deployed', BASE], {

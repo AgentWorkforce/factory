@@ -210,7 +210,9 @@ export async function diagnoseDeployedFactory(
   try {
     const health = await getJson(fetchImpl, endpoint(url, '/healthz'), { timeoutMs })
     const body = asRecord(health.body)
-    const published = normalizePublicHealth(body.health)
+    // The container serves the daemon's block inside its heartbeat projection;
+    // accept a top-level copy too, so a proxy that hoists it still works.
+    const published = normalizePublicHealth(body.health ?? asRecord(body.heartbeat).health)
     base = {
       url,
       reachable: true,

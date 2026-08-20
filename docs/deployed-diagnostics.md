@@ -1,6 +1,6 @@
 # Diagnosing a deployed Factory
 
-> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) — a deployed Factory had no
+> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) · companion: AgentWorkforce/factory-cloud `fix/295-healthz-diagnostics` — a deployed Factory had no
 > operator-reachable diagnostics. The field naming the 2026-08-19/20 outage existed the whole time
 > and was unreachable for ~10 hours.
 
@@ -118,21 +118,19 @@ none of it appears in the published record.
 The container entrypoint passes the block through unchanged:
 
 ```js
-// container/entrypoint.mjs
-async function safeHeartbeat() {
-  const parsed = await readHeartbeatRecord()
-  if (!parsed) return undefined
-  return {
-    status: parsed.status,
-    updatedAt: parsed.updatedAt,
-    updatedAtMs: parsed.updatedAtMs,
-    eventListener: parsed.eventListener?.state,
-    readinessReconcile: parsed.readinessReconcile?.state,
-    health: parsed.health,        // already redacted by the daemon
-  }
+// container/entrypoint.mjs — publicHeartbeat()
+return {
+  status: parsed.status,
+  updatedAt: parsed.updatedAt,
+  updatedAtMs: parsed.updatedAtMs,
+  eventListener: parsed.eventListener?.state,
+  readinessReconcile: parsed.readinessReconcile?.state,
+  health: parsed.health,        // already redacted by the daemon
 }
-// ...and /healthz answers { ok, phase, factoryProcess, heartbeat, health: heartbeat?.health }
 ```
+
+so `/healthz` answers `{ ok, phase, factoryProcess, heartbeat: { …, health } }`. `factory diagnose`
+reads the block from `heartbeat.health`, and accepts a top-level `health` as well.
 
 Instances running a Factory older than this change publish no `health` block; `factory diagnose`
 detects that and says so rather than reporting a false green.
