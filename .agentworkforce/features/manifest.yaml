@@ -1,11 +1,11 @@
 version: '1.1'
-updated: '2026-08-18'
+updated: '2026-08-20'
 catalog:
   category_count: 25
-  feature_count: 321
+  feature_count: 323
   tier_counts:
-    1: 49
-    2: 127
+    1: 50
+    2: 128
     3: 12
     4: 52
     5: 65
@@ -155,6 +155,14 @@ categories:
         api: checkFactoryLoopLiveness()
         description: Read the loop heartbeat and report whether the owning process is live or stale
         location: src/cli/fleet.ts, src/orchestrator/factory.ts
+        verify_tier: 2
+
+      - id: cli-diagnose-deployed
+        name: Diagnose a Deployed Instance
+        cli: factory diagnose --deployed <url>
+        api: diagnoseDeployedFactory()
+        description: Ask a deployed Factory over HTTP why it is or is not dispatching — public health block, readiness failure count, error class, in-flight sweep age and missed passes — with no credential, and read the gated /evidence lastError when an operator token is supplied
+        location: src/cli/diagnose.ts, src/cli/fleet.ts
         verify_tier: 2
 
       - id: cli-kill-loop
@@ -1482,6 +1490,13 @@ categories:
         api: InMemoryStateStore / DocumentStateStore / FileStateStore
         description: Persist batch, retry, critical delivery, human-loop, handoff, canonical-state, and discovery sweep lease and checkpoint records through memory, an injectable document port, or the atomic file adapter
         location: src/ports/state.ts, src/state/
+        verify_tier: 1
+
+      - id: api-public-health
+        name: Public Health Projection API
+        api: publicHealthFromHeartbeat() / normalizePublicHealth()
+        description: Project the loop heartbeat into the record safe to serve unauthenticated — liveness split from an amber status, readiness failure count, allowlisted error class, and a stalled state derived from an in-flight sweep's age — with free text, paths, URLs and tokens excluded by construction
+        location: src/orchestrator/public-health.ts, src/observability/error-class.ts
         verify_tier: 1
 
       - id: api-reaper

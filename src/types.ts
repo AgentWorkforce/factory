@@ -142,17 +142,90 @@ export interface FactoryLoopHeartbeat {
   readinessReconcile?: FactoryReadinessReconcileStatus
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
+  /**
+   * Redacted projection of this record, safe to serve unauthenticated (#295).
+   *
+   * The deployed container reads this file to answer `/healthz` and has no
+   * redaction logic of its own, so the daemon publishes the already-safe view
+   * rather than leaving the boundary to whoever serves it.
+   */
+  health?: FactoryPublicHealth
 }
 
+/**
+ * `stalled` is derived, not written: a sweep that hangs takes neither the
+ * success nor the failure path, so nothing updates `state` while it is stuck.
+ * See `derivedReadinessReconcileState`.
+ */
+export type FactoryReadinessReconcileState =
+  | 'not-running'
+  | 'healthy'
+  | 'retrying'
+  | 'degraded'
+  | 'stalled'
+
 export interface FactoryReadinessReconcileStatus {
-  state: 'not-running' | 'healthy' | 'retrying' | 'degraded'
+  state: FactoryReadinessReconcileState
   consecutiveFailures: number
   failureThreshold: number
+  /** Sweep cadence — the denominator that turns `inFlightMs` into missed passes. */
+  intervalMs?: number
   lastDurationMs?: number
   lastStartedAtMs?: number
   lastCompletedAtMs?: number
   lastFailureAtMs?: number
+  /** Age of a pass that started and has neither completed nor failed. */
+  inFlightMs?: number
+  /** Free text; authenticated surfaces only. */
   lastError?: string
+  /** Allowlisted class name of `lastError`; publishable. */
+  lastErrorClass?: string
+}
+
+/** A subsystem state as published, plus the value an unrecognised one collapses to. */
+export type FactoryPublicSubsystemState = FactoryReadinessReconcileState
+
+export interface FactoryPublicReadinessReconcileHealth {
+  state: FactoryPublicSubsystemState | 'unknown'
+  consecutiveFailures: number
+  failureThreshold: number
+  intervalMs?: number
+  lastDurationMs?: number
+  lastStartedAtMs?: number
+  lastCompletedAtMs?: number
+  lastFailureAtMs?: number
+  inFlightMs?: number
+  /** `inFlightMs` expressed in sweeps that should have run and did not. */
+  missedPasses?: number
+  lastErrorClass?: string
+}
+
+export interface FactoryPublicEventListenerHealth {
+  state: FactoryEventListenerStatus['state']
+}
+
+/**
+ * The unauthenticated health record (#295).
+ *
+ * `ok` is process liveness — the question the container ping endpoint asks,
+ * and the only one whose answer may recycle a container. `status` is the
+ * amber: dispatch-gating degradation that an operator or monitor must see,
+ * carried where no platform will act on it.
+ */
+export interface FactoryPublicHealth {
+  schemaVersion: number
+  ok: boolean
+  status: 'ok' | 'degraded' | 'unknown'
+  stale: boolean
+  updatedAtMs?: number
+  ageMs?: number
+  loopStatus?: FactoryLoopHeartbeatStatus | 'unknown'
+  /** Dispatch-gating subsystems that are not healthy right now. */
+  degradedSubsystems: string[]
+  /** Why this is not plain `ok`, assembled from closed vocabularies only. */
+  reason?: string
+  readinessReconcile?: FactoryPublicReadinessReconcileHealth
+  eventListener?: FactoryPublicEventListenerHealth
 }
 
 export interface FactoryInFlightRegistryAgent {

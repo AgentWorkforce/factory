@@ -1,0 +1,272 @@
+import { describe, expect, it } from 'vitest'
+
+import { runFleetCli } from './fleet'
+
+const BASE = 'https://factory.example.com'
+const NOW_MS = 1_787_224_000_000
+
+const buffer = () => {
+  let value = ''
+  return {
+    write(chunk: string) {
+      value += chunk
+      return true
+    },
+    text() {
+      return value
+    },
+  }
+}
+
+interface StubRoutes {
+  healthz?: { status: number; body: unknown }
+  evidence?: { status: number; body: unknown }
+}
+
+const stubFetch = (routes: StubRoutes, seen: string[] = []): typeof fetch =>
+  (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const authorization = new Headers(init?.headers ?? {}).get('authorization')
+    seen.push(`${url}${authorization ? ` auth=${authorization}` : ''}`)
+    const route = url.endsWith('/evidence') ? routes.evidence : routes.healthz
+    if (!route) throw Object.assign(new Error('fetch failed'), { name: 'TypeError' })
+    return new Response(JSON.stringify(route.body), {
+      status: route.status,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as typeof fetch
+
+const healthy = {
+  ok: true,
+  phase: 'running',
+  factoryProcess: 'running',
+  health: {
+    schemaVersion: 1,
+    ok: true,
+    status: 'ok',
+    stale: false,
+    updatedAtMs: NOW_MS,
+    ageMs: 12_000,
+    loopStatus: 'running',
+    degradedSubsystems: [],
+    readinessReconcile: {
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      intervalMs: 60_000,
+      lastStartedAtMs: NOW_MS - 30_000,
+      lastCompletedAtMs: NOW_MS - 29_000,
+    },
+    eventListener: { state: 'subscribed' },
+  },
+}
+
+describe('factory diagnose --deployed (#295)', () => {
+  it('reports a healthy deployed instance and exits zero without any credential', async () => {
+    const seen: string[] = []
+    const out = buffer()
+    const err = buffer()
+
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: err,
+      diagnoseFetch: stubFetch({ healthz: { status: 200, body: healthy } }, seen),
+    })
+
+    expect(code).toBe(0)
+    expect(seen).toEqual([`${BASE}/healthz`])
+    expect(out.text()).toContain('dispatching')
+    expect(out.text()).toContain('readinessReconcile')
+  })
+
+  // The 2026-08-19/20 outage: eight consecutive failures behind `ok: true`.
+  it('names the failing subsystem, its failure count and its error class', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              schemaVersion: 1,
+              ok: true,
+              status: 'degraded',
+              stale: false,
+              loopStatus: 'running',
+              degradedSubsystems: ['readinessReconcile'],
+              readinessReconcile: {
+                state: 'degraded',
+                consecutiveFailures: 8,
+                failureThreshold: 3,
+                intervalMs: 60_000,
+                lastErrorClass: 'DispatchLifecycleError',
+              },
+            },
+          },
+        },
+      }),
+    })
+
+    // A lane briefed to "find out why production is not dispatching" must get
+    // a non-zero exit and a named subsystem out of one command.
+    expect(code).not.toBe(0)
+    const text = out.text()
+    expect(text).toContain('readinessReconcile')
+    expect(text).toContain('8')
+    expect(text).toContain('DispatchLifecycleError')
+    expect(text).toContain('not dispatching')
+  })
+
+  // The 2026-08-20 case: every settled field green, one pass wedged for 77m.
+  it('calls out a stalled sweep and how many passes it has missed', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              schemaVersion: 1,
+              ok: true,
+              status: 'degraded',
+              stale: false,
+              loopStatus: 'running',
+              degradedSubsystems: ['readinessReconcile'],
+              readinessReconcile: {
+                state: 'stalled',
+                consecutiveFailures: 0,
+                failureThreshold: 3,
+                intervalMs: 60_000,
+                inFlightMs: 4_620_000,
+                missedPasses: 77,
+                lastStartedAtMs: NOW_MS,
+                lastCompletedAtMs: NOW_MS - 60_003,
+              },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as {
+      dispatching: boolean
+      verdict: string
+      health?: { readinessReconcile?: { state?: string; missedPasses?: number } }
+    }
+    expect(report.dispatching).toBe(false)
+    expect(report.health?.readinessReconcile).toMatchObject({ state: 'stalled', missedPasses: 77 })
+    expect(report.verdict).toContain('stalled')
+  })
+
+  it('says what is missing when the instance predates the diagnostics block', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            heartbeat: { status: 'running', readinessReconcile: 'degraded', eventListener: 'subscribed' },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    expect(out.text()).toContain('state strings only')
+    expect(out.text()).toContain('degraded')
+  })
+
+  it('reads the gated evidence surface when an operator token is supplied', async () => {
+    const seen: string[] = []
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'op-token', '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: { status: 200, body: healthy },
+        evidence: {
+          status: 200,
+          body: {
+            phase: 'running',
+            heartbeat: { status: 'running' },
+            readinessReconcile: {
+              state: 'degraded',
+              consecutiveFailures: 8,
+              lastError: 'Refusing to dispatch AR-241: dispatch lifecycle is already terminal',
+            },
+          },
+        },
+      }, seen),
+    })
+
+    expect(code).toBe(0)
+    expect(seen).toEqual([`${BASE}/healthz`, `${BASE}/evidence auth=Bearer op-token`])
+    const report = JSON.parse(out.text()) as { evidence?: { fetched?: boolean; lastError?: string } }
+    expect(report.evidence?.fetched).toBe(true)
+    expect(report.evidence?.lastError).toContain('dispatch lifecycle is already terminal')
+  })
+
+  it('still diagnoses when the evidence token is rejected', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'stale-token', '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: { status: 200, body: healthy },
+        evidence: { status: 401, body: { error: 'unauthorized' } },
+      }),
+    })
+
+    expect(code).toBe(0)
+    const report = JSON.parse(out.text()) as { evidence?: { fetched?: boolean; reason?: string } }
+    expect(report.evidence?.fetched).toBe(false)
+    expect(report.evidence?.reason).toContain('401')
+  })
+
+  it('reports an unreachable instance as a failure rather than silence', async () => {
+    const out = buffer()
+    const err = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: err,
+      diagnoseFetch: (async () => {
+        throw Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { name: 'TypeError' })
+      }) as typeof fetch,
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { reachable: boolean; errorClass?: string }
+    expect(report.reachable).toBe(false)
+    // Class only: an error message from a private-networked host names hosts
+    // and paths the report does not need.
+    expect(report.errorClass).toBe('TypeError')
+  })
+
+  it('requires the target url', async () => {
+    const err = buffer()
+    const code = await runFleetCli(['diagnose'], { stdout: buffer(), stderr: err })
+
+    expect(code).not.toBe(0)
+    expect(err.text()).toContain('--deployed')
+  })
+
+  it('is listed in help so a lane brief can name it', async () => {
+    const out = buffer()
+    await runFleetCli(['--help'], { stdout: out, stderr: buffer() })
+
+    expect(out.text()).toContain('diagnose --deployed <url>')
+  })
+})

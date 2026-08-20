@@ -22,6 +22,7 @@ import type {
   HostedFactoryWritebackRecord,
 } from './types'
 import { dispatchAgentIdentityKey } from '../dispatch/work-unit-identity'
+import { telemetryErrorClass } from '../observability/error-class.js'
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60_000
 const DEFAULT_MAX_ISSUES_PER_RUN = 100
@@ -769,11 +770,6 @@ function hostedInvocationReleaseReason(
   if (invocation.status === 'completed') return 'completed'
   if (invocation.status === 'failed' || invocation.status === 'cancelled') return 'other'
   return undefined
-}
-
-function telemetryErrorClass(error: unknown): string {
-  const name = error instanceof Error ? error.name : ''
-  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 function dedupeIssues<T extends { uuid: string }>(issues: T[]): T[] {

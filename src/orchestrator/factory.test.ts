@@ -11788,6 +11788,186 @@ describe('FactoryLoop', () => {
     }
   })
 
+
+  // #295. The deployed instance publishes exactly one unauthenticated record,
+  // and it is built from this file. These two tests are the pair the outage
+  // needed: the failing case (a counter and a class an operator can read
+  // without a credential) and the silent case (a pass that hangs and writes
+  // no state at all).
+  describe('operator-reachable diagnostics on the public health block (#295)', () => {
+    it('publishes the failure count and error class without the message that names a path', async () => {
+      class DiagnosableFailureStateStore extends InMemoryStateStore {
+        failClaims = false
+
+        override async claimDiscoverySweep(
+          workspaceId: string,
+          owner: string,
+          nowMs: number,
+          leaseMs: number,
+        ): Promise<DiscoverySweepClaim> {
+          if (this.failClaims) {
+            throw Object.assign(
+              new Error(
+                'ENOENT: no such file or directory, open ' +
+                "'/srv/agent-workforce/.relay/workspace-key' while POSTing " +
+                'https://relay.internal.example.com/v1/workspaces/ws_9f2?token=sk-live-abc',
+              ),
+              { name: 'DiscoveryClaimError' },
+            )
+          }
+          return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
+        }
+      }
+
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new DiagnosableFailureStateStore({ batchSize: 2 })
+      const root = await mkdtemp(join(tmpdir(), 'factory-public-health-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { heartbeatPath, registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      try {
+        stateStore.failClaims = true
+        await vi.waitFor(async () => {
+          const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+          expect(heartbeat?.health?.readinessReconcile?.consecutiveFailures).toBeGreaterThanOrEqual(3)
+        }, { timeout: 3_000 })
+
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        expect(heartbeat?.health).toMatchObject({
+          // Liveness is unchanged: the process is up, and this is what the
+          // container ping endpoint reads.
+          ok: true,
+          // ...but the record can now go amber, which is what was missing.
+          status: 'degraded',
+          degradedSubsystems: ['readinessReconcile'],
+          readinessReconcile: {
+            state: 'degraded',
+            failureThreshold: 3,
+            lastErrorClass: 'DiscoveryClaimError',
+          },
+        })
+
+        // MUST-NOT-FIRE: the authenticated surface keeps the message, the
+        // public block never sees it.
+        expect(heartbeat?.readinessReconcile?.lastError).toContain('/srv/agent-workforce')
+        const published = JSON.stringify(heartbeat?.health)
+        expect(published).not.toContain('/srv/agent-workforce')
+        expect(published).not.toContain('https://')
+        expect(published).not.toContain('sk-live-abc')
+        expect(published).not.toContain('ENOENT')
+      } finally {
+        stateStore.failClaims = false
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    it('reports a hung sweep as stalled while every settled field still reads healthy', async () => {
+      class HangingPeriodicMount extends CountingEventsMount {
+        readonly periodicStarted: Promise<void>
+        hangPeriodic = false
+        #resolvePeriodicStarted: () => void = () => undefined
+        #releasePeriodic: () => void = () => undefined
+        #hung = false
+
+        constructor() {
+          super()
+          this.periodicStarted = new Promise((resolve) => { this.#resolvePeriodicStarted = resolve })
+          this.setSubRoot('/linear/issues', 'absent')
+        }
+
+        releasePeriodic(): void {
+          this.#releasePeriodic()
+        }
+
+        override async listTree(prefix: string): Promise<string[]> {
+          if (this.hangPeriodic && !this.#hung) {
+            this.#hung = true
+            this.#resolvePeriodicStarted()
+            await new Promise<void>((resolve) => { this.#releasePeriodic = resolve })
+          }
+          return super.listTree(prefix)
+        }
+      }
+
+      const mount = new HangingPeriodicMount()
+      const root = await mkdtemp(join(tmpdir(), 'factory-stalled-health-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: {
+          heartbeatPath,
+          registryPath: join(root, 'registry.json'),
+          // Keep the heartbeat refreshing while the sweep is wedged: the
+          // deployed instance ticks every ~30s throughout a hang, which is
+          // exactly why the hang looked green.
+          heartbeatStaleMs: 1_000,
+        },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      // 10 missed passes at a 20ms cadence is 200ms of hang.
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 20 },
+      })
+      try {
+        mount.hangPeriodic = true
+        await mount.periodicStarted
+
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.state).toBe('stalled')
+          expect(readiness?.inFlightMs ?? 0).toBeGreaterThan(200)
+        }, { timeout: 3_000 })
+
+        const readiness = factory.status().readinessReconcile
+        // The fields the old surface exposed all still read green — that is
+        // the point. Nothing wrote them, because a hang settles neither way.
+        expect(readiness?.consecutiveFailures).toBe(0)
+        expect(readiness?.lastError).toBeUndefined()
+        expect(readiness?.lastFailureAtMs).toBeUndefined()
+        // The relative order of the two timestamps is the whole signal.
+        expect(readiness?.lastStartedAtMs).toBeGreaterThan(readiness?.lastCompletedAtMs ?? 0)
+
+        await vi.waitFor(async () => {
+          const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+          expect(heartbeat?.health).toMatchObject({
+            ok: true,
+            status: 'degraded',
+            degradedSubsystems: ['readinessReconcile'],
+            readinessReconcile: { state: 'stalled', consecutiveFailures: 0 },
+          })
+          expect(heartbeat?.health?.readinessReconcile?.missedPasses ?? 0).toBeGreaterThanOrEqual(10)
+        }, { timeout: 3_000 })
+      } finally {
+        mount.releasePeriodic()
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
   it('derives a repo-scoped subscription and startup backfill from the simple hoopsheet config', async () => {
     class ScopedStartupMount extends CountingEventsMount {
       readonly listTreePrefixes: string[] = []

@@ -126,6 +126,12 @@ import {
   type FactoryCloudCancellationReasonV1,
   type FactoryCloudEventInputV1,
 } from '../observability/events'
+import { telemetryErrorClass } from '../observability/error-class'
+import {
+  derivedReadinessReconcileState,
+  publicHealthFromHeartbeat,
+  readinessReconcileInFlightMs,
+} from './public-health'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -713,6 +719,7 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastCompletedAtMs?: number
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
+  #readinessReconcileLastErrorClass?: string
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -1599,6 +1606,7 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       this.#readinessReconcileLastError = undefined
+      this.#readinessReconcileLastErrorClass = undefined
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
@@ -1625,6 +1633,9 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
       this.#readinessReconcileLastError = errorMessage
+      // The class, unlike the message, is publishable: #295 puts it on the
+      // unauthenticated health surface through the same allowlist.
+      this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
       this.#increment('readinessReconcileErrors')
       this.#logger.warn?.('[factory] periodic readiness reconciliation failed; retry remains scheduled', {
         error: errorMessage,
@@ -4581,17 +4592,39 @@ export class FactoryLoop implements Factory {
 
   #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
     const consecutiveFailures = this.#readinessReconcileConsecutiveFailures
-    const state = this.#startMode !== 'live'
+    const settled: FactoryReadinessReconcileStatus['state'] = this.#startMode !== 'live'
       ? 'not-running'
       : consecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD
         ? 'degraded'
         : consecutiveFailures > 0
           ? 'retrying'
           : 'healthy'
+    // The counters above only move when a pass *settles*. A pass that hangs
+    // takes neither path, so `settled` would keep reporting the last finished
+    // pass — `healthy` — for as long as the process is stuck (#295). The
+    // in-flight age is the only field that can express that, so derive the
+    // state from it rather than trusting the last write.
+    const timestamps = {
+      intervalMs: this.#readinessReconcileIntervalMs,
+      ...(this.#readinessReconcileLastStartedAtMs !== undefined
+        ? { lastStartedAtMs: this.#readinessReconcileLastStartedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastCompletedAtMs !== undefined
+        ? { lastCompletedAtMs: this.#readinessReconcileLastCompletedAtMs }
+        : {}),
+      ...(this.#readinessReconcileLastFailureAtMs !== undefined
+        ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
+        : {}),
+    }
+    const nowMs = this.#clock.now()
+    const inFlightMs = readinessReconcileInFlightMs(timestamps, nowMs)
+    const derived = derivedReadinessReconcileState({ ...timestamps, state: settled }, nowMs)
     return {
-      state,
+      state: derived === 'unknown' ? settled : derived,
       consecutiveFailures,
       failureThreshold: READINESS_RECONCILE_FAILURE_THRESHOLD,
+      intervalMs: this.#readinessReconcileIntervalMs,
+      ...(inFlightMs !== undefined ? { inFlightMs } : {}),
       ...(this.#readinessReconcileLastDurationMs !== undefined
         ? { lastDurationMs: this.#readinessReconcileLastDurationMs }
         : {}),
@@ -4605,6 +4638,9 @@ export class FactoryLoop implements Factory {
         ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
+      ...(this.#readinessReconcileLastErrorClass
+        ? { lastErrorClass: this.#readinessReconcileLastErrorClass }
+        : {}),
     }
   }
 
@@ -7293,6 +7329,15 @@ export class FactoryLoop implements Factory {
       readinessReconcile: this.#readinessReconcileStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
     }
+    // The deployed container serves `/healthz` straight out of this file and
+    // has no redaction logic of its own, so publish the already-safe view here
+    // rather than leaving that boundary to whoever reads the file (#295).
+    // Derived against this daemon's clock: every duration in it is a
+    // difference between timestamps this process wrote.
+    heartbeat.health = publicHealthFromHeartbeat(heartbeat, {
+      nowMs: updatedAtMs,
+      staleMs: this.#config.loop.heartbeatStaleMs,
+    })
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
     await this.#writeInFlightRegistry(registryPath, path)
@@ -19308,11 +19353,6 @@ const telemetryCategory = (value: string | undefined): string | undefined => {
   if (!value) return undefined
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:/-]+/gu, '-')
   return normalized.slice(0, 120) || undefined
-}
-
-const telemetryErrorClass = (error: unknown): string => {
-  const name = error instanceof Error ? error.name : ''
-  return /^[A-Za-z][A-Za-z0-9]{0,63}(?:Error|Exception)$/u.test(name) ? name : 'Error'
 }
 
 const isTimeoutError = (error: unknown): boolean =>
