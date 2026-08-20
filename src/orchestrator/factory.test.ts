@@ -1888,6 +1888,54 @@ class FailingConversationClearStateStore extends InMemoryStateStore {
   }
 }
 
+/** Parks the terminal undelivered-replies receipt inside its provider write. */
+class ParkedTerminalReceiptMountClient extends ConfirmRecordingSlackMountClient {
+  receiptWriteEntered = false
+  #releaseReceiptWrite!: () => void
+  readonly #receiptWriteReleased: Promise<void>
+
+  constructor(initialFiles: Record<string, unknown> = {}) {
+    super(initialFiles)
+    this.#receiptWriteReleased = new Promise((resolve) => { this.#releaseReceiptWrite = resolve })
+  }
+
+  releaseReceiptWrite(): void {
+    this.#releaseReceiptWrite()
+  }
+
+  override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Factory could not deliver')) {
+      this.receiptWriteEntered = true
+      await this.#receiptWriteReleased
+    }
+    await super.writeFile(path, content, opts)
+  }
+}
+
+/** Parks the per-reply "durably queued" receipt inside its provider write. */
+class ParkedReplyReceiptMountClient extends ConfirmRecordingSlackMountClient {
+  receiptWriteEntered = false
+  #releaseReceiptWrite!: () => void
+  readonly #receiptWriteReleased: Promise<void>
+
+  constructor(initialFiles: Record<string, unknown> = {}) {
+    super(initialFiles)
+    this.#receiptWriteReleased = new Promise((resolve) => { this.#releaseReceiptWrite = resolve })
+  }
+
+  releaseReceiptWrite(): void {
+    this.#releaseReceiptWrite()
+  }
+
+  override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Factory received this reply and durably queued it')) {
+      this.receiptWriteEntered = true
+      await this.#receiptWriteReleased
+    }
+    await super.writeFile(path, content, opts)
+  }
+}
+
 /** Holds the terminal "unroutable" writeback open, then rejects it on release. */
 class RejectingUnroutableReplyMountClient extends ConfirmRecordingSlackMountClient {
   readonly unroutableWriteStarted: Promise<void>
@@ -20176,6 +20224,144 @@ describe('FactoryLoop PR babysitter', () => {
       await rm(root, { recursive: true, force: true })
     }
   }, 20_000)
+
+  it('holds the terminal Slack receipt lease for as long as the provider write runs', async () => {
+    const mount = new ParkedTerminalReceiptMountClient()
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const clock = new ManualClock()
+    clock.advance(10_000)
+    const terminalIssue = { uuid: 'uuid-418', key: 'AR-418', path: issuePath(418) }
+    const decision = await new StaticTriage().triage(parseLinearIssue(issuePath(418), issueFile(418)))
+    const conversationId = `slack:${mount.threadTs}`
+    await stateStore.setSlackThreadWatch('factory-test', issueKey(terminalIssue), {
+      kind: 'terminal-grace',
+      issue: terminalIssue,
+      decision,
+      threadId: mount.threadTs,
+      retiredAtMs: clock.now(),
+      expiresAtMs: clock.now() + 24 * 60 * 60_000,
+    })
+    await stateStore.reserveConversationSession('factory-test', conversationId, {
+      provider: 'slack',
+      issue: terminalIssue,
+      externalId: mount.threadTs,
+      context: { channel: 'C0FACTORY' },
+      history: [],
+      processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      pending: [],
+    })
+    await stateStore.appendConversationMessage('factory-test', conversationId, {
+      id: `${mount.threadTs}:1780751613.000200`,
+      text: 'Nobody has told me this reply went nowhere.',
+      receivedAtMs: clock.now(),
+      providerSequence: '1780751613.000200',
+      author: 'U418',
+    })
+
+    vi.useFakeTimers()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+    })
+    const terminalNotice = 'Factory could not deliver 1 queued reply because this work unit no longer ' +
+      'has an active agent. Please continue on the linked issue or pull request.'
+    const starting = factory.start({ mode: 'dispatch-owner' })
+    try {
+      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
+        await vi.advanceTimersByTimeAsync(1)
+      }
+      expect(mount.receiptWriteEntered).toBe(true)
+
+      // Slack writeback budgets 90s for the confirm alone, so a write that runs
+      // longer than the 60s lease is inside spec, not pathological. Push past
+      // the lease with the provider call still in flight.
+      for (let step = 0; step < 8; step += 1) {
+        clock.advance(10_000)
+        await vi.advanceTimersByTimeAsync(10_000)
+      }
+
+      // A lease has to outlive the work it covers: while this write is running
+      // no second handler may take the receipt and post the notice again.
+      expect(await stateStore.claimConversationTerminalReceipt(
+        'factory-test', conversationId, 'competing-handler', clock.now(), 60_000,
+      )).toBe(false)
+
+      mount.releaseReceiptWrite()
+      await starting
+      await vi.advanceTimersByTimeAsync(1)
+      expect(slackReplyWrites(mount).filter((write) => write.content.text === terminalNotice))
+        .toHaveLength(1)
+      expect(await stateStore.getConversationSession('factory-test', conversationId)).toBeUndefined()
+    } finally {
+      mount.releaseReceiptWrite()
+      await starting.catch(() => undefined)
+      await factory.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('holds the Slack reply acknowledgement lease for as long as the provider write runs', async () => {
+    const issue = issueFile(419)
+    const mount = new ParkedReplyReceiptMountClient({ [issuePath(419)]: issue })
+    const fleet = new FakeFleetClient()
+    fleet.setSessionRef('ar-419-impl-pear', 'session-ar-419-impl-pear')
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const clock = new ManualClock()
+    clock.advance(10_000)
+    const factory = createFactory(config({
+      slack: { ...slackConfig(), conversationCoalesceMs: 60_000 },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+    })
+    const conversationId = `slack:${mount.threadTs}`
+    const replyId = `${mount.threadTs}:slack-human-slow-receipt`
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(419), issue)))
+      vi.useFakeTimers()
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e', mount.threadTs, 'human-slow-receipt',
+      ), 'slack-human-slow-receipt', {
+        text: 'Acknowledge me before anyone else does.',
+        user: 'U419',
+        user_is_bot: false,
+      })
+      for (let tick = 0; tick < 400 && !mount.receiptWriteEntered; tick += 1) {
+        await vi.advanceTimersByTimeAsync(1)
+      }
+      expect(mount.receiptWriteEntered).toBe(true)
+
+      // The acknowledgement claim covers the same 90s-budgeted writeback as the
+      // terminal receipt, so it is the same lease-scope bug.
+      for (let step = 0; step < 8; step += 1) {
+        clock.advance(10_000)
+        await vi.advanceTimersByTimeAsync(10_000)
+      }
+
+      expect(await stateStore.claimConversationMessageAcknowledgement(
+        'factory-test', conversationId, replyId, 'competing-handler', clock.now(), 60_000,
+      )).toBe(false)
+
+      mount.releaseReceiptWrite()
+      for (let tick = 0; tick < 40; tick += 1) await vi.advanceTimersByTimeAsync(1)
+      expect(slackReplyWrites(mount).filter((write) => write.content.text === slackImplementerReceipt))
+        .toHaveLength(1)
+      expect((await stateStore.getConversationSession('factory-test', conversationId))
+        ?.acknowledgedMessageIds).toEqual([replyId])
+    } finally {
+      mount.releaseReceiptWrite()
+      vi.useRealTimers()
+      await factory.stop()
+    }
+  })
 
   it('does not re-post a terminal Slack receipt when the durable clear behind it fails', async () => {
     const mount = new ConfirmRecordingSlackMountClient()

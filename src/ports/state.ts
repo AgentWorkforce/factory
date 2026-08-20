@@ -481,6 +481,12 @@ export interface StateStore {
   appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
   claimConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
   completeConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<boolean>
+  /**
+   * Extend an acknowledgement claim while its provider write is still running.
+   * Returns false once the claim is gone, so the caller learns it was overtaken
+   * instead of writing on a lease it no longer holds.
+   */
+  renewConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string, nowMs: number): Promise<boolean>
   releaseConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<void>
   /**
    * Reserve the right to write this conversation's terminal receipt. Returns
@@ -488,6 +494,7 @@ export interface StateStore {
    * unexpired claim.
    */
   claimConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
+  renewConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string, nowMs: number): Promise<boolean>
   completeConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<boolean>
   releaseConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<void>
   claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>

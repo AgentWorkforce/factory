@@ -419,6 +419,20 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async renewConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    const claim = session?.acknowledgementClaims?.[messageId]
+    if (claim?.claimId !== claimId) return false
+    claim.claimedAtMs = nowMs
+    return true
+  }
+
   async releaseConversationMessageAcknowledgement(
     workspaceId: string,
     conversationId: string,
@@ -444,6 +458,19 @@ export class InMemoryStateStore implements StateStore {
     const current = session.terminalReceipt
     if (current && current.claimedAtMs + leaseMs > nowMs) return false
     session.terminalReceipt = { claimId, claimedAtMs: nowMs }
+    return true
+  }
+
+  async renewConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    const receipt = session?.terminalReceipt
+    if (receipt?.claimId !== claimId || receipt.posted) return false
+    receipt.claimedAtMs = nowMs
     return true
   }
 

@@ -602,6 +602,37 @@ describe('FileStateStore', () => {
         'workspace-1', conversationId, 'receipt-b', 1_002, 60_000,
       )).toBe(false)
 
+      // Slack writeback budgets 90s for the confirm alone, so the holder renews
+      // while its write runs: the idle lease stays short without letting a slow
+      // provider call outlive the claim taken for it.
+      expect(await first.renewConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-a', 200_000,
+      )).toBe(true)
+      expect(await first.claimConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-b', 220_000, 60_000,
+      )).toBe(false)
+      expect(await first.renewConversationTerminalReceipt(
+        'workspace-1', conversationId, 'not-the-holder', 220_000,
+      )).toBe(false)
+
+      // The per-message acknowledgement claim covers the same provider write and
+      // renews on the same terms.
+      expect(await first.claimConversationMessageAcknowledgement(
+        'workspace-1', conversationId, '1780751613.000010', 'ack-a', 220_001, 60_000,
+      )).toBe(true)
+      expect(await first.renewConversationMessageAcknowledgement(
+        'workspace-1', conversationId, '1780751613.000010', 'ack-a', 400_000,
+      )).toBe(true)
+      expect(await first.claimConversationMessageAcknowledgement(
+        'workspace-1', conversationId, '1780751613.000010', 'ack-thief', 420_000, 60_000,
+      )).toBe(false)
+      expect(await first.renewConversationMessageAcknowledgement(
+        'workspace-1', conversationId, '1780751613.000010', 'ack-thief', 420_000,
+      )).toBe(false)
+      await first.releaseConversationMessageAcknowledgement(
+        'workspace-1', conversationId, '1780751613.000010', 'ack-a',
+      )
+
       // A receipt that never reached Slack releases its claim, so the retry that
       // owes the human the notice can still take it.
       await first.releaseConversationTerminalReceipt('workspace-1', conversationId, 'receipt-a')

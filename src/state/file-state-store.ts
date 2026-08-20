@@ -996,6 +996,22 @@ export class DocumentStateStore extends InMemoryStateStore {
     return Boolean(result)
   }
 
+  override async renewConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      const claim = session.acknowledgementClaims?.[messageId]
+      if (claim?.claimId !== claimId) return false
+      claim.claimedAtMs = nowMs
+      return true
+    })
+    return Boolean(result)
+  }
+
   override async releaseConversationMessageAcknowledgement(
     workspaceId: string,
     conversationId: string,
@@ -1021,6 +1037,21 @@ export class DocumentStateStore extends InMemoryStateStore {
       const current = session.terminalReceipt
       if (current && current.claimedAtMs + leaseMs > nowMs) return false
       session.terminalReceipt = { claimId, claimedAtMs: nowMs }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async renewConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      const receipt = session.terminalReceipt
+      if (receipt?.claimId !== claimId || receipt.posted) return false
+      receipt.claimedAtMs = nowMs
       return true
     })
     return Boolean(result)

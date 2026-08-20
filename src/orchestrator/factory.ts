@@ -394,6 +394,13 @@ const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
+// Both receipt leases guard an in-flight Slack writeback, and no fixed lease can
+// cover one: MountSlackWriteback budgets 90s for the confirm alone, on top of an
+// unbounded writeFile. Sizing them past that worst case would only trade a stolen
+// claim for a stranded one — a lease long enough to survive the slowest write is
+// equally long enough to hold the receipt hostage to a dead holder. So these
+// bound the *idle* claim and #withRenewedProviderLease extends them for exactly
+// as long as the write they cover is still running.
 const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
 const SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
@@ -14655,10 +14662,21 @@ export class FactoryLoop implements Factory {
       throw new Error(`Slack thread ${threadId} terminal receipt is claimed by another handler; retrying`)
     }
     const noun = pendingCount === 1 ? 'reply' : 'replies'
+    const slack = this.#slack
     try {
-      await this.#slack.reply(
-        threadId,
-        `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+      await this.#withRenewedProviderLease(
+        'terminal Slack receipt',
+        SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS,
+        () => this.#state.renewConversationTerminalReceipt(
+          this.#workspaceId,
+          conversationId,
+          claimId,
+          this.#clock.now(),
+        ),
+        () => slack.reply(
+          threadId,
+          `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+        ),
       )
     } catch (error) {
       await this.#state.releaseConversationTerminalReceipt(this.#workspaceId, conversationId, claimId)
@@ -14672,6 +14690,47 @@ export class FactoryLoop implements Factory {
       throw new Error(`Slack thread ${threadId} terminal receipt could not be recorded`)
     }
     this.#increment('slackConversationRepliesSurfacedTerminal')
+  }
+
+  // A claim only means something for as long as it outlives the work it covers.
+  // A provider write can legitimately run past a fixed lease, at which point the
+  // claim stops protecting the write it was taken for and a second handler can
+  // post the same thing to the same human. Renewing on a heartbeat scopes the
+  // lease to the work instead of to a guessed duration, and leaves the idle
+  // timeout short enough that a holder that dies mid-write still frees it.
+  async #withRenewedProviderLease<T>(
+    label: string,
+    leaseMs: number,
+    renew: () => Promise<boolean>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    let leaseLost = false
+    let renewalInFlight = false
+    const heartbeat = setInterval(() => {
+      if (renewalInFlight || leaseLost) return
+      renewalInFlight = true
+      void renew()
+        .then((renewed) => {
+          if (renewed) return
+          // Losing the lease mid-write is not recoverable from in here: the
+          // write may already have landed. Stop renewing and let the caller's
+          // completion check fail closed, which keeps the queued replies for
+          // whoever holds the claim now.
+          leaseLost = true
+          this.#increment('slackProviderReceiptLeasesLost')
+          this.#logger.warn?.(`[factory] ${label} lease was lost while its provider write was in flight`)
+        })
+        .catch((error) => this.#logger.warn?.(`[factory] ${label} lease renewal failed`, {
+          error: describeError(error).errorMessage,
+        }))
+        .finally(() => { renewalInFlight = false })
+    }, Math.max(1_000, Math.floor(leaseMs / 3)))
+    heartbeat.unref?.()
+    try {
+      return await run()
+    } finally {
+      clearInterval(heartbeat)
+    }
   }
 
   // A terminal receipt that could not be written leaves the queued replies
@@ -14943,7 +15002,22 @@ export class FactoryLoop implements Factory {
             const receipt = durable.agent
               ? `Factory received this reply and durably queued it for ${owner}.`
               : 'Factory received and durably stored this reply; it will route when an issue agent is resumable.'
-            await this.#slack.reply(reply.threadTs, receipt)
+            const slack = this.#slack
+            // Same lease scope as the terminal receipt: this claim covers a
+            // provider write that can outrun any fixed duration, so it is
+            // renewed for as long as that write is actually running.
+            await this.#withRenewedProviderLease(
+              'Slack reply acknowledgement',
+              SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS,
+              () => this.#state.renewConversationMessageAcknowledgement(
+                this.#workspaceId,
+                conversationId,
+                replyId,
+                acknowledgementClaimId,
+                this.#clock.now(),
+              ),
+              () => slack.reply(reply.threadTs, receipt),
+            )
             if (!await this.#state.completeConversationMessageAcknowledgement(
               this.#workspaceId,
               conversationId,
