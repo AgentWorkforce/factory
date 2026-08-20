@@ -19,6 +19,27 @@ describe('parseWatchStateDocument', () => {
     expect(parseWatchStateDocument(validDocument())).toEqual(validDocument())
   })
 
+  // Triage can label an issue `agent:swarm`, and every persisted decision — the
+  // Slack thread watch, the waiting clarification, the dispatch lifecycle — stores
+  // that scope verbatim. A validator that does not know the scope rejects the whole
+  // document, so one swarm issue costs every watch in the workspace on restart.
+  it('accepts a swarm-scope decision everywhere a triage decision is persisted', () => {
+    const document = validDocument()
+    const swarmDecision = { ...decision(), scope: 'swarm' }
+    document.workspaces.workspace.slackThreadWatches.watch = {
+      kind: 'terminal-grace',
+      issue: issue(),
+      decision: swarmDecision,
+      threadId: '1780751612.176224',
+      retiredAtMs: 1,
+      expiresAtMs: 2,
+    }
+    document.workspaces.workspace.waitingClarifications.clarification.decision = swarmDecision
+    document.workspaces.workspace.dispatchLifecycles.lifecycle.decision = swarmDecision
+
+    expect(parseWatchStateDocument(document)).toEqual(document)
+  })
+
   it('migrates legacy conversation history as already acknowledged without acknowledging pending work', () => {
     const document = validDocument()
     document.workspaces.workspace.conversationSessions.legacy = {

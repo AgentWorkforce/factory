@@ -14624,8 +14624,24 @@ export class FactoryLoop implements Factory {
     await this.#slackReplyRoutes.get(key)?.catch(() => undefined)
     const conversationId = slackConversationId(threadId)
     await this.#slackConversationTurns.cancel(conversationId)
-    await this.#surfaceUndeliveredSlackConversation(threadId)
-    await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+    try {
+      await this.#surfaceUndeliveredSlackConversation(threadId)
+      await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+    } catch (error) {
+      // The receipt fails whenever another handler holds the claim or Slack
+      // writeback is down — neither is a reason to abort retirement. Callers
+      // reach here having already committed the terminal phase and dropped the
+      // pending abandon reason, so a rejection escaping would strand the
+      // registry rewrite, the GitHub watcher stop, and the queued next dispatch
+      // with nothing left to re-run them. Keep the queued replies and let the
+      // retry that owns this receipt settle it inside the grace window.
+      this.#logger.warn?.(
+        '[factory] failed to settle undelivered Slack replies while retiring the watcher; will retry',
+        { issue: record.issue.key, error },
+      )
+      this.#increment('slackTerminalWatchReceiptsDeferred')
+      this.#scheduleSlackTerminalReceiptRetry(record.issue, threadId, expiresAtMs)
+    }
     if (!this.#slackWatchers.has(key) && !this.#stopping) {
       await this.#rearmSlackWatcher(record, threadId)
     }

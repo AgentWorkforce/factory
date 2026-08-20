@@ -473,9 +473,19 @@ const validPendingPullRequestWake = (value: unknown): boolean => isRecord(value)
   typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
   Array.isArray(value.kinds) && value.kinds.every((kind) => typeof kind === 'string')
 
+// A scope this validator does not know rejects the entire document, so one
+// swarm-scoped issue would cost every watch in the workspace on restart. Keyed
+// on the union itself, a new scope is a compile error here instead.
+const triageScopes: Record<TriageDecision['scope'], true> = {
+  single: true,
+  workflow: true,
+  team: true,
+  swarm: true,
+}
+
 const validTriageDecision = (value: unknown): value is TriageDecision => isRecord(value) &&
   validIssueRef(value.issue) && Array.isArray(value.routes) && value.routes.every(validRoute) &&
-  (value.scope === 'single' || value.scope === 'workflow' || value.scope === 'team') &&
+  (typeof value.scope === 'string' && Object.hasOwn(triageScopes, value.scope)) &&
   Array.isArray(value.implementers) && value.implementers.every(validAgentSpec) &&
   (value.workflow === undefined || validAgentSpec(value.workflow)) && validAgentSpec(value.reviewer) &&
   typeof value.thin === 'boolean' && (value.confidence === 'high' || value.confidence === 'low') &&

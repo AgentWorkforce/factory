@@ -18849,13 +18849,16 @@ describe('FactoryLoop', () => {
     })
 
     await expectSlackConversationResume(fleet, ['Please retain this while the acknowledgement write retries.'])
+    // The unroutable notice also contains 'received', so a substring match here
+    // would pass for the wrong artifact. Only the exact receipt proves the retry
+    // re-sent the acknowledgement it was retrying.
     await vi.waitFor(() => expect(slackReplyWrites(mount).filter((write) =>
-      write.content.text?.includes('received'),
+      write.content.text === slackImplementerReceipt,
     ).length).toBeGreaterThanOrEqual(2), { timeout: 4_000 })
     expect(mount.failedReplies).toBe(1)
     expect(slackReplyWrites(mount).at(-1)?.content).toMatchObject({
       thread_ts: slack.threadId,
-      text: expect.stringContaining('received'),
+      text: slackImplementerReceipt,
     })
   })
 
@@ -20224,6 +20227,73 @@ describe('FactoryLoop PR babysitter', () => {
       await rm(root, { recursive: true, force: true })
     }
   }, 20_000)
+
+  // Abandonment commits the terminal phase, records the dispatch terminal, and
+  // clears the pending abandon reason *before* it retires the Slack watcher. A
+  // receipt that throws out of retirement therefore takes the rest of abandon
+  // with it — the registry rewrite, the GitHub watcher stop, the queued next
+  // dispatch — and nothing re-runs them, because the reason that would have
+  // driven an in-process retry is already gone.
+  it('completes dispatch abandonment when the terminal Slack receipt fails, and retries the receipt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-abandon-terminal-receipt-'))
+    const registryPath = join(root, 'registry.json')
+    const issue = issueFile(823)
+    const mount = new FailingUndeliveredReceiptMountClient({ [issuePath(823)]: issue })
+    const fleet = new ResumeNameCollisionFleetClient()
+    fleet.setSessionRef('ar-823-impl-pear', 'session-ar-823-impl-pear')
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const factory = createFactory(config({
+      slack: { ...slackConfig(), conversationCoalesceMs: 60_000 },
+      loop: { registryPath },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      probePrResolver: async () => undefined,
+    })
+
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(823), issue)))
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e', mount.threadTs, 'human-abandon-receipt',
+      ), 'slack-human-abandon-receipt', {
+        text: 'Nobody has told me this reply went nowhere.',
+        user: 'U823',
+        user_is_bot: false,
+      })
+      await vi.waitFor(async () => expect(
+        (await stateStore.getConversationSession('factory-test', `slack:${mount.threadTs}`))?.pending,
+      ).toEqual([expect.objectContaining({ text: 'Nobody has told me this reply went nowhere.' })]))
+
+      fleet.emitAgentExit('ar-823-impl-pear', 'crash')
+
+      // The receipt failed, so the retirement deferred it. Everything abandon
+      // still owed after that point must have run anyway.
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackTerminalWatchReceiptsDeferred,
+      ).toBe(1), { timeout: 5_000 })
+      expect(mount.receiptAttempts).toBeGreaterThanOrEqual(1)
+      await vi.waitFor(async () => expect(
+        (await readFactoryInFlightRegistry(registryPath))?.agents,
+      ).toEqual([]), { timeout: 5_000 })
+      expect(factory.status().inFlight).toEqual([])
+
+      // Writeback returns inside the grace window: the deferred receipt is this
+      // daemon's to finish, not the next restart's.
+      mount.failReceipts = false
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackTerminalWatchReceiptsRecovered,
+      ).toBe(1), { timeout: 15_000, interval: 25 })
+      expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
+        'Factory could not deliver 1 queued reply because this work unit no longer has an active agent. ' +
+        'Please continue on the linked issue or pull request.',
+      )
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 25_000)
 
   it('holds the terminal Slack receipt lease for as long as the provider write runs', async () => {
     const mount = new ParkedTerminalReceiptMountClient()
