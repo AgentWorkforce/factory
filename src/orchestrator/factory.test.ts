@@ -4306,7 +4306,7 @@ describe('FactoryLoop', () => {
       // this test is about is still consumed, so the next pass recovers it.
       await expect(factory.runOnce()).resolves.toMatchObject({
         dispatched: [],
-        skipped: [{ issue: { key: '58' }, reason: 'dispatch failed: transient triage failure' }],
+        skipped: [{ issue: { key: '58' }, reason: 'dispatch failed (Error)' }],
       })
       await expect(factory.runOnce()).resolves.toMatchObject({
         dispatched: [{ issue: { key: '58' } }],
@@ -4532,6 +4532,10 @@ describe('FactoryLoop', () => {
         'ar-60-impl-pear',
         'ar-60-review-pear',
       ])
+      // Visible as a number, not only as a report line: a terminal-lifecycle
+      // backlog must not be invisible to an operator watching counters.
+      expect(factory.status().counters.dispatchItemsSkippedUndispatchable).toBe(1)
+      expect(factory.status().counters.errors ?? 0).toBe(0)
     })
 
     it('skips a work unit whose per-item failure is unclassified and dispatches the rest of the pass', async () => {
@@ -4552,7 +4556,9 @@ describe('FactoryLoop', () => {
 
       expect(report.skipped).toContainEqual({
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
-        reason: 'dispatch failed: fetch failed',
+        // Sanitized: `run-once` prints the report as JSON, so the reason
+        // carries a classification rather than raw provider text.
+        reason: 'dispatch failed (TypeError)',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
@@ -4637,7 +4643,8 @@ describe('FactoryLoop', () => {
         githubWriteback: new RecordingGithubWriteback(),
       })
 
-      await expect(factory.runOnce()).rejects.toThrow(/consecutive unclassified dispatch failures/)
+      await expect(factory.runOnce())
+        .rejects.toThrow(/unclassified dispatch failures without a successful dispatch/)
       expect(fleet.spawns).toEqual([])
     })
   })
