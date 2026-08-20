@@ -1,6 +1,6 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
 import { AgentRelay } from '@agent-relay/sdk'
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -24,6 +24,12 @@ export type AgentRelayMcpCommand = { command: string; args: string[] }
 
 export interface HarnessDriverClientLike {
   readonly brokerPid?: number
+  /**
+   * Broker URL this client is bound to. Optional because test doubles do not
+   * have one; the real client exposes it so a failure can name the address it
+   * actually attempted instead of Node's unattributable bare `fetch failed`.
+   */
+  readonly baseUrl?: string
   getStatus?(): Promise<{ node_delivery?: { connected?: boolean } } | null | undefined>
   spawnPty(input: SpawnPtyInput): Promise<SpawnedHandleLike>
   release(name: string, reason?: string): Promise<{ name: string }>
@@ -50,6 +56,13 @@ export interface InternalFleetClientOptions {
   ownedBrokerAgentExitTimeoutMs?: number
   cwd?: string
   connectionPath?: string
+  /**
+   * Opens a client against whatever `connection.json` currently names. Called
+   * at construction (when no `client` is injected) and again whenever the file
+   * turns out to name a different broker than the one we are attached to.
+   * Injected by tests; defaults to the real Harness Driver connect.
+   */
+  connect?: (options: { cwd?: string; connectionPath?: string }) => HarnessDriverClientLike
   workspaceKey?: string
   /** Canonical cloud liveness lookup. Injected by tests; derived from workspaceKey in production. */
   listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
@@ -105,7 +118,12 @@ const CANONICAL_PRESENCE_REGISTRATION_GRACE_MS = 60_000
 export class InternalFleetClient implements FleetClient {
   readonly placementLocality = 'local' as const
   readonly durableOwnership = true
-  readonly #client: HarnessDriverClientLike
+  #client: HarnessDriverClientLike
+  readonly #connect: (options: { cwd?: string; connectionPath?: string }) => HarnessDriverClientLike
+  // Identifies the broker this client is attached to, as `connection.json`
+  // described it when we attached. A rebind rewrites that file, so a mismatch
+  // is the signal — and the ONLY signal — that reconnecting is worthwhile.
+  #connectedBroker: string | undefined
   #ownsBroker: boolean
   readonly #ownedBrokerAgentExitTimeoutMs: number
   readonly #cwd?: string
@@ -166,7 +184,13 @@ export class InternalFleetClient implements FleetClient {
     this.#previewManager = options.previewManager ?? (options.previewConfig
       ? new TailscalePreviewManager({ config: options.previewConfig })
       : undefined)
-    this.#client = options.client ?? HarnessDriverClient.connect({ cwd: options.cwd, connectionPath: options.connectionPath })
+    this.#connect = options.connect ?? ((connectOptions) => HarnessDriverClient.connect(connectOptions))
+    this.#client = options.client ?? this.#connect({ cwd: options.cwd, connectionPath: options.connectionPath })
+    // One read at construction so a later failure can tell "the file still
+    // names the broker I am talking to" (nothing to do) apart from "the file
+    // now names a different one" (rebind — reconnect). Reading it here keeps
+    // the successful path free of any file access at all.
+    this.#connectedBroker = this.#readConnectionFile()?.fingerprint
     this.#ownsBroker = options.ownsBroker ?? false
     this.#ownedBrokerAgentExitTimeoutMs = options.ownedBrokerAgentExitTimeoutMs ?? OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS
   }
@@ -195,7 +219,7 @@ export class InternalFleetClient implements FleetClient {
     this.#tracked.set(input.name, { invocationId: input.invocationId })
     let handle: SpawnedHandleLike
     try {
-      handle = await this.#client.spawnPty(spawnInput)
+      handle = await this.#callBroker('spawnPty', (client) => client.spawnPty(spawnInput))
     } catch (error) {
       this.#trackAgentExit(input.name)
       throw error
@@ -237,7 +261,7 @@ export class InternalFleetClient implements FleetClient {
     this.#tracked.set(requestedName, {})
     let handle: SpawnedHandleLike
     try {
-      handle = await this.#client.spawnPty(spawnInput)
+      handle = await this.#callBroker('spawnPty', (client) => client.spawnPty(spawnInput))
     } catch (error) {
       this.#trackAgentExit(requestedName)
       throw error
@@ -292,7 +316,7 @@ export class InternalFleetClient implements FleetClient {
   async #releaseWithRetry(name: string, reason?: string): Promise<void> {
     for (let attempt = 1; attempt <= RELEASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
-        await this.#client.release(name, reason)
+        await this.#callBroker('release', (client) => client.release(name, reason))
       } catch (error) {
         if (attempt >= RELEASE_RETRY_MAX_ATTEMPTS || !isRetryableReleaseError(error)) {
           throw error
@@ -315,7 +339,7 @@ export class InternalFleetClient implements FleetClient {
       // broker itself no longer advertises the name.
       let retained: boolean
       try {
-        const agents = await this.#client.listAgents()
+        const agents = await this.#callBroker('listAgents', (client) => client.listAgents(), { retry: true })
         if (!Array.isArray(agents)) {
           throw new TypeError('Expected Harness Driver listAgents() to return an array')
         }
@@ -426,7 +450,8 @@ export class InternalFleetClient implements FleetClient {
     try {
       let sawAgent = false
       for (let attempt = 1; attempt <= PID_RESOLVE_ATTEMPTS; attempt += 1) {
-        const agent = (await this.#client.listAgents()).find((candidate) => candidate.name === name)
+        const agent = (await this.#callBroker('listAgents', (client) => client.listAgents(), { retry: true }))
+          .find((candidate) => candidate.name === name)
         if (agent) {
           sawAgent = true
         }
@@ -444,6 +469,125 @@ export class InternalFleetClient implements FleetClient {
     }
   }
 
+  /**
+   * Run a broker call, and recover from a broker that rebound its ephemeral
+   * port underneath us.
+   *
+   * The broker binds `AGENT_RELAY_BROKER_PORT=0`, so every restart picks a new
+   * port and rewrites `connection.json`. A daemon that captured the URL at boot
+   * would otherwise call the dead port for the rest of its life.
+   *
+   * Cost: nothing is read while calls succeed. `connection.json` is consulted
+   * only after a call has already failed, and only to answer one question —
+   * does the file still name the broker we are attached to? If it does, the
+   * broker is simply down and the error propagates untouched; we do not
+   * reconnect, and repeated failures cannot turn into a reconnect loop.
+   *
+   * `retry` is for reads only. A write that fails may still have been accepted
+   * by the broker that vanished, so those are never replayed — the transport is
+   * repaired and the error is surfaced for the caller to retry deliberately.
+   */
+  async #callBroker<T>(
+    operation: string,
+    call: (client: HarnessDriverClientLike) => Promise<T>,
+    options?: { retry?: boolean },
+  ): Promise<T> {
+    const attemptedBaseUrl = this.#client.baseUrl
+    try {
+      return await call(this.#client)
+    } catch (error) {
+      if (!this.#reconnectIfBrokerChanged(error, operation) || options?.retry !== true) {
+        throw attributeBrokerError(error, attemptedBaseUrl)
+      }
+      try {
+        return await call(this.#client)
+      } catch (retryError) {
+        throw attributeBrokerError(retryError, this.#client.baseUrl)
+      }
+    }
+  }
+
+  /**
+   * Reconnect only when the connection file names a broker other than the one
+   * we are attached to. That single condition is what keeps this from firing on
+   * a broker that is merely down: nothing rewrites `connection.json` in that
+   * case, so there is no new address to move to and the failure stands.
+   */
+  #reconnectIfBrokerChanged(error: unknown, operation: string): boolean {
+    if (this.#disposed) return false
+    // A broker that answered is reachable, so its rejection is not a routing
+    // problem. The exception is an auth rejection: a rebound broker mints a new
+    // api key, and if it happens to land on the same port a stale key is the
+    // only symptom we would see.
+    if (!isBrokerTransportError(error) && !isBrokerAuthError(error)) return false
+
+    const current = this.#readConnectionFile()
+    if (!current || current.fingerprint === this.#connectedBroker) return false
+
+    let next: HarnessDriverClientLike
+    try {
+      next = this.#connect({ cwd: this.#cwd, connectionPath: this.#connectionPath })
+    } catch (connectError) {
+      // A rewritten file that still will not open (dead pid, corrupt JSON)
+      // leaves us no better address. Keep the current client and let the
+      // original error propagate.
+      this.#logger?.warn?.('[factory-sdk] relay broker connection file changed but reconnect failed', {
+        operation,
+        connectionPath: this.#connectionPath ?? connectionPathForCwd(this.#cwd),
+        error: connectError,
+      })
+      return false
+    }
+
+    const previous = this.#client
+    const previousBaseUrl = previous.baseUrl
+    const wasSubscribed = this.#subscribed
+    for (const unsubscribe of this.#eventUnsubscribers.splice(0)) {
+      try {
+        unsubscribe()
+      } catch (unsubscribeError) {
+        this.#logger?.debug?.('[factory-sdk] failed to detach a listener from the previous broker', unsubscribeError)
+      }
+    }
+    this.#subscribed = false
+    try {
+      previous.disconnect?.()
+    } catch (disconnectError) {
+      this.#logger?.debug?.('[factory-sdk] failed to disconnect the previous broker transport', disconnectError)
+    }
+
+    this.#client = next
+    this.#connectedBroker = current.fingerprint
+    // Whatever we just attached to, we did not spawn it — the broker we spawned
+    // is the one that went away. Never shut down a broker we do not own.
+    this.#ownsBroker = false
+    if (wasSubscribed) this.#ensureEventSubscription()
+
+    this.#logger?.warn?.('[factory-sdk] relay broker rebound; reconnected from the refreshed connection file', {
+      operation,
+      previousBaseUrl,
+      baseUrl: current.url,
+      brokerPid: current.pid,
+    })
+    return true
+  }
+
+  #readConnectionFile(): { fingerprint: string; url: string; pid: number } | undefined {
+    const path = this.#connectionPath ?? connectionPathForCwd(this.#cwd)
+    if (!path) return undefined
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as { url?: unknown; api_key?: unknown; pid?: unknown }
+      const { url, api_key: apiKey, pid } = parsed
+      if (typeof url !== 'string' || !url) return undefined
+      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return undefined
+      // The api key rotates with the broker, so it belongs in the identity: a
+      // restart that reuses the same port is still a different broker.
+      return { fingerprint: `${url}\u0000${typeof apiKey === 'string' ? apiKey : ''}\u0000${pid}`, url, pid }
+    } catch {
+      return undefined
+    }
+  }
+
   async #connectionFilePid(): Promise<number | undefined> {
     const path = this.#connectionPath ?? connectionPathForCwd(this.#cwd)
     if (!path) return undefined
@@ -457,14 +601,21 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async sendMessage(input: SendInput): Promise<void> {
-    await this.#client.sendMessage(messageInputFrom(input))
+    await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(input)))
   }
 
   async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }> {
     this.#ensureEventSubscription()
     const targetWasReady = this.#readyAgentNames.has(input.to)
     const injectedSequenceAtSendStart = this.#injectedByAgent.get(input.to)?.sequence ?? 0
-    const result = await this.#client.sendMessage(messageInputFrom(input))
+    const result = await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(input)))
+    // dispose() can land while the send is in flight. It drains the waiters
+    // that exist at that moment, so installing a new one afterwards would leave
+    // a timer running on a torn-down client and defer the rejection by a full
+    // timeout. Reject on the disposal that already happened instead.
+    if (this.#disposed) {
+      throw new Error('InternalFleetClient disposed before delivery was confirmed')
+    }
     const eventId = result.event_id
     const targets = result.targets ?? []
 
@@ -530,7 +681,7 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async sendInput(name: string, data: string): Promise<void> {
-    await this.#client.sendInput(name, data)
+    await this.#callBroker('sendInput', (client) => client.sendInput(name, data))
   }
 
   onDeliveryFailed(listener: DeliveryFailedListener): () => void {
@@ -798,7 +949,7 @@ export class InternalFleetClient implements FleetClient {
 
   async #resendPendingInjected(pending: PendingInjectedWait): Promise<void> {
     try {
-      const result = await this.#client.sendMessage(messageInputFrom(pending.input))
+      const result = await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(pending.input)))
       pending.resendInFlight = false
       if (pending.settled) return
 
@@ -976,10 +1127,11 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async #listLiveAgents(): Promise<Array<Pick<ListAgent, 'name' | 'cli' | 'pid'>>> {
-    if (!this.#listCanonicalOnlineAgentNames) return this.#client.listAgents()
+    const listAgents = () => this.#callBroker('listAgents', (client) => client.listAgents(), { retry: true })
+    if (!this.#listCanonicalOnlineAgentNames) return listAgents()
 
     const [agents, canonicalOnlineAgentNames] = await Promise.all([
-      this.#client.listAgents(),
+      listAgents(),
       this.#listCanonicalOnlineAgentNames(),
     ])
     const online = new Set(canonicalOnlineAgentNames)
@@ -1078,6 +1230,52 @@ export class InternalFleetClient implements FleetClient {
 
     return false
   }
+}
+
+// Connection faults, as they reach us through Node's fetch. `fetch failed` is a
+// bare TypeError with the address buried in `cause`, which is exactly why the
+// daemon log carried 1469 unattributable failures.
+const BROKER_TRANSPORT_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'EPIPE',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+])
+
+function isBrokerTransportError(error: unknown): boolean {
+  // A HarnessDriverProtocolError carries the broker's own HTTP status, which
+  // means the broker answered. Reachable is reachable — not a routing fault.
+  if (typeof (error as { status?: unknown } | undefined)?.status === 'number') return false
+  for (let current: unknown = error, depth = 0; current instanceof Error && depth < 5; depth += 1) {
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string' && BROKER_TRANSPORT_ERROR_CODES.has(code)) return true
+    if (current.message === 'fetch failed') return true
+    if (current.name === 'TimeoutError' || current.name === 'AbortError') return true
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
+}
+
+function isBrokerAuthError(error: unknown): boolean {
+  const status = (error as { status?: unknown } | undefined)?.status
+  return status === 401 || status === 403
+}
+
+/**
+ * Name the address a transport failure was aimed at. Mutates the message in
+ * place rather than wrapping so callers that duck-type `retryable` / `code` off
+ * the error keep working.
+ */
+function attributeBrokerError(error: unknown, baseUrl: string | undefined): unknown {
+  if (!baseUrl || !(error instanceof Error)) return error
+  if (!isBrokerTransportError(error) || error.message.includes(baseUrl)) return error
+  error.message = `${error.message} (broker at ${baseUrl})`
+  return error
 }
 
 function connectionPathForCwd(cwd: string | undefined): string | undefined {
