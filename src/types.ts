@@ -108,6 +108,12 @@ export interface FactoryLiveSubscriptionOptions {
   replaySkewMarginMs: number
   /** Periodic source-of-truth readiness reconciliation, independent of event cursors/watermarks. */
   reconcileIntervalMs: number
+  /**
+   * Deadline for one reconcile sweep. Expiry rejects the sweep, which is what
+   * routes a hang into the failure path that re-arms the loop (#296). Must be
+   * sized above realistic worst-case mirror hydration, not to the interval.
+   */
+  reconcileTimeoutMs: number
 }
 
 /**
@@ -172,6 +178,17 @@ export interface FactoryReadinessReconcileStatus {
   intervalMs?: number
   lastDurationMs?: number
   lastStartedAtMs?: number
+  /**
+   * When the oldest sweep still running actually began, published by a daemon
+   * that knows rather than inferred from timestamp order (#296).
+   *
+   * `lastStartedAtMs` is the start of the last *wait*. A wait that ends on its
+   * deadline writes a settle timestamp while its `runOnce()` keeps running, so
+   * order alone reports "nothing in flight" while work is still stuck. Readers
+   * prefer this and fall back to the order inference, which is all a heartbeat
+   * from a daemon that does not publish it can offer.
+   */
+  inFlightSinceMs?: number
   lastCompletedAtMs?: number
   lastFailureAtMs?: number
   /** Age of a pass that started and has neither completed nor failed. */

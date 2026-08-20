@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
-import { FactoryConfigSchema, type FactoryConfig } from '../config/schema'
+import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type FactoryConfig } from '../config/schema'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
@@ -563,6 +563,20 @@ class DispatchLifecycleClaimRefusedError extends Error {
   }
 }
 
+/**
+ * The deadline that makes a hung sweep reachable by the existing recovery path.
+ * Its message is fully internal (one integer), so it is safe to persist into
+ * the operator-facing `readinessReconcile.lastError`.
+ */
+class ReadinessReconcileTimeoutError extends Error {
+  readonly code = 'FACTORY_READINESS_RECONCILE_TIMEOUT'
+
+  constructor(readonly timeoutMs: number) {
+    super(`readiness reconcile sweep exceeded its ${timeoutMs}ms deadline`)
+    this.name = 'ReadinessReconcileTimeoutError'
+  }
+}
+
 const realClock: Clock = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -713,6 +727,34 @@ export class FactoryLoop implements Factory {
   #readinessReconcileTimer?: ReturnType<typeof setTimeout>
   #readinessReconcileInFlight?: Promise<void>
   #readinessReconcileIntervalMs = 60_000
+  #readinessReconcileTimeoutMs = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+  // Set for exactly as long as a sweep is running. `state` is derived from
+  // this, so an in-flight pass can no longer masquerade as the last settled one.
+  #readinessReconcileInFlightSinceMs?: number
+  /**
+   * The work a deadline gave up waiting on. The deadline bounds the wait, not
+   * the sweep, so this is still live: shutdown has to drain it, and `state` has
+   * to keep counting from when it actually started.
+   *
+   * Two fields rather than a collection, because every live abandoned wait
+   * converges on the same sweep. They are all `runOnce()` calls with the same
+   * `dryRun`, so whatever they are queued behind, the first one out starts the
+   * sweep and the rest coalesce onto it — they settle together. So the newest
+   * wait is a sufficient drain target, and the earliest start is the honest
+   * age. Both matter (#301 review): keeping only the newest start advanced the
+   * age by two intervals every two intervals, so at `reconcileTimeoutMs ===
+   * reconcileIntervalMs` it never reached three and `stalled` was never
+   * reported; keeping one record per wait grew without bound in exactly the
+   * never-settling case this change exists for.
+   *
+   * The wait, deliberately, and never `#runOnceInFlight`: a mismatched-`dryRun`
+   * sweep is waited BEHIND rather than coalesced onto, so that handle can name
+   * an unrelated sweep, and the readiness pass would then start its own work
+   * after shutdown believed it had drained everything. The wait covers the
+   * queueing and the sweep it eventually runs, in every branch.
+   */
+  #readinessReconcileAbandonedWait?: Promise<void>
+  #readinessReconcileAbandonedSinceMs?: number
   #readinessReconcileConsecutiveFailures = 0
   #readinessReconcileLastDurationMs?: number
   #readinessReconcileLastStartedAtMs?: number
@@ -1240,6 +1282,14 @@ export class FactoryLoop implements Factory {
     if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
     this.#previewSweepTimer = undefined
     await this.#readinessReconcileInFlight
+    // #301 review: the deadline ends the *wait*, so `#readinessReconcileInFlight`
+    // can settle with its `runOnce()` still live. Shutdown releases dispatch
+    // lifecycle leases and disposes ports below, and `#isPassFatalFailure` only
+    // fences a stopping sweep once something in it throws — so a sweep whose
+    // dependency recovers cleanly would otherwise dispatch through torn-down
+    // state. Draining here restores exactly the pre-deadline shutdown contract:
+    // stop() outlives the sweep it started.
+    await this.#readinessReconcileAbandonedWait
     await this.#previewSweepInFlight
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
@@ -1403,6 +1453,9 @@ export class FactoryLoop implements Factory {
     const options = this.#liveOptions(overrides)
     this.#liveTransport = options.transport
     this.#readinessReconcileIntervalMs = options.reconcileIntervalMs
+    // `start()` overrides skip the schema's cross-field check, so re-apply its
+    // floor here: a deadline under one interval would kill every pass.
+    this.#readinessReconcileTimeoutMs = Math.max(options.reconcileTimeoutMs, options.reconcileIntervalMs)
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -1561,6 +1614,7 @@ export class FactoryLoop implements Factory {
       eventLimit: overrides.eventLimit ?? this.#config.liveSubscription.eventLimit,
       replaySkewMarginMs: overrides.replaySkewMarginMs ?? this.#config.liveSubscription.replaySkewMarginMs,
       reconcileIntervalMs: overrides.reconcileIntervalMs ?? this.#config.liveSubscription.reconcileIntervalMs,
+      reconcileTimeoutMs: overrides.reconcileTimeoutMs ?? this.#config.liveSubscription.reconcileTimeoutMs,
     }
   }
 
@@ -1610,15 +1664,78 @@ export class FactoryLoop implements Factory {
     this.#readinessReconcileTimer.unref?.()
   }
 
+  /**
+   * Runs one sweep under a deadline (#296).
+   *
+   * The sweep itself cannot be cancelled — `runOnce()` owns a durable discovery
+   * lease and abandoning it mid-flight is not safe — so expiry rejects *this*
+   * wait and leaves the underlying pass to finish on its own. That is enough:
+   * the rejection is what reaches the failure path, which re-arms the timer.
+   * A later reconcile pass coalesces onto the still-running `runOnce()` and
+   * fails on its own deadline too, so a persistent hang keeps counting up to
+   * `degraded` instead of going quiet.
+   */
+  async #runOnceWithReadinessDeadline(): Promise<IterationReport> {
+    const timeoutMs = this.#readinessReconcileTimeoutMs
+    const startedAtMs = this.#clock.now()
+    const sweep = this.runOnce()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await new Promise<IterationReport>((resolve, reject) => {
+        timer = setTimeout(() => {
+          this.#increment('readinessReconcileDeadlineExceeded')
+          if (this.#readinessReconcileAbandonedSinceMs === undefined) {
+            // `state` ages from the FIRST wait that gave up on this work, not
+            // from whenever the latest one began.
+            this.#readinessReconcileAbandonedSinceMs = startedAtMs
+            // The abandoned pass is still running against the live control
+            // plane. Report where it lands, so an operator can tell a
+            // dependency that recovered late from one that never answered.
+            // Attached once, so a wedge is reported once and not per expiry.
+            void sweep.then(
+              (report) => this.#logger.warn?.('[factory] abandoned readiness sweep completed after its deadline', {
+                timeoutMs,
+                overrunMs: this.#elapsedSince(startedAtMs) - timeoutMs,
+                dispatched: report.dispatched.length,
+              }),
+              (error: unknown) => this.#logger.warn?.('[factory] abandoned readiness sweep failed after its deadline', {
+                timeoutMs,
+                overrunMs: this.#elapsedSince(startedAtMs) - timeoutMs,
+                error: describeError(error).errorMessage,
+              }),
+            ).catch(() => undefined)
+          }
+          // Newest wait wins as the drain target: it settles no earlier than
+          // the ones before it, and clearing on it clears them all.
+          const wait: Promise<void> = sweep.catch(() => undefined).then(() => {
+            if (this.#readinessReconcileAbandonedWait !== wait) return
+            this.#readinessReconcileAbandonedWait = undefined
+            this.#readinessReconcileAbandonedSinceMs = undefined
+          })
+          this.#readinessReconcileAbandonedWait = wait
+          reject(new ReadinessReconcileTimeoutError(timeoutMs))
+        }, timeoutMs)
+        timer.unref?.()
+        // Attaching handlers here is also what keeps a late rejection from the
+        // abandoned pass from surfacing as an unhandled rejection.
+        sweep.then(resolve, reject)
+      })
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
   async #reconcileReadyIssues(): Promise<void> {
     const startedAtMs = this.#clock.now()
     this.#readinessReconcileLastStartedAtMs = startedAtMs
+    this.#readinessReconcileInFlightSinceMs = startedAtMs
     this.#increment('readinessReconcileSweeps')
     this.#logger.info?.('[factory] periodic readiness reconciliation started', {
       intervalMs: this.#readinessReconcileIntervalMs,
+      timeoutMs: this.#readinessReconcileTimeoutMs,
     })
     try {
-      const report = await this.runOnce()
+      const report = await this.#runOnceWithReadinessDeadline()
       this.#readinessReconcileConsecutiveFailures = 0
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
@@ -1660,6 +1777,10 @@ export class FactoryLoop implements Factory {
         consecutiveFailures: this.#readinessReconcileConsecutiveFailures,
         degraded: this.#readinessReconcileConsecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD,
       })
+    } finally {
+      // Cleared before the heartbeat write below, so a slow-but-successful pass
+      // does not stamp its own tail as `stalled`.
+      this.#readinessReconcileInFlightSinceMs = undefined
     }
     await this.#refreshLiveHeartbeat()
   }
@@ -4609,8 +4730,20 @@ export class FactoryLoop implements Factory {
 
   #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
     const consecutiveFailures = this.#readinessReconcileConsecutiveFailures
+    // #296 owns the numerator here, #295/#300 own the derivation. The earliest
+    // sweep still running — after a deadline expiry that is the abandoned one,
+    // not the current wait, or every expiry would restart the clock and a
+    // permanently stuck pass would read as merely `retrying`.
+    const inFlightSinceMs = Math.min(
+      this.#readinessReconcileInFlightSinceMs ?? Number.POSITIVE_INFINITY,
+      this.#readinessReconcileAbandonedSinceMs ?? Number.POSITIVE_INFINITY,
+    )
     const settled: FactoryReadinessReconcileStatus['state'] = this.#startMode !== 'live'
       ? 'not-running'
+      // Failure-count ladder only. Precedence against `stalled` belongs to
+      // `derivedReadinessReconcileState`, which outranks everything here: a
+      // stall is the more specific fact, and `consecutiveFailures` ships
+      // alongside so nothing an alarm keyed on `degraded` needs is lost.
       : consecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD
         ? 'degraded'
         : consecutiveFailures > 0
@@ -4623,6 +4756,7 @@ export class FactoryLoop implements Factory {
     // state from it rather than trusting the last write.
     const timestamps = {
       intervalMs: this.#readinessReconcileIntervalMs,
+      ...(Number.isFinite(inFlightSinceMs) ? { inFlightSinceMs } : {}),
       ...(this.#readinessReconcileLastStartedAtMs !== undefined
         ? { lastStartedAtMs: this.#readinessReconcileLastStartedAtMs }
         : {}),
@@ -4656,6 +4790,7 @@ export class FactoryLoop implements Factory {
       consecutiveFailures,
       failureThreshold: READINESS_RECONCILE_FAILURE_THRESHOLD,
       intervalMs: this.#readinessReconcileIntervalMs,
+      ...(Number.isFinite(inFlightSinceMs) ? { inFlightSinceMs } : {}),
       ...(inFlightMs !== undefined ? { inFlightMs } : {}),
       ...(this.#readinessReconcileLastDurationMs !== undefined
         ? { lastDurationMs: this.#readinessReconcileLastDurationMs }

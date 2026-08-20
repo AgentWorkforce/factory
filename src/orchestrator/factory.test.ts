@@ -16,7 +16,9 @@ import {
   parseGithubFactoryIssue,
   parseLinearIssue,
   readFactoryInFlightRegistry,
+  publicHealthFromHeartbeat,
   readFactoryLoopHeartbeat,
+  readinessReconcileInFlightMs,
   reapFactoryOrphansOnce,
   type FactoryConfig,
   type FactoryEventPayload,
@@ -27,7 +29,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { changeEventPath } from './factory'
-import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { BatchTracker, issueKey } from './batch-tracker'
@@ -12029,6 +12031,638 @@ describe('FactoryLoop', () => {
         mount.releasePeriodic()
         await factory.stop()
         await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
+  // #296: a `runOnce()` that never settles used to stop this loop permanently
+  // and silently. `#scheduleReadinessReconcile` re-arms only from
+  // `sweep.finally(...)`, and both state-writing paths run on settle, so a hang
+  // took neither: the subsystem reported `healthy` with zero failures while
+  // dispatching nothing, and only a process restart recovered it.
+  describe('bounded readiness reconciliation', () => {
+    class HangingDiscoveryStateStore extends InMemoryStateStore {
+      hangClaims = false
+      readonly hangStarted: Promise<void>
+      readonly #releases: Array<() => void> = []
+      #signalHangStarted: () => void = () => undefined
+
+      constructor() {
+        super({ batchSize: 2 })
+        this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+      }
+
+      /** Frees every hung claim so teardown never inherits the wedge. */
+      release(): void {
+        this.hangClaims = false
+        this.releaseParked()
+      }
+
+      /** Frees the claims parked right now, leaving later ones to hang. */
+      releaseParked(): void {
+        while (this.#releases.length > 0) this.#releases.pop()?.()
+      }
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        if (this.hangClaims) {
+          this.#signalHangStarted()
+          // Never settles — the shape of the un-timed-out dependency call that
+          // wedged production for 104 minutes.
+          await new Promise<void>((resolve) => { this.#releases.push(resolve) })
+        }
+        return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
+      }
+    }
+
+    it('rejects a never-settling sweep on its deadline and schedules the next pass', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 300 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+        const sweepsWhileHung = factory.status().counters.readinessReconcileSweeps ?? 0
+
+        // The deadline is the only thing that can end this pass, and ending it
+        // is what re-arms the timer. Without it both numbers stay frozen and
+        // the subsystem keeps reporting healthy.
+        await vi.waitFor(() => {
+          const status = factory.status()
+          expect(status.readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          expect(status.readinessReconcile?.lastError)
+            .toMatch(/readiness reconcile sweep exceeded its 300ms deadline/)
+          expect(status.counters.readinessReconcileSweeps ?? 0).toBeGreaterThan(sweepsWhileHung)
+        }, { timeout: 3_000 })
+
+        // Repeated deadline expiry must carry the failure count past the same
+        // threshold a repeatedly-throwing sweep crosses. The published `state`
+        // is `stalled` rather than `degraded` because
+        // `derivedReadinessReconcileState` (#295/#300) outranks the failure
+        // ladder with the more specific fact — the count is what proves the
+        // failure path was reached, and it ships either way.
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures ?? 0)
+            .toBeGreaterThanOrEqual(readiness?.failureThreshold ?? 3)
+          expect(readiness?.state).not.toBe('healthy')
+        }, { timeout: 5_000 })
+      } finally {
+        stateStore.release()
+        // Drain the abandoned pass before teardown. It is still running by
+        // design — the deadline rejects the wait, not the sweep — and this
+        // coalesces onto it rather than leaking it into the next test.
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
+    it('reports a pass still in flight past the stall threshold as stalled rather than healthy', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        // A deadline far past this test's horizon: `stalled` has to come from
+        // the in-flight duration alone, not as a side effect of the kill.
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 60_000 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+
+        await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+          state: 'stalled',
+          // Nothing has failed yet: this state is derived from the pass in
+          // flight, not from the last write of a settled one.
+          consecutiveFailures: 0,
+          lastStartedAtMs: expect.any(Number),
+        }), { timeout: 3_000 })
+      } finally {
+        stateStore.release()
+        // Drain the abandoned pass before teardown. It is still running by
+        // design — the deadline rejects the wait, not the sweep — and this
+        // coalesces onto it rather than leaking it into the next test.
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
+    // PR #301 review, Codex P1 + cubic P1. The deadline bounds the *wait*, not
+    // the sweep, so the abandoned `runOnce()` is still live. Shutdown must not
+    // complete underneath it: `stop()` disposes the fleet and releases dispatch
+    // lifecycle leases, and `#isPassFatalFailure` only fences a stopping sweep
+    // once something in it throws — a sweep whose dependency recovers cleanly
+    // sails past that check and dispatches through torn-down ports.
+    it('does not complete shutdown while a sweep abandoned by the deadline is still running', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+      })
+      let stopped = false
+      let stopping: Promise<void> | undefined
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+        await vi.waitFor(
+          () => expect(factory.status().readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1),
+          { timeout: 3_000 },
+        )
+
+        stopping = factory.stop().then(() => { stopped = true })
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        expect(stopped).toBe(false)
+
+        stateStore.release()
+        await stopping
+        expect(stopped).toBe(true)
+      } finally {
+        stateStore.release()
+        await stopping
+        if (!stopped) await factory.stop()
+      }
+    })
+
+    // PR #301 review, cubic P2. Clearing the in-flight timestamp when the
+    // *wait* ends hid the fact that the underlying pass was still stuck, so a
+    // genuinely wedged Factory fell back to reporting `retrying`.
+    it('keeps reporting stalled while the sweep the deadline abandoned is still stuck', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      // Deadline (1000ms) far below the stall threshold (READINESS_RECONCILE_
+      // STALL_INTERVALS = 10 x 400ms), so no single *wait* can last long enough
+      // to be reported stalled on its own. Reaching `stalled` here is only
+      // possible by carrying the abandoned sweep's own start time.
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 1_000 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+
+        await vi.waitFor(
+          () => expect(factory.status().readinessReconcile?.state).toBe('stalled'),
+          { timeout: 9_000 },
+        )
+      } finally {
+        stateStore.release()
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
+    // PR #301 review round two, cubic P2. Every pass that coalesces onto the
+    // same hung `runOnce()` abandons its own wrapper, and keeping only the
+    // latest one advanced the stall age by two intervals every two intervals.
+    // At the tightest legal setting — deadline equal to the interval — the age
+    // can then never reach the stall threshold at all, so a permanently stuck
+    // Factory never reports `stalled`, skipping the early warning this exists
+    // to add.
+    it('ages the stall from the earliest abandoned sweep when the deadline equals the interval', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 400 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+
+        // All of these waits abandon the *same* stuck sweep, so its age is the
+        // honest one: measured from when the first pass began.
+        await vi.waitFor(
+          () => expect(factory.status().readinessReconcile?.state).toBe('stalled'),
+          { timeout: 9_000 },
+        )
+      } finally {
+        stateStore.release()
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
+    // PR #301 review round three, cubic P2. Every expiry registered another
+    // record even though they all await the SAME hung `runOnce()`, so the
+    // retention that fixed the stall age grew without bound in exactly the
+    // scenario this PR is about: a loop that stays wedged indefinitely.
+    // Registering per underlying sweep instead of per wait is observable —
+    // the abandoned-sweep completion is reported once, not once per expiry.
+    it('registers one record per abandoned sweep however many deadlines expire on it', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const warn = vi.fn()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+
+        // Several waits give up on the one stuck sweep.
+        await vi.waitFor(
+          () => expect(factory.status().counters.readinessReconcileDeadlineExceeded ?? 0)
+            .toBeGreaterThanOrEqual(3),
+          { timeout: 5_000 },
+        )
+
+        stateStore.release()
+        await factory.runOnce().catch(() => undefined)
+        await vi.waitFor(() => expect(warn.mock.calls.filter(
+          ([message]) => message === '[factory] abandoned readiness sweep completed after its deadline',
+        )).toHaveLength(1), { timeout: 3_000 })
+      } finally {
+        stateStore.release()
+        await factory.stop()
+      }
+    })
+
+    // PR #301 review round four, cubic P1. `runOnce()` does not coalesce a
+    // mismatched `dryRun`; it waits BEHIND that sweep. So at expiry the global
+    // in-flight handle can name an unrelated sweep the readiness pass is queued
+    // behind rather than the work it will actually do — and once that unrelated
+    // sweep settles, the readiness pass starts its own, untracked, after
+    // shutdown believed it had drained everything.
+    it('drains the readiness sweep queued behind a mismatched dry-run sweep', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+      })
+      let stopped = false
+      let stopping: Promise<void> | undefined
+      let dryRun: Promise<unknown> | undefined
+      try {
+        stateStore.hangClaims = true
+        // Occupies `#runOnceInFlight` with a sweep the readiness pass cannot
+        // coalesce onto, so the readiness pass queues behind it.
+        dryRun = factory.runOnce({ dryRun: true }).catch(() => undefined)
+        await stateStore.hangStarted
+        await vi.waitFor(
+          () => expect(factory.status().readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1),
+          { timeout: 3_000 },
+        )
+
+        // Let the unrelated sweep finish. The readiness pass now runs its own
+        // sweep, which hangs in turn — and that is the work shutdown owes.
+        stateStore.releaseParked()
+        await dryRun
+
+        stopping = factory.stop().then(() => { stopped = true })
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        expect(stopped).toBe(false)
+
+        stateStore.release()
+        await stopping
+        expect(stopped).toBe(true)
+      } finally {
+        stateStore.release()
+        await dryRun
+        await stopping
+        if (!stopped) await factory.stop()
+      }
+    })
+
+    // The seam between #296 and #295/#300. Both changes describe the same
+    // subsystem: this one knows what is still running, that one publishes the
+    // health an operator reads out-of-process. They have to be ONE view.
+    // The hard case is after a deadline expiry, when the wait has written a
+    // settle timestamp while its `runOnce()` is still stuck — timestamp order
+    // alone then says "nothing in flight", which is precisely the blindness
+    // #295 exists to cure. `inFlightSinceMs` is what makes them agree.
+    it('publishes an abandoned sweep to the deployed health projection as stalled', async () => {
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new HangingDiscoveryStateStore()
+      const root = await mkdtemp(join(tmpdir(), 'factory-abandoned-health-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { heartbeatPath, registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 100, reconcileTimeoutMs: 200 },
+      })
+      try {
+        stateStore.hangClaims = true
+        await stateStore.hangStarted
+        // Past the deadline, so the failure path has already written
+        // `lastFailureAtMs` while the sweep underneath it is still stuck.
+        await vi.waitFor(
+          () => expect(factory.status().readinessReconcile?.consecutiveFailures ?? 0)
+            .toBeGreaterThanOrEqual(1),
+          { timeout: 3_000 },
+        )
+
+        const status = factory.status().readinessReconcile
+        expect(status?.inFlightSinceMs).toEqual(expect.any(Number))
+        // Timestamp order on its own has already lost the sweep...
+        expect(readinessReconcileInFlightMs({
+          lastStartedAtMs: status?.lastStartedAtMs,
+          lastCompletedAtMs: status?.lastCompletedAtMs,
+          lastFailureAtMs: status?.lastFailureAtMs,
+        }, Date.now())).toBeUndefined()
+        // ...and with the published start it has not.
+        expect(readinessReconcileInFlightMs(status ?? {}, Date.now())).toBeGreaterThan(0)
+
+        // The out-of-process reader — `factory diagnose --deployed` reads
+        // exactly this file — must land on the same conclusion the daemon has.
+        await vi.waitFor(async () => {
+          const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+          expect(heartbeat?.readinessReconcile?.inFlightSinceMs).toEqual(expect.any(Number))
+          const health = publicHealthFromHeartbeat(heartbeat!, Date.now() + 10 * 100 * 10)
+          expect(health.readinessReconcile?.state).toBe('stalled')
+        }, { timeout: 5_000 })
+      } finally {
+        stateStore.release()
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // #299 taught the fleet client to notice a broker rebind, reconnect and
+    // retry the read. That recovery costs an extra round trip inside a call
+    // this sweep is already waiting on, so the two changes have to coexist:
+    // the deadline must not kill a rebind it is recovering from, and must
+    // still fire when the reconnect cannot succeed. #299's retry is one-shot
+    // and read-only by construction ("repeated failures cannot turn into a
+    // reconnect loop"), so it cannot outrun a deadline sized for #36.
+    describe('against the #299 broker-rebind recovery', () => {
+      class RebindingFleetClient extends FakeFleetClient {
+        rebindDelayMs = 0
+        rebindsRemaining = 0
+        failRoster = false
+        rosterCalls = 0
+
+        override async roster(): Promise<RosterEntry> {
+          this.rosterCalls += 1
+          if (this.failRoster) throw new Error('no running broker')
+          if (this.rebindsRemaining > 0) {
+            this.rebindsRemaining -= 1
+            // Stands in for detect-rebind, reconnect, reissue the read.
+            await new Promise((resolve) => setTimeout(resolve, this.rebindDelayMs))
+          }
+          return await super.roster()
+        }
+      }
+
+      it('lets a sweep that recovered from a rebind finish instead of killing it', async () => {
+        const path = githubIssueCompactPath('AgentWorkforce', 'pear', 299)
+        const mount = new CountingEventsMount()
+        mount.setSubRoot('/linear/issues', 'absent')
+        const fleet = new RebindingFleetClient()
+        const factory = createFactory(config({ issueSource: 'github' }), {
+          mount,
+          fleet,
+          triage: new StaticTriage(),
+          githubWriteback: new RecordingGithubWriteback(),
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        })
+
+        await factory.start({
+          mode: 'live',
+          liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 4_000 },
+        })
+        try {
+          // A reconnect round trip an order of magnitude longer than the whole
+          // reconcile interval, still far inside the deadline.
+          fleet.rebindDelayMs = 600
+          fleet.rebindsRemaining = 1
+          mount.files.set(path, {
+            content: githubIssueFile(299, {
+              title: '[factory-e2e] Sweep that recovered from a broker rebind',
+              labels: ['factory', 'pear'],
+            }),
+          })
+
+          await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+            'ar-299-impl-pear',
+            'ar-299-review-pear',
+          ]), { timeout: 8_000 })
+          // The recovered pass was never abandoned mid-recovery.
+          expect(factory.status().counters.readinessReconcileDeadlineExceeded ?? 0).toBe(0)
+          expect(factory.status().counters.readinessReconcileErrors ?? 0).toBe(0)
+        } finally {
+          await factory.stop()
+        }
+      })
+
+      it('still fails the pass and re-arms when the broker cannot be reached at all', async () => {
+        const mount = new CountingEventsMount()
+        mount.setSubRoot('/linear/issues', 'absent')
+        const fleet = new RebindingFleetClient()
+        const factory = createFactory(config({ issueSource: 'github' }), {
+          mount,
+          fleet,
+          triage: new StaticTriage(),
+          githubWriteback: new RecordingGithubWriteback(),
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        })
+
+        await factory.start({
+          mode: 'live',
+          liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 4_000 },
+        })
+        try {
+          fleet.failRoster = true
+          // An unreachable broker RAISES rather than hangs, so the pre-existing
+          // failure path carries it. The deadline is the backstop for a hang,
+          // not a substitute for an error, and must stay out of the way here.
+          await vi.waitFor(() => {
+            const readiness = factory.status().readinessReconcile
+            expect(readiness?.consecutiveFailures ?? 0)
+              .toBeGreaterThanOrEqual(readiness?.failureThreshold ?? 3)
+            expect(readiness?.state).not.toBe('healthy')
+          }, { timeout: 8_000 })
+          expect(factory.status().counters.readinessReconcileDeadlineExceeded ?? 0).toBe(0)
+          // And the loop kept sweeping rather than stopping on the failures.
+          expect(factory.status().counters.readinessReconcileSweeps ?? 0).toBeGreaterThanOrEqual(3)
+        } finally {
+          await factory.stop()
+        }
+      }, 15_000)
+    })
+
+    // MUST-NOT-FIRE. #36 measured a real cold-mirror reconcile at 3,665,173 ms
+    // (61 minutes) in production: container disk is ephemeral, so the Relayfile
+    // mirror rehydrates on every boot. A default below that converts a slow
+    // boot into a crash loop, which is strictly worse than the bug fixed here.
+    it('defaults the sweep deadline above the measured worst-case cold-mirror hydration', () => {
+      expect(config().liveSubscription.reconcileTimeoutMs).toBeGreaterThan(3_665_173)
+    })
+
+    it('does not kill a slow-but-completing sweep that runs for many intervals', async () => {
+      const path = githubIssueCompactPath('AgentWorkforce', 'pear', 296)
+
+      class SlowDiscoveryStateStore extends InMemoryStateStore {
+        slowClaimMs = 0
+        appliedSlowClaim = false
+        onSlowClaim: () => void = () => undefined
+
+        constructor() {
+          super({ batchSize: 2 })
+        }
+
+        override async claimDiscoverySweep(
+          workspaceId: string,
+          owner: string,
+          nowMs: number,
+          leaseMs: number,
+        ): Promise<DiscoverySweepClaim> {
+          if (this.slowClaimMs > 0 && !this.appliedSlowClaim) {
+            this.appliedSlowClaim = true
+            // Publish the work inside the slow pass, so only a sweep that
+            // survived its own hydration can be the one that dispatches.
+            this.onSlowClaim()
+            await new Promise((resolve) => setTimeout(resolve, this.slowClaimMs))
+          }
+          return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
+        }
+      }
+
+      const mount = new CountingEventsMount()
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const stateStore = new SlowDiscoveryStateStore()
+      stateStore.onSlowClaim = () => {
+        mount.files.set(path, {
+          content: githubIssueFile(296, {
+            title: '[factory-e2e] Slow but completing readiness sweep',
+            labels: ['factory', 'pear'],
+          }),
+        })
+      }
+      const info = vi.fn()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info, warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 4_000 },
+      })
+      try {
+        // 600ms of hydration against a 50ms interval — twelve intervals deep,
+        // far past the stall-report threshold — under a 4s deadline.
+        stateStore.slowClaimMs = 600
+        await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+          'ar-296-impl-pear',
+          'ar-296-review-pear',
+        ]), { timeout: 8_000 })
+
+        // Nothing was abandoned: no sweep ever took the failure path...
+        expect(factory.status().counters.readinessReconcileErrors ?? 0).toBe(0)
+        expect(factory.status().readinessReconcile?.lastError).toBeUndefined()
+        // ...and the long pass reached the *completion* path, carrying a
+        // duration that a naive `n * reconcileIntervalMs` deadline would have
+        // killed. Read from the sweep's own log rather than `lastDurationMs`,
+        // which the next 50ms pass immediately overwrites.
+        await vi.waitFor(() => {
+          const completions = info.mock.calls.filter(
+            ([message]) => message === '[factory] periodic readiness reconciliation completed',
+          )
+          expect(completions.some(
+            ([, meta]) => ((meta as { durationMs?: number } | undefined)?.durationMs ?? 0) >= 600,
+          )).toBe(true)
+        }, { timeout: 3_000 })
+      } finally {
+        await factory.stop()
       }
     })
   })

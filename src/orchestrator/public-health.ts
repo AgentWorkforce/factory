@@ -163,10 +163,17 @@ const enumValue = <T extends string>(value: unknown, allowed: readonly T[]): T |
 export function readinessReconcileInFlightMs(
   status: Pick<
     FactoryReadinessReconcileStatus,
-    'lastStartedAtMs' | 'lastCompletedAtMs' | 'lastFailureAtMs'
+    'inFlightSinceMs' | 'lastStartedAtMs' | 'lastCompletedAtMs' | 'lastFailureAtMs'
   >,
   nowMs: number,
 ): number | undefined {
+  // A daemon that publishes `inFlightSinceMs` knows what is still running and
+  // does not need the inference below. It is strictly better: a sweep whose
+  // wait ended on the #296 deadline writes a settle timestamp while its
+  // `runOnce()` keeps running, so timestamp order alone would call that stuck
+  // pass "not in flight" — the exact blindness this projection exists to cure.
+  const inFlightSinceMs = timestamp(status.inFlightSinceMs)
+  if (inFlightSinceMs !== undefined) return Math.max(0, nowMs - inFlightSinceMs)
   const startedAtMs = timestamp(status.lastStartedAtMs)
   if (startedAtMs === undefined) return undefined
   const settledAtMs = Math.max(
@@ -188,7 +195,7 @@ export function readinessReconcileInFlightMs(
 export function derivedReadinessReconcileState(
   status: Pick<
     FactoryReadinessReconcileStatus,
-    'state' | 'intervalMs' | 'lastStartedAtMs' | 'lastCompletedAtMs' | 'lastFailureAtMs'
+    'state' | 'intervalMs' | 'inFlightSinceMs' | 'lastStartedAtMs' | 'lastCompletedAtMs' | 'lastFailureAtMs'
   >,
   nowMs: number,
 ): FactoryPublicSubsystemState | 'unknown' {
