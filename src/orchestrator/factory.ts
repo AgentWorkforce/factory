@@ -2818,6 +2818,21 @@ export class FactoryLoop implements Factory {
             dispatched.push(result)
           }
         } catch (error) {
+          // The failure may have left half-spawned agents behind, persisted as
+          // failure handoffs on the way out of `#dispatchUnlocked`. runLoop's
+          // catch used to reap them because every such error aborted the pass;
+          // now that most of them are skipped, the reap has to happen here.
+          //
+          // BEFORE the fatality check, not after (#298 review, round two): the
+          // 429 that trips the overload fuse aborts this pass, and a direct
+          // `runOnce()` — the `factory run-once` CLI, `#reconcileReadyIssues` —
+          // has no runLoop catch behind it, so the unit that trips the fuse
+          // would leak the agents it had already spawned. Reaping first covers
+          // the abort and the skip with one call; it is idempotent, so the
+          // runLoop catch finding nothing left to do is free.
+          if (mayHaveSpawnedBeforeFailing(error)) {
+            await this.#reapDispatchFailureHandoffsNow()
+          }
           // #292: issues in a pass are independent work units, so a failure
           // that is about ONE unit costs that unit and nothing else. Only the
           // conditions named in `#isPassFatalFailure` — the ones where
@@ -2874,17 +2889,6 @@ export class FactoryLoop implements Factory {
               issue: issueRef(issue).key,
               error: describeError(error).errorMessage,
             })
-          }
-          // The failure may have left half-spawned agents behind, persisted as
-          // failure handoffs on the way out of `#dispatchUnlocked`. runLoop's
-          // catch used to reap them because the error aborted the pass; now
-          // that the pass survives, the reap has to happen here or the agents
-          // leak and the next pass spawns duplicates on top of them. This
-          // covers a shed dispatch as much as an unclassified one — relayfile
-          // can shed a *post-spawn* read (#297 review) — and skips only the
-          // two refusals that are decided before anything is spawned.
-          if (mayHaveSpawnedBeforeFailing(error)) {
-            await this.#reapDispatchFailureHandoffsNow()
           }
           recordSkip({ issue: issueRef(issue), reason: perItemDispatchSkipReason(error) })
           continue

@@ -4709,6 +4709,74 @@ describe('FactoryLoop', () => {
       }))
       expect(factory.status().counters.discoveryOverloadResidualUnsupported).toBe(1)
     })
+
+    // Review follow-up on #298 (P1, cubic, second round). The reap added for
+    // the first P1 sits AFTER the fatal-failure check, so the 429 that trips
+    // the per-sweep fuse throws straight past it. A direct `runOnce()` — the
+    // `factory run-once` CLI, and `#reconcileReadyIssues` — has no runLoop
+    // catch behind it, so that work unit's spawned agents leak.
+    it('reaps the agents of the shed dispatch that trips the fuse', async () => {
+      const numbers = [71, 72, 73, 74, 75]
+
+      /**
+       * Sheds one read per issue, and only after that issue has already
+       * spawned — the spawn loop reads the issue again between agents, which
+       * is the post-spawn window the leak lives in.
+       */
+      class ShedPostSpawnReadMount extends FakeMountClient {
+        readonly #shed = new Set<string>()
+
+        constructor(files: Record<string, unknown>, readonly spawnedFor: (issueKey: string) => number) {
+          super(files)
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          // Keyed on THIS issue's own agents: the spawn loop re-reads the issue
+          // between agents, so the read after its first agent is the post-spawn
+          // window. A global spawn count would instead make every issue after
+          // the first shed before it had spawned anything.
+          const issueKey = /AR-(\d+)/u.exec(path)?.[1]
+          if (issueKey && !this.#shed.has(path) && this.spawnedFor(issueKey) > 0) {
+            this.#shed.add(path)
+            throw overloadError({ retryAfterSeconds: 5, reason: 'oldest_inflight_age' })
+          }
+          return await super.readFile(path)
+        }
+      }
+
+      const fleet = new CapturedPidFleetClient(numbers.flatMap((number, index) => [
+        { name: `ar-${number}-impl-pear`, sessionRef: `session-ar-${number}-impl`, pid: 7_100 + index * 2 },
+        { name: `ar-${number}-review`, sessionRef: `session-ar-${number}-review`, pid: 7_101 + index * 2 },
+      ]))
+      const mount = new ShedPostSpawnReadMount(
+        Object.fromEntries(numbers.map((number) => [issuePath(number), issueFile(number)])),
+        (issueKey) => fleet.spawns.filter((spawn) => spawn.name.startsWith(`ar-${issueKey}-`)).length,
+      )
+      const factory = createFactory(config({ batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        readChildPids: async () => [],
+        kill: () => {
+          throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+        },
+        terminationGraceMs: 0,
+      })
+
+      // Five shed operations trip DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT, so the
+      // fifth unit aborts the pass instead of being skipped.
+      await expect(factory.runOnce()).rejects.toThrow(OVERLOAD_MESSAGE)
+
+      // The first four were skipped and reaped by the existing path. The fifth
+      // is the one that throws — its agents must be released too, or a retry
+      // spawns duplicates on top of them.
+      const released = new Set(fleet.releases.map((release) => release.name))
+      const spawned = fleet.spawns.map((spawn) => spawn.name)
+      expect(spawned.length).toBeGreaterThan(0)
+      for (const name of spawned) {
+        expect(released).toContain(name)
+      }
+    })
   })
 
   it('filters GitHub startup discovery through the Relayfile issue index', async () => {
