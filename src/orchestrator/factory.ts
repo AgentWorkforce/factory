@@ -2579,7 +2579,7 @@ export class FactoryLoop implements Factory {
           // that is about ONE unit costs that unit and nothing else. Only the
           // conditions named in `#isPassFatalFailure` — the ones where
           // continuing the pass is meaningless — abort the whole sweep.
-          if (this.#isPassFatalFailure(error)) throw error
+          if (this.#isPassFatalFailure(error, dryRun)) throw error
           if (!isClassifiedPerItemDispatchFailure(error)) {
             unclassifiedFailuresSinceDispatch += 1
             // A pass-wide fault can arrive disguised as a run of per-item
@@ -2678,14 +2678,16 @@ export class FactoryLoop implements Factory {
    *   anyway.
    * - The factory is stopping. Teardown is in progress and dispatching more
    *   agents now leaks them past the shutdown deadline.
-   * - The fleet control-plane circuit is no longer closed. Dispatch is
-   *   globally paused — this is the same condition
-   *   `#assertFleetControlPlaneAvailable` refuses to *start* a pass on, so it
-   *   must also stop one already in flight. This is read as circuit *state*,
-   *   not as an error type, because the failure that trips the threshold is
-   *   rethrown by `FleetControlPlaneCircuit.probe` as the original transport
-   *   error: a type check alone would skip the very item whose roster request
-   *   opened the circuit and let the pass finish reporting healthy.
+   * - The fleet control-plane circuit is no longer closed, **on a live pass**.
+   *   Dispatch is globally paused — the same condition
+   *   `#assertFleetControlPlaneAvailable` refuses to *start* a live pass on,
+   *   so it must also stop one already in flight. A dry run is exempt: it
+   *   never calls that admission gate and never spawns, so a paused control
+   *   plane is irrelevant to it rather than fatal to it. Without the
+   *   exemption, one live pass that trips the circuit would poison every
+   *   later dry run — including the boot gate's own `run-once --dry-run`
+   *   probe, turning a recoverable circuit-open condition into a failed boot.
+   *   That is a nastier version of the wedge this whole change removes.
    *
    * Deliberately NOT here: JavaScript builtin error types. Classifying
    * "programmer faults" such as `TypeError` as fatal is the obvious next rule
@@ -2699,12 +2701,30 @@ export class FactoryLoop implements Factory {
    * keep going. The unclassified-failure fuse in `#performRunOnce` is the
    * backstop for a pass-wide fault that does not announce itself as one.
    */
-  #isPassFatalFailure(error: unknown): boolean {
+  #isPassFatalFailure(error: unknown, dryRun: boolean): boolean {
+    // Sweep-scoped: these are about this process's right or ability to run the
+    // pass at all, so they hold for a dry run exactly as for a live one.
     if (this.#discoverySweepLeaseLost || this.#discoveryOverloadError !== undefined || this.#stopping) {
       return true
     }
-    if (this.#fleetControlPlane.status().state !== 'closed') return true
-    return isPassFatalDispatchError(error)
+    // Fleet-scoped, and therefore live-only. See the doc comment above.
+    return !dryRun && this.#isFleetControlPlaneHalted(error)
+  }
+
+  /**
+   * Whether dispatch is globally paused by the fleet control-plane circuit.
+   *
+   * Two reads, because the circuit announces itself two different ways. The
+   * state read covers `guardedMutation`, which records a mutation's own
+   * transport failure and rethrows the *original* error rather than the
+   * circuit-open type — converting it there would be wrong, since the mutation
+   * may already have reached the broker and callers key spawn-failure handling
+   * off that original error. The type check covers a rejection raised without
+   * any state transition, such as an already-open circuit refusing admission.
+   */
+  #isFleetControlPlaneHalted(error: unknown): boolean {
+    return this.#fleetControlPlane.status().state !== 'closed' ||
+      wrapsErrorOfType(error, FleetControlPlaneCircuitOpenError)
   }
 
   #startDiscoverySweepRenewal(epoch: number): void {
@@ -19182,17 +19202,24 @@ export function isLiveDispatchStateChangedError(error: unknown): error is LiveDi
   return error instanceof LiveDispatchStateChangedError
 }
 
-/**
- * Error types that abort a readiness pass rather than skipping one work unit.
- * Kept deliberately short; the reasoning for what is in and out of this set
- * lives on `FactoryLoop#isPassFatalFailure`.
- */
-const PASS_FATAL_DISPATCH_ERRORS: ReadonlyArray<abstract new (...args: never[]) => Error> = [
-  FleetControlPlaneCircuitOpenError,
-]
-
 /** How deep to follow `cause` when classifying a wrapped failure. */
 const PASS_FATAL_CAUSE_DEPTH = 4
+
+/**
+ * Whether `error`, or anything it wraps, is an instance of `type`.
+ * `contextualError` and the fleet control-plane guard both rethrow wrapped, so
+ * classification has to follow the cause chain rather than trust the outermost
+ * type.
+ */
+const wrapsErrorOfType = (
+  error: unknown,
+  type: abstract new (...args: never[]) => Error,
+  depth = 0,
+): boolean => {
+  if (depth > PASS_FATAL_CAUSE_DEPTH || !(error instanceof Error)) return false
+  if (error instanceof type) return true
+  return wrapsErrorOfType((error as { cause?: unknown }).cause, type, depth + 1)
+}
 
 /**
  * How many *unclassified* per-item failures without an intervening successful
@@ -19211,16 +19238,6 @@ const UNCLASSIFIED_DISPATCH_FAILURE_LIMIT = 5
 const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
   error instanceof LiveDispatchStateChangedError ||
   error instanceof DispatchLifecycleClaimRefusedError
-
-const isPassFatalDispatchError = (error: unknown, depth = 0): boolean => {
-  if (depth > PASS_FATAL_CAUSE_DEPTH || !(error instanceof Error)) return false
-  if (isClassifiedPerItemDispatchFailure(error)) return false
-  if (PASS_FATAL_DISPATCH_ERRORS.some((type) => error instanceof type)) return true
-  // `contextualError` and the fleet control-plane guard both re-throw wrapped,
-  // so classification has to follow the cause chain rather than trust the
-  // outermost type.
-  return isPassFatalDispatchError((error as { cause?: unknown }).cause, depth + 1)
-}
 
 /**
  * The run-report reason recorded for a work unit the pass could not dispatch.

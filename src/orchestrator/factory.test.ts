@@ -4627,6 +4627,73 @@ describe('FactoryLoop', () => {
       expect(fleet.spawns).toEqual([])
     })
 
+    // The circuit rule is fleet-scoped, so it is live-only. A dry run never
+    // calls fleet admission and never spawns, so an open circuit is irrelevant
+    // to it — otherwise one live pass that trips the circuit would poison every
+    // later dry run, including the boot gate's `run-once --dry-run` probe.
+    // These two cases are a pair: the same open circuit, opposite verdicts.
+    const openTheCircuit = async () => {
+      class BrieflyBrokenRosterFleetClient extends LocalLifecycleFleetClient {
+        failRoster = false
+
+        override async roster() {
+          if (this.failRoster) {
+            throw Object.assign(new Error('broker unreachable'), { code: 'ECONNREFUSED' })
+          }
+          return await super.roster()
+        }
+      }
+
+      const fleet = new BrieflyBrokenRosterFleetClient()
+      const failures = new Map<string, Error>()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        batchSize: 4,
+        fleetHealth: { rosterTimeoutMs: 1_000, failureThreshold: 1, resetTimeoutMs: 60_000 },
+      }), {
+        mount: new FakeMountClient({
+          [blockedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+          [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+        }),
+        fleet,
+        triage: new FailingTriage((issue) => {
+          if (issue.key === '59') fleet.failRoster = true
+          return failures.get(issue.key)
+        }),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      // A live pass trips the circuit and aborts, as it must.
+      await expect(factory.runOnce()).rejects.toThrow()
+      expect(factory.status().fleetControlPlane.state).not.toBe('closed')
+      // The broker recovers, but the circuit stays open for its reset window —
+      // which is exactly the window a later pass runs in.
+      fleet.failRoster = false
+      failures.set('59', new Error('unrelated per-item fault'))
+      return { factory, fleet }
+    }
+
+    it('skips per-item failures in a dry run while the fleet circuit is open', async () => {
+      const { factory, fleet } = await openTheCircuit()
+
+      const report = await factory.runOnce({ dryRun: true })
+
+      expect(report.skipped).toContainEqual({
+        issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
+        reason: 'dispatch failed (Error)',
+      })
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(fleet.spawns).toEqual([])
+      expect(factory.status().fleetControlPlane.state).not.toBe('closed')
+    })
+
+    it('still treats the same open circuit as fatal on a live pass', async () => {
+      const { factory, fleet } = await openTheCircuit()
+
+      await expect(factory.runOnce()).rejects.toThrow()
+      expect(fleet.spawns).toEqual([])
+    })
+
     // Must-not-fire control. A pass-wide fault that arrives disguised as a
     // string of per-item faults must still surface as a failed pass rather
     // than a green report full of skips.
