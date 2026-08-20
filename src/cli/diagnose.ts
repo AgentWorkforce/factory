@@ -64,6 +64,14 @@ export interface DeployedFactoryDiagnosis {
    * Factory (factory-cloud#40 review).
    */
   workerOnly?: boolean
+  /**
+   * The container's own bootstrap phase, when it reports one.
+   *
+   * `booting`/`rendering-config`/`preflight` answer `ok: false` exactly like a
+   * wedged instance does, and telling someone three minutes into a boot that
+   * their Factory process is gone sends them to the wrong problem.
+   */
+  phase?: string
   /** Present when the instance predates the `/healthz` diagnostics block. */
   legacy?: DeployedLegacyHealth
   evidence?: DeployedEvidenceSummary
@@ -77,6 +85,9 @@ export interface DiagnoseDeployedOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000
+
+/** Container bootstrap phases: `ok: false` here means "not yet", not "wedged". */
+const BOOT_PHASES = new Set(['booting', 'rendering-config', 'preflight'])
 const MAX_EVIDENCE_TEXT = 2_000
 
 const endpoint = (base: string, path: string): string => `${base.replace(/\/+$/u, '')}${path}`
@@ -154,10 +165,20 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
   // daemon has stopped updating it describes a process that is no longer
   // there. The instance already said so.
   if (diagnosis.live === false) {
+    if (diagnosis.phase !== undefined && BOOT_PHASES.has(diagnosis.phase)) {
+      return {
+        dispatching: false,
+        verdict:
+          `not dispatching yet: the instance is still starting (phase ${diagnosis.phase}). ` +
+          'A cold container hydrates its Relayfile mirror before the first pass, which #36 measured ' +
+          'at up to 61 minutes; re-run this in a few minutes before treating it as wedged.',
+      }
+    }
     return {
       dispatching: false,
       verdict:
-        `not dispatching: the instance reports itself not live (HTTP ${diagnosis.httpStatus ?? '?'}). ` +
+        `not dispatching: the instance reports itself not live (HTTP ${diagnosis.httpStatus ?? '?'}` +
+        `${diagnosis.phase ? `, phase ${diagnosis.phase}` : ''}). ` +
         'Its loop heartbeat is stale or the Factory process is gone, so any health block it still ' +
         'serves describes the last write, not the present.',
     }
@@ -279,6 +300,7 @@ export async function diagnoseDeployedFactory(
       reachable: true,
       httpStatus: health.status,
       live: health.status === 200 && body.ok !== false,
+      ...(asText(body.phase) ? { phase: asText(body.phase) } : {}),
       ...(workerOnly ? { workerOnly: true } : {}),
       ...(published ? { health: published } : { legacy: legacyHealth(body) }),
     }
@@ -339,6 +361,9 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
     `  reachable            : ${diagnosis.reachable ? `yes (HTTP ${diagnosis.httpStatus ?? '?'})` : `no (${diagnosis.errorClass ?? 'no response'})`}`,
   )
 
+  if (diagnosis.phase !== undefined) {
+    lines.push(`  phase                : ${diagnosis.phase}`)
+  }
   if (diagnosis.live === false) {
     lines.push('  instance liveness    : NOT LIVE (the instance\'s own verdict, on its own clock)')
   }

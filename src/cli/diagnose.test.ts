@@ -440,5 +440,27 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(code).toBe(0)
     expect(seen).toEqual([`${BASE}/healthz`, `${BASE}/evidence auth=Bearer env-token`])
   })
+  // A container in `preflight` also answers ok:false, and "the Factory process
+  // is gone" is the wrong thing to tell someone whose instance is three
+  // minutes into a boot. The phase is right there in the response.
+  it('distinguishes a booting instance from a wedged one', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 503,
+          body: { ok: false, phase: 'preflight', factoryProcess: 'not-running' },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const text = out.text()
+    expect(text).toContain('preflight')
+    expect(text).toMatch(/still starting|booting/iu)
+    expect(text).not.toContain('the Factory process is gone')
+  })
 })
 
