@@ -2601,10 +2601,13 @@ export class FactoryLoop implements Factory {
           // shedding THIS issue's read. That is a fact about one work unit:
           // a sweep that pulled 40 issues and was shed on the 39th must keep
           // the other 39, exactly as #292 argued for dispatch failures. The
-          // fuse below is what still ends a sweep the backend is refusing.
+          // fuse is what still ends a sweep the backend is refusing.
           const overload = relayfileOverload(error)
+          // Defensive: anything `#readIssue` did not swallow and is not a 429
+          // is not ours to reclassify, and must surface as itself.
+          if (!overload) throw error
           const fuse = this.#discoveryOverloadFuseError()
-          if (!overload || fuse) throw fuse ?? error
+          if (fuse) throw fuse
           shed = true
           this.#increment('discoveryOverloadItemsSkipped')
           this.#logger.warn?.('[factory] relayfile shed a ready-issue read; skipping it and continuing the sweep', {
