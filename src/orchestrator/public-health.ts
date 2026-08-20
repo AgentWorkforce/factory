@@ -313,9 +313,13 @@ function countAgentlessOccupants(occupants: unknown, reapMs: number): number {
     const slotHeldForMs = finiteNumber(occupant.slotHeldForMs)
     // A producer that sends neither field cannot answer the question, and
     // guessing "wedged" from an absence is how a false alarm gets published.
+    // `>=`, not `>`: the reaper skips only while `nowMs < dueAtMs`, so it
+    // reaps at exactly the deadline. A diagnostic that disagrees with the
+    // mechanism it reports on — even on one boundary instant — is the failure
+    // mode this whole PR exists to close (#303 review, cubic).
     return finiteNumber(occupant.placedAgents) === 0 &&
       slotHeldForMs !== undefined &&
-      slotHeldForMs > reapMs
+      slotHeldForMs >= reapMs
   }).length
 }
 

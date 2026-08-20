@@ -99,6 +99,27 @@ describe('dispatch capacity health (#303)', () => {
     expect(health.dispatchCapacity?.state).toBe('stalled')
   })
 
+  // The reaper skips only while `nowMs < dueAtMs`, so it reaps AT the
+  // deadline. A strict `>` here would make the diagnostic disagree with the
+  // mechanism it reports on for that instant.
+  it('counts a never-placed slot that reached its reap deadline exactly', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        occupants: [{
+          issue: 'AR-303',
+          phase: 'dispatching',
+          agents: 1,
+          placedAgents: 0,
+          slotHeldForMs: 30 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.agentlessHoldTimeoutMs).toBe(30 * 60_000)
+    expect(health.dispatchCapacity?.agentlessOccupants).toBe(1)
+  })
+
   it('survives a corrupted occupants collection rather than dropping the block', () => {
     for (const occupants of ['not-an-array', null, [null], [42], [{ placedAgents: 0 }]]) {
       const health = publicHealthFromHeartbeat(

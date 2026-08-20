@@ -11100,6 +11100,109 @@ describe('FactoryLoop', () => {
     }
   }, 60_000)
 
+  // #303 review (cubic): the reset must be gated on the transition actually
+  // freeing a slot. A `queued` row going terminal — a queued issue abandoned at
+  // startup because its source went terminal — frees nothing, and waking every
+  // waiter for it re-creates the retry storm on an event that cannot have
+  // changed any of their answers.
+  it('does not restart the capacity backoff when a terminal row never held a slot (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-non-slot-terminal-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const seedMount = new FakeMountClient({
+      [issuePath(314)]: issueFile(314),
+      [issuePath(315)]: issueFile(315),
+      [issuePath(316)]: issueFile(316),
+    })
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: seedMount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decisions = new Map<number, TriageDecision>()
+    for (const number of [314, 315, 316]) {
+      decisions.set(number, await seed.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    }
+    await seed.stop()
+
+    const lifecycleFor = (
+      number: number,
+      phase: DispatchLifecycle['phase'],
+      agents: DispatchLifecycle['agents'],
+      heldSinceAtMs?: number,
+    ): DispatchLifecycle => ({
+      runId: `run-${number}`,
+      issue: { ...decisions.get(number)!.issue },
+      decision: decisions.get(number)!,
+      dryRun: false,
+      phase,
+      agents,
+      invocationIds: [],
+      ...(heldSinceAtMs !== undefined ? { heldSinceAtMs } : {}),
+      updatedAtMs: 0,
+    })
+
+    // Seeded in this order so adoption walks holder -> waiter -> abandoned row.
+    const holderSpec = decisions.get(314)!.implementers[0]!
+    const holder = lifecycleFor(314, 'running', [{
+      name: holderSpec.name,
+      tracked: {
+        spec: { ...holderSpec },
+        result: { name: holderSpec.name, sessionRef: 'session-314', node: 'sf-mini', locality: 'remote' },
+      },
+    }], Date.now())
+    const nowMs = Date.now()
+    await state().claimDispatchLifecycle('factory-test', issueKey(holder.issue), holder, 'dead-owner', nowMs, 1)
+    for (const number of [315, 316]) {
+      const queued = lifecycleFor(number, 'queued', [])
+      await state().claimDispatchLifecycle('factory-test', issueKey(queued.issue), queued, 'dead-owner', nowMs, 1)
+    }
+
+    // AR-316's source went terminal while it sat queued. Its read is delayed so
+    // AR-315's capacity wait is already registered when AR-316 is abandoned —
+    // without that, the map is empty and the reset is a no-op eitherway.
+    let delayTerminalRead = true
+    class SlowTerminalIssueMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === issuePath(316) && delayTerminalRead) {
+          delayTerminalRead = false
+          await new Promise((resolve) => setTimeout(resolve, 1_800))
+        }
+        return super.readFile(path)
+      }
+    }
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new SlowTerminalIssueMount({
+        [issuePath(314)]: issueFile(314),
+        [issuePath(315)]: issueFile(315),
+        [issuePath(316)]: issueFile(316, done),
+      }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(
+        await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(316)!.issue)),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 15_000 })
+      // AR-314 still holds the only slot, so nothing was freed.
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(314)!.issue)))
+        .toMatchObject({ phase: 'running' })
+      // Establishes that a waiter really was parked at that moment — without
+      // this the assertion below passes vacuously.
+      expect(factory.status().counters.dispatchLifecycleCapacityWaits).toBeGreaterThanOrEqual(1)
+      expect(factory.status().counters.dispatchCapacityBackoffResets).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
   // sight would convert a wedge into a dispatch race.

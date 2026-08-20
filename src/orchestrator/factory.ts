@@ -56,7 +56,11 @@ import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
-import { dispatchHandedOffToBabysitters, dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
+import {
+  dispatchHandedOffToBabysitters,
+  dispatchLifecycleOccupiesSlot,
+  dispatchPhaseOccupiesSlot,
+} from '../state/dispatch-lifecycle-slot'
 import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
@@ -5937,9 +5941,19 @@ export class FactoryLoop implements Factory {
       }
       if (isTerminalDispatchLifecycle(lifecycle)) {
         this.#dispatchLifecycleEpochs.delete(key)
-        // This row just gave up its slot, so every waiter's answer may have
-        // changed. Local completion dispatches the next issue directly; this
-        // is what covers a waiter with no local event to ride on.
+      }
+      // Wake the capacity waiters exactly when this write gives a slot back —
+      // occupied before, not occupied after — and never otherwise (#303
+      // review, cubic).
+      //
+      // Not "when it goes terminal". `releasing` already does not occupy a
+      // slot, so a normal completion frees it one save *before* `complete`,
+      // and a babysitter handoff frees it without ever going terminal at all.
+      // Keying on the terminal save alone therefore both fires for rows that
+      // freed nothing (a `queued` row abandoned at startup) and misses the
+      // writes that actually freed something. The occupancy transition is the
+      // event; the phase is only a proxy for it.
+      if (previous && dispatchLifecycleOccupiesSlot(previous) && !dispatchLifecycleOccupiesSlot(lifecycle)) {
         this.#resetDispatchCapacityBackoff()
       }
       return true
