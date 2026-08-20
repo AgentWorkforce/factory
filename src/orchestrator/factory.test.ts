@@ -4715,53 +4715,64 @@ describe('FactoryLoop', () => {
     // the per-sweep fuse throws straight past it. A direct `runOnce()` — the
     // `factory run-once` CLI, and `#reconcileReadyIssues` — has no runLoop
     // catch behind it, so that work unit's spawned agents leak.
-    it('reaps the agents of the shed dispatch that trips the fuse', async () => {
-      const numbers = [71, 72, 73, 74, 75]
+    const FUSE_ISSUE_NUMBERS = [71, 72, 73, 74, 75]
 
-      /**
-       * Sheds one read per issue, and only after that issue has already
-       * spawned — the spawn loop reads the issue again between agents, which
-       * is the post-spawn window the leak lives in.
-       */
-      class ShedPostSpawnReadMount extends FakeMountClient {
-        readonly #shed = new Set<string>()
+    /**
+     * Sheds one read per issue, and only after that issue has already spawned
+     * — the spawn loop reads the issue again between agents, which is the
+     * post-spawn window the leak lives in. Five issues means five shed
+     * operations, so the fifth trips DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT.
+     */
+    class ShedPostSpawnReadMount extends FakeMountClient {
+      readonly #shed = new Set<string>()
 
-        constructor(files: Record<string, unknown>, readonly spawnedFor: (issueKey: string) => number) {
-          super(files)
-        }
-
-        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
-          // Keyed on THIS issue's own agents: the spawn loop re-reads the issue
-          // between agents, so the read after its first agent is the post-spawn
-          // window. A global spawn count would instead make every issue after
-          // the first shed before it had spawned anything.
-          const issueKey = /AR-(\d+)/u.exec(path)?.[1]
-          if (issueKey && !this.#shed.has(path) && this.spawnedFor(issueKey) > 0) {
-            this.#shed.add(path)
-            throw overloadError({ retryAfterSeconds: 5, reason: 'oldest_inflight_age' })
-          }
-          return await super.readFile(path)
-        }
+      constructor(files: Record<string, unknown>, readonly spawnedFor: (issueKey: string) => number) {
+        super(files)
       }
 
-      const fleet = new CapturedPidFleetClient(numbers.flatMap((number, index) => [
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        // Keyed on THIS issue's own agents. A global spawn count would instead
+        // make every issue after the first shed before it had spawned
+        // anything, tripping the fuse on a unit with nothing to leak — which
+        // is exactly how the first version of this harness silently passed
+        // against the unfixed code.
+        const issueKey = /AR-(\d+)/u.exec(path)?.[1]
+        if (issueKey && !this.#shed.has(path) && this.spawnedFor(issueKey) > 0) {
+          this.#shed.add(path)
+          throw overloadError({ retryAfterSeconds: 5, reason: 'oldest_inflight_age' })
+        }
+        return await super.readFile(path)
+      }
+    }
+
+    const fuseTrippingFactory = (overrides: { stateStore?: StateStore; warnings?: Warning[] } = {}) => {
+      const fleet = new CapturedPidFleetClient(FUSE_ISSUE_NUMBERS.flatMap((number, index) => [
         { name: `ar-${number}-impl-pear`, sessionRef: `session-ar-${number}-impl`, pid: 7_100 + index * 2 },
         { name: `ar-${number}-review`, sessionRef: `session-ar-${number}-review`, pid: 7_101 + index * 2 },
       ]))
       const mount = new ShedPostSpawnReadMount(
-        Object.fromEntries(numbers.map((number) => [issuePath(number), issueFile(number)])),
+        Object.fromEntries(FUSE_ISSUE_NUMBERS.map((number) => [issuePath(number), issueFile(number)])),
         (issueKey) => fleet.spawns.filter((spawn) => spawn.name.startsWith(`ar-${issueKey}-`)).length,
       )
       const factory = createFactory(config({ batchSize: 5 }), {
         mount,
         fleet,
         triage: new StaticTriage(),
+        ...(overrides.stateStore ? { stateStore: overrides.stateStore } : {}),
+        ...(overrides.warnings
+          ? { logger: { warn: (message, details) => overrides.warnings!.push({ message, details }) } }
+          : {}),
         readChildPids: async () => [],
         kill: () => {
           throw Object.assign(new Error('not running'), { code: 'ESRCH' })
         },
         terminationGraceMs: 0,
       })
+      return { factory, fleet }
+    }
+
+    it('reaps the agents of the shed dispatch that trips the fuse', async () => {
+      const { factory, fleet } = fuseTrippingFactory()
 
       // Five shed operations trip DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT, so the
       // fifth unit aborts the pass instead of being skipped.
@@ -4776,6 +4787,65 @@ describe('FactoryLoop', () => {
       for (const name of spawned) {
         expect(released).toContain(name)
       }
+    })
+
+    // Review follow-up on #298 (P2, cubic, second round). Reaping before the
+    // fatality check put a state-store read on the path of EVERY per-item
+    // failure. `listFailureHandoffs` sits outside `#reapDispatchFailureHandoffsNow`'s
+    // own try, so its failure replaces the dispatch error — and a replaced 429
+    // is no longer recognised as overload at the fence, which silently drops
+    // the advertised backoff the whole PR exists to honour.
+    it('keeps the 429 when the handoff store fails during the reap', async () => {
+      /**
+       * Fails only the reap's read, not the registry write's.
+       *
+       * `#writeInFlightRegistry` calls the same method from inside dispatch's
+       * own failure handling, and breaking that replaces the 429 *before* the
+       * reap ever runs — which masks the defect under test rather than
+       * exercising it. Keying on the caller is precise where a call count
+       * would be brittle.
+       */
+      class UnreadableHandoffStateStore extends InMemoryStateStore {
+        override async listFailureHandoffs(): ReturnType<InMemoryStateStore['listFailureHandoffs']> {
+          if (new Error().stack?.includes('reapDispatchFailureHandoffsNow')) {
+            throw new Error('handoff store unavailable')
+          }
+          return await super.listFailureHandoffs()
+        }
+      }
+
+      // One issue, so this isolates the reap: the unit is skipped rather than
+      // fatal, and the only thing that can change the recorded error is the
+      // reap running between the failure and the classification.
+      const fleet = new CapturedPidFleetClient([
+        { name: 'ar-71-impl-pear', sessionRef: 'session-ar-71-impl', pid: 7_100 },
+        { name: 'ar-71-review', sessionRef: 'session-ar-71-review', pid: 7_101 },
+      ])
+      const mount = new ShedPostSpawnReadMount(
+        { [issuePath(71)]: issueFile(71) },
+        (issueKey) => fleet.spawns.filter((spawn) => spawn.name.startsWith(`ar-${issueKey}-`)).length,
+      )
+      const factory = createFactory(config({ batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        stateStore: new UnreadableHandoffStateStore({ batchSize: 5 }),
+        readChildPids: async () => [],
+        kill: () => {
+          throw Object.assign(new Error('not running'), { code: 'ESRCH' })
+        },
+        terminationGraceMs: 0,
+      })
+
+      const report = await factory.runOnce()
+
+      // The 429 must survive the failed reap. If it does not, the unit is
+      // misclassified as an ordinary failure — and at the fence a replaced 429
+      // is no longer overload at all, so the advertised backoff is dropped.
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-71' }),
+        reason: 'relayfile overloaded (oldest_inflight_age)',
+      }))
     })
   })
 

@@ -7315,12 +7315,18 @@ export class FactoryLoop implements Factory {
     heartbeatPath = this.#loopReapPaths?.heartbeatPath ?? this.#config.loop.heartbeatPath,
     registryPath = this.#loopReapPaths?.registryPath ?? this.#config.loop.registryPath,
   ): Promise<void> {
-    const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
-    if (handoffs.length === 0) {
-      return
-    }
-
     try {
+      // Inside the try, not before it (#298 review). Every caller reaps while
+      // already handling a failure and then propagates that failure: the
+      // per-item catch rethrows the dispatch error, runLoop's catch is mid
+      // teardown. A throw from here would REPLACE the error in flight — and a
+      // replaced 429 is no longer recognised as overload at the discovery
+      // fence, silently dropping the advertised backoff. Reaping is
+      // best-effort by construction; the caller's error always wins.
+      const handoffs = await this.#state.listFailureHandoffs(this.#workspaceId)
+      if (handoffs.length === 0) {
+        return
+      }
       const protectedPids = await this.#protectedPids()
       let registryChanged = false
       const readyToClear = new Set<string>()
