@@ -19,6 +19,7 @@ import type {
   DiscoverySweepLease,
   DiscoverySweepRenewal,
   DiscoverySweepState,
+  SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
@@ -56,9 +57,9 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
 
 /**
  * Keeps the factory's general runtime bookkeeping in memory while persisting
- * GitHub escalation watches, parked clarification teams, exact babysitter PR
- * ownership, and thread-owned conversation turns atomically so they survive a
- * CLI process restart.
+ * GitHub/Slack escalation watches, parked clarification teams, exact
+ * babysitter PR ownership, and thread-owned conversation turns atomically so
+ * they survive a CLI process restart.
  * Mutations reload under an advisory lock so independent processes merge
  * updates instead of publishing divergent cached documents.
  */
@@ -368,6 +369,40 @@ export class DocumentStateStore extends InMemoryStateStore {
       const workspace = document.workspaces[workspaceId]
       if (!workspace || !(key in workspace.dispatchLifecycles)) return
       delete workspace.dispatchLifecycles[key]
+      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+    }))
+  }
+
+  override async setSlackThreadWatch(
+    workspaceId: string,
+    key: string,
+    watch: SlackThreadWatchState,
+  ): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      workspace.slackThreadWatches[key] = structuredClone(watch)
+      await this.#persist(document)
+    }))
+  }
+
+  override async listSlackThreadWatches(
+    workspaceId: string,
+  ): Promise<Array<[string, SlackThreadWatchState]>> {
+    return await this.#exclusive(async () => {
+      const document = await this.#loadFromDisk()
+      return Object.entries(document.workspaces[workspaceId]?.slackThreadWatches ?? {})
+        .map(([key, watch]) => [key, structuredClone(watch)])
+    })
+  }
+
+  override async clearSlackThreadWatch(workspaceId: string, key: string): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      if (!workspace || !(key in workspace.slackThreadWatches)) return
+      delete workspace.slackThreadWatches[key]
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)
     }))
@@ -925,6 +960,128 @@ export class DocumentStateStore extends InMemoryStateStore {
     })
   }
 
+  override async claimConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (!conversationHasMessage(session, messageId)) return false
+      if ((session.acknowledgedMessageIds ?? []).includes(messageId)) return false
+      session.acknowledgementClaims ??= {}
+      const current = session.acknowledgementClaims[messageId]
+      if (current && current.claimedAtMs + leaseMs > nowMs) return false
+      session.acknowledgementClaims[messageId] = { claimId, claimedAtMs: nowMs }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async completeConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.acknowledgementClaims?.[messageId]?.claimId !== claimId) return false
+      session.acknowledgedMessageIds ??= []
+      if (!session.acknowledgedMessageIds.includes(messageId)) session.acknowledgedMessageIds.push(messageId)
+      delete session.acknowledgementClaims[messageId]
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async renewConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      const claim = session.acknowledgementClaims?.[messageId]
+      if (claim?.claimId !== claimId) return false
+      claim.claimedAtMs = nowMs
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async releaseConversationMessageAcknowledgement(
+    workspaceId: string,
+    conversationId: string,
+    messageId: string,
+    claimId: string,
+  ): Promise<void> {
+    await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.acknowledgementClaims?.[messageId]?.claimId !== claimId) return false
+      delete session.acknowledgementClaims[messageId]
+      return true
+    })
+  }
+
+  override async claimConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.posted) return false
+      const current = session.terminalReceipt
+      if (current && current.claimedAtMs + leaseMs > nowMs) return false
+      session.terminalReceipt = { claimId, claimedAtMs: nowMs }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async renewConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      const receipt = session.terminalReceipt
+      if (receipt?.claimId !== claimId || receipt.posted) return false
+      receipt.claimedAtMs = nowMs
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async completeConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.claimId !== claimId) return false
+      session.terminalReceipt = { ...session.terminalReceipt, posted: true }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async releaseConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<void> {
+    await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.claimId !== claimId || session.terminalReceipt.posted) return false
+      delete session.terminalReceipt
+      return true
+    })
+  }
+
   override async claimConversationTurn(
     workspaceId: string,
     conversationId: string,
@@ -940,10 +1097,12 @@ export class DocumentStateStore extends InMemoryStateStore {
       const attempts = session.delivery?.attempts ?? 0
       if (session.delivery) session.pending.unshift(...session.delivery.messages)
       session.pending.sort(compareConversationMessages)
-      if (session.pending.length === 0) {
+      if (!session.agent || session.pending.length === 0) {
+        const hadDelivery = session.delivery !== undefined
         session.delivery = undefined
-        return false
+        return hadDelivery
       }
+      const agent = session.agent
       session.delivery = {
         claimId,
         owner,
@@ -951,8 +1110,8 @@ export class DocumentStateStore extends InMemoryStateStore {
         attempts: attempts + 1,
         messages: session.pending.splice(0),
         agent: {
-          name: session.agent.name,
-          sessionRef: session.agent.sessionRef,
+          name: agent.name,
+          sessionRef: agent.sessionRef,
         },
       }
       return true
@@ -985,6 +1144,7 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (!session.delivery || session.delivery.owner !== owner || session.delivery.claimId !== claimId) return false
       session.history = [...session.history, ...session.delivery.messages].slice(-CONVERSATION_HISTORY_LIMIT)
       if (
+        session.agent &&
         session.agent.name === session.delivery.agent.name &&
         session.agent.sessionRef === session.delivery.agent.sessionRef
       ) {
@@ -1021,7 +1181,7 @@ export class DocumentStateStore extends InMemoryStateStore {
   override async rebindConversationSession(
     workspaceId: string,
     conversationId: string,
-    agent: ConversationSessionState['agent'],
+    agent: NonNullable<ConversationSessionState['agent']>,
   ): Promise<boolean> {
     const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
       session.agent = structuredClone(agent)
@@ -1232,6 +1392,7 @@ const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): 
 
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},
+  slackThreadWatches: {},
   waitingClarifications: {},
   babysitterSessions: {},
   babysitterGenerations: {},
@@ -1242,6 +1403,7 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
+  Object.keys(workspace.slackThreadWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&
   Object.keys(workspace.babysitterSessions).length === 0 &&
   Object.keys(workspace.babysitterGenerations).length === 0 &&

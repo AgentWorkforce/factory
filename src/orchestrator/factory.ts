@@ -410,8 +410,32 @@ const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
+// Both receipt leases guard an in-flight Slack writeback, and no fixed lease can
+// cover one: MountSlackWriteback budgets 90s for the confirm alone, on top of an
+// unbounded writeFile. Sizing them past that worst case would only trade a stolen
+// claim for a stranded one — a lease long enough to survive the slowest write is
+// equally long enough to hold the receipt hostage to a dead holder. So these
+// bound the *idle* claim and #withRenewedProviderLease extends them for exactly
+// as long as the write they cover is still running.
+const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
+const SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS = 60_000
+// Renewal without a ceiling is the same defect from the other side: a heartbeat
+// that extends the claim for as long as the write runs also extends it forever
+// when the write never returns, and nothing else can reclaim the receipt short
+// of a restart. So renewal is bounded past the slowest write this daemon budgets
+// for — MountSlackWriteback's 90s confirm on top of its writeFile — and beyond
+// that the write is not slow, it is wedged: the heartbeat stops, the idle lease
+// runs out, and the retry that owns the queued replies can take them back.
+const SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS = 5 * 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
+// One pass drains the whole chain (#slackReplyRoutes holds only the newest
+// route per key and every route awaits its predecessor). The extra passes only
+// exist so the drain can prove quiescence rather than assume it.
+const SLACK_REPLY_ROUTE_DRAIN_PASSES = 8
+const SLACK_TERMINAL_THREAD_GRACE_MS = 24 * 60 * 60_000
+const SLACK_TERMINAL_RECEIPT_RETRY_MS = 1_000
+const SLACK_TERMINAL_RECEIPT_RETRY_MAX_MS = 5 * 60_000
 const MERGE_GATE_MAX_ATTEMPTS = 12
 const MERGE_GATE_POLL_DELAY_MS = 10_000
 const MAX_LABEL_IMPLEMENTERS = 4
@@ -533,6 +557,19 @@ export class FactoryLoop implements Factory {
   readonly #dispatchInFlight = new Map<string, Promise<DispatchResult>>()
   readonly #slackWatchers = new Map<string, SlackThreadWatcher>()
   readonly #slackWatcherStarts = new Map<string, Promise<unknown>>()
+  readonly #slackTerminalWatchExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #slackTerminalReceiptRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #terminalSlackWatchIssues = new Set<string>()
+  /**
+   * The one in-memory record of "this work unit has an in-flight Slack side
+   * effect". Both ordinary reply routes and the writebacks the terminal fence
+   * issues on their behalf register here, because this map is what the terminal
+   * drain waits on: anything that touches Slack for a work unit without
+   * registering is invisible to the drain, and the watcher teardown that follows
+   * a successful drain then pulls that effect's retry timer out from under it.
+   */
+  readonly #slackReplyRoutes = new Map<string, Promise<DispatchResult | undefined>>()
+  readonly #slackReplyRouteDrains = new Set<string>()
   readonly #slackConversationTurns: CoalescedTaskQueue<string>
   readonly #slackConversationOwner = `${process.pid}:${randomUUID()}`
   readonly #githubIssueCommentWatchers = new Map<string, GithubIssueCommentWatcher>()
@@ -1163,6 +1200,12 @@ export class FactoryLoop implements Factory {
       await this.#boundedStopTeardown('factory subscription unsubscribe', () => subscription?.unsubscribe())
       await Promise.all([...this.#slackWatchers.values()].map((watcher) => watcher.stop()))
       this.#slackWatchers.clear()
+      for (const timer of this.#slackTerminalWatchExpiryTimers.values()) clearTimeout(timer)
+      this.#slackTerminalWatchExpiryTimers.clear()
+      for (const timer of this.#slackTerminalReceiptRetryTimers.values()) clearTimeout(timer)
+      this.#slackTerminalReceiptRetryTimers.clear()
+      this.#terminalSlackWatchIssues.clear()
+      this.#slackReplyRouteDrains.clear()
       await Promise.all([...this.#githubIssueCommentWatchers.values()].map((watcher) => watcher.stop()))
       this.#githubIssueCommentWatchers.clear()
       this.#githubIssueCommentWatchStates.clear()
@@ -5585,7 +5628,7 @@ export class FactoryLoop implements Factory {
     for (const [name] of record.agents) {
       this.#fleet.markAgentTerminal?.(name, 'durable-dispatch-abandoned')
     }
-    await this.#stopSlackWatcher(record.issue)
+    await this.#retireSlackWatcher(record)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     this.#increment('dispatchLifecycleStaleIssuesAbandoned')
@@ -8548,7 +8591,7 @@ export class FactoryLoop implements Factory {
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
-    await this.#stopSlackWatcher(record.issue)
+    await this.#retireSlackWatcher(record)
     await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
     await this.#writeInFlightRegistry()
     if (next) {
@@ -12831,7 +12874,7 @@ export class FactoryLoop implements Factory {
         batch.complete(record.issue)
       }
       if (!await this.#saveDispatchLifecycle(record, 'releasing', undefined, releaseReason)) return
-      await this.#stopSlackWatcher(record.issue)
+      await this.#retireSlackWatcher(record)
       await this.#stopGithubIssueCommentWatcherForIssue(record.issue)
       await this.#recordDispatchTerminal(record.issue)
       await this.#finishDurableRelease(record, releaseReason)
@@ -13355,6 +13398,24 @@ export class FactoryLoop implements Factory {
     }
 
     const key = issueKey(record.issue)
+    const previousWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    if (previousWatch?.kind === 'terminal-grace') {
+      // A reopened work unit needs a fresh dispatch notification and a fresh
+      // conversation. Do not let the old grace-period watcher (or its expiry
+      // timer) capture and later tear down the new dispatch.
+      if (!await this.#stopSlackWatcher(record.issue)) {
+        // Fail closed. An undrained reply route still holds the retired thread
+        // and would bind it to this dispatch, delivering a stale human reply to
+        // fresh work. Leave the fence up; the next reconcile retries the drain.
+        this.#logger.warn?.(
+          '[factory] deferring Slack dispatch thread for reopened work unit; in-flight reply route not drained',
+          { issue: record.issue.key },
+        )
+        this.#increment('slackDispatchThreadsDeferredUndrainedReply')
+        return
+      }
+    }
     const existingThread = await this.#persistedSlackThread(key)
     const watcherStart = this.#slackWatcherStarts.get(key)
     if (existingThread || watcherStart) {
@@ -13456,13 +13517,14 @@ export class FactoryLoop implements Factory {
     if (existing) {
       const sessionRef = owned?.tracked.sessionRef
       const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
+      let rebound = false
       if (
         owned && sessionRef &&
-        (agentName !== existing.agent.name || (
+        (!existing.agent || agentName !== existing.agent.name || (
           options.forceAgentRebind === true && sessionRef !== existing.agent.sessionRef
         ))
       ) {
-        const rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
+        rebound = await this.#state.rebindConversationSession(this.#workspaceId, conversationId, {
           name: agentName!,
           sessionRef,
           role: owned.tracked.spec.role,
@@ -13478,26 +13540,21 @@ export class FactoryLoop implements Factory {
           this.#workspaceId,
           issueKey(existing.issue),
         )
-        if (!waiting) this.#slackConversationTurns.schedule(conversationId)
+        if (!waiting && (existing.agent || rebound)) this.#slackConversationTurns.schedule(conversationId)
       }
       return
     }
 
     const sessionRef = owned?.tracked.sessionRef
-    if (!owned || !sessionRef) {
-      this.#increment('slackConversationSessionsSkippedMissingSession')
-      return
-    }
-
     const channelDir = await this.#slackChannelDir() ?? this.#config.slack?.channel
     if (!channelDir) return
-    const agentName = owned.tracked.result?.name ?? owned.name
+    const agentName = owned ? (owned.tracked.result?.name ?? owned.name) : undefined
     const reserved = await this.#state.reserveConversationSession(this.#workspaceId, conversationId, {
       provider: 'slack',
       issue: { ...record.issue },
       externalId: threadId,
       context: { channelDir },
-      agent: {
+      ...(owned && sessionRef && agentName ? { agent: {
         name: agentName,
         sessionRef,
         role: owned.tracked.spec.role,
@@ -13505,12 +13562,16 @@ export class FactoryLoop implements Factory {
         capability: owned.tracked.spec.capability,
         repo: owned.tracked.spec.repo,
         clonePath: owned.tracked.spec.clonePath,
-      },
+      } } : {}),
       history: [],
       processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      acknowledgementClaims: {},
       pending: [],
     })
-    if (reserved) this.#increment('slackConversationSessionsOwned')
+    if (reserved) {
+      this.#increment(owned && sessionRef ? 'slackConversationSessionsOwned' : 'slackConversationSessionsReservedUnowned')
+    }
   }
 
   // Called right after a babysitter is spawned/reattached for an issue's PR so
@@ -13545,9 +13606,18 @@ export class FactoryLoop implements Factory {
     )
     if (!claimed?.delivery) {
       const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
-      if (current && (current.pending.length > 0 || current.delivery)) {
+      if (current?.agent && (current.pending.length > 0 || current.delivery)) {
         this.#slackConversationTurns.schedule(conversationId, SLACK_CONVERSATION_TURN_RETRY_MS)
       }
+      return
+    }
+    if (!claimed.agent) {
+      await this.#state.releaseConversationTurn(
+        this.#workspaceId,
+        conversationId,
+        this.#slackConversationOwner,
+        claimId,
+      )
       return
     }
 
@@ -13659,10 +13729,12 @@ export class FactoryLoop implements Factory {
     session: ConversationSessionState,
     result: SpawnResult,
   ): Promise<void> {
+    const sessionAgent = session.agent
+    if (!sessionAgent) return
     const record = (await this.#batch()).getIssue(session.issue)
     if (!record) return
     const entry = [...record.agents.entries()].find(([name, tracked]) =>
-      name === session.agent.name || tracked.result?.name === session.agent.name)
+      name === sessionAgent.name || tracked.result?.name === sessionAgent.name)
     if (!entry) return
     const [previousName, tracked] = entry
     tracked.result = {
@@ -14005,7 +14077,14 @@ export class FactoryLoop implements Factory {
         `Question: ${triageEscalationQuestion(decision, issue)}`,
       ].join('\n'),
     })
-    await this.#state.setSlackThread(this.#workspaceId, issueKey(decision.issue), root.threadId)
+    const key = issueKey(decision.issue)
+    await this.#state.setSlackThread(this.#workspaceId, key, root.threadId)
+    await this.#state.setSlackThreadWatch(this.#workspaceId, key, {
+      kind: 'triage',
+      issue: { ...decision.issue },
+      decision: structuredClone(decision),
+      threadId: root.threadId,
+    })
     const replayedResult = await this.#watchSlackThread(escalationWatchRecord(decision), root.threadId)
     this.#recordSlackWritebackSuccess('triage-escalation')
     return replayedResult
@@ -14014,7 +14093,7 @@ export class FactoryLoop implements Factory {
   async #watchSlackThread(
     record: InFlightIssue,
     threadId: string,
-    options: { replayConversationReplies?: boolean } = {},
+    options: { replayConversationReplies?: boolean; replayAfterMs?: number } = {},
   ): Promise<DispatchResult | undefined> {
     if (!this.#config.slack) {
       return
@@ -14080,6 +14159,13 @@ export class FactoryLoop implements Factory {
 
         const reply = await this.#readSlackReply(path)
         if (!reply || !reply.isThreadReply || reply.threadTs !== threadId || reply.channelDir !== channelDir) {
+          return
+        }
+        if (
+          allowPreExisting &&
+          options.replayAfterMs !== undefined &&
+          slackMessageReceivedAtMs(reply.messageTs, Number.MAX_SAFE_INTEGER) < options.replayAfterMs
+        ) {
           return
         }
 
@@ -14215,7 +14301,7 @@ export class FactoryLoop implements Factory {
   async #rearmSlackWatcher(
     record: InFlightIssue,
     threadId: string,
-    options: { replayConversationReplies?: boolean } = {},
+    options: { replayConversationReplies?: boolean; replayAfterMs?: number } = {},
   ): Promise<void> {
     const key = issueKey(record.issue)
     if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) {
@@ -14279,6 +14365,48 @@ export class FactoryLoop implements Factory {
       if (record && !waiting && (session.pending.length > 0 || session.delivery)) {
         this.#slackConversationTurns.schedule(conversationId)
       }
+    }
+    for (const [key, watch] of await this.#state.listSlackThreadWatches(this.#workspaceId)) {
+      if (this.#slackWatchers.has(key) || this.#slackWatcherStarts.has(key)) continue
+      if (watch.kind === 'terminal-grace' && watch.expiresAtMs <= this.#clock.now()) {
+        await this.#stopSlackWatcher(watch.issue)
+        continue
+      }
+      await this.#state.setSlackThread(this.#workspaceId, key, watch.threadId)
+      const watchRecord = escalationWatchRecord(watch.decision)
+      if (watch.kind === 'terminal-grace') {
+        const retiredAtMs = terminalSlackWatchRetiredAtMs(watch)
+        if (watch.retiredAtMs !== retiredAtMs) {
+          await this.#state.setSlackThreadWatch(this.#workspaceId, key, { ...watch, retiredAtMs })
+        }
+        this.#terminalSlackWatchIssues.add(key)
+        const conversationId = slackConversationId(watch.threadId)
+        await this.#slackConversationTurns.cancel(conversationId)
+        try {
+          await this.#surfaceUndeliveredSlackConversation(watch.threadId)
+          await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+        } catch (error) {
+          // The undelivered-reply receipt needs Slack writeback, which may be
+          // unavailable at startup. That is retryable state maintenance for this
+          // one thread, not a reason to abandon rehydration: aborting here would
+          // leave every remaining thread watched by nobody. Keep the queued
+          // replies (clearing them now would drop replies nobody was told about)
+          // and carry on re-arming.
+          this.#logger.warn?.(
+            '[factory] failed to settle undelivered Slack replies for terminal watch; will retry',
+            { issue: watch.issue.key, error },
+          )
+          this.#increment('slackTerminalWatchReceiptsDeferred')
+          this.#scheduleSlackTerminalReceiptRetry(watch.issue, watch.threadId, watch.expiresAtMs)
+        }
+        await this.#rearmSlackWatcher(watchRecord, watch.threadId, {
+          replayConversationReplies: true,
+          replayAfterMs: retiredAtMs,
+        })
+        this.#scheduleSlackTerminalWatchExpiry(watch.issue, watch.expiresAtMs)
+        continue
+      }
+      await this.#rearmSlackWatcher(watchRecord, watch.threadId, { replayConversationReplies: true })
     }
     await this.#sweepWaitingClarifications()
     for (const [, waiting] of await this.#state.listWaitingClarifications(this.#workspaceId)) {
@@ -14450,8 +14578,72 @@ export class FactoryLoop implements Factory {
     this.#clarificationSweepDueAtMs = dueAtMs
   }
 
-  async #stopSlackWatcher(issue: IssueRef): Promise<void> {
+  // The terminal fence is the only thing that makes an in-flight reply route
+  // answer "no active agent" instead of binding the retired thread to whatever
+  // dispatch owns this key. Routes are chained per work unit, so awaiting the
+  // newest one drains every reply queued behind it.
+  async #drainSlackReplyRoutes(key: string): Promise<boolean> {
+    // Snapshotting #slackReplyRoutes is not enough on its own. A reply handler
+    // that is still inside its mount read when the drain starts registers its
+    // route *after* the snapshot, so it would run once the fence is gone and
+    // bind the retired thread to the next dispatch — the same escape one level
+    // in. Bar *routing* for this key first (the bar and the registration are
+    // both synchronous, so nothing can slip between them), then drain whatever
+    // is already chained, then prove the set is empty before reporting success.
+    // A barred reply still answers the human, and that writeback registers here
+    // like any other effect, so the extra passes are what pick it up: quiescence
+    // means every effect this work unit started has settled, not merely the ones
+    // that existed when the drain began.
+    const nested = this.#slackReplyRouteDrains.has(key)
+    this.#slackReplyRouteDrains.add(key)
+    try {
+      for (let pass = 0; pass < SLACK_REPLY_ROUTE_DRAIN_PASSES; pass += 1) {
+        const route = this.#slackReplyRoutes.get(key)
+        if (!route) return true
+        try {
+          await route
+        } catch (error) {
+          // A route that *rejects* is not drained: the watcher replays it after
+          // SLACK_REPLY_ROUTE_RETRY_MS, and that replay would land on the next
+          // dispatch. Fail closed and let the caller keep the fence up rather
+          // than leak a stale human reply onto fresh work.
+          this.#logger.warn?.(
+            '[factory] in-flight Slack reply route did not drain; keeping terminal Slack fence',
+            { issue: key, error },
+          )
+          this.#increment('slackReplyRouteDrainsFailed')
+          return false
+        }
+        // The owner clears its own entry when it settles; retiring it here too
+        // keeps the loop monotonic if that finally has not run yet.
+        if (this.#slackReplyRoutes.get(key) === route) this.#slackReplyRoutes.delete(key)
+      }
+      // Not provably quiescent. Fail closed for the same reason as a rejection.
+      this.#logger.warn?.(
+        '[factory] Slack reply routes did not quiesce; keeping terminal Slack fence',
+        { issue: key },
+      )
+      this.#increment('slackReplyRouteDrainsFailed')
+      return false
+    } finally {
+      if (!nested) this.#slackReplyRouteDrains.delete(key)
+    }
+  }
+
+  async #stopSlackWatcher(issue: IssueRef): Promise<boolean> {
     const key = issueKey(issue)
+    // Drain before clearing the fence. Clearing it first lets a reply that is
+    // already mid-route — or one queued behind it — fall through the fence check
+    // in #routeSlackConversationAnswerUnlocked and rebind the retired thread to
+    // the next dispatch of this work unit.
+    if (!await this.#drainSlackReplyRoutes(key)) return false
+    this.#terminalSlackWatchIssues.delete(key)
+    const expiryTimer = this.#slackTerminalWatchExpiryTimers.get(key)
+    if (expiryTimer) clearTimeout(expiryTimer)
+    this.#slackTerminalWatchExpiryTimers.delete(key)
+    const receiptRetryTimer = this.#slackTerminalReceiptRetryTimers.get(key)
+    if (receiptRetryTimer) clearTimeout(receiptRetryTimer)
+    this.#slackTerminalReceiptRetryTimers.delete(key)
     const watcher = this.#slackWatchers.get(key)
     this.#slackWatchers.delete(key)
     const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
@@ -14462,6 +14654,301 @@ export class FactoryLoop implements Factory {
       await this.#state.clearConversationSession(this.#workspaceId, conversationId)
     }
     await this.#state.clearSlackThread(this.#workspaceId, key)
+    await this.#state.clearSlackThreadWatch(this.#workspaceId, key)
+    return true
+  }
+
+  async #retireSlackWatcher(record: InFlightIssue): Promise<void> {
+    const key = issueKey(record.issue)
+    const threadId = await this.#state.getSlackThread(this.#workspaceId, key)
+    if (!threadId) {
+      await this.#stopSlackWatcher(record.issue)
+      return
+    }
+
+    const existingWatch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    const retiredAtMs = existingWatch?.kind === 'terminal-grace'
+      ? terminalSlackWatchRetiredAtMs(existingWatch)
+      : this.#clock.now()
+    const expiresAtMs = existingWatch?.kind === 'terminal-grace'
+      ? existingWatch.expiresAtMs
+      : retiredAtMs + SLACK_TERMINAL_THREAD_GRACE_MS
+    await this.#state.setSlackThreadWatch(this.#workspaceId, key, {
+      kind: 'terminal-grace',
+      issue: { ...record.issue },
+      decision: structuredClone(record.decision),
+      threadId,
+      retiredAtMs,
+      expiresAtMs,
+    })
+
+    // A terminal thread must never retain a resumable session for an agent that
+    // has already exited. Keep only the exact-thread listener so a late human
+    // reply receives the explicit no-active-agent writeback below.
+    this.#terminalSlackWatchIssues.add(key)
+    await this.#slackReplyRoutes.get(key)?.catch(() => undefined)
+    const conversationId = slackConversationId(threadId)
+    await this.#slackConversationTurns.cancel(conversationId)
+    try {
+      await this.#surfaceUndeliveredSlackConversation(threadId)
+      await this.#state.clearConversationSession(this.#workspaceId, conversationId)
+    } catch (error) {
+      // The receipt fails whenever another handler holds the claim or Slack
+      // writeback is down — neither is a reason to abort retirement. Callers
+      // reach here having already committed the terminal phase and dropped the
+      // pending abandon reason, so a rejection escaping would strand the
+      // registry rewrite, the GitHub watcher stop, and the queued next dispatch
+      // with nothing left to re-run them. Keep the queued replies and let the
+      // retry that owns this receipt settle it inside the grace window.
+      this.#logger.warn?.(
+        '[factory] failed to settle undelivered Slack replies while retiring the watcher; will retry',
+        { issue: record.issue.key, error },
+      )
+      this.#increment('slackTerminalWatchReceiptsDeferred')
+      this.#scheduleSlackTerminalReceiptRetry(record.issue, threadId, expiresAtMs)
+    }
+    if (!this.#slackWatchers.has(key) && !this.#stopping) {
+      await this.#rearmSlackWatcher(record, threadId)
+    }
+    this.#scheduleSlackTerminalWatchExpiry(record.issue, expiresAtMs)
+    this.#increment('slackTerminalWatchersRetained')
+  }
+
+  // The durable half of the same record. Every caller here follows the receipt
+  // with a state write (clearing the session), and those two cannot be one
+  // durable step: when the state write fails, the retry that owns it must not
+  // read "replies still queued" as "the human has not been told" and post the
+  // notice again. So the receipt is claimed before the provider write and marked
+  // posted after it, and a retry finds it already settled.
+  async #surfaceUndeliveredSlackConversation(threadId: string): Promise<void> {
+    const conversationId = slackConversationId(threadId)
+    const session = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    const pendingCount = session
+      ? session.pending.length + (session.delivery?.messages.length ?? 0)
+      : 0
+    if (pendingCount === 0) return
+    if (session?.terminalReceipt?.posted) {
+      this.#increment('slackTerminalReceiptsAlreadySettled')
+      return
+    }
+    if (!this.#slack) throw new Error(`Slack thread ${threadId} cannot surface undelivered replies without writeback`)
+    const claimId = randomUUID()
+    if (!await this.#state.claimConversationTerminalReceipt(
+      this.#workspaceId,
+      conversationId,
+      claimId,
+      this.#clock.now(),
+      SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS,
+    )) {
+      const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (current?.terminalReceipt?.posted) {
+        this.#increment('slackTerminalReceiptsAlreadySettled')
+        return
+      }
+      // Another handler is mid-write. Fail closed so the queued replies survive
+      // for whoever settles them rather than racing a second notice onto the
+      // same thread.
+      throw new Error(`Slack thread ${threadId} terminal receipt is claimed by another handler; retrying`)
+    }
+    const noun = pendingCount === 1 ? 'reply' : 'replies'
+    const slack = this.#slack
+    try {
+      await this.#withRenewedProviderLease(
+        'terminal Slack receipt',
+        SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS,
+        () => this.#state.renewConversationTerminalReceipt(
+          this.#workspaceId,
+          conversationId,
+          claimId,
+          this.#clock.now(),
+        ),
+        () => slack.reply(
+          threadId,
+          `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+        ),
+      )
+    } catch (error) {
+      await this.#state.releaseConversationTerminalReceipt(this.#workspaceId, conversationId, claimId)
+      throw error
+    }
+    if (!await this.#state.completeConversationTerminalReceipt(
+      this.#workspaceId,
+      conversationId,
+      claimId,
+    )) {
+      throw new Error(`Slack thread ${threadId} terminal receipt could not be recorded`)
+    }
+    this.#increment('slackConversationRepliesSurfacedTerminal')
+  }
+
+  // A claim only means something for as long as it outlives the work it covers.
+  // A provider write can legitimately run past a fixed lease, at which point the
+  // claim stops protecting the write it was taken for and a second handler can
+  // post the same thing to the same human. Renewing on a heartbeat scopes the
+  // lease to the work instead of to a guessed duration, and leaves the idle
+  // timeout short enough that a holder that dies mid-write still frees it.
+  //
+  // The heartbeat is bounded on both ends, because a renewal loop that never
+  // stops is a lock with no owner check: a provider write that hangs would hold
+  // the receipt past every retry and past shutdown, and the human whose reply is
+  // queued behind it would be told nothing until the process restarts. So it
+  // stops at the ceiling and it stops when this daemon is stopping, and either
+  // way it says so — from there the claim ages out on its own idle lease and
+  // becomes reclaimable. The write may still land afterwards and duplicate the
+  // notice; a reply nobody can ever reclaim is the worse of the two.
+  async #withRenewedProviderLease<T>(
+    label: string,
+    leaseMs: number,
+    renew: () => Promise<boolean>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const renewUntilMs = this.#clock.now() + SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS
+    let renewalStopped = false
+    let renewalInFlight = false
+    const stopRenewing = (counter: string, reason: string): void => {
+      renewalStopped = true
+      this.#increment(counter)
+      this.#logger.warn?.(
+        `[factory] ${label} lease will not be renewed further (${reason}); ` +
+        'its claim expires and the queued replies return to whoever retries them',
+      )
+    }
+    const heartbeat = setInterval(() => {
+      if (renewalInFlight || renewalStopped) return
+      if (this.#stopping) {
+        stopRenewing('slackProviderReceiptLeaseRenewalsStoppedForShutdown', 'shutting down')
+        return
+      }
+      if (this.#clock.now() >= renewUntilMs) {
+        stopRenewing(
+          'slackProviderReceiptLeaseRenewalsExpired',
+          `provider write exceeded ${SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS}ms`,
+        )
+        return
+      }
+      renewalInFlight = true
+      void renew()
+        .then((renewed) => {
+          if (renewed) return
+          // Losing the lease mid-write is not recoverable from in here: the
+          // write may already have landed. Stop renewing and let the caller's
+          // completion check fail closed, which keeps the queued replies for
+          // whoever holds the claim now.
+          renewalStopped = true
+          this.#increment('slackProviderReceiptLeasesLost')
+          this.#logger.warn?.(`[factory] ${label} lease was lost while its provider write was in flight`)
+        })
+        .catch((error) => this.#logger.warn?.(`[factory] ${label} lease renewal failed`, {
+          error: describeError(error).errorMessage,
+        }))
+        .finally(() => { renewalInFlight = false })
+    }, Math.max(1_000, Math.floor(leaseMs / 3)))
+    heartbeat.unref?.()
+    try {
+      return await run()
+    } finally {
+      clearInterval(heartbeat)
+    }
+  }
+
+  // A terminal receipt that could not be written leaves the queued replies
+  // pending with the human who wrote them told nothing. That is retryable
+  // maintenance this daemon owns, not work to leave for the next restart: the
+  // grace watch is the only window in which the receipt can still land on the
+  // retired thread, so keep reattempting inside it and give up when it closes.
+  #scheduleSlackTerminalReceiptRetry(
+    issue: IssueRef,
+    threadId: string,
+    expiresAtMs: number,
+    attempt = 0,
+  ): void {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const existing = this.#slackTerminalReceiptRetryTimers.get(key)
+    if (existing) clearTimeout(existing)
+    this.#slackTerminalReceiptRetryTimers.delete(key)
+    const remainingMs = expiresAtMs - this.#clock.now()
+    if (remainingMs <= 0) {
+      this.#increment('slackTerminalWatchReceiptsAbandoned')
+      return
+    }
+    const backoffMs = Math.min(
+      SLACK_TERMINAL_RECEIPT_RETRY_MAX_MS,
+      SLACK_TERMINAL_RECEIPT_RETRY_MS * 2 ** Math.min(attempt, 16),
+    )
+    const timer = setTimeout(() => {
+      this.#slackTerminalReceiptRetryTimers.delete(key)
+      void this.#retrySlackTerminalReceipt(issue, threadId, attempt)
+    }, Math.max(0, Math.min(backoffMs, remainingMs)))
+    timer.unref?.()
+    this.#slackTerminalReceiptRetryTimers.set(key, timer)
+  }
+
+  async #retrySlackTerminalReceipt(issue: IssueRef, threadId: string, attempt: number): Promise<void> {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const watch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    // The grace watch is gone (expired, or the work unit reopened): the thread
+    // this receipt would settle no longer exists, so there is nothing to say.
+    if (watch?.kind !== 'terminal-grace' || watch.threadId !== threadId) return
+    try {
+      await this.#surfaceUndeliveredSlackConversation(threadId)
+      await this.#state.clearConversationSession(this.#workspaceId, slackConversationId(threadId))
+      this.#increment('slackTerminalWatchReceiptsRecovered')
+    } catch (error) {
+      this.#logger.warn?.('[factory] terminal Slack receipt retry failed; rescheduling', {
+        issue: issue.key,
+        error,
+      })
+      this.#increment('slackTerminalWatchReceiptRetryFailures')
+      this.#scheduleSlackTerminalReceiptRetry(issue, threadId, watch.expiresAtMs, attempt + 1)
+    }
+  }
+
+  #scheduleSlackTerminalWatchExpiry(
+    issue: IssueRef,
+    expiresAtMs: number,
+    retryDelayMs?: number,
+  ): void {
+    if (this.#stopping) return
+    const key = issueKey(issue)
+    const existing = this.#slackTerminalWatchExpiryTimers.get(key)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.#slackTerminalWatchExpiryTimers.delete(key)
+      void this.#expireSlackTerminalWatcher(issue, expiresAtMs).catch((error) => {
+        this.#logger.warn?.('[factory] failed to expire terminal Slack reply watcher; retrying', {
+          issue: issue.key,
+          error,
+        })
+        this.#scheduleSlackTerminalWatchExpiry(issue, expiresAtMs, SLACK_REPLY_ROUTE_RETRY_MS)
+      })
+    }, retryDelayMs ?? Math.max(0, expiresAtMs - this.#clock.now()))
+    timer.unref?.()
+    this.#slackTerminalWatchExpiryTimers.set(key, timer)
+  }
+
+  async #expireSlackTerminalWatcher(issue: IssueRef, expiresAtMs: number): Promise<void> {
+    const key = issueKey(issue)
+    const watch = (await this.#state.listSlackThreadWatches(this.#workspaceId))
+      .find(([watchKey]) => watchKey === key)?.[1]
+    if (watch?.kind !== 'terminal-grace' || watch.expiresAtMs !== expiresAtMs) return
+    if (watch.expiresAtMs > this.#clock.now()) {
+      this.#scheduleSlackTerminalWatchExpiry(issue, watch.expiresAtMs)
+      return
+    }
+    // #stopSlackWatcher fails closed when an in-flight reply route will not
+    // drain, leaving the watch and its terminal fence in place. Counting that as
+    // an expiration retires the watch in the metrics while the real one lives
+    // on unwatched by any expiry timer, so reschedule and count only on success.
+    if (!await this.#stopSlackWatcher(issue)) {
+      this.#increment('slackTerminalWatchExpiriesDeferred')
+      this.#scheduleSlackTerminalWatchExpiry(issue, expiresAtMs, SLACK_REPLY_ROUTE_RETRY_MS)
+      return
+    }
+    this.#increment('slackTerminalWatchersExpired')
   }
 
   async #readSlackReply(path: string): Promise<SlackThreadReply | undefined> {
@@ -14529,34 +15016,196 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    return await this.#routeSlackConversationAnswer(record, reply, text, clarificationKey)
+  }
+
+  async #routeSlackConversationAnswer(
+    record: InFlightIssue,
+    reply: SlackThreadReply,
+    text: string,
+    clarificationKey: string,
+  ): Promise<DispatchResult | undefined> {
+    if (this.#slackReplyRouteDrains.has(clarificationKey)) {
+      // The terminal fence for this work unit is being drained right now.
+      // Registering an ordinary route here would put it past the drain's
+      // snapshot and run it once the fence is gone. Answer it the way the fence
+      // would have — but as a tracked effect, because this writeback is still a
+      // side effect of this work unit. Left untracked it is the same escape one
+      // level further in: the drain reports quiescence without it, the watcher
+      // stop clears the retry timer that owns this reply, and a slow or failed
+      // receipt leaves the human told nothing at all.
+      this.#increment('slackReplyRoutesFencedDuringDrain')
+      return await this.#trackSlackWorkUnitEffect(clarificationKey, async () => {
+        await this.#writeUnroutableSlackReply(reply.threadTs)
+        return undefined
+      })
+    }
+    return await this.#trackSlackWorkUnitEffect(clarificationKey, () =>
+      this.#routeSlackConversationAnswerUnlocked(record, reply, text, clarificationKey))
+  }
+
+  // Every Slack side effect a work unit makes on its own behalf runs through
+  // here, so #slackReplyRoutes stays the single record the terminal drain
+  // consults. Effects are chained per work unit: awaiting the newest one drains
+  // everything queued behind it, and a rejection propagates to the drain, which
+  // fails closed rather than tearing the effect's retry path down.
+  async #trackSlackWorkUnitEffect(
+    key: string,
+    run: () => Promise<DispatchResult | undefined>,
+  ): Promise<DispatchResult | undefined> {
+    const preceding = this.#slackReplyRoutes.get(key)
+    const effect = (async () => {
+      await preceding?.catch(() => undefined)
+      return await run()
+    })()
+    this.#slackReplyRoutes.set(key, effect)
+    try {
+      return await effect
+    } finally {
+      if (this.#slackReplyRoutes.get(key) === effect) this.#slackReplyRoutes.delete(key)
+    }
+  }
+
+  async #routeSlackConversationAnswerUnlocked(
+    record: InFlightIssue,
+    reply: SlackThreadReply,
+    text: string,
+    clarificationKey: string,
+  ): Promise<DispatchResult | undefined> {
+    if (this.#terminalSlackWatchIssues.has(clarificationKey)) {
+      await this.#writeUnroutableSlackReply(reply.threadTs)
+      return
+    }
+
     const conversationId = slackConversationId(reply.threadTs)
-    const conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    let conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+    let liveRecord: InFlightIssue | undefined
+    if (!conversation) {
+      liveRecord = (await this.#batch()).getIssue(record.issue)
+      if (liveRecord && !liveRecord.dryRun) {
+        await this.#ensureSlackConversationSession(liveRecord, reply.threadTs)
+        conversation = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      }
+    }
     if (conversation && issueKey(conversation.issue) === clarificationKey) {
+      const replyId = `${reply.threadTs}:${reply.messageTs}`
       const queued = await this.#state.appendConversationMessage(this.#workspaceId, conversationId, {
-        id: `${reply.threadTs}:${reply.messageTs}`,
+        id: replyId,
         text,
         receivedAtMs: slackMessageReceivedAtMs(reply.messageTs, this.#clock.now()),
         providerSequence: reply.messageTs,
         author: reply.author,
       })
-      if (!queued) {
-        this.#increment('slackConversationDuplicateRepliesSuppressed')
-        return
+      const durable = queued ?? await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (!durable || !durable.processedMessageIds.includes(replyId)) {
+        throw new Error(`Slack reply ${replyId} was not durably queued`)
       }
-      this.#increment('slackConversationRepliesQueued')
-      this.#slackConversationTurns.schedule(conversationId)
+      if (!(durable.acknowledgedMessageIds ?? []).includes(replyId)) {
+        const acknowledgementClaimId = randomUUID()
+        const acknowledgementClaimed = await this.#state.claimConversationMessageAcknowledgement(
+          this.#workspaceId,
+          conversationId,
+          replyId,
+          acknowledgementClaimId,
+          this.#clock.now(),
+          SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS,
+        )
+        if (acknowledgementClaimed) {
+          try {
+            if (!this.#slack) throw new Error(`Slack reply ${replyId} cannot be acknowledged without writeback`)
+            const owner = durable.agent?.role === 'babysitter'
+              ? 'the PR babysitter'
+              : durable.agent
+                ? 'the issue implementer'
+                : 'an issue agent'
+            const receipt = durable.agent
+              ? `Factory received this reply and durably queued it for ${owner}.`
+              : 'Factory received and durably stored this reply; it will route when an issue agent is resumable.'
+            const slack = this.#slack
+            // Same lease scope as the terminal receipt: this claim covers a
+            // provider write that can outrun any fixed duration, so it is
+            // renewed for as long as that write is actually running.
+            await this.#withRenewedProviderLease(
+              'Slack reply acknowledgement',
+              SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS,
+              () => this.#state.renewConversationMessageAcknowledgement(
+                this.#workspaceId,
+                conversationId,
+                replyId,
+                acknowledgementClaimId,
+                this.#clock.now(),
+              ),
+              () => slack.reply(reply.threadTs, receipt),
+            )
+            if (!await this.#state.completeConversationMessageAcknowledgement(
+              this.#workspaceId,
+              conversationId,
+              replyId,
+              acknowledgementClaimId,
+            )) {
+              throw new Error(`Slack reply ${replyId} receipt could not be recorded`)
+            }
+            this.#increment('slackConversationRepliesAcknowledged')
+          } catch (error) {
+            await this.#state.releaseConversationMessageAcknowledgement(
+              this.#workspaceId,
+              conversationId,
+              replyId,
+              acknowledgementClaimId,
+            )
+            throw error
+          }
+        } else {
+          const acknowledgementState = await this.#state.getConversationSession(
+            this.#workspaceId,
+            conversationId,
+          )
+          if (!(acknowledgementState?.acknowledgedMessageIds ?? []).includes(replyId)) {
+            throw new Error(`Slack reply ${replyId} receipt is claimed by another handler; retrying`)
+          }
+        }
+      }
+      if (queued) {
+        this.#increment('slackConversationRepliesQueued')
+      } else {
+        this.#increment('slackConversationDuplicateRepliesSuppressed')
+      }
+      const pending = durable.pending.some((message) => message.id === replyId) ||
+        Boolean(durable.delivery?.messages.some((message) => message.id === replyId))
+      if (pending && durable.agent) {
+        this.#slackConversationTurns.schedule(conversationId)
+      } else if (pending) {
+        this.#increment('slackConversationRepliesWaitingForOwner')
+      }
       return
     }
 
-    const liveRecord = (await this.#batch()).getIssue(record.issue)
+    liveRecord ??= (await this.#batch()).getIssue(record.issue)
     if (!liveRecord || liveRecord.dryRun) {
       if (isTriageEscalationWatchRecord(record)) {
         return await this.#handleTriageEscalationSlackAnswer(record, text)
       }
-      this.#increment('slackAnswersIgnoredNoInFlight')
+      await this.#writeUnroutableSlackReply(reply.threadTs)
       return
     }
     this.#increment('slackAnswersIgnoredNoConversationSession')
+    if (this.#slack) {
+      await this.#slack.reply(
+        reply.threadTs,
+        'Factory received this reply but could not create a durable agent route. It will remain replayable; please also continue on the linked issue or pull request.',
+      )
+      this.#increment('slackAnswersUnroutableVisible')
+    }
+  }
+
+  async #writeUnroutableSlackReply(threadId: string): Promise<void> {
+    this.#increment('slackAnswersIgnoredNoInFlight')
+    if (!this.#slack) return
+    await this.#slack.reply(
+      threadId,
+      'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+    )
+    this.#increment('slackAnswersUnroutableVisible')
   }
 
   async #wakeWaitingClarification(key: string, waiting: WaitingClarification): Promise<void> {
@@ -14951,6 +15600,7 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     if (batch.isInFlight(record.issue) || batch.isQueued(record.issue)) {
       this.#increment('slackTriageAnswersIgnoredAlreadyActive')
+      await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
       return
     }
     if (await this.#dispatchBlockReason(record.issue)) {
@@ -14968,6 +15618,10 @@ export class FactoryLoop implements Factory {
       if (hasDispatchableRoute(decision)) {
         this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
         const result = await this.#startOrQueueSlackClarifiedDecision(dispatchAfterSlackClarification(decision, escalationReason))
+        const active = await this.#batch()
+        if (result || active.isInFlight(decision.issue) || active.isQueued(decision.issue)) {
+          await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
+        }
         this.#increment('slackTriageAnswersDispatchedWithRemainingEscalation')
         return result
       }
@@ -14981,6 +15635,10 @@ export class FactoryLoop implements Factory {
 
     this.#pendingSlackClarifications.set(issueKey(decision.issue), text)
     const result = await this.#startOrQueueSlackClarifiedDecision(decision)
+    const active = await this.#batch()
+    if (result || active.isInFlight(decision.issue) || active.isQueued(decision.issue)) {
+      await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
+    }
     this.#increment('slackTriageAnswersDispatched')
     return result
   }
@@ -18001,6 +18659,11 @@ const slackMessageReceivedAtMs = (messageTs: string, fallback: number): number =
   const seconds = Number(messageTs)
   return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds * 1_000) : fallback
 }
+
+const terminalSlackWatchRetiredAtMs = (watch: { retiredAtMs?: number; expiresAtMs: number }): number =>
+  typeof watch.retiredAtMs === 'number' && Number.isFinite(watch.retiredAtMs)
+    ? watch.retiredAtMs
+    : Math.max(0, watch.expiresAtMs - SLACK_TERMINAL_THREAD_GRACE_MS)
 
 const eventIdentity = (event: ChangeEvent): string | undefined => {
   const record = event as unknown as Record<string, unknown>

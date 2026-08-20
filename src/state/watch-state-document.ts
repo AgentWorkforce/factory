@@ -7,6 +7,7 @@ import type {
   DiscoverySweepState,
   DispatchLifecycle,
   GithubIssueCommentWatchState,
+  SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
 import type { AgentSpec, SpawnResult } from '../ports/fleet'
@@ -23,6 +24,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
     for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
       if (!isRecord(rawWorkspace)) throw invalidDocument()
       const watches = rawWorkspace.githubIssueCommentWatches
+      const slackWatches = rawWorkspace.slackThreadWatches
       const clarifications = rawWorkspace.waitingClarifications
       const babysitters = rawWorkspace.babysitterSessions
       const generations = rawWorkspace.babysitterGenerations
@@ -31,6 +33,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       const discoverySweep = rawWorkspace.discoverySweep
       if (
         !isRecord(watches) ||
+        (slackWatches !== undefined && !isRecord(slackWatches)) ||
         !isRecord(clarifications) ||
         (babysitters !== undefined && !isRecord(babysitters)) ||
         (generations !== undefined && !isRecord(generations)) ||
@@ -40,6 +43,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       ) throw invalidDocument()
       workspaces[workspaceId] = {
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
+        slackThreadWatches: parseSlackThreadWatches(slackWatches ?? {}),
         waitingClarifications: parseWaitingClarifications(clarifications),
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
         babysitterGenerations: parseBabysitterGenerations(generations ?? {}),
@@ -62,6 +66,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       }
       workspaces[workspaceId] = {
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
+        slackThreadWatches: {},
         waitingClarifications: parseWaitingClarifications(clarifications),
         babysitterSessions: parseBabysitterSessions(babysitters ?? {}),
         babysitterGenerations: {},
@@ -78,6 +83,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       if (!isRecord(watches)) throw invalidDocument()
       workspaces[workspaceId] = {
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
+        slackThreadWatches: {},
         waitingClarifications: {},
         babysitterSessions: {},
         babysitterGenerations: {},
@@ -123,7 +129,7 @@ const parseConversationSessions = (
 ): Record<string, ConversationSessionState> => {
   const sessions: Record<string, ConversationSessionState> = {}
   for (const [conversationId, candidate] of Object.entries(value)) {
-    if (!isRecord(candidate) || !isRecord(candidate.issue) || !isRecord(candidate.agent) || !isRecord(candidate.context)) {
+    if (!isRecord(candidate) || !isRecord(candidate.issue) || !isRecord(candidate.context)) {
       throw invalidDocument()
     }
     const issue = candidate.issue
@@ -133,9 +139,12 @@ const parseConversationSessions = (
       typeof issue.uuid !== 'string' || typeof issue.key !== 'string' || typeof issue.path !== 'string' ||
       typeof candidate.provider !== 'string' || typeof candidate.externalId !== 'string' ||
       !Object.values(candidate.context).every((entry) => typeof entry === 'string') ||
-      typeof agent.name !== 'string' || typeof agent.sessionRef !== 'string' ||
+      (agent !== undefined && (!isRecord(agent) || typeof agent.name !== 'string' || typeof agent.sessionRef !== 'string')) ||
       !validConversationMessages(candidate.history) || !validConversationMessages(candidate.pending) ||
       (candidate.processedMessageIds !== undefined && !validConversationMessageIds(candidate.processedMessageIds)) ||
+      (candidate.acknowledgedMessageIds !== undefined && !validConversationMessageIds(candidate.acknowledgedMessageIds)) ||
+      (candidate.acknowledgementClaims !== undefined && !validConversationAcknowledgementClaims(candidate.acknowledgementClaims)) ||
+      (candidate.terminalReceipt !== undefined && !validConversationTerminalReceipt(candidate.terminalReceipt)) ||
       (delivery !== undefined && !validConversationDelivery(delivery) && !validLegacyConversationDelivery(delivery))
     ) throw invalidDocument()
     const session = structuredClone(candidate) as unknown as ConversationSessionState
@@ -150,6 +159,15 @@ const parseConversationSessions = (
           ...(session.delivery?.messages ?? []),
         ].map((message) => message.id))]
       : [...candidate.processedMessageIds as string[]]
+    session.acknowledgedMessageIds = candidate.acknowledgedMessageIds === undefined
+      ? session.history.map((message) => message.id)
+      : [...candidate.acknowledgedMessageIds as string[]]
+    if (candidate.acknowledgementClaims !== undefined) {
+      session.acknowledgementClaims = structuredClone(candidate.acknowledgementClaims) as ConversationSessionState['acknowledgementClaims']
+    }
+    if (candidate.terminalReceipt !== undefined) {
+      session.terminalReceipt = structuredClone(candidate.terminalReceipt) as ConversationSessionState['terminalReceipt']
+    }
     sessions[conversationId] = session
   }
   return sessions
@@ -179,6 +197,14 @@ const validLegacyConversationDelivery = (value: unknown): value is {
 
 const validConversationMessageIds = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((id) => typeof id === 'string')
+
+const validConversationAcknowledgementClaims = (value: unknown): boolean =>
+  isRecord(value) && Object.values(value).every((claim) => isRecord(claim) &&
+    typeof claim.claimId === 'string' && typeof claim.claimedAtMs === 'number')
+
+const validConversationTerminalReceipt = (value: unknown): boolean =>
+  isRecord(value) && typeof value.claimId === 'string' && typeof value.claimedAtMs === 'number' &&
+  (value.posted === undefined || typeof value.posted === 'boolean')
 
 const parseBabysitterSessions = (value: Record<string, unknown>): Record<string, BabysitterSessionState> => {
   const sessions: Record<string, BabysitterSessionState> = {}
@@ -284,6 +310,24 @@ const parseGithubIssueCommentWatches = (
       !validOptionalStringArray(candidate.processedCommentIds)
     ) throw invalidDocument()
     watches[key] = structuredClone(candidate) as unknown as GithubIssueCommentWatchState
+  }
+  return watches
+}
+
+const parseSlackThreadWatches = (
+  value: Record<string, unknown>,
+): Record<string, SlackThreadWatchState> => {
+  const watches: Record<string, SlackThreadWatchState> = {}
+  for (const [key, candidate] of Object.entries(value)) {
+    if (
+      !isRecord(candidate) || !validIssueRef(candidate.issue) || !validTriageDecision(candidate.decision) ||
+      typeof candidate.threadId !== 'string' ||
+      (candidate.kind !== 'triage' && candidate.kind !== 'terminal-grace') ||
+      (candidate.kind === 'terminal-grace' && (
+        !validNumber(candidate.expiresAtMs) || !validOptionalNumber(candidate.retiredAtMs)
+      ))
+    ) throw invalidDocument()
+    watches[key] = structuredClone(candidate) as unknown as SlackThreadWatchState
   }
   return watches
 }
@@ -429,9 +473,19 @@ const validPendingPullRequestWake = (value: unknown): boolean => isRecord(value)
   typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&
   Array.isArray(value.kinds) && value.kinds.every((kind) => typeof kind === 'string')
 
+// A scope this validator does not know rejects the entire document, so one
+// swarm-scoped issue would cost every watch in the workspace on restart. Keyed
+// on the union itself, a new scope is a compile error here instead.
+const triageScopes: Record<TriageDecision['scope'], true> = {
+  single: true,
+  workflow: true,
+  team: true,
+  swarm: true,
+}
+
 const validTriageDecision = (value: unknown): value is TriageDecision => isRecord(value) &&
   validIssueRef(value.issue) && Array.isArray(value.routes) && value.routes.every(validRoute) &&
-  (value.scope === 'single' || value.scope === 'workflow' || value.scope === 'team') &&
+  (typeof value.scope === 'string' && Object.hasOwn(triageScopes, value.scope)) &&
   Array.isArray(value.implementers) && value.implementers.every(validAgentSpec) &&
   (value.workflow === undefined || validAgentSpec(value.workflow)) && validAgentSpec(value.reviewer) &&
   typeof value.thin === 'boolean' && (value.confidence === 'high' || value.confidence === 'low') &&

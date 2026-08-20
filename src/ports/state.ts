@@ -115,7 +115,7 @@ export type ConversationSessionState = {
   externalId: string
   /** Provider-specific routing metadata; continuity itself stays provider-neutral. */
   context: Record<string, string>
-  agent: {
+  agent?: {
     name: string
     sessionRef: string
     /**
@@ -134,6 +134,20 @@ export type ConversationSessionState = {
   history: ConversationMessage[]
   /** Durable dedupe ledger; unlike rendered history, this is never context-trimmed. */
   processedMessageIds: string[]
+  /** Human replies whose visible provider receipt has been acknowledged. */
+  acknowledgedMessageIds?: string[]
+  /** Short durable claims preventing duplicate concurrent provider receipts. */
+  acknowledgementClaims?: Record<string, { claimId: string; claimedAtMs: number }>
+  /**
+   * Write-ahead outbox record for the one-per-thread terminal receipt telling a
+   * human their queued replies were never delivered. The provider write and the
+   * session clear that follows it cannot be one durable step, so the claim is
+   * taken before the write and marked posted after it: a retry of the clear then
+   * finds the receipt already settled instead of telling the human a second
+   * time. The lease keeps a crash between claim and write from suppressing the
+   * receipt forever.
+   */
+  terminalReceipt?: { claimId: string; claimedAtMs: number; posted?: boolean }
   /** New replies waiting for the short coalescing window. */
   pending: ConversationMessage[]
   /** Claimed batch; new arrivals remain in pending while this resume runs. */
@@ -144,8 +158,24 @@ export type ConversationSessionState = {
     attempts: number
     messages: ConversationMessage[]
     /** Binding captured at claim time so a later handoff cannot be overwritten. */
-    agent: Pick<ConversationSessionState['agent'], 'name' | 'sessionRef'>
+    agent: Pick<NonNullable<ConversationSessionState['agent']>, 'name' | 'sessionRef'>
   }
+}
+
+/** Durable metadata required to reconstruct a pre-dispatch Slack watcher. */
+export type SlackThreadWatchState = {
+  kind: 'triage'
+  issue: IssueRef
+  decision: TriageDecision
+  threadId: string
+} | {
+  kind: 'terminal-grace'
+  issue: IssueRef
+  decision: TriageDecision
+  threadId: string
+  /** Provider-message cutoff preventing historical replies from replaying as terminal. */
+  retiredAtMs?: number
+  expiresAtMs: number
 }
 
 export type DispatchAttemptState = {
@@ -441,11 +471,32 @@ export interface StateStore {
   getSlackThread(workspaceId: string, issueKey: string): Promise<string | undefined>
   clearSlackThread(workspaceId: string, issueKey: string): Promise<void>
   clearSlackThreads(workspaceId: string): Promise<void>
+  setSlackThreadWatch(workspaceId: string, issueKey: string, watch: SlackThreadWatchState): Promise<void>
+  listSlackThreadWatches(workspaceId: string): Promise<Array<[string, SlackThreadWatchState]>>
+  clearSlackThreadWatch(workspaceId: string, issueKey: string): Promise<void>
 
   reserveConversationSession(workspaceId: string, conversationId: string, session: ConversationSessionState): Promise<boolean>
   getConversationSession(workspaceId: string, conversationId: string): Promise<ConversationSessionState | undefined>
   listConversationSessions(workspaceId: string): Promise<Array<[string, ConversationSessionState]>>
   appendConversationMessage(workspaceId: string, conversationId: string, message: ConversationMessage): Promise<ConversationSessionState | undefined>
+  claimConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
+  completeConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<boolean>
+  /**
+   * Extend an acknowledgement claim while its provider write is still running.
+   * Returns false once the claim is gone, so the caller learns it was overtaken
+   * instead of writing on a lease it no longer holds.
+   */
+  renewConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string, nowMs: number): Promise<boolean>
+  releaseConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<void>
+  /**
+   * Reserve the right to write this conversation's terminal receipt. Returns
+   * false once the receipt is posted, and while another handler holds an
+   * unexpired claim.
+   */
+  claimConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
+  renewConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string, nowMs: number): Promise<boolean>
+  completeConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<boolean>
+  releaseConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<void>
   claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
   renewConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number): Promise<boolean>
   completeConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, agent: { name: string; sessionRef?: string }): Promise<boolean>
@@ -456,7 +507,7 @@ export interface StateStore {
    * once a babysitter takes over an issue whose Slack thread was reserved by the
    * implementer) without disturbing accumulated history/pending turns.
    */
-  rebindConversationSession(workspaceId: string, conversationId: string, agent: ConversationSessionState['agent']): Promise<boolean>
+  rebindConversationSession(workspaceId: string, conversationId: string, agent: NonNullable<ConversationSessionState['agent']>): Promise<boolean>
 
   setGithubIssueCommentWatch(workspaceId: string, key: string, watch: GithubIssueCommentWatchState): Promise<void>
   listGithubIssueCommentWatches(workspaceId: string): Promise<Array<[string, GithubIssueCommentWatchState]>>
