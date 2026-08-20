@@ -20305,6 +20305,164 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it('stops renewing the terminal Slack receipt lease once its provider write outruns the ceiling', async () => {
+    const mount = new ParkedTerminalReceiptMountClient()
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const clock = new ManualClock()
+    clock.advance(10_000)
+    const terminalIssue = { uuid: 'uuid-418', key: 'AR-418', path: issuePath(418) }
+    const decision = await new StaticTriage().triage(parseLinearIssue(issuePath(418), issueFile(418)))
+    const conversationId = `slack:${mount.threadTs}`
+    await stateStore.setSlackThreadWatch('factory-test', issueKey(terminalIssue), {
+      kind: 'terminal-grace',
+      issue: terminalIssue,
+      decision,
+      threadId: mount.threadTs,
+      retiredAtMs: clock.now(),
+      expiresAtMs: clock.now() + 24 * 60 * 60_000,
+    })
+    await stateStore.reserveConversationSession('factory-test', conversationId, {
+      provider: 'slack',
+      issue: terminalIssue,
+      externalId: mount.threadTs,
+      context: { channel: 'C0FACTORY' },
+      history: [],
+      processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      pending: [],
+    })
+    await stateStore.appendConversationMessage('factory-test', conversationId, {
+      id: `${mount.threadTs}:1780751613.000300`,
+      text: 'This reply must not be stranded behind a wedged write.',
+      receivedAtMs: clock.now(),
+      providerSequence: '1780751613.000300',
+      author: 'U418',
+    })
+
+    vi.useFakeTimers()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+    })
+    const starting = factory.start({ mode: 'dispatch-owner' })
+    try {
+      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
+        await vi.advanceTimersByTimeAsync(1)
+      }
+      expect(mount.receiptWriteEntered).toBe(true)
+
+      // Inside the renewal ceiling the claim still belongs to the write: a
+      // writeback that runs past the 60s idle lease is inside spec, and this is
+      // the steal the renewal exists to prevent.
+      for (let step = 0; step < 12; step += 1) {
+        clock.advance(10_000)
+        await vi.advanceTimersByTimeAsync(10_000)
+      }
+      expect(await stateStore.claimConversationTerminalReceipt(
+        'factory-test', conversationId, 'competing-handler', clock.now(), 60_000,
+      )).toBe(false)
+
+      // Past the ceiling the write is no longer "slow", it is wedged, and a
+      // heartbeat that keeps renewing through it is a lock with no owner: the
+      // human's queued reply would stay unclaimable until the process restarts.
+      // Renewal has to stop so the claim idles out and the retry can reclaim it.
+      for (let step = 0; step < 60; step += 1) {
+        clock.advance(10_000)
+        await vi.advanceTimersByTimeAsync(10_000)
+      }
+      expect(await stateStore.claimConversationTerminalReceipt(
+        'factory-test', conversationId, 'competing-handler', clock.now(), 60_000,
+      )).toBe(true)
+      // And the expiry is reported, not silent.
+      expect(factory.status().counters.slackProviderReceiptLeaseRenewalsExpired).toBe(1)
+      // The queued reply survives for whoever holds the claim now.
+      expect((await stateStore.getConversationSession('factory-test', conversationId))?.pending)
+        .toHaveLength(1)
+    } finally {
+      mount.releaseReceiptWrite()
+      await starting.catch(() => undefined)
+      await factory.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops renewing the terminal Slack receipt lease when the daemon is shutting down', async () => {
+    const mount = new ParkedTerminalReceiptMountClient()
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const clock = new ManualClock()
+    clock.advance(10_000)
+    const terminalIssue = { uuid: 'uuid-418', key: 'AR-418', path: issuePath(418) }
+    const decision = await new StaticTriage().triage(parseLinearIssue(issuePath(418), issueFile(418)))
+    const conversationId = `slack:${mount.threadTs}`
+    await stateStore.setSlackThreadWatch('factory-test', issueKey(terminalIssue), {
+      kind: 'terminal-grace',
+      issue: terminalIssue,
+      decision,
+      threadId: mount.threadTs,
+      retiredAtMs: clock.now(),
+      expiresAtMs: clock.now() + 24 * 60 * 60_000,
+    })
+    await stateStore.reserveConversationSession('factory-test', conversationId, {
+      provider: 'slack',
+      issue: terminalIssue,
+      externalId: mount.threadTs,
+      context: { channel: 'C0FACTORY' },
+      history: [],
+      processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      pending: [],
+    })
+    await stateStore.appendConversationMessage('factory-test', conversationId, {
+      id: `${mount.threadTs}:1780751613.000400`,
+      text: 'A restart must not be what frees this reply.',
+      receivedAtMs: clock.now(),
+      providerSequence: '1780751613.000400',
+      author: 'U418',
+    })
+
+    vi.useFakeTimers()
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+    })
+    const starting = factory.start({ mode: 'dispatch-owner' })
+    let stopping: Promise<void> | undefined
+    try {
+      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
+        await vi.advanceTimersByTimeAsync(1)
+      }
+      expect(mount.receiptWriteEntered).toBe(true)
+
+      // A stopping daemon has no standing to keep holding a claim on work it is
+      // walking away from; the successor must find the receipt free.
+      stopping = factory.stop()
+      for (let step = 0; step < 12; step += 1) {
+        clock.advance(10_000)
+        await vi.advanceTimersByTimeAsync(10_000)
+      }
+      // Well inside the renewal ceiling, so this is shutdown releasing the
+      // claim and not the ceiling expiring it.
+      expect(await stateStore.claimConversationTerminalReceipt(
+        'factory-test', conversationId, 'competing-handler', clock.now(), 60_000,
+      )).toBe(true)
+      expect(factory.status().counters.slackProviderReceiptLeaseRenewalsStoppedForShutdown).toBe(1)
+      expect(factory.status().counters.slackProviderReceiptLeaseRenewalsExpired).toBeUndefined()
+    } finally {
+      mount.releaseReceiptWrite()
+      await starting.catch(() => undefined)
+      await (stopping ?? factory.stop()).catch(() => undefined)
+      vi.useRealTimers()
+    }
+  })
+
   it('holds the Slack reply acknowledgement lease for as long as the provider write runs', async () => {
     const issue = issueFile(419)
     const mount = new ParkedReplyReceiptMountClient({ [issuePath(419)]: issue })

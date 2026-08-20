@@ -403,6 +403,14 @@ const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
 // as long as the write they cover is still running.
 const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
 const SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS = 60_000
+// Renewal without a ceiling is the same defect from the other side: a heartbeat
+// that extends the claim for as long as the write runs also extends it forever
+// when the write never returns, and nothing else can reclaim the receipt short
+// of a restart. So renewal is bounded past the slowest write this daemon budgets
+// for — MountSlackWriteback's 90s confirm on top of its writeFile — and beyond
+// that the write is not slow, it is wedged: the heartbeat stops, the idle lease
+// runs out, and the retry that owns the queued replies can take them back.
+const SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS = 5 * 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
 // One pass drains the whole chain (#slackReplyRoutes holds only the newest
@@ -14698,16 +14706,45 @@ export class FactoryLoop implements Factory {
   // post the same thing to the same human. Renewing on a heartbeat scopes the
   // lease to the work instead of to a guessed duration, and leaves the idle
   // timeout short enough that a holder that dies mid-write still frees it.
+  //
+  // The heartbeat is bounded on both ends, because a renewal loop that never
+  // stops is a lock with no owner check: a provider write that hangs would hold
+  // the receipt past every retry and past shutdown, and the human whose reply is
+  // queued behind it would be told nothing until the process restarts. So it
+  // stops at the ceiling and it stops when this daemon is stopping, and either
+  // way it says so — from there the claim ages out on its own idle lease and
+  // becomes reclaimable. The write may still land afterwards and duplicate the
+  // notice; a reply nobody can ever reclaim is the worse of the two.
   async #withRenewedProviderLease<T>(
     label: string,
     leaseMs: number,
     renew: () => Promise<boolean>,
     run: () => Promise<T>,
   ): Promise<T> {
-    let leaseLost = false
+    const renewUntilMs = this.#clock.now() + SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS
+    let renewalStopped = false
     let renewalInFlight = false
+    const stopRenewing = (counter: string, reason: string): void => {
+      renewalStopped = true
+      this.#increment(counter)
+      this.#logger.warn?.(
+        `[factory] ${label} lease will not be renewed further (${reason}); ` +
+        'its claim expires and the queued replies return to whoever retries them',
+      )
+    }
     const heartbeat = setInterval(() => {
-      if (renewalInFlight || leaseLost) return
+      if (renewalInFlight || renewalStopped) return
+      if (this.#stopping) {
+        stopRenewing('slackProviderReceiptLeaseRenewalsStoppedForShutdown', 'shutting down')
+        return
+      }
+      if (this.#clock.now() >= renewUntilMs) {
+        stopRenewing(
+          'slackProviderReceiptLeaseRenewalsExpired',
+          `provider write exceeded ${SLACK_PROVIDER_LEASE_MAX_RENEWAL_MS}ms`,
+        )
+        return
+      }
       renewalInFlight = true
       void renew()
         .then((renewed) => {
@@ -14716,7 +14753,7 @@ export class FactoryLoop implements Factory {
           // write may already have landed. Stop renewing and let the caller's
           // completion check fail closed, which keeps the queued replies for
           // whoever holds the claim now.
-          leaseLost = true
+          renewalStopped = true
           this.#increment('slackProviderReceiptLeasesLost')
           this.#logger.warn?.(`[factory] ${label} lease was lost while its provider write was in flight`)
         })
