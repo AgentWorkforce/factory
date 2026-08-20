@@ -324,23 +324,33 @@ describe('FactoryCloudReporter', () => {
 
   it('records shutdown, not the lapsed deadline, as the reason a token request was cancelled', async () => {
     const signals: AbortSignal[] = []
+    let resolveTokenRequested!: () => void
+    const tokenRequested = new Promise<void>((resolve) => {
+      resolveTokenRequested = resolve
+    })
     const reporter = await createReporter({
       getAccessToken: async (options) => {
         if (options?.signal) signals.push(options.signal)
+        resolveTokenRequested()
         // The hosted credential endpoint never answers.
-        await new Promise<never>(() => {})
-        return 'cloud-token'
+        return await new Promise<string>(() => {})
       },
       fetch: vi.fn(),
     })
 
     await reporter.report(progress('event-shutdown-reason'))
+    // The credential request has to be in flight under an *unbounded* flush.
+    // Give it a deadline of its own and the two cancellations race: whichever
+    // fires first freezes the reason, so the assertion below would be flaky.
+    void reporter.flush()
+    await tokenRequested
+
     await reporter.close({ deadlineMs: 20 })
 
     // `aborted` alone cannot guard the shutdown binding: this controller is
     // also aborted when the flush deadline lapses, so a request unbound from
     // shutdown still ends up aborted. Only the reason tells the two apart.
-    await vi.waitFor(() => { expect(signals[0]?.aborted).toBe(true) })
+    expect(signals[0]?.aborted).toBe(true)
     expect((signals[0]?.reason as Error | undefined)?.name).toBe('FactoryCloudShutdownError')
   })
 
