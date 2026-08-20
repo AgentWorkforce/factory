@@ -102,7 +102,21 @@ export class FleetControlPlaneCircuit {
     const probe = withTimeout(roster, this.#timeoutMs)
       .catch((error: unknown) => {
         this.recordFailure(error)
-        throw error
+        // The failure that trips the threshold IS the open transition, but the
+        // transport error it arrives as says nothing about that. Callers that
+        // saw only the original error could not tell "one roster request
+        // failed" from "dispatch is now globally paused" — factory#292 —
+        // without re-reading status() after every rejection. Name the
+        // transition here, the same way the two branches above already do, and
+        // keep the original as `cause` for diagnostics.
+        const settled = this.status()
+        if (settled.state === 'closed') throw error
+        const opened = new FleetControlPlaneCircuitOpenError(
+          settled.retryAtMs ?? this.#now(),
+          settled.state,
+        )
+        ;(opened as Error & { cause?: unknown }).cause = error
+        throw opened
       })
       .then((result) => {
         const settledStatus = this.status()

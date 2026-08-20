@@ -41,8 +41,14 @@ describe('FleetControlPlaneCircuit', () => {
     await firstFailure
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
 
+    // The threshold-crossing failure rejects as the open transition, not as
+    // the bare timeout that caused it (factory#292); the timeout stays on
+    // `cause` so the diagnostic is not lost.
     const second = circuit.probe(never)
-    const secondFailure = expect(second).rejects.toMatchObject({ name: 'TimeoutError' })
+    const secondFailure = expect(second).rejects.toMatchObject({
+      name: 'FleetControlPlaneCircuitOpenError',
+      cause: expect.objectContaining({ name: 'TimeoutError' }),
+    })
     await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
     await secondFailure
     expect(circuit.status()).toMatchObject({ state: 'open', consecutiveFailures: 2, retryAtMs: 61_000 })
@@ -85,6 +91,35 @@ describe('FleetControlPlaneCircuit', () => {
 
     await expect(circuit.probe(async () => roster)).resolves.toEqual(roster)
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+  })
+
+  // factory#292: the failure that trips the threshold IS the open transition,
+  // but it arrives as an ordinary transport error. A caller that classifies by
+  // error type — a dispatcher deciding whether one work unit's failure should
+  // abort the whole pass — cannot tell the two apart unless probe() names it.
+  it('MUST FIRE: the failure that trips the threshold rejects as circuit-open, keeping the cause', async () => {
+    const transport = Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' })
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000 })
+
+    const rejection = await circuit.probe(async () => { throw transport }).catch((error: unknown) => error)
+
+    expect(rejection).toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    expect((rejection as { code?: unknown }).code).toBe('FACTORY_FLEET_CONTROL_CIRCUIT_OPEN')
+    expect((rejection as { cause?: unknown }).cause).toBe(transport)
+    expect(circuit.status()).toMatchObject({ state: 'open', consecutiveFailures: 1 })
+  })
+
+  // MUST NOT FIRE control for the above: a failure that leaves the circuit
+  // closed is one unit's problem and must keep its own identity, or a caller
+  // would treat every transient fault as a global pause.
+  it('MUST NOT FIRE: a failure below the threshold still rejects with the original error', async () => {
+    const transport = Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' })
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 2, resetTimeoutMs: 1_000 })
+
+    const rejection = await circuit.probe(async () => { throw transport }).catch((error: unknown) => error)
+
+    expect(rejection).toBe(transport)
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
   })
 
   it('coalesces a rejected probe, rejects every waiter, and does not cache the failure', async () => {
@@ -217,8 +252,13 @@ describe('FleetControlPlaneCircuit', () => {
     await firstFailure
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
 
+    // As above: the admission probe that opens the circuit reports the
+    // transition, keeping the timeout as `cause`.
     const second = guarded.spawn({ name: 'worker-2', capability: 'spawn:codex' })
-    const secondFailure = expect(second).rejects.toMatchObject({ name: 'TimeoutError' })
+    const secondFailure = expect(second).rejects.toMatchObject({
+      name: 'FleetControlPlaneCircuitOpenError',
+      cause: expect.objectContaining({ name: 'TimeoutError' }),
+    })
     await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
     await secondFailure
     expect(circuit.status()).toMatchObject({ state: 'open', consecutiveFailures: 2 })
