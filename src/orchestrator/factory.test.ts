@@ -11131,7 +11131,12 @@ describe('FactoryLoop', () => {
       // Deliverable 3: batch occupancy is on the operator surface rather than
       // only in a log line that fires once.
       const capacity = factory.status().dispatchCapacity
-      expect(capacity).toMatchObject({ batchSize: 1, active: 1, waiting: 1 })
+      expect(capacity).toMatchObject({
+        batchSize: 1,
+        active: 1,
+        waiting: 1,
+        agentlessHoldTimeoutMs: 30 * 60_000,
+      })
       expect(capacity?.longestWaitMs).toBeGreaterThan(0)
       expect(capacity?.occupants).toEqual([
         expect.objectContaining({ issue: 'AR-306', phase: 'running', agents: 2 }),

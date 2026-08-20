@@ -272,10 +272,16 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
     return {
       dispatching: false,
       verdict:
-        `not dispatching: all ${capacity.batchSize} batch slot(s) have been occupied for ` +
-        `${formatDuration(capacity.longestWaitMs)} with ${capacity.waiting} issue(s) waiting` +
+        // `longestWaitMs` is the oldest *queue* wait, not how long the slots
+        // have been held; saying otherwise sends an operator looking for an
+        // occupant that has been there that long (#303 review, cubic).
+        `not dispatching: ${capacity.waiting} issue(s) have been waiting for batch capacity for up ` +
+        `to ${formatDuration(capacity.longestWaitMs)}, with ${capacity.active}/${capacity.batchSize} ` +
+        'slot(s) occupied' +
         (agentless > 0
-          ? `. ${agentless} occupied slot(s) never placed an agent, so they cannot finish on their own`
+          ? `. ${agentless} occupied slot(s) never placed an agent and are past the ` +
+            `${formatDuration(capacity.agentlessHoldTimeoutMs)} reap deadline, so they cannot finish ` +
+            'on their own'
           : '') +
         '. Pass --token to read /evidence for the issues holding the slots.',
     }
@@ -468,10 +474,13 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       lines.push(`    slots              : ${capacity.active}/${capacity.batchSize} occupied`)
       lines.push(`    waiting            : ${capacity.waiting} issue(s)`)
       lines.push(
-        `    longest wait       : ${formatDuration(capacity.longestWaitMs)} (warn past ${formatDuration(capacity.waitWarnMs)})`,
+        `    longest queue wait : ${formatDuration(capacity.longestWaitMs)} (warn past ${formatDuration(capacity.waitWarnMs)})`,
       )
       if (capacity.agentlessOccupants !== undefined) {
-        lines.push(`    never placed agent : ${capacity.agentlessOccupants} occupied slot(s)`)
+        lines.push(
+          `    unreaped wedges    : ${capacity.agentlessOccupants} occupied slot(s) never placed an ` +
+          `agent and are past the ${formatDuration(capacity.agentlessHoldTimeoutMs)} reap deadline`,
+        )
       }
     }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)

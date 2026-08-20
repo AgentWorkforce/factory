@@ -1,6 +1,6 @@
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
-import { DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
+import { DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS, DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
 import type {
   FactoryDispatchCapacityStatus,
   FactoryEventListenerStatus,
@@ -291,6 +291,35 @@ function readinessReconcileHealth(
 }
 
 /**
+ * Occupied slots that will not free themselves.
+ *
+ * NOT "has no agent yet". `BatchTracker#recordPlanned` writes a spec before
+ * the spawn returns, so every healthy dispatch is agent-less for as long as
+ * its placement takes — minutes for a cloud spawn — and on a single-slot batch
+ * that is nearly always. Counting that would make the wedge signature read 1
+ * continuously on a batch that is working, which is worse than not having the
+ * field (#303 review, cubic). The condition no healthy dispatch reaches is
+ * *never placed and already past the deadline that should have reaped it*.
+ *
+ * Defensive throughout: this runs inside the heartbeat writer, where a throw
+ * costs the whole diagnostics block, and the record may come from an older or
+ * corrupted producer (#303 review, cubic).
+ */
+function countAgentlessOccupants(occupants: unknown, reapMs: number): number {
+  if (!Array.isArray(occupants)) return 0
+  return occupants.filter((entry) => {
+    const occupant = plainRecord(entry)
+    if (!occupant) return false
+    const slotHeldForMs = finiteNumber(occupant.slotHeldForMs)
+    // A producer that sends neither field cannot answer the question, and
+    // guessing "wedged" from an absence is how a false alarm gets published.
+    return finiteNumber(occupant.placedAgents) === 0 &&
+      slotHeldForMs !== undefined &&
+      slotHeldForMs > reapMs
+  }).length
+}
+
+/**
  * Batch occupancy, redacted (#303).
  *
  * Issue keys stay behind the authenticated surface — they carry customer
@@ -304,22 +333,15 @@ function dispatchCapacityHealth(
   const waiting = counter(status.waiting)
   const longestWaitMs = finiteNumber(status.longestWaitMs)
   const warnMs = positiveNumber(status.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS
-  // `agents` counts specs, and `recordPlanned` writes one before the spawn
-  // returns — so a dispatch that died mid-spawn reports `agents: 1` with no
-  // placement, and counting specs would drop the wedge signature for exactly
-  // the case #303 exists for. `heldForMs` is stamped only by a successful
-  // placement, and `placedAgents` says so outright; prefer the explicit count
-  // and fall back for a producer that does not send it.
-  const agentlessOccupants = (status.occupants ?? [])
-    .filter((occupant) => (occupant.placedAgents !== undefined
-      ? counter(occupant.placedAgents) === 0
-      : finiteNumber(occupant.heldForMs) === undefined)).length
+  const reapMs = positiveNumber(status.agentlessHoldTimeoutMs) ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS
+  const agentlessOccupants = countAgentlessOccupants(status.occupants, reapMs)
   return {
     state: deriveDispatchCapacityState(waiting, longestWaitMs, warnMs),
     batchSize: counter(status.batchSize),
     active: counter(status.active),
     waiting,
     waitWarnMs: warnMs,
+    agentlessHoldTimeoutMs: reapMs,
     ...optionalDuration('longestWaitMs', longestWaitMs),
     ...(agentlessOccupants > 0 ? { agentlessOccupants } : {}),
   }
@@ -538,6 +560,8 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             active: counter(capacity.active),
             waiting: counter(capacity.waiting),
             waitWarnMs: positiveNumber(capacity.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS,
+            agentlessHoldTimeoutMs: positiveNumber(capacity.agentlessHoldTimeoutMs)
+              ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS,
             ...optionalDuration('longestWaitMs', capacity.longestWaitMs),
             ...optionalCount('agentlessOccupants', capacity.agentlessOccupants),
           },

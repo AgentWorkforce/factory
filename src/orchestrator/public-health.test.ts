@@ -39,6 +39,7 @@ describe('dispatch capacity health (#303)', () => {
       active: 1,
       waiting: 3,
       waitWarnMs: 30 * 60_000,
+      agentlessHoldTimeoutMs: 30 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
       // `recordPlanned` wrote a spec and the spawn never returned, so the row
       // reports an agent and no placement — the shape the projection must not
@@ -64,6 +65,7 @@ describe('dispatch capacity health (#303)', () => {
       active: 1,
       waiting: 3,
       waitWarnMs: 30 * 60_000,
+      agentlessHoldTimeoutMs: 30 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
       agentlessOccupants: 1,
     })
@@ -74,18 +76,39 @@ describe('dispatch capacity health (#303)', () => {
     expect(health.ok).toBe(true)
   })
 
-  it('falls back to the placement stamp for a producer without placedAgents', () => {
+  // The wedge signature must not fire on a dispatch that is merely mid-spawn.
+  // `recordPlanned` writes the spec first, so every healthy dispatch has zero
+  // placements until its spawn returns — minutes, for a cloud placement.
+  it('does not count a dispatch still inside its spawn window as a wedge', () => {
     const health = publicHealthFromHeartbeat(
       capacity({
-        occupants: [
-          { issue: 'AR-303', phase: 'dispatching', agents: 1 } as never,
-          { issue: 'AR-307', phase: 'running', agents: 2, heldForMs: 90_000 } as never,
-        ],
+        occupants: [{
+          issue: 'AR-307',
+          phase: 'dispatching',
+          agents: 1,
+          placedAgents: 0,
+          slotHeldForMs: 90_000,
+        }],
       }),
       { nowMs: BOOT_MS + 1_000 },
     )
 
-    expect(health.dispatchCapacity?.agentlessOccupants).toBe(1)
+    expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    // The wait itself is still reported: capacity is the outage signal here,
+    // and only the "cannot finish on its own" claim is withheld.
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+  })
+
+  it('survives a corrupted occupants collection rather than dropping the block', () => {
+    for (const occupants of ['not-an-array', null, [null], [42], [{ placedAgents: 0 }]]) {
+      const health = publicHealthFromHeartbeat(
+        capacity({ occupants: occupants as never }),
+        { nowMs: BOOT_MS + 1_000 },
+      )
+
+      expect(health.dispatchCapacity).toMatchObject({ state: 'stalled', waiting: 3 })
+      expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    }
   })
 
   it('keeps issue keys behind the authenticated surface', () => {
@@ -114,6 +137,7 @@ describe('dispatch capacity health (#303)', () => {
         active: 1,
         waiting: 3,
         waitWarnMs: 30 * 60_000,
+        agentlessHoldTimeoutMs: 30 * 60_000,
         longestWaitMs: 6 * 60 * 60_000,
       },
     })

@@ -211,6 +211,7 @@ describe('factory diagnose --deployed (#295)', () => {
                 active: 1,
                 waiting: 7,
                 waitWarnMs: 1_800_000,
+                agentlessHoldTimeoutMs: 1_800_000,
                 longestWaitMs: 46_800_000,
                 agentlessOccupants: 1,
               },
@@ -223,9 +224,12 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(code).not.toBe(0)
     const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
     expect(report.dispatching).toBe(false)
-    expect(report.verdict).toContain('batch slot')
-    expect(report.verdict).toContain('never placed an agent')
-    expect(report.verdict).toContain('7 issue(s) waiting')
+    expect(report.verdict).toContain('7 issue(s) have been waiting for batch capacity')
+    expect(report.verdict).toContain('1/1 slot(s) occupied')
+    expect(report.verdict).toContain('never placed an agent and are past the 30m 0s reap deadline')
+    // `longestWaitMs` is a queue wait, so the verdict must not present it as
+    // how long the slots have been held (#303 review, cubic).
+    expect(report.verdict).not.toContain('slot(s) have been occupied for')
   })
 
   // The deployed container serves the block inside its heartbeat projection.

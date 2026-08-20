@@ -6009,6 +6009,7 @@ export class FactoryLoop implements Factory {
       active: occupants.length,
       waiting: waits.length,
       waitWarnMs: this.#config.dispatch.capacityWaitWarnMs,
+      agentlessHoldTimeoutMs: this.#config.dispatch.agentlessHoldTimeoutMs,
       ...(longestWaitMs !== undefined ? { longestWaitMs } : {}),
       ...(occupants.length > 0 ? { occupants } : {}),
       ...(waits.length > 0

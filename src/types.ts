@@ -260,6 +260,8 @@ export interface FactoryDispatchCapacityStatus {
   waiting: number
   /** Wall-clock wait past which the wait is treated as dispatch-gating. */
   waitWarnMs: number
+  /** Deadline after which a slot that never placed an agent should have been reaped. */
+  agentlessHoldTimeoutMs: number
   longestWaitMs?: number
   occupants?: FactoryDispatchSlotOccupant[]
   /** Issue keys waiting on capacity, longest wait first. */
@@ -273,8 +275,19 @@ export interface FactoryPublicDispatchCapacityHealth {
   active: number
   waiting: number
   waitWarnMs: number
+  agentlessHoldTimeoutMs: number
   longestWaitMs?: number
-  /** Occupied slots that never placed an agent — the wedge signature. */
+  /**
+   * Occupied slots that never placed an agent **and** are already past the
+   * deadline that should have reaped them.
+   *
+   * Deliberately not "has no agent yet": `recordPlanned` writes a spec before
+   * the spawn returns, so every healthy dispatch is agent-less for as long as
+   * its spawn takes — minutes, for a cloud placement. Counting that would make
+   * the wedge signature read 1 continuously on a single-slot batch that is
+   * working perfectly (#303 review, cubic). Past the deadline, no healthy
+   * dispatch is still here.
+   */
   agentlessOccupants?: number
 }
 
