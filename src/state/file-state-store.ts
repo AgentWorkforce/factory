@@ -1009,6 +1009,48 @@ export class DocumentStateStore extends InMemoryStateStore {
     })
   }
 
+  override async claimConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.posted) return false
+      const current = session.terminalReceipt
+      if (current && current.claimedAtMs + leaseMs > nowMs) return false
+      session.terminalReceipt = { claimId, claimedAtMs: nowMs }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async completeConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<boolean> {
+    const result = await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.claimId !== claimId) return false
+      session.terminalReceipt = { ...session.terminalReceipt, posted: true }
+      return true
+    })
+    return Boolean(result)
+  }
+
+  override async releaseConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<void> {
+    await this.#mutateConversation(workspaceId, conversationId, (session) => {
+      if (session.terminalReceipt?.claimId !== claimId || session.terminalReceipt.posted) return false
+      delete session.terminalReceipt
+      return true
+    })
+  }
+
   override async claimConversationTurn(
     workspaceId: string,
     conversationId: string,

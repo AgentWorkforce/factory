@@ -572,6 +572,63 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('durably records a posted terminal receipt so a restart cannot re-post it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-file-state-terminal-receipt-'))
+    try {
+      const watchStatePath = join(root, 'factory-state.json')
+      const conversationId = 'slack:1780751612.176224'
+      const session = {
+        provider: 'slack',
+        issue: { uuid: 'uuid-135', key: 'AR-135', path: '/linear/issues/AR-135__uuid-135.json' },
+        externalId: '1780751612.176224',
+        context: { channelDir: 'C0FACTORY__factory-e2e' },
+        history: [],
+        processedMessageIds: [],
+        acknowledgedMessageIds: [],
+        pending: [],
+      }
+      const first = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect(await first.reserveConversationSession('workspace-1', conversationId, session)).toBe(true)
+      await first.appendConversationMessage('workspace-1', conversationId, {
+        id: '1780751613.000010', text: 'Nobody delivered this.', receivedAtMs: 1_000, author: 'U135',
+      })
+
+      // A second handler must not race a duplicate notice onto the thread while
+      // the first one's write is still in flight.
+      expect(await first.claimConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-a', 1_001, 60_000,
+      )).toBe(true)
+      expect(await first.claimConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-b', 1_002, 60_000,
+      )).toBe(false)
+
+      // A receipt that never reached Slack releases its claim, so the retry that
+      // owes the human the notice can still take it.
+      await first.releaseConversationTerminalReceipt('workspace-1', conversationId, 'receipt-a')
+      expect(await first.claimConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-b', 1_003, 60_000,
+      )).toBe(true)
+      expect(await first.completeConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-b',
+      )).toBe(true)
+
+      // The replies are still queued because the clear behind the receipt failed.
+      // A restart therefore re-runs that maintenance and must find the receipt
+      // settled rather than telling the human a second time.
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      expect((await restarted.getConversationSession('workspace-1', conversationId)))
+        .toMatchObject({ pending: [{ id: '1780751613.000010' }], terminalReceipt: { posted: true } })
+      expect(await restarted.claimConversationTerminalReceipt(
+        'workspace-1', conversationId, 'receipt-c', 1_004, 60_000,
+      )).toBe(false)
+      await restarted.releaseConversationTerminalReceipt('workspace-1', conversationId, 'receipt-b')
+      expect((await new FileStateStore({ batchSize: 2, watchStatePath })
+        .getConversationSession('workspace-1', conversationId))?.terminalReceipt?.posted).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('durably requeues an expired delivery when its conversation has no owner', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-slack-expired-unowned-'))
     try {

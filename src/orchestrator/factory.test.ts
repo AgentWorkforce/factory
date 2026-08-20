@@ -1809,6 +1809,85 @@ class DrainStraddlingReplyMountClient extends BlockingUnroutableReplyMountClient
   }
 }
 
+/**
+ * The same drain straddle as DrainStraddlingReplyMountClient, except the receipt
+ * the fence itself writes for the mid-drain reply fails. The first "no active
+ * agent" write still parks so the drain stays open; every later one throws until
+ * `failFencedReceipt` is cleared, standing in for Slack writeback being down for
+ * exactly the write nothing is waiting on.
+ */
+class FailingFencedReceiptMountClient extends ConfirmRecordingSlackMountClient {
+  readonly unroutableWriteStarted: Promise<void>
+  readonly straddlingReadStarted: Promise<void>
+  failFencedReceipt = true
+  fencedReceiptAttempts = 0
+  #signalUnroutableWriteStarted!: () => void
+  #releaseUnroutableWrite!: () => void
+  readonly #unroutableWriteReleased: Promise<void>
+  #signalStraddlingReadStarted!: () => void
+  #releaseStraddlingRead!: () => void
+  readonly #straddlingReadReleased: Promise<void>
+  #parked = false
+  #blockedReadPath: string | undefined
+
+  constructor(initialFiles: Record<string, unknown> = {}) {
+    super(initialFiles)
+    this.unroutableWriteStarted = new Promise((resolve) => { this.#signalUnroutableWriteStarted = resolve })
+    this.#unroutableWriteReleased = new Promise((resolve) => { this.#releaseUnroutableWrite = resolve })
+    this.straddlingReadStarted = new Promise((resolve) => { this.#signalStraddlingReadStarted = resolve })
+    this.#straddlingReadReleased = new Promise((resolve) => { this.#releaseStraddlingRead = resolve })
+  }
+
+  blockReadsFor(path: string): void {
+    this.#blockedReadPath = path
+  }
+
+  releaseStraddlingRead(): void {
+    this.#releaseStraddlingRead()
+  }
+
+  releaseUnroutableWrite(): void {
+    this.#releaseUnroutableWrite()
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    if (path === this.#blockedReadPath) {
+      this.#signalStraddlingReadStarted()
+      await this.#straddlingReadReleased
+    }
+    return await super.readFile(path)
+  }
+
+  override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+    if (slackWriteText(content).startsWith('Factory received this reply but could not route it')) {
+      if (!this.#parked) {
+        this.#parked = true
+        this.#signalUnroutableWriteStarted()
+        await this.#unroutableWriteReleased
+      } else if (this.failFencedReceipt) {
+        this.fencedReceiptAttempts += 1
+        throw new Error('Slack writeback is unavailable')
+      }
+    }
+    await super.writeFile(path, content, opts)
+  }
+}
+
+/** Fails the durable clear that follows an accepted terminal Slack receipt. */
+class FailingConversationClearStateStore extends InMemoryStateStore {
+  failClears = 1
+  clearAttempts = 0
+
+  override async clearConversationSession(workspaceId: string, conversationId: string): Promise<void> {
+    this.clearAttempts += 1
+    if (this.failClears > 0) {
+      this.failClears -= 1
+      throw new Error('conversation state write is unavailable')
+    }
+    await super.clearConversationSession(workspaceId, conversationId)
+  }
+}
+
 /** Holds the terminal "unroutable" writeback open, then rejects it on release. */
 class RejectingUnroutableReplyMountClient extends ConfirmRecordingSlackMountClient {
   readonly unroutableWriteStarted: Promise<void>
@@ -16248,6 +16327,102 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('keeps the terminal drain waiting on the receipt the fence itself writes', async () => {
+    const mount = new FailingFencedReceiptMountClient({ [issuePath(416)]: issueFile(416) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+    })
+    const retiredThreadTs = mount.threadTs
+    const staleText = 'reply whose fence receipt fails while the drain is still running'
+
+    try {
+      const first = await factory.runOnce()
+      expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-416'])
+
+      fleet.emitAgentExit('ar-416-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+      await vi.waitFor(async () => expect(
+        (await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1],
+      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }))
+      await vi.waitFor(() => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1))
+
+      // Reply 1 parks inside its "no active agent" writeback. Its route is the
+      // one the drain snapshots, and holding it open keeps the drain running.
+      emitSlackReply(mount, slackReplyFixturePath(
+        'C0FACTORY__factory-e2e', retiredThreadTs, 'human-holds-route',
+      ), 'slack-human-holds-route', {
+        text: 'first late reply',
+        user: 'U416',
+        user_is_bot: false,
+      })
+      await mount.unroutableWriteStarted
+
+      // Reply 2 parks inside its mount read, before it has registered anything,
+      // so it reaches the fence-during-drain branch rather than the fence.
+      const stalePath = slackReplyFixturePath('C0FACTORY__factory-e2e', retiredThreadTs, 'human-mid-drain')
+      mount.blockReadsFor(stalePath)
+      emitSlackReply(mount, stalePath, 'slack-human-mid-drain', {
+        text: staleText,
+        user: 'U416',
+        user_is_bot: false,
+      })
+      await mount.straddlingReadStarted
+
+      await mount.writeFile(issuePath(416), issuePayload(416, ready))
+      const reopening = factory.runOnce()
+      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4))
+      for (let tick = 0; tick < 20; tick += 1) await flush()
+
+      mount.releaseStraddlingRead()
+      for (let tick = 0; tick < 20; tick += 1) await flush()
+      mount.releaseUnroutableWrite()
+      const reopened = await reopening
+      expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-416'])
+      for (let tick = 0; tick < 40; tick += 1) await flush()
+
+      // The receipt the fence writes is this work unit's own side effect, so the
+      // drain has to wait on it. It fails, so the drain fails closed and the
+      // watcher that owns this reply's retry timer is never torn down.
+      await vi.waitFor(() => expect(mount.fencedReceiptAttempts).toBeGreaterThanOrEqual(1))
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackReplyRouteDrainsFailed ?? 0,
+      ).toBeGreaterThanOrEqual(1))
+      expect(factory.status().counters.slackDispatchThreadsDeferredUndrainedReply ?? 0)
+        .toBeGreaterThanOrEqual(1)
+      expect((await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1])
+        .toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs })
+
+      // ...so once writeback recovers the human is still told, instead of the
+      // reply dying with a retry timer the stop() cleared out from under it.
+      mount.failFencedReceipt = false
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackAnswersUnroutableVisible).toBe(2),
+        { timeout: 15_000, interval: 25 },
+      )
+      expect(factory.status().counters.slackConversationRepliesQueued ?? 0).toBe(0)
+      const conversation = await stateStore.getConversationSession(
+        'factory-test', `slack:${retiredThreadTs}`,
+      )
+      const carried = [
+        ...(conversation?.pending ?? []),
+        ...(conversation?.history ?? []),
+        ...(conversation?.delivery?.messages ?? []),
+      ].map((message) => message.text)
+      expect(carried).not.toContain(staleText)
+      expect(slackConversationResumes(fleet)).toEqual([])
+    } finally {
+      mount.failFencedReceipt = false
+      mount.releaseStraddlingRead()
+      mount.releaseUnroutableWrite()
+      await factory.stop()
+    }
+  }, 30_000)
+
   it('does not wire Slack answer injection when Slack is unconfigured', async () => {
     const mount = new CloudWritebackFakeMountClient({ [issuePath(22)]: issueFile(22) })
     const fleet = new FakeFleetClient()
@@ -19999,6 +20174,70 @@ describe('FactoryLoop PR babysitter', () => {
       await first.stop()
       await restarted?.stop()
       await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('does not re-post a terminal Slack receipt when the durable clear behind it fails', async () => {
+    const mount = new ConfirmRecordingSlackMountClient()
+    const fleet = new FakeFleetClient()
+    const stateStore = new FailingConversationClearStateStore({ batchSize: 10 })
+    const clock = new ManualClock()
+    clock.advance(10_000)
+    const terminalIssue = { uuid: 'uuid-417', key: 'AR-417', path: issuePath(417) }
+    const decision = await new StaticTriage().triage(parseLinearIssue(issuePath(417), issueFile(417)))
+    const conversationId = `slack:${mount.threadTs}`
+    await stateStore.setSlackThreadWatch('factory-test', issueKey(terminalIssue), {
+      kind: 'terminal-grace',
+      issue: terminalIssue,
+      decision,
+      threadId: mount.threadTs,
+      retiredAtMs: clock.now(),
+      expiresAtMs: clock.now() + 24 * 60 * 60_000,
+    })
+    await stateStore.reserveConversationSession('factory-test', conversationId, {
+      provider: 'slack',
+      issue: terminalIssue,
+      externalId: mount.threadTs,
+      context: { channel: 'C0FACTORY' },
+      history: [],
+      processedMessageIds: [],
+      acknowledgedMessageIds: [],
+      pending: [],
+    })
+    await stateStore.appendConversationMessage('factory-test', conversationId, {
+      id: `${mount.threadTs}:1780751613.000100`,
+      text: 'Nobody has told me this reply went nowhere.',
+      receivedAtMs: clock.now(),
+      providerSequence: '1780751613.000100',
+      author: 'U417',
+    })
+
+    const factory = createFactory(config({ slack: slackConfig() }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      stateStore,
+      clock,
+    })
+    const terminalNotice = 'Factory could not deliver 1 queued reply because this work unit no longer ' +
+      'has an active agent. Please continue on the linked issue or pull request.'
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+
+      // Slack accepted the receipt; only the durable clear behind it failed. The
+      // retry owes the state store another clear, not the human a second notice.
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackTerminalWatchReceiptsDeferred,
+      ).toBe(1))
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackTerminalWatchReceiptsRecovered,
+      ).toBe(1), { timeout: 15_000, interval: 25 })
+      expect(stateStore.clearAttempts).toBeGreaterThanOrEqual(2)
+      expect(slackReplyWrites(mount).filter((write) => write.content.text === terminalNotice))
+        .toHaveLength(1)
+      expect(await stateStore.getConversationSession('factory-test', conversationId)).toBeUndefined()
+    } finally {
+      await factory.stop()
     }
   }, 20_000)
 

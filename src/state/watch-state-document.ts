@@ -144,6 +144,7 @@ const parseConversationSessions = (
       (candidate.processedMessageIds !== undefined && !validConversationMessageIds(candidate.processedMessageIds)) ||
       (candidate.acknowledgedMessageIds !== undefined && !validConversationMessageIds(candidate.acknowledgedMessageIds)) ||
       (candidate.acknowledgementClaims !== undefined && !validConversationAcknowledgementClaims(candidate.acknowledgementClaims)) ||
+      (candidate.terminalReceipt !== undefined && !validConversationTerminalReceipt(candidate.terminalReceipt)) ||
       (delivery !== undefined && !validConversationDelivery(delivery) && !validLegacyConversationDelivery(delivery))
     ) throw invalidDocument()
     const session = structuredClone(candidate) as unknown as ConversationSessionState
@@ -163,6 +164,9 @@ const parseConversationSessions = (
       : [...candidate.acknowledgedMessageIds as string[]]
     if (candidate.acknowledgementClaims !== undefined) {
       session.acknowledgementClaims = structuredClone(candidate.acknowledgementClaims) as ConversationSessionState['acknowledgementClaims']
+    }
+    if (candidate.terminalReceipt !== undefined) {
+      session.terminalReceipt = structuredClone(candidate.terminalReceipt) as ConversationSessionState['terminalReceipt']
     }
     sessions[conversationId] = session
   }
@@ -197,6 +201,10 @@ const validConversationMessageIds = (value: unknown): value is string[] =>
 const validConversationAcknowledgementClaims = (value: unknown): boolean =>
   isRecord(value) && Object.values(value).every((claim) => isRecord(claim) &&
     typeof claim.claimId === 'string' && typeof claim.claimedAtMs === 'number')
+
+const validConversationTerminalReceipt = (value: unknown): boolean =>
+  isRecord(value) && typeof value.claimId === 'string' && typeof value.claimedAtMs === 'number' &&
+  (value.posted === undefined || typeof value.posted === 'boolean')
 
 const parseBabysitterSessions = (value: Record<string, unknown>): Record<string, BabysitterSessionState> => {
   const sessions: Record<string, BabysitterSessionState> = {}

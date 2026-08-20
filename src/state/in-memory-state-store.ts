@@ -431,6 +431,44 @@ export class InMemoryStateStore implements StateStore {
     }
   }
 
+  async claimConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (!session) return false
+    if (session.terminalReceipt?.posted) return false
+    const current = session.terminalReceipt
+    if (current && current.claimedAtMs + leaseMs > nowMs) return false
+    session.terminalReceipt = { claimId, claimedAtMs: nowMs }
+    return true
+  }
+
+  async completeConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<boolean> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (session?.terminalReceipt?.claimId !== claimId) return false
+    session.terminalReceipt = { ...session.terminalReceipt, posted: true }
+    return true
+  }
+
+  async releaseConversationTerminalReceipt(
+    workspaceId: string,
+    conversationId: string,
+    claimId: string,
+  ): Promise<void> {
+    const session = this.#workspace(workspaceId).conversationSessions.get(conversationId)
+    if (session?.terminalReceipt?.claimId === claimId && !session.terminalReceipt.posted) {
+      delete session.terminalReceipt
+    }
+  }
+
   async claimConversationTurn(
     workspaceId: string,
     conversationId: string,

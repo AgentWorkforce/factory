@@ -138,6 +138,16 @@ export type ConversationSessionState = {
   acknowledgedMessageIds?: string[]
   /** Short durable claims preventing duplicate concurrent provider receipts. */
   acknowledgementClaims?: Record<string, { claimId: string; claimedAtMs: number }>
+  /**
+   * Write-ahead outbox record for the one-per-thread terminal receipt telling a
+   * human their queued replies were never delivered. The provider write and the
+   * session clear that follows it cannot be one durable step, so the claim is
+   * taken before the write and marked posted after it: a retry of the clear then
+   * finds the receipt already settled instead of telling the human a second
+   * time. The lease keeps a crash between claim and write from suppressing the
+   * receipt forever.
+   */
+  terminalReceipt?: { claimId: string; claimedAtMs: number; posted?: boolean }
   /** New replies waiting for the short coalescing window. */
   pending: ConversationMessage[]
   /** Claimed batch; new arrivals remain in pending while this resume runs. */
@@ -472,6 +482,14 @@ export interface StateStore {
   claimConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
   completeConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<boolean>
   releaseConversationMessageAcknowledgement(workspaceId: string, conversationId: string, messageId: string, claimId: string): Promise<void>
+  /**
+   * Reserve the right to write this conversation's terminal receipt. Returns
+   * false once the receipt is posted, and while another handler holds an
+   * unexpired claim.
+   */
+  claimConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string, nowMs: number, leaseMs: number): Promise<boolean>
+  completeConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<boolean>
+  releaseConversationTerminalReceipt(workspaceId: string, conversationId: string, claimId: string): Promise<void>
   claimConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number, leaseMs: number): Promise<ConversationSessionState | undefined>
   renewConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, nowMs: number): Promise<boolean>
   completeConversationTurn(workspaceId: string, conversationId: string, owner: string, claimId: string, agent: { name: string; sessionRef?: string }): Promise<boolean>

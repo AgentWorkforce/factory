@@ -395,6 +395,7 @@ const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
 const SLACK_EVENT_WATERMARK_CACHE_MS = 60_000
 const SLACK_CONVERSATION_TURN_LEASE_MS = 60_000
 const SLACK_REPLY_ACKNOWLEDGEMENT_LEASE_MS = 60_000
+const SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS = 60_000
 const SLACK_CONVERSATION_TURN_RETRY_MS = 1_000
 const SLACK_REPLY_ROUTE_RETRY_MS = 1_000
 // One pass drains the whole chain (#slackReplyRoutes holds only the newest
@@ -527,6 +528,14 @@ export class FactoryLoop implements Factory {
   readonly #slackTerminalWatchExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #slackTerminalReceiptRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #terminalSlackWatchIssues = new Set<string>()
+  /**
+   * The one in-memory record of "this work unit has an in-flight Slack side
+   * effect". Both ordinary reply routes and the writebacks the terminal fence
+   * issues on their behalf register here, because this map is what the terminal
+   * drain waits on: anything that touches Slack for a work unit without
+   * registering is invisible to the drain, and the watcher teardown that follows
+   * a successful drain then pulls that effect's retry timer out from under it.
+   */
   readonly #slackReplyRoutes = new Map<string, Promise<DispatchResult | undefined>>()
   readonly #slackReplyRouteDrains = new Set<string>()
   readonly #slackConversationTurns: CoalescedTaskQueue<string>
@@ -14497,9 +14506,13 @@ export class FactoryLoop implements Factory {
     // that is still inside its mount read when the drain starts registers its
     // route *after* the snapshot, so it would run once the fence is gone and
     // bind the retired thread to the next dispatch — the same escape one level
-    // in. Bar registration for this key first (the bar and the registration are
+    // in. Bar *routing* for this key first (the bar and the registration are
     // both synchronous, so nothing can slip between them), then drain whatever
     // is already chained, then prove the set is empty before reporting success.
+    // A barred reply still answers the human, and that writeback registers here
+    // like any other effect, so the extra passes are what pick it up: quiescence
+    // means every effect this work unit started has settled, not merely the ones
+    // that existed when the drain began.
     const nested = this.#slackReplyRouteDrains.has(key)
     this.#slackReplyRouteDrains.add(key)
     try {
@@ -14605,21 +14618,59 @@ export class FactoryLoop implements Factory {
     this.#increment('slackTerminalWatchersRetained')
   }
 
+  // The durable half of the same record. Every caller here follows the receipt
+  // with a state write (clearing the session), and those two cannot be one
+  // durable step: when the state write fails, the retry that owns it must not
+  // read "replies still queued" as "the human has not been told" and post the
+  // notice again. So the receipt is claimed before the provider write and marked
+  // posted after it, and a retry finds it already settled.
   async #surfaceUndeliveredSlackConversation(threadId: string): Promise<void> {
-    const session = await this.#state.getConversationSession(
-      this.#workspaceId,
-      slackConversationId(threadId),
-    )
+    const conversationId = slackConversationId(threadId)
+    const session = await this.#state.getConversationSession(this.#workspaceId, conversationId)
     const pendingCount = session
       ? session.pending.length + (session.delivery?.messages.length ?? 0)
       : 0
     if (pendingCount === 0) return
+    if (session?.terminalReceipt?.posted) {
+      this.#increment('slackTerminalReceiptsAlreadySettled')
+      return
+    }
     if (!this.#slack) throw new Error(`Slack thread ${threadId} cannot surface undelivered replies without writeback`)
+    const claimId = randomUUID()
+    if (!await this.#state.claimConversationTerminalReceipt(
+      this.#workspaceId,
+      conversationId,
+      claimId,
+      this.#clock.now(),
+      SLACK_TERMINAL_RECEIPT_CLAIM_LEASE_MS,
+    )) {
+      const current = await this.#state.getConversationSession(this.#workspaceId, conversationId)
+      if (current?.terminalReceipt?.posted) {
+        this.#increment('slackTerminalReceiptsAlreadySettled')
+        return
+      }
+      // Another handler is mid-write. Fail closed so the queued replies survive
+      // for whoever settles them rather than racing a second notice onto the
+      // same thread.
+      throw new Error(`Slack thread ${threadId} terminal receipt is claimed by another handler; retrying`)
+    }
     const noun = pendingCount === 1 ? 'reply' : 'replies'
-    await this.#slack.reply(
-      threadId,
-      `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
-    )
+    try {
+      await this.#slack.reply(
+        threadId,
+        `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+      )
+    } catch (error) {
+      await this.#state.releaseConversationTerminalReceipt(this.#workspaceId, conversationId, claimId)
+      throw error
+    }
+    if (!await this.#state.completeConversationTerminalReceipt(
+      this.#workspaceId,
+      conversationId,
+      claimId,
+    )) {
+      throw new Error(`Slack thread ${threadId} terminal receipt could not be recorded`)
+    }
     this.#increment('slackConversationRepliesSurfacedTerminal')
   }
 
@@ -14798,22 +14849,42 @@ export class FactoryLoop implements Factory {
   ): Promise<DispatchResult | undefined> {
     if (this.#slackReplyRouteDrains.has(clarificationKey)) {
       // The terminal fence for this work unit is being drained right now.
-      // Registering here would put this route past the drain's snapshot and run
-      // it once the fence is gone. Answer it the way the fence would have.
+      // Registering an ordinary route here would put it past the drain's
+      // snapshot and run it once the fence is gone. Answer it the way the fence
+      // would have — but as a tracked effect, because this writeback is still a
+      // side effect of this work unit. Left untracked it is the same escape one
+      // level further in: the drain reports quiescence without it, the watcher
+      // stop clears the retry timer that owns this reply, and a slow or failed
+      // receipt leaves the human told nothing at all.
       this.#increment('slackReplyRoutesFencedDuringDrain')
-      await this.#writeUnroutableSlackReply(reply.threadTs)
-      return
+      return await this.#trackSlackWorkUnitEffect(clarificationKey, async () => {
+        await this.#writeUnroutableSlackReply(reply.threadTs)
+        return undefined
+      })
     }
-    const preceding = this.#slackReplyRoutes.get(clarificationKey)
-    const route = (async () => {
+    return await this.#trackSlackWorkUnitEffect(clarificationKey, () =>
+      this.#routeSlackConversationAnswerUnlocked(record, reply, text, clarificationKey))
+  }
+
+  // Every Slack side effect a work unit makes on its own behalf runs through
+  // here, so #slackReplyRoutes stays the single record the terminal drain
+  // consults. Effects are chained per work unit: awaiting the newest one drains
+  // everything queued behind it, and a rejection propagates to the drain, which
+  // fails closed rather than tearing the effect's retry path down.
+  async #trackSlackWorkUnitEffect(
+    key: string,
+    run: () => Promise<DispatchResult | undefined>,
+  ): Promise<DispatchResult | undefined> {
+    const preceding = this.#slackReplyRoutes.get(key)
+    const effect = (async () => {
       await preceding?.catch(() => undefined)
-      return await this.#routeSlackConversationAnswerUnlocked(record, reply, text, clarificationKey)
+      return await run()
     })()
-    this.#slackReplyRoutes.set(clarificationKey, route)
+    this.#slackReplyRoutes.set(key, effect)
     try {
-      return await route
+      return await effect
     } finally {
-      if (this.#slackReplyRoutes.get(clarificationKey) === route) this.#slackReplyRoutes.delete(clarificationKey)
+      if (this.#slackReplyRoutes.get(key) === effect) this.#slackReplyRoutes.delete(key)
     }
   }
 
