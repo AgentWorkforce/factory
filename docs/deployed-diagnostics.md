@@ -149,6 +149,8 @@ Two other shapes the command refuses to read as green:
   liveness and carries no Factory health, so `factory diagnose` reports *cannot tell* and points at
   `/evidence`, which does reach the container.
 - **A container serving a heartbeat its daemon stopped updating.** The block's own `stale`/`ageMs`
-  were true at write time and stay frozen; the container recomputes liveness from `updatedAtMs`
-  against its own clock on every request, and that verdict (`ok: false`, HTTP 503) outranks anything
-  the block still claims.
+  are not measurements of a read — they are constants of the write: `ageMs` is always `0` and
+  `stale` always `false` in the file, whether that file is one second or one week old. Freshness
+  comes from `updatedAtMs` measured against the clock of whoever serves it, which is what the
+  container does on every request; that verdict (`ok: false`, HTTP 503) outranks anything the block
+  still claims.
