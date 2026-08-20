@@ -130,6 +130,14 @@ const optionalDuration = <K extends string>(key: K, value: unknown): Partial<Rec
   return parsed === undefined || parsed < 0 ? {} : { [key]: parsed } as Partial<Record<K, number>>
 }
 
+/** A count of whole passes: fractions are not a thing an operator can read. */
+const optionalCount = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
+  const parsed = finiteNumber(value)
+  return parsed === undefined || parsed < 0
+    ? {}
+    : { [key]: Math.floor(parsed) } as Partial<Record<K, number>>
+}
+
 const optionalPositive = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
   const parsed = positiveNumber(value)
   return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
@@ -396,7 +404,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             ...optionalTimestamp('lastCompletedAtMs', readiness.lastCompletedAtMs),
             ...optionalTimestamp('lastFailureAtMs', readiness.lastFailureAtMs),
             ...optionalDuration('inFlightMs', readiness.inFlightMs),
-            ...optionalDuration('missedPasses', readiness.missedPasses),
+            ...optionalCount('missedPasses', readiness.missedPasses),
             ...(readiness.lastErrorClass !== undefined
               ? { lastErrorClass: telemetryErrorClassName(readiness.lastErrorClass) }
               : {}),

@@ -331,9 +331,11 @@ export async function diagnoseDeployedFactory(
     // service-level negative. Anything else that answers on this URL — a
     // gateway 404, an auth proxy 401, a load balancer 502 — never asked the
     // container, and cannot support a statement about Factory.
-    const instanceAnswered = typeof body.ok === 'boolean' ||
-      health.status === 200 ||
-      health.status === 503
+    // The container's health response always carries a top-level `ok`. A
+    // status code alone is not enough: a gateway can answer 200 with an error
+    // page or 503 with its own, and neither asked the container (#300 review,
+    // cubic).
+    const instanceAnswered = typeof body.ok === 'boolean'
     base = {
       url,
       reachable: true,

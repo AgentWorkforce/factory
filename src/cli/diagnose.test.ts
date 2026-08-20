@@ -670,5 +670,41 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(err.text()).not.toContain('s3cr3t-evidence-token')
     expect(err.text()).toMatch(/argument 2|second argument|position/iu)
   })
+  // Review follow-up on #300 (P2, cubic). My own no-echo fix was incomplete:
+  // a token in the URL slot still reached stderr through the scheme check.
+  it('never echoes a value that landed in the url slot either', async () => {
+    for (const argv of [
+      ['diagnose', 's3cr3t-evidence-token'],
+      ['diagnose', '--deployed', 's3cr3t-evidence-token'],
+      ['diagnose', '--url', 's3cr3t-evidence-token'],
+    ]) {
+      const err = buffer()
+      const code = await runFleetCli(argv, { stdout: buffer(), stderr: err, env: HERMETIC_ENV })
+
+      expect(code).not.toBe(0)
+      expect(err.text()).not.toContain('s3cr3t-evidence-token')
+      expect(err.text()).toMatch(/http/iu)
+    }
+  })
+
+  // Review follow-up on #300 (P2, cubic). A gateway can answer 200 or 503 with
+  // its own body; the container's health response always carries `ok`.
+  it('treats a 200 or 503 with no ok field as something other than the instance', async () => {
+    for (const status of [200, 503]) {
+      const out = buffer()
+      const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+        stdout: out,
+        stderr: buffer(),
+        env: HERMETIC_ENV,
+        diagnoseFetch: stubFetch({ healthz: { status, body: { message: 'gateway timeout page' } } }),
+      })
+
+      expect(code).not.toBe(0)
+      const report = JSON.parse(out.text()) as { live?: boolean; verdict: string }
+      expect(report.live).toBeUndefined()
+      expect(report.verdict).toMatch(/cannot tell/iu)
+      expect(report.verdict).not.toContain('reports itself not live')
+    }
+  })
 })
 

@@ -410,5 +410,28 @@ describe('publicHealthFromHeartbeat (#295)', () => {
     // not cost the operator the signal.
     expect(health?.readinessReconcile).toMatchObject({ state: 'stalled', consecutiveFailures: 3 })
   })
+  // Review follow-up on #300 (P2, cubic). "1.5 missed passes" is not a thing.
+  it('reports missed passes as a whole number', () => {
+    const health = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'degraded',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: ['readinessReconcile'],
+      readinessReconcile: {
+        state: 'stalled',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        intervalMs: 60_000,
+        inFlightMs: 90_000,
+        missedPasses: 1.5,
+      },
+    })
+
+    expect(health?.readinessReconcile?.missedPasses).toBe(1)
+    // A duration is genuinely fractional; only the count is not.
+    expect(health?.readinessReconcile?.inFlightMs).toBe(90_000)
+  })
 })
 

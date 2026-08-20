@@ -1613,7 +1613,13 @@ function parseFactoryDiagnoseFlags(flags: string[], env: NodeJS.ProcessEnv): Par
     throw new Error('factory diagnose requires --deployed <url> (the deployed instance base URL)')
   }
   if (!/^https?:\/\//u.test(url)) {
-    throw new Error(`factory diagnose --deployed requires an http(s) url, got: ${url}`)
+    // Not echoed, for the same reason as the positional case above: the value
+    // in the url slot is exactly where a mistyped `--token` argument lands
+    // (#300 review, cubic).
+    throw new Error(
+      'factory diagnose --deployed requires an http(s) url; the value given does not start with ' +
+      'http:// or https://. If that value is a token, pass it with --token.',
+    )
   }
   return { kind: 'factory-diagnose', url, json, ...(token ? { token } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}) }
 }
