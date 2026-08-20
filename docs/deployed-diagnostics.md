@@ -45,13 +45,16 @@ The daemon writes a redacted projection of its loop heartbeat — `heartbeat.hea
 logic of its own by design: the boundary lives in one place, in this repo, with tests.
 
 ```jsonc
+// The daemon stamps this when it WRITES the heartbeat, so `ageMs` is 0 and
+// `stale` false in the file; freshness is `updatedAtMs` against the clock of
+// whoever serves it. Here now = 1787229155805 (2026-08-20T12:32:35.805Z).
 {
   "schemaVersion": 1,
   "ok": true,                       // process liveness — see below
   "status": "degraded",             // the amber
   "stale": false,
-  "updatedAtMs": 1787224535802,
-  "ageMs": 12000,
+  "updatedAtMs": 1787229155805,
+  "ageMs": 0,
   "loopStatus": "running",
   "degradedSubsystems": ["readinessReconcile"],
   "reason": "dispatch-gating subsystem not healthy: readinessReconcile",
@@ -60,13 +63,14 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "consecutiveFailures": 0,
     "failureThreshold": 3,
     "intervalMs": 60000,
-    "lastStartedAtMs": 1787224595805,
-    "lastCompletedAtMs": 1787224535802,
-    "inFlightMs": 4620000,          // this pass has run 77 minutes
-    "missedPasses": 77,
+    "lastStartedAtMs": 1787224595805,   // 11:16:35.805Z
+    "lastCompletedAtMs": 1787224535802, // 11:15:35.802Z — 60s EARLIER
+    "inFlightMs": 4560000,          // now − lastStarted: this pass has run 76 minutes
+    "missedPasses": 76,
     "lastErrorClass": "TimeoutError"
   },
-  "eventListener": { "state": "subscribed" }
+  "eventListener": { "state": "subscribed" },
+  "fleetControlPlane": { "state": "closed", "consecutiveFailures": 0, "failureThreshold": 3 }
 }
 ```
 
@@ -78,6 +82,8 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   the success nor the failure path, so no state is written and every settled field keeps reading
   green. `lastStarted > lastCompleted` is the only evidence that a pass is in flight, and `inFlightMs`
   says for how long.
+- **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
+  as hard as a failing sweep. `closed` is the healthy value.
 - **`state: "stalled"`** — derived, not written: an in-flight pass older than ten sweep intervals.
   A cold container legitimately spends minutes in its first pass (#36 measured 61 minutes while the
   Relayfile mirror hydrated), so check `lastCompletedAtMs`: absent means "first pass since boot,
@@ -134,3 +140,15 @@ reads the block from `heartbeat.health`, and accepts a top-level `health` as wel
 
 Instances running a Factory older than this change publish no `health` block; `factory diagnose`
 detects that and says so rather than reporting a false green.
+
+Two other shapes the command refuses to read as green:
+
+- **Event-driven short-sleep mode.** With `FACTORY_EVENT_DRIVEN_SLEEP_ENABLED=1` the Worker answers
+  `/healthz` itself and never probes the container, deliberately — anonymous polling must not be a
+  second wake path. That response (`phase: "worker-ready"`, `container: "not-probed"`) is Worker
+  liveness and carries no Factory health, so `factory diagnose` reports *cannot tell* and points at
+  `/evidence`, which does reach the container.
+- **A container serving a heartbeat its daemon stopped updating.** The block's own `stale`/`ageMs`
+  were true at write time and stay frozen; the container recomputes liveness from `updatedAtMs`
+  against its own clock on every request, and that verdict (`ok: false`, HTTP 503) outranks anything
+  the block still claims.

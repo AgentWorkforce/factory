@@ -1,8 +1,10 @@
 import { telemetryErrorClassName } from '../observability/error-class.js'
+import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
 import type {
   FactoryEventListenerStatus,
   FactoryLoopHeartbeat,
   FactoryPublicEventListenerHealth,
+  FactoryPublicFleetControlPlaneHealth,
   FactoryPublicHealth,
   FactoryPublicReadinessReconcileHealth,
   FactoryPublicSubsystemState,
@@ -62,15 +64,48 @@ const EVENT_LISTENER_STATES: readonly FactoryEventListenerStatus['state'][] = [
   'polling',
 ]
 
+const FLEET_CONTROL_PLANE_STATES: readonly FleetControlPlaneStatus['state'][] = [
+  'closed',
+  'open',
+  'half-open',
+]
+
 /** Subsystems whose degradation stops issues from being dispatched. */
-const DISPATCH_GATING_SUBSYSTEMS = ['readinessReconcile', 'eventListener'] as const
+const DISPATCH_GATING_SUBSYSTEMS = ['readinessReconcile', 'eventListener', 'fleetControlPlane'] as const
 
 const finiteNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined
 
+/** A cadence is a denominator: zero or negative would make every derived ratio nonsense. */
+const positiveNumber = (value: unknown): number | undefined => {
+  const parsed = finiteNumber(value)
+  return parsed !== undefined && parsed > 0 ? parsed : undefined
+}
+
 const counter = (value: unknown): number => {
   const parsed = finiteNumber(value)
   return parsed !== undefined && parsed >= 0 ? Math.floor(parsed) : 0
+}
+
+/**
+ * The widest instant `Date` can represent (ECMA-262 time-value limit).
+ *
+ * Review follow-up on #300 (P2, codex): a finite number is not a valid date.
+ * `new Date(1e300).toISOString()` throws, and these numbers arrive from a
+ * remote process — so a hostile or corrupted record could abort a renderer
+ * that was asked to explain an outage. A timestamp outside the range is
+ * dropped rather than published.
+ */
+const MAX_TIME_VALUE_MS = 8.64e15
+
+const timestamp = (value: unknown): number | undefined => {
+  const parsed = finiteNumber(value)
+  return parsed !== undefined && Math.abs(parsed) <= MAX_TIME_VALUE_MS ? parsed : undefined
+}
+
+const optionalTimestamp = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
+  const parsed = timestamp(value)
+  return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
 }
 
 const plainRecord = (value: unknown): Record<string, unknown> | undefined =>
@@ -85,7 +120,9 @@ const optionalNumber = <K extends string>(key: K, value: unknown): Partial<Recor
 
 /** Control characters stripped, length bounded: this text can reach a terminal. */
 const boundedText = (value: string): string =>
-  value.replace(/[\u0000-\u001F\u007F]+/gu, ' ').trim().slice(0, 300)
+  // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
+  // C1 range as escape introducers.
+  value.replace(/[\u0000-\u001F\u007F-\u009F]+/gu, ' ').trim().slice(0, 300)
 
 const enumValue = <T extends string>(value: unknown, allowed: readonly T[]): T | 'unknown' =>
   typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : 'unknown'
@@ -105,11 +142,11 @@ export function readinessReconcileInFlightMs(
   >,
   nowMs: number,
 ): number | undefined {
-  const startedAtMs = finiteNumber(status.lastStartedAtMs)
+  const startedAtMs = timestamp(status.lastStartedAtMs)
   if (startedAtMs === undefined) return undefined
   const settledAtMs = Math.max(
-    finiteNumber(status.lastCompletedAtMs) ?? Number.NEGATIVE_INFINITY,
-    finiteNumber(status.lastFailureAtMs) ?? Number.NEGATIVE_INFINITY,
+    timestamp(status.lastCompletedAtMs) ?? Number.NEGATIVE_INFINITY,
+    timestamp(status.lastFailureAtMs) ?? Number.NEGATIVE_INFINITY,
   )
   if (settledAtMs >= startedAtMs) return undefined
   return Math.max(0, nowMs - startedAtMs)
@@ -135,7 +172,7 @@ export function derivedReadinessReconcileState(
   if (reported === 'not-running') return reported
   const inFlightMs = readinessReconcileInFlightMs(status, nowMs)
   if (inFlightMs === undefined) return reported
-  const intervalMs = finiteNumber(status.intervalMs) ?? DEFAULT_READINESS_RECONCILE_INTERVAL_MS
+  const intervalMs = positiveNumber(status.intervalMs) ?? DEFAULT_READINESS_RECONCILE_INTERVAL_MS
   return inFlightMs > intervalMs * READINESS_RECONCILE_STALL_INTERVALS ? 'stalled' : reported
 }
 
@@ -143,7 +180,11 @@ function readinessReconcileHealth(
   status: FactoryReadinessReconcileStatus,
   nowMs: number,
 ): FactoryPublicReadinessReconcileHealth {
-  const intervalMs = finiteNumber(status.intervalMs)
+  // Review follow-up on #300 (P2, cubic): a recorded `intervalMs: 0` made
+  // every in-flight pass instantly stalled and `missedPasses` Infinity, which
+  // JSON renders as null. An unusable cadence falls back to the default and is
+  // not republished as though it were real.
+  const intervalMs = positiveNumber(status.intervalMs)
   const inFlightMs = readinessReconcileInFlightMs(status, nowMs)
   const cadenceMs = intervalMs ?? DEFAULT_READINESS_RECONCILE_INTERVAL_MS
   return {
@@ -154,15 +195,9 @@ function readinessReconcileHealth(
     ...(finiteNumber(status.lastDurationMs) !== undefined
       ? { lastDurationMs: finiteNumber(status.lastDurationMs) }
       : {}),
-    ...(finiteNumber(status.lastStartedAtMs) !== undefined
-      ? { lastStartedAtMs: finiteNumber(status.lastStartedAtMs) }
-      : {}),
-    ...(finiteNumber(status.lastCompletedAtMs) !== undefined
-      ? { lastCompletedAtMs: finiteNumber(status.lastCompletedAtMs) }
-      : {}),
-    ...(finiteNumber(status.lastFailureAtMs) !== undefined
-      ? { lastFailureAtMs: finiteNumber(status.lastFailureAtMs) }
-      : {}),
+    ...optionalTimestamp('lastStartedAtMs', status.lastStartedAtMs),
+    ...optionalTimestamp('lastCompletedAtMs', status.lastCompletedAtMs),
+    ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
     ...(inFlightMs !== undefined
       ? { inFlightMs, missedPasses: Math.floor(inFlightMs / cadenceMs) }
       : {}),
@@ -172,6 +207,20 @@ function readinessReconcileHealth(
     ...(status.lastErrorClass !== undefined || status.lastError !== undefined
       ? { lastErrorClass: telemetryErrorClassName(status.lastErrorClass) }
       : {}),
+  }
+}
+
+function fleetControlPlaneHealth(
+  status: FleetControlPlaneStatus,
+): FactoryPublicFleetControlPlaneHealth {
+  return {
+    state: enumValue(status.state, FLEET_CONTROL_PLANE_STATES),
+    consecutiveFailures: counter(status.consecutiveFailures),
+    failureThreshold: counter(status.failureThreshold),
+    ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
+    ...optionalTimestamp('retryAtMs', status.retryAtMs),
+    // `lastError` stays behind /evidence: a roster probe failure names the
+    // broker socket path.
   }
 }
 
@@ -200,7 +249,7 @@ export function publicHealthFromHeartbeat(
     }
   }
 
-  const updatedAtMs = finiteNumber(heartbeat.updatedAtMs)
+  const updatedAtMs = timestamp(heartbeat.updatedAtMs)
   const ageMs = updatedAtMs === undefined ? undefined : Math.max(0, nowMs - updatedAtMs)
   const stale = ageMs === undefined || ageMs > staleMs
   const loopStatus = enumValue(heartbeat.status, ['running', 'idle', 'stopping'] as const)
@@ -208,19 +257,38 @@ export function publicHealthFromHeartbeat(
   const readinessReconcile = heartbeat.readinessReconcile
     ? readinessReconcileHealth(heartbeat.readinessReconcile, nowMs)
     : undefined
+  const fleetControlPlane = heartbeat.fleetControlPlane
+    ? fleetControlPlaneHealth(heartbeat.fleetControlPlane)
+    : undefined
   const eventListener: FactoryPublicEventListenerHealth | undefined = heartbeat.eventListener
     // Only the state. `reason` is assembled free text and stays behind the
     // authenticated surface.
     ? { state: enumValue(heartbeat.eventListener.state, EVENT_LISTENER_STATES) }
     : undefined
 
+  // A daemon that is not running a readiness loop is not a live dispatcher —
+  // a bounded `factory loop` reports `not-running` here and is not supposed to
+  // hold a subscription. Only a live instance's listener is dispatch-gating.
+  const liveDispatcher = readinessReconcile !== undefined && readinessReconcile.state !== 'not-running'
   const degradedSubsystems = DISPATCH_GATING_SUBSYSTEMS.filter((name) => {
     if (name === 'readinessReconcile') {
       return readinessReconcile !== undefined &&
         readinessReconcile.state !== 'healthy' &&
         readinessReconcile.state !== 'not-running'
     }
-    return eventListener !== undefined && eventListener.state === 'not-listening'
+    if (name === 'fleetControlPlane') {
+      // An open circuit fails every spawn fast; half-open is one probe away
+      // from either. Both mean dispatch is not admitting work normally.
+      return fleetControlPlane !== undefined && fleetControlPlane.state !== 'closed'
+    }
+    // Review follow-up on #300 (P2, codex): `starting` is what a live daemon
+    // reports before `#startLiveSubscription` installs the subscription. No
+    // listener is registered, and startup can be lengthy, so anything short of
+    // a registered subscription or an active poll is amber — not green.
+    return liveDispatcher &&
+      eventListener !== undefined &&
+      eventListener.state !== 'subscribed' &&
+      eventListener.state !== 'polling'
   })
 
   // Deliberate split (#295, deliverable 2).
@@ -258,6 +326,7 @@ export function publicHealthFromHeartbeat(
     ...(reason ? { reason } : {}),
     ...(readinessReconcile ? { readinessReconcile } : {}),
     ...(eventListener ? { eventListener } : {}),
+    ...(fleetControlPlane ? { fleetControlPlane } : {}),
   }
 }
 
@@ -281,6 +350,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   if (!record) return undefined
   const readiness = plainRecord(record.readinessReconcile)
   const listener = plainRecord(record.eventListener)
+  const fleet = plainRecord(record.fleetControlPlane)
   const degradedSubsystems = Array.isArray(record.degradedSubsystems)
     ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => (record.degradedSubsystems as unknown[]).includes(name))
     : []
@@ -290,7 +360,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     ok: record.ok === true,
     status,
     stale: record.stale === true,
-    ...optionalNumber('updatedAtMs', record.updatedAtMs),
+    ...optionalTimestamp('updatedAtMs', record.updatedAtMs),
     ...optionalNumber('ageMs', record.ageMs),
     loopStatus: enumValue(record.loopStatus, ['running', 'idle', 'stopping'] as const),
     degradedSubsystems: [...degradedSubsystems],
@@ -305,9 +375,9 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             failureThreshold: counter(readiness.failureThreshold),
             ...optionalNumber('intervalMs', readiness.intervalMs),
             ...optionalNumber('lastDurationMs', readiness.lastDurationMs),
-            ...optionalNumber('lastStartedAtMs', readiness.lastStartedAtMs),
-            ...optionalNumber('lastCompletedAtMs', readiness.lastCompletedAtMs),
-            ...optionalNumber('lastFailureAtMs', readiness.lastFailureAtMs),
+            ...optionalTimestamp('lastStartedAtMs', readiness.lastStartedAtMs),
+            ...optionalTimestamp('lastCompletedAtMs', readiness.lastCompletedAtMs),
+            ...optionalTimestamp('lastFailureAtMs', readiness.lastFailureAtMs),
             ...optionalNumber('inFlightMs', readiness.inFlightMs),
             ...optionalNumber('missedPasses', readiness.missedPasses),
             ...(readiness.lastErrorClass !== undefined
@@ -317,5 +387,16 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
         }
       : {}),
     ...(listener ? { eventListener: { state: enumValue(listener.state, EVENT_LISTENER_STATES) } } : {}),
+    ...(fleet
+      ? {
+          fleetControlPlane: {
+            state: enumValue(fleet.state, FLEET_CONTROL_PLANE_STATES),
+            consecutiveFailures: counter(fleet.consecutiveFailures),
+            failureThreshold: counter(fleet.failureThreshold),
+            ...optionalTimestamp('lastFailureAtMs', fleet.lastFailureAtMs),
+            ...optionalTimestamp('retryAtMs', fleet.retryAtMs),
+          },
+        }
+      : {}),
   }
 }

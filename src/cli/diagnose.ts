@@ -40,11 +40,30 @@ export interface DeployedFactoryDiagnosis {
   url: string
   reachable: boolean
   httpStatus?: number
+  /**
+   * The instance's own liveness verdict, computed against ITS clock.
+   *
+   * The daemon stamps the health block when it writes the heartbeat, so the
+   * block's `ageMs` is 0 and `stale` false *in the file*. If the daemon dies
+   * and the container keeps serving that file, the block stays green forever.
+   * The container recomputes liveness from `updatedAtMs` on every request, so
+   * its verdict is the fresh one and it wins (#300 review, P1).
+   */
+  live?: boolean
   /** Allowlisted class of a transport failure; the message is not reported. */
   errorClass?: string
   dispatching: boolean
   verdict: string
   health?: FactoryPublicHealth
+  /**
+   * The Worker answered without probing the container.
+   *
+   * In event-driven short-sleep mode `/healthz` terminates at the Worker on
+   * purpose, so anonymous polling cannot wake the container and defeat
+   * scale-to-zero. That answer is Worker liveness and says nothing about
+   * Factory (factory-cloud#40 review).
+   */
+  workerOnly?: boolean
   /** Present when the instance predates the `/healthz` diagnostics block. */
   legacy?: DeployedLegacyHealth
   evidence?: DeployedEvidenceSummary
@@ -70,7 +89,9 @@ const endpoint = (base: string, path: string): string => `${base.replace(/\/+$/u
  * interprets escape sequences.
  */
 const forTerminal = (value: string): string =>
-  value.replace(/[\u0000-\u001F\u007F]+/gu, ' ').trim().slice(0, MAX_EVIDENCE_TEXT)
+  // C0 and C1 alike (#300 review, P2, cubic): some terminals treat the C1
+  // range as escape introducers, so stripping only C0 is not enough.
+  value.replace(/[\u0000-\u001F\u007F-\u009F]+/gu, ' ').trim().slice(0, MAX_EVIDENCE_TEXT)
 
 const asRecord = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -129,6 +150,27 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       verdict: `unreachable: ${diagnosis.url} did not answer (${diagnosis.errorClass ?? 'no response'})`,
     }
   }
+  // Before any subsystem reading: a snapshot served by a container whose
+  // daemon has stopped updating it describes a process that is no longer
+  // there. The instance already said so.
+  if (diagnosis.live === false) {
+    return {
+      dispatching: false,
+      verdict:
+        `not dispatching: the instance reports itself not live (HTTP ${diagnosis.httpStatus ?? '?'}). ` +
+        'Its loop heartbeat is stale or the Factory process is gone, so any health block it still ' +
+        'serves describes the last write, not the present.',
+    }
+  }
+  if (diagnosis.workerOnly) {
+    return {
+      dispatching: false,
+      verdict:
+        'cannot tell: this deployment answers /healthz at the Worker without probing the container ' +
+        '(event-driven short-sleep), so the response is Worker liveness and carries no Factory ' +
+        'health. Pass --token to read /evidence, which does reach the container.',
+    }
+  }
   const health = diagnosis.health
   if (!health) {
     const legacy = diagnosis.legacy ?? {}
@@ -179,6 +221,24 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
   if (health.status !== 'ok') {
     return { dispatching: false, verdict: `not dispatching: ${health.reason ?? 'a subsystem is degraded'}` }
   }
+  // Review follow-up on #300 (P1, cubic). An empty `degradedSubsystems` on a
+  // block that never reported the readiness sweep is an absence of evidence,
+  // not evidence of health.
+  if (!readiness || readiness.state === 'unknown') {
+    return {
+      dispatching: false,
+      verdict:
+        'cannot tell: the health block carries no readiness-reconcile state, so nothing here says ' +
+        'whether discovery is running. Pass --token to read /evidence.',
+    }
+  }
+  if (readiness.state === 'not-running') {
+    return {
+      dispatching: false,
+      verdict:
+        'not dispatching: the readiness loop is not running — this instance is not a live daemon.',
+    }
+  }
   return {
     dispatching: true,
     verdict:
@@ -213,10 +273,13 @@ export async function diagnoseDeployedFactory(
     // The container serves the daemon's block inside its heartbeat projection;
     // accept a top-level copy too, so a proxy that hoists it still works.
     const published = normalizePublicHealth(body.health ?? asRecord(body.heartbeat).health)
+    const workerOnly = body.eventDrivenSleep === true || body.container === 'not-probed'
     base = {
       url,
       reachable: true,
       httpStatus: health.status,
+      live: health.status === 200 && body.ok !== false,
+      ...(workerOnly ? { workerOnly: true } : {}),
       ...(published ? { health: published } : { legacy: legacyHealth(body) }),
     }
   } catch (error) {
@@ -276,9 +339,13 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
     `  reachable            : ${diagnosis.reachable ? `yes (HTTP ${diagnosis.httpStatus ?? '?'})` : `no (${diagnosis.errorClass ?? 'no response'})`}`,
   )
 
+  if (diagnosis.live === false) {
+    lines.push('  instance liveness    : NOT LIVE (the instance\'s own verdict, on its own clock)')
+  }
+
   const health = diagnosis.health
   if (health) {
-    lines.push(`  liveness (ok)        : ${health.ok}`)
+    lines.push(`  liveness (ok)        : ${health.ok} (as of the last heartbeat write)`)
     lines.push(`  status               : ${health.status}`)
     lines.push(
       `  loop                 : ${health.loopStatus ?? 'unknown'}, heartbeat ${formatDuration(health.ageMs)} old${health.stale ? ' (STALE)' : ''}`,
@@ -325,5 +392,10 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
   return `${lines.join('\n')}\n`
 }
 
-const formatInstant = (ms: number | undefined): string =>
-  ms === undefined ? '—' : new Date(ms).toISOString()
+const formatInstant = (ms: number | undefined): string => {
+  if (ms === undefined) return '—'
+  // Belt and braces with `normalizePublicHealth`'s range check: a renderer
+  // asked to explain an outage must never be the thing that throws.
+  const instant = new Date(ms)
+  return Number.isNaN(instant.getTime()) ? 'unknown' : instant.toISOString()
+}

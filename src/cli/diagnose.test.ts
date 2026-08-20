@@ -298,4 +298,147 @@ describe('factory diagnose --deployed (#295)', () => {
 
     expect(out.text()).toContain('diagnose --deployed <url>')
   })
+  // Review follow-up on #300 (P1, codex). The daemon stamps the block at write
+  // time, so its `ageMs` is 0 and `stale` false *in the file*. If the daemon
+  // dies and the container keeps serving that file, believing the embedded
+  // snapshot reports green forever — the exact failure this command exists to
+  // catch. The container computes liveness against its own clock; that verdict
+  // wins.
+  it('believes the container liveness verdict over a frozen health snapshot', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 503,
+          body: {
+            // The container's own staleness check, against its own clock.
+            ok: false,
+            phase: 'running',
+            factoryProcess: 'running',
+            heartbeat: {
+              status: 'running',
+              updatedAtMs: NOW_MS - 3_600_000,
+              readinessReconcile: 'healthy',
+              health: healthy.health,
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
+    expect(report.dispatching).toBe(false)
+    expect(report.verdict).toMatch(/heartbeat|liveness|not alive/iu)
+  })
+
+  // Review follow-up on #300 (P2, codex). `new Date(1e300).toISOString()`
+  // throws, and a remote instance chooses these numbers.
+  it('renders an out-of-range remote timestamp as unknown instead of aborting', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              ...healthy.health,
+              readinessReconcile: {
+                ...healthy.health.readinessReconcile,
+                lastStartedAtMs: 1e300,
+                lastCompletedAtMs: 1e300,
+              },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    const text = out.text()
+    expect(text).toContain('readinessReconcile')
+    expect(text).not.toContain('Invalid time value')
+  })
+  // Review follow-up on #300 (P1, cubic). A block with no readiness subsystem
+  // in it says nothing about dispatch; "no degraded subsystem listed" is not
+  // the same statement as "the sweep is healthy".
+  it('refuses to call an incomplete health block dispatching', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ok: true,
+            phase: 'running',
+            health: {
+              schemaVersion: 1,
+              ok: true,
+              status: 'ok',
+              stale: false,
+              loopStatus: 'running',
+              degradedSubsystems: [],
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
+    expect(report.dispatching).toBe(false)
+    expect(report.verdict).toMatch(/cannot tell|no readiness/iu)
+  })
+
+  // Review follow-up on factory-cloud#40 (P2, codex). In event-driven
+  // short-sleep mode the Worker answers /healthz itself and never probes the
+  // container, deliberately, so anonymous polling cannot defeat scale-to-zero.
+  // That response is Worker liveness — reading it as "Factory is dispatching"
+  // is exactly the false green this command exists to prevent.
+  it('does not read a worker-only short-sleep response as a dispatching Factory', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: out,
+      stderr: buffer(),
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: { ok: true, phase: 'worker-ready', container: 'not-probed', eventDrivenSleep: true },
+        },
+      }),
+    })
+
+    expect(code).not.toBe(0)
+    const report = JSON.parse(out.text()) as { dispatching: boolean; verdict: string }
+    expect(report.dispatching).toBe(false)
+    expect(report.verdict).toMatch(/short-sleep|not probed|worker/iu)
+    expect(report.verdict).toContain('/evidence')
+  })
+
+  // Review follow-up on #300 (P2, cubic). A hermetic env must be honoured, or
+  // a test — or an embedder — silently skips the authenticated read.
+  it('takes the evidence token from the injected environment', async () => {
+    const seen: string[] = []
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--json'], {
+      stdout: buffer(),
+      stderr: buffer(),
+      env: { FACTORY_EVIDENCE_TOKEN: 'env-token' } as NodeJS.ProcessEnv,
+      diagnoseFetch: stubFetch({
+        healthz: { status: 200, body: healthy },
+        evidence: { status: 200, body: { phase: 'running' } },
+      }, seen),
+    })
+
+    expect(code).toBe(0)
+    expect(seen).toEqual([`${BASE}/healthz`, `${BASE}/evidence auth=Bearer env-token`])
+  })
 })
+

@@ -1440,9 +1440,26 @@ export class FactoryLoop implements Factory {
       this.#logger.info?.('[factory] running startup ready-issue backfill before draining buffered events', {
         highWatermarkRouteUnavailable: highWatermark.routeUnavailable,
       })
+      // Review follow-up on #300 (P1, cubic). The startup backfill is a
+      // discovery pass like any other, and it is the one most likely to hang:
+      // #36 measured 61 minutes here while the Relayfile mirror hydrated on a
+      // cold container. Stamping it means a wedged FIRST pass is visible as
+      // in-flight, instead of leaving the timestamps empty and the derived
+      // state reading `healthy` forever.
+      //
+      // Only the timestamps. `consecutiveFailures` and `lastError` belong to
+      // the reconcile loop's own failure accounting, which owns the degraded
+      // threshold and the #297 reason allowlist; a startup failure is already
+      // counted by `liveStartupBackfillErrors` and reported through `#error`.
+      const backfillStartedAtMs = this.#clock.now()
+      this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
         await this.runOnce()
+        this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
+        this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       } catch (error) {
+        this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
+        this.#readinessReconcileLastFailureAtMs = this.#clock.now()
         // A startup backfill failure must not abort the daemon: log it and fall
         // back to the live event stream (plus any buffered events) instead of
         // leaving the factory down.

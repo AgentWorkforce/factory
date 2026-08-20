@@ -205,6 +205,22 @@ export interface FactoryPublicEventListenerHealth {
 }
 
 /**
+ * The broker/fleet mutation gate, redacted (#300 review).
+ *
+ * An open circuit fails every spawn and resume fast, so it gates dispatch as
+ * hard as a failing readiness sweep. Its `lastError` is free text — a roster
+ * probe failure names sockets and paths — so only the state, the counters and
+ * the retry instant cross.
+ */
+export interface FactoryPublicFleetControlPlaneHealth {
+  state: FleetControlPlaneStatus['state'] | 'unknown'
+  consecutiveFailures: number
+  failureThreshold: number
+  lastFailureAtMs?: number
+  retryAtMs?: number
+}
+
+/**
  * The unauthenticated health record (#295).
  *
  * `ok` is process liveness — the question the container ping endpoint asks,
@@ -216,6 +232,15 @@ export interface FactoryPublicHealth {
   schemaVersion: number
   ok: boolean
   status: 'ok' | 'degraded' | 'unknown'
+  /**
+   * Stamped when the daemon WROTE this record, not when it was read.
+   *
+   * A record served out of a file the daemon has stopped updating still says
+   * `stale: false`, because it was fresh at write time. Freshness is therefore
+   * `updatedAtMs` measured against the serving process's clock — which is what
+   * the container's own liveness verdict does, and why that verdict outranks
+   * this field (#300 review).
+   */
   stale: boolean
   updatedAtMs?: number
   ageMs?: number
@@ -226,6 +251,7 @@ export interface FactoryPublicHealth {
   reason?: string
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
+  fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
 }
 
 export interface FactoryInFlightRegistryAgent {

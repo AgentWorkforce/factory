@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
   READINESS_RECONCILE_STALL_INTERVALS,
+  normalizePublicHealth,
   publicHealthFromHeartbeat,
 } from './public-health'
 import type { FactoryLoopHeartbeat } from '../types'
@@ -226,4 +227,158 @@ describe('publicHealthFromHeartbeat (#295)', () => {
     expect(rendered).not.toContain('https://')
     expect(health.readinessReconcile).toMatchObject({ state: 'unknown', consecutiveFailures: 0 })
   })
+  // Review follow-up on #300 (P2, codex). `starting` is the state a live
+  // daemon reports before `#startLiveSubscription` installs the subscription:
+  // no listener is registered, so reporting green would be the same false
+  // green this issue exists to remove. Startup can be lengthy.
+  it('treats a listener that is still starting as not yet dispatch-capable', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({ eventListener: { state: 'starting' } }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.degradedSubsystems).toContain('eventListener')
+    expect(health.status).toBe('degraded')
+    // Still alive — this is amber during startup, not a dead process.
+    expect(health.ok).toBe(true)
+  })
+
+  it('does not fault the listener on an instance that is not running live', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({
+        eventListener: { state: 'not-listening', reason: 'factory mode is dispatch-owner' },
+        readinessReconcile: { state: 'not-running', consecutiveFailures: 0, failureThreshold: 3 },
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    // A bounded `factory loop` is not supposed to be listening; only a live
+    // daemon's silence is a fault.
+    expect(health.degradedSubsystems).toEqual([])
+    expect(health.status).toBe('ok')
+  })
+
+  // Review follow-up on #300 (P2, codex). A finite number is not a valid date:
+  // `new Date(1e300).toISOString()` throws, and a remote record reaches a
+  // renderer that would abort the whole diagnosis.
+  it('drops timestamps outside the representable Date range', () => {
+    const health = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      updatedAtMs: 1e300,
+      loopStatus: 'running',
+      degradedSubsystems: [],
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        lastStartedAtMs: 1e300,
+        lastCompletedAtMs: -1e300,
+        lastFailureAtMs: Number.MAX_VALUE,
+        intervalMs: 60_000,
+      },
+    })
+
+    expect(health?.updatedAtMs).toBeUndefined()
+    expect(health?.readinessReconcile?.lastStartedAtMs).toBeUndefined()
+    expect(health?.readinessReconcile?.lastCompletedAtMs).toBeUndefined()
+    expect(health?.readinessReconcile?.lastFailureAtMs).toBeUndefined()
+    // Durations are not dates and stay as they are.
+    expect(health?.readinessReconcile?.intervalMs).toBe(60_000)
+  })
+
+  it('drops an out-of-range timestamp written into the heartbeat itself', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({
+        readinessReconcile: {
+          state: 'healthy',
+          consecutiveFailures: 0,
+          failureThreshold: 3,
+          intervalMs: 60_000,
+          lastStartedAtMs: 1e300,
+        },
+      }),
+      { nowMs: BOOT_MS },
+    )
+
+    expect(health.readinessReconcile?.lastStartedAtMs).toBeUndefined()
+    expect(health.readinessReconcile?.inFlightMs).toBeUndefined()
+  })
+  // Review follow-up on #300 (P1, cubic). An open fleet control-plane circuit
+  // rejects every spawn and resume, so dispatch is gated just as hard as by a
+  // failing readiness sweep — and the health record said nothing about it.
+  it('reports an open fleet control-plane circuit as dispatch-gating', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({
+        fleetControlPlane: {
+          state: 'open',
+          consecutiveFailures: 4,
+          timeoutMs: 10_000,
+          failureThreshold: 3,
+          resetTimeoutMs: 30_000,
+          lastFailureAtMs: BOOT_MS - 5_000,
+          retryAtMs: BOOT_MS + 25_000,
+          lastError: 'roster probe failed: connect ECONNREFUSED /run/relay/broker.sock',
+        },
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.degradedSubsystems).toContain('fleetControlPlane')
+    expect(health.status).toBe('degraded')
+    expect(health.fleetControlPlane).toMatchObject({
+      state: 'open',
+      consecutiveFailures: 4,
+      retryAtMs: BOOT_MS + 25_000,
+    })
+    // MUST-NOT-FIRE: the circuit's lastError is free text with a socket path.
+    const rendered = JSON.stringify(health)
+    expect(rendered).not.toContain('/run/relay/broker.sock')
+    expect(rendered).not.toContain('ECONNREFUSED')
+  })
+
+  it('does not fault a closed fleet control-plane circuit', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({
+        fleetControlPlane: {
+          state: 'closed',
+          consecutiveFailures: 0,
+          timeoutMs: 10_000,
+          failureThreshold: 3,
+          resetTimeoutMs: 30_000,
+        },
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.degradedSubsystems).toEqual([])
+    expect(health.fleetControlPlane).toMatchObject({ state: 'closed' })
+  })
+
+  // Review follow-up on #300 (P2, cubic). A zero cadence made every in-flight
+  // pass instantly stalled and `missedPasses` Infinity, which JSON renders as
+  // null — a broken record about a working sweep.
+  it('falls back to the default cadence when the recorded interval is not positive', () => {
+    const health = publicHealthFromHeartbeat(
+      heartbeat({
+        readinessReconcile: {
+          state: 'healthy',
+          consecutiveFailures: 0,
+          failureThreshold: 3,
+          intervalMs: 0,
+          lastStartedAtMs: BOOT_MS - 120_000,
+          lastCompletedAtMs: BOOT_MS - 180_000,
+        },
+      }),
+      { nowMs: BOOT_MS },
+    )
+
+    expect(health.readinessReconcile?.state).toBe('healthy')
+    expect(health.readinessReconcile?.missedPasses).toBe(2)
+    expect(Number.isFinite(health.readinessReconcile?.missedPasses ?? 0)).toBe(true)
+    expect(health.readinessReconcile?.intervalMs).toBeUndefined()
+  })
 })
+

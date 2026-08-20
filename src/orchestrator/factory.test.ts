@@ -11877,6 +11877,71 @@ describe('FactoryLoop', () => {
       }
     })
 
+    // Review follow-up on #300 (P1, cubic). The startup backfill is the pass
+    // most likely to hang — #36 measured 61 minutes here on a cold container —
+    // and it recorded no timestamps at all, so a wedged FIRST pass left the
+    // derived state reading `healthy` with nothing to derive from.
+    it('marks a hung startup backfill as an in-flight pass', async () => {
+      class HangingBackfillMount extends CountingEventsMount {
+        readonly backfillStarted: Promise<void>
+        #resolveBackfillStarted: () => void = () => undefined
+        #releaseBackfill: () => void = () => undefined
+        #hung = false
+
+        constructor() {
+          super()
+          this.backfillStarted = new Promise((resolve) => { this.#resolveBackfillStarted = resolve })
+          this.setSubRoot('/linear/issues', 'absent')
+        }
+
+        releaseBackfill(): void {
+          this.#releaseBackfill()
+        }
+
+        override async listTree(prefix: string): Promise<string[]> {
+          if (!this.#hung) {
+            this.#hung = true
+            this.#resolveBackfillStarted()
+            await new Promise<void>((resolve) => { this.#releaseBackfill = resolve })
+          }
+          return super.listTree(prefix)
+        }
+      }
+
+      const mount = new HangingBackfillMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      const started = factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 20 },
+      })
+      try {
+        await mount.backfillStarted
+
+        // 10 missed passes at a 20ms cadence is 200ms of hang.
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.state).toBe('stalled')
+          expect(readiness?.lastCompletedAtMs).toBeUndefined()
+          expect(readiness?.inFlightMs ?? 0).toBeGreaterThan(200)
+        }, { timeout: 3_000 })
+
+        // No completed pass on record is how an operator tells a cold boot
+        // still hydrating from a daemon that ran fine for hours and stopped.
+        expect(factory.status().readinessReconcile?.consecutiveFailures).toBe(0)
+      } finally {
+        mount.releaseBackfill()
+        await started
+        await factory.stop()
+      }
+    })
+
     it('reports a hung sweep as stalled while every settled field still reads healthy', async () => {
       class HangingPeriodicMount extends CountingEventsMount {
         readonly periodicStarted: Promise<void>

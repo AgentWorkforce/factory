@@ -236,7 +236,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
       return 0
     }
     const { globals, args } = parseGlobalOptions(argv)
-    const command = parseFleetCommand(args)
+    const command = parseFleetCommand(args, deps.env ?? process.env)
 
     if (command.kind === 'featuremap-check') {
       const report = await (deps.featureMapCheck ?? checkFeatureMap)({
@@ -632,14 +632,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
   }
 }
 
-export function parseFleetCommand(args: string[]): ParsedCommand {
+export function parseFleetCommand(args: string[], env: NodeJS.ProcessEnv = process.env): ParsedCommand {
   const [verb, ...rest] = args
   if (!verb) {
     throw new Error(usage())
   }
 
   if (isFactoryAction(verb)) {
-    return parseFactoryCommand(args)
+    return parseFactoryCommand(args, env)
   }
 
   if (verb === 'fleet') {
@@ -1460,7 +1460,7 @@ function resolveLocalMountFn(
   }
 }
 
-function parseFactoryCommand(args: string[]): ParsedCommand {
+function parseFactoryCommand(args: string[], env: NodeJS.ProcessEnv = process.env): ParsedCommand {
   const [action, issueOrPr, ...flags] = args
   if (action === 'init') {
     const values = [issueOrPr, ...flags].filter((value): value is string => Boolean(value))
@@ -1479,7 +1479,10 @@ function parseFactoryCommand(args: string[]): ParsedCommand {
     return { kind: 'factory-init', repo, workspaceId }
   }
   if (action === 'diagnose') {
-    return parseFactoryDiagnoseFlags([issueOrPr, ...flags].filter((value): value is string => Boolean(value)))
+    return parseFactoryDiagnoseFlags(
+      [issueOrPr, ...flags].filter((value): value is string => Boolean(value)),
+      env,
+    )
   }
   if (action === 'start') {
     return { kind: 'factory', action, ...parseFactoryStartFlags([issueOrPr, ...flags]) }
@@ -1562,9 +1565,12 @@ function evaluateFactoryCanary(
   }
 }
 
-function parseFactoryDiagnoseFlags(flags: string[]): ParsedCommand {
+function parseFactoryDiagnoseFlags(flags: string[], env: NodeJS.ProcessEnv): ParsedCommand {
   let url: string | undefined
-  let token = process.env.FACTORY_EVIDENCE_TOKEN?.trim() || undefined
+  // The injected environment, not the process one: an embedder or a hermetic
+  // test that supplies `deps.env` must not silently skip the authenticated
+  // read (#300 review, P2, cubic).
+  let token = env.FACTORY_EVIDENCE_TOKEN?.trim() || undefined
   let json = false
   let timeoutMs: number | undefined
   for (let index = 0; index < flags.length; index += 1) {
