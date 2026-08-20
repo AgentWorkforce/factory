@@ -721,6 +721,7 @@ export class FactoryLoop implements Factory {
    * `status().dispatchCapacity` are derived from.
    */
   readonly #dispatchLifecycleCapacityWaits = new Map<string, {
+    record: InFlightIssue
     sinceAtMs: number
     attempts: number
     lastLoggedAtMs?: number
@@ -5936,6 +5937,10 @@ export class FactoryLoop implements Factory {
       }
       if (isTerminalDispatchLifecycle(lifecycle)) {
         this.#dispatchLifecycleEpochs.delete(key)
+        // This row just gave up its slot, so every waiter's answer may have
+        // changed. Local completion dispatches the next issue directly; this
+        // is what covers a waiter with no local event to ride on.
+        this.#resetDispatchCapacityBackoff()
       }
       return true
     })
@@ -6026,10 +6031,11 @@ export class FactoryLoop implements Factory {
     const nowMs = this.#clock.now()
     let wait = this.#dispatchLifecycleCapacityWaits.get(key)
     if (!wait) {
-      wait = { sinceAtMs: nowMs, attempts: 0 }
+      wait = { record, sinceAtMs: nowMs, attempts: 0 }
       this.#dispatchLifecycleCapacityWaits.set(key, wait)
       this.#increment('dispatchLifecycleCapacityWaits')
     }
+    wait.record = record
     wait.attempts += 1
     const retryMs = this.#capacityRetryDelayMs(wait.attempts)
     const waitedMs = Math.max(0, nowMs - wait.sinceAtMs)
@@ -6052,6 +6058,31 @@ export class FactoryLoop implements Factory {
       })
     }
     return retryMs
+  }
+
+  /**
+   * Put every capacity waiter back on the fast path, because a slot just freed.
+   *
+   * The backoff exists to stop a storm of retries asking a question whose
+   * answer is not changing. When a lifecycle reaches a terminal phase the
+   * answer *has* changed, so parking a waiter behind a 30 s timer would trade
+   * the storm for latency — and for a slot released by another process, that
+   * timer is the only signal this one gets (#303 review follow-up).
+   *
+   * The wait's `sinceAtMs` is deliberately untouched: the issue really has
+   * been waiting that long, and the escalating warning should keep saying so.
+   */
+  #resetDispatchCapacityBackoff(): void {
+    if (this.#stopping || this.#dispatchLifecycleCapacityWaits.size === 0) return
+    for (const [key, wait] of this.#dispatchLifecycleCapacityWaits) {
+      wait.attempts = 0
+      const timer = this.#dispatchLifecycleRetryTimers.get(key)
+      if (!timer) continue
+      clearTimeout(timer)
+      this.#dispatchLifecycleRetryTimers.delete(key)
+      this.#scheduleDispatchLifecycleRetry(wait.record)
+    }
+    this.#increment('dispatchCapacityBackoffResets')
   }
 
   #scheduleDispatchLifecycleRetry(record: InFlightIssue, delayMs = DISPATCH_LIFECYCLE_RETRY_MS): void {

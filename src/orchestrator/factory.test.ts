@@ -8223,7 +8223,9 @@ describe('FactoryLoop', () => {
       await first.stop()
       await rm(root, { recursive: true, force: true })
     }
-  })
+    // The fixed 2.2 s observation plus the 4 s wait always exceeded vitest's
+    // 5 s default, so this only ever passed because the wait resolved early.
+  }, 30_000)
 
   it('enforces one global durable slot across concurrent same-host control-plane processes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-global-capacity-'))
@@ -11027,6 +11029,76 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   }, 40_000)
+
+  // #303 review follow-up: the backoff must not outlive the condition it is
+  // damping. It exists to stop retries asking a question whose answer is not
+  // changing; a terminal lifecycle changes it, and a waiter with no local
+  // event to ride on has only this timer.
+  it('restarts the capacity backoff when a slot is released (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-capacity-backoff-reset-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mount = new FakeMountClient({
+      [issuePath(311)]: issueFile(311),
+      [issuePath(312)]: issueFile(312),
+      [issuePath(313)]: issueFile(313),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 311,
+        url: 'https://github.com/AgentWorkforce/pear/pull/311',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const waits: Array<{ issue: string; retryMs: number }> = []
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      warn: vi.fn((message: string, details?: Record<string, unknown>) => {
+        if (message === '[factory] durable dispatch is queued for batch capacity; retries remain active') {
+          waits.push({ issue: details!.issue as string, retryMs: details!.retryMs as number })
+        }
+      }),
+    }
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      for (const number of [311, 312, 313]) {
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      }
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-311-impl-pear', 'ar-311-review'])
+
+      // Let the third issue climb its ladder past the base delay.
+      await vi.waitFor(() => expect(waits.filter((wait) => wait.issue === 'AR-313')
+        .some((wait) => wait.retryMs >= 4_000)).toBe(true), { timeout: 15_000 })
+
+      const beforeExit = waits.filter((wait) => wait.issue === 'AR-313').length
+      fleet.emitAgentExit('ar-311-impl-pear', 'exited')
+
+      // AR-312 takes the freed slot; AR-313 keeps waiting, but its ladder
+      // starts over at the base delay rather than staying parked behind the
+      // one it had already climbed.
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
+        .toContain('ar-312-impl-pear'), { timeout: 15_000 })
+      await vi.waitFor(() => expect(
+        waits.filter((wait) => wait.issue === 'AR-313').slice(beforeExit).map((wait) => wait.retryMs),
+      ).toContain(1_000), { timeout: 15_000 })
+      expect(factory.status().counters.dispatchCapacityBackoffResets).toBeGreaterThanOrEqual(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 60_000)
 
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
