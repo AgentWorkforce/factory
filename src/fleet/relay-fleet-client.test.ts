@@ -1298,6 +1298,49 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
   })
 
   /**
+   * #307 review (codex, coderabbit, cubic — three independent finds).
+   *
+   * `reapPreviews` bounded its placement calls but awaited `roster()` outside
+   * the budget, and `roster()` is three unbounded reads. `#reapPreviewOrphans`
+   * keeps the sweep promise in `#previewSweepInFlight` and schedules the next
+   * sweep only from its `.finally()`, so one stalled read stops preview
+   * cleanup permanently — the exact hang this change removes elsewhere.
+   */
+  it('rejects within the ack budget when the preview roster read never resolves', async () => {
+    const messaging = new FakeMessaging()
+    messaging.nodes.list = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 120 })
+
+    const startedAt = Date.now()
+    await expect(fleet.reapPreviews({ namespace: 'ns', activeOwners: [] })).rejects.toThrow(/timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  /**
+   * #307 review (cubic). The budget must be checked *before* the request is
+   * made, not after. Taking an already-started promise meant an exhausted
+   * deadline still fired the call — a mutating one here — and then abandoned
+   * it, which is how a local timeout orphans a remote spawn.
+   *
+   * `now` is stepped so the budget is intact through bootstrap and lifecycle
+   * registration and spent by the time placement is reached.
+   */
+  it('does not issue the placement call once the budget is already spent', async () => {
+    const messaging = new FakeMessaging()
+    let calls = 0
+    const now = () => {
+      calls += 1
+      return calls <= 3 ? 0 : 10_000
+    }
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 1_000, now })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+
+    // The mutating call was never made, so there is no remote spawn to orphan.
+    expect(messaging.placements).toEqual([])
+  })
+
+  /**
    * A confirmed placement already carries the terminal invocation, so polling
    * for it again would double every spawn's round trips against the same
    * budget.

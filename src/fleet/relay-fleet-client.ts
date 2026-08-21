@@ -209,19 +209,19 @@ export class RelayFleetClient implements FleetClient {
     // here rather than inside `#awaitInvocation` is what stops the time already
     // spent from being free.
     const deadlineAtMs = this.#operationDeadline()
-    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, this.#ensureMessaging())
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
     if (input.capability.startsWith('spawn:')) {
       await this.#withinDeadline(
         'lifecycle action registration',
         deadlineAtMs,
-        this.#ensureLifecycleAction(messaging),
+        () => this.#ensureLifecycleAction(messaging),
       )
       // A transient startup registration failure may have torn down the first
       // subscription attempt. Re-arm it after the required action is durable so
       // the invocation cannot be accepted without a live Factory consumer.
       this.#ensureEventSubscription()
     }
-    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, messaging.placement.spawn({
+    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: input.capability,
       // 'self' from the orchestrator means "no placement preference": let the
       // engine pick the least-loaded eligible node.
@@ -304,8 +304,8 @@ export class RelayFleetClient implements FleetClient {
     // SDK's `confirm` cannot bound it — it needs the explicit budget (#306).
     // An unbounded release is how the reaper's own teardown wedges.
     const deadlineAtMs = this.#operationDeadline()
-    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, this.#ensureMessaging())
-    const ack = await this.#withinDeadline('release invoke', deadlineAtMs, messaging.commands.invoke('release', {
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('release invoke', deadlineAtMs, () => messaging.commands.invoke('release', {
       name,
       agent: name,
       ...(reason ? { reason } : {}),
@@ -321,8 +321,8 @@ export class RelayFleetClient implements FleetClient {
     // than `confirm`: their failure semantics are the preview reaper's, not the
     // dispatch fuse's, and bounding is what they were missing.
     const deadlineAtMs = this.#operationDeadline()
-    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, this.#ensureMessaging())
-    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, messaging.placement.spawn({
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: 'preview:tailscale-serve',
       ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
       repo: input.repo,
@@ -347,8 +347,8 @@ export class RelayFleetClient implements FleetClient {
 
   async removePreview(preview: PreviewReference): Promise<boolean> {
     const deadlineAtMs = this.#operationDeadline()
-    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, this.#ensureMessaging())
-    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, messaging.placement.spawn({
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: 'preview:tailscale-serve',
       ...(preview.node ? { node: preview.node } : {}),
       input: { operation: 'remove', preview },
@@ -361,13 +361,20 @@ export class RelayFleetClient implements FleetClient {
 
   async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
     const deadlineAtMs = this.#operationDeadline()
-    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, this.#ensureMessaging())
-    const nodes = (await this.roster()).nodes.filter((node) =>
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    // The roster is three unbounded reads (`agents.presence`, `agents.list`,
+    // `nodes.list`). Leaving it outside the budget left exactly the hang this
+    // change removes everywhere else: `#reapPreviewOrphans` keeps the sweep
+    // promise in `#previewSweepInFlight` and schedules the next sweep only from
+    // its `.finally()`, so one stalled read stops preview cleanup for good
+    // (#307 review, codex/coderabbit/cubic).
+    const roster = await this.#withinDeadline('preview roster', deadlineAtMs, () => this.roster())
+    const nodes = roster.nodes.filter((node) =>
       node.live && node.capabilities.includes('preview:tailscale-serve'),
     )
     const reports = await Promise.all(nodes.map(async (node): Promise<PreviewSweepResult> => {
       try {
-        const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, messaging.placement.spawn({
+        const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
           capability: 'preview:tailscale-serve',
           node: node.name,
           input: {
@@ -630,17 +637,21 @@ export class RelayFleetClient implements FleetClient {
    * constant, so many polls cost one budget between them instead of a fresh
    * budget each. Rejection is folded into the outcome value so a slow call we
    * stopped waiting on cannot later surface as an unhandled rejection.
+   *
+   * Takes a thunk rather than a promise so an exhausted budget refuses *before*
+   * the request is made. An already-started promise would mean the call had
+   * been sent — a mutating one, on the placement path — while this method was
+   * still deciding there was no time left to make it (#307 review, cubic).
    */
-  async #withinDeadline<T>(operation: string, deadlineAtMs: number, call: Promise<T>): Promise<T> {
+  async #withinDeadline<T>(operation: string, deadlineAtMs: number, start: () => Promise<T>): Promise<T> {
     const remainingMs = deadlineAtMs - this.#now()
     if (remainingMs <= 0) {
-      void call.catch(() => {})
       throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
     }
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       const outcome = await Promise.race<CallOutcome<T> | typeof CALL_TIMED_OUT>([
-        call.then(
+        start().then(
           (value) => ({ ok: true, value }) as const,
           (error) => ({ ok: false, error }) as const,
         ),
@@ -673,7 +684,7 @@ export class RelayFleetClient implements FleetClient {
     const messaging = await this.#withinDeadline(
       `${actionName} messaging bootstrap`,
       deadlineAtMs,
-      this.#ensureMessaging(),
+      () => this.#ensureMessaging(),
     )
     let status = ack.status ?? 'pending'
     let invocation: RelayActionInvocation | undefined
@@ -693,7 +704,7 @@ export class RelayFleetClient implements FleetClient {
       invocation = await this.#withinDeadline(
         `${actionName} invocation ${ack.invocationId}`,
         deadlineAtMs,
-        messaging.commands.getInvocation(actionName, ack.invocationId),
+        () => messaging.commands.getInvocation(actionName, ack.invocationId),
       )
       status = invocation.status || 'pending'
     }
@@ -701,7 +712,7 @@ export class RelayFleetClient implements FleetClient {
     invocation ??= await this.#withinDeadline(
       `${actionName} invocation ${ack.invocationId}`,
       deadlineAtMs,
-      messaging.commands.getInvocation(actionName, ack.invocationId),
+      () => messaging.commands.getInvocation(actionName, ack.invocationId),
     )
     if (status === 'failed' || status === 'denied') {
       throw new Error(`${actionName} invocation ${ack.invocationId} ${status}${invocation.error ? `: ${invocation.error}` : ''}`)
