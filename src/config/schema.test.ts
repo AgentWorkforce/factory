@@ -46,6 +46,45 @@ describe('relay.agentName', () => {
     expect(issue?.code).toBe('too_small')
   })
 
+  // Split configs are how a cloud deployment and another deployment share one
+  // workspace. If the identity could only live on the shared half, every
+  // deployment would register the same name -- the collision this prevents.
+  it('takes the relay agent name from the node-local half', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: { repos: { default: 'AgentWorkforce/factory' } },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-cloud')
+    // The node-local half must carry it back too, or a per-host identity is
+    // reflected as workspace-shared configuration.
+    expect(loaded.nodeConfig.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('lets the node-local relay agent name override the workspace default', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('still applies a workspace-half relay agent name when the node half sets none', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: {},
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-shared')
+  })
+
   it('rejects an unknown key under relay rather than ignoring a typo', () => {
     expect(() => FactoryConfigSchema.parse({
       repos: { byLabel: { pear: 'AgentWorkforce/pear' } },

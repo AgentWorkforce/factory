@@ -149,6 +149,11 @@ const fleetHealthSchema = z.object({
  *
  * Left unset, `RelayFleetClient` keeps its own `DEFAULT_AGENT_NAME`, so every
  * existing deployment registers exactly the name it registers today.
+ *
+ * Declared on both config halves, like `preview`: the workspace half carries a
+ * shared default, and the node half overrides it per host. An identity that
+ * only ever lived on the workspace half would be handed to every deployment in
+ * the workspace -- the collision this exists to prevent.
  */
 const relaySchema = z.object({
   // Deliberately not `.default(...)`: an empty or whitespace-only value is a
@@ -461,6 +466,9 @@ const WorkspaceConfigObjectSchema = z.object({
 
 const NodeConfigObjectSchema = z.object({
   workspaceId: z.string().optional(),
+  // Node-local, so two deployments sharing a workspace can register distinct
+  // relay identities. Overrides the workspace half when both set it.
+  relay: relaySchema,
   capabilities: z.array(z.string()).default([]),
   cloneRoot: z.string().optional(),
   clonePaths: z.record(z.string(), z.string()).default({}),
@@ -704,6 +712,7 @@ function normalizeLoadedConfig(input: unknown): LoadedFactoryConfig {
     factoryLoopHeartbeatPath: factoryConfig.loop.heartbeatPath,
     factoryLoopRegistryPath: factoryConfig.loop.registryPath,
     preview: factoryConfig.preview,
+    relay: factoryConfig.relay,
   })
 
   return { workspaceConfig, nodeConfig, factoryConfig }
@@ -724,6 +733,10 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   const nodePreview = asOptionalConfigRecord(node.preview)
   const hasPreview = workspace.preview !== undefined || node.preview !== undefined
 
+  const workspaceRelay = asOptionalConfigRecord(workspace.relay)
+  const nodeRelay = asOptionalConfigRecord(node.relay)
+  const hasRelay = workspace.relay !== undefined || node.relay !== undefined
+
   return {
     ...workspace,
     ...node,
@@ -737,6 +750,9 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
         },
       },
     } : {}),
+    // Merged rather than replaced, so a node half that pins only `agentName`
+    // does not drop whatever else the workspace half configured.
+    ...(hasRelay ? { relay: { ...workspaceRelay, ...nodeRelay } } : {}),
     repos: {
       ...workspaceRepos,
       cloneRoot: node.cloneRoot ?? workspaceRepos.cloneRoot,
@@ -787,5 +803,4 @@ export type WorkspaceConfig = z.infer<typeof WorkspaceConfigSchema>
 export type NodeConfig = z.infer<typeof NodeConfigSchema>
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>
 export type PreviewConfig = NonNullable<FactoryConfig['preview']>
-export type RelayConfig = FactoryConfig['relay']
 export type PreviewServiceConfig = PreviewConfig['services'][string]
