@@ -1115,3 +1115,209 @@ describe('RelayFleetClient', () => {
     expect(messaging.disconnected).toBe(1)
   })
 })
+
+/**
+ * #306 — every await on the placement path must be bounded.
+ *
+ * The 5-minute spawn-ack timeout existed before this suite and could never
+ * fire: the deadline was read at the top of the poll loop, around an unbounded
+ * `commands.getInvocation`, so a call that never settled never returned control
+ * to the check. Production ran a single readiness sweep for 62 minutes against
+ * that 5-minute bound with `consecutiveFailures: 0`.
+ *
+ * Each test below states which half it guards. The must-not-fire cases exist
+ * because the cheap way to pass the must-fire cases is an over-eager per-call
+ * timeout that kills healthy slow placements — which would trade a hang for an
+ * outage.
+ */
+describe('RelayFleetClient placement deadlines (#306)', () => {
+  const never = <T>(): Promise<T> => new Promise<T>(() => {})
+  const after = <T>(ms: number, value: T): Promise<T> =>
+    new Promise((resolve) => setTimeout(() => resolve(value), ms))
+
+  const spawnInput = () => ({
+    name: 'ar-1-impl',
+    capability: 'spawn:claude' as const,
+    node: 'self',
+    repo: 'AgentWorkforce/factory',
+    task: 'do work',
+  })
+
+  const pending = (invocationId: string): RelayActionInvocation =>
+    ({ invocationId, actionName: 'spawn', status: 'dispatched' }) as RelayActionInvocation
+
+  const completed = (invocationId: string): RelayActionInvocation =>
+    ({
+      invocationId,
+      actionName: 'spawn',
+      status: 'completed',
+      output: { agent_name: 'ar-1-impl', session_ref: 'session-1', pid: 7 },
+    }) as RelayActionInvocation
+
+  // MUST-FIRE. The exact production failure: a poll that never settles.
+  it('rejects within the ack budget when getInvocation never resolves', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'inv-1', status: 'pending', placement: { node: 'node-a' } }
+    messaging.commands.getInvocation = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 120 })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  // MUST-FIRE. `placement.spawn` runs before any deadline existed at all.
+  it('rejects within the ack budget when placement.spawn never resolves', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placement.spawn = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 120 })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  // MUST-FIRE. `#ensureLifecycleAction` is also awaited before the old deadline.
+  it('rejects within the ack budget when lifecycle-action registration never resolves', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.register = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 120 })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  /**
+   * MUST-FIRE, and the one that pins requirement 2 specifically.
+   *
+   * `placement.spawn` completes — slowly, but it completes — and then every
+   * poll completes too. No single call is slow enough to trip a per-call
+   * timeout on its own. What must end this is one budget spanning the whole
+   * operation.
+   *
+   * Before the fix `#awaitInvocation` computed its own deadline on entry, so
+   * the time `placement.spawn` had already burned was free: the operation cost
+   * the spawn delay *plus* a fresh full ack budget. The assertion below is
+   * what separates a shared budget from a restarted one.
+   */
+  it('carries one budget across placement.spawn and the poll loop', async () => {
+    const messaging = new FakeMessaging()
+    const spawnDelayMs = 500
+    const budgetMs = 500
+    messaging.placement.spawn = async (input) => {
+      messaging.placements.push(input)
+      return await after(spawnDelayMs, {
+        invocationId: 'inv-1',
+        actionName: 'spawn',
+        status: 'pending',
+        node: { name: 'node-a' },
+        placement: { capability: input.capability, node: 'node-a', attempts: 1, queued: false },
+      })
+    }
+    messaging.commands.getInvocation = async () => await after(20, pending('inv-1'))
+    const fleet = createClient(messaging, {
+      spawnAckTimeoutMs: budgetMs,
+      sleep: (ms) => after(ms, undefined),
+    })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    const elapsedMs = Date.now() - startedAt
+
+    // A restarted budget costs spawnDelayMs + budgetMs (~1000ms); one shared
+    // budget cannot exceed budgetMs (~500ms). The threshold sits between them.
+    expect(elapsedMs).toBeLessThan(spawnDelayMs + budgetMs - 250)
+  })
+
+  /**
+   * MUST-NOT-FIRE. A healthy but slow placement: several real polls, each
+   * taking real time, all comfortably inside the overall budget. This is the
+   * test that forbids "fixing" #306 with a timeout short enough to break
+   * working spawns.
+   */
+  it('still succeeds when slow-but-completing polls stay inside the overall budget', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'inv-1', status: 'pending', placement: { node: 'node-a' } }
+    let polls = 0
+    messaging.commands.getInvocation = async () => {
+      polls += 1
+      return await after(40, polls < 4 ? pending('inv-1') : completed('inv-1'))
+    }
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 5_000, sleep: (ms) => after(ms, undefined) })
+
+    await expect(fleet.spawn(spawnInput())).resolves.toMatchObject({
+      name: 'ar-1-impl',
+      sessionRef: 'session-1',
+      node: 'node-a',
+    })
+    expect(polls).toBe(4)
+  })
+
+  // MUST-NOT-FIRE. A release that completes normally must not be timed out.
+  it('still releases normally when the release invocation completes', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 5_000 })
+
+    await expect(fleet.release('ar-1-impl', 'done')).resolves.toBeUndefined()
+    expect(messaging.invokes.map((invoke) => invoke.name)).toContain('release')
+  })
+
+  // MUST-FIRE on the release path, which `confirm` cannot reach: `release`
+  // goes through `commands.invoke`, not `placement.spawn`.
+  it('rejects within the ack budget when a release invocation never settles', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.invoke = async (name: string) => ({
+      invocationId: 'inv-rel',
+      actionName: name,
+      status: 'pending',
+    }) as RelayActionInvocationAck
+    messaging.commands.getInvocation = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 120 })
+
+    const startedAt = Date.now()
+    await expect(fleet.release('ar-1-impl', 'done')).rejects.toThrow(/timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  /**
+   * #306 (1) — an ack alone proves the engine accepted the dispatch, not that
+   * the node launched anything. Ask the SDK to read the invocation back.
+   */
+  it('requests placement confirmation with a budget drawn from the ack deadline', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 30_000, pollIntervalMs: 250 })
+
+    await fleet.spawn(spawnInput())
+
+    const placement = messaging.placements[0]!
+    expect(placement.confirm).toBe(true)
+    expect(placement.confirmPollIntervalMs).toBe(250)
+    expect(placement.confirmTimeoutMs).toBeGreaterThan(0)
+    expect(placement.confirmTimeoutMs).toBeLessThanOrEqual(30_000)
+  })
+
+  /**
+   * A confirmed placement already carries the terminal invocation, so polling
+   * for it again would double every spawn's round trips against the same
+   * budget.
+   */
+  it('uses a confirmed invocation instead of polling for it again', async () => {
+    const messaging = new FakeMessaging()
+    let reads = 0
+    messaging.commands.getInvocation = async (name: string, invocationId: string) => {
+      reads += 1
+      return completed(invocationId)
+    }
+    const spawnPlacement = messaging.placement.spawn.bind(messaging.placement)
+    messaging.placement.spawn = async (input) => ({
+      ...(await spawnPlacement(input)),
+      status: 'pending',
+      confirmation: completed('inv-confirmed'),
+    })
+    const fleet = createClient(messaging)
+
+    await expect(fleet.spawn(spawnInput())).resolves.toMatchObject({ sessionRef: 'session-1' })
+    expect(reads).toBe(0)
+  })
+})
