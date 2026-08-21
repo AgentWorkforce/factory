@@ -136,6 +136,28 @@ const fleetHealthSchema = z.object({
   requireDedicatedBroker: z.boolean().default(false),
 }).default({})
 
+/**
+ * Relay-workspace identity settings for the `relay` fleet backend.
+ *
+ * `agentName` is the workspace agent Factory registers *as itself* — not an
+ * agent it spawns. Two Factory deployments sharing one workspace must not share
+ * it: the second registration collides with the first
+ * (`Agent "<name>" already exists in this workspace`), the fleet control plane
+ * never initialises, and nothing is ever dispatched. Hosts with ephemeral disk
+ * cannot prove they own a previously-registered name after a restart, so a
+ * deployment that needs its own identity pins one here.
+ *
+ * Left unset, `RelayFleetClient` keeps its own `DEFAULT_AGENT_NAME`, so every
+ * existing deployment registers exactly the name it registers today.
+ */
+const relaySchema = z.object({
+  // Deliberately not `.default(...)`: an empty or whitespace-only value is a
+  // misconfiguration, and coercing it to the default identity is precisely how
+  // an unconfigurable identity stayed invisible. `.trim().min(1)` rejects it at
+  // config load instead.
+  agentName: z.string().trim().min(1).optional(),
+}).strict().default({})
+
 const loopSchema = z.object({
   maxIterations: z.number().int().min(1).max(5).default(3),
   maxConsecutiveFailures: z.number().int().min(1).max(5).default(3),
@@ -381,6 +403,7 @@ const WorkspaceConfigObjectSchema = z.object({
   liveSubscription: liveSubscriptionSchema,
   dispatch: dispatchSchema,
   fleetHealth: fleetHealthSchema,
+  relay: relaySchema,
   loop: loopSchema,
   triage: triageSchema,
   repos: workspaceReposSchema,
@@ -764,4 +787,5 @@ export type WorkspaceConfig = z.infer<typeof WorkspaceConfigSchema>
 export type NodeConfig = z.infer<typeof NodeConfigSchema>
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>
 export type PreviewConfig = NonNullable<FactoryConfig['preview']>
+export type RelayConfig = FactoryConfig['relay']
 export type PreviewServiceConfig = PreviewConfig['services'][string]

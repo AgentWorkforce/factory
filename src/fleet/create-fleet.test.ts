@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { createFleet } from './create-fleet'
+import { FactoryConfigSchema } from '../config/schema'
 import { InternalFleetClient } from './internal-fleet-client'
 import { RelayFleetClient } from './relay-fleet-client'
 import type { HarnessDriverClientLike } from './internal-fleet-client'
@@ -19,6 +20,11 @@ const fakeHarness: HarnessDriverClientLike = {
     return { event_id: 'event', targets: [input.to] }
   },
   async sendInput() {},
+}
+
+const baseConfig = {
+  workspaceId: 'ws_create_fleet_test',
+  repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
 }
 
 describe('createFleet', () => {
@@ -96,5 +102,33 @@ describe('createFleet', () => {
     const fleet = createFleet({ backend: 'relay' }, { env: {} })
 
     await expect(fleet.roster()).rejects.toThrow(/requires a workspace key \(rk_live_…\) or agent token \(at_live_…\)/)
+  })
+
+  // The identity the factory registers as, threaded config -> createFleet ->
+  // RelayFleetClient. Both directions are asserted from a really-parsed config
+  // so the schema, the option, and the client default stay in one story.
+  describe('relay workspace identity', () => {
+    const relayFleetFor = (raw: Record<string, unknown>): RelayFleetClient => {
+      const config = FactoryConfigSchema.parse({ ...baseConfig, ...raw })
+      return createFleet(
+        { backend: 'relay', relayAgentName: config.relay.agentName },
+        { env: {} },
+      ) as RelayFleetClient
+    }
+
+    it('registers under the agent name the config supplies', () => {
+      expect(relayFleetFor({ relay: { agentName: 'factory-cloud' } }).agentName).toBe('factory-cloud')
+    })
+
+    // Guards the upgrade path, not the feature: a deployment that never sets
+    // `relay.agentName` must keep registering the exact name it registers
+    // today. A silent identity change here strands a live deployment the same
+    // way an unconfigurable identity did.
+    it('keeps the built-in `factory` identity when the config omits an agent name', () => {
+      const config = FactoryConfigSchema.parse(baseConfig)
+
+      expect(config.relay.agentName).toBeUndefined()
+      expect(relayFleetFor({}).agentName).toBe('factory')
+    })
   })
 })

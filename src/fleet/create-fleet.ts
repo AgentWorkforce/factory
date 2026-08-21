@@ -11,6 +11,12 @@ export interface CreateFleetOptions {
   cwd?: string
   connectionPath?: string
   previewConfig?: PreviewConfig
+  /**
+   * Workspace identity the relay backend registers as (config `relay.agentName`).
+   * Relay-only; the internal backend has no workspace registration. Undefined
+   * leaves `RelayFleetClient`'s own default in place.
+   */
+  relayAgentName?: string
 }
 
 export interface CreateFleetDeps {
@@ -53,6 +59,7 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
   if (backend === 'relay') {
     return new RelayFleetClient({
       workspaceKey: deps.workspaceKey,
+      agentName: options.relayAgentName,
       env: deps.env,
       log: deps.logger ? (message) => deps.logger?.info?.(message) : undefined,
     })

@@ -5,6 +5,55 @@ import { join } from 'node:path'
 import { FactoryConfigSchema, NodeConfigSchema, loadFactoryConfig } from './schema'
 import { routedPrRepos } from '../github/routed-pr-babysitter'
 
+describe('relay.agentName', () => {
+  it('keeps an explicit relay agent name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName: 'factory-cloud' },
+    })
+
+    expect(parsed.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('trims surrounding whitespace from an otherwise valid name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName: '  factory-cloud  ' },
+    })
+
+    expect(parsed.relay.agentName).toBe('factory-cloud')
+  })
+
+  // An identity that silently falls back to the default is how a workspace
+  // registration collision hides: the operator believes they pinned a name.
+  it.each([
+    ['empty', ''],
+    ['whitespace-only', '   '],
+    ['a tab', '\t'],
+  ])('rejects %s relay.agentName at config load instead of defaulting it', (_label, agentName) => {
+    const result = FactoryConfigSchema.safeParse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName },
+    })
+
+    expect(result.success).toBe(false)
+    // Asserted by path and code, not by message text: the point is that the
+    // trimmed value failed the length check under `relay.agentName`, rather
+    // than some unrelated issue happening to mention the field.
+    const issue = result.success ? undefined : result.error.issues.find(
+      (candidate) => candidate.path.join('.') === 'relay.agentName',
+    )
+    expect(issue?.code).toBe('too_small')
+  })
+
+  it('rejects an unknown key under relay rather than ignoring a typo', () => {
+    expect(() => FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentname: 'factory-cloud' },
+    })).toThrow(/unrecognized key/i)
+  })
+})
+
 describe('FactoryConfigSchema', () => {
   it('parses a valid config and applies defaults', () => {
     const parsed = FactoryConfigSchema.parse({
@@ -44,6 +93,9 @@ describe('FactoryConfigSchema', () => {
       resetTimeoutMs: 60_000,
       requireDedicatedBroker: false,
     })
+    // Absent, not defaulted in the schema: RelayFleetClient owns the
+    // `factory` fallback, so there is exactly one place the default lives.
+    expect(parsed.relay).toEqual({})
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
     // Agent CLI per role defaults to today's behavior: codex implements, claude
     // reviews/babysits — so existing configs are unaffected unless set.

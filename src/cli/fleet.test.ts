@@ -1346,6 +1346,43 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  // The plumbing that was missing: without it a cloud deployment can configure
+  // `relay.agentName` and still register as the default, colliding with itself.
+  it.each([
+    ['forwards a configured relay agent name to fleet construction', { relay: { agentName: 'factory-cloud' } }, 'factory-cloud'],
+    ['leaves the relay agent name unset when the config omits it', {}, undefined],
+  ])('%s', async (_label, overrides, expected) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-relay-identity-'))
+    try {
+      const configPath = await writeConfig(root, overrides)
+      const createFleetCalls: Array<{ relayAgentName?: string }> = []
+      const output = buffer()
+
+      const code = await runFleetCli([
+        '--backend',
+        'relay',
+        'run-once',
+        '--dry-run',
+        '--config',
+        configPath,
+      ], {
+        createFleet: (opts) => {
+          createFleetCalls.push(opts as { relayAgentName?: string })
+          return new FakeFleetClient()
+        },
+        cloudMountFromConfig: async () => new FakeMountClient({ [issuePath]: issueFile }),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(0)
+      expect(createFleetCalls).toHaveLength(1)
+      expect(createFleetCalls[0]?.relayAgentName).toBe(expected)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('keeps explicit fixtureFiles configs on Fake fleet and mount for harness runs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-fixture-opt-in-'))
     try {
