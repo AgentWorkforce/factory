@@ -8460,9 +8460,22 @@ export class FactoryLoop implements Factory {
     const key = issueKey(record.issue)
     if (this.#abandonedDispatchReasons.has(key)) return false
     if (!this.#usesDurableDispatchLifecycle()) return true
-    if (!this.#dispatchLifecycleEpochs.has(key)) return false
+    const epoch = this.#dispatchLifecycleEpochs.get(key)
+    if (epoch === undefined) return false
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    return Boolean(lifecycle) && !isTerminalDispatchLifecycle(lifecycle!)
+    if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) return false
+    // A live row is not the same as *our* row. Another owner can reclaim an
+    // expired lease and leave it nonterminal, and the cached epoch here would
+    // still say we hold it (#303 review, cubic). This mirrors exactly what
+    // `saveDispatchLifecycle` will accept — owner, epoch and an unexpired
+    // lease — so a placement is recorded only when the write that follows can
+    // actually land. Otherwise the save fails and the worker leaks through the
+    // generic ownership-lost path instead of orphan cleanup.
+    const lease = lifecycle.lease
+    return lease !== undefined &&
+      lease.owner === this.#dispatchLifecycleOwner &&
+      lease.epoch === epoch &&
+      lease.leaseUntilMs > this.#clock.now()
   }
 
   /**
@@ -20154,6 +20167,16 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
  * turns it into a distinct exit code — can recognize it by type rather than by
  * matching on `error.name`, and so tests can construct a genuine instance.
  */
+export class LiveDispatchStateChangedError extends Error {
+  readonly issueKey: string
+
+  constructor(issueKey: string) {
+    super(`Live state changed before writeback for ${issueKey}`)
+    this.name = 'LiveDispatchStateChangedError'
+    this.issueKey = issueKey
+  }
+}
+
 /**
  * A placement that finished spawning after its dispatch had been released.
  *
@@ -20176,16 +20199,6 @@ export class LatePlacementReleasedError extends Error {
     this.name = 'LatePlacementReleasedError'
     this.issueKey = issueKey
     this.agentName = agentName
-  }
-}
-
-export class LiveDispatchStateChangedError extends Error {
-  readonly issueKey: string
-
-  constructor(issueKey: string) {
-    super(`Live state changed before writeback for ${issueKey}`)
-    this.name = 'LiveDispatchStateChangedError'
-    this.issueKey = issueKey
   }
 }
 

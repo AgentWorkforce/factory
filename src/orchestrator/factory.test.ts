@@ -11309,6 +11309,67 @@ describe('FactoryLoop', () => {
     }
   }, 40_000)
 
+  // #303 review (cubic): a live durable row is not the same as *our* row.
+  // Another owner can reclaim an expired lease and leave it nonterminal, and a
+  // cached epoch would still claim ownership — so the placement gets recorded,
+  // the save then fails on the epoch, and the worker leaks out through the
+  // generic ownership-lost path instead of orphan cleanup.
+  it('releases a late placement when another owner reclaimed the lifecycle (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-late-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const gate = Promise.withResolvers<void>()
+    class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        await gate.promise
+        return super.spawn(input)
+      }
+    }
+    const fleet = new HangingSpawnFleetClient()
+    const factory = createFactory(config({
+      batchSize: 1,
+      // Both deadlines far away: the takeover is the only thing that can end
+      // this dispatch, so nothing else can explain the release.
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 60 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient({ [issuePath(318)]: issueFile(318) }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(318), issueFile(318)))
+      const key = issueKey(decision.issue)
+      const dispatched = factory.dispatch(decision)
+
+      const claimed = await vi.waitFor(async () => {
+        const lifecycle = await state().getDispatchLifecycle('factory-test', key)
+        expect(lifecycle).toMatchObject({ phase: 'dispatching' })
+        return lifecycle!
+      }, { timeout: 6_000 })
+
+      // Another owner reclaims the row once this process's lease has lapsed.
+      // Claiming on a future clock is what lets it past the live-lease guard.
+      const takeover = await state().claimDispatchLifecycle(
+        'factory-test', key, claimed, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
+      )
+      expect(takeover.acquired).toBe(true)
+
+      gate.resolve()
+      await expect(dispatched).rejects.toThrow(/was released while .* was still spawning/)
+      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+        name: 'ar-318-impl-pear',
+        reason: 'dispatch-released-before-placement',
+      }), { timeout: 8_000 })
+      expect(factory.status().counters.lateSpawnPlacementsReleased).toBeGreaterThanOrEqual(1)
+    } finally {
+      gate.resolve()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
   // sight would convert a wedge into a dispatch race.
