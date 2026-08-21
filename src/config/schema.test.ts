@@ -32,6 +32,10 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.dispatch).toEqual({
       errorCooldownMs: 60_000,
       maxAttempts: 2,
+      // Much shorter than the placed-agent hold: a slot-occupying lifecycle
+      // that never placed an agent has nothing that can move it (#303).
+      agentlessHoldTimeoutMs: 30 * 60_000,
+      capacityWaitWarnMs: 30 * 60_000,
       agentHoldTimeoutMs: 4 * 60 * 60_000,
     })
     expect(parsed.fleetHealth).toEqual({

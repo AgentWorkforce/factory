@@ -409,6 +409,7 @@ const validDispatchLifecycle = (value: unknown): value is DispatchLifecycle => i
   Array.isArray(value.agents) && value.agents.every(validDispatchLifecycleAgent) &&
   Array.isArray(value.invocationIds) && value.invocationIds.every((id) => typeof id === 'string') &&
   validNumber(value.updatedAtMs) && validOptionalNumber(value.heldSinceAtMs) &&
+  validOptionalNumber(value.slotHeldSinceAtMs) &&
   validOptionalString(value.releaseReason) &&
   (value.lease === undefined || validLifecycleLease(value.lease)) &&
   (value.result === undefined || validDispatchResult(value.result)) &&

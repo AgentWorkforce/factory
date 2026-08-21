@@ -1293,6 +1293,14 @@ async function factoryStatusWithMountHealth(
   const fleetControlPlane = liveness.ok
     ? heartbeat?.fleetControlPlane
     : observableStatus.fleetControlPlane
+  // Same rule as readinessReconcile (#303): a live daemon owns the batch, and
+  // a fresh local Factory instance holds no lifecycles. Falling back to that
+  // instance when a live daemon predates the field would publish its empty
+  // view as "the batch is free" — the exact misreport this exists to prevent,
+  // so an older daemon reports nothing here instead (#303 review, cubic).
+  const dispatchCapacity = liveness.ok
+    ? heartbeat?.dispatchCapacity
+    : observableStatus.dispatchCapacity
   const eventListener = liveness.ok
     ? heartbeat?.eventListener ?? {
       state: 'unknown' as const,
@@ -1311,6 +1319,7 @@ async function factoryStatusWithMountHealth(
     eventListener,
     readinessReconcile,
     fleetControlPlane,
+    ...(dispatchCapacity ? { dispatchCapacity } : {}),
   }
   return {
     ...observableStatus,
@@ -1320,6 +1329,7 @@ async function factoryStatusWithMountHealth(
     eventListener,
     readinessReconcile,
     fleetControlPlane,
+    ...(dispatchCapacity ? { dispatchCapacity } : {}),
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),
     ...(health.localDir ? { localMountRoot: health.localDir } : {}),

@@ -263,6 +263,29 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       verdict: 'not dispatching: the daemon is not listening for Relayfile events.',
     }
   }
+  // #303. A wedged batch is the one dispatch-gating condition that fails
+  // without failing: nothing throws, no counter moves, and every other line in
+  // this report reads green while no issue can be promoted out of `queued`.
+  const capacity = health.dispatchCapacity
+  if (capacity?.state === 'stalled') {
+    const agentless = capacity.agentlessOccupants ?? 0
+    return {
+      dispatching: false,
+      verdict:
+        // `longestWaitMs` is the oldest *queue* wait, not how long the slots
+        // have been held; saying otherwise sends an operator looking for an
+        // occupant that has been there that long (#303 review, cubic).
+        `not dispatching: ${capacity.waiting} issue(s) have been waiting for batch capacity for up ` +
+        `to ${formatDuration(capacity.longestWaitMs)}, with ${capacity.active}/${capacity.batchSize} ` +
+        'slot(s) occupied' +
+        (agentless > 0
+          ? `. ${agentless} occupied slot(s) never placed an agent and are past the ` +
+            `${formatDuration(capacity.agentlessHoldTimeoutMs)} reap deadline, so they cannot finish ` +
+            'on their own'
+          : '') +
+        '. Pass --token to read /evidence for the issues holding the slots.',
+    }
+  }
   if (health.status === 'unknown') {
     return {
       dispatching: false,
@@ -443,6 +466,22 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       lines.push(`    lastStartedAt      : ${formatInstant(readiness.lastStartedAtMs)}`)
       lines.push(`    lastCompletedAt    : ${formatInstant(readiness.lastCompletedAtMs)}`)
       lines.push(`    lastFailureAt      : ${formatInstant(readiness.lastFailureAtMs)}`)
+    }
+    const capacity = health.dispatchCapacity
+    if (capacity) {
+      lines.push('  dispatchCapacity:')
+      lines.push(`    state              : ${capacity.state}`)
+      lines.push(`    slots              : ${capacity.active}/${capacity.batchSize} occupied`)
+      lines.push(`    waiting            : ${capacity.waiting} issue(s)`)
+      lines.push(
+        `    longest queue wait : ${formatDuration(capacity.longestWaitMs)} (warn past ${formatDuration(capacity.waitWarnMs)})`,
+      )
+      if (capacity.agentlessOccupants !== undefined) {
+        lines.push(
+          `    unreaped wedges    : ${capacity.agentlessOccupants} occupied slot(s) never placed an ` +
+          `agent and are past the ${formatDuration(capacity.agentlessHoldTimeoutMs)} reap deadline`,
+        )
+      }
     }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)
   } else if (diagnosis.unreadable) {

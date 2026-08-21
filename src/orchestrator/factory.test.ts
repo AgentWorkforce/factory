@@ -28,7 +28,7 @@ import {
   type TriageEngine,
   type WorkflowRunnerInput,
 } from '../index'
-import { changeEventPath } from './factory'
+import { LatePlacementReleasedError, changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
@@ -5449,9 +5449,44 @@ describe('FactoryLoop', () => {
       expect(fleet.spawns).toEqual([])
     })
 
+    // #303 review (factory-lead). The never-placed deadline releases a dispatch
+    // whose spawn is still in flight, and it does so precisely under slow
+    // spawns — the condition it exists for — so a degraded fleet produces the
+    // race repeatedly, not once. Left unclassified, five in a row would trip
+    // the #292 fuse and abort the whole readiness pass: a bounded slot traded
+    // for a stopped sweep, which from outside is the same outage again.
+    it('does not abort the pass when late-placement releases repeat (#303)', async () => {
+      const numbers = [81, 82, 83, 84, 85, 86, 87]
+      const paths = numbers.map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new FakeMountClient(Object.fromEntries(
+        paths.map((path, index) => [path, githubIssueFile(numbers[index]!, { labels: ['factory', 'pear'] })]),
+      ))
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new FailingTriage(() => new LatePlacementReleasedError('AR-81', 'ar-81-impl-pear')),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      // Seven consecutive, well past UNCLASSIFIED_DISPATCH_FAILURE_LIMIT, with
+      // no successful dispatch in between to reset the counter.
+      const report = await factory.runOnce()
+
+      expect(report.skipped).toHaveLength(numbers.length)
+      expect(report.skipped[0]).toMatchObject({
+        reason: 'dispatch released while its agent was still spawning',
+      })
+      expect(factory.status().counters.dispatchItemsSkippedUndispatchable).toBe(numbers.length)
+      // Stays out of `counters.errors` and out of the unexplained-fault bucket.
+      expect(factory.status().counters.dispatchItemFailuresSkipped).toBeUndefined()
+      expect(fleet.spawns).toEqual([])
+    })
+
     // Must-not-fire control. A pass-wide fault that arrives disguised as a
     // string of per-item faults must still surface as a failed pass rather
-    // than a green report full of skips.
+    // than a green report full of skips. This is the #292 fuse, and the test
+    // above must not have disabled it (#303 review, factory-lead).
     it('still aborts the pass once unclassified per-item failures repeat', async () => {
       const paths = [71, 72, 73, 74, 75, 76].map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
       const mount = new FakeMountClient(Object.fromEntries(
@@ -8223,7 +8258,9 @@ describe('FactoryLoop', () => {
       await first.stop()
       await rm(root, { recursive: true, force: true })
     }
-  })
+    // The fixed 2.2 s observation plus the 4 s wait always exceeded vitest's
+    // 5 s default, so this only ever passed because the wait resolved early.
+  }, 30_000)
 
   it('enforces one global durable slot across concurrent same-host control-plane processes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-global-capacity-'))
@@ -10851,6 +10888,606 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  // #303: a lifecycle that reached a slot-occupying phase and never had a
+  // live agent placement has no `heldSinceAtMs`, so both halves of the
+  // held-agent reaper skipped it. With batchSize 1 that one row held the only
+  // slot forever and every other issue spun at 1 Hz in `queued`.
+  for (const variant of [
+    { label: 'never recorded an agent', wedged: 303, queued: 304, planned: false },
+    { label: 'recorded a planned agent that never spawned', wedged: 308, queued: 309, planned: true },
+  ]) {
+    it(`reaps a slot-holding lifecycle that ${variant.label} so a queued issue can dispatch (#303)`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-agentless-slot-'))
+      const watchStatePath = join(root, 'state.json')
+      const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+      const wedgedIssue = parseLinearIssue(issuePath(variant.wedged), issueFile(variant.wedged))
+      const seed = createFactory(config({ batchSize: 1 }), {
+        mount: new FakeMountClient({ [issuePath(variant.wedged)]: issueFile(variant.wedged) }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      const wedgedDecision = await seed.triageIssue(wedgedIssue)
+      await seed.stop()
+
+      // The wedged row: promoted into `dispatching`, then the owner died
+      // before any placement succeeded. Its issue is deliberately absent from
+      // the replacement's mount, so nothing the resume driver can do will ever
+      // move it forward.
+      const plannedSpec = wedgedDecision.implementers[0]!
+      const wedged: DispatchLifecycle = {
+        runId: 'wedged-run',
+        issue: { ...wedgedDecision.issue },
+        decision: wedgedDecision,
+        dryRun: false,
+        phase: 'dispatching',
+        agents: variant.planned
+          ? [{ name: plannedSpec.name, tracked: { spec: { ...plannedSpec } } }]
+          : [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      }
+      const wedgedKey = issueKey(wedgedDecision.issue)
+      await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
+      const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
+      expect(seeded?.phase).toBe('dispatching')
+      expect(seeded?.heldSinceAtMs).toBeUndefined()
+      expect(seeded?.agents).toHaveLength(variant.planned ? 1 : 0)
+
+      // A real broker rejects a release for a name it never issued. If the
+      // reaper asked for one, the cleanup would fail and re-arm forever,
+      // trading the wedge for a quieter one.
+      class StrictReleaseFleetClient extends RemoteLifecycleFleetClient {
+        override async release(name: string, reason?: string): Promise<void> {
+          if (!this.spawns.some((spawn) => spawn.name === name)) {
+            throw new Error(`unknown agent ${name}`)
+          }
+          await super.release(name, reason)
+        }
+      }
+      const fleet = new StrictReleaseFleetClient()
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+      const factory = createFactory(config({
+        batchSize: 1,
+        // The ordinary held-agent deadline stays far away: only the
+        // never-placed deadline can explain a release here.
+        dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+        loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+      }), {
+        mount: new FakeMountClient({ [issuePath(variant.queued)]: issueFile(variant.queued) }),
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        logger,
+      })
+      try {
+        await factory.start({ mode: 'backfill-and-subscribe' })
+
+        await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', wedgedKey))
+          .toMatchObject({ phase: 'abandoned', releaseReason: 'agentless-slot-past-deadline' }), { timeout: 8_000 })
+        expect(logger.warn).toHaveBeenCalledWith(
+          '[factory] releasing a dispatch lifecycle that never placed an agent',
+          expect.objectContaining({
+            issue: `AR-${variant.wedged}`,
+            phase: 'dispatching',
+            holdTimeoutMs: 1_000,
+          }),
+        )
+        await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
+          .toEqual([`ar-${variant.queued}-impl-pear`, `ar-${variant.queued}-review`]), { timeout: 8_000 })
+        expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBe(1)
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
+  // #303 review (CodeRabbit): the sweep re-reads the durable row before tearing
+  // anything down, so it must also *classify* from it. Reading the stale
+  // in-memory record instead relabels a team that did run as never-placed —
+  // which excludes its agents from the release and leaks live workers.
+  it('classifies a release from the durable row when the in-flight record lags a placement (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-durable-classification-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(310)]: issueFile(310) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decision = await seed.triageIssue(parseLinearIssue(issuePath(310), issueFile(310)))
+    await seed.stop()
+
+    const plannedSpec = decision.implementers[0]!
+    const key = issueKey(decision.issue)
+    const wedged: DispatchLifecycle = {
+      runId: 'lagging-run',
+      issue: { ...decision.issue },
+      decision,
+      dryRun: false,
+      phase: 'dispatching',
+      agents: [{ name: plannedSpec.name, tracked: { spec: { ...plannedSpec } } }],
+      invocationIds: [],
+      updatedAtMs: 0,
+    }
+    // Claimed on the real clock so the never-placed deadline is still ahead
+    // while the durable row is patched below; the lease is already expired.
+    await state().claimDispatchLifecycle('factory-test', key, wedged, 'dead-owner', Date.now(), 1)
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 5_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      // AR-310 is unreadable here, so the resume driver keeps failing and
+      // `BatchTracker#restore` keeps handing back the same stale record.
+      mount: new FakeMountClient({}),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+
+      // Another owner placed the agent and stamped the hold. Only the durable
+      // row knows; this process still holds the never-placed record.
+      const document = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+        workspaces: Record<string, { dispatchLifecycles: Record<string, DispatchLifecycle> }>
+      }
+      const durable = document.workspaces['factory-test']!.dispatchLifecycles[key]!
+      durable.heldSinceAtMs = 0
+      durable.agents[0]!.tracked.result = {
+        name: plannedSpec.name,
+        sessionRef: 'session-310',
+        node: 'sf-mini',
+        locality: 'remote',
+      }
+      await writeFile(watchStatePath, JSON.stringify(document))
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 15_000 })
+      expect(fleet.releases).toContainEqual({ name: plannedSpec.name, reason: 'held-past-deadline' })
+      // The release reason and the release itself are the discriminators: read
+      // from the stale record this row is classified never-placed, which both
+      // relabels it and filters its agent out of the release entirely.
+      // `heldPastDeadlineReleases` is deliberately not asserted — the sweep
+      // only increments it when the abandon completes on that same pass, and
+      // this one does real agent teardown, so a slower pass finishes through
+      // `#scheduleAbandonedDispatchRetry` with the same durable outcome.
+      expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  // #303 review follow-up: the backoff must not outlive the condition it is
+  // damping. It exists to stop retries asking a question whose answer is not
+  // changing; a terminal lifecycle changes it, and a waiter with no local
+  // event to ride on has only this timer.
+  it('restarts the capacity backoff when a slot is released (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-capacity-backoff-reset-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mount = new FakeMountClient({
+      [issuePath(311)]: issueFile(311),
+      [issuePath(312)]: issueFile(312),
+      [issuePath(313)]: issueFile(313),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 311,
+        url: 'https://github.com/AgentWorkforce/pear/pull/311',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const waits: Array<{ issue: string; retryMs: number }> = []
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      warn: vi.fn((message: string, details?: Record<string, unknown>) => {
+        if (message === '[factory] durable dispatch is queued for batch capacity; retries remain active') {
+          waits.push({ issue: details!.issue as string, retryMs: details!.retryMs as number })
+        }
+      }),
+    }
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      for (const number of [311, 312, 313]) {
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+      }
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-311-impl-pear', 'ar-311-review'])
+
+      // Let the third issue climb its ladder past the base delay.
+      await vi.waitFor(() => expect(waits.filter((wait) => wait.issue === 'AR-313')
+        .some((wait) => wait.retryMs >= 4_000)).toBe(true), { timeout: 15_000 })
+
+      const beforeExit = waits.filter((wait) => wait.issue === 'AR-313').length
+      fleet.emitAgentExit('ar-311-impl-pear', 'exited')
+
+      // AR-312 takes the freed slot; AR-313 keeps waiting, but its ladder
+      // starts over at the base delay rather than staying parked behind the
+      // one it had already climbed.
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
+        .toContain('ar-312-impl-pear'), { timeout: 15_000 })
+      await vi.waitFor(() => expect(
+        waits.filter((wait) => wait.issue === 'AR-313').slice(beforeExit).map((wait) => wait.retryMs),
+      ).toContain(1_000), { timeout: 15_000 })
+      expect(factory.status().counters.dispatchCapacityBackoffResets).toBeGreaterThanOrEqual(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  // #303 review (cubic): the reset must be gated on the transition actually
+  // freeing a slot. A `queued` row going terminal — a queued issue abandoned at
+  // startup because its source went terminal — frees nothing, and waking every
+  // waiter for it re-creates the retry storm on an event that cannot have
+  // changed any of their answers.
+  it('does not restart the capacity backoff when a terminal row never held a slot (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-non-slot-terminal-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const seedMount = new FakeMountClient({
+      [issuePath(314)]: issueFile(314),
+      [issuePath(315)]: issueFile(315),
+      [issuePath(316)]: issueFile(316),
+    })
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: seedMount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decisions = new Map<number, TriageDecision>()
+    for (const number of [314, 315, 316]) {
+      decisions.set(number, await seed.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    }
+    await seed.stop()
+
+    const lifecycleFor = (
+      number: number,
+      phase: DispatchLifecycle['phase'],
+      agents: DispatchLifecycle['agents'],
+      heldSinceAtMs?: number,
+    ): DispatchLifecycle => ({
+      runId: `run-${number}`,
+      issue: { ...decisions.get(number)!.issue },
+      decision: decisions.get(number)!,
+      dryRun: false,
+      phase,
+      agents,
+      invocationIds: [],
+      ...(heldSinceAtMs !== undefined ? { heldSinceAtMs } : {}),
+      updatedAtMs: 0,
+    })
+
+    // Seeded in this order so adoption walks holder -> waiter -> abandoned row.
+    const holderSpec = decisions.get(314)!.implementers[0]!
+    const holder = lifecycleFor(314, 'running', [{
+      name: holderSpec.name,
+      tracked: {
+        spec: { ...holderSpec },
+        result: { name: holderSpec.name, sessionRef: 'session-314', node: 'sf-mini', locality: 'remote' },
+      },
+    }], Date.now())
+    const nowMs = Date.now()
+    await state().claimDispatchLifecycle('factory-test', issueKey(holder.issue), holder, 'dead-owner', nowMs, 1)
+    for (const number of [315, 316]) {
+      const queued = lifecycleFor(number, 'queued', [])
+      await state().claimDispatchLifecycle('factory-test', issueKey(queued.issue), queued, 'dead-owner', nowMs, 1)
+    }
+
+    // AR-316's source went terminal while it sat queued. Its read is delayed so
+    // AR-315's capacity wait is already registered when AR-316 is abandoned —
+    // without that, the map is empty and the reset is a no-op eitherway.
+    let delayTerminalRead = true
+    class SlowTerminalIssueMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === issuePath(316) && delayTerminalRead) {
+          delayTerminalRead = false
+          await new Promise((resolve) => setTimeout(resolve, 1_800))
+        }
+        return super.readFile(path)
+      }
+    }
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new SlowTerminalIssueMount({
+        [issuePath(314)]: issueFile(314),
+        [issuePath(315)]: issueFile(315),
+        [issuePath(316)]: issueFile(316, done),
+      }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(
+        await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(316)!.issue)),
+      ).toMatchObject({ phase: 'abandoned' }), { timeout: 15_000 })
+      // AR-314 still holds the only slot, so nothing was freed.
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(314)!.issue)))
+        .toMatchObject({ phase: 'running' })
+      // Establishes that a waiter really was parked at that moment — without
+      // this the assertion below passes vacuously.
+      expect(factory.status().counters.dispatchLifecycleCapacityWaits).toBeGreaterThanOrEqual(1)
+      expect(factory.status().counters.dispatchCapacityBackoffResets).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  // #303 review (CodeRabbit): the fresh dispatch path stamps the slot at its
+  // first `dispatching` save, but only armed the deadline after a placement
+  // succeeded. `#fleet.spawn` carries no mutation timeout by design, so a first
+  // attempt that hangs in an otherwise idle process held the slot with no timer
+  // that could ever fire — the #303 shape reached through dispatch rather than
+  // durable recovery.
+  it('reaps a first dispatch whose spawn never returns (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-fresh-dispatch-hang-'))
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath: join(root, 'state.json') })
+    const gate = Promise.withResolvers<void>()
+    class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        await gate.promise
+        return super.spawn(input)
+      }
+    }
+    const fleet = new HangingSpawnFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient({ [issuePath(317)]: issueFile(317) }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(317), issueFile(317)))
+      const key = issueKey(decision.issue)
+      // Nothing else is in flight, so no other record's deadline can sweep
+      // this one in by side effect.
+      const dispatched = factory.dispatch(decision).catch(() => undefined)
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'dispatching' }), { timeout: 6_000 })
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ releaseReason: 'agentless-slot-past-deadline' }), { timeout: 12_000 })
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] releasing a dispatch lifecycle that never placed an agent',
+        expect.objectContaining({ issue: 'AR-317', holdTimeoutMs: 1_000 }),
+      )
+
+      // The spawn now returns, long after the reaper released the lifecycle.
+      // That placement belongs to nothing, so it must be torn down rather than
+      // recorded onto a record the reaper has finished with (#303 review,
+      // cubic) — otherwise arming the deadline earlier trades a wedged slot
+      // for a leaked worker.
+      gate.resolve()
+      await dispatched
+      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+        name: 'ar-317-impl-pear',
+        reason: 'dispatch-released-before-placement',
+      }), { timeout: 8_000 })
+      expect(factory.status().counters.lateSpawnPlacementsReleased).toBeGreaterThanOrEqual(1)
+      // The terminal row is not resurrected by the late placement. It still
+      // carries the planned spec `recordPlanned` wrote before the spawn — that
+      // is a record of intent — but no spawn result was ever persisted onto it.
+      const terminal = await state().getDispatchLifecycle('factory-test', key)
+      expect(terminal).toMatchObject({ releaseReason: 'agentless-slot-past-deadline' })
+      expect(terminal?.agents.map((agent) => agent.tracked.result)).toEqual([undefined])
+      expect(terminal?.heldSinceAtMs).toBeUndefined()
+    } finally {
+      gate.resolve()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  // #303 review (cubic): a live durable row is not the same as *our* row.
+  // Another owner can reclaim an expired lease and leave it nonterminal, and a
+  // cached epoch would still claim ownership — so the placement gets recorded,
+  // the save then fails on the epoch, and the worker leaks out through the
+  // generic ownership-lost path instead of orphan cleanup.
+  it('releases a late placement when another owner reclaimed the lifecycle (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-late-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const gate = Promise.withResolvers<void>()
+    class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        await gate.promise
+        return super.spawn(input)
+      }
+    }
+    const fleet = new HangingSpawnFleetClient()
+    const factory = createFactory(config({
+      batchSize: 1,
+      // Both deadlines far away: the takeover is the only thing that can end
+      // this dispatch, so nothing else can explain the release.
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 60 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient({ [issuePath(318)]: issueFile(318) }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(318), issueFile(318)))
+      const key = issueKey(decision.issue)
+      const dispatched = factory.dispatch(decision)
+
+      const claimed = await vi.waitFor(async () => {
+        const lifecycle = await state().getDispatchLifecycle('factory-test', key)
+        expect(lifecycle).toMatchObject({ phase: 'dispatching' })
+        return lifecycle!
+      }, { timeout: 6_000 })
+
+      // Another owner reclaims the row once this process's lease has lapsed.
+      // Claiming on a future clock is what lets it past the live-lease guard.
+      const takeover = await state().claimDispatchLifecycle(
+        'factory-test', key, claimed, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
+      )
+      expect(takeover.acquired).toBe(true)
+
+      gate.resolve()
+      await expect(dispatched).rejects.toThrow(/was released while .* was still spawning/)
+      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+        name: 'ar-318-impl-pear',
+        reason: 'dispatch-released-before-placement',
+      }), { timeout: 8_000 })
+      expect(factory.status().counters.lateSpawnPlacementsReleased).toBeGreaterThanOrEqual(1)
+    } finally {
+      gate.resolve()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
+  // and the first `recordSpawn` legitimately has zero agents. Reaping it on
+  // sight would convert a wedge into a dispatch race.
+  it('does not reap a lifecycle still inside its promote-to-spawn window (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-agentless-window-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const gate = Promise.withResolvers<void>()
+    class BlockedSpawnFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        await gate.promise
+        return super.spawn(input)
+      }
+    }
+    const fleet = new BlockedSpawnFleetClient()
+    const mount = new FakeMountClient({ [issuePath(305)]: issueFile(305) })
+    const factory = createFactory(config({
+      batchSize: 1,
+      // The ordinary held deadline is 1 s and would be long past by the time
+      // this assertion runs; the agent-less deadline is the one under test.
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), { mount, fleet, stateStore: state(), triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(305), issueFile(305)))
+      const key = issueKey(decision.issue)
+      const dispatched = factory.dispatch(decision)
+
+      // `recordPlanned` writes the spec before the spawn returns, so the row
+      // carries an agent with no result and still has no `heldSinceAtMs` --
+      // the same "never placed" shape the reaper must bound.
+      await vi.waitFor(async () => {
+        const pending = await state().getDispatchLifecycle('factory-test', key)
+        expect(pending?.phase).toBe('dispatching')
+        expect(pending?.heldSinceAtMs).toBeUndefined()
+        expect(pending?.agents.map((agent) => agent.tracked.result)).toEqual([undefined])
+      }, { timeout: 4_000 })
+      // Well past `agentHoldTimeoutMs`, nowhere near `agentlessHoldTimeoutMs`.
+      await new Promise((resolve) => setTimeout(resolve, 2_500))
+      expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'dispatching' })
+      expect(fleet.releases).toEqual([])
+      expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBeUndefined()
+
+      gate.resolve()
+      await dispatched
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-305-impl-pear', 'ar-305-review'])
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+    } finally {
+      gate.resolve()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // #303 deliverable 2/3: the capacity wait re-armed at a flat 1 Hz forever and
+  // logged once per key, so an operator saw a healthy, idle-looking Factory.
+  it('backs off and keeps reporting a dispatch capacity wait instead of spinning silently (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-capacity-wait-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mount = new FakeMountClient({
+      [issuePath(306)]: issueFile(306),
+      [issuePath(307)]: issueFile(307),
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const capacityWaits: Array<Record<string, unknown>> = []
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      warn: vi.fn((message: string, details?: unknown) => {
+        if (message === '[factory] durable dispatch is queued for batch capacity; retries remain active') {
+          capacityWaits.push(details as Record<string, unknown>)
+        }
+      }),
+    }
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      const running = await factory.triageIssue(parseLinearIssue(issuePath(306), issueFile(306)))
+      const waiting = await factory.triageIssue(parseLinearIssue(issuePath(307), issueFile(307)))
+      await factory.dispatch(running)
+      await factory.dispatch(waiting)
+      expect(await state().getDispatchLifecycle('factory-test', issueKey(waiting.issue)))
+        .toMatchObject({ phase: 'queued' })
+
+      // Deliverable 2: the wait escalates instead of going silent after one
+      // log, and each re-arm is longer than the last.
+      await vi.waitFor(() => expect(capacityWaits.length).toBeGreaterThanOrEqual(3), { timeout: 12_000 })
+      expect(capacityWaits.map((entry) => entry.retryMs).slice(0, 3)).toEqual([1_000, 2_000, 4_000])
+      expect(capacityWaits.every((entry) => (entry.retryMs as number) <= 30_000)).toBe(true)
+      expect(capacityWaits[2]!.waitedMs as number).toBeGreaterThan(capacityWaits[0]!.waitedMs as number)
+      expect(capacityWaits[2]!.occupiedBy).toEqual(['AR-306'])
+
+      // Deliverable 3: batch occupancy is on the operator surface rather than
+      // only in a log line that fires once.
+      const capacity = factory.status().dispatchCapacity
+      expect(capacity).toMatchObject({
+        batchSize: 1,
+        active: 1,
+        waiting: 1,
+        agentlessHoldTimeoutMs: 30 * 60_000,
+      })
+      expect(capacity?.longestWaitMs).toBeGreaterThan(0)
+      expect(capacity?.occupants).toEqual([
+        expect.objectContaining({ issue: 'AR-306', phase: 'running', agents: 2 }),
+      ])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   it('stop releases each in-flight factory-dispatched agent', async () => {
     const mount = new FakeMountClient({ [issuePath(60)]: issueFile(60) })
@@ -21515,6 +22152,13 @@ describe('FactoryLoop PR babysitter', () => {
         reason: 'superseded-pr-receipt',
       }))
       expect(factory.status().counters.supersededBabysittersReleased).toBe(1)
+      // #303 review (codex): admission stops counting a lifecycle once every
+      // implementer repo is babysat, so the reported occupancy has to stop
+      // counting it too. Reporting it would name a slot that is not blocking
+      // anything — and with batchSize 1, `active: 1` here is a claim the
+      // store's own predicate contradicts.
+      expect(factory.status().dispatchCapacity).toMatchObject({ batchSize: 1, active: 0, waiting: 0 })
+      expect(factory.status().dispatchCapacity?.occupants).toBeUndefined()
     } finally {
       await factory.stop()
     }

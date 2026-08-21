@@ -4,7 +4,6 @@ import { dirname, join } from 'node:path'
 
 import lockfile from 'proper-lockfile'
 
-import { githubRepositoriesMatch } from '../github/repo-identity'
 import type {
   BabysitterGenerationRecord,
   BabysitterSessionState,
@@ -24,6 +23,7 @@ import type {
 } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
 import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
+import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
 import type {
   PersistedWorkspaceState,
   WatchStateDocument,
@@ -259,6 +259,10 @@ export class DocumentStateStore extends InMemoryStateStore {
         : (lifecycle.lease?.epoch ?? 0) + 1
       lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
       lifecycle.updatedAtMs = nowMs
+      // Rows written before #303 carry no slot anchor. Claim is where a
+      // process first takes responsibility for one, so it is also where the
+      // never-placed clock starts for a pre-existing wedge.
+      stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
       await this.#persist(document)
       return {
         key,
@@ -310,6 +314,7 @@ export class DocumentStateStore extends InMemoryStateStore {
       ) return false
       lifecycle.phase = 'dispatching'
       lifecycle.updatedAtMs = nowMs
+      stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
       await this.#persist(document)
       return true
     }))
@@ -348,6 +353,7 @@ export class DocumentStateStore extends InMemoryStateStore {
       const next = cloneLifecycle(lifecycle)
       next.lease = { ...current.lease }
       next.updatedAtMs = nowMs
+      stampDispatchLifecycleSlot(next, current, nowMs)
       workspace!.dispatchLifecycles[key] = next
       await this.#persist(document)
       return true
@@ -1394,25 +1400,6 @@ const dispatchLifecycleLeaseMatches = (
 
 const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecycle>, exceptKey?: string): number =>
   Object.entries(lifecycles).filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
-
-const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
-  lifecycle.phase !== 'queued' &&
-  lifecycle.phase !== 'waiting-for-human' &&
-  lifecycle.phase !== 'releasing' &&
-  lifecycle.phase !== 'complete' &&
-  lifecycle.phase !== 'abandoned' &&
-  !dispatchLifecycleHandedOffToBabysitters(lifecycle)
-
-const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean => {
-  const implementerRepos = [...new Set(lifecycle.decision.implementers.map((spec) => spec.repo))]
-  if (implementerRepos.length === 0) return false
-  const babysitterRepos = lifecycle.agents
-    .filter((agent) => agent.tracked.spec.role === 'babysitter')
-    .map((agent) => agent.tracked.spec.ownedPullRequest?.repo)
-    .filter((repo): repo is string => Boolean(repo))
-  return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
-    githubRepositoriesMatch(repo, ownedRepo)))
-}
 
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},

@@ -146,6 +146,8 @@ export interface FactoryLoopHeartbeat {
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
   readinessReconcile?: FactoryReadinessReconcileStatus
+  /** Batch-slot admission: a full batch is why dispatch stops without failing (#303). */
+  dispatchCapacity?: FactoryDispatchCapacityStatus
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
   /**
@@ -217,6 +219,78 @@ export interface FactoryPublicReadinessReconcileHealth {
   lastErrorClass?: string
 }
 
+/**
+ * A lifecycle currently holding one of the `batchSize` slots (#303).
+ *
+ * `agents` and `slotHeldForMs` together are what separate ordinary
+ * backpressure from a wedge: a slot held for hours by a row that never placed
+ * an agent is the shape that produced a total dispatch outage.
+ */
+export interface FactoryDispatchSlotOccupant {
+  issue: string
+  phase?: DispatchLifecyclePhase
+  /** Entries recorded on the lifecycle, including planned-but-unspawned. */
+  agents: number
+  /**
+   * Entries that actually reached a spawn result.
+   *
+   * `agents` counts specs: `BatchTracker#recordPlanned` writes one before the
+   * spawn returns. Zero here with a slot held is the wedge signature.
+   */
+  placedAgents: number
+  /** Since the first successful placement, when there has been one. */
+  heldForMs?: number
+  /** Since the row took the batch slot, whether or not it ever placed an agent. */
+  slotHeldForMs?: number
+}
+
+/**
+ * Batch admission as an operator-readable fact (#303).
+ *
+ * `promoteDispatchLifecycle` is a silent predicate: it returns `false`, never
+ * throws, and the caller swallows the result into a retry. A full batch was
+ * therefore indistinguishable from an idle Factory on every surface an
+ * operator could reach. This is that predicate, published.
+ */
+export interface FactoryDispatchCapacityStatus {
+  batchSize: number
+  /** Lifecycles occupying a slot right now. */
+  active: number
+  /** Lifecycles waiting on capacity right now. */
+  waiting: number
+  /** Wall-clock wait past which the wait is treated as dispatch-gating. */
+  waitWarnMs: number
+  /** Deadline after which a slot that never placed an agent should have been reaped. */
+  agentlessHoldTimeoutMs: number
+  longestWaitMs?: number
+  occupants?: FactoryDispatchSlotOccupant[]
+  /** Issue keys waiting on capacity, longest wait first. */
+  waitingIssues?: string[]
+}
+
+/** Batch occupancy, redacted for the unauthenticated surface (#303). */
+export interface FactoryPublicDispatchCapacityHealth {
+  state: 'healthy' | 'waiting' | 'stalled'
+  batchSize: number
+  active: number
+  waiting: number
+  waitWarnMs: number
+  agentlessHoldTimeoutMs: number
+  longestWaitMs?: number
+  /**
+   * Occupied slots that never placed an agent **and** are already past the
+   * deadline that should have reaped them.
+   *
+   * Deliberately not "has no agent yet": `recordPlanned` writes a spec before
+   * the spawn returns, so every healthy dispatch is agent-less for as long as
+   * its spawn takes — minutes, for a cloud placement. Counting that would make
+   * the wedge signature read 1 continuously on a single-slot batch that is
+   * working perfectly (#303 review, cubic). Past the deadline, no healthy
+   * dispatch is still here.
+   */
+  agentlessOccupants?: number
+}
+
 export interface FactoryPublicEventListenerHealth {
   state: FactoryEventListenerStatus['state']
 }
@@ -269,6 +343,7 @@ export interface FactoryPublicHealth {
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
+  dispatchCapacity?: FactoryPublicDispatchCapacityHealth
 }
 
 export interface FactoryInFlightRegistryAgent {
@@ -416,6 +491,8 @@ export interface FactoryStatus {
   eventListener?: FactoryEventListenerStatus
   /** Periodic ready-issue backfill health as reported by the live daemon. */
   readinessReconcile?: FactoryReadinessReconcileStatus
+  /** Batch-slot admission, including which lifecycles hold the slots (#303). */
+  dispatchCapacity?: FactoryDispatchCapacityStatus
   /** Agents retained while their issue waits for its configured terminal state. */
   heldAgents?: FactoryHeldAgent[]
 }

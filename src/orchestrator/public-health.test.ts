@@ -32,6 +32,148 @@ function heartbeat(overrides: Partial<FactoryLoopHeartbeat> = {}): FactoryLoopHe
   }
 }
 
+describe('dispatch capacity health (#303)', () => {
+  const capacity = (overrides: Partial<NonNullable<FactoryLoopHeartbeat['dispatchCapacity']>> = {}) => heartbeat({
+    dispatchCapacity: {
+      batchSize: 1,
+      active: 1,
+      waiting: 3,
+      waitWarnMs: 30 * 60_000,
+      agentlessHoldTimeoutMs: 30 * 60_000,
+      longestWaitMs: 6 * 60 * 60_000,
+      // `recordPlanned` wrote a spec and the spawn never returned, so the row
+      // reports an agent and no placement — the shape the projection must not
+      // mistake for a healthy occupant (#303 review).
+      occupants: [{
+        issue: 'AR-303',
+        phase: 'dispatching',
+        agents: 1,
+        placedAgents: 0,
+        slotHeldForMs: 13 * 60 * 60_000,
+      }],
+      waitingIssues: ['AR-304', 'AR-305', 'AR-306'],
+      ...overrides,
+    },
+  })
+
+  it('reports a long capacity wait as a dispatch-gating degradation', () => {
+    const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
+
+    expect(health.dispatchCapacity).toEqual({
+      state: 'stalled',
+      batchSize: 1,
+      active: 1,
+      waiting: 3,
+      waitWarnMs: 30 * 60_000,
+      agentlessHoldTimeoutMs: 30 * 60_000,
+      longestWaitMs: 6 * 60 * 60_000,
+      agentlessOccupants: 1,
+    })
+    expect(health.degradedSubsystems).toContain('dispatchCapacity')
+    expect(health.status).toBe('degraded')
+    // Liveness must not move: recycling the container would destroy the
+    // evidence of the wedge and carry the durable lock into the replacement.
+    expect(health.ok).toBe(true)
+  })
+
+  // The wedge signature must not fire on a dispatch that is merely mid-spawn.
+  // `recordPlanned` writes the spec first, so every healthy dispatch has zero
+  // placements until its spawn returns — minutes, for a cloud placement.
+  it('does not count a dispatch still inside its spawn window as a wedge', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        occupants: [{
+          issue: 'AR-307',
+          phase: 'dispatching',
+          agents: 1,
+          placedAgents: 0,
+          slotHeldForMs: 90_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    // The wait itself is still reported: capacity is the outage signal here,
+    // and only the "cannot finish on its own" claim is withheld.
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+  })
+
+  // The reaper skips only while `nowMs < dueAtMs`, so it reaps AT the
+  // deadline. A strict `>` here would make the diagnostic disagree with the
+  // mechanism it reports on for that instant.
+  it('counts a never-placed slot that reached its reap deadline exactly', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        occupants: [{
+          issue: 'AR-303',
+          phase: 'dispatching',
+          agents: 1,
+          placedAgents: 0,
+          slotHeldForMs: 30 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.agentlessHoldTimeoutMs).toBe(30 * 60_000)
+    expect(health.dispatchCapacity?.agentlessOccupants).toBe(1)
+  })
+
+  it('survives a corrupted occupants collection rather than dropping the block', () => {
+    for (const occupants of ['not-an-array', null, [null], [42], [{ placedAgents: 0 }]]) {
+      const health = publicHealthFromHeartbeat(
+        capacity({ occupants: occupants as never }),
+        { nowMs: BOOT_MS + 1_000 },
+      )
+
+      expect(health.dispatchCapacity).toMatchObject({ state: 'stalled', waiting: 3 })
+      expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    }
+  })
+
+  it('keeps issue keys behind the authenticated surface', () => {
+    const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
+
+    expect(JSON.stringify(health)).not.toContain('AR-30')
+  })
+
+  it('treats an ordinary full batch as healthy backpressure', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({ longestWaitMs: 60_000 }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.state).toBe('waiting')
+    expect(health.degradedSubsystems).not.toContain('dispatchCapacity')
+    expect(health.status).toBe('ok')
+  })
+
+  it('re-derives the state when a remote record carries an unrecognised one', () => {
+    const normalized = normalizePublicHealth({
+      ...publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 }),
+      dispatchCapacity: {
+        state: 'catastrophically-fine',
+        batchSize: 1,
+        active: 1,
+        waiting: 3,
+        waitWarnMs: 30 * 60_000,
+        agentlessHoldTimeoutMs: 30 * 60_000,
+        longestWaitMs: 6 * 60 * 60_000,
+      },
+    })
+
+    expect(normalized?.dispatchCapacity?.state).toBe('stalled')
+  })
+
+  it('omits the block entirely for an instance that predates it', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS + 1_000 })
+
+    expect(health.dispatchCapacity).toBeUndefined()
+    expect(health.degradedSubsystems).not.toContain('dispatchCapacity')
+  })
+})
+
 describe('publicHealthFromHeartbeat (#295)', () => {
   it('carries the failure count and an allowlisted error class', () => {
     const health = publicHealthFromHeartbeat(
