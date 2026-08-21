@@ -82,6 +82,49 @@ const DEFAULT_EXIT_WATCH_INTERVAL_MS = 15_000
 // synthesize a false exit.
 const DEFAULT_NODE_OFFLINE_GRACE_MS = 90_000
 const DEFAULT_REGISTRATION_GRACE_MS = 60_000
+/**
+ * Compensating release for a placement Relay accepted after we stopped waiting.
+ *
+ * Giving up locally does not cancel a remote spawn: the engine may already have
+ * launched the worker. Without this the #306 bound would trade an infinite hang
+ * for a leaked agent — the same shape #304 fixed with `LatePlacementReleasedError`
+ * and `#releaseOrphanedLatePlacement` one layer up (#307 review, cubic).
+ */
+const LATE_PLACEMENT_RELEASE_REASON = 'late-placement-timeout'
+
+/** Distinguishes "the call outlived its budget" from any value the call returns. */
+const CALL_TIMED_OUT = Symbol('relay.placement.callTimedOut')
+
+type CallOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+/**
+ * A placement call that outlived the operation's remaining budget (#306).
+ *
+ * Deliberately **not** registered in `isClassifiedPerItemDispatchFailure`. The
+ * classified conditions are per-item and self-healing — the unit goes back to
+ * the queue and the next pass dispatches it. This one is neither. A placement
+ * that cannot reach a terminal status inside the ack budget is evidence about
+ * the fleet, not about the work unit: the node is gone, wedged, or running a
+ * broker that acks without launching. Retrying that against the same fleet
+ * produces the same timeout, so a run of them is a pass-wide fault and should
+ * trip the #292 fuse rather than be exempted from it.
+ *
+ * Classifying it would rebuild the outage in slow motion — instead of one
+ * sweep hung forever, an unbounded series of five-minute sweeps that never
+ * abort, never alert, and never dispatch. The fuse is the alarm; this error is
+ * meant to reach it.
+ */
+export class RelaySpawnAckTimeoutError extends Error {
+  readonly operation: string
+  readonly timeoutMs: number
+
+  constructor(operation: string, timeoutMs: number) {
+    super(`Relay placement timed out after ${timeoutMs}ms waiting for ${operation}`)
+    this.name = 'RelaySpawnAckTimeoutError'
+    this.operation = operation
+    this.timeoutMs = timeoutMs
+  }
+}
 
 export class RelayFleetClient implements FleetClient {
   readonly placementLocality = 'remote' as const
@@ -170,15 +213,24 @@ export class RelayFleetClient implements FleetClient {
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
-    const messaging = await this.#ensureMessaging()
+    // One budget for the whole placement: bootstrap, lifecycle registration,
+    // the placement call and every poll after it share it (#306). Anchoring it
+    // here rather than inside `#awaitInvocation` is what stops the time already
+    // spent from being free.
+    const deadlineAtMs = this.#operationDeadline()
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
     if (input.capability.startsWith('spawn:')) {
-      await this.#ensureLifecycleAction(messaging)
+      await this.#withinDeadline(
+        'lifecycle action registration',
+        deadlineAtMs,
+        () => this.#ensureLifecycleAction(messaging),
+      )
       // A transient startup registration failure may have torn down the first
       // subscription attempt. Re-arm it after the required action is durable so
       // the invocation cannot be accepted without a live Factory consumer.
       this.#ensureEventSubscription()
     }
-    const ack = await messaging.placement.spawn({
+    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: input.capability,
       // 'self' from the orchestrator means "no placement preference": let the
       // engine pick the least-loaded eligible node.
@@ -186,9 +238,37 @@ export class RelayFleetClient implements FleetClient {
       ...(input.repo ? { repo: input.repo } : {}),
       input: spawnActionInput(input),
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+      // An ack proves the engine accepted the dispatch, not that the node
+      // launched anything: a node advertising `spawn:<harness>` on an obsolete
+      // broker acks and launches nothing, and that is indistinguishable from a
+      // real spawn until someone reads the invocation back. `confirm` makes the
+      // SDK do that read, bounded, and fail as `spawn_unconfirmed` instead of
+      // handing us an ack we would wait on forever (#306).
+      confirm: true,
+      confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
+      confirmPollIntervalMs: this.#pollIntervalMs,
       log: this.#log,
-    })
-    const invocation = await this.#awaitInvocation(ack.actionName || 'spawn', ack)
+      // Giving up on the wait does not cancel the placement. If Relay accepts
+      // it after we have already reported failure, a worker is live that
+      // nothing is tracking — so release it (#307 review, cubic).
+    }), (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
+    // A confirmed placement already carries the terminal invocation. Polling
+    // for it again would spend the same budget twice over on a spawn that has
+    // already proven it launched.
+    let invocation: RelayActionInvocation
+    try {
+      invocation = ack.confirmation
+        ?? await this.#awaitInvocation(ack.actionName || 'spawn', ack, deadlineAtMs)
+    } catch (error) {
+      // Holding an ack means Relay accepted the placement, so running out of
+      // budget while polling leaves a worker we asked for and never adopted.
+      // This is the certain leak; the abandoned-placement case above is the
+      // possible one.
+      if (error instanceof RelaySpawnAckTimeoutError) {
+        await this.#releaseLatePlacement(input.name, ack)
+      }
+      throw error
+    }
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
     let acknowledgedNode: string
     try {
@@ -244,20 +324,29 @@ export class RelayFleetClient implements FleetClient {
   }
 
   async release(name: string, reason?: string): Promise<void> {
-    const messaging = await this.#ensureMessaging()
-    const ack = await messaging.commands.invoke('release', {
+    // `release` goes through `commands.invoke`, not `placement.spawn`, so the
+    // SDK's `confirm` cannot bound it — it needs the explicit budget (#306).
+    // An unbounded release is how the reaper's own teardown wedges.
+    const deadlineAtMs = this.#operationDeadline()
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('release invoke', deadlineAtMs, () => messaging.commands.invoke('release', {
       name,
       agent: name,
       ...(reason ? { reason } : {}),
-    })
-    await this.#awaitInvocation(ack.actionName || 'release', ack)
+    }))
+    await this.#awaitInvocation(ack.actionName || 'release', ack, deadlineAtMs)
     this.#tracked.delete(name)
     this.#syncExitWatcher()
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
-    const messaging = await this.#ensureMessaging()
-    const ack = await messaging.placement.spawn({
+    // Previews reach the same unbounded placement surface as agent spawns and
+    // need the same budget (#306). They keep the poll-based read-back rather
+    // than `confirm`: their failure semantics are the preview reaper's, not the
+    // dispatch fuse's, and bounding is what they were missing.
+    const deadlineAtMs = this.#operationDeadline()
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: 'preview:tailscale-serve',
       ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
       repo: input.repo,
@@ -275,32 +364,41 @@ export class RelayFleetClient implements FleetClient {
       },
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
       log: this.#log,
-    })
-    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    }))
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack, deadlineAtMs)
     return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId)
   }
 
   async removePreview(preview: PreviewReference): Promise<boolean> {
-    const messaging = await this.#ensureMessaging()
-    const ack = await messaging.placement.spawn({
+    const deadlineAtMs = this.#operationDeadline()
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: 'preview:tailscale-serve',
       ...(preview.node ? { node: preview.node } : {}),
       input: { operation: 'remove', preview },
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
       log: this.#log,
-    })
-    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+    }))
+    const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack, deadlineAtMs)
     return asRecord(invocation.output)?.removed === true
   }
 
   async reapPreviews(input: PreviewSweepInput): Promise<PreviewSweepResult> {
-    const messaging = await this.#ensureMessaging()
-    const nodes = (await this.roster()).nodes.filter((node) =>
+    const deadlineAtMs = this.#operationDeadline()
+    const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
+    // The roster is three unbounded reads (`agents.presence`, `agents.list`,
+    // `nodes.list`). Leaving it outside the budget left exactly the hang this
+    // change removes everywhere else: `#reapPreviewOrphans` keeps the sweep
+    // promise in `#previewSweepInFlight` and schedules the next sweep only from
+    // its `.finally()`, so one stalled read stops preview cleanup for good
+    // (#307 review, codex/coderabbit/cubic).
+    const roster = await this.#withinDeadline('preview roster', deadlineAtMs, () => this.roster())
+    const nodes = roster.nodes.filter((node) =>
       node.live && node.capabilities.includes('preview:tailscale-serve'),
     )
     const reports = await Promise.all(nodes.map(async (node): Promise<PreviewSweepResult> => {
       try {
-        const ack = await messaging.placement.spawn({
+        const ack = await this.#withinDeadline('preview placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
           capability: 'preview:tailscale-serve',
           node: node.name,
           input: {
@@ -311,8 +409,8 @@ export class RelayFleetClient implements FleetClient {
           },
           ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
           log: this.#log,
-        })
-        const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack)
+        }))
+        const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack, deadlineAtMs)
         const output = asRecord(invocation.output)
         return {
           reaped: Array.isArray(output?.reaped)
@@ -543,25 +641,160 @@ export class RelayFleetClient implements FleetClient {
     return registration.token
   }
 
-  async #awaitInvocation(actionName: string, ack: RelayActionInvocationAck): Promise<RelayActionInvocation> {
-    const messaging = await this.#ensureMessaging()
+  /** The wall-clock instant one placement operation must be finished by. */
+  #operationDeadline(): number {
+    return this.#now() + this.#spawnAckTimeoutMs
+  }
+
+  /**
+   * Await `call`, or give up on it once the operation's budget is spent.
+   *
+   * The Relay messaging surface takes no `AbortSignal`, so racing the wait is
+   * the only bound available — it abandons the *wait*, not the call. That is
+   * the whole point of #306: a deadline read only between calls cannot bound
+   * any of them. `#awaitInvocation` checked `Date.now() > deadline` at the top
+   * of its poll loop around an unbounded `commands.getInvocation`, so a read
+   * that never settled never returned control to the check. Production ran one
+   * readiness sweep for 62 minutes against a 5-minute bound.
+   *
+   * `remainingMs` comes from the shared deadline rather than a per-call
+   * constant, so many polls cost one budget between them instead of a fresh
+   * budget each. Rejection is folded into the outcome value so a slow call we
+   * stopped waiting on cannot later surface as an unhandled rejection.
+   *
+   * Takes a thunk rather than a promise so an exhausted budget refuses *before*
+   * the request is made. An already-started promise would mean the call had
+   * been sent — a mutating one, on the placement path — while this method was
+   * still deciding there was no time left to make it (#307 review, cubic).
+   */
+  async #withinDeadline<T>(
+    operation: string,
+    deadlineAtMs: number,
+    start: () => Promise<T>,
+    /**
+     * Called when the budget runs out with the call still in flight, receiving
+     * the abandoned work. Abandoning the *wait* does not cancel the *call*, so
+     * a mutating operation needs a way to clean up whatever it still lands.
+     */
+    onAbandoned?: (inFlight: Promise<CallOutcome<T>>) => void,
+  ): Promise<T> {
+    const remainingMs = deadlineAtMs - this.#now()
+    if (remainingMs <= 0) {
+      throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      // Folded to an outcome once, so the abandoned handler shares this promise
+      // rather than attaching a second rejection path to the same call.
+      const inFlight: Promise<CallOutcome<T>> = start().then(
+        (value) => ({ ok: true, value }) as const,
+        (error) => ({ ok: false, error }) as const,
+      )
+      const outcome = await Promise.race<CallOutcome<T> | typeof CALL_TIMED_OUT>([
+        inFlight,
+        new Promise<typeof CALL_TIMED_OUT>((resolve) => {
+          timer = setTimeout(() => resolve(CALL_TIMED_OUT), remainingMs)
+          timer.unref?.()
+        }),
+      ])
+      if (outcome === CALL_TIMED_OUT) {
+        onAbandoned?.(inFlight)
+        throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
+      }
+      if (outcome.ok) return outcome.value
+      throw outcome.error
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Release a worker whose placement Relay accepted after the local deadline.
+   *
+   * Tracked *before* the release is attempted so a failed cleanup is retried by
+   * the reconciliation loop instead of forgotten — the same retain-and-retry the
+   * `unverified-placement` path uses. Losing the release would leave a live
+   * worker outside Factory's lifecycle tracking.
+   */
+  async #releaseLatePlacement(name: string, ack: RelayActionInvocationAck & { placement?: { node?: string } }): Promise<void> {
+    const node = ack.placement?.node ?? ack.dispatchedNodeId
+    this.#track(name, {
+      invocationId: ack.invocationId,
+      ...(node ? { node } : {}),
+      pendingReleaseReason: LATE_PLACEMENT_RELEASE_REASON,
+    })
+    this.#log(`Releasing ${name}: Relay accepted its placement after the local deadline expired`)
+    try {
+      await this.release(name, LATE_PLACEMENT_RELEASE_REASON)
+    } catch (error) {
+      // Retained above, so reconciliation retries the idempotent release.
+      this.#log(`Failed to release late placement ${name}: ${errorMessage(error)}`)
+    }
+  }
+
+  /**
+   * Attach a compensating release to a placement we stopped waiting for.
+   *
+   * If the call ultimately fails, nothing was launched and there is nothing to
+   * release. If it succeeds, a worker exists that this process has already
+   * reported as failed, so it must be torn down.
+   */
+  #releaseAbandonedPlacement(
+    name: string,
+    inFlight: Promise<CallOutcome<RelayActionInvocationAck & { placement?: { node?: string } }>>,
+  ): void {
+    void inFlight.then(async (outcome) => {
+      if (!outcome.ok) return
+      await this.#releaseLatePlacement(name, outcome.value)
+    })
+  }
+
+  /**
+   * Poll an invocation to a terminal status inside `deadlineAtMs`.
+   *
+   * Callers that already spent part of the budget — `spawn` burns some on
+   * bootstrap and placement — pass their own deadline so the total stays
+   * bounded. A caller that omits it is starting a fresh operation (`release`,
+   * the preview paths) and gets a full budget of its own.
+   */
+  async #awaitInvocation(
+    actionName: string,
+    ack: RelayActionInvocationAck,
+    deadlineAtMs: number = this.#operationDeadline(),
+  ): Promise<RelayActionInvocation> {
+    const messaging = await this.#withinDeadline(
+      `${actionName} messaging bootstrap`,
+      deadlineAtMs,
+      () => this.#ensureMessaging(),
+    )
     let status = ack.status ?? 'pending'
     let invocation: RelayActionInvocation | undefined
-    const deadline = Date.now() + this.#spawnAckTimeoutMs
 
     while (!terminalStatuses.has(status)) {
-      if (Date.now() > deadline) {
-        throw new Error(`Timed out waiting for ${actionName} invocation ${ack.invocationId} to complete (last status: ${status})`)
+      if (this.#now() >= deadlineAtMs) {
+        throw new RelaySpawnAckTimeoutError(
+          `${actionName} invocation ${ack.invocationId} to complete (last status: ${status})`,
+          this.#spawnAckTimeoutMs,
+        )
       }
       if (!openStatuses.has(status)) {
         throw new Error(`Unexpected ${actionName} invocation ${ack.invocationId} status: ${status}`)
       }
-      await this.#sleep(this.#pollIntervalMs)
-      invocation = await messaging.commands.getInvocation(actionName, ack.invocationId)
+      // Never sleep past the deadline: that only buys one more pointless read.
+      await this.#sleep(Math.max(0, Math.min(this.#pollIntervalMs, deadlineAtMs - this.#now())))
+      invocation = await this.#withinDeadline(
+        `${actionName} invocation ${ack.invocationId}`,
+        deadlineAtMs,
+        () => messaging.commands.getInvocation(actionName, ack.invocationId),
+      )
       status = invocation.status || 'pending'
     }
 
-    invocation ??= await messaging.commands.getInvocation(actionName, ack.invocationId)
+    invocation ??= await this.#withinDeadline(
+      `${actionName} invocation ${ack.invocationId}`,
+      deadlineAtMs,
+      () => messaging.commands.getInvocation(actionName, ack.invocationId),
+    )
     if (status === 'failed' || status === 'denied') {
       throw new Error(`${actionName} invocation ${ack.invocationId} ${status}${invocation.error ? `: ${invocation.error}` : ''}`)
     }

@@ -29,6 +29,7 @@ import {
   type WorkflowRunnerInput,
 } from '../index'
 import { LatePlacementReleasedError, changeEventPath } from './factory'
+import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
@@ -788,6 +789,24 @@ class SpawnFailingFleetClient extends FakeFleetClient {
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     this.spawns.push(input)
     throw new Error('spawnPty failed: cwd does not exist')
+  }
+}
+
+/**
+ * A fleet whose placement never reaches a terminal ack inside the budget — the
+ * #306 production failure, once `RelayFleetClient` is able to give up on it.
+ */
+class SpawnAckTimingOutFleetClient extends FakeFleetClient {
+  override readonly durableOwnership = true
+  /** Times out only the agents of these issue keys; others spawn normally. */
+  readonly timeOutIssueKeys = new Set<string>()
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const wedged = this.timeOutIssueKeys.size === 0 ||
+      [...this.timeOutIssueKeys].some((key) => input.name.includes(`ar-${key}-`))
+    if (!wedged) return await super.spawn(input)
+    this.spawns.push(input)
+    throw new RelaySpawnAckTimeoutError(`spawn invocation ${input.name} to complete`, 300_000)
   }
 }
 
@@ -5503,6 +5522,68 @@ describe('FactoryLoop', () => {
       await expect(factory.runOnce())
         .rejects.toThrow(/unclassified dispatch failures without a successful dispatch/)
       expect(fleet.spawns).toEqual([])
+    })
+
+    /**
+     * #306. A spawn whose ack never reaches a terminal status now gives up on
+     * schedule instead of holding its batch slot forever. The pass must record
+     * that as a failure, free the slot, and carry on with the other units —
+     * the 62-minute production sweep did none of the three.
+     */
+    it('releases the batch slot and counts the failure when a spawn ack times out (#306)', async () => {
+      const mount = twoReadyIssues()
+      const fleet = new SpawnAckTimingOutFleetClient()
+      fleet.timeOutIssueKeys.add('59')
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      const report = await factory.runOnce()
+
+      // Counted as an unexplained fault, not waved through as a known
+      // per-item condition: the fleet could not place, and that is a fact
+      // about the fleet.
+      expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
+      expect(factory.status().counters.dispatchItemsSkippedUndispatchable).toBeUndefined()
+      expect(report.skipped.map((skip) => skip.issue.key)).toEqual(['59'])
+      // The public reason stays the sanitized generic form: `contextualError`
+      // wraps the spawn failure, and `telemetryErrorClass` reads the outer
+      // class. The timeout is identified by its counter, the fuse and the
+      // operator log rather than by the run report — widening the report's
+      // classification is a separate change from bounding the call.
+      expect(report.skipped[0]?.reason).toBe('dispatch failed (Error)')
+      // The slot the wedged unit took is free again: the next unit dispatches
+      // inside the same pass rather than queueing behind a hang.
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(factory.status().dispatchCapacity.waiting).toBe(0)
+    })
+
+    /**
+     * #306, and the justification for leaving `RelaySpawnAckTimeoutError`
+     * unclassified. Unlike a late-placement release, a spawn-ack timeout is not
+     * self-healing: retrying it against the same fleet times out again. A run
+     * of them is a pass-wide fault and must reach the #292 fuse, or the outage
+     * simply returns in five-minute instalments — every sweep failing, no sweep
+     * ever complaining.
+     */
+    it('lets repeated spawn-ack timeouts trip the #292 fuse (#306)', async () => {
+      const paths = [91, 92, 93, 94, 95, 96].map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new FakeMountClient(Object.fromEntries(
+        paths.map((path, index) => [path, githubIssueFile(91 + index, { labels: ['factory', 'pear'] })]),
+      ))
+      const fleet = new SpawnAckTimingOutFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      await expect(factory.runOnce())
+        .rejects.toThrow(/unclassified dispatch failures without a successful dispatch/)
     })
   })
 
