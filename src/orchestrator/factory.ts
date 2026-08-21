@@ -8436,7 +8436,7 @@ export class FactoryLoop implements Factory {
     // release it. Hand it straight to teardown instead.
     if (!await this.#dispatchLifecycleStillOwned(record)) {
       await this.#releaseOrphanedLatePlacement(record, spec, result)
-      throw new Error(`Dispatch lifecycle for ${record.issue.key} was released while ${spec.name} was still spawning`)
+      throw new LatePlacementReleasedError(record.issue.key, result.name ?? spec.name)
     }
     record.heldSinceAtMs ??= this.#clock.now()
     batch.recordSpawn(record, spec, invocationId, result)
@@ -20154,6 +20154,31 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
  * turns it into a distinct exit code — can recognize it by type rather than by
  * matching on `error.name`, and so tests can construct a genuine instance.
  */
+/**
+ * A placement that finished spawning after its dispatch had been released.
+ *
+ * The never-placed deadline (#303) can terminalize a lifecycle while
+ * `#fleet.spawn` is still in flight; the worker is released and the dispatch
+ * unwinds. That is a known, named, self-healing race — the issue returns to the
+ * queue and is re-dispatched — so it must be classified rather than counted as
+ * an unexplained fault. It fires precisely under slow spawns, which is the
+ * condition the deadline exists for, so a degraded fleet produces it
+ * repeatedly; left unclassified, five in a row would trip
+ * `UNCLASSIFIED_DISPATCH_FAILURE_LIMIT` and abort the whole readiness pass,
+ * turning a bounded slot into a stopped sweep (#303 review, factory-lead).
+ */
+export class LatePlacementReleasedError extends Error {
+  readonly issueKey: string
+  readonly agentName: string
+
+  constructor(issueKey: string, agentName: string) {
+    super(`Dispatch lifecycle for ${issueKey} was released while ${agentName} was still spawning`)
+    this.name = 'LatePlacementReleasedError'
+    this.issueKey = issueKey
+    this.agentName = agentName
+  }
+}
+
 export class LiveDispatchStateChangedError extends Error {
   readonly issueKey: string
 
@@ -20205,6 +20230,12 @@ const UNCLASSIFIED_DISPATCH_FAILURE_LIMIT = 5
 const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
   error instanceof LiveDispatchStateChangedError ||
   error instanceof DispatchLifecycleClaimRefusedError ||
+  // #303: the never-placed deadline released this dispatch while its spawn was
+  // still in flight. Named, expected and self-healing — the issue goes back to
+  // the queue — and it recurs under exactly the slow-spawn conditions the
+  // deadline exists for, so leaving it unclassified would let a degraded fleet
+  // trip the pass-abort fuse. Its own counters keep it visible.
+  error instanceof LatePlacementReleasedError ||
   // Relayfile shedding one operation is a state of the dependency, not an
   // unexplained fault, and it has its own fuse — see #297 and
   // DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT.
@@ -20240,6 +20271,7 @@ const perItemDispatchSkipReason = (error: unknown): string => {
   const overload = relayfileOverload(error)
   if (overload) return `relayfile overloaded (${relayfileOverloadReasonLabel(overload.reason)})`
   if (error instanceof LiveDispatchStateChangedError) return 'live state changed during dispatch'
+  if (error instanceof LatePlacementReleasedError) return 'dispatch released while its agent was still spawning'
   if (error instanceof DispatchLifecycleClaimRefusedError) {
     return error.refusal === 'terminal'
       ? 'dispatch lifecycle already terminal'

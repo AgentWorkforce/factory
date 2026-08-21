@@ -28,7 +28,7 @@ import {
   type TriageEngine,
   type WorkflowRunnerInput,
 } from '../index'
-import { changeEventPath } from './factory'
+import { LatePlacementReleasedError, changeEventPath } from './factory'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
@@ -5449,9 +5449,44 @@ describe('FactoryLoop', () => {
       expect(fleet.spawns).toEqual([])
     })
 
+    // #303 review (factory-lead). The never-placed deadline releases a dispatch
+    // whose spawn is still in flight, and it does so precisely under slow
+    // spawns — the condition it exists for — so a degraded fleet produces the
+    // race repeatedly, not once. Left unclassified, five in a row would trip
+    // the #292 fuse and abort the whole readiness pass: a bounded slot traded
+    // for a stopped sweep, which from outside is the same outage again.
+    it('does not abort the pass when late-placement releases repeat (#303)', async () => {
+      const numbers = [81, 82, 83, 84, 85, 86, 87]
+      const paths = numbers.map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
+      const mount = new FakeMountClient(Object.fromEntries(
+        paths.map((path, index) => [path, githubIssueFile(numbers[index]!, { labels: ['factory', 'pear'] })]),
+      ))
+      const fleet = new LocalLifecycleFleetClient()
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 5 }), {
+        mount,
+        fleet,
+        triage: new FailingTriage(() => new LatePlacementReleasedError('AR-81', 'ar-81-impl-pear')),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+
+      // Seven consecutive, well past UNCLASSIFIED_DISPATCH_FAILURE_LIMIT, with
+      // no successful dispatch in between to reset the counter.
+      const report = await factory.runOnce()
+
+      expect(report.skipped).toHaveLength(numbers.length)
+      expect(report.skipped[0]).toMatchObject({
+        reason: 'dispatch released while its agent was still spawning',
+      })
+      expect(factory.status().counters.dispatchItemsSkippedUndispatchable).toBe(numbers.length)
+      // Stays out of `counters.errors` and out of the unexplained-fault bucket.
+      expect(factory.status().counters.dispatchItemFailuresSkipped).toBeUndefined()
+      expect(fleet.spawns).toEqual([])
+    })
+
     // Must-not-fire control. A pass-wide fault that arrives disguised as a
     // string of per-item faults must still surface as a failed pass rather
-    // than a green report full of skips.
+    // than a green report full of skips. This is the #292 fuse, and the test
+    // above must not have disabled it (#303 review, factory-lead).
     it('still aborts the pass once unclassified per-item failures repeat', async () => {
       const paths = [71, 72, 73, 74, 75, 76].map((number) => githubIssuePath('AgentWorkforce', 'pear', number))
       const mount = new FakeMountClient(Object.fromEntries(
