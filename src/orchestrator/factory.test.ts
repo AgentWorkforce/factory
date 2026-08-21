@@ -11248,8 +11248,25 @@ describe('FactoryLoop', () => {
         expect.objectContaining({ issue: 'AR-317', holdTimeoutMs: 1_000 }),
       )
 
+      // The spawn now returns, long after the reaper released the lifecycle.
+      // That placement belongs to nothing, so it must be torn down rather than
+      // recorded onto a record the reaper has finished with (#303 review,
+      // cubic) — otherwise arming the deadline earlier trades a wedged slot
+      // for a leaked worker.
       gate.resolve()
       await dispatched
+      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+        name: 'ar-317-impl-pear',
+        reason: 'dispatch-released-before-placement',
+      }), { timeout: 8_000 })
+      expect(factory.status().counters.lateSpawnPlacementsReleased).toBeGreaterThanOrEqual(1)
+      // The terminal row is not resurrected by the late placement. It still
+      // carries the planned spec `recordPlanned` wrote before the spawn — that
+      // is a record of intent — but no spawn result was ever persisted onto it.
+      const terminal = await state().getDispatchLifecycle('factory-test', key)
+      expect(terminal).toMatchObject({ releaseReason: 'agentless-slot-past-deadline' })
+      expect(terminal?.agents.map((agent) => agent.tracked.result)).toEqual([undefined])
+      expect(terminal?.heldSinceAtMs).toBeUndefined()
     } finally {
       gate.resolve()
       await factory.stop()

@@ -8427,6 +8427,17 @@ export class FactoryLoop implements Factory {
           : 'agent_spawn_failed' as const,
       })
     }
+    // The never-placed deadline can fire while this spawn is in flight — that
+    // is the whole point of arming it before the first await, and it makes a
+    // late `spawn` result newly reachable (#303 review, cubic). By now the
+    // reaper may have fenced, released and terminalized the lifecycle, so this
+    // placement belongs to nothing: recording it would attach a live worker to
+    // a record the reaper has finished with, and nothing downstream would ever
+    // release it. Hand it straight to teardown instead.
+    if (!await this.#dispatchLifecycleStillOwned(record)) {
+      await this.#releaseOrphanedLatePlacement(record, spec, result)
+      throw new Error(`Dispatch lifecycle for ${record.issue.key} was released while ${spec.name} was still spawning`)
+    }
     record.heldSinceAtMs ??= this.#clock.now()
     batch.recordSpawn(record, spec, invocationId, result)
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
@@ -8436,6 +8447,56 @@ export class FactoryLoop implements Factory {
     const spawned = record.agents.get(result.name)
     if (spawned) await this.#reportAgent(record, spawned, 'agent.spawned')
     return { name: result.name }
+  }
+
+  /**
+   * Is this process still the owner of a lifecycle that is not already done?
+   *
+   * Cheap local checks first — a pending abandon reason, or a dropped epoch,
+   * both of which the reaper sets before anything durable is re-read — then the
+   * durable row, which is authoritative when another owner terminalized it.
+   */
+  async #dispatchLifecycleStillOwned(record: InFlightIssue): Promise<boolean> {
+    const key = issueKey(record.issue)
+    if (this.#abandonedDispatchReasons.has(key)) return false
+    if (!this.#usesDurableDispatchLifecycle()) return true
+    if (!this.#dispatchLifecycleEpochs.has(key)) return false
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    return Boolean(lifecycle) && !isTerminalDispatchLifecycle(lifecycle!)
+  }
+
+  /**
+   * Tear down a placement that landed after its lifecycle was already released.
+   *
+   * Deliberately not routed through `#abandonStuckDispatch`: that record is
+   * terminal and its batch entry is gone, so there is nothing left to abandon.
+   * The only thing that still exists is a live worker on the fleet.
+   */
+  async #releaseOrphanedLatePlacement(
+    record: InFlightIssue,
+    spec: AgentSpec,
+    result: SpawnResult,
+  ): Promise<void> {
+    const name = result.name ?? spec.name
+    this.#increment('lateSpawnPlacementsReleased')
+    this.#logger.warn?.('[factory] releasing an agent that finished spawning after its dispatch was released', {
+      issue: record.issue.key,
+      agent: name,
+      role: spec.role,
+    })
+    this.#fleet.markAgentTerminal?.(name, 'dispatch-released-before-placement')
+    try {
+      await this.#fleet.release(name, 'dispatch-released-before-placement')
+    } catch (error) {
+      // The reaper handoff owns anything this could not clean up; failing here
+      // would only replace a released worker with an unreleased one.
+      this.#increment('lateSpawnPlacementReleaseFailures')
+      this.#logger.warn?.('[factory] failed to release a late placement; leaving it to the orphan reaper', {
+        issue: record.issue.key,
+        agent: name,
+        error: describeError(error).errorMessage,
+      })
+    }
   }
 
   async #handleAgentExit(name: string, reason?: string): Promise<void> {
