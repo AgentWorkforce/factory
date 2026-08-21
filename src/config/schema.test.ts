@@ -85,6 +85,38 @@ describe('relay.agentName', () => {
     expect(loaded.factoryConfig.relay.agentName).toBe('factory-shared')
   })
 
+  // Both halves are validated before the merge, so a node override cannot
+  // launder an invalid shared value into a clean load on the hosts that
+  // override it.
+  it.each([
+    ['workspaceConfig', { relay: { agentName: '   ' } }, { relay: { agentName: 'factory-cloud' } }],
+    ['nodeConfig', { relay: { agentName: 'factory-shared' } }, { relay: { agentName: '   ' } }],
+  ])('rejects an invalid relay agent name in the %s half even when the other half is valid', (field, workspaceRelay, nodeRelay) => {
+    expect(() => loadFactoryConfig({
+      workspaceConfig: { repos: { default: 'AgentWorkforce/factory' }, ...workspaceRelay },
+      nodeConfig: nodeRelay,
+    })).toThrow(new RegExp(`${field} has an invalid relay config`))
+  })
+
+  // Pins existing `normalizeLoadedConfig` semantics rather than asserting an
+  // intent: both views are projected from the *merged* config, so the
+  // workspace-shaped view reports the effective identity, exactly as it already
+  // does for preview, cloneRoot, and clonePaths. Nothing serializes
+  // `workspaceConfig` back to a shared file today; this test fails loudly if
+  // that projection ever changes underneath a caller who starts to.
+  it('reports the effective identity on the workspace-shaped view after a node override', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.workspaceConfig.relay.agentName).toBe('factory-cloud')
+    expect(loaded.nodeConfig.relay.agentName).toBe('factory-cloud')
+  })
+
   it('rejects an unknown key under relay rather than ignoring a typo', () => {
     expect(() => FactoryConfigSchema.parse({
       repos: { byLabel: { pear: 'AgentWorkforce/pear' } },

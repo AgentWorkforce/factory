@@ -733,8 +733,14 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   const nodePreview = asOptionalConfigRecord(node.preview)
   const hasPreview = workspace.preview !== undefined || node.preview !== undefined
 
-  const workspaceRelay = asOptionalConfigRecord(workspace.relay)
-  const nodeRelay = asOptionalConfigRecord(node.relay)
+  // Each half is validated *before* the merge. A node half that overrides the
+  // identity otherwise discards an invalid workspace-half value without it ever
+  // reaching `relaySchema`, so a broken shared config would load clean on every
+  // host that happens to override it -- the silent acceptance this key exists
+  // to prevent. Mirrors validateClonePathSyntax, which validates both halves
+  // before node-local values take precedence.
+  const workspaceRelay = validateRelayHalf(workspace.relay, 'workspaceConfig')
+  const nodeRelay = validateRelayHalf(node.relay, 'nodeConfig')
   const hasRelay = workspace.relay !== undefined || node.relay !== undefined
 
   return {
@@ -759,6 +765,18 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
       clonePaths: node.clonePaths ?? workspaceRepos.clonePaths,
     },
   }
+}
+
+function validateRelayHalf(value: unknown, field: string): Record<string, unknown> {
+  const record = asOptionalConfigRecord(value)
+  const parsed = relaySchema.safeParse(record)
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${['relay', ...issue.path].join('.')}: ${issue.message}`)
+      .join('; ')
+    throw new Error(`${field} has an invalid relay config -- ${detail}`)
+  }
+  return record
 }
 
 function normalizePreviewConfig<T extends z.infer<typeof previewSchema>>(preview: T): T {
