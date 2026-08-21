@@ -82,6 +82,15 @@ const DEFAULT_EXIT_WATCH_INTERVAL_MS = 15_000
 // synthesize a false exit.
 const DEFAULT_NODE_OFFLINE_GRACE_MS = 90_000
 const DEFAULT_REGISTRATION_GRACE_MS = 60_000
+/**
+ * Compensating release for a placement Relay accepted after we stopped waiting.
+ *
+ * Giving up locally does not cancel a remote spawn: the engine may already have
+ * launched the worker. Without this the #306 bound would trade an infinite hang
+ * for a leaked agent — the same shape #304 fixed with `LatePlacementReleasedError`
+ * and `#releaseOrphanedLatePlacement` one layer up (#307 review, cubic).
+ */
+const LATE_PLACEMENT_RELEASE_REASON = 'late-placement-timeout'
 
 /** Distinguishes "the call outlived its budget" from any value the call returns. */
 const CALL_TIMED_OUT = Symbol('relay.placement.callTimedOut')
@@ -239,12 +248,27 @@ export class RelayFleetClient implements FleetClient {
       confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
       confirmPollIntervalMs: this.#pollIntervalMs,
       log: this.#log,
-    }))
+      // Giving up on the wait does not cancel the placement. If Relay accepts
+      // it after we have already reported failure, a worker is live that
+      // nothing is tracking — so release it (#307 review, cubic).
+    }), (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
     // A confirmed placement already carries the terminal invocation. Polling
     // for it again would spend the same budget twice over on a spawn that has
     // already proven it launched.
-    const invocation = ack.confirmation
-      ?? await this.#awaitInvocation(ack.actionName || 'spawn', ack, deadlineAtMs)
+    let invocation: RelayActionInvocation
+    try {
+      invocation = ack.confirmation
+        ?? await this.#awaitInvocation(ack.actionName || 'spawn', ack, deadlineAtMs)
+    } catch (error) {
+      // Holding an ack means Relay accepted the placement, so running out of
+      // budget while polling leaves a worker we asked for and never adopted.
+      // This is the certain leak; the abandoned-placement case above is the
+      // possible one.
+      if (error instanceof RelaySpawnAckTimeoutError) {
+        await this.#releaseLatePlacement(input.name, ack)
+      }
+      throw error
+    }
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
     let acknowledgedNode: string
     try {
@@ -643,29 +667,86 @@ export class RelayFleetClient implements FleetClient {
    * been sent — a mutating one, on the placement path — while this method was
    * still deciding there was no time left to make it (#307 review, cubic).
    */
-  async #withinDeadline<T>(operation: string, deadlineAtMs: number, start: () => Promise<T>): Promise<T> {
+  async #withinDeadline<T>(
+    operation: string,
+    deadlineAtMs: number,
+    start: () => Promise<T>,
+    /**
+     * Called when the budget runs out with the call still in flight, receiving
+     * the abandoned work. Abandoning the *wait* does not cancel the *call*, so
+     * a mutating operation needs a way to clean up whatever it still lands.
+     */
+    onAbandoned?: (inFlight: Promise<CallOutcome<T>>) => void,
+  ): Promise<T> {
     const remainingMs = deadlineAtMs - this.#now()
     if (remainingMs <= 0) {
       throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
     }
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
+      // Folded to an outcome once, so the abandoned handler shares this promise
+      // rather than attaching a second rejection path to the same call.
+      const inFlight: Promise<CallOutcome<T>> = start().then(
+        (value) => ({ ok: true, value }) as const,
+        (error) => ({ ok: false, error }) as const,
+      )
       const outcome = await Promise.race<CallOutcome<T> | typeof CALL_TIMED_OUT>([
-        start().then(
-          (value) => ({ ok: true, value }) as const,
-          (error) => ({ ok: false, error }) as const,
-        ),
+        inFlight,
         new Promise<typeof CALL_TIMED_OUT>((resolve) => {
           timer = setTimeout(() => resolve(CALL_TIMED_OUT), remainingMs)
           timer.unref?.()
         }),
       ])
-      if (outcome === CALL_TIMED_OUT) throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
+      if (outcome === CALL_TIMED_OUT) {
+        onAbandoned?.(inFlight)
+        throw new RelaySpawnAckTimeoutError(operation, this.#spawnAckTimeoutMs)
+      }
       if (outcome.ok) return outcome.value
       throw outcome.error
     } finally {
       if (timer) clearTimeout(timer)
     }
+  }
+
+  /**
+   * Release a worker whose placement Relay accepted after the local deadline.
+   *
+   * Tracked *before* the release is attempted so a failed cleanup is retried by
+   * the reconciliation loop instead of forgotten — the same retain-and-retry the
+   * `unverified-placement` path uses. Losing the release would leave a live
+   * worker outside Factory's lifecycle tracking.
+   */
+  async #releaseLatePlacement(name: string, ack: RelayActionInvocationAck & { placement?: { node?: string } }): Promise<void> {
+    const node = ack.placement?.node ?? ack.dispatchedNodeId
+    this.#track(name, {
+      invocationId: ack.invocationId,
+      ...(node ? { node } : {}),
+      pendingReleaseReason: LATE_PLACEMENT_RELEASE_REASON,
+    })
+    this.#log(`Releasing ${name}: Relay accepted its placement after the local deadline expired`)
+    try {
+      await this.release(name, LATE_PLACEMENT_RELEASE_REASON)
+    } catch (error) {
+      // Retained above, so reconciliation retries the idempotent release.
+      this.#log(`Failed to release late placement ${name}: ${errorMessage(error)}`)
+    }
+  }
+
+  /**
+   * Attach a compensating release to a placement we stopped waiting for.
+   *
+   * If the call ultimately fails, nothing was launched and there is nothing to
+   * release. If it succeeds, a worker exists that this process has already
+   * reported as failed, so it must be torn down.
+   */
+  #releaseAbandonedPlacement(
+    name: string,
+    inFlight: Promise<CallOutcome<RelayActionInvocationAck & { placement?: { node?: string } }>>,
+  ): void {
+    void inFlight.then(async (outcome) => {
+      if (!outcome.ok) return
+      await this.#releaseLatePlacement(name, outcome.value)
+    })
   }
 
   /**

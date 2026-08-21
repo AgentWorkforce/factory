@@ -1317,6 +1317,80 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
   })
 
   /**
+   * #307 review (cubic P1) — the finding that matters most, because getting it
+   * wrong trades an infinite hang for a leaked agent.
+   *
+   * Relay ACCEPTS the placement, but its response arrives after our local
+   * deadline. A worker is live on the fleet and this process has already
+   * reported the spawn as failed, so nothing downstream knows to release it.
+   * Abandoning the wait must not mean abandoning the worker — the same shape
+   * #304 handles one layer up with `LatePlacementReleasedError`.
+   */
+  it('releases a placement Relay accepts after the local deadline expired', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placement.spawn = async (input) => {
+      messaging.placements.push(input)
+      return await after(200, {
+        invocationId: 'inv-late',
+        actionName: 'spawn',
+        status: 'completed',
+        node: { name: 'node-a' } as RelayNode,
+        placement: { capability: input.capability, node: 'node-a', attempts: 1, queued: false },
+      })
+    }
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 60 })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+
+    // The late placement lands after we gave up; the worker must be torn down.
+    await vi.waitFor(() => {
+      expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toHaveLength(1)
+    }, { timeout: 3_000 })
+    const release = messaging.invokes.find((invoke) => invoke.name === 'release')
+    expect(release?.input).toMatchObject({ name: 'ar-1-impl', reason: 'late-placement-timeout' })
+    // Released cleanly, so nothing is left retaining it.
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  /**
+   * The certain leak, as opposed to the possible one above: we already hold an
+   * ack, so Relay definitely accepted the placement. Running out of budget
+   * while polling the invocation must still release the worker.
+   */
+  it('releases an acked placement when the invocation poll exhausts the budget', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'inv-1', status: 'pending', placement: { node: 'node-a' } }
+    messaging.commands.getInvocation = never
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 100 })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+
+    const releases = messaging.invokes.filter((invoke) => invoke.name === 'release')
+    expect(releases).toHaveLength(1)
+    expect(releases[0]?.input).toMatchObject({ name: 'ar-1-impl', reason: 'late-placement-timeout' })
+  })
+
+  /**
+   * MUST-NOT-FIRE. A placement that genuinely failed launched nothing, so
+   * issuing a release would be a spurious teardown against a worker that never
+   * existed.
+   */
+  it('does not release when the abandoned placement ultimately fails', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placement.spawn = async () => {
+      await after(120, undefined)
+      throw new Error('placement rejected')
+    }
+    const fleet = createClient(messaging, { spawnAckTimeoutMs: 60 })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    await after(300, undefined)
+
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toEqual([])
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  /**
    * #307 review (cubic). The budget must be checked *before* the request is
    * made, not after. Taking an already-started promise meant an exhausted
    * deadline still fired the call — a mutating one here — and then abandoned
