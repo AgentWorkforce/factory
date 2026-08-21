@@ -4541,6 +4541,14 @@ export class FactoryLoop implements Factory {
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
       throw new Error(`Dispatch lifecycle ownership lost immediately before spawning ${dispatchDecision.issue.key}`)
     }
+    // That save stamped `slotHeldSinceAtMs`: the row occupies a batch slot from
+    // here on. Arm its deadline before the first await rather than after a
+    // placement succeeds — `#fleet.spawn` deliberately carries no mutation
+    // timeout, so a first attempt that hangs in an otherwise idle process would
+    // otherwise hold the slot with no timer that can ever fire. That is the
+    // exact shape of #303, reached through the fresh dispatch path instead of
+    // the durable one (#303 review, CodeRabbit).
+    this.#scheduleHeldAgentDeadline(record)
     if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
@@ -5277,7 +5285,7 @@ export class FactoryLoop implements Factory {
   #recordOccupiesSlot(record: InFlightIssue): boolean {
     return dispatchPhaseOccupiesSlot(record.lifecyclePhase) && !dispatchHandedOffToBabysitters(
       record.decision.implementers,
-      [...record.agents.values()].map((tracked) => tracked.spec),
+      [...record.agents.values()].map((tracked) => ({ releasedAtMs: tracked.releasedAtMs, spec: tracked.spec })),
     )
   }
 

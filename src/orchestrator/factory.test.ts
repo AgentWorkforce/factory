@@ -11203,6 +11203,60 @@ describe('FactoryLoop', () => {
     }
   }, 40_000)
 
+  // #303 review (CodeRabbit): the fresh dispatch path stamps the slot at its
+  // first `dispatching` save, but only armed the deadline after a placement
+  // succeeded. `#fleet.spawn` carries no mutation timeout by design, so a first
+  // attempt that hangs in an otherwise idle process held the slot with no timer
+  // that could ever fire — the #303 shape reached through dispatch rather than
+  // durable recovery.
+  it('reaps a first dispatch whose spawn never returns (#303)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-fresh-dispatch-hang-'))
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath: join(root, 'state.json') })
+    const gate = Promise.withResolvers<void>()
+    class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        await gate.promise
+        return super.spawn(input)
+      }
+    }
+    const fleet = new HangingSpawnFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient({ [issuePath(317)]: issueFile(317) }),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(317), issueFile(317)))
+      const key = issueKey(decision.issue)
+      // Nothing else is in flight, so no other record's deadline can sweep
+      // this one in by side effect.
+      const dispatched = factory.dispatch(decision).catch(() => undefined)
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'dispatching' }), { timeout: 6_000 })
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ releaseReason: 'agentless-slot-past-deadline' }), { timeout: 12_000 })
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] releasing a dispatch lifecycle that never placed an agent',
+        expect.objectContaining({ issue: 'AR-317', holdTimeoutMs: 1_000 }),
+      )
+
+      gate.resolve()
+      await dispatched
+    } finally {
+      gate.resolve()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
   // sight would convert a wedge into a dispatch race.

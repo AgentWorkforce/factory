@@ -29,13 +29,22 @@ export const dispatchPhaseOccupiesSlot = (phase: DispatchLifecyclePhase | undefi
  */
 export const dispatchHandedOffToBabysitters = (
   implementers: ReadonlyArray<{ repo: string }>,
-  agentSpecs: ReadonlyArray<{ role?: string; ownedPullRequest?: { repo: string } }>,
+  agents: ReadonlyArray<{
+    releasedAtMs?: number
+    spec: { role?: string; ownedPullRequest?: { repo: string } }
+  }>,
 ): boolean => {
   const implementerRepos = [...new Set(implementers.map((spec) => spec.repo))]
   if (implementerRepos.length === 0) return false
-  const babysitterRepos = agentSpecs
-    .filter((spec) => spec.role === 'babysitter')
-    .map((spec) => spec.ownedPullRequest?.repo)
+  const babysitterRepos = agents
+    // A released babysitter is not babysitting anything. Letting one satisfy
+    // the handoff would drop the lifecycle out of `batchSize` accounting while
+    // nothing is actually watching its PR, so admission would over-subscribe
+    // and the reaper would stop bounding a row it still needs to bound (#303
+    // review, CodeRabbit). Release state is the reason this takes agents
+    // rather than bare specs.
+    .filter((agent) => agent.releasedAtMs === undefined && agent.spec.role === 'babysitter')
+    .map((agent) => agent.spec.ownedPullRequest?.repo)
     .filter((repo): repo is string => Boolean(repo))
   return implementerRepos.every((repo) => babysitterRepos.some((ownedRepo) =>
     githubRepositoriesMatch(repo, ownedRepo)))
@@ -44,7 +53,13 @@ export const dispatchHandedOffToBabysitters = (
 export const dispatchLifecycleHandedOffToBabysitters = (lifecycle: DispatchLifecycle): boolean =>
   dispatchHandedOffToBabysitters(
     lifecycle.decision.implementers,
-    lifecycle.agents.map((agent) => agent.tracked.spec),
+    lifecycle.agents.map((agent) => ({
+      // The durable row carries the stamp in either place depending on which
+      // writer last touched it; `inFlightRecordFromLifecycle` reads it the
+      // same way.
+      releasedAtMs: agent.releasedAtMs ?? agent.tracked.releasedAtMs,
+      spec: agent.tracked.spec,
+    })),
   )
 
 export const dispatchLifecycleOccupiesSlot = (lifecycle: DispatchLifecycle): boolean =>
