@@ -5,6 +5,126 @@ import { join } from 'node:path'
 import { FactoryConfigSchema, NodeConfigSchema, loadFactoryConfig } from './schema'
 import { routedPrRepos } from '../github/routed-pr-babysitter'
 
+describe('relay.agentName', () => {
+  it('keeps an explicit relay agent name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName: 'factory-cloud' },
+    })
+
+    expect(parsed.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('trims surrounding whitespace from an otherwise valid name', () => {
+    const parsed = FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName: '  factory-cloud  ' },
+    })
+
+    expect(parsed.relay.agentName).toBe('factory-cloud')
+  })
+
+  // An identity that silently falls back to the default is how a workspace
+  // registration collision hides: the operator believes they pinned a name.
+  it.each([
+    ['empty', ''],
+    ['whitespace-only', '   '],
+    ['a tab', '\t'],
+  ])('rejects %s relay.agentName at config load instead of defaulting it', (_label, agentName) => {
+    const result = FactoryConfigSchema.safeParse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentName },
+    })
+
+    expect(result.success).toBe(false)
+    // Asserted by path and code, not by message text: the point is that the
+    // trimmed value failed the length check under `relay.agentName`, rather
+    // than some unrelated issue happening to mention the field.
+    const issue = result.success ? undefined : result.error.issues.find(
+      (candidate) => candidate.path.join('.') === 'relay.agentName',
+    )
+    expect(issue?.code).toBe('too_small')
+  })
+
+  // Split configs are how a cloud deployment and another deployment share one
+  // workspace. If the identity could only live on the shared half, every
+  // deployment would register the same name -- the collision this prevents.
+  it('takes the relay agent name from the node-local half', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: { repos: { default: 'AgentWorkforce/factory' } },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-cloud')
+    // The node-local half must carry it back too, or a per-host identity is
+    // reflected as workspace-shared configuration.
+    expect(loaded.nodeConfig.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('lets the node-local relay agent name override the workspace default', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('still applies a workspace-half relay agent name when the node half sets none', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: {},
+    })
+
+    expect(loaded.factoryConfig.relay.agentName).toBe('factory-shared')
+  })
+
+  // Both halves are validated before the merge, so a node override cannot
+  // launder an invalid shared value into a clean load on the hosts that
+  // override it.
+  it.each([
+    ['workspaceConfig', { relay: { agentName: '   ' } }, { relay: { agentName: 'factory-cloud' } }],
+    ['nodeConfig', { relay: { agentName: 'factory-shared' } }, { relay: { agentName: '   ' } }],
+  ])('rejects an invalid relay agent name in the %s half even when the other half is valid', (field, workspaceRelay, nodeRelay) => {
+    expect(() => loadFactoryConfig({
+      workspaceConfig: { repos: { default: 'AgentWorkforce/factory' }, ...workspaceRelay },
+      nodeConfig: nodeRelay,
+    })).toThrow(new RegExp(`${field} has an invalid relay config`))
+  })
+
+  // Pins existing `normalizeLoadedConfig` semantics rather than asserting an
+  // intent: both views are projected from the *merged* config, so the
+  // workspace-shaped view reports the effective identity, exactly as it already
+  // does for preview, cloneRoot, and clonePaths. Nothing serializes
+  // `workspaceConfig` back to a shared file today; this test fails loudly if
+  // that projection ever changes underneath a caller who starts to.
+  it('reports the effective identity on the workspace-shaped view after a node override', () => {
+    const loaded = loadFactoryConfig({
+      workspaceConfig: {
+        repos: { default: 'AgentWorkforce/factory' },
+        relay: { agentName: 'factory-shared' },
+      },
+      nodeConfig: { relay: { agentName: 'factory-cloud' } },
+    })
+
+    expect(loaded.workspaceConfig.relay.agentName).toBe('factory-cloud')
+    expect(loaded.nodeConfig.relay.agentName).toBe('factory-cloud')
+  })
+
+  it('rejects an unknown key under relay rather than ignoring a typo', () => {
+    expect(() => FactoryConfigSchema.parse({
+      repos: { byLabel: { pear: 'AgentWorkforce/pear' } },
+      relay: { agentname: 'factory-cloud' },
+    })).toThrow(/unrecognized key/i)
+  })
+})
+
 describe('FactoryConfigSchema', () => {
   it('parses a valid config and applies defaults', () => {
     const parsed = FactoryConfigSchema.parse({
@@ -44,6 +164,9 @@ describe('FactoryConfigSchema', () => {
       resetTimeoutMs: 60_000,
       requireDedicatedBroker: false,
     })
+    // Absent, not defaulted in the schema: RelayFleetClient owns the
+    // `factory` fallback, so there is exactly one place the default lives.
+    expect(parsed.relay).toEqual({})
     expect(parsed.models).toEqual({ babysitter: 'sonnet' })
     // Agent CLI per role defaults to today's behavior: codex implements, claude
     // reviews/babysits — so existing configs are unaffected unless set.

@@ -136,6 +136,33 @@ const fleetHealthSchema = z.object({
   requireDedicatedBroker: z.boolean().default(false),
 }).default({})
 
+/**
+ * Relay-workspace identity settings for the `relay` fleet backend.
+ *
+ * `agentName` is the workspace agent Factory registers *as itself* — not an
+ * agent it spawns. Two Factory deployments sharing one workspace must not share
+ * it: the second registration collides with the first
+ * (`Agent "<name>" already exists in this workspace`), the fleet control plane
+ * never initialises, and nothing is ever dispatched. Hosts with ephemeral disk
+ * cannot prove they own a previously-registered name after a restart, so a
+ * deployment that needs its own identity pins one here.
+ *
+ * Left unset, `RelayFleetClient` keeps its own `DEFAULT_AGENT_NAME`, so every
+ * existing deployment registers exactly the name it registers today.
+ *
+ * Declared on both config halves, like `preview`: the workspace half carries a
+ * shared default, and the node half overrides it per host. An identity that
+ * only ever lived on the workspace half would be handed to every deployment in
+ * the workspace -- the collision this exists to prevent.
+ */
+const relaySchema = z.object({
+  // Deliberately not `.default(...)`: an empty or whitespace-only value is a
+  // misconfiguration, and coercing it to the default identity is precisely how
+  // an unconfigurable identity stayed invisible. `.trim().min(1)` rejects it at
+  // config load instead.
+  agentName: z.string().trim().min(1).optional(),
+}).strict().default({})
+
 const loopSchema = z.object({
   maxIterations: z.number().int().min(1).max(5).default(3),
   maxConsecutiveFailures: z.number().int().min(1).max(5).default(3),
@@ -381,6 +408,7 @@ const WorkspaceConfigObjectSchema = z.object({
   liveSubscription: liveSubscriptionSchema,
   dispatch: dispatchSchema,
   fleetHealth: fleetHealthSchema,
+  relay: relaySchema,
   loop: loopSchema,
   triage: triageSchema,
   repos: workspaceReposSchema,
@@ -438,6 +466,9 @@ const WorkspaceConfigObjectSchema = z.object({
 
 const NodeConfigObjectSchema = z.object({
   workspaceId: z.string().optional(),
+  // Node-local, so two deployments sharing a workspace can register distinct
+  // relay identities. Overrides the workspace half when both set it.
+  relay: relaySchema,
   capabilities: z.array(z.string()).default([]),
   cloneRoot: z.string().optional(),
   clonePaths: z.record(z.string(), z.string()).default({}),
@@ -681,6 +712,7 @@ function normalizeLoadedConfig(input: unknown): LoadedFactoryConfig {
     factoryLoopHeartbeatPath: factoryConfig.loop.heartbeatPath,
     factoryLoopRegistryPath: factoryConfig.loop.registryPath,
     preview: factoryConfig.preview,
+    relay: factoryConfig.relay,
   })
 
   return { workspaceConfig, nodeConfig, factoryConfig }
@@ -701,6 +733,16 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
   const nodePreview = asOptionalConfigRecord(node.preview)
   const hasPreview = workspace.preview !== undefined || node.preview !== undefined
 
+  // Each half is validated *before* the merge. A node half that overrides the
+  // identity otherwise discards an invalid workspace-half value without it ever
+  // reaching `relaySchema`, so a broken shared config would load clean on every
+  // host that happens to override it -- the silent acceptance this key exists
+  // to prevent. Mirrors validateClonePathSyntax, which validates both halves
+  // before node-local values take precedence.
+  const workspaceRelay = validateRelayHalf(workspace.relay, 'workspaceConfig')
+  const nodeRelay = validateRelayHalf(node.relay, 'nodeConfig')
+  const hasRelay = workspace.relay !== undefined || node.relay !== undefined
+
   return {
     ...workspace,
     ...node,
@@ -714,12 +756,27 @@ function combineSplitConfigInput(workspaceInput: unknown, nodeInput: unknown): R
         },
       },
     } : {}),
+    // Merged rather than replaced, so a node half that pins only `agentName`
+    // does not drop whatever else the workspace half configured.
+    ...(hasRelay ? { relay: { ...workspaceRelay, ...nodeRelay } } : {}),
     repos: {
       ...workspaceRepos,
       cloneRoot: node.cloneRoot ?? workspaceRepos.cloneRoot,
       clonePaths: node.clonePaths ?? workspaceRepos.clonePaths,
     },
   }
+}
+
+function validateRelayHalf(value: unknown, field: string): Record<string, unknown> {
+  const record = asOptionalConfigRecord(value)
+  const parsed = relaySchema.safeParse(record)
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${['relay', ...issue.path].join('.')}: ${issue.message}`)
+      .join('; ')
+    throw new Error(`${field} has an invalid relay config -- ${detail}`)
+  }
+  return record
 }
 
 function normalizePreviewConfig<T extends z.infer<typeof previewSchema>>(preview: T): T {

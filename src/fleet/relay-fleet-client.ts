@@ -162,6 +162,17 @@ export class RelayFleetClient implements FleetClient {
   #reconciling: Promise<void> | undefined
   #pendingReleaseRetry: Promise<void> | undefined
 
+  /**
+   * Workspace identity this client registers as, after defaulting.
+   *
+   * Exposed read-only so a caller (and its tests) can confirm which identity a
+   * given configuration actually resolved to. Registration reads `#agentName`
+   * directly; this changes nothing about it.
+   */
+  get agentName(): string {
+    return this.#agentName
+  }
+
   constructor(options: RelayFleetClientOptions = {}) {
     this.#options = options
     this.#agentName = options.agentName ?? DEFAULT_AGENT_NAME

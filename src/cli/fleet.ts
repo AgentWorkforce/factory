@@ -1790,7 +1790,13 @@ async function buildFleet(
   // real broker bootstrap.
   if (deps.createFleet) {
     return deps.createFleet(
-      { backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview },
+      {
+        backend: globals.backend,
+        cwd,
+        connectionPath,
+        previewConfig: loaded?.config.preview,
+        relayAgentName: loaded?.config.relay.agentName,
+      },
       { ownedBrokerAgentExitTimeoutMs: globals.agentExitTimeoutMs },
     )
   }
@@ -1827,7 +1833,16 @@ async function buildFleet(
     )
   }
 
-  return createFleet({ backend: globals.backend, cwd, connectionPath, previewConfig: loaded?.config.preview }, { env: deps.env })
+  return createFleet(
+    {
+      backend: globals.backend,
+      cwd,
+      connectionPath,
+      previewConfig: loaded?.config.preview,
+      relayAgentName: loaded?.config.relay.agentName,
+    },
+    { env: deps.env },
+  )
 }
 
 function streamLogger(stream: Pick<NodeJS.WriteStream, 'write'>): Logger {
