@@ -36,6 +36,16 @@ export interface InFlightIssue {
   slotHeldSinceAtMs?: number
   /** Latest durable phase, used only for operator-facing held-agent status. */
   lifecyclePhase?: DispatchLifecyclePhase
+  /**
+   * Set once THIS dispatch's own writeback to the issue has been confirmed.
+   *
+   * Lifecycle phases advance on local progress alone — `publishing` is entered
+   * before the PR is published, `parking` before anything touches the issue —
+   * so a phase cannot answer "did we write to this issue?". Only this marker
+   * can, and it is what lets the post-spawn readiness re-read tell its own
+   * writeback from a foreign one (factory#319).
+   */
+  issueWritebackConfirmedAtMs?: number
 }
 
 export interface QueuedIssue {

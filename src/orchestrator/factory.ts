@@ -4589,10 +4589,36 @@ export class FactoryLoop implements Factory {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
-          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+          // The agents spawned a few lines above can reach terminal before we
+          // get here. Their completion writeback parks the issue — Linear
+          // `humanReview`, or the GitHub human-review label — and stamps
+          // *this same record's* lifecycle on the way past. Re-reading the
+          // issue then shows "not ready", but the writer was us.
+          //
+          // Treating that as a foreign change is not a cosmetic misreport: the
+          // catch below classifies LiveDispatchStateChangedError as terminal
+          // and calls #releaseAndTerminateAgents, so a dispatch whose agents
+          // finished quickly tore down its own completed work and reported
+          // RETRYABLE to its supervisor (factory#319).
+          //
+          // Only THIS dispatch's own confirmed issue writeback may excuse the
+          // change. Lifecycle phases are not enough: `publishing` is entered
+          // before the PR is published and `parking` before anything touches
+          // the issue, so a phase records local progress, not authorship — and
+          // a foreign park landing during those awaits would be misread as
+          // ours (codex review on #321). Losing the row to another owner is a
+          // different condition and is still caught where it always was, by
+          // #saveDispatchLifecycle returning false.
+          if (record.issueWritebackConfirmedAtMs === undefined) {
+            throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+          }
+          // The claim is moot and would be wrong to write: it would drag an
+          // issue our own lifecycle has already parked back to `implementing`.
+        } else {
+          implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
+          record.issueWritebackConfirmedAtMs = this.#clock.now()
+          this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
-        implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
-        this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
       const result = {
@@ -13934,6 +13960,7 @@ export class FactoryLoop implements Factory {
           await this.#linear.setState(issue, targetState)
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
+        record.issueWritebackConfirmedAtMs = this.#clock.now()
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       }
