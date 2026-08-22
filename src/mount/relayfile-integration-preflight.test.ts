@@ -153,4 +153,31 @@ describe('Relayfile integration preflight', () => {
     expect(relayfile.connect).not.toHaveBeenCalled()
     expect(relayfile.waitForConnection).not.toHaveBeenCalled()
   })
+
+  it('classifies a degraded completed integration by its normalized state, echoing the reported values', async () => {
+    const relayfile = connections(async () => ({
+      ready: false,
+      state: '  DeGraded ',
+      initialSyncState: '\tComplete  ',
+    }))
+    const terminal = io()
+
+    // Only `.trim().toLowerCase()` routes this to the repair branch; without it
+    // the provider falls back to "wait for its initial sync", which is the
+    // advice #203 is about. The details string deliberately echoes the values
+    // as the provider reported them, so the operator can match them to what
+    // the dashboard shows -- normalization decides the branch, not the text.
+    await expect(ensureFactoryIntegrations({
+      connections: relayfile,
+      providers: ['github'],
+      workspaceId: 'rw_test',
+      interactive: false,
+      dryRun: true,
+      io: terminal,
+    })).rejects.toThrow(
+      /degraded after its initial sync completed \(  DeGraded ,\s+Complete  \).*workspace owner.*repair or reconnect github/u,
+    )
+    expect(relayfile.connect).not.toHaveBeenCalled()
+    expect(relayfile.waitForConnection).not.toHaveBeenCalled()
+  })
 })
