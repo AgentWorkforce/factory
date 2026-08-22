@@ -189,6 +189,13 @@ export interface FleetClient {
   resolveAgentPid?(name: string): Promise<AgentPidResolution>
   protectedPids?(): Promise<number[]>
   sendMessage(input: SendInput): Promise<void>
+  /**
+   * Identity this backend actually authors sends as, when it cannot honour
+   * `SendInput.from`. A teammate replies to that identity, not to the caller's
+   * requested `from`, so a reply waiter must match against this instead.
+   * Backends that faithfully carry `from` leave it undefined.
+   */
+  effectiveSender?(): string | undefined
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
   sendInput?(name: string, data: string): Promise<void>
   markAgentTerminal?(name: string, reason?: string): void

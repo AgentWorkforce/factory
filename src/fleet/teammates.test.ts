@@ -127,4 +127,102 @@ describe('askTeammate', () => {
       question: 'Whoever is first, please answer.',
     })).rejects.toThrow('requires a discovered teammate or a skill/tag/query')
   })
+
+  // A backend that cannot represent `SendInput.from` authors every send as its
+  // own identity, so the teammate replies to THAT name and the reply arrives
+  // addressed to it -- never to the worker that asked. Matching on the caller's
+  // `from` would discard every valid reply and time out. (#178 review, codex P1)
+  const relayLike = () => {
+    const fleet = new FakeFleetClient()
+    Object.assign(fleet, { effectiveSender: () => 'factory-app' })
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    return fleet
+  }
+
+  it('matches the reply against the identity the backend actually sends as', async () => {
+    const fleet = relayLike()
+
+    const asked = askTeammate(fleet, {
+      from: 'factory-worker',
+      question: 'Is the deploy healthy?',
+      teammate: fleet.teammates[0],
+      timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    // Addressed to the authenticated sender, which is what this backend receives.
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-app', body: 'All systems green.' })
+
+    await expect(asked).resolves.toMatchObject({
+      reply: { from: 'infra-agent', target: 'factory-app', body: 'All systems green.' },
+    })
+  })
+
+  it('rejects a second unanswered question to one teammate when replies cannot be correlated', async () => {
+    const fleet = relayLike()
+    const first = askTeammate(fleet, {
+      from: 'factory-worker',
+      question: 'Is the deploy healthy?',
+      teammate: fleet.teammates[0],
+      timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+
+    // `data` is dropped by such a backend, so `requestId` never reaches the
+    // teammate and a reply cannot be attributed to one of two open questions.
+    // Refusing beats resolving the wrong waiter. (#178 review, codex P2)
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker',
+      question: 'And the database?',
+      teammate: fleet.teammates[0],
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to this teammate/u)
+
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-app', body: 'All systems green.' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'All systems green.' } })
+
+    // The refused ask never sent, so this is only the second message on the
+    // wire -- and the claim is released once the first settles, so the pair is
+    // reusable rather than poisoned for the rest of the process.
+    const third = askTeammate(fleet, {
+      from: 'factory-worker',
+      question: 'And the database?',
+      teammate: fleet.teammates[0],
+      timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(2))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-app', body: 'Healthy.' })
+    await expect(third).resolves.toMatchObject({ reply: { body: 'Healthy.' } })
+  })
+
+  it('leaves a faithful backend uncorrelated-guard-free', async () => {
+    // FakeFleetClient carries `from`, so effectiveSender() is undefined and two
+    // concurrent asks stay legal -- the guard must not punish a correct backend.
+    const fleet = new FakeFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const a = askTeammate(fleet, {
+      from: 'worker-a', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    const b = askTeammate(fleet, {
+      from: 'worker-b', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(2))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'worker-a', body: 'answer-a' })
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'worker-b', body: 'answer-b' })
+    await expect(a).resolves.toMatchObject({ reply: { body: 'answer-a' } })
+    await expect(b).resolves.toMatchObject({ reply: { body: 'answer-b' } })
+  })
 })

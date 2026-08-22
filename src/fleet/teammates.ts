@@ -96,29 +96,66 @@ export interface AskTeammateResult {
 }
 
 /**
+ * Asks that are currently waiting on a reply, keyed by the identity the reply
+ * will be addressed to plus the teammate being asked.
+ *
+ * A backend that drops `SendInput.data` cannot carry `requestId` to the
+ * teammate, so the teammate cannot echo it and a reply is indistinguishable
+ * from the reply to any other question in the same pair. Rather than resolve a
+ * waiter with an answer that may belong to a different question, refuse the
+ * overlap. Correlated backends (those that preserve `data`) are exempt.
+ */
+const inFlightAsks = new Set<string>()
+
+/**
  * Resolve a teammate (when needed), deliver a relay DM, and wait for that
  * teammate's reply. The listener is armed before sending so fast replies cannot
  * race the waiter; the whole operation has one bounded deadline.
+ *
+ * Replies are matched against the identity the backend actually authors as --
+ * see `FleetClient.effectiveSender` -- because a backend that cannot represent
+ * `from` receives the teammate's reply under its own identity instead.
  */
 export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): Promise<AskTeammateResult> {
   const timeoutMs = positiveTimeout(input.timeoutMs, DEFAULT_ASK_TEAMMATE_TIMEOUT_MS)
   const requestId = randomUUID()
   const from = requiredText(input.from, 'askTeammate.from')
   const question = requiredText(input.question, 'askTeammate.question')
+  // Whoever the teammate will actually reply to. Falls back to `from` on a
+  // backend that carries the requested sender faithfully.
+  const replyTarget = fleet.effectiveSender?.() ?? from
+  const correlatable = sameAgent(replyTarget, from)
   const query = normalizeQuery({ skill: input.skill, tag: input.tag, q: input.q })
   if (!input.teammate && !query.skill && !query.tag && !query.q) {
     throw new Error('askTeammate requires a discovered teammate or a skill/tag/query')
   }
   const deadline = Date.now() + timeoutMs
 
+  // Claimed for the whole wait, including the discovery leg, so two overlapping
+  // asks cannot both arm a listener that would accept the same reply.
+  const askKey = `${replyTarget.toLowerCase()}\u0000${teammateKey(input.teammate)}`
+  const guarded = !correlatable && Boolean(input.teammate)
+  if (guarded && inFlightAsks.has(askKey)) {
+    throw new Error(
+      `askTeammate already has an unanswered question to this teammate as "${replyTarget}". ` +
+      'This backend cannot carry a correlation id, so a reply cannot be attributed to one ' +
+      'of two open questions; await the first before asking again.',
+    )
+  }
+  if (guarded) inFlightAsks.add(askKey)
+
   return await new Promise<AskTeammateResult>((resolve, reject) => {
     let settled = false
     let unsubscribe = () => {}
+    const release = () => {
+      if (guarded) inFlightAsks.delete(askKey)
+    }
     const finish = (result: AskTeammateResult) => {
       if (settled) return
       settled = true
       clearTimeout(timeout)
       unsubscribe()
+      release()
       resolve(result)
     }
     const fail = (error: unknown) => {
@@ -126,6 +163,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       settled = true
       clearTimeout(timeout)
       unsubscribe()
+      release()
       reject(error)
     }
     const timeout = setTimeout(() => {
@@ -143,7 +181,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       }
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
-        if (!sameAgent(message.target, from)) return
+        if (!sameAgent(message.target, replyTarget)) return
         finish({ requestId, teammate, reply: message })
       })
       const send = {
@@ -256,6 +294,10 @@ function positiveTimeout(value: number | undefined, fallback: number): number {
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/u, '')
+}
+
+function teammateKey(teammate: TeammateAgent | undefined): string {
+  return teammate ? `${teammate.kind}:${teammate.address.toLowerCase()}` : ''
 }
 
 function sameAgent(left: string, right: string): boolean {

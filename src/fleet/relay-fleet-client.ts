@@ -517,6 +517,14 @@ export class RelayFleetClient implements FleetClient {
 
   // `from`/`data` are not representable on the agent-scoped messaging surface:
   // every send is authored by the factory's own agent identity.
+  //
+  // That identity is also the `target` stamped on every inbound message (see
+  // `#emitAgentMessage`), so a reply waiter must match against it rather than
+  // against the `from` its caller asked to send as.
+  effectiveSender(): string | undefined {
+    return this.#authenticatedAgentName
+  }
+
   async sendMessage(input: SendInput): Promise<void> {
     await this.#send(input)
   }
