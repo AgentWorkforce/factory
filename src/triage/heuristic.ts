@@ -1,6 +1,7 @@
 import type { FactoryConfig } from '../config/schema'
 import type { AgentSpec } from '../ports'
 import type { IssueRef, LinearIssue, RepoMapEntry, TriageContext, TriageDecision, TriageEngine } from '../types'
+import { mirrorWorkUnitOrigin } from '../dispatch/work-unit-identity'
 import { agentBaseName, agentNameForRole, repoSlugFromName } from './agent-names'
 
 type RouteSource = RepoMapEntry['source']
@@ -290,7 +291,8 @@ function hasAcceptanceSignal(issue: LinearIssue): boolean {
 }
 
 function issueRefFor(issue: LinearIssue): IssueRef {
-  return { uuid: issue.uuid, key: issue.key, path: issue.path }
+  const origin = mirrorWorkUnitOrigin(issue)
+  return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
 }
 
 function implementerSpec(input: {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import type { DispatchLifecycle } from '../ports/state'
-import { githubLifecycleIdentity, matchingGithubLifecycleEntry } from './github-lifecycle-identity'
+import { githubLifecycleIdentity } from './github-lifecycle-identity'
+import { planLifecycleMigration } from './work-unit-lifecycle-migration'
 
 describe('GitHub lifecycle identity', () => {
   it('ignores malformed legacy lifecycle rows', () => {
@@ -11,7 +12,7 @@ describe('GitHub lifecycle identity', () => {
       .toBeUndefined()
   })
 
-  it('selects the best logical alias in one pass with deterministic legacy timestamp handling', () => {
+  it('picks the liveliest alias to adopt, with deterministic legacy timestamp handling', () => {
     const queuedWithoutTimestamp = lifecycle(
       '/github/repos/AgentWorkforce__factory/issues/by-id/146.json',
       'queued',
@@ -28,11 +29,20 @@ describe('GitHub lifecycle identity', () => {
       2,
     )
 
-    expect(matchingGithubLifecycleEntry([
-      ['queued', queuedWithoutTimestamp],
-      ['unrelated', unrelated],
-      ['active', active],
-    ], queuedWithoutTimestamp)).toEqual(['active', active])
+    // The GitHub-only lifecycle scan this module used to own became the
+    // provider-neutral rekey; the alias-ranking behaviour it guarded lives on
+    // there. `active` outranks the queued row, and the unrelated issue is not
+    // an alias of it at all.
+    expect(planLifecycleMigration(
+      [
+        ['queued', queuedWithoutTimestamp],
+        ['unrelated', unrelated],
+        ['active', active],
+      ],
+      'github:agentworkforce/factory#146',
+      queuedWithoutTimestamp,
+      1_000,
+    )).toEqual({ outcome: 'adopt', from: 'active', aliases: ['queued'] })
   })
 })
 
