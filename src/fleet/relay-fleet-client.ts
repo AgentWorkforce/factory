@@ -184,6 +184,7 @@ export class RelayFleetClient implements FleetClient {
   #lifecycleActionReady: Promise<void> | undefined
   #authenticatedAgentName: string
   #eventsStarted = false
+  #eventSubscriptionReady?: Promise<void>
   #disposed = false
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
@@ -1162,10 +1163,27 @@ export class RelayFleetClient implements FleetClient {
   #ensureEventSubscription(): void {
     if (this.#eventsStarted) return
     this.#eventsStarted = true
-    void this.#subscribeEvents().catch((error) => {
+    this.#eventSubscriptionReady = this.#subscribeEvents().catch((error) => {
       this.#eventsStarted = false
+      this.#eventSubscriptionReady = undefined
       this.#log(`relay fleet event subscription failed: ${errorMessage(error)}`)
+      throw error
     })
+    // Nothing here awaits it -- callers that must not miss an inbound message
+    // use `whenMessagesObservable()`. The rejection is re-thrown for them and
+    // swallowed here so a background subscription failure stays non-fatal.
+    void this.#eventSubscriptionReady.catch(() => {})
+  }
+
+  // `onAgentMessage` returns as soon as the listener is in the local set, but
+  // the SDK handler behind it is installed by an async chain (messaging
+  // bootstrap, then lifecycle registration, then `events.connect()`). A caller
+  // that registers a listener and immediately sends can therefore lose a fast
+  // reply that lands before the transport is actually listening. Await this
+  // between the two.
+  async whenMessagesObservable(): Promise<void> {
+    this.#ensureEventSubscription()
+    await this.#eventSubscriptionReady
   }
 
   async #subscribeEvents(): Promise<void> {

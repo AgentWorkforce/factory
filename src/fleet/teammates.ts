@@ -96,21 +96,38 @@ export interface AskTeammateResult {
 }
 
 /**
- * Asks that are currently waiting on a reply, keyed by the identity the reply
- * will be addressed to plus the teammate being asked.
+ * Claimed teammate pairs per backend: key -> earliest epoch ms at which the
+ * key may be reused.
  *
  * `AgentMessage` carries no echoed request field on ANY backend -- there is no
  * reply-to, and `SendInput.data` is not reflected back -- so a reply can never
- * be attributed to one of two open questions to the same teammate. That makes
- * every backend uncorrelatable today, not just the ones that drop `data`, so
- * the claim is unconditional. It is keyed on the RESOLVED teammate and taken
- * after discovery, because two callers passing the same skill query resolve to
- * the same teammate and must contend for the same key.
+ * be attributed to one of two questions to the same teammate. Two devices
+ * follow from that:
  *
- * When `AgentMessage` grows an echoed correlation field, this should become a
- * real requestId check and the claim can be dropped.
+ * - While an ask is waiting, the pair is claimed with `Infinity`. A second ask
+ *   is refused rather than resolved with an answer that may not be its own.
+ *   The key uses the RESOLVED teammate and is taken after discovery, so two
+ *   callers passing the same skill query contend for one key.
+ * - After a TIMEOUT the pair stays quarantined for a further `timeoutMs`,
+ *   because the abandoned question's reply can still land and would satisfy a
+ *   fresh waiter's predicate exactly. A reply later than that was already past
+ *   what its caller was willing to wait for. This is a heuristic; the real fix
+ *   is an observable correlation field, and when `AgentMessage` grows one this
+ *   whole registry should be replaced by a requestId check.
+ *
+ * Scoped per `FleetClient` because two clients in one process address
+ * different workspaces, where identical names cannot collide.
  */
-const inFlightAsks = new Set<string>()
+const inFlightAsks = new WeakMap<FleetClient, Map<string, number>>()
+
+function claimsFor(fleet: FleetClient): Map<string, number> {
+  let claims = inFlightAsks.get(fleet)
+  if (!claims) {
+    claims = new Map()
+    inFlightAsks.set(fleet, claims)
+  }
+  return claims
+}
 
 /**
  * Resolve a teammate (when needed), deliver a relay DM, and wait for that
@@ -134,10 +151,15 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
 
   return await new Promise<AskTeammateResult>((resolve, reject) => {
     let settled = false
+    let quarantineOnFail: number | undefined
     let unsubscribe = () => {}
     let claimed: string | undefined
-    const release = () => {
-      if (claimed) inFlightAsks.delete(claimed)
+    // `quarantine` holds the pair past a timeout; a normal settle frees it.
+    const release = (quarantineUntilMs?: number) => {
+      if (!claimed) return
+      const claims = claimsFor(fleet)
+      if (quarantineUntilMs === undefined) claims.delete(claimed)
+      else claims.set(claimed, quarantineUntilMs)
       claimed = undefined
     }
     const finish = (result: AskTeammateResult) => {
@@ -153,10 +175,13 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       settled = true
       clearTimeout(timeout)
       unsubscribe()
-      release()
+      release(quarantineOnFail)
       reject(error)
     }
     const timeout = setTimeout(() => {
+      // Quarantine, do not free: the abandoned question's reply can still
+      // arrive and would satisfy the next waiter on this pair exactly.
+      quarantineOnFail = Date.now() + timeoutMs
       fail(new Error(`Timed out waiting for a reply from a teammate after ${timeoutMs}ms`))
     }, timeoutMs)
 
@@ -178,15 +203,24 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       // contends with an explicit one for the same target. Taken before the
       // listener is armed so two waiters can never both accept one reply.
       const askKey = `${replyTarget.toLowerCase()}\u0000${teammateKey(teammate)}`
-      if (inFlightAsks.has(askKey)) {
+      const claims = claimsFor(fleet)
+      const heldUntil = claims.get(askKey)
+      if (heldUntil !== undefined && heldUntil > Date.now()) {
         throw new Error(
-          `askTeammate already has an unanswered question to "${teammate.name}" as "${replyTarget}". ` +
-          'A reply carries no correlation id, so it cannot be attributed to one of two open ' +
-          'questions; await the first before asking again.',
+          heldUntil === Infinity
+            ? `askTeammate already has an unanswered question to "${teammate.name}" as "${replyTarget}". ` +
+              'A reply carries no correlation id, so it cannot be attributed to one of two open ' +
+              'questions; await the first before asking again.'
+            : `askTeammate is holding "${teammate.name}" for "${replyTarget}" after a timed-out ` +
+              'question, because that question\'s reply may still arrive and could not be told ' +
+              'apart from this one\'s; retry after the hold expires.',
         )
       }
-      inFlightAsks.add(askKey)
+      claims.set(askKey, Infinity)
       claimed = askKey
+      // `onAgentMessage` can return before the transport is really listening,
+      // so wait for observability BEFORE sending -- otherwise a fast reply
+      // lands in the gap and is lost.
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
         if (!sameAgent(message.target, replyTarget)) return
@@ -203,6 +237,8 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
           requester: from,
         },
       }
+      await fleet.whenMessagesObservable?.()
+      if (settled) return
       if (fleet.waitForInjected) {
         await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
       } else {

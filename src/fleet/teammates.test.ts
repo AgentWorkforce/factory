@@ -274,6 +274,85 @@ describe('askTeammate', () => {
     await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
   })
 
+  // `onAgentMessage` can return before the transport is really listening, so a
+  // reply that lands between registration and connection is lost. The wait
+  // must happen before the send. (#178 review, codex P1 third pass)
+  it('waits for the message transport to be observable before sending', async () => {
+    const fleet = new FakeFleetClient()
+    let openTransport = () => {}
+    const observable = new Promise<void>((r) => { openTransport = r })
+    Object.assign(fleet, { whenMessagesObservable: () => observable })
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const asked = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    // Give the async body every chance to run ahead of the gate.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fleet.messages).toHaveLength(0)
+    openTransport()
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answered' })
+    await expect(asked).resolves.toMatchObject({ reply: { body: 'answered' } })
+  })
+
+  // A reply to an abandoned question is indistinguishable from a reply to a
+  // fresh one, so the pair must not reopen the instant it times out.
+  // (#178 review, codex P2 third pass)
+  it('quarantines a timed-out pair instead of reopening it immediately', async () => {
+    const fleet = new FakeFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 20,
+    })).rejects.toThrow(/Timed out waiting for a reply/u)
+
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 20,
+    })).rejects.toThrow(/holding "infra-agent" for "factory-worker" after a timed-out question/u)
+  })
+
+  // Two clients address different workspaces; identical names there cannot
+  // collide and must not contend. (#178 review, codex P2 third pass)
+  it('scopes claims per fleet client', async () => {
+    const teammate = {
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native' as const,
+    }
+    const one = new FakeFleetClient()
+    const two = new FakeFleetClient()
+    one.teammates.push(teammate)
+    two.teammates.push(teammate)
+
+    const a = askTeammate(one, { from: 'factory-worker', question: 'q', teammate, timeoutMs: 1_000 })
+    await vi.waitFor(() => expect(one.messages).toHaveLength(1))
+    // Same requester, same teammate name, different backend: must be allowed.
+    const b = askTeammate(two, { from: 'factory-worker', question: 'q', teammate, timeoutMs: 1_000 })
+    await vi.waitFor(() => expect(two.messages).toHaveLength(1))
+
+    one.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'from-one' })
+    two.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'from-two' })
+    await expect(a).resolves.toMatchObject({ reply: { body: 'from-one' } })
+    await expect(b).resolves.toMatchObject({ reply: { body: 'from-two' } })
+  })
+
   // A backend whose authenticated identity is only knowable after a round trip
   // must be awaited; matching on a pre-auth guess rejects every reply.
   // (#178 review, codex P1 second pass)

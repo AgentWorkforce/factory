@@ -206,6 +206,14 @@ export interface FleetClient {
   markAgentTerminal?(name: string, reason?: string): void
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
+  /**
+   * Resolves once the inbound-message transport is genuinely listening.
+   * `onAgentMessage` may return before that is true on a backend whose
+   * subscription is established asynchronously, so a caller that registers a
+   * listener and then sends must await this in between or risk losing a reply
+   * that arrives first.
+   */
+  whenMessagesObservable?(): Promise<void>
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentUsage?(listener: (usage: AgentUsage) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
