@@ -2932,12 +2932,13 @@ export class FactoryLoop implements Factory {
         const labels = isGithubIssue(issue)
           ? new Set(issue.labels.map((label) => label.trim().toLowerCase()))
           : undefined
-        const requiredLabel = this.#config.safety.requireLabel.trim().toLowerCase()
+        // Must stay the same scope test as dispatch and as
+        // #reconcileOrphanedGithubInProgress. Gating on the scope label alone
+        // left every title-scoped issue stuck in `factory:in-progress` forever.
         const mayRecoverGithubOrphan = !wasReady &&
           !dryRun &&
           issueSource === 'github' &&
-          Boolean(requiredLabel) &&
-          Boolean(labels?.has(requiredLabel)) &&
+          isInFactoryScope(issue, this.#config.safety) &&
           Boolean(labels?.has('factory:in-progress')) &&
           !labels?.has('factory:human-review')
         if (!mayRecoverGithubOrphan) {
@@ -3569,10 +3570,14 @@ export class FactoryLoop implements Factory {
     if (!context) return { recovered: false, reason: 'orphan-recovery safety context is unavailable' }
     if (!isGithubIssue(issue)) return { recovered: false, reason: 'issue is not GitHub-native' }
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
-    const required = this.#config.safety.requireLabel.trim().toLowerCase()
+    // Recovery must admit exactly what dispatch admits. Dispatch accepts the
+    // configured title prefix OR the scope label (`isInFactoryScope`), but this
+    // gate used to demand the label alone — so an issue admitted by its title
+    // could be dispatched and then never un-stuck, keeping `factory:in-progress`
+    // forever once its dispatch died. factory#139 is the live instance: title
+    // `[factory] ...`, and its only label is `factory:in-progress`.
     if (
-      !required ||
-      !labels.has(required) ||
+      !isInFactoryScope(issue, this.#config.safety) ||
       !labels.has('factory:in-progress') ||
       labels.has('factory:human-review')
     ) return { recovered: false, reason: 'issue is not an orphan-recovery candidate' }
@@ -7176,7 +7181,16 @@ export class FactoryLoop implements Factory {
         !labels.every((label) => typeof label === 'string')) {
         return undefined
       }
-      if (state !== 'open' || !labels.some((label) => label.trim().toLowerCase() === requiredLabel)) {
+      // Retain Factory's own lifecycle rows even when they lack the scope
+      // label. The index carries no title, so a title-scoped issue cannot be
+      // recognised here — and dropping it means its file is never read and the
+      // orphan-recovery sweep never sees it. `factory:in-progress` is a label
+      // only Factory applies, so a row carrying it is by definition
+      // Factory-touched and worth reading; `isInFactoryScope` downstream
+      // remains the authority on whether anything may be done with it.
+      const rowLabels = labels.map((label) => label.trim().toLowerCase())
+      if (state !== 'open' ||
+        !(rowLabels.includes(requiredLabel) || rowLabels.includes('factory:in-progress'))) {
         continue
       }
       paths.push(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`)

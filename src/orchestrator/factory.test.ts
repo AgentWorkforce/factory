@@ -4962,6 +4962,65 @@ describe('FactoryLoop', () => {
     }
   })
 
+  // Factory admits an issue to dispatch on EITHER the title prefix or the
+  // scope label, but orphan recovery demanded the label alone. An issue
+  // admitted by title could therefore be dispatched and then never un-stuck.
+  // factory#139 is the live instance: title `[factory] ...`, and its only
+  // label is `factory:in-progress`.
+  it('recovers an orphaned in-progress GitHub issue that is in scope by title prefix alone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-title-scope-'))
+    try {
+      const path = githubIssueCompactPath('AgentWorkforce', 'pear', 139)
+      const payload = { title: '[factory-e2e] Title-scoped orphan', labels: ['pear', 'factory:in-progress'] }
+      // Go through the Relayfile issue index, which is what indexed production
+      // deployments use. The index carries no title, so a title-scoped row can
+      // only be retained via its `factory:in-progress` lifecycle label — fixing
+      // the recovery gate alone leaves this issue unread and still stranded.
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/_index.json': [
+          {
+            id: '139',
+            number: 139,
+            title: '[factory-e2e] Title-scoped orphan',
+            updated: '2026-08-17T10:00:00Z',
+            state: 'open',
+            labels: ['pear', 'factory:in-progress'],
+          },
+        ],
+        [path]: githubIssueFile(139, payload),
+      })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, githubIssueFile(139, payload))
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      const restartedFactory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      await restartedFactory.runOnce()
+
+      expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+      expect(githubWriteback.statuses).toContainEqual({ key: '139', status: 'ready' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('releases a dead durable GitHub claim and redispatches the issue', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-dead-lifecycle-claim-'))
     try {
