@@ -11065,6 +11065,251 @@ describe('FactoryLoop', () => {
     }, 30_000)
   }
 
+  // #315: restart-time arming used to be the LAST STATEMENT of the re-adoption
+  // `try`, whose catch only logs. Two fleet awaits sit above it —
+  // `reconcileTrackedAgents`, which `guardFleetControlPlane` does not proxy and
+  // so reaches the transport, and `roster`, which the guard rejects outright
+  // once the circuit is open. With the broker down either one throws and no
+  // hold deadline is armed for that boot: the #304 reaper is in the build and
+  // was never scheduled — disabled by the exact fault it exists to clear.
+  //
+  // The wedge lands on a `running` row specifically. Every other slot-occupying
+  // phase is additionally armed by `#scheduleDispatchLifecycleRetry` earlier in
+  // the same loop; `running` is the one phase that call skips, so the aggregate
+  // arming below it is its only route. An agent-less `running` row is what the
+  // GitHub orphaned-PR adoption path produces: it saves `running` from records
+  // whose agents may carry no spawn result, and never stamps `heldSinceAtMs`.
+  for (const probe of [
+    { label: 'reconcileTrackedAgents rejects', wedged: 330, queued: 331, mode: 'reconcile' as const },
+    { label: 'roster rejects', wedged: 332, queued: 333, mode: 'roster' as const },
+  ]) {
+    it(`arms the never-placed deadline when startup ${probe.label} (#315)`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-315-fleet-'))
+      const watchStatePath = join(root, 'state.json')
+      const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+      const wedgedIssue = parseLinearIssue(issuePath(probe.wedged), issueFile(probe.wedged))
+      const seed = createFactory(config({ batchSize: 1 }), {
+        mount: new FakeMountClient({ [issuePath(probe.wedged)]: issueFile(probe.wedged) }),
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore: state(),
+        triage: new StaticTriage(),
+      })
+      const wedgedDecision = await seed.triageIssue(wedgedIssue)
+      await seed.stop()
+
+      // Adopted from an orphaned PR: `running`, holding the slot, and no
+      // placement ever recorded — so only the never-placed deadline can move it.
+      const wedged: DispatchLifecycle = {
+        runId: 'wedged-run',
+        issue: { ...wedgedDecision.issue },
+        decision: wedgedDecision,
+        dryRun: false,
+        phase: 'running',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 0,
+      }
+      const wedgedKey = issueKey(wedgedDecision.issue)
+      await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
+      const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
+      expect(seeded).toMatchObject({ phase: 'running' })
+      expect(seeded?.heldSinceAtMs).toBeUndefined()
+
+      class BrokerDownFleetClient extends RemoteLifecycleFleetClient {
+        override async reconcileTrackedAgents(): Promise<void> {
+          if (probe.mode === 'reconcile') throw new Error('no running broker')
+          await super.reconcileTrackedAgents()
+        }
+
+        override async roster() {
+          if (probe.mode === 'roster') {
+            throw new Error('fleet control-plane circuit is open until 2026-01-01T00:00:00.000Z')
+          }
+          return super.roster()
+        }
+      }
+      const fleet = new BrokerDownFleetClient()
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+      const factory = createFactory(config({
+        batchSize: 1,
+        // The ordinary held-agent deadline stays far away: only the
+        // never-placed deadline can explain a release here.
+        dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+        loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+      }), {
+        mount: new FakeMountClient({ [issuePath(probe.queued)]: issueFile(probe.queued) }),
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        logger,
+      })
+      try {
+        await factory.start({ mode: 'backfill-and-subscribe' })
+
+        // The fixture has to actually break re-adoption, or this test would
+        // pass for the wrong reason: it would be asserting that arming works on
+        // a boot where nothing ever threw.
+        expect(logger.warn).toHaveBeenCalledWith(
+          '[factory] failed to re-adopt durable in-flight agents',
+          expect.anything(),
+        )
+
+        await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', wedgedKey))
+          .toMatchObject({ phase: 'abandoned', releaseReason: 'agentless-slot-past-deadline' }), { timeout: 8_000 })
+        expect(logger.warn).toHaveBeenCalledWith(
+          '[factory] releasing a dispatch lifecycle that never placed an agent',
+          expect.objectContaining({ issue: `AR-${probe.wedged}`, phase: 'running', holdTimeoutMs: 1_000 }),
+        )
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
+  // #315: `#readIssue` swallows every read failure except a relayfile 429,
+  // which it rethrows. On the startup adoption path that rethrow aborted the
+  // whole loop from inside one row's iteration — before that row was restored
+  // into the batch and before its retry was scheduled — so neither it nor any
+  // later row had a hold deadline armed. A shed read must degrade the way an
+  // unreadable issue already does, not strand the batch.
+  it('adopts a durable row whose startup issue read is shed (#315)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-315-shed-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const wedgedIssue = parseLinearIssue(issuePath(334), issueFile(334))
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(334)]: issueFile(334) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const wedgedDecision = await seed.triageIssue(wedgedIssue)
+    await seed.stop()
+
+    const wedged: DispatchLifecycle = {
+      runId: 'wedged-run',
+      issue: { ...wedgedDecision.issue },
+      decision: wedgedDecision,
+      dryRun: false,
+      phase: 'dispatching',
+      agents: [],
+      invocationIds: [],
+      updatedAtMs: 0,
+    }
+    const wedgedKey = issueKey(wedgedDecision.issue)
+    await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
+
+    // relayfile sheds this row's issue read for the whole run.
+    class SheddingMountClient extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (path === issuePath(334)) {
+          throw Object.assign(new Error('relayfile shed the read'), {
+            status: 429,
+            reason: 'inflight_limit',
+          })
+        }
+        return super.readFile(path)
+      }
+    }
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new SheddingMountClient({ [issuePath(334)]: issueFile(334), [issuePath(335)]: issueFile(335) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+
+      // The shed read is observed rather than fatal, and adoption completed.
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] startup issue read was shed; adopting without it',
+        expect.objectContaining({ issue: 'AR-334', status: 429 }),
+      ), { timeout: 8_000 })
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        '[factory] failed to re-adopt durable in-flight agents',
+        expect.anything(),
+      )
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', wedgedKey))
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'agentless-slot-past-deadline' }), { timeout: 8_000 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // #315 MUST-NOT-FIRE: a `dispatching` row is armed twice over — once by the
+  // per-row retry driver and once by the aggregate arming this fix moved into
+  // `finally`. Arming is idempotent (an equal-or-later deadline is a no-op), so
+  // the row must still be released exactly once. Two releases here would mean
+  // the fix traded a wedged slot for a double teardown.
+  it('releases a never-placed row exactly once when both arming routes run (#315)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-315-once-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const wedgedIssue = parseLinearIssue(issuePath(336), issueFile(336))
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(336)]: issueFile(336) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const wedgedDecision = await seed.triageIssue(wedgedIssue)
+    await seed.stop()
+
+    const wedged: DispatchLifecycle = {
+      runId: 'wedged-run',
+      issue: { ...wedgedDecision.issue },
+      decision: wedgedDecision,
+      dryRun: false,
+      phase: 'dispatching',
+      agents: [],
+      invocationIds: [],
+      updatedAtMs: 0,
+    }
+    const wedgedKey = issueKey(wedgedDecision.issue)
+    await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
+
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      // A healthy fleet, so both arming routes really do run.
+      mount: new FakeMountClient({ [issuePath(337)]: issueFile(337) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        '[factory] failed to re-adopt durable in-flight agents',
+        expect.anything(),
+      )
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', wedgedKey))
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'agentless-slot-past-deadline' }), { timeout: 8_000 })
+      // Settle any second sweep that a double-arm would have scheduled.
+      await new Promise((resolve) => setTimeout(resolve, 2_500))
+      expect(logger.warn.mock.calls.filter((call) =>
+        call[0] === '[factory] releasing a dispatch lifecycle that never placed an agent')).toHaveLength(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+
   // #303 review (CodeRabbit): the sweep re-reads the durable row before tearing
   // anything down, so it must also *classify* from it. Reading the stale
   // in-memory record instead relabels a team that did run as never-placed —

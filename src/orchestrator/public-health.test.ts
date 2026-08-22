@@ -68,6 +68,15 @@ describe('dispatch capacity health (#303)', () => {
       agentlessHoldTimeoutMs: 30 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
       agentlessOccupants: 1,
+      // #315: the count alone cannot separate one stuck occupant from
+      // reap-and-reacquire churn. The age can, and the id lets two samples be
+      // compared without ever naming the issue.
+      occupants: [{
+        id: expect.stringMatching(/^[0-9a-f]{12}$/),
+        placedAgents: 0,
+        slotHeldForMs: 13 * 60 * 60_000,
+        pastReapDeadline: true,
+      }],
     })
     expect(health.degradedSubsystems).toContain('dispatchCapacity')
     expect(health.status).toBe('degraded')
@@ -132,6 +141,96 @@ describe('dispatch capacity health (#303)', () => {
     }
   })
 
+
+  // #315: the monitor stayed green through the exact condition it exists to
+  // catch. `agentlessOccupants` was computed and then dropped: with nothing
+  // queued behind the wedge, `waiting === 0` short-circuited the state to
+  // `healthy` while half a two-slot batch was held by a row past its own reap
+  // deadline. Nothing is waiting *because* dispatch is down — the moment it
+  // resumes, that is a halved batch running into a backlog.
+  it('does not report healthy while an occupant is past its own reap deadline', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        batchSize: 2,
+        active: 1,
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [{
+          issue: 'AR-315',
+          phase: 'running',
+          agents: 0,
+          placedAgents: 0,
+          slotHeldForMs: 40 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.agentlessOccupants).toBe(1)
+    expect(health.dispatchCapacity?.state).not.toBe('healthy')
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+    expect(health.degradedSubsystems).toContain('dispatchCapacity')
+  })
+
+  // #315: a count cannot distinguish one stuck occupant from reap-and-reacquire
+  // churn — both read 1 on every sample. A monotonically growing age against a
+  // stable id settles it in one request instead of 34.
+  it('publishes a stable identity and age per occupant, without the issue key', () => {
+    const sample = (slotHeldForMs: number) => publicHealthFromHeartbeat(
+      capacity({
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [
+          { issue: 'AR-315', phase: 'running', agents: 0, placedAgents: 0, slotHeldForMs },
+          { issue: 'AR-318', phase: 'running', agents: 2, placedAgents: 2, slotHeldForMs: 5_000 },
+        ],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    ).dispatchCapacity
+
+    const first = sample(40 * 60_000)
+    const second = sample(41 * 60_000)
+
+    // Same occupant across two samples: the id holds, the age advances. That is
+    // the reading a count cannot give.
+    expect(first?.occupants?.[0]?.id).toBe(second?.occupants?.[0]?.id)
+    expect(second?.occupants?.[0]?.slotHeldForMs).toBeGreaterThan(first?.occupants?.[0]?.slotHeldForMs ?? 0)
+    expect(first?.occupants?.[0]?.pastReapDeadline).toBe(true)
+
+    // Distinct occupants stay distinguishable, and the healthy one is not
+    // mislabelled as a wedge.
+    expect(first?.occupants?.[1]?.id).not.toBe(first?.occupants?.[0]?.id)
+    expect(first?.occupants?.[1]?.pastReapDeadline).toBeUndefined()
+    expect(first?.occupants?.[1]?.placedAgents).toBe(2)
+
+    // The redaction #303 established still holds: no issue key on the wire.
+    expect(JSON.stringify(first)).not.toContain('AR-315')
+    expect(JSON.stringify(first)).not.toContain('AR-318')
+  })
+
+  // #315: a record that carries the wedge in its occupants cannot be
+  // re-published as healthy on the strength of its own stale state string.
+  it('will not launder a stale healthy state over a wedged occupant', () => {
+    const normalized = normalizePublicHealth({
+      ...publicHealthFromHeartbeat(capacity({ waiting: 0, longestWaitMs: undefined }), { nowMs: BOOT_MS + 1_000 }),
+      dispatchCapacity: {
+        state: 'healthy',
+        batchSize: 2,
+        active: 1,
+        waiting: 0,
+        waitWarnMs: 30 * 60_000,
+        agentlessHoldTimeoutMs: 30 * 60_000,
+        occupants: [{ id: 'abcdef123456', placedAgents: 0, slotHeldForMs: 40 * 60_000 }],
+      },
+    })
+
+    expect(normalized.dispatchCapacity?.state).toBe('stalled')
+    expect(normalized.dispatchCapacity?.occupants?.[0]?.id).toBe('abcdef123456')
+    expect(normalized.dispatchCapacity?.occupants?.[0]?.pastReapDeadline).toBe(true)
+  })
+
   it('keeps issue keys behind the authenticated surface', () => {
     const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
 
@@ -140,7 +239,19 @@ describe('dispatch capacity health (#303)', () => {
 
   it('treats an ordinary full batch as healthy backpressure', () => {
     const health = publicHealthFromHeartbeat(
-      capacity({ longestWaitMs: 60_000 }),
+      // The shared fixture carries a wedged occupant, which is anything but
+      // ordinary — spell out a placed one so this really is the healthy case
+      // it claims to be (#315).
+      capacity({
+        longestWaitMs: 60_000,
+        occupants: [{
+          issue: 'AR-303',
+          phase: 'running',
+          agents: 2,
+          placedAgents: 2,
+          slotHeldForMs: 60_000,
+        }],
+      }),
       { nowMs: BOOT_MS + 1_000 },
     )
 

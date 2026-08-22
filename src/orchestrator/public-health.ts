@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto'
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
 import { DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS, DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
@@ -6,6 +7,7 @@ import type {
   FactoryEventListenerStatus,
   FactoryLoopHeartbeat,
   FactoryPublicDispatchCapacityHealth,
+  FactoryPublicDispatchSlotOccupant,
   FactoryPublicEventListenerHealth,
   FactoryPublicFleetControlPlaneHealth,
   FactoryPublicHealth,
@@ -181,21 +183,37 @@ const deriveDispatchCapacityState = (
   waiting: number,
   longestWaitMs: number | undefined,
   warnMs: number,
-): FactoryPublicDispatchCapacityHealth['state'] => waiting === 0
-  ? 'healthy'
-  : longestWaitMs !== undefined && longestWaitMs > warnMs
+  agentlessOccupants = 0,
+): FactoryPublicDispatchCapacityHealth['state'] =>
+  // An occupant past its own reap deadline is stalled capacity, and it is
+  // stalled whether or not anything is queued behind it (#315). This block
+  // already computed that fact and then dropped it on the floor: with
+  // `waiting === 0` the state read `healthy` while half of a two-slot batch
+  // was consumed by a row nothing could move — a monitor staying green through
+  // the exact condition it exists to catch. Nobody is waiting yet precisely
+  // because dispatch is down; the moment it resumes, this is a halved batch.
+  agentlessOccupants > 0
     ? 'stalled'
-    : 'waiting'
+    : waiting === 0
+      ? 'healthy'
+      : longestWaitMs !== undefined && longestWaitMs > warnMs
+        ? 'stalled'
+        : 'waiting'
 
 const dispatchCapacityState = (
   value: unknown,
   waiting: number,
   longestWaitMs: number | undefined,
   warnMs: number,
+  agentlessOccupants = 0,
 ): FactoryPublicDispatchCapacityHealth['state'] =>
-  typeof value === 'string' && (DISPATCH_CAPACITY_STATES as readonly string[]).includes(value)
-    ? value as FactoryPublicDispatchCapacityHealth['state']
-    : deriveDispatchCapacityState(waiting, longestWaitMs, warnMs)
+  // A record that already names the wedge cannot be re-published as `healthy`
+  // on the strength of its own stale state string.
+  agentlessOccupants > 0
+    ? 'stalled'
+    : typeof value === 'string' && (DISPATCH_CAPACITY_STATES as readonly string[]).includes(value)
+      ? value as FactoryPublicDispatchCapacityHealth['state']
+      : deriveDispatchCapacityState(waiting, longestWaitMs, warnMs, agentlessOccupants)
 
 const enumValue = <T extends string>(value: unknown, allowed: readonly T[]): T | 'unknown' =>
   typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : 'unknown'
@@ -324,6 +342,57 @@ function countAgentlessOccupants(occupants: unknown, reapMs: number): number {
 }
 
 /**
+ * Boot-scoped salt for occupant ids (#315).
+ *
+ * Issue keys carry project and repository names, so they cannot be published —
+ * but a bare digest of a low-entropy key like `AR-315` is recoverable from a
+ * word list, which would defeat the redaction it is meant to respect. Salting
+ * per process makes the id meaningful only by comparison, which is all the
+ * caller needs: two samples from one boot can be matched against each other,
+ * and nothing can be matched back to an issue.
+ */
+const OCCUPANT_ID_SALT = randomBytes(16).toString('hex')
+
+const occupantId = (issue: unknown): string =>
+  createHash('sha256')
+    .update(`${OCCUPANT_ID_SALT}:${typeof issue === 'string' ? issue : ''}`)
+    .digest('hex')
+    .slice(0, 12)
+
+/**
+ * Occupied slots as identities with ages, redacted (#315).
+ *
+ * The count above answers "is something wedged". It cannot answer "is it the
+ * SAME something", which is the question that separates a stuck slot from
+ * reap-and-reacquire churn, and answering it by sampling a count takes as long
+ * as the operator is willing to watch. A monotonically growing `slotHeldForMs`
+ * against a stable `id` settles it in one request.
+ *
+ * Defensive throughout: this runs inside the heartbeat writer, where a throw
+ * costs the whole diagnostics block (#303 review, cubic).
+ */
+function publicOccupants(occupants: unknown, reapMs: number): FactoryPublicDispatchSlotOccupant[] {
+  if (!Array.isArray(occupants)) return []
+  return occupants.flatMap((entry) => {
+    const occupant = plainRecord(entry)
+    if (!occupant) return []
+    const placedAgents = finiteNumber(occupant.placedAgents) ?? 0
+    const slotHeldForMs = finiteNumber(occupant.slotHeldForMs)
+    const pastReapDeadline = placedAgents === 0 &&
+      slotHeldForMs !== undefined &&
+      slotHeldForMs >= reapMs
+    return [{
+      // A record re-projected from an already-public one carries its id
+      // forward; only the writer, which holds the issue key, mints one.
+      id: typeof occupant.id === 'string' ? occupant.id : occupantId(occupant.issue),
+      placedAgents,
+      ...optionalDuration('slotHeldForMs', slotHeldForMs),
+      ...(pastReapDeadline ? { pastReapDeadline } : {}),
+    }]
+  })
+}
+
+/**
  * Batch occupancy, redacted (#303).
  *
  * Issue keys stay behind the authenticated surface — they carry customer
@@ -339,8 +408,9 @@ function dispatchCapacityHealth(
   const warnMs = positiveNumber(status.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS
   const reapMs = positiveNumber(status.agentlessHoldTimeoutMs) ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS
   const agentlessOccupants = countAgentlessOccupants(status.occupants, reapMs)
+  const occupants = publicOccupants(status.occupants, reapMs)
   return {
-    state: deriveDispatchCapacityState(waiting, longestWaitMs, warnMs),
+    state: deriveDispatchCapacityState(waiting, longestWaitMs, warnMs, agentlessOccupants),
     batchSize: counter(status.batchSize),
     active: counter(status.active),
     waiting,
@@ -348,6 +418,7 @@ function dispatchCapacityHealth(
     agentlessHoldTimeoutMs: reapMs,
     ...optionalDuration('longestWaitMs', longestWaitMs),
     ...(agentlessOccupants > 0 ? { agentlessOccupants } : {}),
+    ...(occupants.length > 0 ? { occupants } : {}),
   }
 }
 
@@ -504,6 +575,16 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const listener = plainRecord(record.eventListener)
   const fleet = plainRecord(record.fleetControlPlane)
   const capacity = plainRecord(record.dispatchCapacity)
+  // Re-derive the wedge from the occupants the record carries rather than
+  // trusting its own `agentlessOccupants`: a producer that published the
+  // occupants but predates the count still has to project as stalled (#315).
+  const capacityReapMs = positiveNumber(capacity?.agentlessHoldTimeoutMs)
+    ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS
+  const capacityOccupants = publicOccupants(capacity?.occupants, capacityReapMs)
+  const capacityAgentlessOccupants = Math.max(
+    counter(capacity?.agentlessOccupants),
+    capacityOccupants.filter((occupant) => occupant.pastReapDeadline).length,
+  )
   const degradedSubsystems = Array.isArray(record.degradedSubsystems)
     ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => (record.degradedSubsystems as unknown[]).includes(name))
     : []
@@ -559,6 +640,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
               counter(capacity.waiting),
               optionalDuration('longestWaitMs', capacity.longestWaitMs).longestWaitMs,
               positiveNumber(capacity.waitWarnMs) ?? DEFAULT_CAPACITY_WAIT_WARN_MS,
+              capacityAgentlessOccupants,
             ),
             batchSize: counter(capacity.batchSize),
             active: counter(capacity.active),
@@ -568,6 +650,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
               ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS,
             ...optionalDuration('longestWaitMs', capacity.longestWaitMs),
             ...optionalCount('agentlessOccupants', capacity.agentlessOccupants),
+            ...(capacityOccupants.length > 0 ? { occupants: capacityOccupants } : {}),
           },
         }
       : {}),
