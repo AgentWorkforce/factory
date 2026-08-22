@@ -590,10 +590,21 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     counter(capacity?.agentlessOccupants),
     capacityOccupants.filter((occupant) => occupant.pastReapDeadline).length,
   )
-  const degradedSubsystems = Array.isArray(record.degradedSubsystems)
+  const recordDegraded = Array.isArray(record.degradedSubsystems)
     ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => (record.degradedSubsystems as unknown[]).includes(name))
     : []
-  const status = enumValue(record.status, ['ok', 'degraded'] as const)
+  // The wedge has to reach the TOP-LEVEL signal too, not just the nested state
+  // (#318 review, codex). A record whose producer published occupants without
+  // the count would otherwise project `dispatchCapacity.state: 'stalled'`
+  // underneath `status: 'ok'` and an empty `degradedSubsystems` — the same
+  // stays-green failure this change exists to close, reappearing one layer up,
+  // where every documented consumer actually reads it.
+  const degradedSubsystems = capacityAgentlessOccupants > 0 && !recordDegraded.includes('dispatchCapacity')
+    ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => recordDegraded.includes(name) || name === 'dispatchCapacity')
+    : recordDegraded
+  const status = capacityAgentlessOccupants > 0
+    ? 'degraded' as const
+    : enumValue(record.status, ['ok', 'degraded'] as const)
   return {
     schemaVersion: finiteNumber(record.schemaVersion) ?? FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
     ok: record.ok === true,
@@ -654,7 +665,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             agentlessHoldTimeoutMs: positiveNumber(capacity.agentlessHoldTimeoutMs)
               ?? DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS,
             ...optionalDuration('longestWaitMs', capacity.longestWaitMs),
-            ...optionalCount('agentlessOccupants', capacity.agentlessOccupants),
+            ...(capacityAgentlessOccupants > 0 ? { agentlessOccupants: capacityAgentlessOccupants } : {}),
             ...(capacityOccupants.length > 0 ? { occupants: capacityOccupants } : {}),
           },
         }

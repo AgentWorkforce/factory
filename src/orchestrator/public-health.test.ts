@@ -229,6 +229,13 @@ describe('dispatch capacity health (#303)', () => {
     expect(normalized.dispatchCapacity?.state).toBe('stalled')
     expect(normalized.dispatchCapacity?.occupants?.[0]?.id).toBe('abcdef123456')
     expect(normalized.dispatchCapacity?.occupants?.[0]?.pastReapDeadline).toBe(true)
+    // The wedge has to reach the top-level signal, not just the nested state
+    // (#318 review, codex): a `stalled` capacity under `status: 'ok'` with an
+    // empty `degradedSubsystems` is the stays-green defect one layer up, and
+    // the top level is what every documented consumer reads.
+    expect(normalized.dispatchCapacity?.agentlessOccupants).toBe(1)
+    expect(normalized.degradedSubsystems).toContain('dispatchCapacity')
+    expect(normalized.status).toBe('degraded')
   })
 
   // Two occupants that both arrive without an issue key must not collapse onto
