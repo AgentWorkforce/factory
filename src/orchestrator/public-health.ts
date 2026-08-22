@@ -353,9 +353,14 @@ function countAgentlessOccupants(occupants: unknown, reapMs: number): number {
  */
 const OCCUPANT_ID_SALT = randomBytes(16).toString('hex')
 
-const occupantId = (issue: unknown): string =>
+// The position is the fallback identity, not the primary one: a corrupted
+// producer that sent no issue key would otherwise hash the empty string for
+// every such row, and two distinct occupants sharing one id reads as a single
+// stuck slot — the precise misreading this field exists to prevent. Occupants
+// are emitted in a stable key order, so the index is a usable last resort.
+const occupantId = (issue: unknown, index: number): string =>
   createHash('sha256')
-    .update(`${OCCUPANT_ID_SALT}:${typeof issue === 'string' ? issue : ''}`)
+    .update(`${OCCUPANT_ID_SALT}:${typeof issue === 'string' && issue ? issue : `#${index}`}`)
     .digest('hex')
     .slice(0, 12)
 
@@ -373,7 +378,7 @@ const occupantId = (issue: unknown): string =>
  */
 function publicOccupants(occupants: unknown, reapMs: number): FactoryPublicDispatchSlotOccupant[] {
   if (!Array.isArray(occupants)) return []
-  return occupants.flatMap((entry) => {
+  return occupants.flatMap((entry, index) => {
     const occupant = plainRecord(entry)
     if (!occupant) return []
     const placedAgents = finiteNumber(occupant.placedAgents) ?? 0
@@ -384,7 +389,7 @@ function publicOccupants(occupants: unknown, reapMs: number): FactoryPublicDispa
     return [{
       // A record re-projected from an already-public one carries its id
       // forward; only the writer, which holds the issue key, mints one.
-      id: typeof occupant.id === 'string' ? occupant.id : occupantId(occupant.issue),
+      id: typeof occupant.id === 'string' ? occupant.id : occupantId(occupant.issue, index),
       placedAgents,
       ...optionalDuration('slotHeldForMs', slotHeldForMs),
       ...(pastReapDeadline ? { pastReapDeadline } : {}),

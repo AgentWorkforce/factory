@@ -231,6 +231,25 @@ describe('dispatch capacity health (#303)', () => {
     expect(normalized.dispatchCapacity?.occupants?.[0]?.pastReapDeadline).toBe(true)
   })
 
+  // Two occupants that both arrive without an issue key must not collapse onto
+  // one id: distinct rows sharing an identity read as a single stuck slot,
+  // which is the exact misreading this field exists to prevent (#315).
+  it('keeps occupants distinguishable when the producer sent no issue key', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        occupants: [
+          { phase: 'running', agents: 0, placedAgents: 0, slotHeldForMs: 40 * 60_000 },
+          { phase: 'running', agents: 0, placedAgents: 0, slotHeldForMs: 50 * 60_000 },
+        ] as never,
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    const ids = health.dispatchCapacity?.occupants?.map((occupant) => occupant.id) ?? []
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+  })
+
   it('keeps issue keys behind the authenticated surface', () => {
     const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
 
